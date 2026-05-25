@@ -18,6 +18,7 @@ def test_connections_from_b24_date_column():
         ["1", "01.02.2026", "vuz", "12345", "02.02.2026"],
         ["2", "01.02.2026", "vuz", "12345", ""],
     ]
-    agg = _sync_leads_raw(headers, values)
-    assert agg["2026-02-01|12345"]["leads"] == 2
-    assert agg["2026-02-01|12345"]["connections"] == 1
+    agg, _dims = _sync_leads_raw(headers, values)
+    key = "2026-02-01|12345|rf|unknown|unknown"
+    assert agg[key]["leads"] == 2
+    assert agg[key]["connections"] == 1

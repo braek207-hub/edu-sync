@@ -87,6 +87,84 @@ def normalize_plan_direction(raw: str) -> str:
     return s
 
 
+# Листы Директа в книге EDU (как GAS DIRECT_SHEETS)
+DIRECT_SHEETS: dict[str, str] = {
+    "vse": "Postupi.VseKolledzhi",
+    "provuz": "Postupi.ProVuz",
+    "vuz": "Vuz.Edunetwork",
+    "brand": "Бренды",
+}
+
+
+def normalize_b24_dim(raw) -> str:
+    s = str(raw if raw is not None else "").strip()
+    return s or "unknown"
+
+
+def normalize_city_ip_segment(raw) -> str:
+    """Порт GAS normalizeCityIpSegment_."""
+    s = str(raw if raw is not None else "").strip().lower()
+    if not s:
+        return "rf"
+    compact = (
+        s.replace("ё", "е")
+        .replace(".", " ")
+        .replace("-", " ")
+        .replace("_", " ")
+        .replace(",", " ")
+        .replace("(", " ")
+        .replace(")", " ")
+    )
+    while "  " in compact:
+        compact = compact.replace("  ", " ")
+    compact = compact.strip()
+    if "московская область" in compact or "подмосков" in compact:
+        return "msk_mo"
+    msk_mo_cities = (
+        "москва",
+        "зеленоград",
+        "троицк",
+        "балашиха",
+        "подольск",
+        "химки",
+        "мытищи",
+        "королев",
+        "люберцы",
+        "красногорск",
+        "одинцово",
+        "домодедово",
+        "электросталь",
+        "коломна",
+        "серпухов",
+        "долгопрудный",
+        "пушкино",
+        "раменское",
+        "реутов",
+        "жуковский",
+        "ногинск",
+        "лобня",
+        "видное",
+        "дмитров",
+        "солнечногорск",
+        "истра",
+        "фрязино",
+        "дубна",
+        "клин",
+        "чехов",
+        "ступино",
+        "воскресенск",
+        "сергиев посад",
+        "ивантеевка",
+        "щелково",
+        "котельники",
+        "лыткарино",
+    )
+    for city in msk_mo_cities:
+        if compact == city or city in compact:
+            return "msk_mo"
+    return "rf"
+
+
 def map_crm_land(land: str) -> str:
     s = str(land or "").strip().lower()
     if not s:
@@ -100,6 +178,21 @@ def map_crm_land(land: str) -> str:
     if s in ("бренды", "brand"):
         return "brand"
     return "unknown"
+
+
+def resolve_row_project(
+    sheet_project: str | None,
+    campaign_name: str,
+    land: str = "",
+) -> str:
+    """Проект строки: лист Директа → ленд CRM → имя кампании."""
+    if sheet_project:
+        return sheet_project
+    if land:
+        mapped = map_crm_land(land)
+        if mapped != "unknown":
+            return mapped
+    return detect_project(campaign_name)
 
 
 def detect_direction(campaign_name: str) -> str:

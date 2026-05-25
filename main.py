@@ -79,9 +79,9 @@ def main() -> None:
     errors: list[str] = []
 
     try:
-        from sync.direct import sync_direct
+        from sync.direct import sync_direct_all
 
-        sync_direct(days_back=7)
+        sync_direct_all()
     except Exception as e:
         print(f"ОШИБКА direct: {e}")
         errors.append(f"direct: {e}")

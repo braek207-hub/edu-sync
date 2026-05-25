@@ -1,14 +1,22 @@
 import os
 import re
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
-from sync.classify import detect_direction, detect_project, map_crm_land
+from sync.classify import (
+    detect_direction,
+    map_crm_land,
+    normalize_b24_dim,
+    normalize_city_ip_segment,
+    resolve_row_project,
+)
 from sync.sheets import get_sheets_service, read_sheet
 from sync.utils import normalize_campaign_id, pick_index_loose, to_iso_date, to_num
 
 CRM_LEADS_SHEET = "Лиды"
 CRM_PAYMENTS_SHEET = "Оплаты"
+
+Dims = Tuple[str, str, str]
 
 
 def _cell(row: List[Any], idx: int) -> Any:
@@ -17,12 +25,13 @@ def _cell(row: List[Any], idx: int) -> Any:
     return row[idx]
 
 
-def _apply_meta(bucket: Dict[str, Any], raw_campaign: Any) -> None:
+def _apply_meta(bucket: Dict[str, Any], raw_campaign: Any, land: str = "") -> None:
     name = str(raw_campaign or "").strip()
     if name and not bucket.get("campaign_name"):
         bucket["campaign_name"] = name
-        bucket["project"] = detect_project(name)
         bucket["direction"] = detect_direction(name)
+    if land and bucket.get("project") == "unknown":
+        bucket["project"] = map_crm_land(land)
 
 
 def _log_spreadsheet_tabs(service, spreadsheet_id: str) -> None:
@@ -40,7 +49,7 @@ def _log_spreadsheet_tabs(service, spreadsheet_id: str) -> None:
 
 
 def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
-    """Построчные лиды (как GAS): date created + utm campaign."""
+    """Построчные лиды с сегментами — как GAS readCrmRawFromVals_."""
     li = {
         "date": pick_index_loose(
             headers, ["date created", "дата создания", "дата", "date"]
@@ -73,22 +82,25 @@ def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Di
         "deals": pick_index_loose(
             headers, ["уникальные сделки", "сделка", "сделки", "deals", "deal"]
         ),
+        "id": pick_index_loose(headers, ["id"]),
+        "city_ip": pick_index_loose(
+            headers, ["город (ip)", "город(ip)", "город ip"]
+        ),
+        "grad_year": pick_index_loose(
+            headers, ["б24 год выпуска", "год выпуска"]
+        ),
+        "edu_level": pick_index_loose(
+            headers,
+            ["б24 уровень образования", "уровень образования", "класс/курс"],
+        ),
     }
     if li["date"] == -1:
         raise ValueError("CRM(Лиды): не найдена колонка даты")
     if li["campaign"] == -1:
         raise ValueError("CRM(Лиды): не найдена колонка utm campaign")
 
-    agg: Dict[str, Dict[str, Any]] = defaultdict(
-        lambda: {
-            "leads": 0,
-            "connections": 0.0,
-            "deals": 0.0,
-            "project": "unknown",
-            "direction": "other",
-            "campaign_name": "",
-        }
-    )
+    agg: Dict[str, Dict[str, Any]] = {}
+    lead_dims_by_id: Dict[str, Dims] = {}
 
     for row in values[1:]:
         date_iso = to_iso_date(_cell(row, li["date"]))
@@ -102,11 +114,49 @@ def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Di
             cid = f"land:{land}"
         if not cid:
             continue
-        key = f"{date_iso}|{cid}"
-        bucket = agg[key]
-        _apply_meta(bucket, _cell(row, li["campaign"]))
-        if land and bucket.get("project") == "unknown":
-            bucket["project"] = map_crm_land(land)
+
+        city = (
+            normalize_city_ip_segment(_cell(row, li["city_ip"]))
+            if li["city_ip"] != -1
+            else "rf"
+        )
+        grad = (
+            normalize_b24_dim(_cell(row, li["grad_year"]))
+            if li["grad_year"] != -1
+            else "unknown"
+        )
+        edu = (
+            normalize_b24_dim(_cell(row, li["edu_level"]))
+            if li["edu_level"] != -1
+            else "unknown"
+        )
+        lead_id = (
+            normalize_campaign_id(_cell(row, li["id"])) if li["id"] != -1 else ""
+        )
+        if lead_id:
+            lead_dims_by_id[lead_id] = (city, grad, edu)
+
+        key = f"{date_iso}|{cid}|{city}|{grad}|{edu}"
+        bucket = agg.setdefault(
+            key,
+            {
+                "date": date_iso,
+                "campaign_id": cid,
+                "city_ip_segment": city,
+                "b24_grad_year": grad,
+                "b24_edu_level": edu,
+                "leads": 0,
+                "connections": 0.0,
+                "deals": 0.0,
+                "project": "unknown",
+                "direction": "other",
+                "campaign_name": "",
+                "land": land,
+            },
+        )
+        _apply_meta(bucket, _cell(row, li["campaign"]), land)
+        if land:
+            bucket["project"] = resolve_row_project(None, bucket.get("campaign_name", ""), land)
         bucket["leads"] += 1
         if li["connections"] != -1:
             bucket["connections"] += to_num(_cell(row, li["connections"]))
@@ -115,14 +165,11 @@ def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Di
                 bucket["connections"] += 1
         if li["deals"] != -1:
             bucket["deals"] += to_num(_cell(row, li["deals"]))
-    return agg
+
+    return agg, lead_dims_by_id
 
 
 def _sync_leads_by_land(headers: List[str], values: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Агрегат по дате + ленду (колонки Дата / Ленд / Лиды / Соединения) —
-    как на сводном листе в книге, не построчный CRM.
-    """
     li = {
         "date": pick_index_loose(headers, ["дата", "date"]),
         "land": pick_index_loose(headers, ["ленд", "land", "проект"]),
@@ -131,7 +178,7 @@ def _sync_leads_by_land(headers: List[str], values: List[List[Any]]) -> Dict[str
         "deals": pick_index_loose(headers, ["уникальные сделки", "сделки", "deals"]),
     }
     if li["date"] == -1 or li["land"] == -1 or li["leads"] == -1:
-        return {}
+        return {}, {}
 
     agg: Dict[str, Dict[str, Any]] = {}
     for row in values[1:]:
@@ -140,18 +187,43 @@ def _sync_leads_by_land(headers: List[str], values: List[List[Any]]) -> Dict[str
         if not date_iso or not land:
             continue
         cid = f"land:{land}"
-        key = f"{date_iso}|{cid}"
+        key = f"{date_iso}|{cid}|rf|unknown|unknown"
         agg[key] = {
+            "date": date_iso,
+            "campaign_id": cid,
+            "city_ip_segment": "rf",
+            "b24_grad_year": "unknown",
+            "b24_edu_level": "unknown",
             "leads": int(to_num(_cell(row, li["leads"]))),
             "connections": int(
                 to_num(_cell(row, li["connections"])) if li["connections"] != -1 else 0
             ),
             "deals": int(to_num(_cell(row, li["deals"])) if li["deals"] != -1 else 0),
-            "project": map_crm_land(land) if land else "unknown",
+            "project": map_crm_land(land),
             "direction": detect_direction(land),
             "campaign_name": land,
+            "land": land,
         }
-    return agg
+    return agg, {}
+
+
+def _enrich_project_from_direct(agg: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        from sync.crm_lite import _meta_from_direct_stats
+
+        meta = _meta_from_direct_stats()
+        for bucket in agg.values():
+            m = meta.get(bucket["campaign_id"])
+            if not m:
+                continue
+            if m.get("project") and m["project"] != "unknown":
+                bucket["project"] = m["project"]
+            if m.get("direction") and m["direction"] != "other":
+                bucket["direction"] = m["direction"]
+            if m.get("campaign_name"):
+                bucket["campaign_name"] = m["campaign_name"]
+    except Exception as e:
+        print(f"CRM Лиды: meta Direct пропущена: {e}")
 
 
 def sync_crm_leads() -> int:
@@ -188,16 +260,17 @@ def sync_crm_leads() -> int:
     headers = [str(x) for x in values[0]]
     print(f"CRM Лиды [{sheet_used}]: заголовки = {headers[:12]}")
 
+    lead_dims_by_id: Dict[str, Dims] = {}
     agg: Dict[str, Dict[str, Any]] = {}
     try:
-        agg = _sync_leads_raw(headers, values)
+        agg, lead_dims_by_id = _sync_leads_raw(headers, values)
         if agg:
-            print("CRM Лиды: режим построчный (utm campaign)")
+            print("CRM Лиды: режим построчный (utm campaign + сегменты)")
     except ValueError:
         pass
 
     if not agg:
-        agg = _sync_leads_by_land(headers, values)
+        agg, lead_dims_by_id = _sync_leads_by_land(headers, values)
         if agg:
             print("CRM Лиды: режим свод по Ленд (Дата + Ленд + Лиды)")
 
@@ -205,42 +278,30 @@ def sync_crm_leads() -> int:
         _log_spreadsheet_tabs(service, spreadsheet_id)
         raise ValueError(f"CRM(Лиды): нет строк после разбора, заголовки: {headers[:15]}")
 
-    try:
-        from sync.crm_lite import _meta_from_direct_stats
-
-        meta = _meta_from_direct_stats()
-        for key, bucket in agg.items():
-            _cid = key.split("|", 1)[1]
-            m = meta.get(_cid)
-            if not m:
-                continue
-            if m.get("project") and m["project"] != "unknown":
-                bucket["project"] = m["project"]
-            if m.get("direction") and m["direction"] != "other":
-                bucket["direction"] = m["direction"]
-    except Exception as e:
-        print(f"CRM Лиды: meta Direct пропущена: {e}")
+    _enrich_project_from_direct(agg)
 
     rows = []
-    for key, v in agg.items():
-        date_iso, campaign_id = key.split("|", 1)
+    for v in agg.values():
         rows.append(
             {
-                "date": date_iso,
-                "campaign_id": campaign_id,
+                "date": v["date"],
+                "campaign_id": v["campaign_id"],
                 "project": v["project"],
                 "direction": v["direction"],
+                "city_ip_segment": v["city_ip_segment"],
+                "b24_grad_year": v["b24_grad_year"],
+                "b24_edu_level": v["b24_edu_level"],
                 "leads": int(v["leads"]),
                 "connections": int(v["connections"]),
                 "deals": int(v["deals"]),
             }
         )
 
-    print(f"CRM Лиды: {len(rows)} агрегированных строк")
-    from sync.db import upsert_crm_leads
+    print(f"CRM Лиды: {len(rows)} сегментированных строк")
+    from sync.db import replace_crm_leads
 
-    n = upsert_crm_leads(rows)
-    print(f"CRM Лиды: upsert {n} строк в crm_leads")
+    n = replace_crm_leads(rows)
+    print(f"CRM Лиды: записано {n} строк в crm_leads")
     return n
 
 
@@ -261,6 +322,10 @@ def sync_crm_payments() -> int:
         ),
         "revenue": pick_index_loose(headers, ["выручка", "revenue", "сумма", "оборот"]),
         "orders": pick_index_loose(headers, ["orders", "оплат"]),
+        "land": pick_index_loose(headers, ["ленд", "land"]),
+        "lead_id": pick_index_loose(
+            headers, ["id лида в scrm", "lead id", "id лида"]
+        ),
     }
     if len(headers) > 17 and re_match_revenue(headers[17]):
         pi["revenue"] = 17
@@ -274,15 +339,17 @@ def sync_crm_payments() -> int:
     if pi["revenue"] == -1:
         raise ValueError('CRM(Оплаты): не найдена колонка "Выручка"')
 
-    agg: Dict[str, Dict[str, Any]] = defaultdict(
-        lambda: {
-            "payments": 0,
-            "revenue": 0.0,
-            "project": "unknown",
-            "direction": "other",
-            "campaign_name": "",
-        }
-    )
+    lead_dims_by_id: Dict[str, Dims] = {}
+    try:
+        leads_vals = read_sheet(service, spreadsheet_id, CRM_LEADS_SHEET)
+        if len(leads_vals) >= 2:
+            _, lead_dims_by_id = _sync_leads_raw(
+                [str(x) for x in leads_vals[0]], leads_vals
+            )
+    except Exception:
+        lead_dims_by_id = {}
+
+    agg: Dict[str, Dict[str, Any]] = {}
 
     for row in values[1:]:
         date_iso = to_iso_date(_cell(row, pi["pay_date"]))
@@ -291,37 +358,67 @@ def sync_crm_payments() -> int:
         cid = normalize_campaign_id(_cell(row, pi["campaign"]))
         if not cid:
             continue
-        key = f"{date_iso}|{cid}"
-        bucket = agg[key]
-        _apply_meta(bucket, _cell(row, pi["campaign"]))
+        land = (
+            str(_cell(row, pi["land"])).strip().lower() if pi["land"] != -1 else ""
+        )
+        lead_id = (
+            normalize_campaign_id(_cell(row, pi["lead_id"]))
+            if pi["lead_id"] != -1
+            else ""
+        )
+        if lead_id and lead_id in lead_dims_by_id:
+            city, grad, edu = lead_dims_by_id[lead_id]
+        else:
+            city, grad, edu = "rf", "unknown", "unknown"
+
+        key = f"{date_iso}|{cid}|{city}|{grad}|{edu}"
+        bucket = agg.setdefault(
+            key,
+            {
+                "date": date_iso,
+                "campaign_id": cid,
+                "city_ip_segment": city,
+                "b24_grad_year": grad,
+                "b24_edu_level": edu,
+                "payments": 0,
+                "revenue": 0.0,
+                "project": "unknown",
+                "direction": "other",
+            },
+        )
+        _apply_meta(bucket, _cell(row, pi["campaign"]), land)
+        if land:
+            bucket["project"] = resolve_row_project(
+                None, str(_cell(row, pi["campaign"])), land
+            )
 
         if pi["orders"] != -1:
             p_num = to_num(_cell(row, pi["orders"]))
-            p_bin = 1 if round(p_num) == 1 else 0
-            bucket["payments"] += p_bin
+            bucket["payments"] += 1 if round(p_num) == 1 else 0
         else:
             bucket["payments"] += 1
         bucket["revenue"] += to_num(_cell(row, pi["revenue"]))
 
-    rows = []
-    for key, v in agg.items():
-        date_iso, campaign_id = key.split("|", 1)
-        rows.append(
-            {
-                "date": date_iso,
-                "campaign_id": campaign_id,
-                "project": v["project"],
-                "direction": v["direction"],
-                "payments": int(v["payments"]),
-                "revenue": round(float(v["revenue"]), 2),
-            }
-        )
+    rows = [
+        {
+            "date": v["date"],
+            "campaign_id": v["campaign_id"],
+            "project": v["project"],
+            "direction": v["direction"],
+            "city_ip_segment": v["city_ip_segment"],
+            "b24_grad_year": v["b24_grad_year"],
+            "b24_edu_level": v["b24_edu_level"],
+            "payments": int(v["payments"]),
+            "revenue": round(float(v["revenue"]), 2),
+        }
+        for v in agg.values()
+    ]
 
-    print(f"CRM Оплаты: {len(rows)} агрегированных строк")
-    from sync.db import upsert_crm_payments
+    print(f"CRM Оплаты: {len(rows)} сегментированных строк")
+    from sync.db import replace_crm_payments
 
-    n = upsert_crm_payments(rows)
-    print(f"CRM Оплаты: upsert {n} строк в crm_payments")
+    n = replace_crm_payments(rows)
+    print(f"CRM Оплаты: записано {n} строк в crm_payments")
     return n
 
 

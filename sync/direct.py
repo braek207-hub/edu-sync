@@ -8,19 +8,29 @@ from typing import Any, Dict, List
 
 import requests
 
-from sync.classify import detect_direction, detect_project, project_from_client
+from sync.classify import detect_direction, detect_project, project_from_client, resolve_row_project
 
 DIRECT_API_URL = "https://api.direct.yandex.com/json/v5/reports"
-# Директ часто отвечает 201/202 и отдаёт TSV через несколько минут
 CONNECT_TIMEOUT = 30
 READ_TIMEOUT = 600
 MAX_POLL_ATTEMPTS = 30
+VAT_MULT = 1.2
+
+FIELD_NAMES = [
+    "Date",
+    "CampaignId",
+    "CampaignName",
+    "Impressions",
+    "Clicks",
+    "Cost",
+    "AvgEffectiveBid",
+    "AvgTrafficVolume",
+    "AvgImpressionPosition",
+    "AvgClickPosition",
+]
 
 
 def _direct_clients() -> List[dict]:
-    """
-    Клиенты Директа из DIRECT_CLIENTS_JSON (+ project/sheet_name как в BJ/GAS).
-    """
     raw_json = os.environ.get("DIRECT_CLIENTS_JSON", "").strip()
     if raw_json:
         clients = json.loads(raw_json)
@@ -48,16 +58,6 @@ def _direct_clients() -> List[dict]:
     raise RuntimeError("Нужен DIRECT_CLIENTS_JSON или DIRECT_CLIENT_LOGIN")
 
 
-FIELD_NAMES = [
-    "Date",
-    "CampaignId",
-    "CampaignName",
-    "Impressions",
-    "Clicks",
-    "Cost",
-]
-
-
 def _report_headers(login: str) -> dict:
     token = os.environ["DIRECT_TOKEN"]
     return {
@@ -66,14 +66,13 @@ def _report_headers(login: str) -> dict:
         "Accept-Language": "ru",
         "processingMode": "auto",
         "returnMoneyInMicros": "false",
-        # как в BJ_auto_metrica — TSV без строки заголовков
         "skipReportHeader": "true",
         "skipColumnHeader": "true",
         "skipReportSummary": "true",
     }
 
 
-def _parse_report_tsv(text: str) -> List[Dict[str, Any]]:
+def _parse_report_tsv(text: str, sheet_project: str | None = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     lines = [ln for ln in text.lstrip("\ufeff").splitlines() if ln.strip()]
     if not lines:
@@ -81,46 +80,61 @@ def _parse_report_tsv(text: str) -> List[Dict[str, Any]]:
 
     reader = csv.reader(lines, delimiter="\t")
     for parts in reader:
-        if len(parts) < len(FIELD_NAMES):
+        if len(parts) < 6:
             continue
-        row = dict(zip(FIELD_NAMES, parts))
+        padded = parts + [""] * (len(FIELD_NAMES) - len(parts))
+        row = dict(zip(FIELD_NAMES, padded[: len(FIELD_NAMES)]))
         campaign_id = str(row.get("CampaignId", "")).strip()
         if not campaign_id or campaign_id == "--":
             continue
         campaign_name = str(row.get("CampaignName", "")).strip()
-        project = detect_project(campaign_name)
+        impressions = int(float(row.get("Impressions", 0) or 0))
+        clicks = int(float(row.get("Clicks", 0) or 0))
+        cost = float(row.get("Cost", 0) or 0) * VAT_MULT
+
+        w_bid = w_traffic = w_impr = w_click = 0.0
+        if len(parts) > 6 and clicks > 0:
+            w_bid = float(parts[6] or 0) * clicks
+        if len(parts) > 7 and impressions > 0:
+            w_traffic = float(parts[7] or 0) * impressions
+        if len(parts) > 8 and impressions > 0:
+            w_impr = float(parts[8] or 0) * impressions
+        if len(parts) > 9 and clicks > 0:
+            w_click = float(parts[9] or 0) * clicks
+
         rows.append(
             {
                 "date": str(row.get("Date", "")).strip(),
                 "campaign_id": campaign_id,
                 "campaign_name": campaign_name,
-                "project": project,
+                "project": resolve_row_project(sheet_project, campaign_name),
                 "direction": detect_direction(campaign_name),
-                "cost": float(row.get("Cost", 0) or 0),
-                "clicks": int(float(row.get("Clicks", 0) or 0)),
-                "impressions": int(float(row.get("Impressions", 0) or 0)),
+                "cost": cost,
+                "clicks": clicks,
+                "impressions": impressions,
+                "w_avg_eff_bid": w_bid,
+                "w_avg_traffic_vol": w_traffic,
+                "w_avg_impr_pos": w_impr,
+                "w_avg_click_pos": w_click,
+                "w_auction_win_share": 0.0,
             }
         )
     return rows
 
 
-def _fetch_report(
-    login: str, date_from: str, date_to: str
-) -> List[Dict[str, Any]]:
+def _fetch_report(login: str, date_from: str, date_to: str, goals: List[str]) -> List[Dict[str, Any]]:
     headers = _report_headers(login)
-
     body = {
         "params": {
-            "SelectionCriteria": {
-                "DateFrom": date_from,
-                "DateTo": date_to,
-            },
+            "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
+            "Goals": goals or [],
+            "AttributionModels": ["LSC"],
             "FieldNames": FIELD_NAMES,
             "ReportName": f"edu_sync_{login}_{date_from}_{date_to}",
-            "ReportType": "CAMPAIGN_PERFORMANCE_REPORT",
+            "ReportType": "CUSTOM_REPORT",
             "DateRangeType": "CUSTOM_DATE",
             "Format": "TSV",
-            "IncludeVAT": "NO",
+            "IncludeVAT": "YES",
             "IncludeDiscount": "NO",
         }
     }
@@ -144,60 +158,58 @@ def _fetch_report(
         if resp.status_code in (201, 202):
             retry_in = int(resp.headers.get("retryIn", 60))
             retry_in = max(30, min(retry_in, 120))
-            print(
-                f"  [{login}] отчёт в очереди, ждём {retry_in}с "
-                f"(HTTP {resp.status_code}, попытка {attempt})..."
-            )
+            print(f"  [{login}] ждём {retry_in}с (HTTP {resp.status_code})...")
             time.sleep(retry_in)
             continue
         raise RuntimeError(
             f"Директ API [{login}] error {resp.status_code}: {resp.text[:500]}"
         )
     else:
-        raise RuntimeError(f"Директ API [{login}]: превышено число попыток ({MAX_POLL_ATTEMPTS})")
+        raise RuntimeError(f"Директ API [{login}]: превышено число попыток")
 
-    rows = _parse_report_tsv(resp.text)
-    if not rows and resp.text.strip():
-        preview = resp.text[:300].replace("\n", "\\n")
-        print(f"  [{login}] предупреждение: TSV без строк данных, превью: {preview}")
-    return rows
+    return _parse_report_tsv(resp.text, sheet_project=None)
 
 
 def sync_direct(days_back: int = 7) -> int:
+    """API fallback (короткое окно), если листы пустые."""
     today = date.today()
     date_from = (today - timedelta(days=days_back)).isoformat()
     date_to = today.isoformat()
 
     clients = _direct_clients()
-    print(f"Директ: запрос за {date_from} — {date_to}, клиентов: {len(clients)}")
+    print(f"Директ API: {date_from} — {date_to}, клиентов: {len(clients)}")
 
     all_rows: List[Dict[str, Any]] = []
     errors: List[str] = []
     for client in clients:
         login = client["login"]
+        proj = client.get("project")
         try:
-            chunk = _fetch_report(login, date_from, date_to)
-            if client.get("project"):
+            chunk = _fetch_report(login, date_from, date_to, client.get("goal_ids") or [])
+            if proj:
                 for row in chunk:
-                    row["project"] = client["project"]
+                    row["project"] = proj
             print(f"  [{login}] получено {len(chunk)} строк")
             all_rows.extend(chunk)
         except Exception as e:
-            msg = f"{login}: {e}"
             print(f"  [{login}] ОШИБКА: {e}")
-            errors.append(msg)
+            errors.append(f"{login}: {e}")
 
     if errors and not all_rows:
         raise RuntimeError("; ".join(errors))
-    if errors:
-        print(f"Директ: предупреждения ({len(errors)}): {'; '.join(errors)}")
-
-    print(f"Директ: всего {len(all_rows)} строк")
     if not all_rows:
         return 0
 
     from sync.db import upsert_direct_stats
 
-    n = upsert_direct_stats(all_rows)
-    print(f"Директ: upsert {n} строк в direct_stats")
-    return n
+    return upsert_direct_stats(all_rows)
+
+
+def sync_direct_all() -> int:
+    from sync.direct_sheets import sync_direct_sheets
+
+    n = sync_direct_sheets()
+    if n > 0:
+        return n
+    print("Директ листы пусты — fallback на API (7 дней)")
+    return sync_direct(days_back=7)
