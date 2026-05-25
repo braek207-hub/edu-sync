@@ -9,10 +9,15 @@ from typing import List
 
 def pick_index_loose(headers: List[str], variants: List[str], fallback: int = -1) -> int:
     h = [str(x or "").strip().lower() for x in headers]
-    vars_lower = [str(v or "").strip().lower() for v in variants]
+    # Сначала более длинные варианты («дата создания» до «дата»)
+    vars_lower = sorted(
+        {str(v or "").strip().lower() for v in variants if str(v or "").strip()},
+        key=len,
+        reverse=True,
+    )
     for i, hh in enumerate(h):
         for v in vars_lower:
-            if v and v in hh:
+            if v in hh:
                 return i
     return fallback
 
@@ -57,8 +62,9 @@ def to_iso_date(v, tz: str = "Europe/Moscow") -> str:
         return ""
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
         return s
-    if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", s):
-        dd, mm, yy = s.split(".")
+    m_dot = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})", s)
+    if m_dot:
+        dd, mm, yy = m_dot.group(1), m_dot.group(2), m_dot.group(3)
         return f"{yy}-{mm}-{dd}"
     if re.match(r"^\d{4}-\d{2}-\d{2}", s):
         return s[:10]

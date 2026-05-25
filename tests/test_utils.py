@@ -15,7 +15,15 @@ def test_normalize_campaign_id():
 def test_to_iso_date_formats():
     assert to_iso_date("2024-03-15") == "2024-03-15"
     assert to_iso_date("15.03.2024") == "2024-03-15"
+    assert to_iso_date("15.03.2024 14:30:00") == "2024-03-15"
     assert to_iso_date("20240315") == "2024-03-15"
+
+
+def test_pick_index_prefers_longer_header():
+    from sync.utils import pick_index_loose
+
+    h = ["ID", "Дата создания", "Б24 дата соединения на ОП", "UTM Campaign"]
+    assert pick_index_loose(h, ["date created", "дата создания", "дата"]) == 1
 
 
 def test_to_num():

@@ -24,8 +24,21 @@ def _resolve_env() -> None:
     ):
         os.environ["DIRECT_CLIENTS_JSON"] = os.environ["DIRECT_CLIENTS_JSON_EDU"]
 
-    # psycopg2: предпочитаем прямое подключение Supabase (5432), не pooler
-    if not os.environ.get("DATABASE_URL") and os.environ.get("DIRECT_URL"):
+    # GitHub Actions: pooler (IPv4). Локально можно DIRECT_URL (5432).
+    if os.environ.get("GITHUB_ACTIONS"):
+        pooler = os.environ.get("DATABASE_POOLER_URL") or os.environ.get(
+            "DATABASE_URL"
+        )
+        if pooler and "pooler.supabase.com" in pooler:
+            os.environ["DATABASE_URL"] = pooler
+        elif os.environ.get("DATABASE_URL", "").find("db.") >= 0 and ":5432" in os.environ.get(
+            "DATABASE_URL", ""
+        ):
+            print(
+                "WARN: DATABASE_URL — direct :5432; с Actions часто недоступен. "
+                "Задайте pooler URL (…pooler.supabase.com:6543) в секрете DATABASE_URL."
+            )
+    elif not os.environ.get("DATABASE_URL") and os.environ.get("DIRECT_URL"):
         os.environ["DATABASE_URL"] = os.environ["DIRECT_URL"]
 
 

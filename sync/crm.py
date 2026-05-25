@@ -81,7 +81,10 @@ def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Di
                 "кампания",
             ],
         ),
-        "connections": pick_index_loose(headers, ["connect", "соединен"]),
+        "land": pick_index_loose(headers, ["ленд", "land"]),
+        "connections": pick_index_loose(
+            headers, ["connect", "количество соединений", "соединения"]
+        ),
         "deals": pick_index_loose(headers, ["сделка", "сделки", "уникальные сделки"]),
     }
     if li["date"] == -1:
@@ -105,6 +108,10 @@ def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Di
         if not date_iso:
             continue
         cid = normalize_campaign_id(_cell(row, li["campaign"]))
+        if not cid and li["land"] != -1:
+            land = str(_cell(row, li["land"])).strip().lower()
+            if land:
+                cid = f"land:{land}"
         if not cid:
             continue
         key = f"{date_iso}|{cid}"
