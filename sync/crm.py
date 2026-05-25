@@ -1,40 +1,14 @@
-import json
 import os
 import re
 from collections import defaultdict
 from typing import Any, Dict, List
 
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-
-from sync.classify import detect_direction, detect_project
+from sync.classify import detect_direction, detect_project, map_crm_land
+from sync.sheets import get_sheets_service, read_sheet
 from sync.utils import normalize_campaign_id, pick_index_loose, to_iso_date, to_num
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 CRM_LEADS_SHEET = "Лиды"
 CRM_PAYMENTS_SHEET = "Оплаты"
-
-
-def _get_sheets_service():
-    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-        creds = Credentials.from_service_account_file(
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"], scopes=SCOPES
-        )
-    else:
-        sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT"]
-        sa_info = json.loads(sa_json)
-        creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-
-def _read_sheet(service, spreadsheet_id: str, sheet_name: str) -> List[List[Any]]:
-    result = (
-        service.spreadsheets()
-        .values()
-        .get(spreadsheetId=spreadsheet_id, range=sheet_name)
-        .execute()
-    )
-    return result.get("values", [])
 
 
 def _cell(row: List[Any], idx: int) -> Any:
@@ -83,9 +57,22 @@ def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Di
         ),
         "land": pick_index_loose(headers, ["ленд", "land"]),
         "connections": pick_index_loose(
-            headers, ["connect", "количество соединений", "соединения"]
+            headers, ["connect", "количество соединений"]
         ),
-        "deals": pick_index_loose(headers, ["сделка", "сделки", "уникальные сделки"]),
+        "date_connect": pick_index_loose(
+            headers,
+            [
+                "б24 дата соединения",
+                "дата соединения",
+                "date connect",
+                "connect date",
+                "дата коннекта",
+                "дата дозвона",
+            ],
+        ),
+        "deals": pick_index_loose(
+            headers, ["уникальные сделки", "сделка", "сделки", "deals", "deal"]
+        ),
     }
     if li["date"] == -1:
         raise ValueError("CRM(Лиды): не найдена колонка даты")
@@ -108,18 +95,24 @@ def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Di
         if not date_iso:
             continue
         cid = normalize_campaign_id(_cell(row, li["campaign"]))
-        if not cid and li["land"] != -1:
-            land = str(_cell(row, li["land"])).strip().lower()
-            if land:
-                cid = f"land:{land}"
+        land = (
+            str(_cell(row, li["land"])).strip().lower() if li["land"] != -1 else ""
+        )
+        if not cid and land:
+            cid = f"land:{land}"
         if not cid:
             continue
         key = f"{date_iso}|{cid}"
         bucket = agg[key]
         _apply_meta(bucket, _cell(row, li["campaign"]))
+        if land and bucket.get("project") == "unknown":
+            bucket["project"] = map_crm_land(land)
         bucket["leads"] += 1
         if li["connections"] != -1:
             bucket["connections"] += to_num(_cell(row, li["connections"]))
+        elif li["date_connect"] != -1:
+            if str(_cell(row, li["date_connect"]) or "").strip() not in ("", "0"):
+                bucket["connections"] += 1
         if li["deals"] != -1:
             bucket["deals"] += to_num(_cell(row, li["deals"]))
     return agg
@@ -162,10 +155,10 @@ def _sync_leads_by_land(headers: List[str], values: List[List[Any]]) -> Dict[str
 
 
 def sync_crm_leads() -> int:
-    service = _get_sheets_service()
+    service = get_sheets_service()
     spreadsheet_id = os.environ["GOOGLE_SHEETS_ID"]
 
-    values = _read_sheet(service, spreadsheet_id, CRM_LEADS_SHEET)
+    values = read_sheet(service, spreadsheet_id, CRM_LEADS_SHEET)
     sheet_used = CRM_LEADS_SHEET
 
     if len(values) < 2:
@@ -178,7 +171,7 @@ def sync_crm_leads() -> int:
             title = s.get("properties", {}).get("title") or ""
             if not title or title == CRM_LEADS_SHEET:
                 continue
-            candidate = _read_sheet(service, spreadsheet_id, title)
+            candidate = read_sheet(service, spreadsheet_id, title)
             if len(candidate) < 2:
                 continue
             hlow = " ".join(str(x).lower() for x in candidate[0])
@@ -236,10 +229,10 @@ def sync_crm_leads() -> int:
 
 
 def sync_crm_payments() -> int:
-    service = _get_sheets_service()
+    service = get_sheets_service()
     spreadsheet_id = os.environ["GOOGLE_SHEETS_ID"]
 
-    values = _read_sheet(service, spreadsheet_id, CRM_PAYMENTS_SHEET)
+    values = read_sheet(service, spreadsheet_id, CRM_PAYMENTS_SHEET)
     if len(values) < 2:
         print("CRM Оплаты: пустой лист")
         return 0

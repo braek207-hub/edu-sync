@@ -12,6 +12,19 @@ def detect_project(campaign_name: str) -> str:
     return "unknown"
 
 
+def map_crm_land(land: str) -> str:
+    s = str(land or "").strip().lower()
+    if not s:
+        return "unknown"
+    if s == "vuz":
+        return "vuz"
+    if s in ("vsekolledzhi_postupi", "vse", "postupi_vsekolledzhi"):
+        return "vse"
+    if s in ("postupi_provuz", "provuz", "provuz_postupi"):
+        return "provuz"
+    return "unknown"
+
+
 def detect_direction(campaign_name: str) -> str:
     s = str(campaign_name or "").lower()
     if "мти" in s or " mti " in s or "мти " in s or " mti" in s:

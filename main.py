@@ -102,6 +102,22 @@ def main() -> None:
         print(f"ОШИБКА crm_payments: {e}")
         errors.append(f"crm_payments: {e}")
 
+    try:
+        from sync.plan import sync_plan_monthly
+
+        sync_plan_monthly()
+    except Exception as e:
+        print(f"ОШИБКА plan: {e}")
+        errors.append(f"plan: {e}")
+
+    try:
+        from sync.strategies import sync_strategies_daily
+
+        sync_strategies_daily()
+    except Exception as e:
+        print(f"ОШИБКА strategies: {e}")
+        errors.append(f"strategies: {e}")
+
     print("=== EDU Sync DONE ===")
     if errors:
         print(f"Завершено с ошибками: {errors}")
