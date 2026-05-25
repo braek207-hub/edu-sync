@@ -51,28 +51,43 @@ def _apply_meta(bucket: Dict[str, Any], raw_campaign: Any) -> None:
         bucket["direction"] = detect_direction(name)
 
 
-def sync_crm_leads() -> int:
-    service = _get_sheets_service()
-    spreadsheet_id = os.environ["GOOGLE_SHEETS_ID"]
+def _log_spreadsheet_tabs(service, spreadsheet_id: str) -> None:
+    meta = (
+        service.spreadsheets()
+        .get(spreadsheetId=spreadsheet_id, fields="sheets.properties.title")
+        .execute()
+    )
+    titles = [
+        s["properties"]["title"]
+        for s in meta.get("sheets", [])
+        if s.get("properties", {}).get("title")
+    ]
+    print(f"CRM: листы в книге ({len(titles)}): {', '.join(titles[:20])}")
 
-    values = _read_sheet(service, spreadsheet_id, CRM_LEADS_SHEET)
-    if len(values) < 2:
-        print("CRM Лиды: пустой лист")
-        return 0
 
-    headers = [str(x) for x in values[0]]
+def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
+    """Построчные лиды (как GAS): date created + utm campaign."""
     li = {
-        "date": pick_index_loose(headers, ["date created", "дата создания"]),
+        "date": pick_index_loose(
+            headers, ["date created", "дата создания", "дата", "date"]
+        ),
         "campaign": pick_index_loose(
-            headers, ["utm campaign", "utm_campaign", "utmcampaign", "campaign"]
+            headers,
+            [
+                "utm campaign",
+                "utm_campaign",
+                "utmcampaign",
+                "campaign",
+                "кампания",
+            ],
         ),
         "connections": pick_index_loose(headers, ["connect", "соединен"]),
-        "deals": pick_index_loose(headers, ["сделка", "сделки"]),
+        "deals": pick_index_loose(headers, ["сделка", "сделки", "уникальные сделки"]),
     }
     if li["date"] == -1:
-        raise ValueError('CRM(Лиды): не найдена колонка даты (ожидали "date created")')
+        raise ValueError("CRM(Лиды): не найдена колонка даты")
     if li["campaign"] == -1:
-        raise ValueError('CRM(Лиды): не найдена колонка utm campaign')
+        raise ValueError("CRM(Лиды): не найдена колонка utm campaign")
 
     agg: Dict[str, Dict[str, Any]] = defaultdict(
         lambda: {
@@ -100,6 +115,95 @@ def sync_crm_leads() -> int:
             bucket["connections"] += to_num(_cell(row, li["connections"]))
         if li["deals"] != -1:
             bucket["deals"] += to_num(_cell(row, li["deals"]))
+    return agg
+
+
+def _sync_leads_by_land(headers: List[str], values: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Агрегат по дате + ленду (колонки Дата / Ленд / Лиды / Соединения) —
+    как на сводном листе в книге, не построчный CRM.
+    """
+    li = {
+        "date": pick_index_loose(headers, ["дата", "date"]),
+        "land": pick_index_loose(headers, ["ленд", "land", "проект"]),
+        "leads": pick_index_loose(headers, ["лиды", "leads"]),
+        "connections": pick_index_loose(headers, ["соединен", "connect"]),
+        "deals": pick_index_loose(headers, ["уникальные сделки", "сделки", "deals"]),
+    }
+    if li["date"] == -1 or li["land"] == -1 or li["leads"] == -1:
+        return {}
+
+    agg: Dict[str, Dict[str, Any]] = {}
+    for row in values[1:]:
+        date_iso = to_iso_date(_cell(row, li["date"]))
+        land = str(_cell(row, li["land"])).strip().lower()
+        if not date_iso or not land:
+            continue
+        cid = f"land:{land}"
+        key = f"{date_iso}|{cid}"
+        agg[key] = {
+            "leads": int(to_num(_cell(row, li["leads"]))),
+            "connections": int(
+                to_num(_cell(row, li["connections"])) if li["connections"] != -1 else 0
+            ),
+            "deals": int(to_num(_cell(row, li["deals"])) if li["deals"] != -1 else 0),
+            "project": detect_project(land),
+            "direction": detect_direction(land),
+            "campaign_name": land,
+        }
+    return agg
+
+
+def sync_crm_leads() -> int:
+    service = _get_sheets_service()
+    spreadsheet_id = os.environ["GOOGLE_SHEETS_ID"]
+
+    values = _read_sheet(service, spreadsheet_id, CRM_LEADS_SHEET)
+    sheet_used = CRM_LEADS_SHEET
+
+    if len(values) < 2:
+        meta = (
+            service.spreadsheets()
+            .get(spreadsheetId=spreadsheet_id, fields="sheets.properties.title")
+            .execute()
+        )
+        for s in meta.get("sheets", []):
+            title = s.get("properties", {}).get("title") or ""
+            if not title or title == CRM_LEADS_SHEET:
+                continue
+            candidate = _read_sheet(service, spreadsheet_id, title)
+            if len(candidate) < 2:
+                continue
+            hlow = " ".join(str(x).lower() for x in candidate[0])
+            if "ленд" in hlow and "лиды" in hlow and "дата" in hlow:
+                values = candidate
+                sheet_used = title
+                print(f"CRM Лиды: используем лист «{title}» (свод Дата+Ленд)")
+                break
+        if len(values) < 2:
+            print("CRM Лиды: пустой лист или только заголовок")
+            _log_spreadsheet_tabs(service, spreadsheet_id)
+            return 0
+
+    headers = [str(x) for x in values[0]]
+    print(f"CRM Лиды [{sheet_used}]: заголовки = {headers[:12]}")
+
+    agg: Dict[str, Dict[str, Any]] = {}
+    try:
+        agg = _sync_leads_raw(headers, values)
+        if agg:
+            print("CRM Лиды: режим построчный (utm campaign)")
+    except ValueError:
+        pass
+
+    if not agg:
+        agg = _sync_leads_by_land(headers, values)
+        if agg:
+            print("CRM Лиды: режим свод по Ленд (Дата + Ленд + Лиды)")
+
+    if not agg:
+        _log_spreadsheet_tabs(service, spreadsheet_id)
+        raise ValueError(f"CRM(Лиды): нет строк после разбора, заголовки: {headers[:15]}")
 
     rows = []
     for key, v in agg.items():

@@ -42,18 +42,65 @@ def _direct_clients() -> List[Tuple[str, List[str]]]:
     raise RuntimeError("Нужен DIRECT_CLIENTS_JSON или DIRECT_CLIENT_LOGIN")
 
 
-def _fetch_report(
-    login: str, date_from: str, date_to: str
-) -> List[Dict[str, Any]]:
-    token = os.environ["DIRECT_TOKEN"]
+FIELD_NAMES = [
+    "Date",
+    "CampaignId",
+    "CampaignName",
+    "Impressions",
+    "Clicks",
+    "Cost",
+]
 
-    headers = {
+
+def _report_headers(login: str) -> dict:
+    token = os.environ["DIRECT_TOKEN"]
+    return {
         "Authorization": f"Bearer {token}",
         "Client-Login": login,
         "Accept-Language": "ru",
         "processingMode": "auto",
         "returnMoneyInMicros": "false",
+        # как в BJ_auto_metrica — TSV без строки заголовков
+        "skipReportHeader": "true",
+        "skipColumnHeader": "true",
+        "skipReportSummary": "true",
     }
+
+
+def _parse_report_tsv(text: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    lines = [ln for ln in text.lstrip("\ufeff").splitlines() if ln.strip()]
+    if not lines:
+        return rows
+
+    reader = csv.reader(lines, delimiter="\t")
+    for parts in reader:
+        if len(parts) < len(FIELD_NAMES):
+            continue
+        row = dict(zip(FIELD_NAMES, parts))
+        campaign_id = str(row.get("CampaignId", "")).strip()
+        if not campaign_id or campaign_id == "--":
+            continue
+        campaign_name = str(row.get("CampaignName", "")).strip()
+        rows.append(
+            {
+                "date": str(row.get("Date", "")).strip(),
+                "campaign_id": campaign_id,
+                "campaign_name": campaign_name,
+                "project": detect_project(campaign_name),
+                "direction": detect_direction(campaign_name),
+                "cost": float(row.get("Cost", 0) or 0),
+                "clicks": int(float(row.get("Clicks", 0) or 0)),
+                "impressions": int(float(row.get("Impressions", 0) or 0)),
+            }
+        )
+    return rows
+
+
+def _fetch_report(
+    login: str, date_from: str, date_to: str
+) -> List[Dict[str, Any]]:
+    headers = _report_headers(login)
 
     body = {
         "params": {
@@ -61,14 +108,7 @@ def _fetch_report(
                 "DateFrom": date_from,
                 "DateTo": date_to,
             },
-            "FieldNames": [
-                "Date",
-                "CampaignId",
-                "CampaignName",
-                "Impressions",
-                "Clicks",
-                "Cost",
-            ],
+            "FieldNames": FIELD_NAMES,
             "ReportName": f"edu_sync_{login}_{date_from}_{date_to}",
             "ReportType": "CAMPAIGN_PERFORMANCE_REPORT",
             "DateRangeType": "CUSTOM_DATE",
@@ -109,26 +149,10 @@ def _fetch_report(
     else:
         raise RuntimeError(f"Директ API [{login}]: превышено число попыток ({MAX_POLL_ATTEMPTS})")
 
-    rows: List[Dict[str, Any]] = []
-    text = resp.text.lstrip("\ufeff")
-    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
-    for row in reader:
-        campaign_id = str(row.get("CampaignId", "")).strip()
-        if not campaign_id or campaign_id == "--":
-            continue
-        campaign_name = str(row.get("CampaignName", "")).strip()
-        rows.append(
-            {
-                "date": str(row.get("Date", "")).strip(),
-                "campaign_id": campaign_id,
-                "campaign_name": campaign_name,
-                "project": detect_project(campaign_name),
-                "direction": detect_direction(campaign_name),
-                "cost": float(row.get("Cost", 0) or 0),
-                "clicks": int(float(row.get("Clicks", 0) or 0)),
-                "impressions": int(float(row.get("Impressions", 0) or 0)),
-            }
-        )
+    rows = _parse_report_tsv(resp.text)
+    if not rows and resp.text.strip():
+        preview = resp.text[:300].replace("\n", "\\n")
+        print(f"  [{login}] предупреждение: TSV без строк данных, превью: {preview}")
     return rows
 
 
