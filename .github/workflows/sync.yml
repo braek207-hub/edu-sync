@@ -2,7 +2,7 @@ name: EDU Daily Sync
 
 on:
   schedule:
-    # 04:00 UTC = 07:00 MSK
+    # 04:00 UTC = 07:00 MSK (после Direct EDU → Sheets в 03:15 UTC)
     - cron: "0 4 * * *"
   workflow_dispatch:
 
@@ -24,11 +24,31 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Тот же SA, что в BJ_auto_metrica (секрет GCP_SA_KEY)
+      - name: Create Google SA key file
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -n "$GCP_SA_KEY" ]; then
+            printf '%s' "$GCP_SA_KEY" > sa.json
+          elif [ -n "$GOOGLE_SERVICE_ACCOUNT" ]; then
+            printf '%s' "$GOOGLE_SERVICE_ACCOUNT" > sa.json
+          else
+            echo "No Google credentials secret"
+            exit 1
+          fi
+
       - name: Run sync
         env:
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_URL: ${{ secrets.DIRECT_URL }}
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_TOKEN_EDU: ${{ secrets.DIRECT_TOKEN_EDU }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+          DIRECT_CLIENTS_JSON_EDU: ${{ secrets.DIRECT_CLIENTS_JSON_EDU }}
           DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
           GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          SHEET_ID_EDU: ${{ secrets.SHEET_ID_EDU }}
         run: python main.py

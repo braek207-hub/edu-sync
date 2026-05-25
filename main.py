@@ -9,25 +9,58 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _resolve_env() -> None:
+    """Поддержка имён секретов из BJ_auto_metrica и edu-sync."""
+    if not os.environ.get("GOOGLE_SHEETS_ID") and os.environ.get("SHEET_ID_EDU"):
+        os.environ["GOOGLE_SHEETS_ID"] = os.environ["SHEET_ID_EDU"]
+    if not os.environ.get("GOOGLE_SHEETS_ID") and os.environ.get("SHEET_ID"):
+        os.environ["GOOGLE_SHEETS_ID"] = os.environ["SHEET_ID"]
+
+    if not os.environ.get("DIRECT_TOKEN") and os.environ.get("DIRECT_TOKEN_EDU"):
+        os.environ["DIRECT_TOKEN"] = os.environ["DIRECT_TOKEN_EDU"]
+
+    if not os.environ.get("DIRECT_CLIENTS_JSON") and os.environ.get(
+        "DIRECT_CLIENTS_JSON_EDU"
+    ):
+        os.environ["DIRECT_CLIENTS_JSON"] = os.environ["DIRECT_CLIENTS_JSON_EDU"]
+
+    # psycopg2: предпочитаем прямое подключение Supabase (5432), не pooler
+    if not os.environ.get("DATABASE_URL") and os.environ.get("DIRECT_URL"):
+        os.environ["DATABASE_URL"] = os.environ["DIRECT_URL"]
+
+
 def main() -> None:
     print("=== EDU Sync START ===")
+    _resolve_env()
 
-    required = [
-        "DATABASE_URL",
-        "DIRECT_TOKEN",
-        "DIRECT_CLIENT_LOGIN",
-        "GOOGLE_SHEETS_ID",
-    ]
+    required = ["DATABASE_URL", "DIRECT_TOKEN", "GOOGLE_SHEETS_ID"]
+    has_direct_client = bool(
+        os.environ.get("DIRECT_CLIENTS_JSON")
+        or os.environ.get("DIRECT_CLIENT_LOGIN")
+    )
+    if not has_direct_client:
+        required.append("DIRECT_CLIENTS_JSON (или DIRECT_CLIENT_LOGIN)")
+
     has_google = bool(
         os.environ.get("GOOGLE_SERVICE_ACCOUNT")
         or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     )
     if not has_google:
-        required.append("GOOGLE_SERVICE_ACCOUNT")
+        required.append("GCP_SA_KEY / GOOGLE_SERVICE_ACCOUNT")
 
-    missing = [k for k in required if not os.environ.get(k)]
+    missing = []
+    for k in required:
+        if "или" in k:
+            continue
+        if not os.environ.get(k):
+            missing.append(k)
+    if not has_direct_client:
+        missing.append("DIRECT_CLIENTS_JSON")
+    if not has_google:
+        missing.append("GOOGLE_CREDENTIALS")
+
     if missing:
-        print(f"ОШИБКА: отсутствуют переменные: {', '.join(missing)}")
+        print(f"ОШИБКА: отсутствуют: {', '.join(missing)}")
         sys.exit(1)
 
     errors: list[str] = []

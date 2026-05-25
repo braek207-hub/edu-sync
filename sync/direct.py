@@ -1,9 +1,10 @@
 import csv
 import io
+import json
 import os
 import time
 from datetime import date, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import requests
 
@@ -12,13 +13,39 @@ from sync.classify import detect_direction, detect_project
 DIRECT_API_URL = "https://api.direct.yandex.com/json/v5/reports"
 
 
-def _fetch_report(date_from: str, date_to: str) -> List[Dict[str, Any]]:
+def _direct_clients() -> List[Tuple[str, List[str]]]:
+    """
+    Список (login, goal_ids) из DIRECT_CLIENTS_JSON (как BJ_auto_metrica)
+    или один клиент из DIRECT_CLIENT_LOGIN.
+    """
+    raw_json = os.environ.get("DIRECT_CLIENTS_JSON", "").strip()
+    if raw_json:
+        clients = json.loads(raw_json)
+        out: List[Tuple[str, List[str]]] = []
+        for item in clients:
+            login = str(item.get("login", "")).strip()
+            if not login:
+                continue
+            goals = item.get("goal_ids") or item.get("goals") or []
+            out.append((login, [str(g) for g in goals]))
+        if out:
+            return out
+
+    login = os.environ.get("DIRECT_CLIENT_LOGIN", "").strip()
+    if login:
+        return [(login, [])]
+
+    raise RuntimeError("Нужен DIRECT_CLIENTS_JSON или DIRECT_CLIENT_LOGIN")
+
+
+def _fetch_report(
+    login: str, date_from: str, date_to: str
+) -> List[Dict[str, Any]]:
     token = os.environ["DIRECT_TOKEN"]
-    client_login = os.environ["DIRECT_CLIENT_LOGIN"]
 
     headers = {
         "Authorization": f"Bearer {token}",
-        "Client-Login": client_login,
+        "Client-Login": login,
         "Accept-Language": "ru",
         "processingMode": "auto",
         "returnMoneyInMicros": "false",
@@ -38,7 +65,7 @@ def _fetch_report(date_from: str, date_to: str) -> List[Dict[str, Any]]:
                 "Clicks",
                 "Cost",
             ],
-            "ReportName": f"edu_sync_{date_from}_{date_to}",
+            "ReportName": f"edu_sync_{login}_{date_from}_{date_to}",
             "ReportType": "CAMPAIGN_PERFORMANCE_REPORT",
             "DateRangeType": "CUSTOM_DATE",
             "Format": "TSV",
@@ -54,12 +81,14 @@ def _fetch_report(date_from: str, date_to: str) -> List[Dict[str, Any]]:
             break
         if resp.status_code in (201, 202):
             retry_in = int(resp.headers.get("retryIn", 30))
-            print(f"  Отчёт Директа: ждём {retry_in}с (HTTP {resp.status_code})...")
+            print(f"  [{login}] отчёт: ждём {retry_in}с (HTTP {resp.status_code})...")
             time.sleep(retry_in)
             continue
-        raise RuntimeError(f"Директ API error {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(
+            f"Директ API [{login}] error {resp.status_code}: {resp.text[:500]}"
+        )
     else:
-        raise RuntimeError("Директ API: превышено число попыток")
+        raise RuntimeError(f"Директ API [{login}]: превышено число попыток")
 
     rows: List[Dict[str, Any]] = []
     text = resp.text.lstrip("\ufeff")
@@ -89,14 +118,21 @@ def sync_direct(days_back: int = 7) -> int:
     date_from = (today - timedelta(days=days_back)).isoformat()
     date_to = today.isoformat()
 
-    print(f"Директ: запрос за {date_from} — {date_to}")
-    rows = _fetch_report(date_from, date_to)
-    print(f"Директ: получено {len(rows)} строк")
-    if not rows:
+    clients = _direct_clients()
+    print(f"Директ: запрос за {date_from} — {date_to}, клиентов: {len(clients)}")
+
+    all_rows: List[Dict[str, Any]] = []
+    for login, _goals in clients:
+        chunk = _fetch_report(login, date_from, date_to)
+        print(f"  [{login}] получено {len(chunk)} строк")
+        all_rows.extend(chunk)
+
+    print(f"Директ: всего {len(all_rows)} строк")
+    if not all_rows:
         return 0
 
     from sync.db import upsert_direct_stats
 
-    n = upsert_direct_stats(rows)
+    n = upsert_direct_stats(all_rows)
     print(f"Директ: upsert {n} строк в direct_stats")
     return n

@@ -22,17 +22,15 @@ python main.py
 
 Workflow: `.github/workflows/sync.yml` — cron **07:00 MSK** (04:00 UTC) + ручной запуск.
 
-### Secrets (Settings → Secrets → Actions)
+### Secrets
 
-| Secret | Описание |
-|--------|----------|
-| `DATABASE_URL` | Supabase URI (тот же, что на Vercel) |
-| `DIRECT_TOKEN` | OAuth Яндекс Директ |
-| `DIRECT_CLIENT_LOGIN` | Client-Login |
-| `GOOGLE_SHEETS_ID` | ID книги (= `SPREADSHEET_ID` в GAS Script Properties) |
-| `GOOGLE_SERVICE_ACCOUNT` | JSON сервис-аккаунта **целиком одной строкой** |
+**Подробно:** [docs/SECRETS.md](docs/SECRETS.md)
 
-Таблицу нужно расшарить на email сервис-аккаунта (роль Viewer достаточно).
+Четыре секрета уже используются в **`BJ_auto_metrica`**: `GCP_SA_KEY`, `SHEET_ID_EDU`, `DIRECT_TOKEN_EDU`, `DIRECT_CLIENTS_JSON_EDU` — скопируйте в edu-sync.
+
+Новый только **`DATABASE_URL`** (Supabase `:5432`, как `DIRECT_URL` в EDU v2 `.env.local`).
+
+Автозаполнение после `gh auth login`: `scripts/setup-github-secrets.ps1` + файл `.env.sync`.
 
 ## Создание репозитория
 
