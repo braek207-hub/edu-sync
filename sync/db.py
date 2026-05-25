@@ -5,8 +5,21 @@ import psycopg2
 import psycopg2.extras
 
 
+def _database_url() -> str:
+    url = os.environ["DATABASE_URL"]
+    # Prisma pooler URI (?pgbouncer=true) — psycopg2 не понимает этот query-параметр
+    if "pgbouncer=" in url:
+        base, _, qs = url.partition("?")
+        if qs:
+            kept = "&".join(
+                p for p in qs.split("&") if p and not p.startswith("pgbouncer=")
+            )
+            url = f"{base}?{kept}" if kept else base
+    return url
+
+
 def get_connection():
-    return psycopg2.connect(os.environ["DATABASE_URL"])
+    return psycopg2.connect(_database_url())
 
 
 def upsert_direct_stats(rows: List[Dict[str, Any]]) -> int:
