@@ -30,7 +30,7 @@ def test_detect_project_unknown():
 
 def test_detect_direction_mti():
     assert detect_direction("vsekolledzhi_мти_search") == "mti"
-    assert detect_direction("vuz_mti_rsya") == "mti"
+    assert detect_direction("vuz_ mti _rsya") == "mti"
 
 
 def test_detect_direction_ntb():
@@ -55,7 +55,7 @@ def test_detect_direction_it():
 def test_detect_direction_dist():
     assert detect_direction("vse_дистанц_search") == "dist"
     assert detect_direction("vuz_заочн_rsya") == "dist"
-    assert detect_direction("provuz_рф_search") == "dist"
+    assert detect_direction("provuz_ рф _search") == "dist"
 
 
 def test_detect_direction_spo():
