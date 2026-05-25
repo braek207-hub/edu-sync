@@ -1,5 +1,6 @@
 import os
 from typing import Any, Dict, List
+from urllib.parse import unquote, urlparse
 
 import psycopg2
 import psycopg2.extras
@@ -19,7 +20,17 @@ def _database_url() -> str:
 
 
 def get_connection():
-    return psycopg2.connect(_database_url())
+    parsed = urlparse(_database_url())
+    if not parsed.hostname:
+        return psycopg2.connect(_database_url())
+    return psycopg2.connect(
+        host=parsed.hostname,
+        port=parsed.port or 5432,
+        user=unquote(parsed.username or ""),
+        password=unquote(parsed.password or ""),
+        dbname=(parsed.path or "/postgres").lstrip("/") or "postgres",
+        sslmode="require",
+    )
 
 
 def upsert_direct_stats(rows: List[Dict[str, Any]]) -> int:
