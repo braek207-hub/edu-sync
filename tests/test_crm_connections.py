@@ -1,7 +1,12 @@
 import os
 import sys
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+# googleapiclient optional locally
+sys.modules.setdefault("googleapiclient", MagicMock())
+sys.modules.setdefault("googleapiclient.discovery", MagicMock())
 
 from sync.crm import _sync_leads_raw
 

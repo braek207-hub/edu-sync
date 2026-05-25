@@ -10,7 +10,7 @@
 | `SHEET_ID_EDU` или `GOOGLE_SHEETS_ID` | ✅ `SHEET_ID_EDU` | Script Property **`SPREADSHEET_ID`** (тот же ID книги) |
 | `DIRECT_TOKEN_EDU` или `DIRECT_TOKEN` | ✅ `DIRECT_TOKEN_EDU` | — |
 | `DIRECT_CLIENTS_JSON_EDU` | ✅ `DIRECT_CLIENTS_JSON_EDU` | JSON `[{login, goal_ids, sheet_name}, …]` |
-| `DATABASE_URL` | ❌ только для v2 | **EDU v2** `.env.local` → `DIRECT_URL` (Supabase **:5432**, не pooler) |
+| `DATABASE_URL` | ❌ только для v2 | Supabase **Connect → Prisma** → первая строка (**6543**, `aws-*-ap-south-1.pooler…`) |
 
 ### GAS
 
@@ -39,7 +39,7 @@
    - `DIRECT_CLIENTS_JSON_EDU`
 
 2. Добавить только новый:
-   - `DATABASE_URL` — URI Supabase Postgres **direct** (`db.*.supabase.co:5432`), как `DIRECT_URL` в EDU v2
+   - `DATABASE_URL` — **transaction pooler** из Supabase Connect (порт **6543**, user `postgres.vkawfgoqjjdlcfvzihbx`, регион **ap-south-1** — не `eu-central-1`)
 
 Опционально дублировать под «универсальными» именами: `GOOGLE_SERVICE_ACCOUNT` (= содержимое `GCP_SA_KEY`), `GOOGLE_SHEETS_ID` (= `SHEET_ID_EDU`).
 
@@ -53,7 +53,7 @@
 cd "d:\vscode\edu-sync"
 gh repo create braek207-hub/edu-sync --public --source=. --push
 
-# DATABASE_URL — из EDU v2 .env.local (ключ DIRECT_URL, не pooler 6543)
+# DATABASE_URL — скопировать из Supabase Connect → Prisma (6543, ap-south-1 pooler)
 gh secret set DATABASE_URL --repo braek207-hub/edu-sync < db_uri.txt
 ```
 
@@ -65,4 +65,4 @@ gh secret set DATABASE_URL --repo braek207-hub/edu-sync < db_uri.txt
 
 ## Vercel (EDU v2)
 
-Только `DATABASE_URL` (можно pooler для Prisma). **edu-sync** использует direct URL отдельно.
+`DATABASE_URL` (6543) и `DIRECT_URL` (5432) — обе строки из Supabase Connect → Prisma. **edu-sync** использует только `DATABASE_URL`.

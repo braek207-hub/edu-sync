@@ -118,6 +118,14 @@ def main() -> None:
         print(f"ОШИБКА strategies: {e}")
         errors.append(f"strategies: {e}")
 
+    try:
+        from sync.crm_lite import sync_crm_lite
+
+        sync_crm_lite()
+    except Exception as e:
+        print(f"ОШИБКА crm_lite: {e}")
+        errors.append(f"crm_lite: {e}")
+
     print("=== EDU Sync DONE ===")
     if errors:
         print(f"Завершено с ошибками: {errors}")

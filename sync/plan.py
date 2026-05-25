@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List
 
+from sync.classify import normalize_plan_direction, normalize_plan_project
 from sync.sheets import get_sheets_service, read_sheet
 from sync.utils import pick_index_loose, to_num
 
@@ -70,13 +71,11 @@ def sync_plan_monthly() -> int:
         ym = normalize_month_key(r[pi["month"]] if pi["month"] < len(r) else "")
         if not ym:
             continue
-        project = (
-            str(r[pi["project"]]).strip().lower() if pi["project"] != -1 and pi["project"] < len(r) else ""
+        project = normalize_plan_project(
+            str(r[pi["project"]]) if pi["project"] != -1 and pi["project"] < len(r) else ""
         )
-        direction = (
-            str(r[pi["direction"]]).strip().lower()
-            if pi["direction"] != -1 and pi["direction"] < len(r)
-            else ""
+        direction = normalize_plan_direction(
+            str(r[pi["direction"]]) if pi["direction"] != -1 and pi["direction"] < len(r) else ""
         )
         if not project or not direction:
             continue

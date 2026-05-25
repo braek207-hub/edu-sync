@@ -4,11 +4,11 @@ import json
 import os
 import time
 from datetime import date, timedelta
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import requests
 
-from sync.classify import detect_direction, detect_project
+from sync.classify import detect_direction, detect_project, project_from_client
 
 DIRECT_API_URL = "https://api.direct.yandex.com/json/v5/reports"
 # Директ часто отвечает 201/202 и отдаёт TSV через несколько минут
@@ -17,27 +17,33 @@ READ_TIMEOUT = 600
 MAX_POLL_ATTEMPTS = 30
 
 
-def _direct_clients() -> List[Tuple[str, List[str]]]:
+def _direct_clients() -> List[dict]:
     """
-    Список (login, goal_ids) из DIRECT_CLIENTS_JSON (как BJ_auto_metrica)
-    или один клиент из DIRECT_CLIENT_LOGIN.
+    Клиенты Директа из DIRECT_CLIENTS_JSON (+ project/sheet_name как в BJ/GAS).
     """
     raw_json = os.environ.get("DIRECT_CLIENTS_JSON", "").strip()
     if raw_json:
         clients = json.loads(raw_json)
-        out: List[Tuple[str, List[str]]] = []
+        out: List[dict] = []
         for item in clients:
             login = str(item.get("login", "")).strip()
             if not login:
                 continue
             goals = item.get("goal_ids") or item.get("goals") or []
-            out.append((login, [str(g) for g in goals]))
+            out.append(
+                {
+                    "login": login,
+                    "goal_ids": [str(g) for g in goals],
+                    "project": project_from_client(login, item),
+                    "sheet_name": str(item.get("sheet_name", "")),
+                }
+            )
         if out:
             return out
 
     login = os.environ.get("DIRECT_CLIENT_LOGIN", "").strip()
     if login:
-        return [(login, [])]
+        return [{"login": login, "goal_ids": [], "project": None, "sheet_name": ""}]
 
     raise RuntimeError("Нужен DIRECT_CLIENTS_JSON или DIRECT_CLIENT_LOGIN")
 
@@ -82,12 +88,13 @@ def _parse_report_tsv(text: str) -> List[Dict[str, Any]]:
         if not campaign_id or campaign_id == "--":
             continue
         campaign_name = str(row.get("CampaignName", "")).strip()
+        project = detect_project(campaign_name)
         rows.append(
             {
                 "date": str(row.get("Date", "")).strip(),
                 "campaign_id": campaign_id,
                 "campaign_name": campaign_name,
-                "project": detect_project(campaign_name),
+                "project": project,
                 "direction": detect_direction(campaign_name),
                 "cost": float(row.get("Cost", 0) or 0),
                 "clicks": int(float(row.get("Clicks", 0) or 0)),
@@ -166,9 +173,13 @@ def sync_direct(days_back: int = 7) -> int:
 
     all_rows: List[Dict[str, Any]] = []
     errors: List[str] = []
-    for login, _goals in clients:
+    for client in clients:
+        login = client["login"]
         try:
             chunk = _fetch_report(login, date_from, date_to)
+            if client.get("project"):
+                for row in chunk:
+                    row["project"] = client["project"]
             print(f"  [{login}] получено {len(chunk)} строк")
             all_rows.extend(chunk)
         except Exception as e:

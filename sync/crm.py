@@ -147,7 +147,7 @@ def _sync_leads_by_land(headers: List[str], values: List[List[Any]]) -> Dict[str
                 to_num(_cell(row, li["connections"])) if li["connections"] != -1 else 0
             ),
             "deals": int(to_num(_cell(row, li["deals"])) if li["deals"] != -1 else 0),
-            "project": detect_project(land),
+            "project": map_crm_land(land) if land else "unknown",
             "direction": detect_direction(land),
             "campaign_name": land,
         }
@@ -204,6 +204,22 @@ def sync_crm_leads() -> int:
     if not agg:
         _log_spreadsheet_tabs(service, spreadsheet_id)
         raise ValueError(f"CRM(Лиды): нет строк после разбора, заголовки: {headers[:15]}")
+
+    try:
+        from sync.crm_lite import _meta_from_direct_stats
+
+        meta = _meta_from_direct_stats()
+        for key, bucket in agg.items():
+            _cid = key.split("|", 1)[1]
+            m = meta.get(_cid)
+            if not m:
+                continue
+            if m.get("project") and m["project"] != "unknown":
+                bucket["project"] = m["project"]
+            if m.get("direction") and m["direction"] != "other":
+                bucket["direction"] = m["direction"]
+    except Exception as e:
+        print(f"CRM Лиды: meta Direct пропущена: {e}")
 
     rows = []
     for key, v in agg.items():

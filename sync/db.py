@@ -41,9 +41,17 @@ def upsert_direct_stats(rows: List[Dict[str, Any]]) -> int:
         VALUES (%(date)s, %(campaign_id)s, %(campaign_name)s, %(project)s, %(direction)s,
                 %(cost)s, %(clicks)s, %(impressions)s)
         ON CONFLICT (date, campaign_id) DO UPDATE SET
-            campaign_name = EXCLUDED.campaign_name,
-            project       = EXCLUDED.project,
-            direction     = EXCLUDED.direction,
+            campaign_name = COALESCE(NULLIF(EXCLUDED.campaign_name, ''), direct_stats.campaign_name),
+            project       = CASE
+                WHEN EXCLUDED.project IS NOT NULL AND EXCLUDED.project <> 'unknown'
+                THEN EXCLUDED.project
+                ELSE direct_stats.project
+            END,
+            direction     = CASE
+                WHEN EXCLUDED.direction IS NOT NULL AND EXCLUDED.direction <> 'other'
+                THEN EXCLUDED.direction
+                ELSE direct_stats.direction
+            END,
             cost          = EXCLUDED.cost,
             clicks        = EXCLUDED.clicks,
             impressions   = EXCLUDED.impressions
@@ -117,6 +125,22 @@ def upsert_strategy_snapshots(rows: List[Dict[str, Any]]) -> int:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
         conn.commit()
     return len(rows)
+
+
+def upsert_dashboard_extras(crm_leads_lite_json: str, crm_payments_lite_json: str) -> int:
+    sql = """
+        INSERT INTO dashboard_extras (id, crm_leads_lite, crm_payments_lite, updated_at)
+        VALUES ('main', %s::jsonb, %s::jsonb, NOW())
+        ON CONFLICT (id) DO UPDATE SET
+            crm_leads_lite = EXCLUDED.crm_leads_lite,
+            crm_payments_lite = EXCLUDED.crm_payments_lite,
+            updated_at = NOW()
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (crm_leads_lite_json, crm_payments_lite_json))
+        conn.commit()
+    return 1
 
 
 def upsert_crm_payments(rows: List[Dict[str, Any]]) -> int:
