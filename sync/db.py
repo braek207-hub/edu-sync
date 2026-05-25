@@ -127,7 +127,23 @@ def upsert_strategy_snapshots(rows: List[Dict[str, Any]]) -> int:
     return len(rows)
 
 
+def ensure_dashboard_extras_table() -> None:
+    ddl = """
+        CREATE TABLE IF NOT EXISTS dashboard_extras (
+            id TEXT PRIMARY KEY DEFAULT 'main',
+            crm_leads_lite JSONB NOT NULL DEFAULT '[]',
+            crm_payments_lite JSONB NOT NULL DEFAULT '[]',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(ddl)
+        conn.commit()
+
+
 def upsert_dashboard_extras(crm_leads_lite_json: str, crm_payments_lite_json: str) -> int:
+    ensure_dashboard_extras_table()
     sql = """
         INSERT INTO dashboard_extras (id, crm_leads_lite, crm_payments_lite, updated_at)
         VALUES ('main', %s::jsonb, %s::jsonb, NOW())
