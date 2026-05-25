@@ -11,6 +11,10 @@ import requests
 from sync.classify import detect_direction, detect_project
 
 DIRECT_API_URL = "https://api.direct.yandex.com/json/v5/reports"
+# Директ часто отвечает 201/202 и отдаёт TSV через несколько минут
+CONNECT_TIMEOUT = 30
+READ_TIMEOUT = 600
+MAX_POLL_ATTEMPTS = 30
 
 
 def _direct_clients() -> List[Tuple[str, List[str]]]:
@@ -75,20 +79,35 @@ def _fetch_report(
     }
 
     resp = None
-    for _ in range(12):
-        resp = requests.post(DIRECT_API_URL, json=body, headers=headers, timeout=120)
+    for attempt in range(1, MAX_POLL_ATTEMPTS + 1):
+        try:
+            resp = requests.post(
+                DIRECT_API_URL,
+                json=body,
+                headers=headers,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            )
+        except requests.exceptions.Timeout as e:
+            print(f"  [{login}] timeout (попытка {attempt}/{MAX_POLL_ATTEMPTS}): {e}")
+            time.sleep(min(60, 15 + attempt * 5))
+            continue
+
         if resp.status_code == 200:
             break
         if resp.status_code in (201, 202):
-            retry_in = int(resp.headers.get("retryIn", 30))
-            print(f"  [{login}] отчёт: ждём {retry_in}с (HTTP {resp.status_code})...")
+            retry_in = int(resp.headers.get("retryIn", 60))
+            retry_in = max(30, min(retry_in, 120))
+            print(
+                f"  [{login}] отчёт в очереди, ждём {retry_in}с "
+                f"(HTTP {resp.status_code}, попытка {attempt})..."
+            )
             time.sleep(retry_in)
             continue
         raise RuntimeError(
             f"Директ API [{login}] error {resp.status_code}: {resp.text[:500]}"
         )
     else:
-        raise RuntimeError(f"Директ API [{login}]: превышено число попыток")
+        raise RuntimeError(f"Директ API [{login}]: превышено число попыток ({MAX_POLL_ATTEMPTS})")
 
     rows: List[Dict[str, Any]] = []
     text = resp.text.lstrip("\ufeff")
@@ -122,10 +141,21 @@ def sync_direct(days_back: int = 7) -> int:
     print(f"Директ: запрос за {date_from} — {date_to}, клиентов: {len(clients)}")
 
     all_rows: List[Dict[str, Any]] = []
+    errors: List[str] = []
     for login, _goals in clients:
-        chunk = _fetch_report(login, date_from, date_to)
-        print(f"  [{login}] получено {len(chunk)} строк")
-        all_rows.extend(chunk)
+        try:
+            chunk = _fetch_report(login, date_from, date_to)
+            print(f"  [{login}] получено {len(chunk)} строк")
+            all_rows.extend(chunk)
+        except Exception as e:
+            msg = f"{login}: {e}"
+            print(f"  [{login}] ОШИБКА: {e}")
+            errors.append(msg)
+
+    if errors and not all_rows:
+        raise RuntimeError("; ".join(errors))
+    if errors:
+        print(f"Директ: предупреждения ({len(errors)}): {'; '.join(errors)}")
 
     print(f"Директ: всего {len(all_rows)} строк")
     if not all_rows:
