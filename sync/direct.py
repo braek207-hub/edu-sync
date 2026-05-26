@@ -1,5 +1,4 @@
 import csv
-import io
 import json
 import os
 import time
@@ -15,7 +14,6 @@ DIRECT_API_URL = "https://api.direct.yandex.com/json/v5/reports"
 CONNECT_TIMEOUT = 30
 READ_TIMEOUT = 600
 MAX_POLL_ATTEMPTS = 30
-VAT_MULT = 1.2
 
 FIELD_NAMES = [
     "Date",
@@ -29,6 +27,9 @@ FIELD_NAMES = [
     "AvgImpressionPosition",
     "AvgClickPosition",
 ]
+
+DEFAULT_INCREMENTAL_DAYS = 7
+DEFAULT_FULL_DATE_FROM = "2026-01-01"
 
 
 def _direct_clients() -> List[dict]:
@@ -73,7 +74,7 @@ def _report_headers(login: str) -> dict:
     }
 
 
-def _parse_report_tsv(text: str, sheet_project: str | None = None) -> List[Dict[str, Any]]:
+def _parse_report_tsv(text: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     lines = [ln for ln in text.lstrip("\ufeff").splitlines() if ln.strip()]
     if not lines:
@@ -91,7 +92,7 @@ def _parse_report_tsv(text: str, sheet_project: str | None = None) -> List[Dict[
         campaign_name = str(row.get("CampaignName", "")).strip()
         impressions = int(float(row.get("Impressions", 0) or 0))
         clicks = int(float(row.get("Clicks", 0) or 0))
-        cost = float(row.get("Cost", 0) or 0)  # IncludeVAT YES — НДС уже в сумме
+        cost = float(row.get("Cost", 0) or 0)
 
         w_bid = w_traffic = w_impr = w_click = 0.0
         if len(parts) > 6 and clicks > 0:
@@ -134,8 +135,6 @@ def _report_body(login: str, date_from: str, date_to: str, goals: List[str]) -> 
         "IncludeVAT": "YES",
         "IncludeDiscount": "NO",
     }
-    # Goals/AttributionModels — только для метрик по целям Метрики.
-    # Без Goals API возвращает 400 на AttributionModels.
     if goals:
         params["Goals"] = goals
         params["AttributionModels"] = ["LSC"]
@@ -174,36 +173,13 @@ def _fetch_report(login: str, date_from: str, date_to: str, goals: List[str]) ->
     else:
         raise RuntimeError(f"Директ API [{login}]: превышено число попыток")
 
-    return _parse_report_tsv(resp.text, sheet_project=None)
+    return _parse_report_tsv(resp.text)
 
 
-def _direct_date_from_env(days_back: int) -> str:
-    """DIRECT_DATE_FROM (YYYY-MM-DD) или today − days_back."""
-    explicit = os.environ.get("DIRECT_DATE_FROM", "").strip()
-    if explicit:
-        return explicit
-    today = date.today()
-    return (today - timedelta(days=days_back)).isoformat()
-
-
-def _filter_direct_rows(
-    rows: List[Dict[str, Any]], date_from: str | None
-) -> List[Dict[str, Any]]:
-    if not date_from:
-        return rows
-    out = [r for r in rows if str(r.get("date", "")) >= date_from]
-    skipped = len(rows) - len(out)
-    if skipped:
-        print(f"Директ: отфильтровано {skipped} строк ранее {date_from}")
-    return out
-
-
-def sync_direct(days_back: int = 7) -> int:
-    """Yandex Direct API → direct_stats (upsert)."""
-    today = date.today()
-    date_from = _direct_date_from_env(days_back)
-    date_to = today.isoformat()
-
+def sync_direct_api_range(
+    date_from: str, date_to: str, *, replace_from: bool = False
+) -> int:
+    """Загрузка Direct через API за период [date_from, date_to]."""
     clients = _direct_clients()
     print(f"Директ API: {date_from} — {date_to}, клиентов: {len(clients)}")
 
@@ -212,7 +188,9 @@ def sync_direct(days_back: int = 7) -> int:
     for client in clients:
         login = client["login"]
         try:
-            chunk = _fetch_report(login, date_from, date_to, client.get("goal_ids") or [])
+            chunk = _fetch_report(
+                login, date_from, date_to, client.get("goal_ids") or []
+            )
             print(f"  [{login}] получено {len(chunk)} строк")
             all_rows.extend(chunk)
         except Exception as e:
@@ -225,42 +203,55 @@ def sync_direct(days_back: int = 7) -> int:
     if not all_rows:
         return 0
 
-    explicit_from = os.environ.get("DIRECT_DATE_FROM", "").strip()
-    all_rows = _filter_direct_rows(all_rows, explicit_from or None)
+    all_rows = [r for r in all_rows if str(r.get("date", "")) >= date_from]
+    if not all_rows:
+        return 0
 
     from sync.db import delete_direct_stats_from, upsert_direct_stats
 
-    if explicit_from:
-        deleted = delete_direct_stats_from(explicit_from)
-        print(f"Директ API: удалено {deleted} строк с {explicit_from}")
+    if replace_from:
+        deleted = delete_direct_stats_from(date_from)
+        print(f"Директ API: удалено {deleted} строк с {date_from}")
 
     return upsert_direct_stats(all_rows)
 
 
+def sync_direct_incremental(days_back: int = DEFAULT_INCREMENTAL_DAYS) -> int:
+    """Триггер: последние N дней, upsert (по умолчанию 7)."""
+    today = date.today()
+    date_from = (today - timedelta(days=days_back)).isoformat()
+    date_to = today.isoformat()
+    print(f"Директ incremental: {days_back} дн. ({date_from} — {date_to})")
+    return sync_direct_api_range(date_from, date_to, replace_from=False)
+
+
+def sync_direct_full(date_from: str | None = None) -> int:
+    """Полная перезагрузка периода с date_from по сегодня (delete + upsert)."""
+    start = (date_from or os.environ.get("DIRECT_DATE_FROM") or DEFAULT_FULL_DATE_FROM).strip()
+    today = date.today().isoformat()
+    print(f"Директ full: {start} — {today}")
+    return sync_direct_api_range(start, today, replace_from=True)
+
+
 def sync_direct_all() -> int:
-    """Primary: Yandex Direct API. Sheets — fallback (legacy GAS book)."""
-    from sync.direct_sheets import sync_direct_sheets
+    """
+    Только Яндекс Direct API.
 
-    days_back = int(os.environ.get("DIRECT_DAYS_BACK", "120"))
+    DIRECT_SYNC_MODE:
+      - incremental (default) — последние DIRECT_DAYS_BACK дней (default 7)
+      - full — с DIRECT_DATE_FROM (default 2026-01-01) по сегодня
+
+    DIRECT_SOURCE=sheets — legacy, только если явно задан.
+    """
     source = os.environ.get("DIRECT_SOURCE", "api").strip().lower()
+    if source == "sheets":
+        from sync.direct_sheets import sync_direct_sheets
 
-    if source != "sheets":
-        print(f"Директ: primary API, окно {days_back} дн.")
-        try:
-            n = sync_direct(days_back=days_back)
-            if n > 0:
-                return n
-        except Exception as e:
-            print(f"Директ API ошибка: {e}")
-        print("Директ API пуст/ошибка — fallback на листы Sheets")
-        n = sync_direct_sheets()
-        if n > 0:
-            return n
-        return 0
+        print("WARN: DIRECT_SOURCE=sheets (legacy), API отключён")
+        return sync_direct_sheets()
 
-    print("Директ: DIRECT_SOURCE=sheets — читаем листы")
-    n = sync_direct_sheets()
-    if n > 0:
-        return n
-    print(f"Директ листы пусты — fallback API ({days_back} дн.)")
-    return sync_direct(days_back=days_back)
+    mode = os.environ.get("DIRECT_SYNC_MODE", "incremental").strip().lower()
+    if mode == "full":
+        return sync_direct_full()
+    days_back = int(os.environ.get("DIRECT_DAYS_BACK", str(DEFAULT_INCREMENTAL_DAYS)))
+    return sync_direct_incremental(days_back=days_back)

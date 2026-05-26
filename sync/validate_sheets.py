@@ -141,4 +141,4 @@ def run_validation() -> None:
     except Exception as e:
         print(f"Validate sheets: {e}")
     _log_db_direct_wavg()
-    print("--- Validate: DIRECT_SOURCE=api (по умолчанию), DIRECT_DAYS_BACK=120 ---")
+    print("--- Validate: Direct API incremental 7d / full с DIRECT_DATE_FROM ---")

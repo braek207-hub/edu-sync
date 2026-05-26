@@ -24,14 +24,21 @@
 
 ### Директ
 
-**edu-sync** по умолчанию грузит Директ из **Яндекс Direct API** → Supabase (`DIRECT_SOURCE=api`, `DIRECT_DAYS_BACK=120`).
+**edu-sync** грузит Директ только из **Яндекс Direct API** → Supabase.
 
-Листы Direct в Google Sheets — только fallback (`DIRECT_SOURCE=sheets`) или для сверки с GAS. **BJ / `main_direct_daily_multi_edu.py` дашборду v2 не нужен.**
+| Режим | Переменные | Поведение |
+|-------|------------|-----------|
+| **Триггер (cron / daily)** | `DIRECT_SYNC_MODE=incremental`, `DIRECT_DAYS_BACK=7` | Последние **7 дней**, upsert |
+| **Полный период** | `DIRECT_SYNC_MODE=full`, `DIRECT_DATE_FROM=2026-01-01` | С даты по сегодня, delete + upsert |
+
+`DIRECT_SOURCE=sheets` — только legacy (не используется в Actions).
 
 | Переменная | Значение |
 |------------|----------|
-| `DIRECT_SOURCE` | `api` (default) или `sheets` |
-| `DIRECT_DAYS_BACK` | окно API в днях, default `120` |
+| `DIRECT_SOURCE` | `api` (default) |
+| `DIRECT_SYNC_MODE` | `incremental` (default) или `full` |
+| `DIRECT_DAYS_BACK` | для incremental, default `7` |
+| `DIRECT_DATE_FROM` | для full, default `2026-01-01` |
 
 ---
 

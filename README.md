@@ -2,7 +2,7 @@
 
 Ежедневная загрузка данных EDU Dashboard в Supabase:
 
-- **Яндекс Директ API v5** → `direct_stats` (последние 7 дней, cost без НДС)
+- **Яндекс Директ API v5** → `direct_stats` (cron: последние 7 дней; full: с `DIRECT_DATE_FROM`)
 - **Google Sheets** (листы `Лиды`, `Оплаты`) → `crm_leads`, `crm_payments`
 
 Дашборд на Vercel ([EDU v2](https://github.com/braek207-hub/EduDash)) читает только Supabase.

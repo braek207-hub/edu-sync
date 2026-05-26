@@ -1,18 +1,21 @@
 name: EDU Daily Sync
 
 on:
+  schedule:
+    # 04:00 UTC = 07:00 MSK
+    - cron: "0 4 * * *"
   workflow_dispatch:
     inputs:
-      direct_source:
-        description: "Direct — api или sheets (полная история с листов)"
+      direct_sync_mode:
+        description: "Direct — incremental (7 дн.) или full (весь период с даты)"
         required: false
-        default: "sheets"
+        default: "incremental"
         type: choice
         options:
-          - sheets
-          - api
+          - incremental
+          - full
       direct_date_from:
-        description: "Direct с даты (YYYY-MM-DD)"
+        description: "Direct full: с даты (YYYY-MM-DD)"
         required: false
         default: "2026-01-01"
         type: string
@@ -35,7 +38,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Тот же SA, что в BJ_auto_metrica (секрет GCP_SA_KEY)
       - name: Create Google SA key file
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -53,8 +55,10 @@ jobs:
       - name: Run sync
         env:
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
-          DIRECT_SOURCE: ${{ github.event.inputs.direct_source || 'api' }}
-          DIRECT_DATE_FROM: ${{ github.event.inputs.direct_date_from || '' }}
+          DIRECT_SOURCE: api
+          DIRECT_SYNC_MODE: ${{ github.event.inputs.direct_sync_mode || 'incremental' }}
+          DIRECT_DAYS_BACK: "7"
+          DIRECT_DATE_FROM: ${{ github.event.inputs.direct_date_from || '2026-01-01' }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_URL: ${{ secrets.DIRECT_URL }}
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}

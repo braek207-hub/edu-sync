@@ -17,8 +17,9 @@ for p in (
     if p.is_file():
         load_dotenv(p, override=False)
 
-os.environ.setdefault("DIRECT_DATE_FROM", "2026-01-01")
 os.environ.setdefault("DIRECT_SOURCE", "api")
+os.environ.setdefault("DIRECT_SYNC_MODE", "full")
+os.environ.setdefault("DIRECT_DATE_FROM", "2026-01-01")
 
 if __name__ == "__main__":
     from sync.db import ensure_schema

@@ -1,18 +1,19 @@
-# Пересинк Direct с 2026-01-01 (листы Google Sheets + to_num_gas).
-# Запуск: push этого файла в main или Run workflow в Actions.
-name: Direct Backfill 2026
+# Полная загрузка Direct через API (без листов).
+name: Direct Full Sync (API)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/direct-backfill.yml"
+    inputs:
+      direct_date_from:
+        description: "С даты (YYYY-MM-DD)"
+        required: false
+        default: "2026-01-01"
+        type: string
 
 jobs:
   direct:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -24,23 +25,8 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Create Google SA key file
+      - name: Direct API full period
         env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-        run: |
-          if [ -n "$GCP_SA_KEY" ]; then
-            printf '%s' "$GCP_SA_KEY" > sa.json
-          elif [ -n "$GOOGLE_SERVICE_ACCOUNT" ]; then
-            printf '%s' "$GOOGLE_SERVICE_ACCOUNT" > sa.json
-          else
-            echo "No Google credentials secret"
-            exit 1
-          fi
-
-      - name: Direct sheets from 2026-01-01
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: sa.json
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_URL: ${{ secrets.DIRECT_URL }}
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
@@ -48,13 +34,11 @@ jobs:
           DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
           DIRECT_CLIENTS_JSON_EDU: ${{ secrets.DIRECT_CLIENTS_JSON_EDU }}
           DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
-          GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
-          SHEET_ID_EDU: ${{ secrets.SHEET_ID_EDU }}
-          DIRECT_SOURCE: sheets
-          DIRECT_DATE_FROM: "2026-01-01"
+          DIRECT_SOURCE: api
+          DIRECT_SYNC_MODE: full
+          DIRECT_DATE_FROM: ${{ github.event.inputs.direct_date_from || '2026-01-01' }}
         run: |
           python -c "
-          import os
           from main import _resolve_env
           _resolve_env()
           from sync.db import ensure_schema
