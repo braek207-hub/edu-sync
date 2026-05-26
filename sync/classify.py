@@ -2,19 +2,17 @@
 
 
 # Как DIRECT_SHEETS в GAS config.js — лист → проект (кабинет BJ)
+# Только для подсказки кабинета в DIRECT_CLIENTS_JSON (не project строки — как GAS).
 SHEET_NAME_TO_PROJECT = {
     "postupi.vsekolledzhi": "vse",
     "postupi.provuz": "provuz",
     "vuz.edunetwork": "vuz",
-    "бренды": "brand",
 }
 
 LOGIN_HINT_TO_PROJECT = {
     "vsekolledzhi": "vse",
     "provuz": "provuz",
     "vuz": "vuz",
-    "бренд": "brand",
-    "brand": "brand",
 }
 
 
@@ -56,8 +54,6 @@ def normalize_plan_project(raw: str) -> str:
         return "vuz"
     if s in ("provuz", "провуз", "postupi_provuz", "provuz_postupi"):
         return "provuz"
-    if s in ("brand", "бренды", "бренд"):
-        return "brand"
     return s
 
 
@@ -175,8 +171,6 @@ def map_crm_land(land: str) -> str:
         return "vse"
     if s in ("postupi_provuz", "provuz", "provuz_postupi"):
         return "provuz"
-    if s in ("бренды", "brand"):
-        return "brand"
     return "unknown"
 
 
@@ -185,9 +179,8 @@ def resolve_row_project(
     campaign_name: str,
     land: str = "",
 ) -> str:
-    """Проект строки: лист Директа → ленд CRM → имя кампании."""
-    if sheet_project:
-        return sheet_project
+    """Проект строки: ленд CRM → имя кампании (как GAS metaByCampaignId, без ключа листа)."""
+    _ = sheet_project  # лист «Бренды» не задаёт project
     if land:
         mapped = map_crm_land(land)
         if mapped != "unknown":

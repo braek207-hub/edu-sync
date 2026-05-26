@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 
 import requests
 
-from sync.classify import detect_direction, detect_project, project_from_client, resolve_row_project
+from sync.classify import detect_direction, detect_project, project_from_client
 
 DIRECT_API_URL = "https://api.direct.yandex.com/json/v5/reports"
 CONNECT_TIMEOUT = 30
@@ -107,7 +107,7 @@ def _parse_report_tsv(text: str, sheet_project: str | None = None) -> List[Dict[
                 "date": str(row.get("Date", "")).strip(),
                 "campaign_id": campaign_id,
                 "campaign_name": campaign_name,
-                "project": resolve_row_project(sheet_project, campaign_name),
+                "project": detect_project(campaign_name),
                 "direction": detect_direction(campaign_name),
                 "cost": cost,
                 "clicks": clicks,
@@ -189,12 +189,8 @@ def sync_direct(days_back: int = 7) -> int:
     errors: List[str] = []
     for client in clients:
         login = client["login"]
-        proj = client.get("project")
         try:
             chunk = _fetch_report(login, date_from, date_to, client.get("goal_ids") or [])
-            if proj:
-                for row in chunk:
-                    row["project"] = proj
             print(f"  [{login}] получено {len(chunk)} строк")
             all_rows.extend(chunk)
         except Exception as e:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List
 
-from sync.classify import DIRECT_SHEETS, detect_direction, resolve_row_project
+from sync.classify import DIRECT_SHEETS, detect_direction, detect_project
 from sync.sheets import get_sheets_service, read_sheet
 from sync.utils import normalize_campaign_id, pick_index_loose, to_iso_date, to_num
 
@@ -100,7 +100,7 @@ def _parse_sheet(
                 "date": date_iso,
                 "campaign_id": cid,
                 "campaign_name": cname,
-                "project": resolve_row_project(sheet_project, cname),
+                "project": detect_project(cname),
                 "direction": detect_direction(cname),
                 "cost": cost,
                 "clicks": clicks,
