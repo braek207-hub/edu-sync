@@ -1,9 +1,6 @@
 name: EDU Daily Sync
 
 on:
-  schedule:
-    # 04:00 UTC = 07:00 MSK (после Direct EDU → Sheets в 03:15 UTC)
-    - cron: "0 4 * * *"
   workflow_dispatch:
 
 jobs:
