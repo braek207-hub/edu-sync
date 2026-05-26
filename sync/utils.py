@@ -33,21 +33,36 @@ def normalize_campaign_id(raw) -> str:
 
 
 def to_num(v) -> float:
+    """Как GAS toNum_, плюс разбор «1.222.433» / «1,222,433» из текстовых ячеек Sheets."""
     if v is None or v == "":
         return 0.0
     if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).strip()
+        n = float(v)
+        return n if n == n else 0.0
+    s = str(v).strip().replace("\u00a0", "")
     if not s:
         return 0.0
     s = s.replace(" ", "")
     if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    else:
-        s = s.replace(",", ".")
+        # 1.234,56 → decimal comma; 1,234.56 → decimal dot
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        parts = s.split(",")
+        if len(parts) == 2 and len(parts[1]) <= 2:
+            s = parts[0] + "." + parts[1]
+        else:
+            s = "".join(parts)
+    elif "." in s:
+        parts = s.split(".")
+        # 1.222.433 или 12.574 (тысячи) — точки как разделитель тысяч
+        if len(parts) > 2 or (len(parts) == 2 and len(parts[1]) == 3):
+            s = "".join(parts)
     try:
         n = float(s)
-        return n if n == n else 0.0  # NaN check
+        return n if n == n else 0.0
     except ValueError:
         return 0.0
 

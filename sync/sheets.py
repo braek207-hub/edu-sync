@@ -23,11 +23,18 @@ def get_sheets_service():
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
-def read_sheet(service, spreadsheet_id: str, sheet_name: str) -> list[list]:
-    result = (
-        service.spreadsheets()
-        .values()
-        .get(spreadsheetId=spreadsheet_id, range=sheet_name)
-        .execute()
-    )
+def read_sheet(
+    service,
+    spreadsheet_id: str,
+    sheet_name: str,
+    *,
+    value_render_option: str | None = None,
+) -> list[list]:
+    kwargs: dict = {
+        "spreadsheetId": spreadsheet_id,
+        "range": sheet_name,
+    }
+    if value_render_option:
+        kwargs["valueRenderOption"] = value_render_option
+    result = service.spreadsheets().values().get(**kwargs).execute()
     return result.get("values", [])
