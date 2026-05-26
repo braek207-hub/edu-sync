@@ -151,6 +151,13 @@ def sync_direct_sheets() -> int:
     if not all_rows:
         return 0
 
+    date_from = os.environ.get("DIRECT_DATE_FROM", "").strip()
+    if date_from:
+        all_rows = [
+            r for r in all_rows if str(r.get("date", "")) >= date_from
+        ]
+        print(f"Директ листы: оставлено {len(all_rows)} строк с {date_from}")
+
     from sync.db import replace_direct_stats
 
     n = replace_direct_stats(all_rows)

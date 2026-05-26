@@ -98,6 +98,17 @@ def get_connection():
     )
 
 
+def delete_direct_stats_from(date_from: str) -> int:
+    """Удалить direct_stats с date >= date_from (перед перезагрузкой окна)."""
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM direct_stats WHERE date >= %s", (date_from,))
+            deleted = cur.rowcount
+        conn.commit()
+    return deleted
+
+
 def replace_direct_stats(rows: List[Dict[str, Any]]) -> int:
     """Полная перезапись direct_stats (как полный лист в GAS)."""
     if not rows:

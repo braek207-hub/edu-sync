@@ -177,10 +177,31 @@ def _fetch_report(login: str, date_from: str, date_to: str, goals: List[str]) ->
     return _parse_report_tsv(resp.text, sheet_project=None)
 
 
-def sync_direct(days_back: int = 7) -> int:
-    """API fallback (короткое окно), если листы пустые."""
+def _direct_date_from_env(days_back: int) -> str:
+    """DIRECT_DATE_FROM (YYYY-MM-DD) или today − days_back."""
+    explicit = os.environ.get("DIRECT_DATE_FROM", "").strip()
+    if explicit:
+        return explicit
     today = date.today()
-    date_from = (today - timedelta(days=days_back)).isoformat()
+    return (today - timedelta(days=days_back)).isoformat()
+
+
+def _filter_direct_rows(
+    rows: List[Dict[str, Any]], date_from: str | None
+) -> List[Dict[str, Any]]:
+    if not date_from:
+        return rows
+    out = [r for r in rows if str(r.get("date", "")) >= date_from]
+    skipped = len(rows) - len(out)
+    if skipped:
+        print(f"Директ: отфильтровано {skipped} строк ранее {date_from}")
+    return out
+
+
+def sync_direct(days_back: int = 7) -> int:
+    """Yandex Direct API → direct_stats (upsert)."""
+    today = date.today()
+    date_from = _direct_date_from_env(days_back)
     date_to = today.isoformat()
 
     clients = _direct_clients()
@@ -204,7 +225,14 @@ def sync_direct(days_back: int = 7) -> int:
     if not all_rows:
         return 0
 
-    from sync.db import upsert_direct_stats
+    explicit_from = os.environ.get("DIRECT_DATE_FROM", "").strip()
+    all_rows = _filter_direct_rows(all_rows, explicit_from or None)
+
+    from sync.db import delete_direct_stats_from, upsert_direct_stats
+
+    if explicit_from:
+        deleted = delete_direct_stats_from(explicit_from)
+        print(f"Директ API: удалено {deleted} строк с {explicit_from}")
 
     return upsert_direct_stats(all_rows)
 

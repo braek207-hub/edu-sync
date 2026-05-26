@@ -2,6 +2,20 @@ name: EDU Daily Sync
 
 on:
   workflow_dispatch:
+    inputs:
+      direct_source:
+        description: "Direct — api или sheets (полная история с листов)"
+        required: false
+        default: "sheets"
+        type: choice
+        options:
+          - sheets
+          - api
+      direct_date_from:
+        description: "Direct с даты (YYYY-MM-DD)"
+        required: false
+        default: "2026-01-01"
+        type: string
 
 jobs:
   sync:
@@ -39,6 +53,8 @@ jobs:
       - name: Run sync
         env:
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          DIRECT_SOURCE: ${{ github.event.inputs.direct_source || 'api' }}
+          DIRECT_DATE_FROM: ${{ github.event.inputs.direct_date_from || '' }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_URL: ${{ secrets.DIRECT_URL }}
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
