@@ -28,7 +28,7 @@
 
 | Режим | Переменные | Поведение |
 |-------|------------|-----------|
-| **Триггер (cron / daily)** | `DIRECT_SYNC_MODE=incremental`, `DIRECT_DAYS_BACK=7` | Последние **7 дней**, upsert |
+| **Триггер (workflow_dispatch)** | `DIRECT_SYNC_MODE=incremental`, `DIRECT_DAYS_BACK=7` | Последние **7 дней**, upsert |
 | **Полный период** | `DIRECT_SYNC_MODE=full`, `DIRECT_DATE_FROM=2026-01-01` | С даты по сегодня, delete + upsert |
 
 `DIRECT_SOURCE=sheets` — только legacy (не используется в Actions).

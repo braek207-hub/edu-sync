@@ -2,7 +2,7 @@
 
 Ежедневная загрузка данных EDU Dashboard в Supabase:
 
-- **Яндекс Директ API v5** → `direct_stats` (cron: последние 7 дней; full: с `DIRECT_DATE_FROM`)
+- **Яндекс Директ API v5** → `direct_stats` (триггер: 7 дней; full: с `DIRECT_DATE_FROM`)
 - **Google Sheets** (листы `Лиды`, `Оплаты`) → `crm_leads`, `crm_payments`
 
 Дашборд на Vercel ([EDU v2](https://github.com/braek207-hub/EduDash)) читает только Supabase.
@@ -20,7 +20,7 @@ python main.py
 
 ## GitHub Actions
 
-Workflow: `.github/workflows/sync.yml` — cron **07:00 MSK** (04:00 UTC) + ручной запуск.
+Workflow: `.github/workflows/sync.yml` — только ручной запуск (`workflow_dispatch`).
 
 ### Secrets
 

@@ -1,9 +1,6 @@
 name: EDU Daily Sync
 
 on:
-  schedule:
-    # 04:00 UTC = 07:00 MSK
-    - cron: "0 4 * * *"
   workflow_dispatch:
     inputs:
       direct_sync_mode:
