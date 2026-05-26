@@ -1,0 +1,67 @@
+# Одноразовый пересинк Direct с 2026-01-01 (листы + to_num_gas).
+# Запуск: push этого файла в main или Run workflow в Actions.
+name: Direct Backfill 2026
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/direct-backfill.yml"
+
+jobs:
+  direct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Create Google SA key file
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -n "$GCP_SA_KEY" ]; then
+            printf '%s' "$GCP_SA_KEY" > sa.json
+          elif [ -n "$GOOGLE_SERVICE_ACCOUNT" ]; then
+            printf '%s' "$GOOGLE_SERVICE_ACCOUNT" > sa.json
+          else
+            echo "No Google credentials secret"
+            exit 1
+          fi
+
+      - name: Direct sheets from 2026-01-01
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_URL: ${{ secrets.DIRECT_URL }}
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_TOKEN_EDU: ${{ secrets.DIRECT_TOKEN_EDU }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+          DIRECT_CLIENTS_JSON_EDU: ${{ secrets.DIRECT_CLIENTS_JSON_EDU }}
+          DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
+          GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
+          SHEET_ID_EDU: ${{ secrets.SHEET_ID_EDU }}
+          DIRECT_SOURCE: sheets
+          DIRECT_DATE_FROM: "2026-01-01"
+        run: |
+          python -c "
+          import os
+          from main import _resolve_env
+          _resolve_env()
+          from sync.db import ensure_schema
+          from sync.direct import sync_direct_all
+          ensure_schema()
+          n = sync_direct_all()
+          print('direct_stats rows:', n)
+          if n <= 0:
+              raise SystemExit('Direct sync returned 0 rows')
+          "
