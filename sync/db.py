@@ -222,26 +222,26 @@ def upsert_crm_leads(rows: List[Dict[str, Any]]) -> int:
     return replace_crm_leads(rows)
 
 
-def upsert_monthly_plans(rows: List[Dict[str, Any]]) -> int:
+def replace_monthly_plans(rows: List[Dict[str, Any]]) -> int:
+    """Полная перезапись monthly_plans из листа (как GAS readPlanMonthly_)."""
     if not rows:
         return 0
+    ensure_schema()
     sql = """
         INSERT INTO monthly_plans (month, project, direction, budget, leads, connections, deals, payments, revenue)
         VALUES (%(month)s, %(project)s, %(direction)s, %(budget)s,
                 %(leads)s, %(connections)s, %(deals)s, %(payments)s, %(revenue)s)
-        ON CONFLICT (month, project, direction) DO UPDATE SET
-            budget      = EXCLUDED.budget,
-            leads       = EXCLUDED.leads,
-            connections = EXCLUDED.connections,
-            deals       = EXCLUDED.deals,
-            payments    = EXCLUDED.payments,
-            revenue     = EXCLUDED.revenue
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("TRUNCATE monthly_plans RESTART IDENTITY")
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
         conn.commit()
     return len(rows)
+
+
+def upsert_monthly_plans(rows: List[Dict[str, Any]]) -> int:
+    return replace_monthly_plans(rows)
 
 
 def upsert_strategy_snapshots(rows: List[Dict[str, Any]]) -> int:
