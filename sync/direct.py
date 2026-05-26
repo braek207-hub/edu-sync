@@ -90,7 +90,7 @@ def _parse_report_tsv(text: str, sheet_project: str | None = None) -> List[Dict[
         campaign_name = str(row.get("CampaignName", "")).strip()
         impressions = int(float(row.get("Impressions", 0) or 0))
         clicks = int(float(row.get("Clicks", 0) or 0))
-        cost = float(row.get("Cost", 0) or 0) * VAT_MULT
+        cost = float(row.get("Cost", 0) or 0)  # IncludeVAT YES — НДС уже в сумме
 
         w_bid = w_traffic = w_impr = w_click = 0.0
         if len(parts) > 6 and clicks > 0:
@@ -122,22 +122,28 @@ def _parse_report_tsv(text: str, sheet_project: str | None = None) -> List[Dict[
     return rows
 
 
+def _report_body(login: str, date_from: str, date_to: str, goals: List[str]) -> dict:
+    params: Dict[str, Any] = {
+        "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
+        "FieldNames": FIELD_NAMES,
+        "ReportName": f"edu_sync_{login}_{date_from}_{date_to}",
+        "ReportType": "CUSTOM_REPORT",
+        "DateRangeType": "CUSTOM_DATE",
+        "Format": "TSV",
+        "IncludeVAT": "YES",
+        "IncludeDiscount": "NO",
+    }
+    # Goals/AttributionModels — только для метрик по целям Метрики.
+    # Без Goals API возвращает 400 на AttributionModels.
+    if goals:
+        params["Goals"] = goals
+        params["AttributionModels"] = ["LSC"]
+    return {"params": params}
+
+
 def _fetch_report(login: str, date_from: str, date_to: str, goals: List[str]) -> List[Dict[str, Any]]:
     headers = _report_headers(login)
-    body = {
-        "params": {
-            "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
-            "Goals": goals or [],
-            "AttributionModels": ["LSC"],
-            "FieldNames": FIELD_NAMES,
-            "ReportName": f"edu_sync_{login}_{date_from}_{date_to}",
-            "ReportType": "CUSTOM_REPORT",
-            "DateRangeType": "CUSTOM_DATE",
-            "Format": "TSV",
-            "IncludeVAT": "YES",
-            "IncludeDiscount": "NO",
-        }
-    }
+    body = _report_body(login, date_from, date_to, goals)
 
     resp = None
     for attempt in range(1, MAX_POLL_ATTEMPTS + 1):
@@ -196,7 +202,8 @@ def sync_direct(days_back: int = 7) -> int:
             errors.append(f"{login}: {e}")
 
     if errors and not all_rows:
-        raise RuntimeError("; ".join(errors))
+        print(f"Директ API: все клиенты с ошибками: {'; '.join(errors)}")
+        return 0
     if not all_rows:
         return 0
 
@@ -214,10 +221,13 @@ def sync_direct_all() -> int:
 
     if source != "sheets":
         print(f"Директ: primary API, окно {days_back} дн.")
-        n = sync_direct(days_back=days_back)
-        if n > 0:
-            return n
-        print("Директ API пуст — fallback на листы Sheets")
+        try:
+            n = sync_direct(days_back=days_back)
+            if n > 0:
+                return n
+        except Exception as e:
+            print(f"Директ API ошибка: {e}")
+        print("Директ API пуст/ошибка — fallback на листы Sheets")
         n = sync_direct_sheets()
         if n > 0:
             return n
