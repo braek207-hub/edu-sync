@@ -1,13 +1,13 @@
-"""Синк plan_monthly из Google Sheets → monthly_plans."""
+"""Синк plan_monthly из Google Sheets → monthly_plans (как GAS readPlanMonthly_)."""
 
 from __future__ import annotations
 
 import os
 import re
+from collections import defaultdict
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
-from sync.classify import normalize_plan_direction, normalize_plan_project
 from sync.sheets import get_sheets_service, read_sheet
 from sync.utils import pick_index_loose, to_num
 
@@ -66,41 +66,84 @@ def sync_plan_monthly() -> int:
     if pi["month"] == -1:
         raise ValueError("План: не найдена колонка month")
 
-    rows: List[Dict[str, Any]] = []
+    agg: Dict[Tuple[str, str, str], Dict[str, Any]] = defaultdict(
+        lambda: {
+            "budget": 0.0,
+            "leads": 0,
+            "connections": 0,
+            "deals": 0,
+            "payments": 0,
+            "revenue": 0.0,
+        }
+    )
+    skipped_month = 0
+    raw_rows = 0
+
     for r in values[1:]:
+        raw_rows += 1
         ym = normalize_month_key(r[pi["month"]] if pi["month"] < len(r) else "")
         if not ym:
+            skipped_month += 1
             continue
-        project = normalize_plan_project(
-            str(r[pi["project"]]) if pi["project"] != -1 and pi["project"] < len(r) else ""
+        project = (
+            str(r[pi["project"]]).strip().lower()
+            if pi["project"] != -1 and pi["project"] < len(r)
+            else ""
         )
-        direction = normalize_plan_direction(
-            str(r[pi["direction"]]) if pi["direction"] != -1 and pi["direction"] < len(r) else ""
+        direction = (
+            str(r[pi["direction"]]).strip().lower()
+            if pi["direction"] != -1 and pi["direction"] < len(r)
+            else ""
         )
-        if not project or not direction:
-            continue
+        key = (f"{ym}-01", project, direction)
+        bucket = agg[key]
+        bucket["budget"] += to_num(
+            r[pi["budget"]] if pi["budget"] != -1 and pi["budget"] < len(r) else 0
+        )
+        bucket["leads"] += int(
+            to_num(r[pi["leads"]] if pi["leads"] != -1 and pi["leads"] < len(r) else 0)
+        )
+        bucket["connections"] += int(
+            to_num(
+                r[pi["connections"]]
+                if pi["connections"] != -1 and pi["connections"] < len(r)
+                else 0
+            )
+        )
+        bucket["deals"] += int(
+            to_num(r[pi["deals"]] if pi["deals"] != -1 and pi["deals"] < len(r) else 0)
+        )
+        bucket["payments"] += int(
+            to_num(
+                r[pi["payments"]]
+                if pi["payments"] != -1 and pi["payments"] < len(r)
+                else 0
+            )
+        )
+        bucket["revenue"] += to_num(
+            r[pi["revenue"]] if pi["revenue"] != -1 and pi["revenue"] < len(r) else 0
+        )
+
+    rows: List[Dict[str, Any]] = []
+    for (month, project, direction), b in agg.items():
         rows.append(
             {
-                "month": f"{ym}-01",
+                "month": month,
                 "project": project,
                 "direction": direction,
-                "budget": to_num(r[pi["budget"]] if pi["budget"] != -1 and pi["budget"] < len(r) else 0),
-                "leads": int(to_num(r[pi["leads"]] if pi["leads"] != -1 and pi["leads"] < len(r) else 0)),
-                "connections": int(
-                    to_num(r[pi["connections"]] if pi["connections"] != -1 and pi["connections"] < len(r) else 0)
-                ),
-                "deals": int(to_num(r[pi["deals"]] if pi["deals"] != -1 and pi["deals"] < len(r) else 0)),
-                "payments": int(
-                    to_num(r[pi["payments"]] if pi["payments"] != -1 and pi["payments"] < len(r) else 0)
-                ),
-                "revenue": round(
-                    to_num(r[pi["revenue"]] if pi["revenue"] != -1 and pi["revenue"] < len(r) else 0),
-                    2,
-                ),
+                "budget": round(b["budget"], 2),
+                "leads": b["leads"],
+                "connections": b["connections"],
+                "deals": b["deals"],
+                "payments": b["payments"],
+                "revenue": round(b["revenue"], 2),
             }
         )
 
-    print(f"План: {len(rows)} строк из plan_monthly")
+    print(
+        f"План: лист {raw_rows} строк → {len(rows)} ключей "
+        f"(пропуск month: {skipped_month})"
+    )
     from sync.db import upsert_monthly_plans
 
     n = upsert_monthly_plans(rows)

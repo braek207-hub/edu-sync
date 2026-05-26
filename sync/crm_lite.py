@@ -7,10 +7,15 @@ import os
 import re
 from typing import Any, Dict, List
 
-from sync.classify import detect_direction, detect_project, map_crm_land
+from sync.classify import (
+    detect_direction,
+    map_crm_land,
+    normalize_b24_dim,
+    normalize_city_ip_segment,
+)
 from sync.crm import CRM_LEADS_SHEET, CRM_PAYMENTS_SHEET, _cell
 from sync.sheets import get_sheets_service, read_sheet
-from sync.utils import normalize_campaign_id, pick_index_loose, to_iso_date, to_num
+from sync.utils import normalize_campaign_id, pick_index_loose, to_datetime_ms, to_iso_date, to_num
 
 
 def _meta_from_direct_stats() -> Dict[str, Dict[str, str]]:
@@ -47,7 +52,7 @@ def _read_leads_lite(
         "source": pick_index_loose(headers, ["б24 источник", "source", "utm source"]),
         "responsible": pick_index_loose(headers, ["ответственный"]),
         "dispatcher": pick_index_loose(
-            headers, ["диспетчер", "dispatcher", "дисп"]
+            headers, ["диспетчер", "dispatcher", "дисп", "диспетчер фио"]
         ),
         "connections": pick_index_loose(headers, ["connect"]),
         "date_connect": pick_index_loose(
@@ -57,14 +62,25 @@ def _read_leads_lite(
                 "дата соединения",
                 "date connect",
                 "connect date",
+                "дата коннекта",
+                "дата дозвона",
             ],
         ),
         "deals": pick_index_loose(headers, ["сделка", "сделки"]),
+        "time_to_connect": pick_index_loose(
+            headers,
+            ["время до соединения", "time to connect", "lag to connect", "t2connect"],
+        ),
+        "city_ip": pick_index_loose(headers, ["город (ip)", "город(ip)", "город ip"]),
+        "grad_year": pick_index_loose(headers, ["б24 год выпуска", "год выпуска"]),
+        "edu_level": pick_index_loose(
+            headers,
+            ["б24 уровень образования", "уровень образования", "класс/курс"],
+        ),
     }
     if li["date"] == -1:
         return []
 
-    # GAS: диспетчер в колонке H (index 7)
     if len(headers) > 7 and li["dispatcher"] == -1:
         h7 = str(headers[7]).lower()
         if "диспетч" in h7:
@@ -75,6 +91,12 @@ def _read_leads_lite(
         date_iso = to_iso_date(_cell(row, li["date"]))
         if not date_iso:
             continue
+        created_at_ms = to_datetime_ms(_cell(row, li["date"]))
+        connected_at_ms = (
+            to_datetime_ms(_cell(row, li["date_connect"]))
+            if li["date_connect"] != -1
+            else None
+        )
         cid = normalize_campaign_id(_cell(row, li["campaign"]))
         land = str(_cell(row, li["land"])).strip().lower() if li["land"] != -1 else ""
         m = meta.get(cid) if cid else None
@@ -90,6 +112,16 @@ def _read_leads_lite(
             conn = to_num(_cell(row, li["connections"]))
         elif li["date_connect"] != -1 and str(_cell(row, li["date_connect"]) or "").strip():
             conn = 1.0
+
+        time_to_connect = 0
+        if (
+            created_at_ms is not None
+            and connected_at_ms is not None
+            and connected_at_ms >= created_at_ms
+        ):
+            time_to_connect = int(round((connected_at_ms - created_at_ms) / 1000))
+        elif li["time_to_connect"] != -1:
+            time_to_connect = int(to_num(_cell(row, li["time_to_connect"])))
 
         cname = m["campaign_name"] if m else ""
         out.append(
@@ -107,14 +139,30 @@ def _read_leads_lite(
                 "dispatcher": (
                     str(_cell(row, li["dispatcher"])) if li["dispatcher"] != -1 else ""
                 ),
+                "cityIpSegment": (
+                    normalize_city_ip_segment(_cell(row, li["city_ip"]))
+                    if li["city_ip"] != -1
+                    else "rf"
+                ),
+                "b24GradYear": (
+                    normalize_b24_dim(_cell(row, li["grad_year"]))
+                    if li["grad_year"] != -1
+                    else "unknown"
+                ),
+                "b24EduLevel": (
+                    normalize_b24_dim(_cell(row, li["edu_level"]))
+                    if li["edu_level"] != -1
+                    else "unknown"
+                ),
                 "connections": conn,
                 "connectedAt": (
                     to_iso_date(_cell(row, li["date_connect"]))
                     if li["date_connect"] != -1
                     else ""
                 ),
+                "connectedAtMs": connected_at_ms if connected_at_ms is not None else 0,
                 "deals": to_num(_cell(row, li["deals"])) if li["deals"] != -1 else 0,
-                "timeToConnect": 0,
+                "timeToConnect": time_to_connect,
             }
         )
     return out

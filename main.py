@@ -126,6 +126,13 @@ def main() -> None:
         print(f"ОШИБКА crm_lite: {e}")
         errors.append(f"crm_lite: {e}")
 
+    try:
+        from sync.validate_sheets import run_validation
+
+        run_validation()
+    except Exception as e:
+        print(f"WARN validate: {e}")
+
     print("=== EDU Sync DONE ===")
     if errors:
         print(f"Завершено с ошибками: {errors}")

@@ -24,7 +24,14 @@
 
 ### Директ
 
-Старый скрипт `main_direct_daily_multi_edu.py` пишет в Sheets. **edu-sync** ходит в API напрямую → Supabase (Sheets для Direct больше не нужен дашборду v2).
+**edu-sync** по умолчанию грузит Директ из **Яндекс Direct API** → Supabase (`DIRECT_SOURCE=api`, `DIRECT_DAYS_BACK=120`).
+
+Листы Direct в Google Sheets — только fallback (`DIRECT_SOURCE=sheets`) или для сверки с GAS. **BJ / `main_direct_daily_multi_edu.py` дашборду v2 не нужен.**
+
+| Переменная | Значение |
+|------------|----------|
+| `DIRECT_SOURCE` | `api` (default) или `sheets` |
+| `DIRECT_DAYS_BACK` | окно API в днях, default `120` |
 
 ---
 

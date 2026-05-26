@@ -51,6 +51,9 @@ def sync_strategies_daily() -> int:
         ),
         "state": pick_index_loose(headers, ["state"]),
         "status": pick_index_loose(headers, ["status"]),
+        "serving": pick_index_loose(
+            headers, ["serving", "servingstatus", "serving_status"]
+        ),
     }
     if si["date"] == -1 or si["campaign_id"] == -1:
         raise ValueError("Стратегии: нужны колонки date и campaignId")
@@ -76,6 +79,9 @@ def sync_strategies_daily() -> int:
                 ),
                 "state": str(r[si["state"]] if si["state"] != -1 and si["state"] < len(r) else ""),
                 "status": str(r[si["status"]] if si["status"] != -1 and si["status"] < len(r) else ""),
+                "serving": str(
+                    r[si["serving"]] if si["serving"] != -1 and si["serving"] < len(r) else ""
+                ),
             }
         )
 

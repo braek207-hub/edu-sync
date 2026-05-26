@@ -42,6 +42,10 @@ def ensure_schema() -> None:
           ADD COLUMN IF NOT EXISTS b24_grad_year TEXT NOT NULL DEFAULT 'unknown',
           ADD COLUMN IF NOT EXISTS b24_edu_level TEXT NOT NULL DEFAULT 'unknown'
         """,
+        """
+        ALTER TABLE strategy_snapshots
+          ADD COLUMN IF NOT EXISTS serving TEXT NOT NULL DEFAULT ''
+        """,
     ]
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -244,15 +248,20 @@ def upsert_strategy_snapshots(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
     sql = """
-        INSERT INTO strategy_snapshots (date, campaign_id, campaign_name, weekly_budget, target_cpa, state, status)
-        VALUES (%(date)s, %(campaign_id)s, %(campaign_name)s, %(weekly_budget)s,
-                %(target_cpa)s, %(state)s, %(status)s)
+        INSERT INTO strategy_snapshots (
+            date, campaign_id, campaign_name, weekly_budget, target_cpa, state, status, serving
+        )
+        VALUES (
+            %(date)s, %(campaign_id)s, %(campaign_name)s, %(weekly_budget)s,
+            %(target_cpa)s, %(state)s, %(status)s, %(serving)s
+        )
         ON CONFLICT (date, campaign_id) DO UPDATE SET
             campaign_name = EXCLUDED.campaign_name,
             weekly_budget = EXCLUDED.weekly_budget,
             target_cpa    = EXCLUDED.target_cpa,
             state         = EXCLUDED.state,
-            status        = EXCLUDED.status
+            status        = EXCLUDED.status,
+            serving       = EXCLUDED.serving
     """
     with get_connection() as conn:
         with conn.cursor() as cur:

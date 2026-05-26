@@ -206,10 +206,26 @@ def sync_direct(days_back: int = 7) -> int:
 
 
 def sync_direct_all() -> int:
+    """Primary: Yandex Direct API. Sheets — fallback (legacy GAS book)."""
     from sync.direct_sheets import sync_direct_sheets
 
+    days_back = int(os.environ.get("DIRECT_DAYS_BACK", "120"))
+    source = os.environ.get("DIRECT_SOURCE", "api").strip().lower()
+
+    if source != "sheets":
+        print(f"Директ: primary API, окно {days_back} дн.")
+        n = sync_direct(days_back=days_back)
+        if n > 0:
+            return n
+        print("Директ API пуст — fallback на листы Sheets")
+        n = sync_direct_sheets()
+        if n > 0:
+            return n
+        return 0
+
+    print("Директ: DIRECT_SOURCE=sheets — читаем листы")
     n = sync_direct_sheets()
     if n > 0:
         return n
-    print("Директ листы пусты — fallback на API (7 дней)")
-    return sync_direct(days_back=7)
+    print(f"Директ листы пусты — fallback API ({days_back} дн.)")
+    return sync_direct(days_back=days_back)

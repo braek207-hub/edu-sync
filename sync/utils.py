@@ -84,3 +84,29 @@ def to_iso_date(v, tz: str = "Europe/Moscow") -> str:
         return d.strftime("%Y-%m-%d")
     except ValueError:
         return ""
+
+
+def to_datetime_ms(v, tz: str = "Europe/Moscow") -> int | None:
+    """Миллисекунды UTC для datetime из Sheets (как GAS toDateTimeMsSafe_)."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        d = v
+    else:
+        iso = to_iso_date(v, tz)
+        if not iso:
+            return None
+        try:
+            from zoneinfo import ZoneInfo
+
+            d = datetime.strptime(iso, "%Y-%m-%d").replace(tzinfo=ZoneInfo(tz))
+        except (ValueError, TypeError):
+            return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=ZoneInfo(tz))
+        return int(d.timestamp() * 1000)
+    except (ValueError, TypeError, OSError):
+        return None
