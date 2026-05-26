@@ -1,4 +1,4 @@
-# Одноразовый пересинк Direct с 2026-01-01 (листы + to_num_gas).
+# Пересинк Direct с 2026-01-01 (листы Google Sheets + to_num_gas).
 # Запуск: push этого файла в main или Run workflow в Actions.
 name: Direct Backfill 2026
 
