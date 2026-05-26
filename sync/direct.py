@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 import requests
 
 from sync.classify import detect_direction, detect_project, project_from_client
+from sync.utils import to_num_gas
 
 DIRECT_API_URL = "https://api.direct.yandex.com/json/v5/reports"
 CONNECT_TIMEOUT = 30
@@ -94,13 +95,13 @@ def _parse_report_tsv(text: str, sheet_project: str | None = None) -> List[Dict[
 
         w_bid = w_traffic = w_impr = w_click = 0.0
         if len(parts) > 6 and clicks > 0:
-            w_bid = float(parts[6] or 0) * clicks
+            w_bid = to_num_gas(parts[6]) * clicks
         if len(parts) > 7 and impressions > 0:
-            w_traffic = float(parts[7] or 0) * impressions
+            w_traffic = to_num_gas(parts[7]) * impressions
         if len(parts) > 8 and impressions > 0:
-            w_impr = float(parts[8] or 0) * impressions
+            w_impr = to_num_gas(parts[8]) * impressions
         if len(parts) > 9 and clicks > 0:
-            w_click = float(parts[9] or 0) * clicks
+            w_click = to_num_gas(parts[9]) * clicks
 
         rows.append(
             {

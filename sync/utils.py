@@ -32,8 +32,29 @@ def normalize_campaign_id(raw) -> str:
     return s
 
 
+def to_num_gas(v) -> float:
+    """Строго как GAS toNum_: запятая — десятичный разделитель (2,666 → 2.666)."""
+    if v is None or v == "":
+        return 0.0
+    if isinstance(v, (int, float)):
+        n = float(v)
+        return n if n == n else 0.0
+    s = str(v).strip().replace("\u00a0", "").replace(" ", "")
+    if not s:
+        return 0.0
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
+    try:
+        n = float(s)
+        return n if n == n else 0.0
+    except ValueError:
+        return 0.0
+
+
 def to_num(v) -> float:
-    """Как GAS toNum_, плюс разбор «1.222.433» / «1,222,433» из текстовых ячеек Sheets."""
+    """План/деньги: тысячи «1.222.433». Метрики Директа — to_num_gas."""
     if v is None or v == "":
         return 0.0
     if isinstance(v, (int, float)):

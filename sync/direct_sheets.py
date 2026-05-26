@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 
 from sync.classify import DIRECT_SHEETS, detect_direction, detect_project
 from sync.sheets import get_sheets_service, read_sheet
-from sync.utils import normalize_campaign_id, pick_index_loose, to_iso_date, to_num
+from sync.utils import normalize_campaign_id, pick_index_loose, to_iso_date, to_num, to_num_gas
 
 # Заголовки листов (BJ FIELDS / gas direct.js)
 _CORE = ["date", "campaignid", "campaignname", "impressions", "clicks", "cost"]
@@ -83,15 +83,15 @@ def _parse_sheet(
 
         w_bid = w_traffic = w_impr = w_click = w_win = 0.0
         if idx["bid"] != -1 and clicks > 0:
-            w_bid = to_num(row[idx["bid"]]) * clicks
+            w_bid = to_num_gas(row[idx["bid"]]) * clicks
         if idx["traffic"] != -1 and impressions > 0:
-            w_traffic = to_num(row[idx["traffic"]]) * impressions
+            w_traffic = to_num_gas(row[idx["traffic"]]) * impressions
         if idx["impr_pos"] != -1 and impressions > 0:
-            w_impr = to_num(row[idx["impr_pos"]]) * impressions
+            w_impr = to_num_gas(row[idx["impr_pos"]]) * impressions
         if idx["click_pos"] != -1 and clicks > 0:
-            w_click = to_num(row[idx["click_pos"]]) * clicks
+            w_click = to_num_gas(row[idx["click_pos"]]) * clicks
         if idx["win"] != -1 and impressions > 0:
-            raw = to_num(row[idx["win"]])
+            raw = to_num_gas(row[idx["win"]])
             ratio = raw / 100 if raw > 1.5 else raw
             w_win = ratio * impressions
 
