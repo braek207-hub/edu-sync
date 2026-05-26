@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
 from sync.sheets import get_sheets_service, read_sheet
@@ -72,6 +72,15 @@ def normalize_month_key(v: Any) -> str:
         return ""
     if isinstance(v, datetime):
         return v.strftime("%Y-%m")
+    # Google Sheets UNFORMATTED_VALUE: месяц как serial (дни от 1899-12-30)
+    if isinstance(v, (int, float)):
+        n = float(v)
+        if 40000 <= n < 60000:
+            d = datetime(1899, 12, 30) + timedelta(days=int(n))
+            return d.strftime("%Y-%m")
+        if 200001 <= n <= 209912 and n == int(n):
+            ym = str(int(n))
+            return f"{ym[:4]}-{ym[4:6]}"
     s = str(v).strip()
     if not s:
         return ""
