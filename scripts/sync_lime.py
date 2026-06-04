@@ -20,7 +20,7 @@ MYSQL_CFG = dict(
     cursorclass=pymysql.cursors.DictCursor,
 )
 
-PG_URL = os.environ["DATABASE_URL"]
+PG_URL = os.environ["DATABASE_URL"].split("?")[0]
 
 
 def main():
