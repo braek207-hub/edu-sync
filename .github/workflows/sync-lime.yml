@@ -1,0 +1,30 @@
+name: Sync LIME → Supabase
+
+on:
+  schedule:
+    - cron: "30 8 * * *"  # 11:30 Moscow (UTC+3)
+  workflow_dispatch:       # manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pymysql psycopg2-binary
+
+      - name: Run sync
+        env:
+          LIME_DB_HOST: ${{ secrets.LIME_DB_HOST }}
+          LIME_DB_PORT: ${{ secrets.LIME_DB_PORT }}
+          LIME_DB_SCHEMA: ${{ secrets.LIME_DB_SCHEMA }}
+          LIME_DB_USER: ${{ secrets.LIME_DB_USER }}
+          LIME_DB_PASSWORD: ${{ secrets.LIME_DB_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIME_SYNC_DAYS: "7"
+        run: python scripts/sync_lime.py
