@@ -111,8 +111,10 @@ def classify(source: str, medium: str):
 def aggregate(rows):
     agg = defaultdict(lambda: {
         "cost": 0.0, "clicks": 0.0, "impressions": 0.0,
-        "sessions": 0, "purchases_count": 0, "purchases_revenue": 0.0,
+        "sessions": 0, "users": 0, "clients": 0,
+        "purchases_count": 0, "purchases_revenue": 0.0,
         "customers": 0, "new_users": 0, "new_customers": 0,
+        "new_customers_revenue": 0.0,
     })
 
     for r in rows:
@@ -133,15 +135,18 @@ def aggregate(rows):
             str(cname) if is_paid and cname not in bad else "",
         )
         a = agg[key]
-        a["cost"]             += float(r["cost"] or 0)
-        a["clicks"]           += float(r["clicks"] or 0)
-        a["impressions"]      += float(r["impressions"] or 0)
-        a["sessions"]         += int(r["sessions"] or 0)
-        a["purchases_count"]  += int(r["purchases_count"] or 0)
-        a["purchases_revenue"]+= float(r["purchases_revenue"] or 0)
-        a["customers"]        += int(r["customers"] or 0)
-        a["new_users"]        += int(r["new_users"] or 0)
-        a["new_customers"]    += int(r["new_customers"] or 0)
+        a["cost"]                  += float(r["cost"] or 0)
+        a["clicks"]                += float(r["clicks"] or 0)
+        a["impressions"]           += float(r["impressions"] or 0)
+        a["sessions"]              += int(r["sessions"] or 0)
+        a["users"]                 += int(r["users"] or 0)
+        a["clients"]               += int(r["clients"] or 0)
+        a["purchases_count"]       += int(r["purchases_count"] or 0)
+        a["purchases_revenue"]     += float(r["purchases_revenue"] or 0)
+        a["customers"]             += int(r["customers"] or 0)
+        a["new_users"]             += int(r["new_users"] or 0)
+        a["new_customers"]         += int(r["new_customers"] or 0)
+        a["new_customers_revenue"] += float(r["new_customers_revenue"] or 0)
 
     return agg
 
@@ -189,8 +194,9 @@ def main():
             INSERT INTO lime_stats (
                 date, data_source, region, channel, subchannel, traffic_type,
                 campaign_id, campaign_name,
-                cost, clicks, impressions, sessions,
-                purchases_count, purchases_revenue, customers, new_users, new_customers
+                cost, clicks, impressions, sessions, users, clients,
+                purchases_count, purchases_revenue, customers,
+                new_users, new_customers, new_customers_revenue
             ) VALUES %s
             """
 
@@ -198,8 +204,10 @@ def main():
                 (
                     key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
                     v["cost"], v["clicks"], v["impressions"], v["sessions"],
+                    v["users"], v["clients"],
                     v["purchases_count"], v["purchases_revenue"],
                     v["customers"], v["new_users"], v["new_customers"],
+                    v["new_customers_revenue"],
                 )
                 for key, v in agg.items()
             ]
