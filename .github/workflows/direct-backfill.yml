@@ -1,19 +1,32 @@
-# Полная загрузка Direct через API (без листов).
-name: Direct Full Sync (API)
+# Backfill Direct через API (full replace или monthly upsert).
+name: Direct Backfill (API)
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "full_replace — delete+reload с даты; monthly_upsert — по месяцам без delete"
+        required: false
+        default: "monthly_upsert"
+        type: choice
+        options:
+          - monthly_upsert
+          - full_replace
       direct_date_from:
         description: "С даты (YYYY-MM-DD)"
         required: false
-        default: "2026-01-01"
+        default: "2025-01-01"
+        type: string
+      direct_date_to:
+        description: "По дату (YYYY-MM-DD), только для monthly_upsert"
+        required: false
+        default: "2025-12-31"
         type: string
 
 jobs:
   direct:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +38,7 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Direct API full period
+      - name: Direct API backfill
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_URL: ${{ secrets.DIRECT_URL }}
@@ -35,8 +48,9 @@ jobs:
           DIRECT_CLIENTS_JSON_EDU: ${{ secrets.DIRECT_CLIENTS_JSON_EDU }}
           DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
           DIRECT_SOURCE: api
-          DIRECT_SYNC_MODE: full
-          DIRECT_DATE_FROM: ${{ github.event.inputs.direct_date_from || '2026-01-01' }}
+          DIRECT_SYNC_MODE: ${{ github.event.inputs.mode || 'monthly_upsert' }}
+          DIRECT_DATE_FROM: ${{ github.event.inputs.direct_date_from || '2025-01-01' }}
+          DIRECT_DATE_TO: ${{ github.event.inputs.direct_date_to || '2025-12-31' }}
         run: |
           python -c "
           from main import _resolve_env
@@ -45,7 +59,7 @@ jobs:
           from sync.direct import sync_direct_all
           ensure_schema()
           n = sync_direct_all()
-          print('direct_stats rows:', n)
+          print('direct_stats rows upserted:', n)
           if n <= 0:
               raise SystemExit('Direct sync returned 0 rows')
           "

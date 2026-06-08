@@ -13,7 +13,7 @@ from sync.classify import (
     normalize_b24_dim,
     normalize_city_ip_segment,
 )
-from sync.crm import CRM_LEADS_SHEET, CRM_PAYMENTS_SHEET, _cell
+from sync.crm import _cell, crm_leads_sheets, crm_payments_sheets
 from sync.sheets import get_sheets_service, read_sheet
 from sync.utils import normalize_campaign_id, pick_index_loose, to_datetime_ms, to_iso_date, to_num
 
@@ -236,18 +236,31 @@ def sync_crm_lite() -> int:
     spreadsheet_id = os.environ["GOOGLE_SHEETS_ID"]
     meta = _meta_from_direct_stats()
 
-    leads_vals = read_sheet(service, spreadsheet_id, CRM_LEADS_SHEET)
-    pay_vals = read_sheet(service, spreadsheet_id, CRM_PAYMENTS_SHEET)
-    leads_lite = (
-        _read_leads_lite([str(x) for x in leads_vals[0]], leads_vals, meta)
-        if len(leads_vals) >= 2
-        else []
-    )
-    payments_lite = (
-        _read_payments_lite([str(x) for x in pay_vals[0]], pay_vals, meta)
-        if len(pay_vals) >= 2
-        else []
-    )
+    leads_lite: List[Dict[str, Any]] = []
+    for sheet_name in crm_leads_sheets():
+        try:
+            leads_vals = read_sheet(service, spreadsheet_id, sheet_name)
+        except Exception as e:
+            print(f"CRM lite [{sheet_name}]: ошибка чтения лидов — {e}")
+            continue
+        if len(leads_vals) < 2:
+            continue
+        chunk = _read_leads_lite([str(x) for x in leads_vals[0]], leads_vals, meta)
+        print(f"CRM lite [{sheet_name}]: {len(chunk)} лидов")
+        leads_lite.extend(chunk)
+
+    payments_lite: List[Dict[str, Any]] = []
+    for sheet_name in crm_payments_sheets():
+        try:
+            pay_vals = read_sheet(service, spreadsheet_id, sheet_name)
+        except Exception as e:
+            print(f"CRM lite [{sheet_name}]: ошибка чтения оплат — {e}")
+            continue
+        if len(pay_vals) < 2:
+            continue
+        chunk = _read_payments_lite([str(x) for x in pay_vals[0]], pay_vals, meta)
+        print(f"CRM lite [{sheet_name}]: {len(chunk)} оплат")
+        payments_lite.extend(chunk)
 
     from sync.db import upsert_dashboard_extras
 

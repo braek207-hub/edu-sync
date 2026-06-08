@@ -3,7 +3,7 @@
 Ежедневная загрузка данных EDU Dashboard в Supabase:
 
 - **Яндекс Директ API v5** → `direct_stats` (триггер: 7 дней; full: с `DIRECT_DATE_FROM`)
-- **Google Sheets** (листы `Лиды`, `Оплаты`) → `crm_leads`, `crm_payments`
+- **Google Sheets** (листы `Лиды`, `Лиды 2025`, `Оплаты`, `Оплаты 2025`) → `crm_leads`, `crm_payments`
 - **LIME MySQL** (`lc_simple_view`) → `lime_stats` (workflow `sync-lime.yml`)
 
 Дашборд на Vercel ([EDU v2](https://github.com/braek207-hub/EduDash)) читает только Supabase.
@@ -23,7 +23,14 @@ python main.py
 
 Workflows:
 - `.github/workflows/sync.yml` — EDU Direct + CRM (`workflow_dispatch`)
+- `.github/workflows/direct-backfill.yml` — backfill Direct (monthly upsert или full replace)
 - `.github/workflows/sync-lime.yml` — LIME → `lime_stats` (cron + backfill)
+
+### Backfill 2025
+
+1. **Direct:** Actions → `Direct Backfill (API)` → mode `monthly_upsert`, from `2025-01-01`, to `2025-12-31`
+2. **CRM:** Actions → `EDU Daily Sync` → run workflow (подхватит `Лиды 2025` / `Оплаты 2025` автоматически)
+3. **Проверка:** `python scripts/verify-date-ranges.py` — min(date) должен быть ≈ 2025-01-01
 
 ### Secrets
 

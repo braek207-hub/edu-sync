@@ -233,6 +233,38 @@ def sync_direct_full(date_from: str | None = None) -> int:
     return sync_direct_api_range(start, today, replace_from=True)
 
 
+def sync_direct_backfill_monthly(
+    date_from: str, date_to: str, *, pause_sec: float = 7.0
+) -> int:
+    """Upsert Direct за период, разбивая на календарные месяцы (без delete)."""
+    start = date.fromisoformat(date_from)
+    end = date.fromisoformat(date_to)
+    if start > end:
+        raise ValueError(f"date_from {date_from} > date_to {date_to}")
+
+    total = 0
+    cursor = date(start.year, start.month, 1)
+    while cursor <= end:
+        if cursor.month == 12:
+            next_month = date(cursor.year + 1, 1, 1)
+        else:
+            next_month = date(cursor.year, cursor.month + 1, 1)
+        month_end = min(end, next_month - timedelta(days=1))
+        chunk_from = max(start, cursor).isoformat()
+        chunk_to = month_end.isoformat()
+        print(f"Директ backfill monthly: {chunk_from} — {chunk_to}")
+        n = sync_direct_api_range(chunk_from, chunk_to, replace_from=False)
+        print(f"  upsert {n} строк")
+        total += n
+        if month_end >= end:
+            break
+        cursor = next_month
+        if cursor <= end:
+            time.sleep(pause_sec)
+    print(f"Директ backfill monthly итого: {total} строк")
+    return total
+
+
 def sync_direct_all() -> int:
     """
     Только Яндекс Direct API.
@@ -251,7 +283,15 @@ def sync_direct_all() -> int:
         return sync_direct_sheets()
 
     mode = os.environ.get("DIRECT_SYNC_MODE", "incremental").strip().lower()
-    if mode == "full":
+    if mode in ("monthly_upsert", "backfill_monthly"):
+        date_from = (
+            os.environ.get("DIRECT_DATE_FROM") or DEFAULT_FULL_DATE_FROM
+        ).strip()
+        date_to = (
+            os.environ.get("DIRECT_DATE_TO") or date.today().isoformat()
+        ).strip()
+        return sync_direct_backfill_monthly(date_from, date_to)
+    if mode in ("full", "full_replace"):
         return sync_direct_full()
     days_back = int(os.environ.get("DIRECT_DAYS_BACK", str(DEFAULT_INCREMENTAL_DAYS)))
     return sync_direct_incremental(days_back=days_back)

@@ -135,8 +135,12 @@ def run_validation() -> None:
     try:
         service = get_sheets_service()
         _log_direct_sheets(service, spreadsheet_id)
-        _log_crm_sheet(service, spreadsheet_id, "Лиды")
-        _log_crm_sheet(service, spreadsheet_id, "Оплаты")
+        from sync.crm import crm_leads_sheets, crm_payments_sheets
+
+        for sheet in crm_leads_sheets():
+            _log_crm_sheet(service, spreadsheet_id, sheet)
+        for sheet in crm_payments_sheets():
+            _log_crm_sheet(service, spreadsheet_id, sheet)
         _log_plan_sheet(service, spreadsheet_id)
     except Exception as e:
         print(f"Validate sheets: {e}")

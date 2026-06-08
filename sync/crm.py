@@ -16,6 +16,20 @@ from sync.utils import normalize_campaign_id, pick_index_loose, to_iso_date, to_
 CRM_LEADS_SHEET = "Лиды"
 CRM_PAYMENTS_SHEET = "Оплаты"
 
+
+def _sheet_names(env_key: str, default: str) -> List[str]:
+    raw = os.environ.get(env_key, default)
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def crm_leads_sheets() -> List[str]:
+    return _sheet_names("CRM_LEADS_SHEETS", "Лиды,Лиды 2025")
+
+
+def crm_payments_sheets() -> List[str]:
+    return _sheet_names("CRM_PAYMENTS_SHEETS", "Оплаты,Оплаты 2025")
+
+
 Dims = Tuple[str, str, str]
 
 
@@ -207,114 +221,112 @@ def _sync_leads_by_land(headers: List[str], values: List[List[Any]]) -> Dict[str
     return agg, {}
 
 
-def _enrich_project_from_direct(agg: Dict[str, Dict[str, Any]]) -> None:
-    try:
-        from sync.crm_lite import _meta_from_direct_stats
+def merge_leads_agg(
+    target: Dict[str, Dict[str, Any]],
+    source: Dict[str, Dict[str, Any]],
+) -> None:
+    """Суммирует leads/connections/deals при совпадении segment key."""
+    for key, src in source.items():
+        if key not in target:
+            target[key] = dict(src)
+            continue
+        dst = target[key]
+        dst["leads"] += src.get("leads", 0)
+        dst["connections"] += src.get("connections", 0)
+        dst["deals"] += src.get("deals", 0)
+        if not dst.get("campaign_name") and src.get("campaign_name"):
+            dst["campaign_name"] = src["campaign_name"]
+        if dst.get("project") == "unknown" and src.get("project") not in (
+            None,
+            "",
+            "unknown",
+        ):
+            dst["project"] = src["project"]
+        if dst.get("direction") == "other" and src.get("direction") not in (
+            None,
+            "",
+            "other",
+        ):
+            dst["direction"] = src["direction"]
 
-        meta = _meta_from_direct_stats()
-        for bucket in agg.values():
-            m = meta.get(bucket["campaign_id"])
-            if not m:
-                continue
-            if m.get("project") and m["project"] != "unknown":
-                bucket["project"] = m["project"]
-            if m.get("direction") and m["direction"] != "other":
-                bucket["direction"] = m["direction"]
-            if m.get("campaign_name"):
-                bucket["campaign_name"] = m["campaign_name"]
-    except Exception as e:
-        print(f"CRM Лиды: meta Direct пропущена: {e}")
+
+def merge_lead_dims(
+    target: Dict[str, Dims], source: Dict[str, Dims]
+) -> None:
+    target.update(source)
 
 
-def sync_crm_leads() -> int:
-    service = get_sheets_service()
-    spreadsheet_id = os.environ["GOOGLE_SHEETS_ID"]
+def merge_payments_agg(
+    target: Dict[str, Dict[str, Any]],
+    source: Dict[str, Dict[str, Any]],
+) -> None:
+    for key, src in source.items():
+        if key not in target:
+            target[key] = dict(src)
+            continue
+        dst = target[key]
+        dst["payments"] += src.get("payments", 0)
+        dst["revenue"] += src.get("revenue", 0.0)
+        if dst.get("project") == "unknown" and src.get("project") not in (
+            None,
+            "",
+            "unknown",
+        ):
+            dst["project"] = src["project"]
+        if dst.get("direction") == "other" and src.get("direction") not in (
+            None,
+            "",
+            "other",
+        ):
+            dst["direction"] = src["direction"]
 
-    values = read_sheet(service, spreadsheet_id, CRM_LEADS_SHEET)
-    sheet_used = CRM_LEADS_SHEET
 
-    if len(values) < 2:
-        meta = (
-            service.spreadsheets()
-            .get(spreadsheetId=spreadsheet_id, fields="sheets.properties.title")
-            .execute()
-        )
-        for s in meta.get("sheets", []):
-            title = s.get("properties", {}).get("title") or ""
-            if not title or title == CRM_LEADS_SHEET:
-                continue
-            candidate = read_sheet(service, spreadsheet_id, title)
-            if len(candidate) < 2:
-                continue
-            hlow = " ".join(str(x).lower() for x in candidate[0])
-            if "ленд" in hlow and "лиды" in hlow and "дата" in hlow:
-                values = candidate
-                sheet_used = title
-                print(f"CRM Лиды: используем лист «{title}» (свод Дата+Ленд)")
-                break
-        if len(values) < 2:
-            print("CRM Лиды: пустой лист или только заголовок")
-            _log_spreadsheet_tabs(service, spreadsheet_id)
-            return 0
-
-    headers = [str(x) for x in values[0]]
-    print(f"CRM Лиды [{sheet_used}]: заголовки = {headers[:12]}")
-
+def _parse_leads_sheet(
+    headers: List[str], values: List[List[Any]], sheet_name: str
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dims]]:
+    print(f"CRM Лиды [{sheet_name}]: заголовки = {headers[:12]}")
     lead_dims_by_id: Dict[str, Dims] = {}
     agg: Dict[str, Dict[str, Any]] = {}
     try:
         agg, lead_dims_by_id = _sync_leads_raw(headers, values)
         if agg:
-            print("CRM Лиды: режим построчный (utm campaign + сегменты)")
+            print(f"CRM Лиды [{sheet_name}]: режим построчный (utm campaign + сегменты)")
+            return agg, lead_dims_by_id
     except ValueError:
         pass
 
-    if not agg:
-        agg, lead_dims_by_id = _sync_leads_by_land(headers, values)
-        if agg:
-            print("CRM Лиды: режим свод по Ленд (Дата + Ленд + Лиды)")
-
-    if not agg:
-        _log_spreadsheet_tabs(service, spreadsheet_id)
-        raise ValueError(f"CRM(Лиды): нет строк после разбора, заголовки: {headers[:15]}")
-
-    _enrich_project_from_direct(agg)
-
-    rows = []
-    for v in agg.values():
-        rows.append(
-            {
-                "date": v["date"],
-                "campaign_id": v["campaign_id"],
-                "project": v["project"],
-                "direction": v["direction"],
-                "city_ip_segment": v["city_ip_segment"],
-                "b24_grad_year": v["b24_grad_year"],
-                "b24_edu_level": v["b24_edu_level"],
-                "leads": int(v["leads"]),
-                "connections": int(v["connections"]),
-                "deals": int(v["deals"]),
-            }
-        )
-
-    print(f"CRM Лиды: {len(rows)} сегментированных строк")
-    from sync.db import replace_crm_leads
-
-    n = replace_crm_leads(rows)
-    print(f"CRM Лиды: записано {n} строк в crm_leads")
-    return n
+    agg, lead_dims_by_id = _sync_leads_by_land(headers, values)
+    if agg:
+        print(f"CRM Лиды [{sheet_name}]: режим свод по Ленд (Дата + Ленд + Лиды)")
+    return agg, lead_dims_by_id
 
 
-def sync_crm_payments() -> int:
-    service = get_sheets_service()
-    spreadsheet_id = os.environ["GOOGLE_SHEETS_ID"]
+def _load_all_lead_dims(
+    service, spreadsheet_id: str
+) -> Dict[str, Dims]:
+    lead_dims_by_id: Dict[str, Dims] = {}
+    for sheet_name in crm_leads_sheets():
+        try:
+            values = read_sheet(service, spreadsheet_id, sheet_name)
+        except Exception as e:
+            print(f"CRM Лиды [{sheet_name}]: пропуск lead_dims — {e}")
+            continue
+        if len(values) < 2:
+            continue
+        try:
+            _, dims = _sync_leads_raw([str(x) for x in values[0]], values)
+            merge_lead_dims(lead_dims_by_id, dims)
+        except Exception:
+            pass
+    return lead_dims_by_id
 
-    values = read_sheet(service, spreadsheet_id, CRM_PAYMENTS_SHEET)
-    if len(values) < 2:
-        print("CRM Оплаты: пустой лист")
-        return 0
 
-    headers = [str(x) for x in values[0]]
+def _parse_payments_sheet(
+    headers: List[str],
+    values: List[List[Any]],
+    lead_dims_by_id: Dict[str, Dims],
+    sheet_name: str,
+) -> Dict[str, Dict[str, Any]]:
     pi = {
         "pay_date": pick_index_loose(headers, ["date pay", "дата оплаты"]),
         "campaign": pick_index_loose(
@@ -333,21 +345,11 @@ def sync_crm_payments() -> int:
         pi["orders"] = 18
 
     if pi["pay_date"] == -1:
-        raise ValueError('CRM(Оплаты): не найдена колонка "date pay"')
+        raise ValueError(f'CRM(Оплаты [{sheet_name}]): не найдена колонка "date pay"')
     if pi["campaign"] == -1:
-        raise ValueError("CRM(Оплаты): не найдена колонка campaign")
+        raise ValueError(f"CRM(Оплаты [{sheet_name}]): не найдена колонка campaign")
     if pi["revenue"] == -1:
-        raise ValueError('CRM(Оплаты): не найдена колонка "Выручка"')
-
-    lead_dims_by_id: Dict[str, Dims] = {}
-    try:
-        leads_vals = read_sheet(service, spreadsheet_id, CRM_LEADS_SHEET)
-        if len(leads_vals) >= 2:
-            _, lead_dims_by_id = _sync_leads_raw(
-                [str(x) for x in leads_vals[0]], leads_vals
-            )
-    except Exception:
-        lead_dims_by_id = {}
+        raise ValueError(f'CRM(Оплаты [{sheet_name}]): не найдена колонка "Выручка"')
 
     agg: Dict[str, Dict[str, Any]] = {}
 
@@ -398,6 +400,119 @@ def sync_crm_payments() -> int:
         else:
             bucket["payments"] += 1
         bucket["revenue"] += to_num(_cell(row, pi["revenue"]))
+
+    print(f"CRM Оплаты [{sheet_name}]: {len(agg)} сегментированных строк")
+    return agg
+
+
+def _enrich_project_from_direct(agg: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        from sync.crm_lite import _meta_from_direct_stats
+
+        meta = _meta_from_direct_stats()
+        for bucket in agg.values():
+            m = meta.get(bucket["campaign_id"])
+            if not m:
+                continue
+            if m.get("project") and m["project"] != "unknown":
+                bucket["project"] = m["project"]
+            if m.get("direction") and m["direction"] != "other":
+                bucket["direction"] = m["direction"]
+            if m.get("campaign_name"):
+                bucket["campaign_name"] = m["campaign_name"]
+    except Exception as e:
+        print(f"CRM Лиды: meta Direct пропущена: {e}")
+
+
+def sync_crm_leads() -> int:
+    service = get_sheets_service()
+    spreadsheet_id = os.environ["GOOGLE_SHEETS_ID"]
+
+    sheet_names = crm_leads_sheets()
+    print(f"CRM Лиды: листы = {sheet_names}")
+
+    lead_dims_by_id: Dict[str, Dims] = {}
+    agg: Dict[str, Dict[str, Any]] = {}
+
+    for sheet_name in sheet_names:
+        try:
+            values = read_sheet(service, spreadsheet_id, sheet_name)
+        except Exception as e:
+            print(f"CRM Лиды [{sheet_name}]: ошибка чтения — {e}")
+            continue
+        if len(values) < 2:
+            print(f"CRM Лиды [{sheet_name}]: пустой лист или только заголовок")
+            continue
+        headers = [str(x) for x in values[0]]
+        sheet_agg, sheet_dims = _parse_leads_sheet(headers, values, sheet_name)
+        if not sheet_agg:
+            continue
+        merge_leads_agg(agg, sheet_agg)
+        merge_lead_dims(lead_dims_by_id, sheet_dims)
+
+    if not agg:
+        _log_spreadsheet_tabs(service, spreadsheet_id)
+        raise ValueError(f"CRM(Лиды): нет строк после разбора листов {sheet_names}")
+
+    _enrich_project_from_direct(agg)
+
+    rows = []
+    for v in agg.values():
+        rows.append(
+            {
+                "date": v["date"],
+                "campaign_id": v["campaign_id"],
+                "project": v["project"],
+                "direction": v["direction"],
+                "city_ip_segment": v["city_ip_segment"],
+                "b24_grad_year": v["b24_grad_year"],
+                "b24_edu_level": v["b24_edu_level"],
+                "leads": int(v["leads"]),
+                "connections": int(v["connections"]),
+                "deals": int(v["deals"]),
+            }
+        )
+
+    print(f"CRM Лиды: {len(rows)} сегментированных строк")
+    from sync.db import replace_crm_leads
+
+    n = replace_crm_leads(rows)
+    print(f"CRM Лиды: записано {n} строк в crm_leads")
+    return n
+
+
+def sync_crm_payments() -> int:
+    service = get_sheets_service()
+    spreadsheet_id = os.environ["GOOGLE_SHEETS_ID"]
+
+    sheet_names = crm_payments_sheets()
+    print(f"CRM Оплаты: листы = {sheet_names}")
+
+    lead_dims_by_id = _load_all_lead_dims(service, spreadsheet_id)
+    agg: Dict[str, Dict[str, Any]] = {}
+
+    for sheet_name in sheet_names:
+        try:
+            values = read_sheet(service, spreadsheet_id, sheet_name)
+        except Exception as e:
+            print(f"CRM Оплаты [{sheet_name}]: ошибка чтения — {e}")
+            continue
+        if len(values) < 2:
+            print(f"CRM Оплаты [{sheet_name}]: пустой лист")
+            continue
+        headers = [str(x) for x in values[0]]
+        try:
+            sheet_agg = _parse_payments_sheet(
+                headers, values, lead_dims_by_id, sheet_name
+            )
+        except ValueError as e:
+            print(f"CRM Оплаты [{sheet_name}]: {e}")
+            continue
+        merge_payments_agg(agg, sheet_agg)
+
+    if not agg:
+        print("CRM Оплаты: нет строк после разбора всех листов")
+        return 0
 
     rows = [
         {
