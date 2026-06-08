@@ -3,20 +3,32 @@ name: Sync LIME → Supabase
 on:
   schedule:
     - cron: "30 8 * * *"  # 11:30 Moscow (UTC+3)
-  workflow_dispatch:       # manual trigger
+  workflow_dispatch:
+    inputs:
+      sync_from:
+        description: "Backfill range start (YYYY-MM-DD, optional — leave empty for last 7 days)"
+        required: false
+        default: ""
+      sync_to:
+        description: "Backfill range end (YYYY-MM-DD, optional — leave empty for last 7 days)"
+        required: false
+        default: ""
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
-        run: pip install pymysql psycopg2-binary
+        run: pip install -r requirements.txt
 
       - name: Run sync
         env:
@@ -27,4 +39,7 @@ jobs:
           LIME_DB_PASSWORD: ${{ secrets.LIME_DB_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           LIME_SYNC_DAYS: "7"
-        run: python scripts/sync_lime.py
+          LIME_SYNC_FROM: ${{ github.event.inputs.sync_from }}
+          LIME_SYNC_TO: ${{ github.event.inputs.sync_to }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime

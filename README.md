@@ -4,6 +4,7 @@
 
 - **Яндекс Директ API v5** → `direct_stats` (триггер: 7 дней; full: с `DIRECT_DATE_FROM`)
 - **Google Sheets** (листы `Лиды`, `Оплаты`) → `crm_leads`, `crm_payments`
+- **LIME MySQL** (`lc_simple_view`) → `lime_stats` (workflow `sync-lime.yml`)
 
 Дашборд на Vercel ([EDU v2](https://github.com/braek207-hub/EduDash)) читает только Supabase.
 
@@ -20,7 +21,9 @@ python main.py
 
 ## GitHub Actions
 
-Workflow: `.github/workflows/sync.yml` — только ручной запуск (`workflow_dispatch`).
+Workflows:
+- `.github/workflows/sync.yml` — EDU Direct + CRM (`workflow_dispatch`)
+- `.github/workflows/sync-lime.yml` — LIME → `lime_stats` (cron + backfill)
 
 ### Secrets
 

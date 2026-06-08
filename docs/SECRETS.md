@@ -11,6 +11,22 @@
 | `DIRECT_TOKEN_EDU` или `DIRECT_TOKEN` | ✅ `DIRECT_TOKEN_EDU` | — |
 | `DIRECT_CLIENTS_JSON_EDU` | ✅ `DIRECT_CLIENTS_JSON_EDU` | JSON `[{login, goal_ids, sheet_name}, …]` |
 | `DATABASE_URL` | ❌ только для v2 | Supabase **Connect → Prisma** → первая строка (**6543**, `aws-*-ap-south-1.pooler…`) |
+| `LIME_DB_HOST` | — | MySQL хост LIME |
+| `LIME_DB_SCHEMA` | — | Имя БД (schema) |
+| `LIME_DB_USER` | — | MySQL user |
+| `LIME_DB_PASSWORD` | — | MySQL password |
+| `LIME_DB_PORT` | — | опционально, default `3306` (можно не задавать) |
+
+### LIME
+
+Workflow: `.github/workflows/sync-lime.yml` → таблица `lime_stats` в Supabase (дашборд LIME в EduDash).
+
+| Режим | Переменные | Поведение |
+|-------|------------|-----------|
+| **Cron** | `LIME_SYNC_DAYS=7` | Последние 7 дней, по одному дню |
+| **Backfill** | `LIME_SYNC_FROM`, `LIME_SYNC_TO` | Диапазон дат, chunked by day |
+
+Секреты LIME (`LIME_DB_*`) — **только в edu-sync**, не в EduDash.
 
 ### GAS
 
@@ -52,8 +68,12 @@
    - `DIRECT_TOKEN_EDU`
    - `DIRECT_CLIENTS_JSON_EDU`
 
-2. Добавить только новый:
+2. Добавить для Supabase:
    - `DATABASE_URL` — **transaction pooler** из Supabase Connect (порт **6543**, user `postgres.vkawfgoqjjdlcfvzihbx`, регион **ap-south-1** — не `eu-central-1`)
+
+3. Добавить для LIME (workflow `Sync LIME → Supabase`):
+   - `LIME_DB_HOST`, `LIME_DB_SCHEMA`, `LIME_DB_USER`, `LIME_DB_PASSWORD`
+   - `LIME_DB_PORT` — опционально (`3306` по умолчанию; **не создавайте пустой секрет**)
 
 Опционально дублировать под «универсальными» именами: `GOOGLE_SERVICE_ACCOUNT` (= содержимое `GCP_SA_KEY`), `GOOGLE_SHEETS_ID` (= `SHEET_ID_EDU`).
 
