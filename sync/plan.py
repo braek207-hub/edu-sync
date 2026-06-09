@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
+from sync.classify import normalize_plan_direction, normalize_plan_project
 from sync.sheets import get_sheets_service, read_sheet
 from sync.utils import pick_index_loose, to_num
 
@@ -140,16 +141,14 @@ def sync_plan_monthly() -> int:
         if not ym:
             skipped_month += 1
             continue
-        project = (
-            str(r[pi["project"]]).strip().lower()
-            if pi["project"] != -1 and pi["project"] < len(r)
-            else ""
+        project = normalize_plan_project(
+            str(r[pi["project"]]) if pi["project"] != -1 and pi["project"] < len(r) else ""
         )
-        direction = (
-            str(r[pi["direction"]]).strip().lower()
-            if pi["direction"] != -1 and pi["direction"] < len(r)
-            else ""
+        direction = normalize_plan_direction(
+            str(r[pi["direction"]]) if pi["direction"] != -1 and pi["direction"] < len(r) else ""
         )
+        if not project or not direction:
+            continue
         key = (f"{ym}-01", project, direction)
         bucket = agg[key]
         bucket["budget"] += to_num(

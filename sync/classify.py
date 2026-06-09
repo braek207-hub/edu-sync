@@ -54,6 +54,8 @@ def normalize_plan_project(raw: str) -> str:
         return "vuz"
     if s in ("provuz", "провуз", "postupi_provuz", "provuz_postupi"):
         return "provuz"
+    if s in ("brand", "бренды", "бренд", "brands"):
+        return "brand"
     return s
 
 
