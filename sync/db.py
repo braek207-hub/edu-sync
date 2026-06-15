@@ -385,6 +385,18 @@ def delete_polinarepik_metrica_from(date_from: str) -> int:
     return deleted
 
 
+def delete_polinarepik_metrica_purchases_from(date_from: str) -> int:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM polinarepik_metrica_purchases WHERE purchase_date >= %s",
+                (date_from,),
+            )
+            deleted = cur.rowcount
+        conn.commit()
+    return deleted
+
+
 def upsert_polinarepik_metrica_visits(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
@@ -396,12 +408,39 @@ def upsert_polinarepik_metrica_visits(rows: List[Dict[str, Any]]) -> int:
             %(date)s, %(client_id)s, %(traffic_source)s, %(utm_source)s,
             %(utm_medium)s, %(utm_campaign)s, %(visits)s, NOW()
         )
-        ON CONFLICT (date, client_id) DO UPDATE SET
+        ON CONFLICT (date, client_id, utm_campaign, utm_source, utm_medium) DO UPDATE SET
+            traffic_source = EXCLUDED.traffic_source,
+            visits         = EXCLUDED.visits,
+            updated_at     = NOW()
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+        conn.commit()
+    return len(rows)
+
+
+def upsert_polinarepik_metrica_purchases(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    sql = """
+        INSERT INTO polinarepik_metrica_purchases (
+            order_id, purchase_date, client_id, traffic_source, utm_source,
+            utm_medium, utm_campaign, purchases, revenue, updated_at
+        )
+        VALUES (
+            %(order_id)s, %(purchase_date)s, %(client_id)s, %(traffic_source)s, %(utm_source)s,
+            %(utm_medium)s, %(utm_campaign)s, %(purchases)s, %(revenue)s, NOW()
+        )
+        ON CONFLICT (order_id) DO UPDATE SET
+            purchase_date  = EXCLUDED.purchase_date,
+            client_id      = COALESCE(NULLIF(EXCLUDED.client_id, ''), polinarepik_metrica_purchases.client_id),
             traffic_source = EXCLUDED.traffic_source,
             utm_source     = EXCLUDED.utm_source,
             utm_medium     = EXCLUDED.utm_medium,
             utm_campaign   = EXCLUDED.utm_campaign,
-            visits         = EXCLUDED.visits,
+            purchases      = EXCLUDED.purchases,
+            revenue        = EXCLUDED.revenue,
             updated_at     = NOW()
     """
     with get_connection() as conn:

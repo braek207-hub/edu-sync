@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       sync_days:
-        description: "Days back to sync (default 7)"
+        description: "Days back to sync (default 60)"
         required: false
-        default: "7"
+        default: "60"
 
 concurrency:
   group: polinarepik-sync
@@ -35,6 +35,6 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           POLINAREPIK_YANDEX_TOKEN: ${{ secrets.POLINAREPIK_YANDEX_TOKEN }}
-          POLINAREPIK_SYNC_DAYS: ${{ github.event.inputs.sync_days || '7' }}
+          POLINAREPIK_SYNC_DAYS: ${{ github.event.inputs.sync_days || '60' }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.polinarepik

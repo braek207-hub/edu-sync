@@ -18,7 +18,9 @@ import requests
 
 from sync.db import (
     delete_polinarepik_metrica_from,
+    delete_polinarepik_metrica_purchases_from,
     upsert_polinarepik_direct_stats,
+    upsert_polinarepik_metrica_purchases,
     upsert_polinarepik_metrica_visits,
 )
 
@@ -26,7 +28,7 @@ from sync.db import (
 DIRECT_CLIENT_LOGIN = "polinarepik-wear"
 METRICA_COUNTER_ID = "100764399"
 METRICA_ATTRIBUTION = "lastsign"
-DEFAULT_SYNC_DAYS = 7
+DEFAULT_SYNC_DAYS = 60
 
 DIRECT_API_URL = "https://api.direct.yandex.com/json/v5/reports"
 METRICA_API_URL = "https://api-metrika.yandex.net/stat/v1/data"
@@ -227,9 +229,9 @@ def fetch_metrica_client_visits(date_from: str, date_to: str) -> list[dict[str, 
             if not row_date or not client_id or client_id in {"(not set)", "0"}:
                 continue
             traffic_source = dims[2] if len(dims) > 2 else ""
-            utm_source = dims[3] if len(dims) > 3 else ""
-            utm_medium = dims[4] if len(dims) > 4 else ""
-            utm_campaign = normalize_campaign_id(dims[5] if len(dims) > 5 else "")
+            utm_source = (dims[3] if len(dims) > 3 else "") or ""
+            utm_medium = (dims[4] if len(dims) > 4 else "") or ""
+            utm_campaign = normalize_campaign_id(dims[5] if len(dims) > 5 else "") or ""
             visits = int(float((record.get("metrics") or [0])[0] or 0))
             if visits <= 0:
                 continue
@@ -270,6 +272,111 @@ def sync_metrica(days_back: int) -> int:
     return upsert_polinarepik_metrica_visits(rows)
 
 
+def _metrica_text(value: str) -> str:
+    text = (value or "").strip()
+    if not text or text in {"(not set)", "not_set", "--", "None", "none"}:
+        return ""
+    return text
+
+
+def fetch_metrica_purchases(date_from: str, date_to: str) -> list[dict[str, Any]]:
+    token = yandex_token()
+    counter_id = metrica_counter_id()
+    if not counter_id:
+        raise RuntimeError("Metrika counter ID missing")
+    attribution = metrica_attribution()
+
+    dimensions = ",".join(
+        [
+            "ym:s:date",
+            "ym:s:purchaseID",
+            "ym:s:clientID",
+            "ym:s:lastSignTrafficSource",
+            "ym:s:lastSignUTMSource",
+            "ym:s:lastSignUTMMedium",
+            "ym:s:lastSignUTMCampaign",
+        ]
+    )
+
+    by_order: dict[str, dict[str, Any]] = {}
+    limit = 100000
+    offset = 1
+
+    while True:
+        params = {
+            "ids": counter_id,
+            "metrics": "ym:s:ecommercePurchases,ym:s:ecommerceRevenue",
+            "dimensions": dimensions,
+            "date1": date_from,
+            "date2": date_to,
+            "accuracy": "full",
+            "proposed_accuracy": "false",
+            "attribution": attribution,
+            "lang": "ru",
+            "limit": limit,
+            "offset": offset,
+            "filters": "ym:s:ecommercePurchases>0",
+        }
+        payload = _metrica_get(params, token)
+        data = payload.get("data", [])
+        if not data:
+            break
+
+        for record in data:
+            dims = [str(d.get("name", "")).strip() for d in record.get("dimensions", [])]
+            if len(dims) < 2:
+                continue
+            row_date, order_id = dims[0], dims[1]
+            if not row_date or not order_id or order_id in {"(not set)", "0", "--"}:
+                continue
+            client_id = _metrica_text(dims[2] if len(dims) > 2 else "")
+            traffic_source = _metrica_text(dims[3] if len(dims) > 3 else "")
+            utm_source = _metrica_text(dims[4] if len(dims) > 4 else "")
+            utm_medium = _metrica_text(dims[5] if len(dims) > 5 else "")
+            utm_campaign = normalize_campaign_id(_metrica_text(dims[6] if len(dims) > 6 else "")) or ""
+            metrics = record.get("metrics") or [0, 0]
+            purchases = int(float(metrics[0] or 0))
+            revenue = float(metrics[1] or 0)
+            if purchases <= 0:
+                continue
+
+            prev = by_order.get(order_id)
+            if prev and prev["purchase_date"] > row_date:
+                continue
+
+            by_order[order_id] = {
+                "order_id": order_id,
+                "purchase_date": row_date,
+                "client_id": client_id,
+                "traffic_source": traffic_source,
+                "utm_source": utm_source,
+                "utm_medium": utm_medium,
+                "utm_campaign": utm_campaign,
+                "purchases": purchases,
+                "revenue": revenue,
+            }
+
+        if len(data) < limit:
+            break
+        offset += limit
+
+    return list(by_order.values())
+
+
+def sync_metrica_purchases(days_back: int) -> int:
+    today = date.today()
+    date_from = (today - timedelta(days=days_back)).isoformat()
+    date_to = today.isoformat()
+    print(f"Metrica purchases: {date_from} — {date_to}")
+    rows = fetch_metrica_purchases(date_from, date_to)
+    print(f"  rows: {len(rows)}")
+    if not rows:
+        return 0
+    deleted = delete_polinarepik_metrica_purchases_from(date_from)
+    print(f"  deleted from {date_from}: {deleted}")
+    return upsert_polinarepik_metrica_purchases(rows)
+
+
 def main() -> int:
     print("=== Polinarepik Sync START ===")
 
@@ -289,10 +396,17 @@ def main() -> int:
 
     try:
         n = sync_metrica(days)
-        print(f"Metrica upserted: {n}")
+        print(f"Metrica visits upserted: {n}")
     except Exception as e:
-        print(f"ERROR metrica: {e}")
-        errors.append(f"metrica: {e}")
+        print(f"ERROR metrica visits: {e}")
+        errors.append(f"metrica visits: {e}")
+
+    try:
+        n = sync_metrica_purchases(days)
+        print(f"Metrica purchases upserted: {n}")
+    except Exception as e:
+        print(f"ERROR metrica purchases: {e}")
+        errors.append(f"metrica purchases: {e}")
 
     print("=== Polinarepik Sync DONE ===")
 
