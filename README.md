@@ -8,7 +8,7 @@
 - **LIME MySQL** (`lc_simple_view`) → `lime_stats` (workflow `sync-lime.yml`)
 - **Polina Repik** (Yandex Direct + Metrika) → `polinarepik_*` (workflow `sync-polinarepik.yml`)
 
-Дашборд на Vercel ([EDU v2](https://github.com/braek207-hub/EduDash)) читает только Supabase.
+Дашборд на Vercel ([Panda-BI](https://panda-bi.vercel.app), репо [EduDash](https://github.com/braek207-hub/EduDash)) читает только Supabase.
 
 ## Локальный запуск
 

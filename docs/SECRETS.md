@@ -19,18 +19,18 @@
 
 ### LIME
 
-Workflow: `.github/workflows/sync-lime.yml` → таблица `lime_stats` в Supabase (дашборд LIME в EduDash).
+Workflow: `.github/workflows/sync-lime.yml` → таблица `lime_stats` в Supabase (дашборд LIME на Panda-BI).
 
 | Режим | Переменные | Поведение |
 |-------|------------|-----------|
 | **Cron** | `LIME_SYNC_DAYS=7` | Последние 7 дней, по одному дню |
 | **Backfill** | `LIME_SYNC_FROM`, `LIME_SYNC_TO` | Диапазон дат, chunked by day |
 
-Секреты LIME (`LIME_DB_*`) — **только в edu-sync**, не в EduDash.
+Секреты LIME (`LIME_DB_*`) — **только в edu-sync**, не в Panda-BI / Vercel.
 
 ### Polina Repik
 
-Workflow: `.github/workflows/sync-polinarepik.yml` → таблицы `polinarepik_direct_stats`, `polinarepik_metrica_visits` в Supabase (дашборд `/polinarepik` в EduDash). Заказы Bitrix — отдельно через ingest в Vercel.
+Workflow: `.github/workflows/sync-polinarepik.yml` → таблицы `polinarepik_direct_stats`, `polinarepik_metrica_visits` в Supabase (дашборд `https://panda-bi.vercel.app/polinarepik`). Заказы Bitrix — ingest на Panda-BI.
 
 | Секрет | Обязателен | Описание |
 |--------|------------|----------|
@@ -44,7 +44,7 @@ Workflow: `.github/workflows/sync-polinarepik.yml` → таблицы `polinarep
 - attribution: `lastsign`
 - sync days: `7` (или input workflow)
 
-**Не нужны в EduDash:** токен Яндекса для Polina Repik. Bitrix ingest — только если ещё не настроен (`POLINAREPIK_INGEST_TOKEN` на Vercel).
+**Не нужны в Panda-BI (Vercel):** токен Яндекса для Polina Repik. Bitrix ingest — только если ещё не настроен (`POLINAREPIK_INGEST_TOKEN` на Vercel).
 
 ### GAS
 
@@ -118,6 +118,10 @@ gh secret set DATABASE_URL --repo braek207-hub/edu-sync < db_uri.txt
 
 ---
 
-## Vercel (EDU v2)
+## Vercel (Panda-BI)
+
+Прод-домен: **https://panda-bi.vercel.app**
+
+`NEXT_PUBLIC_SITE_URL` (Production) = `https://panda-bi.vercel.app`
 
 `DATABASE_URL` (6543) и `DIRECT_URL` (5432) — обе строки из Supabase Connect → Prisma. **edu-sync** использует только `DATABASE_URL`.
