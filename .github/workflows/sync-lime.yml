@@ -43,3 +43,7 @@ jobs:
           LIME_SYNC_TO: ${{ github.event.inputs.sync_to }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime
+
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
