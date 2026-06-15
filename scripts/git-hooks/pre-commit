@@ -1,0 +1,11 @@
+#!/bin/sh
+# Drop invalid agent-injected git identity; use repo git config (braek207@gmail.com).
+for var in GIT_AUTHOR_EMAIL GIT_COMMITTER_EMAIL GIT_AUTHOR_NAME GIT_COMMITTER_NAME; do
+  eval "val=\$$var"
+  case "$val" in
+    *edunetwork.local*|*@local)
+      unset "$var"
+      ;;
+  esac
+done
+exit 0
