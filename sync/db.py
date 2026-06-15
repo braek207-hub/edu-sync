@@ -345,3 +345,67 @@ def replace_crm_payments(rows: List[Dict[str, Any]]) -> int:
 
 def upsert_crm_payments(rows: List[Dict[str, Any]]) -> int:
     return replace_crm_payments(rows)
+
+
+def upsert_polinarepik_direct_stats(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    sql = """
+        INSERT INTO polinarepik_direct_stats (
+            date, campaign_id, campaign_name, source_type, cost, clicks, impressions, updated_at
+        )
+        VALUES (
+            %(date)s, %(campaign_id)s, %(campaign_name)s, %(source_type)s,
+            %(cost)s, %(clicks)s, %(impressions)s, NOW()
+        )
+        ON CONFLICT (date, campaign_id) DO UPDATE SET
+            campaign_name = COALESCE(NULLIF(EXCLUDED.campaign_name, ''), polinarepik_direct_stats.campaign_name),
+            source_type   = EXCLUDED.source_type,
+            cost          = EXCLUDED.cost,
+            clicks        = EXCLUDED.clicks,
+            impressions   = EXCLUDED.impressions,
+            updated_at    = NOW()
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+        conn.commit()
+    return len(rows)
+
+
+def delete_polinarepik_metrica_from(date_from: str) -> int:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM polinarepik_metrica_visits WHERE date >= %s",
+                (date_from,),
+            )
+            deleted = cur.rowcount
+        conn.commit()
+    return deleted
+
+
+def upsert_polinarepik_metrica_visits(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    sql = """
+        INSERT INTO polinarepik_metrica_visits (
+            date, client_id, traffic_source, utm_source, utm_medium, utm_campaign, visits, updated_at
+        )
+        VALUES (
+            %(date)s, %(client_id)s, %(traffic_source)s, %(utm_source)s,
+            %(utm_medium)s, %(utm_campaign)s, %(visits)s, NOW()
+        )
+        ON CONFLICT (date, client_id) DO UPDATE SET
+            traffic_source = EXCLUDED.traffic_source,
+            utm_source     = EXCLUDED.utm_source,
+            utm_medium     = EXCLUDED.utm_medium,
+            utm_campaign   = EXCLUDED.utm_campaign,
+            visits         = EXCLUDED.visits,
+            updated_at     = NOW()
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+        conn.commit()
+    return len(rows)

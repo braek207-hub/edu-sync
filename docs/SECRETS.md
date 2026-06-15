@@ -28,6 +28,24 @@ Workflow: `.github/workflows/sync-lime.yml` → таблица `lime_stats` в S
 
 Секреты LIME (`LIME_DB_*`) — **только в edu-sync**, не в EduDash.
 
+### Polina Repik
+
+Workflow: `.github/workflows/sync-polinarepik.yml` → таблицы `polinarepik_direct_stats`, `polinarepik_metrica_visits` в Supabase (дашборд `/polinarepik` в EduDash). Заказы Bitrix — отдельно через ingest в Vercel.
+
+| Секрет | Обязателен | Описание |
+|--------|------------|----------|
+| `DATABASE_URL` | ✅ | уже есть |
+| `POLINAREPIK_YANDEX_TOKEN` | ✅ | один OAuth-токен Яндекса (Direct + Metrika) |
+
+Не секреты (зашиты в `sync/polinarepik.py`):
+
+- логин Direct: `polinarepik-wear`
+- счётчик Metrika: `100764399`
+- attribution: `lastsign`
+- sync days: `7` (или input workflow)
+
+**Не нужны в EduDash:** токен Яндекса для Polina Repik. Bitrix ingest — только если ещё не настроен (`POLINAREPIK_INGEST_TOKEN` на Vercel).
+
 ### GAS
 
 В Apps Script: **Project Settings → Script properties → `SPREADSHEET_ID`** — это ID Google-книги с листами `Лиды`, `Оплаты`, Direct.
@@ -74,6 +92,9 @@ Workflow: `.github/workflows/sync-lime.yml` → таблица `lime_stats` в S
 3. Добавить для LIME (workflow `Sync LIME → Supabase`):
    - `LIME_DB_HOST`, `LIME_DB_SCHEMA`, `LIME_DB_USER`, `LIME_DB_PASSWORD`
    - `LIME_DB_PORT` — опционально (`3306` по умолчанию; **не создавайте пустой секрет**)
+
+4. Добавить для Polina Repik (workflow `Sync Polina Repik → Supabase`):
+   - `POLINAREPIK_YANDEX_TOKEN` — OAuth Яндекса (Direct + Metrika, аккаунт polinarepik-wear)
 
 Опционально дублировать под «универсальными» именами: `GOOGLE_SERVICE_ACCOUNT` (= содержимое `GCP_SA_KEY`), `GOOGLE_SHEETS_ID` (= `SHEET_ID_EDU`).
 

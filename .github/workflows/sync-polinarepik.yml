@@ -1,0 +1,40 @@
+name: Sync Polina Repik → Supabase
+
+on:
+  schedule:
+    # 05:00 UTC = 08:00 Moscow
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      sync_days:
+        description: "Days back to sync (default 7)"
+        required: false
+        default: "7"
+
+concurrency:
+  group: polinarepik-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          POLINAREPIK_YANDEX_TOKEN: ${{ secrets.POLINAREPIK_YANDEX_TOKEN }}
+          POLINAREPIK_SYNC_DAYS: ${{ github.event.inputs.sync_days || '7' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.polinarepik

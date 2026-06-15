@@ -6,6 +6,7 @@
 - **Google Sheets** (листы `Лиды`, `Лиды 2025`, `Оплаты`, `Оплаты 2025`) → `crm_leads`, `crm_payments`
 - **Google Sheets** (лист `plan_monthly`) → `monthly_plans` (план vs факт в EDUNETWORK)
 - **LIME MySQL** (`lc_simple_view`) → `lime_stats` (workflow `sync-lime.yml`)
+- **Polina Repik** (Yandex Direct + Metrika) → `polinarepik_*` (workflow `sync-polinarepik.yml`)
 
 Дашборд на Vercel ([EDU v2](https://github.com/braek207-hub/EduDash)) читает только Supabase.
 
@@ -26,6 +27,7 @@ Workflows:
 - `.github/workflows/sync.yml` — EDU Direct + CRM + планы (`cron` 07:00 MSK + `workflow_dispatch`)
 - `.github/workflows/direct-backfill.yml` — backfill Direct (monthly upsert или full replace)
 - `.github/workflows/sync-lime.yml` — LIME → `lime_stats` (cron + backfill)
+- `.github/workflows/sync-polinarepik.yml` — Polina Repik → `polinarepik_direct_stats`, `polinarepik_metrica_visits` (cron 08:00 MSK)
 
 ### Backfill 2025
 
