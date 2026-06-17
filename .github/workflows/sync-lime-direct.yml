@@ -31,6 +31,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Apply DB migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/apply_lime_migrations.py
+
       - name: Run LIME Direct sync
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}

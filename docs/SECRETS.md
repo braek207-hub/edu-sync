@@ -57,10 +57,22 @@ Workflow: `.github/workflows/sync-lime-direct.yml` → таблица `lime_dire
 | `DATABASE_URL` | ✅ | уже есть |
 | `LIME_DIRECT_TOKEN` | ✅ | OAuth Яндекс Директ, scope `direct:api` |
 | `LIME_DIRECT_CLIENT_LOGIN` | ✅ | логин рекламируемого аккаунта LIME |
+| `LIME_DIRECT_GOALS` | опц. | JSON ID целей для Reports API (LSC), см. ниже |
+
+**`LIME_DIRECT_GOALS`** — одной строкой JSON (6 целей):
+
+```json
+{"web_cart":123,"web_checkout":456,"web_purchase":789,"app_cart":111,"app_checkout":222,"app_purchase":333}
+```
+
+ID целей — в Директе → цели счётчика Метрики/AppMetrica, привязанные к кампаниям.
+Без секрета синк работает как Phase 1 (без колонок конверсий).
 
 Расписание: ежедневно 10:00 МСК. Ручной запуск: Actions → **Sync LIME Direct → Supabase** → Run workflow.
 
-Миграция таблицы: `panda-bi/supabase/migrations/20260616000000_lime_direct_stats.sql`.
+Миграции таблицы:
+- `panda-bi/supabase/migrations/20260616000000_lime_direct_stats.sql`
+- `panda-bi/supabase/migrations/20260618000000_lime_direct_goals.sql` (конверсии)
 
 ### GAS
 
