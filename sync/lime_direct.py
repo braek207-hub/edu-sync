@@ -197,6 +197,36 @@ def _report_sig(fields: List[str], goal_ids: List[str]) -> str:
 MAX_GOALS_PER_REPORT = 10
 
 
+def _conversion_field_names(goal_ids: List[str]) -> List[str]:
+    return [f"Conversions_{gid}_LSC" for gid in goal_ids]
+
+
+def _parse_row_conversions(row: Dict[str, Any], goal_ids: List[str]) -> Dict[str, int]:
+    """Читает конверсии по фактическим именам колонок TSV (с запасом по префиксу)."""
+    out: Dict[str, int] = {}
+    for gid in goal_ids:
+        exact = f"Conversions_{gid}_LSC"
+        val = 0
+        if exact in row:
+            val = _int(row.get(exact))
+        else:
+            prefix = f"Conversions_{gid}_"
+            for col, raw in row.items():
+                if col and col.startswith(prefix):
+                    val = _int(raw)
+                    break
+        out[str(gid)] = val
+    return out
+
+
+def _tsv_dict_reader(text: str) -> csv.DictReader:
+    text = text.lstrip("\ufeff")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    while lines and "CampaignId" not in lines[0]:
+        lines.pop(0)
+    return csv.DictReader(io.StringIO("\n".join(lines)), delimiter="\t")
+
+
 def _fetch_report_chunk(
     date_from: str,
     date_to: str,
@@ -206,7 +236,7 @@ def _fetch_report_chunk(
 ) -> List[Dict[str, Any]]:
     fields = list(REPORT_FIELDS) if include_metrics else ["Date", "CampaignId", "CampaignName"]
     if goal_ids:
-        fields.append("Conversions")
+        fields.extend(_conversion_field_names(goal_ids))
 
     params: Dict[str, Any] = {
         "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
@@ -240,8 +270,11 @@ def _fetch_report_chunk(
         raise RuntimeError("Reports API: превышено число попыток")
 
     rows: List[Dict[str, Any]] = []
-    reader = csv.DictReader(io.StringIO(r.text), delimiter="\t")
-    conv_cols = {gid: f"Conversions_{gid}_LSC" for gid in goal_ids}
+    reader = _tsv_dict_reader(r.text)
+    fieldnames = reader.fieldnames or []
+    conv_headers = [h for h in fieldnames if h and h.startswith("Conversions_")]
+    if goal_ids and not conv_headers:
+        print(f"  [lime_direct] WARN: в TSV нет колонок Conversions_*, заголовки: {fieldnames[:20]}")
 
     for row in reader:
         cid = str(row.get("CampaignId", "")).strip()
@@ -264,7 +297,7 @@ def _fetch_report_chunk(
                 "bounce_rate": _num(row.get("BounceRate")),
                 "avg_pageviews": _num(row.get("AvgPageviews")),
             })
-        item["conversions"] = {gid: _int(row.get(col)) for gid, col in conv_cols.items()} if goal_ids else {}
+        item["conversions"] = _parse_row_conversions(row, goal_ids) if goal_ids else {}
         rows.append(item)
     return rows
 
@@ -284,6 +317,7 @@ def _fetch_report(
         partial = _fetch_report_chunk(
             date_from, date_to, chunk, include_metrics=(i == 0)
         )
+        print(f"  [lime_direct] батч целей {i + 1}: {len(chunk)} целей, {len(partial)} строк")
         for row in partial:
             key = (row["date"], row["campaign_id"])
             if key not in merged:
@@ -521,6 +555,13 @@ def sync_lime_direct(days_back: int = 7) -> int:
         print(f"[lime_direct] цели LSC: {', '.join(goal_ids)}")
     report_rows = _fetch_report(date_from, date_to, goal_ids)
     print(f"[lime_direct] получено {len(report_rows)} строк отчёта")
+    if goal_ids and report_rows:
+        conv_sum = sum(
+            sum((r.get("conversions") or {}).values())
+            for r in report_rows
+        )
+        keys = len((report_rows[0].get("conversions") or {}))
+        print(f"[lime_direct] конверсии: {conv_sum:.0f} суммарно, {keys} целей в строке")
     if not report_rows:
         return 0
 
