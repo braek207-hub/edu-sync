@@ -312,8 +312,9 @@ def _fetch_report(
 
     merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for i, chunk in enumerate(_chunked(goal_ids, MAX_GOALS_PER_REPORT)):
+        # Полный набор полей на каждом батче — иначе API отдаёт только строки с конверсиями по целям батча.
         partial = _fetch_report_chunk(
-            date_from, date_to, chunk, include_metrics=(i == 0)
+            date_from, date_to, chunk, include_metrics=True
         )
         print(f"  [lime_direct] батч целей {i + 1}: {len(chunk)} целей, {len(partial)} строк")
         for row in partial:
@@ -322,6 +323,10 @@ def _fetch_report(
                 merged[key] = row
             else:
                 merged[key]["conversions"].update(row.get("conversions", {}))
+    for row in merged.values():
+        conv = row.setdefault("conversions", {})
+        for gid in goal_ids:
+            conv.setdefault(str(gid), 0)
     return list(merged.values())
 
 
