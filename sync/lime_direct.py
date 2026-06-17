@@ -194,12 +194,17 @@ def _report_sig(fields: List[str], goal_ids: List[str]) -> str:
     return hashlib.md5(src).hexdigest()[:8]
 
 
-def _fetch_report(
+MAX_GOALS_PER_REPORT = 10
+
+
+def _fetch_report_chunk(
     date_from: str,
     date_to: str,
     goal_ids: List[str],
+    *,
+    include_metrics: bool,
 ) -> List[Dict[str, Any]]:
-    fields = list(REPORT_FIELDS)
+    fields = list(REPORT_FIELDS) if include_metrics else ["Date", "CampaignId", "CampaignName"]
     if goal_ids:
         fields.append("Conversions")
 
@@ -246,19 +251,46 @@ def _fetch_report(
             "date": str(row.get("Date", "")).strip(),
             "campaign_id": cid,
             "campaign_name": str(row.get("CampaignName", "")).strip(),
-            "impressions": _int(row.get("Impressions")),
-            "clicks": _int(row.get("Clicks")),
-            "cost": round(_num(row.get("Cost")), 2),
-            "avg_effective_bid": round(_num(row.get("AvgEffectiveBid")), 2),
-            "avg_traffic_volume": _num(row.get("AvgTrafficVolume")),
-            "avg_impression_position": _num(row.get("AvgImpressionPosition")),
-            "avg_click_position": _num(row.get("AvgClickPosition")),
-            "bounce_rate": _num(row.get("BounceRate")),
-            "avg_pageviews": _num(row.get("AvgPageviews")),
         }
+        if include_metrics:
+            item.update({
+                "impressions": _int(row.get("Impressions")),
+                "clicks": _int(row.get("Clicks")),
+                "cost": round(_num(row.get("Cost")), 2),
+                "avg_effective_bid": round(_num(row.get("AvgEffectiveBid")), 2),
+                "avg_traffic_volume": _num(row.get("AvgTrafficVolume")),
+                "avg_impression_position": _num(row.get("AvgImpressionPosition")),
+                "avg_click_position": _num(row.get("AvgClickPosition")),
+                "bounce_rate": _num(row.get("BounceRate")),
+                "avg_pageviews": _num(row.get("AvgPageviews")),
+            })
         item["conversions"] = {gid: _int(row.get(col)) for gid, col in conv_cols.items()} if goal_ids else {}
         rows.append(item)
     return rows
+
+
+def _fetch_report(
+    date_from: str,
+    date_to: str,
+    goal_ids: List[str],
+) -> List[Dict[str, Any]]:
+    if not goal_ids:
+        return _fetch_report_chunk(date_from, date_to, [], include_metrics=True)
+    if len(goal_ids) <= MAX_GOALS_PER_REPORT:
+        return _fetch_report_chunk(date_from, date_to, goal_ids, include_metrics=True)
+
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for i, chunk in enumerate(_chunked(goal_ids, MAX_GOALS_PER_REPORT)):
+        partial = _fetch_report_chunk(
+            date_from, date_to, chunk, include_metrics=(i == 0)
+        )
+        for row in partial:
+            key = (row["date"], row["campaign_id"])
+            if key not in merged:
+                merged[key] = row
+            else:
+                merged[key]["conversions"].update(row.get("conversions", {}))
+    return list(merged.values())
 
 
 def _chunked(seq: List[str], n: int):
