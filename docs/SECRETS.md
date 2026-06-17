@@ -46,6 +46,22 @@ Workflow: `.github/workflows/sync-polinarepik.yml` → таблицы `polinarep
 
 **Не нужны в Panda-BI (Vercel):** токен Яндекса для Polina Repik. Bitrix ingest — только если ещё не настроен (`POLINAREPIK_INGEST_TOKEN` на Vercel).
 
+### LIME Direct (кабинет Яндекс Директ)
+
+Workflow: `.github/workflows/sync-lime-direct.yml` → таблица `lime_direct_stats` в Supabase (колонки **ЯНДЕКС ДИРЕКТ** на LIME2).
+
+Отдельный от `sync-lime.yml` (MySQL → `lime_stats`): свой OAuth-токен и логин рекламируемого аккаунта LIME.
+
+| Секрет | Обязателен | Описание |
+|--------|------------|----------|
+| `DATABASE_URL` | ✅ | уже есть |
+| `LIME_DIRECT_TOKEN` | ✅ | OAuth Яндекс Директ, scope `direct:api` |
+| `LIME_DIRECT_CLIENT_LOGIN` | ✅ | логин рекламируемого аккаунта LIME |
+
+Расписание: ежедневно 10:00 МСК. Ручной запуск: Actions → **Sync LIME Direct → Supabase** → Run workflow.
+
+Миграция таблицы: `panda-bi/supabase/migrations/20260616000000_lime_direct_stats.sql`.
+
 ### GAS
 
 В Apps Script: **Project Settings → Script properties → `SPREADSHEET_ID`** — это ID Google-книги с листами `Лиды`, `Оплаты`, Direct.
@@ -95,6 +111,10 @@ Workflow: `.github/workflows/sync-polinarepik.yml` → таблицы `polinarep
 
 4. Добавить для Polina Repik (workflow `Sync Polina Repik → Supabase`):
    - `POLINAREPIK_YANDEX_TOKEN` — OAuth Яндекса (Direct + Metrika, аккаунт polinarepik-wear)
+
+5. Добавить для LIME Direct (workflow `Sync LIME Direct → Supabase`):
+   - `LIME_DIRECT_TOKEN` — OAuth Яндекс Директ (аккаунт LIME)
+   - `LIME_DIRECT_CLIENT_LOGIN` — логин рекламируемого аккаунта LIME
 
 Опционально дублировать под «универсальными» именами: `GOOGLE_SERVICE_ACCOUNT` (= содержимое `GCP_SA_KEY`), `GOOGLE_SHEETS_ID` (= `SHEET_ID_EDU`).
 
