@@ -11,3 +11,4 @@ service-account.json
 secrets-local/
 *.json
 !package.json
+!config/lime_direct_goals.json

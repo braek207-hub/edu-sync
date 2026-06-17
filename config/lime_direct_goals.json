@@ -1,0 +1,77 @@
+{
+  "attribution": "LSC",
+  "goals": [
+    {
+      "id": 4,
+      "step": "install",
+      "platforms": ["app_ios", "app_android"],
+      "label": "App installs"
+    },
+    {
+      "id": 194380276,
+      "step": "cart",
+      "platforms": ["web"],
+      "label": "Ecommerce: добавление в корзину (lime-shop.ru)"
+    },
+    {
+      "id": 1900016997,
+      "step": "cart",
+      "platforms": ["app_ios"],
+      "label": "ECOMMERCE_ADD_TO_CART (640129)"
+    },
+    {
+      "id": 1900016998,
+      "step": "cart",
+      "platforms": ["app_android"],
+      "label": "ECOMMERCE_ADD_TO_CART (640131)"
+    },
+    {
+      "id": 38403071,
+      "step": "cart",
+      "platforms": ["app_ios", "app_android"],
+      "label": "Added to cart (AppMetrica)"
+    },
+    {
+      "id": 340817822,
+      "step": "checkout",
+      "platforms": ["web"],
+      "label": "Ecommerce: начало оформления заказа (lime-shop.ru)"
+    },
+    {
+      "id": 1900025332,
+      "step": "checkout",
+      "platforms": ["app_ios"],
+      "label": "begin_checkout (640129)"
+    },
+    {
+      "id": 1900025333,
+      "step": "checkout",
+      "platforms": ["app_android"],
+      "label": "begin_checkout (640131)"
+    },
+    {
+      "id": 3023504302,
+      "step": "purchase",
+      "platforms": ["web"],
+      "label": "Ecommerce: покупка (lime-shop.ru)"
+    },
+    {
+      "id": 1900016999,
+      "step": "purchase",
+      "platforms": ["app_ios"],
+      "label": "ECOMMERCE_PURCHASE (640129)"
+    },
+    {
+      "id": 1900017000,
+      "step": "purchase",
+      "platforms": ["app_android"],
+      "label": "ECOMMERCE_PURCHASE (640131)"
+    },
+    {
+      "id": 38403173,
+      "step": "purchase",
+      "platforms": ["app_ios", "app_android"],
+      "label": "Made a purchase (AppMetrica)"
+    }
+  ]
+}
