@@ -1,0 +1,45 @@
+name: Sync LIME Direct → Supabase
+
+on:
+  schedule:
+    # 07:00 UTC = 10:00 Moscow
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      days_back:
+        description: "Days back to sync (default 7)"
+        required: false
+        default: "7"
+
+concurrency:
+  group: lime-direct-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run LIME Direct sync
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIME_DIRECT_TOKEN: ${{ secrets.LIME_DIRECT_TOKEN }}
+          LIME_DIRECT_CLIENT_LOGIN: ${{ secrets.LIME_DIRECT_CLIENT_LOGIN }}
+          LIME_DIRECT_DAYS_BACK: ${{ github.event.inputs.days_back || '7' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_direct
+
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
