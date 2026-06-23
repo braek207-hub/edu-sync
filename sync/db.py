@@ -1,4 +1,5 @@
 import os
+import time
 from contextlib import contextmanager
 from typing import Any, Dict, List
 from urllib.parse import unquote, urlparse
@@ -86,7 +87,7 @@ def ensure_schema() -> None:
         conn.commit()
 
 
-def _open_connection():
+def _new_connection():
     parsed = urlparse(_database_url())
     if not parsed.hostname:
         return psycopg2.connect(_database_url())
@@ -98,6 +99,36 @@ def _open_connection():
         dbname=(parsed.path or "/postgres").lstrip("/") or "postgres",
         sslmode="require",
     )
+
+
+def _open_connection(attempts: int = 4, delay: float = 2.0):
+    """Открыть ЖИВОЕ соединение с ретраями.
+
+    Первый коннект к пулеру Supabase в прогоне нередко приходит уже закрытым
+    (пробуждение БД/пулера) — psycopg2.connect() проходит, но первый execute
+    падает `connection already closed`. Поэтому проверяем коннект `SELECT 1`
+    и при провале пересоздаём; следующая попытка попадает на «прогретый» пулер.
+    """
+    last_err = None
+    for i in range(1, attempts + 1):
+        conn = None
+        try:
+            conn = _new_connection()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()  # завершить probe-транзакцию, отдать чистый коннект
+            return conn
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if i < attempts:
+                print(f"  [db] коннект не удался ({i}/{attempts}): {e}; повтор через {delay}с")
+                time.sleep(delay)
+    raise last_err
 
 
 @contextmanager
