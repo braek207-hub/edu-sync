@@ -62,6 +62,16 @@ def _log_spreadsheet_tabs(service, spreadsheet_id: str) -> None:
     print(f"CRM: листы в книге ({len(titles)}): {', '.join(titles[:20])}")
 
 
+def _payment_flag(raw: Any) -> int:
+    p_num = to_num(raw)
+    if round(p_num) == 1:
+        return 1
+    s = str(raw or "").strip().lower()
+    if s in ("1", "1.0", "1,0", "true", "да"):
+        return 1
+    return 0
+
+
 def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
     """Построчные лиды с сегментами — как GAS readCrmRawFromVals_."""
     li = {
@@ -107,6 +117,7 @@ def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Di
             headers,
             ["б24 уровень образования", "уровень образования", "класс/курс"],
         ),
+        "payment_flag": pick_index_loose(headers, ["оплата", "payment", "payments"]),
     }
     if li["date"] == -1:
         raise ValueError("CRM(Лиды): не найдена колонка даты")
@@ -162,6 +173,7 @@ def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Di
                 "leads": 0,
                 "connections": 0.0,
                 "deals": 0.0,
+                "payments_from_leads": 0,
                 "project": "unknown",
                 "direction": "other",
                 "campaign_name": "",
@@ -179,6 +191,8 @@ def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Di
                 bucket["connections"] += 1
         if li["deals"] != -1:
             bucket["deals"] += to_num(_cell(row, li["deals"]))
+        if li["payment_flag"] != -1:
+            bucket["payments_from_leads"] += _payment_flag(_cell(row, li["payment_flag"]))
 
     return agg, lead_dims_by_id
 
@@ -213,6 +227,7 @@ def _sync_leads_by_land(headers: List[str], values: List[List[Any]]) -> Dict[str
                 to_num(_cell(row, li["connections"])) if li["connections"] != -1 else 0
             ),
             "deals": int(to_num(_cell(row, li["deals"])) if li["deals"] != -1 else 0),
+            "payments_from_leads": 0,
             "project": map_crm_land(land),
             "direction": detect_direction(land),
             "campaign_name": land,
@@ -234,6 +249,7 @@ def merge_leads_agg(
         dst["leads"] += src.get("leads", 0)
         dst["connections"] += src.get("connections", 0)
         dst["deals"] += src.get("deals", 0)
+        dst["payments_from_leads"] += src.get("payments_from_leads", 0)
         if not dst.get("campaign_name") and src.get("campaign_name"):
             dst["campaign_name"] = src["campaign_name"]
         if dst.get("project") == "unknown" and src.get("project") not in (
@@ -470,6 +486,7 @@ def sync_crm_leads() -> int:
                 "leads": int(v["leads"]),
                 "connections": int(v["connections"]),
                 "deals": int(v["deals"]),
+                "payments_from_leads": int(v.get("payments_from_leads", 0)),
             }
         )
 

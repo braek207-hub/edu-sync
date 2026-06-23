@@ -34,7 +34,8 @@ def ensure_schema() -> None:
         ALTER TABLE crm_leads
           ADD COLUMN IF NOT EXISTS city_ip_segment TEXT NOT NULL DEFAULT 'rf',
           ADD COLUMN IF NOT EXISTS b24_grad_year TEXT NOT NULL DEFAULT 'unknown',
-          ADD COLUMN IF NOT EXISTS b24_edu_level TEXT NOT NULL DEFAULT 'unknown'
+          ADD COLUMN IF NOT EXISTS b24_edu_level TEXT NOT NULL DEFAULT 'unknown',
+          ADD COLUMN IF NOT EXISTS payments_from_leads INTEGER NOT NULL DEFAULT 0
         """,
         """
         ALTER TABLE crm_payments
@@ -206,12 +207,12 @@ def replace_crm_leads(rows: List[Dict[str, Any]]) -> int:
         INSERT INTO crm_leads (
             date, campaign_id, project, direction,
             city_ip_segment, b24_grad_year, b24_edu_level,
-            leads, connections, deals
+            leads, connections, deals, payments_from_leads
         )
         VALUES (
             %(date)s, %(campaign_id)s, %(project)s, %(direction)s,
             %(city_ip_segment)s, %(b24_grad_year)s, %(b24_edu_level)s,
-            %(leads)s, %(connections)s, %(deals)s
+            %(leads)s, %(connections)s, %(deals)s, %(payments_from_leads)s
         )
         ON CONFLICT (date, campaign_id, city_ip_segment, b24_grad_year, b24_edu_level)
         DO UPDATE SET
@@ -219,7 +220,8 @@ def replace_crm_leads(rows: List[Dict[str, Any]]) -> int:
             direction   = EXCLUDED.direction,
             leads       = EXCLUDED.leads,
             connections = EXCLUDED.connections,
-            deals       = EXCLUDED.deals
+            deals       = EXCLUDED.deals,
+            payments_from_leads = EXCLUDED.payments_from_leads
     """
     with get_connection() as conn:
         with conn.cursor() as cur:

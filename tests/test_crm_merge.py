@@ -17,6 +17,7 @@ def test_merge_leads_agg_sums_counters():
             "leads": 2,
             "connections": 1.0,
             "deals": 0.0,
+            "payments_from_leads": 1,
             "project": "unknown",
             "direction": "other",
             "campaign_name": "",
@@ -32,6 +33,7 @@ def test_merge_leads_agg_sums_counters():
             "leads": 3,
             "connections": 2.0,
             "deals": 1.0,
+            "payments_from_leads": 2,
             "project": "vse",
             "direction": "spo",
             "campaign_name": "vse_spo_msk",
@@ -55,6 +57,7 @@ def test_merge_leads_agg_sums_counters():
     assert row["leads"] == 5
     assert row["connections"] == 3.0
     assert row["deals"] == 1.0
+    assert row["payments_from_leads"] == 3
     assert row["project"] == "vse"
     assert row["direction"] == "spo"
     assert row["campaign_name"] == "vse_spo_msk"
