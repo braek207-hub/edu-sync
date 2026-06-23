@@ -118,13 +118,19 @@ def main() -> None:
         print(f"ОШИБКА strategies: {e}")
         errors.append(f"strategies: {e}")
 
-    try:
-        from sync.crm_lite import sync_crm_lite
+    # CRM lite — тяжёлый когортный fallback (все годы). Не нужен в daily: основной
+    # источник paymentsFromLeads — колонка crm_leads.payments_from_leads. Пропускаем
+    # при SYNC_SKIP_LITE=1 (daily), считаем при полном прогоне.
+    if os.environ.get("SYNC_SKIP_LITE") == "1":
+        print("CRM lite: пропуск (SYNC_SKIP_LITE=1) — основной источник в crm_leads.payments_from_leads")
+    else:
+        try:
+            from sync.crm_lite import sync_crm_lite
 
-        sync_crm_lite()
-    except Exception as e:
-        print(f"ОШИБКА crm_lite: {e}")
-        errors.append(f"crm_lite: {e}")
+            sync_crm_lite()
+        except Exception as e:
+            print(f"ОШИБКА crm_lite: {e}")
+            errors.append(f"crm_lite: {e}")
 
     try:
         from sync.validate_sheets import run_validation

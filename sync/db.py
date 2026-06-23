@@ -275,9 +275,12 @@ def replace_crm_leads(rows: List[Dict[str, Any]]) -> int:
             deals       = EXCLUDED.deals,
             payments_from_leads = EXCLUDED.payments_from_leads
     """
+    # Заменяем только диапазон загружаемых дат (>= самой ранней даты в данных),
+    # а не всю таблицу: историю вне диапазона (напр. 2025 при daily) сохраняем.
+    min_date = min(str(r["date"]) for r in rows)
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("TRUNCATE crm_leads RESTART IDENTITY")
+            cur.execute("DELETE FROM crm_leads WHERE date >= %s", (min_date,))
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
         conn.commit()
     return len(rows)
@@ -389,9 +392,11 @@ def replace_crm_payments(rows: List[Dict[str, Any]]) -> int:
             payments  = EXCLUDED.payments,
             revenue   = EXCLUDED.revenue
     """
+    # Заменяем только диапазон дат загружаемых данных — историю (2025) сохраняем.
+    min_date = min(str(r["date"]) for r in rows)
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("TRUNCATE crm_payments RESTART IDENTITY")
+            cur.execute("DELETE FROM crm_payments WHERE date >= %s", (min_date,))
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
         conn.commit()
     return len(rows)
