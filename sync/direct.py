@@ -66,10 +66,10 @@ def _report_headers(login: str) -> dict:
         "Authorization": f"Bearer {token}",
         "Client-Login": login,
         "Accept-Language": "ru",
-        # online: малые отчёты EDU считаются инлайн и возвращаются сразу (HTTP 200),
-        # без офлайн-очереди и поллинга. Если не помещается — Директ вернёт 201/202
-        # и сработает фолбэк-поллинг ниже.
-        "processingMode": "online",
+        # auto: Директ сам выбирает online (мгновенно) для малых отчётов или offline
+        # для крупных. Явный online давал error 8312 на больших аккаунтах EDU.
+        # Скорость офлайна обеспечивает быстрый поллинг ниже (retryIn, не 30с-минимум).
+        "processingMode": "auto",
         "returnMoneyInMicros": "false",
         "skipReportHeader": "true",
         "skipColumnHeader": "true",
