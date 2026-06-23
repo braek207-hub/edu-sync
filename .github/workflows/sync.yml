@@ -54,6 +54,9 @@ jobs:
 
       - name: Run sync
         env:
+          # Без буферизации stdout — пер-шаговый прогресс виден в логе сразу,
+          # не теряется при отмене/таймауте.
+          PYTHONUNBUFFERED: "1"
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
           DIRECT_SOURCE: api
           DIRECT_SYNC_MODE: ${{ github.event.inputs.direct_sync_mode || 'incremental' }}

@@ -66,7 +66,10 @@ def _report_headers(login: str) -> dict:
         "Authorization": f"Bearer {token}",
         "Client-Login": login,
         "Accept-Language": "ru",
-        "processingMode": "auto",
+        # online: малые отчёты EDU считаются инлайн и возвращаются сразу (HTTP 200),
+        # без офлайн-очереди и поллинга. Если не помещается — Директ вернёт 201/202
+        # и сработает фолбэк-поллинг ниже.
+        "processingMode": "online",
         "returnMoneyInMicros": "false",
         "skipReportHeader": "true",
         "skipColumnHeader": "true",
@@ -162,8 +165,9 @@ def _fetch_report(login: str, date_from: str, date_to: str, goals: List[str]) ->
         if resp.status_code == 200:
             break
         if resp.status_code in (201, 202):
-            retry_in = int(resp.headers.get("retryIn", 60))
-            retry_in = max(30, min(retry_in, 120))
+            # Уважаем retryIn Директа (обычно несколько секунд), не форсируем 30с минимум.
+            retry_in = int(resp.headers.get("retryIn", 5))
+            retry_in = max(2, min(retry_in, 60))
             print(f"  [{login}] ждём {retry_in}с (HTTP {resp.status_code})...")
             time.sleep(retry_in)
             continue
