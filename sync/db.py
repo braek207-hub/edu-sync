@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from typing import Any, Dict, List
 from urllib.parse import unquote, urlparse
 
@@ -85,7 +86,7 @@ def ensure_schema() -> None:
         conn.commit()
 
 
-def get_connection():
+def _open_connection():
     parsed = urlparse(_database_url())
     if not parsed.hostname:
         return psycopg2.connect(_database_url())
@@ -97,6 +98,26 @@ def get_connection():
         dbname=(parsed.path or "/postgres").lstrip("/") or "postgres",
         sslmode="require",
     )
+
+
+@contextmanager
+def get_connection():
+    """Контекст-менеджер, который ГАРАНТИРОВАННО закрывает соединение.
+
+    psycopg2 `with conn` сам по себе соединение НЕ закрывает (только commit/
+    rollback транзакции), поэтому каждое `with get_connection()` оставляло
+    открытый коннект. ensure_schema() + запись на каждый шаг = утечка ~2 на шаг,
+    пул pgbouncer исчерпывался → `connection already closed`. Теперь закрываем.
+    """
+    conn = _open_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def delete_direct_stats_from(date_from: str) -> int:
