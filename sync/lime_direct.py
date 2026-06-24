@@ -1079,7 +1079,7 @@ def _fetch_offer_retargeting_flags(campaign_ids: List[str]) -> Dict[str, bool]:
             "method": "get",
             "params": {
                 "SelectionCriteria": {"CampaignIds": [int(x) for x in part]},
-                "FieldNames": ["Id", "CampaignId", "State", "CriterionType"],
+                "FieldNames": ["Id", "CampaignId", "State", "ConditionType"],
             },
         }
         try:
@@ -1087,7 +1087,8 @@ def _fetch_offer_retargeting_flags(campaign_ids: List[str]) -> Dict[str, bool]:
                 cid = str(row.get("CampaignId", ""))
                 if cid not in out:
                     continue
-                if str(row.get("CriterionType", "")) == "OFFER_RETARGETING" and str(row.get("State", "")) == "ON":
+                cond = str(row.get("ConditionType", ""))
+                if cond == "OFFER_RETARGETING" and str(row.get("State", "")) == "ON":
                     out[cid] = True
         except RuntimeError as e:
             print(f"  [lime_direct] smartadtargets skip: {e}")
