@@ -79,6 +79,77 @@ GOAL_KEYS = (
 
 _OS_LABELS = {"ANDROID": "Android", "IOS": "iOS"}
 
+_GENDER_RU = {"GENDER_MALE": "Мужчины", "GENDER_FEMALE": "Женщины"}
+_AGE_RU = {
+    "AGE_0_17": "0–17",
+    "AGE_18_24": "18–24",
+    "AGE_25_34": "25–34",
+    "AGE_35_44": "35–44",
+    "AGE_45_54": "45–54",
+    "AGE_55": "55+",
+}
+
+# Русские названия регионов (API getGeoRegions часто отдаёт EN для округов).
+GEO_REGION_RU: Dict[int, str] = {
+    225: "Россия",
+    73: "Республика Башкортостан",
+    102444: "Дальневосточный федеральный округ",
+    102445: "Сибирский федеральный округ",
+    102446: "Северо-Кавказский федеральный округ",
+    102447: "Северо-Западный федеральный округ",
+    102448: "Уральский федеральный округ",
+    102449: "Приволжский федеральный округ",
+    102450: "Центральный федеральный округ",
+    102451: "Южный федеральный округ",
+}
+
+GEO_REGION_EN_TO_RU: Dict[str, str] = {
+    "Russia": "Россия",
+    "Far Eastern Federal District": "Дальневосточный федеральный округ",
+    "Republic of Bashkortostan": "Республика Башкортостан",
+    "North Caucasian Federal District": "Северо-Кавказский федеральный округ",
+    "Siberian Federal District": "Сибирский федеральный округ",
+    "Northwestern Federal District": "Северо-Западный федеральный округ",
+    "Ural Federal District": "Уральский федеральный округ",
+    "Volga Federal District": "Приволжский федеральный округ",
+    "Central Federal District": "Центральный федеральный округ",
+    "Southern Federal District": "Южный федеральный округ",
+}
+
+_CAMPAIGN_STRATEGY_FIELDS: Dict[str, List[str]] = {
+    "StrategyMaximumClicksFieldNames": ["WeeklySpendLimit", "BidCeiling", "CustomPeriodBudget", "BudgetType"],
+    "StrategyMaximumConversionRateFieldNames": ["WeeklySpendLimit", "BidCeiling", "GoalId", "CustomPeriodBudget", "BudgetType"],
+    "StrategyAverageCpcFieldNames": ["AverageCpc", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
+    "StrategyAverageCpaFieldNames": ["AverageCpa", "GoalId", "WeeklySpendLimit", "BidCeiling", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
+    "StrategyAverageCpaMultipleGoalsFieldNames": ["WeeklySpendLimit", "BidCeiling", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
+    "StrategyPayForConversionFieldNames": ["Cpa", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
+    "StrategyPayForConversionMultipleGoalsFieldNames": ["GoalId", "WeeklySpendLimit", "CustomPeriodBudget"],
+    "StrategyAverageCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
+    "StrategyPayForConversionCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
+}
+
+
+def _geo_region_label(rid: int, api_name: str) -> str:
+    abs_rid = abs(int(rid))
+    return GEO_REGION_RU.get(abs_rid) or GEO_REGION_EN_TO_RU.get(api_name, api_name)
+
+
+def _format_demo_detail(demo: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    gender = demo.get("Gender")
+    if gender and str(gender) not in ("None", ""):
+        parts.append(_GENDER_RU.get(str(gender), str(gender)))
+    age = demo.get("Age")
+    if age and str(age) not in ("None", ""):
+        parts.append(_AGE_RU.get(str(age), str(age)))
+    return " · ".join(parts)
+
+
+def _infer_bid_kind(strategy_type: Optional[str]) -> str:
+    if strategy_type and "CRR" in str(strategy_type).upper():
+        return "drr"
+    return "cpa"
+
 
 def _token() -> str:
     t = os.environ.get("LIME_DIRECT_TOKEN", "").strip()
@@ -513,6 +584,36 @@ def _priority_goal_ids_from_block(block: Dict[str, Any]) -> List[int]:
     return out
 
 
+def _priority_goals_details_from_block(block: Dict[str, Any], bid_kind: str = "cpa") -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for pg in _as_list(block.get("PriorityGoals")):
+        if isinstance(pg, dict) and pg.get("GoalId") is not None:
+            gid = int(pg["GoalId"])
+            if gid == 13:
+                continue
+            entry: Dict[str, Any] = {"goalId": gid, "bidKind": bid_kind}
+            val = pg.get("Value")
+            if val is not None:
+                if bid_kind == "drr":
+                    entry["bidValue"] = _crr_to_drr_percent(int(val))
+                else:
+                    entry["bidValue"] = _micros_to_float(int(val))
+            out.append(entry)
+        elif isinstance(pg, (int, float)):
+            gid = int(pg)
+            if gid != 13:
+                out.append({"goalId": gid, "bidKind": bid_kind, "bidValue": None})
+    return out
+
+
+def _merge_priority_goals_details(blocks: List[Dict[str, Any]], bid_kind: str) -> List[Dict[str, Any]]:
+    merged: Dict[int, Dict[str, Any]] = {}
+    for block in blocks:
+        for item in _priority_goals_details_from_block(block, bid_kind):
+            merged[int(item["goalId"])] = item
+    return list(merged.values())
+
+
 def _counter_ids_from_block(block: Dict[str, Any]) -> List[int]:
     out: List[int] = []
     for counter in _as_list(block.get("CounterIds")):
@@ -668,6 +769,14 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
         for block in (tc, uc, mc):
             priority_goals.extend(_priority_goal_ids_from_block(block))
 
+        network_ch = _extract_strategy_channel_full(tc_bs.get("Network") or uc_bs.get("Network") or mc_bs.get("Network"))
+        search_ch = _extract_strategy_channel_full(tc_bs.get("Search") or uc_bs.get("Search") or mc_bs.get("Search"))
+        bid_kind = _infer_bid_kind(
+            (network_ch or {}).get("biddingStrategyType")
+            or (search_ch or {}).get("biddingStrategyType")
+        )
+        priority_goals_details = _merge_priority_goals_details([tc, uc, mc], bid_kind)
+
         placements: List[str] = []
         for key in (
             "SearchResults", "ProductGallery", "DynamicPlaces", "Maps",
@@ -681,8 +790,6 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 if isinstance(network, dict) and network.get(key) == "YES":
                     placements.append(key)
 
-        search_ch = _extract_strategy_channel_full(tc_bs.get("Search") or uc_bs.get("Search") or mc_bs.get("Search"))
-        network_ch = _extract_strategy_channel_full(tc_bs.get("Network") or uc_bs.get("Network") or mc_bs.get("Network"))
         if not search_ch and not network_ch and mc_bs:
             search_ch = _extract_strategy_channel_full(mc_bs)
 
@@ -700,6 +807,7 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                     "id": int(pkg["StrategyId"]) if pkg else None,
                 } if pkg else None,
                 "priorityGoals": sorted(set(priority_goals)),
+                "priorityGoalsDetails": priority_goals_details,
                 "dailyBudget": _micros_to_float(daily.get("Amount")),
             },
             "targeting": {
@@ -717,7 +825,7 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 "TextCampaignFieldNames": type_fields,
                 "UnifiedCampaignFieldNames": type_fields,
                 "MobileAppCampaignFieldNames": [
-                    "Settings", "BiddingStrategy", "PackageBiddingStrategy",
+                    "Settings", "BiddingStrategy", "PackageBiddingStrategy", "PriorityGoals", "CounterIds",
                 ],
                 "TextCampaignSearchStrategyPlacementTypesFieldNames": [
                     "SearchResults", "ProductGallery", "DynamicPlaces",
@@ -725,6 +833,7 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
                     "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
                 ],
+                **_CAMPAIGN_STRATEGY_FIELDS,
             },
         }
         result = _direct_post(CAMPAIGNS_URL, body)
@@ -779,7 +888,7 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                     "TextCampaignFieldNames": type_fields,
                     "UnifiedCampaignFieldNames": type_fields,
                     "MobileAppCampaignFieldNames": [
-                        "Settings", "BiddingStrategy", "PackageBiddingStrategy",
+                        "Settings", "BiddingStrategy", "PackageBiddingStrategy", "PriorityGoals", "CounterIds",
                     ],
                     "TextCampaignSearchStrategyPlacementTypesFieldNames": [
                         "SearchResults", "ProductGallery", "DynamicPlaces",
@@ -787,6 +896,7 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                     "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
                         "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
                     ],
+                    **_CAMPAIGN_STRATEGY_FIELDS,
                 },
             }
             try:
@@ -840,6 +950,91 @@ def _fetch_adgroups_by_campaign(campaign_ids: List[str]) -> Dict[str, List[Dict[
     return out
 
 
+def _parse_single_bid_modifier(bm: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    btype = str(bm.get("Type", ""))
+    base: Dict[str, Any] = {
+        "id": bm.get("Id"),
+        "type": btype,
+        "level": bm.get("Level"),
+        "percent": None,
+        "detail": None,
+        "regionId": None,
+        "typeLabel": None,
+    }
+
+    def _from_adj(adj: Dict[str, Any], label: str, with_os: bool = False) -> None:
+        if adj.get("BidModifier") is None:
+            return
+        base["percent"] = int(adj["BidModifier"])
+        base["typeLabel"] = label
+        if with_os:
+            os_type = adj.get("OperatingSystemType")
+            if os_type:
+                base["typeLabel"] = f"{label} {_OS_LABELS.get(str(os_type), os_type)}"
+
+    if btype == "MOBILE_ADJUSTMENT":
+        adj = bm.get("MobileAdjustment")
+        if isinstance(adj, dict):
+            _from_adj(adj, "Смартфоны", True)
+    elif btype == "TABLET_ADJUSTMENT":
+        adj = bm.get("TabletAdjustment")
+        if isinstance(adj, dict):
+            _from_adj(adj, "Планшеты", True)
+    elif btype == "DESKTOP_ADJUSTMENT":
+        adj = bm.get("DesktopAdjustment")
+        if isinstance(adj, dict):
+            _from_adj(adj, "Десктоп")
+    elif btype == "DESKTOP_ONLY_ADJUSTMENT":
+        adj = bm.get("DesktopOnlyAdjustment")
+        if isinstance(adj, dict):
+            _from_adj(adj, "Только десктоп")
+    elif btype == "SMART_TV_ADJUSTMENT":
+        adj = bm.get("SmartTvAdjustment")
+        if isinstance(adj, dict):
+            _from_adj(adj, "Smart TV")
+    elif btype == "SMART_AD_ADJUSTMENT":
+        adj = bm.get("SmartAdAdjustment")
+        if isinstance(adj, dict):
+            _from_adj(adj, "Смарт-объявления")
+    elif btype == "AD_GROUP_ADJUSTMENT":
+        adj = bm.get("AdGroupAdjustment")
+        if isinstance(adj, dict):
+            _from_adj(adj, "Группа объявлений")
+    elif btype == "REGIONAL_ADJUSTMENT":
+        reg = bm.get("RegionalAdjustment")
+        if isinstance(reg, dict):
+            base["percent"] = int(reg.get("BidModifier") or 0)
+            region_id = reg.get("RegionId")
+            base["regionId"] = int(region_id) if region_id is not None else None
+            base["detail"] = f"Регион {region_id}" if region_id is not None else None
+    elif btype == "DEMOGRAPHICS_ADJUSTMENT":
+        demo = bm.get("DemographicsAdjustment")
+        if isinstance(demo, dict):
+            base["percent"] = int(demo.get("BidModifier") or 0)
+            base["detail"] = _format_demo_detail(demo) or None
+    elif btype == "RETARGETING_ADJUSTMENT":
+        ret = bm.get("RetargetingAdjustment")
+        if isinstance(ret, dict):
+            base["percent"] = int(ret.get("BidModifier") or 0)
+            base["detail"] = str(ret.get("RetargetingConditionId", ""))
+    else:
+        for key, label, with_os in (
+            ("MobileAdjustment", "Смартфоны", True),
+            ("TabletAdjustment", "Планшеты", True),
+            ("DesktopAdjustment", "Десктоп", False),
+            ("DesktopOnlyAdjustment", "Только десктоп", False),
+            ("SmartTvAdjustment", "Smart TV", False),
+        ):
+            adj = bm.get(key)
+            if isinstance(adj, dict):
+                _from_adj(adj, label, with_os)
+                break
+
+    if base["percent"] is None:
+        return None
+    return base
+
+
 def _fetch_bidmodifiers_by_campaign(campaign_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {cid: [] for cid in campaign_ids}
     for part in _chunked(campaign_ids, 10):
@@ -869,54 +1064,9 @@ def _fetch_bidmodifiers_by_campaign(campaign_ids: List[str]) -> Dict[str, List[D
             cid = str(bm.get("CampaignId", ""))
             if cid not in out:
                 continue
-            btype = str(bm.get("Type", ""))
-            percent = None
-            detail = None
-            region_id = None
-            label_override = None
-            for key, os_label in (
-                ("MobileAdjustment", "Смартфоны"),
-                ("TabletAdjustment", "Планшеты"),
-                ("DesktopAdjustment", "Десктоп"),
-                ("DesktopOnlyAdjustment", "Только десктоп"),
-                ("SmartAdAdjustment", None),
-                ("AdGroupAdjustment", None),
-            ):
-                adj = bm.get(key)
-                if isinstance(adj, dict) and adj.get("BidModifier") is not None:
-                    percent = int(adj["BidModifier"])
-                    os_type = adj.get("OperatingSystemType")
-                    if os_label and os_type:
-                        label_override = f"{os_label} {_OS_LABELS.get(str(os_type), os_type)}"
-                    elif key == "SmartTvAdjustment":
-                        label_override = "Smart TV"
-                    break
-            smart_tv = bm.get("SmartTvAdjustment")
-            if isinstance(smart_tv, dict) and smart_tv.get("BidModifier") is not None:
-                percent = int(smart_tv["BidModifier"])
-                label_override = "Smart TV"
-            reg = bm.get("RegionalAdjustment")
-            if isinstance(reg, dict):
-                percent = int(reg.get("BidModifier") or 0)
-                region_id = reg.get("RegionId")
-                detail = f"Регион {region_id}"
-            demo = bm.get("DemographicsAdjustment")
-            if isinstance(demo, dict):
-                percent = int(demo.get("BidModifier") or 0)
-                detail = f"{demo.get('Gender', '')} {demo.get('Age', '')}".strip()
-            ret = bm.get("RetargetingAdjustment")
-            if isinstance(ret, dict):
-                percent = int(ret.get("BidModifier") or 0)
-                detail = str(ret.get("RetargetingConditionId", ""))
-            out[cid].append({
-                "id": bm.get("Id"),
-                "type": btype,
-                "typeLabel": label_override,
-                "level": bm.get("Level"),
-                "percent": percent,
-                "detail": detail,
-                "regionId": int(region_id) if isinstance(reg, dict) and reg.get("RegionId") is not None else None,
-            })
+            parsed = _parse_single_bid_modifier(bm)
+            if parsed:
+                out[cid].append(parsed)
     return out
 
 
@@ -1049,7 +1199,8 @@ def _fetch_geo_region_names(region_ids: List[int]) -> Dict[int, str]:
     out: Dict[int, str] = {}
     for rid in region_ids:
         abs_rid = abs(int(rid))
-        out[int(rid)] = names.get(abs_rid, f"#{abs_rid}")
+        api_name = names.get(abs_rid, f"#{abs_rid}")
+        out[int(rid)] = _geo_region_label(abs_rid, api_name)
     return out
 
 
@@ -1059,11 +1210,17 @@ def _format_regions_display(region_ids: List[int], geo_names: Dict[int, str]) ->
     positives = sorted({int(r) for r in region_ids if int(r) > 0})
     negatives = sorted({int(r) for r in region_ids if int(r) < 0}, key=abs)
     if 225 in positives and negatives:
-        excluded = [geo_names.get(r, f"#{abs(r)}") for r in negatives]
+        excluded = [geo_names.get(r, _geo_region_label(abs(r), f"#{abs(r)}")) for r in negatives]
         return "Россия − " + ", − ".join(excluded)
+    if 225 in positives:
+        other_pos = [p for p in positives if p != 225]
+        if other_pos:
+            excluded = [geo_names.get(p, _geo_region_label(p, f"#{p}")) for p in other_pos]
+            return "Россия − " + ", − ".join(excluded)
+        return "Россия"
     parts: List[str] = []
     for rid in sorted(region_ids, key=lambda x: (0 if x > 0 else 1, abs(x))):
-        name = geo_names.get(int(rid), f"#{abs(rid)}")
+        name = geo_names.get(int(rid), _geo_region_label(abs(int(rid)), f"#{abs(int(rid))}"))
         if int(rid) < 0:
             parts.append(f"− {name}")
         else:
@@ -1072,9 +1229,9 @@ def _format_regions_display(region_ids: List[int], geo_names: Dict[int, str]) ->
 
 
 def _fetch_offer_retargeting_flags(campaign_ids: List[str]) -> Dict[str, bool]:
-    """Офферный ретаргетинг через smartadtargets (CriterionType OFFER_RETARGETING)."""
+    """Офферный ретаргетинг через smartadtargets (ConditionType OFFER_RETARGETING)."""
     out: Dict[str, bool] = {cid: False for cid in campaign_ids}
-    for part in _chunked(campaign_ids, 10):
+    for part in _chunked(campaign_ids, 2):
         body = {
             "method": "get",
             "params": {
@@ -1175,6 +1332,10 @@ def _build_campaign_settings(
     strategy = dict(base.get("strategy") or {})
     if strategy.get("priorityGoals"):
         strategy["priorityGoals"] = [g for g in strategy["priorityGoals"] if int(g) != 13]
+    if strategy.get("priorityGoalsDetails"):
+        strategy["priorityGoalsDetails"] = [
+            g for g in strategy["priorityGoalsDetails"] if int(g.get("goalId", 0)) != 13
+        ]
     for ch_key in ("search", "network"):
         ch = strategy.get(ch_key)
         if not isinstance(ch, dict):
@@ -1276,6 +1437,35 @@ def _upsert_campaign_settings(rows: List[Dict[str, Any]]) -> int:
     return len(rows)
 
 
+def _fetch_stats_meta_fallback(campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not campaign_ids:
+        return {}
+    sql = """
+        SELECT DISTINCT ON (campaign_id)
+            campaign_id, campaign_name, campaign_type, state, status
+        FROM lime_direct_stats
+        WHERE campaign_id = ANY(%s)
+        ORDER BY campaign_id, date DESC
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        with psycopg2.connect(_pg_url()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (campaign_ids,))
+                for cid, cname, ctype, state, status in cur.fetchall():
+                    out[str(cid)] = {
+                        "campaign_name": cname,
+                        "meta": {
+                            "campaignType": ctype,
+                            "state": state,
+                            "status": status,
+                        },
+                    }
+    except Exception as e:
+        print(f"  [lime_direct] stats meta fallback skip: {e}")
+    return out
+
+
 def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> int:
     if not campaign_ids:
         return 0
@@ -1285,6 +1475,23 @@ def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> i
 
     base_map = _fetch_campaigns_for_settings(campaign_ids)
     counter_ids = list(base_map.pop("_counter_ids", []) or [])
+
+    missing_meta = [
+        cid
+        for cid in campaign_ids
+        if not (base_map.get(cid, {}).get("meta") or {}).get("campaignType")
+    ]
+    if missing_meta:
+        for cid, fb in _fetch_stats_meta_fallback(missing_meta).items():
+            if cid not in base_map:
+                base_map[cid] = {**fb, "strategy": {}, "targeting": {}}
+            else:
+                base_map[cid].setdefault("meta", {}).update(
+                    {k: v for k, v in (fb.get("meta") or {}).items() if v}
+                )
+                if not base_map[cid].get("campaign_name"):
+                    base_map[cid]["campaign_name"] = fb.get("campaign_name")
+
     adgroups_map = _fetch_adgroups_by_campaign(campaign_ids)
     bidmodifiers_map = _fetch_bidmodifiers_by_campaign(campaign_ids)
     audience_map = _fetch_audiencetargets_by_campaign(campaign_ids)
@@ -1314,6 +1521,9 @@ def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> i
         for ag in adgroups_map.get(cid, []):
             for rid in ag.get("regionIds") or []:
                 region_ids.add(int(rid))
+            for rid in ag.get("restrictedRegionIds") or []:
+                rid_int = int(rid)
+                region_ids.add(-abs(rid_int) if rid_int > 0 else rid_int)
         for m in bidmodifiers_map.get(cid, []):
             rid = m.get("regionId")
             if rid is not None:
@@ -1329,6 +1539,9 @@ def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> i
             goal_ids_needed.add(int(gid))
         for gid in strat.get("priorityGoals") or []:
             goal_ids_needed.add(int(gid))
+        for pg in strat.get("priorityGoalsDetails") or []:
+            if pg.get("goalId") is not None:
+                goal_ids_needed.add(int(pg["goalId"]))
 
     geo_names = _fetch_geo_region_names(sorted(region_ids))
     goal_names = _fetch_goals_map(counter_ids)
