@@ -509,3 +509,47 @@ def upsert_polinarepik_metrica_purchases(rows: List[Dict[str, Any]]) -> int:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
         conn.commit()
     return len(rows)
+
+
+# ── Журнал офлайн-конверсий Метрики (дедуп: каждую цель грузим один раз) ──
+
+def ensure_metrika_table() -> None:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS metrika_uploaded_conversions (
+                    counter_id TEXT NOT NULL,
+                    client_id  TEXT NOT NULL,
+                    target     TEXT NOT NULL,
+                    event_ts   BIGINT,
+                    uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (counter_id, client_id, target)
+                )
+                """
+            )
+        conn.commit()
+
+
+def load_uploaded_conversion_keys() -> set:
+    ensure_metrika_table()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT counter_id, client_id, target FROM metrika_uploaded_conversions")
+            return {(r[0], r[1], r[2]) for r in cur.fetchall()}
+
+
+def record_uploaded_conversions(rows: List[tuple]) -> int:
+    """rows: [(counter_id, client_id, target, event_ts)]."""
+    if not rows:
+        return 0
+    sql = """
+        INSERT INTO metrika_uploaded_conversions (counter_id, client_id, target, event_ts)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (counter_id, client_id, target) DO NOTHING
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+        conn.commit()
+    return len(rows)

@@ -123,6 +123,15 @@ def main() -> None:
     # выручки от лидов — колонки crm_leads.payments_from_leads / revenue_from_leads.
     # Модуль sync/crm_lite.py оставлен на случай возврата.
 
+    # Офлайн-конверсии в Я.Метрику (если задан YM_TOKEN). Дедуп через журнал.
+    try:
+        from sync.metrika_offline import sync_metrika_offline
+
+        sync_metrika_offline()
+    except Exception as e:
+        print(f"ОШИБКА metrika_offline: {e}")
+        errors.append(f"metrika_offline: {e}")
+
     try:
         from sync.validate_sheets import run_validation
 

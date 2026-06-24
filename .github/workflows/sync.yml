@@ -19,6 +19,14 @@ on:
         required: false
         default: "2026-01-01"
         type: string
+      metrika_dry_run:
+        description: "Метрика: dry-run (только посчитать, не грузить)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 jobs:
   sync:
@@ -74,4 +82,8 @@ jobs:
           DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
           GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
           SHEET_ID_EDU: ${{ secrets.SHEET_ID_EDU }}
+          # Офлайн-конверсии в Я.Метрику. Расписание/incremental — реальная загрузка;
+          # ручной запуск по умолчанию dry-run (только посчитать).
+          YM_TOKEN: ${{ secrets.YM_TOKEN }}
+          METRIKA_DRY_RUN: ${{ github.event.inputs.metrika_dry_run || 'false' }}
         run: python main.py
