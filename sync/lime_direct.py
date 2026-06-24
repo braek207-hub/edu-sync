@@ -681,7 +681,9 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 "FieldNames": field_names,
                 "TextCampaignFieldNames": type_fields,
                 "UnifiedCampaignFieldNames": type_fields,
-                "MobileAppCampaignFieldNames": type_fields,
+                "MobileAppCampaignFieldNames": [
+                    "Settings", "BiddingStrategy", "PackageBiddingStrategy",
+                ],
                 "TextCampaignSearchStrategyPlacementTypesFieldNames": [
                     "SearchResults", "ProductGallery", "DynamicPlaces",
                 ],
