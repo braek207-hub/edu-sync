@@ -663,9 +663,7 @@ def _fetch_package_strategies_full(strategy_ids: List[int]) -> Tuple[Dict[int, D
         "StrategyMaximumConversionRateFieldNames": ["WeeklySpendLimit", "BidCeiling", "GoalId", "CustomPeriodBudget", "BudgetType"],
         "StrategyAverageCpcFieldNames": ["AverageCpc", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
         "StrategyAverageCpaFieldNames": ["AverageCpa", "GoalId", "WeeklySpendLimit", "BidCeiling", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
-        "StrategyAverageCpaMultipleGoalsFieldNames": ["WeeklySpendLimit", "BidCeiling", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
         "StrategyPayForConversionFieldNames": ["Cpa", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
-        "StrategyPayForConversionMultipleGoalsFieldNames": ["GoalId", "WeeklySpendLimit", "CustomPeriodBudget"],
         "StrategyAverageCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
         "StrategyPayForConversionCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
     }
