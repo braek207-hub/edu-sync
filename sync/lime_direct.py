@@ -732,6 +732,8 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
 
     field_names = ["Id", "Name", "Type", "Status", "State", "DailyBudget"]
     type_fields = ["Settings", "BiddingStrategy", "PriorityGoals", "PackageBiddingStrategy", "CounterIds"]
+    # MobileAppCampaign допускает только эти поля (без PriorityGoals/CounterIds).
+    mobile_app_fields = ["Settings", "BiddingStrategy", "PackageBiddingStrategy"]
     package_ids: set[int] = set()
     counter_ids: set[int] = set()
 
@@ -824,9 +826,7 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 "FieldNames": field_names,
                 "TextCampaignFieldNames": type_fields,
                 "UnifiedCampaignFieldNames": type_fields,
-                "MobileAppCampaignFieldNames": [
-                    "Settings", "BiddingStrategy", "PackageBiddingStrategy", "PriorityGoals", "CounterIds",
-                ],
+                "MobileAppCampaignFieldNames": mobile_app_fields,
                 "TextCampaignSearchStrategyPlacementTypesFieldNames": [
                     "SearchResults", "ProductGallery", "DynamicPlaces",
                 ],
@@ -887,9 +887,7 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                     "FieldNames": field_names,
                     "TextCampaignFieldNames": type_fields,
                     "UnifiedCampaignFieldNames": type_fields,
-                    "MobileAppCampaignFieldNames": [
-                        "Settings", "BiddingStrategy", "PackageBiddingStrategy", "PriorityGoals", "CounterIds",
-                    ],
+                    "MobileAppCampaignFieldNames": mobile_app_fields,
                     "TextCampaignSearchStrategyPlacementTypesFieldNames": [
                         "SearchResults", "ProductGallery", "DynamicPlaces",
                     ],
