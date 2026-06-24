@@ -77,6 +77,8 @@ GOAL_KEYS = (
     "app_purchase",
 )
 
+_OS_LABELS = {"ANDROID": "Android", "IOS": "iOS"}
+
 
 def _token() -> str:
     t = os.environ.get("LIME_DIRECT_TOKEN", "").strip()
@@ -872,8 +874,6 @@ def _fetch_bidmodifiers_by_campaign(campaign_ids: List[str]) -> Dict[str, List[D
             detail = None
             region_id = None
             label_override = None
-_OS_LABELS = {"ANDROID": "Android", "IOS": "iOS"}
-
             for key, os_label in (
                 ("MobileAdjustment", "Смартфоны"),
                 ("TabletAdjustment", "Планшеты"),
