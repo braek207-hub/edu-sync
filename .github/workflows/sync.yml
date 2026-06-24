@@ -62,11 +62,9 @@ jobs:
           DIRECT_SYNC_MODE: ${{ github.event.inputs.direct_sync_mode || 'incremental' }}
           DIRECT_DAYS_BACK: "7"
           DIRECT_DATE_FROM: ${{ github.event.inputs.direct_date_from || '2026-01-01' }}
-          # Daily (incremental) — только текущий год + без тяжёлого CRM lite.
-          # Полный прогон (direct_sync_mode=full) — оба года + lite.
+          # Daily (incremental) — только текущий год; полный прогон (full) — оба года.
           CRM_LEADS_SHEETS: ${{ github.event.inputs.direct_sync_mode == 'full' && 'Лиды,Лиды 2025' || 'Лиды' }}
           CRM_PAYMENTS_SHEETS: ${{ github.event.inputs.direct_sync_mode == 'full' && 'Оплаты,Оплаты 2025' || 'Оплаты' }}
-          SYNC_SKIP_LITE: ${{ github.event.inputs.direct_sync_mode == 'full' && '0' || '1' }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_URL: ${{ secrets.DIRECT_URL }}
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
