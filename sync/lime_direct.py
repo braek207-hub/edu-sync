@@ -10,9 +10,11 @@ sync/lime_direct.py — синк кабинета Яндекс Директ дл
       Impressions, Clicks, Cost (с НДС),
       AvgEffectiveBid, AvgTrafficVolume, AvgImpressionPosition, AvgClickPosition,
       BounceRate (%), AvgPageviews,
-      Conversions по целям (LSC) — из config/lime_direct_goals.json.
+      Conversions по целям (LSC) — если задан LIME_DIRECT_GOALS.
   - Campaigns.get (снапшот): DailyBudget, BiddingStrategy, PackageBiddingStrategy
     → weekly_budget (в т.ч. APP / товарные / пакетные стратегии).
+  - Настройки кампаний (per campaign, lime_campaign_settings):
+      стратегия, аудитория, таргетинг, корректировки, офферный таргетинг.
 
 Запуск:  python -m sync.lime_direct
 
@@ -21,6 +23,7 @@ ENV:
     LIME_DIRECT_TOKEN
     LIME_DIRECT_CLIENT_LOGIN
     LIME_DIRECT_DAYS_BACK  (default 7)
+    LIME_DIRECT_GOALS      (optional JSON, см. _parse_goals)
 """
 
 import os
@@ -38,7 +41,14 @@ import psycopg2.extras
 
 REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports"
 CAMPAIGNS_URL = "https://api.direct.yandex.com/json/v5/campaigns"
+CAMPAIGNS_V501_URL = "https://api.direct.yandex.com/json/v501/campaigns"
 STRATEGIES_URL = "https://api.direct.yandex.com/json/v5/strategies"
+ADGROUPS_URL = "https://api.direct.yandex.com/json/v5/adgroups"
+BIDMODIFIERS_URL = "https://api.direct.yandex.com/json/v5/bidmodifiers"
+AUDIENCETARGETS_URL = "https://api.direct.yandex.com/json/v5/audiencetargets"
+RETARGETINGLISTS_URL = "https://api.direct.yandex.com/json/v5/retargetinglists"
+KEYWORDS_URL = "https://api.direct.yandex.com/json/v5/keywords"
+FEEDS_URL = "https://api.direct.yandex.com/json/v5/feeds"
 
 REPORT_FIELDS = [
     "Date",
@@ -55,7 +65,14 @@ REPORT_FIELDS = [
     "AvgPageviews",
 ]
 
-GOALS_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "lime_direct_goals.json")
+GOAL_KEYS = (
+    "web_cart",
+    "web_checkout",
+    "web_purchase",
+    "app_cart",
+    "app_checkout",
+    "app_purchase",
+)
 
 
 def _token() -> str:
@@ -76,18 +93,27 @@ def _pg_url() -> str:
     return os.environ["DATABASE_URL"].split("?")[0]
 
 
-def _parse_goals() -> List[str]:
-    if not os.path.exists(GOALS_CONFIG_PATH):
-        return []
-    with open(GOALS_CONFIG_PATH, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    goal_ids = []
-    for g in cfg.get("goals", []):
-        gid = g.get("id")
-        if gid is None:
+def _parse_goals() -> Tuple[List[str], Dict[str, str]]:
+    """
+    LIME_DIRECT_GOALS — JSON вида:
+      {"web_cart": 123, "web_checkout": 456, "web_purchase": 789,
+       "app_cart": 111, "app_checkout": 222, "app_purchase": 333}
+    Возвращает (список id для Reports API, map goal_id → ключ колонки).
+    """
+    raw = os.environ.get("LIME_DIRECT_GOALS", "").strip()
+    if not raw:
+        return [], {}
+    cfg = json.loads(raw)
+    goal_ids: List[str] = []
+    id_to_key: Dict[str, str] = {}
+    for key in GOAL_KEYS:
+        val = cfg.get(key)
+        if val is None or val == "":
             continue
-        goal_ids.append(str(int(gid)))
-    return sorted(list(set(goal_ids)))
+        gid = str(int(val))
+        goal_ids.append(gid)
+        id_to_key[gid] = key
+    return goal_ids, id_to_key
 
 
 def _report_headers() -> Dict[str, str]:
@@ -194,43 +220,13 @@ def _report_sig(fields: List[str], goal_ids: List[str]) -> str:
     return hashlib.md5(src).hexdigest()[:8]
 
 
-MAX_GOALS_PER_REPORT = 10
-
-
-def _parse_row_conversions(row: Dict[str, Any], goal_ids: List[str]) -> Dict[str, int]:
-    """Читает конверсии по фактическим именам колонок TSV (с запасом по префиксу)."""
-    out: Dict[str, int] = {}
-    for gid in goal_ids:
-        exact = f"Conversions_{gid}_LSC"
-        val = 0
-        if exact in row:
-            val = _int(row.get(exact))
-        else:
-            prefix = f"Conversions_{gid}_"
-            for col, raw in row.items():
-                if col and col.startswith(prefix):
-                    val = _int(raw)
-                    break
-        out[str(gid)] = val
-    return out
-
-
-def _tsv_dict_reader(text: str) -> csv.DictReader:
-    text = text.lstrip("\ufeff")
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    while lines and "CampaignId" not in lines[0]:
-        lines.pop(0)
-    return csv.DictReader(io.StringIO("\n".join(lines)), delimiter="\t")
-
-
-def _fetch_report_chunk(
+def _fetch_report(
     date_from: str,
     date_to: str,
     goal_ids: List[str],
-    *,
-    include_metrics: bool,
+    id_to_key: Dict[str, str],
 ) -> List[Dict[str, Any]]:
-    fields = list(REPORT_FIELDS) if include_metrics else ["Date", "CampaignId", "CampaignName"]
+    fields = list(REPORT_FIELDS)
     if goal_ids:
         fields.append("Conversions")
 
@@ -266,13 +262,8 @@ def _fetch_report_chunk(
         raise RuntimeError("Reports API: превышено число попыток")
 
     rows: List[Dict[str, Any]] = []
-    reader = _tsv_dict_reader(r.text)
-    fieldnames = reader.fieldnames or []
-    conv_headers = [h for h in fieldnames if h and h.startswith("Conversions_")]
-    if goal_ids and not conv_headers:
-        print(f"  [lime_direct] WARN: в TSV нет колонок Conversions_*, заголовки: {fieldnames[:25]}")
-    elif goal_ids and conv_headers:
-        print(f"  [lime_direct] колонки конверсий: {conv_headers[:5]}{'...' if len(conv_headers) > 5 else ''}")
+    reader = csv.DictReader(io.StringIO(r.text), delimiter="\t")
+    conv_cols = {f"Conversions_{gid}_LSC": key for gid, key in id_to_key.items()}
 
     for row in reader:
         cid = str(row.get("CampaignId", "")).strip()
@@ -282,52 +273,20 @@ def _fetch_report_chunk(
             "date": str(row.get("Date", "")).strip(),
             "campaign_id": cid,
             "campaign_name": str(row.get("CampaignName", "")).strip(),
+            "impressions": _int(row.get("Impressions")),
+            "clicks": _int(row.get("Clicks")),
+            "cost": round(_num(row.get("Cost")), 2),
+            "avg_effective_bid": round(_num(row.get("AvgEffectiveBid")), 2),
+            "avg_traffic_volume": _num(row.get("AvgTrafficVolume")),
+            "avg_impression_position": _num(row.get("AvgImpressionPosition")),
+            "avg_click_position": _num(row.get("AvgClickPosition")),
+            "bounce_rate": _num(row.get("BounceRate")),
+            "avg_pageviews": _num(row.get("AvgPageviews")),
         }
-        if include_metrics:
-            item.update({
-                "impressions": _int(row.get("Impressions")),
-                "clicks": _int(row.get("Clicks")),
-                "cost": round(_num(row.get("Cost")), 2),
-                "avg_effective_bid": round(_num(row.get("AvgEffectiveBid")), 2),
-                "avg_traffic_volume": _num(row.get("AvgTrafficVolume")),
-                "avg_impression_position": _num(row.get("AvgImpressionPosition")),
-                "avg_click_position": _num(row.get("AvgClickPosition")),
-                "bounce_rate": _num(row.get("BounceRate")),
-                "avg_pageviews": _num(row.get("AvgPageviews")),
-            })
-        item["conversions"] = _parse_row_conversions(row, goal_ids) if goal_ids else {}
+        for col, key in conv_cols.items():
+            item[key] = _int(row.get(col))
         rows.append(item)
     return rows
-
-
-def _fetch_report(
-    date_from: str,
-    date_to: str,
-    goal_ids: List[str],
-) -> List[Dict[str, Any]]:
-    if not goal_ids:
-        return _fetch_report_chunk(date_from, date_to, [], include_metrics=True)
-    if len(goal_ids) <= MAX_GOALS_PER_REPORT:
-        return _fetch_report_chunk(date_from, date_to, goal_ids, include_metrics=True)
-
-    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for i, chunk in enumerate(_chunked(goal_ids, MAX_GOALS_PER_REPORT)):
-        # Полный набор полей на каждом батче — иначе API отдаёт только строки с конверсиями по целям батча.
-        partial = _fetch_report_chunk(
-            date_from, date_to, chunk, include_metrics=True
-        )
-        print(f"  [lime_direct] батч целей {i + 1}: {len(chunk)} целей, {len(partial)} строк")
-        for row in partial:
-            key = (row["date"], row["campaign_id"])
-            if key not in merged:
-                merged[key] = row
-            else:
-                merged[key]["conversions"].update(row.get("conversions", {}))
-    for row in merged.values():
-        conv = row.setdefault("conversions", {})
-        for gid in goal_ids:
-            conv.setdefault(str(gid), 0)
-    return list(merged.values())
 
 
 def _chunked(seq: List[str], n: int):
@@ -335,8 +294,8 @@ def _chunked(seq: List[str], n: int):
         yield seq[i:i + n]
 
 
-def _fetch_package_strategies(strategy_ids: List[int]) -> Dict[int, Dict[str, Any]]:
-    out: Dict[int, Dict[str, Any]] = {}
+def _fetch_package_strategies(strategy_ids: List[int]) -> Dict[int, Dict[str, Optional[float]]]:
+    out: Dict[int, Dict[str, Optional[float]]] = {}
     if not strategy_ids:
         return out
 
@@ -382,16 +341,9 @@ def _fetch_package_strategies(strategy_ids: List[int]) -> Dict[int, Dict[str, An
                     break
             weekly = _weekly_from_details(details) if isinstance(details, dict) else None
             cpa = None
-            budget_type = None
             if isinstance(details, dict):
                 cpa = _micros_to_float(details.get("AverageCpa") or details.get("Cpa"))
-                budget_type = "custom_period" if isinstance(details.get("CustomPeriodBudget"), dict) else ("weekly" if details.get("WeeklySpendLimit") else None)
-            out[int(sid)] = {
-                "weekly_budget": weekly,
-                "target_cpa": cpa,
-                "name": s.get("Name"),
-                "budget_type": budget_type,
-            }
+            out[int(sid)] = {"weekly_budget": weekly, "target_cpa": cpa}
 
     return out
 
@@ -463,29 +415,636 @@ def _fetch_campaigns(campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                 "state": c.get("State"),
                 "campaign_type": c.get("Type"),
                 "package_strategy_id": pkg_id,
-                "package_strategy_name": None,
-                "budget_source": "campaign" if _pick_weekly(search["weekly_budget"], network["weekly_budget"], mobile["weekly_budget"]) else None,
-                "budget_type": "weekly",
             }
 
     strategies = _fetch_package_strategies(sorted(package_strategy_ids))
     for cid, row in pending.items():
-        pkg_id = row.get("package_strategy_id")
+        pkg_id = row.pop("package_strategy_id", None)
         if (row.get("weekly_budget") is None or row.get("weekly_budget") == 0) and pkg_id is not None:
             pkg = strategies.get(int(pkg_id), {})
             if pkg.get("weekly_budget") is not None:
                 row["weekly_budget"] = pkg["weekly_budget"]
-                row["budget_source"] = "package"
             if row.get("target_cpa") is None and pkg.get("target_cpa") is not None:
                 row["target_cpa"] = pkg["target_cpa"]
-            row["package_strategy_name"] = pkg.get("name")
-            row["budget_type"] = pkg.get("budget_type") or row.get("budget_type")
-        elif pkg_id is not None:
-            row["budget_source"] = "package"
-            row["package_strategy_name"] = strategies.get(int(pkg_id), {}).get("name")
         info[cid] = row
 
     return info
+
+
+def _direct_post(url: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    r = requests.post(url, data=data, headers=_json_headers())
+    r.encoding = "utf-8"
+    if r.status_code != 200:
+        raise RuntimeError(f"Direct API {url} {r.status_code}: {r.text[:300]}")
+    js = r.json()
+    if "error" in js:
+        raise RuntimeError(f"Direct API error: {json.dumps(js['error'], ensure_ascii=False)}")
+    return js.get("result") or {}
+
+
+def _paginate_items(url: str, result_key: str, body_base: Dict[str, Any], limit: int = 1000) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    offset = 0
+    while True:
+        body = dict(body_base)
+        params = dict(body.get("params") or {})
+        params["Page"] = {"Limit": limit, "Offset": offset}
+        body["params"] = params
+        result = _direct_post(url, body)
+        chunk = result.get(result_key) or []
+        if not chunk:
+            break
+        items.extend(chunk)
+        if len(chunk) < limit:
+            break
+        offset += limit
+        if offset >= 10000:
+            break
+    return items
+
+
+def _goal_ids_from_block(details: Dict[str, Any]) -> List[int]:
+    gid = details.get("GoalId")
+    if gid is not None:
+        return [int(gid)]
+    return []
+
+
+def _extract_strategy_channel_full(strategy_block: Any) -> Dict[str, Any]:
+    if not isinstance(strategy_block, dict):
+        return {}
+    out: Dict[str, Any] = {
+        "biddingStrategyType": strategy_block.get("BiddingStrategyType"),
+        "weeklyBudget": None,
+        "targetCpa": None,
+        "averageCpc": None,
+        "goalIds": [],
+        "placementTypes": list(strategy_block.get("PlacementTypes") or []),
+    }
+    for k, v in strategy_block.items():
+        if k in ("BiddingStrategyType", "PlacementTypes"):
+            continue
+        if not isinstance(v, dict):
+            continue
+        weekly = _weekly_from_details(v)
+        if weekly is not None:
+            out["weeklyBudget"] = weekly
+        cpa = _micros_to_float(v.get("AverageCpa") or v.get("Cpa"))
+        if cpa is not None:
+            out["targetCpa"] = cpa
+        cpc = _micros_to_float(v.get("AverageCpc"))
+        if cpc is not None:
+            out["averageCpc"] = cpc
+        out["goalIds"] = _goal_ids_from_block(v)
+        break
+    return out
+
+
+def _fetch_package_strategies_full(strategy_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    out: Dict[int, Dict[str, Any]] = {}
+    if not strategy_ids:
+        return out
+
+    base_fields = ["Id", "Name", "Type", "StatusArchived", "AttributionModel", "CounterIds", "PriorityGoals"]
+    strat_fields = {
+        "StrategyMaximumClicksFieldNames": ["WeeklySpendLimit", "BidCeiling", "CustomPeriodBudget", "BudgetType"],
+        "StrategyMaximumConversionRateFieldNames": ["WeeklySpendLimit", "BidCeiling", "GoalId", "CustomPeriodBudget", "BudgetType"],
+        "StrategyAverageCpcFieldNames": ["AverageCpc", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
+        "StrategyAverageCpaFieldNames": ["AverageCpa", "GoalId", "WeeklySpendLimit", "BidCeiling", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
+        "StrategyPayForConversionFieldNames": ["Cpa", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
+        "StrategyAverageCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
+        "StrategyPayForConversionCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
+    }
+
+    for part in _chunked([str(x) for x in strategy_ids], 1000):
+        body = {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {"Ids": [int(x) for x in part]},
+                "FieldNames": base_fields,
+                **strat_fields,
+            },
+        }
+        result = _direct_post(STRATEGIES_URL, body)
+        for s in result.get("Strategies") or []:
+            sid = s.get("Id")
+            if sid is None:
+                continue
+            details = None
+            for k, v in s.items():
+                if k in ("Id", "Name", "Type", "StatusArchived", "AttributionModel", "CounterIds", "PriorityGoals"):
+                    continue
+                if isinstance(v, dict):
+                    details = v
+                    break
+            weekly = _weekly_from_details(details) if isinstance(details, dict) else None
+            cpa = None
+            goal_ids: List[int] = []
+            if isinstance(details, dict):
+                cpa = _micros_to_float(details.get("AverageCpa") or details.get("Cpa"))
+                goal_ids = _goal_ids_from_block(details)
+            out[int(sid)] = {
+                "id": int(sid),
+                "name": s.get("Name"),
+                "type": s.get("Type"),
+                "weeklyBudget": weekly,
+                "targetCpa": cpa,
+                "goalIds": goal_ids,
+            }
+    return out
+
+
+def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Полные настройки кампании из campaigns.get (+ v501 для UNIFIED)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    if not campaign_ids:
+        return out
+
+    field_names = ["Id", "Name", "Type", "Status", "State", "DailyBudget"]
+    type_fields = ["Settings", "BiddingStrategy", "PriorityGoals", "PackageBiddingStrategy"]
+    package_ids: set[int] = set()
+
+    def _parse_campaign(c: Dict[str, Any]) -> None:
+        cid = str(c.get("Id", ""))
+        if not cid:
+            return
+        daily = c.get("DailyBudget") or {}
+        tc = c.get("TextCampaign") or {}
+        uc = c.get("UnifiedCampaign") or {}
+        mc = c.get("MobileAppCampaign") or {}
+
+        tc_bs = tc.get("BiddingStrategy") or {}
+        uc_bs = uc.get("BiddingStrategy") or {}
+        mc_bs = mc.get("BiddingStrategy") or {}
+
+        pkg = None
+        for p in (tc.get("PackageBiddingStrategy"), uc.get("PackageBiddingStrategy"), mc.get("PackageBiddingStrategy")):
+            if isinstance(p, dict) and p.get("StrategyId"):
+                pkg = p
+                package_ids.add(int(p["StrategyId"]))
+                break
+
+        settings_opts: List[str] = []
+        for block in (tc, uc, mc):
+            for opt in block.get("Settings") or []:
+                if isinstance(opt, dict) and opt.get("Option") == "YES":
+                    settings_opts.append(str(opt.get("Name", "")))
+
+        priority_goals: List[int] = []
+        for block in (tc, uc, mc):
+            for pg in block.get("PriorityGoals") or []:
+                if isinstance(pg, dict) and pg.get("GoalId") is not None:
+                    priority_goals.append(int(pg["GoalId"]))
+                elif isinstance(pg, (int, float)):
+                    priority_goals.append(int(pg))
+
+        placements: List[str] = []
+        for key in (
+            "SearchResults", "ProductGallery", "DynamicPlaces", "Maps",
+            "SearchOrganizationList", "Network", "SearchResult",
+        ):
+            for bs in (tc_bs, uc_bs):
+                search = bs.get("Search") or {}
+                if isinstance(search, dict) and search.get(key) == "YES":
+                    placements.append(key)
+                network = bs.get("Network") or {}
+                if isinstance(network, dict) and network.get(key) == "YES":
+                    placements.append(key)
+
+        search_ch = _extract_strategy_channel_full(tc_bs.get("Search") or uc_bs.get("Search"))
+        network_ch = _extract_strategy_channel_full(tc_bs.get("Network") or uc_bs.get("Network"))
+        if not search_ch and mc_bs:
+            search_ch = _extract_strategy_channel_full(mc_bs)
+
+        out[cid] = {
+            "campaign_name": c.get("Name"),
+            "meta": {
+                "campaignType": c.get("Type"),
+                "state": c.get("State"),
+                "status": c.get("Status"),
+            },
+            "strategy": {
+                "search": search_ch or None,
+                "network": network_ch or None,
+                "package": {
+                    "id": int(pkg["StrategyId"]) if pkg else None,
+                } if pkg else None,
+                "priorityGoals": sorted(set(priority_goals)),
+                "dailyBudget": _micros_to_float(daily.get("Amount")),
+            },
+            "targeting": {
+                "placements": sorted(set(placements)),
+                "campaignSettings": sorted(set(settings_opts)),
+            },
+        }
+
+    for part in _chunked(campaign_ids, 1000):
+        body = {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {"Ids": [int(x) for x in part]},
+                "FieldNames": field_names,
+                "TextCampaignFieldNames": type_fields,
+                "UnifiedCampaignFieldNames": type_fields,
+                "MobileAppCampaignFieldNames": ["Settings", "BiddingStrategy", "PackageBiddingStrategy"],
+                "TextCampaignSearchStrategyPlacementTypesFieldNames": [
+                    "SearchResults", "ProductGallery", "DynamicPlaces",
+                ],
+                "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
+                    "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
+                ],
+            },
+        }
+        result = _direct_post(CAMPAIGNS_URL, body)
+        for c in result.get("Campaigns") or []:
+            _parse_campaign(c)
+
+        unified_ids = [
+            x for x in part
+            if out.get(x, {}).get("meta", {}).get("campaignType") == "UNIFIED_CAMPAIGN"
+        ]
+        if unified_ids:
+            body501 = {
+                "method": "get",
+                "params": {
+                    "SelectionCriteria": {"Ids": [int(x) for x in unified_ids]},
+                    "FieldNames": field_names,
+                    "UnifiedCampaignFieldNames": type_fields,
+                    "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
+                        "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
+                    ],
+                },
+            }
+            try:
+                result501 = _direct_post(CAMPAIGNS_V501_URL, body501)
+                for c in result501.get("Campaigns") or []:
+                    _parse_campaign(c)
+            except RuntimeError as e:
+                print(f"  [lime_direct] v501 campaigns.get: {e}")
+
+    packages = _fetch_package_strategies_full(sorted(package_ids))
+    for cid, row in out.items():
+        pkg = (row.get("strategy") or {}).get("package")
+        if not pkg or not pkg.get("id"):
+            continue
+        full = packages.get(int(pkg["id"]))
+        if full:
+            row["strategy"]["package"] = full
+
+    return out
+
+
+def _fetch_adgroups_by_campaign(campaign_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {cid: [] for cid in campaign_ids}
+    for part in _chunked(campaign_ids, 10):
+        body = {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {"CampaignIds": [int(x) for x in part]},
+                "FieldNames": [
+                    "Id", "Name", "CampaignId", "Status", "Type",
+                    "RegionIds", "RestrictedRegionIds", "ServingStatus",
+                ],
+                "SmartAdGroupFieldNames": ["FeedId"],
+            },
+        }
+        for ag in _paginate_items(ADGROUPS_URL, "AdGroups", body):
+            cid = str(ag.get("CampaignId", ""))
+            if cid in out:
+                feed_id = None
+                smart = ag.get("SmartAdGroup") or {}
+                if isinstance(smart, dict):
+                    feed_id = smart.get("FeedId")
+                out[cid].append({
+                    "id": ag.get("Id"),
+                    "name": ag.get("Name"),
+                    "type": ag.get("Type"),
+                    "status": ag.get("Status"),
+                    "regionIds": list(ag.get("RegionIds") or []),
+                    "feedId": feed_id,
+                })
+    return out
+
+
+def _fetch_bidmodifiers_by_campaign(campaign_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {cid: [] for cid in campaign_ids}
+    for part in _chunked(campaign_ids, 10):
+        body = {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {"CampaignIds": [int(x) for x in part]},
+                "FieldNames": ["Id", "CampaignId", "AdGroupId", "Level", "Type"],
+                "MobileAdjustmentFieldNames": ["BidModifier"],
+                "TabletAdjustmentFieldNames": ["BidModifier"],
+                "DesktopAdjustmentFieldNames": ["BidModifier"],
+                "RegionalAdjustmentFieldNames": ["RegionId", "BidModifier"],
+                "DemographicsAdjustmentFieldNames": ["Gender", "Age", "BidModifier"],
+                "RetargetingAdjustmentFieldNames": ["RetargetingConditionId", "BidModifier"],
+                "SmartAdAdjustmentFieldNames": ["BidModifier"],
+                "SerpLayoutAdjustmentFieldNames": ["SerpLayout", "BidModifier"],
+                "IncomeGradeAdjustmentFieldNames": ["Grade", "BidModifier"],
+                "AdGroupAdjustmentFieldNames": ["BidModifier"],
+            },
+        }
+        for bm in _paginate_items(BIDMODIFIERS_URL, "BidModifiers", body):
+            cid = str(bm.get("CampaignId", ""))
+            if cid not in out:
+                continue
+            btype = str(bm.get("Type", ""))
+            percent = None
+            detail = None
+            for key, sub in (
+                ("MobileAdjustment", None),
+                ("TabletAdjustment", None),
+                ("DesktopAdjustment", None),
+                ("SmartAdAdjustment", None),
+                ("AdGroupAdjustment", None),
+            ):
+                adj = bm.get(key)
+                if isinstance(adj, dict) and adj.get("BidModifier") is not None:
+                    percent = int(adj["BidModifier"])
+                    break
+            reg = bm.get("RegionalAdjustment")
+            if isinstance(reg, dict):
+                percent = int(reg.get("BidModifier") or 0)
+                detail = f"Регион {reg.get('RegionId')}"
+            demo = bm.get("DemographicsAdjustment")
+            if isinstance(demo, dict):
+                percent = int(demo.get("BidModifier") or 0)
+                detail = f"{demo.get('Gender', '')} {demo.get('Age', '')}".strip()
+            ret = bm.get("RetargetingAdjustment")
+            if isinstance(ret, dict):
+                percent = int(ret.get("BidModifier") or 0)
+                detail = str(ret.get("RetargetingConditionId", ""))
+            out[cid].append({
+                "id": bm.get("Id"),
+                "type": btype,
+                "level": bm.get("Level"),
+                "percent": percent,
+                "detail": detail,
+            })
+    return out
+
+
+def _fetch_audiencetargets_by_campaign(campaign_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {cid: [] for cid in campaign_ids}
+    for part in _chunked(campaign_ids, 10):
+        body = {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {"CampaignIds": [int(x) for x in part]},
+                "FieldNames": ["Id", "AdGroupId", "CampaignId", "RetargetingListId", "State"],
+            },
+        }
+        for t in _paginate_items(AUDIENCETARGETS_URL, "AudienceTargets", body):
+            cid = str(t.get("CampaignId", ""))
+            if cid in out:
+                out[cid].append({
+                    "id": t.get("Id"),
+                    "adGroupId": t.get("AdGroupId"),
+                    "retargetingListId": t.get("RetargetingListId"),
+                    "state": t.get("State"),
+                })
+    return out
+
+
+def _fetch_retargetinglists_map(list_ids: List[int]) -> Dict[int, str]:
+    if not list_ids:
+        return {}
+    names: Dict[int, str] = {}
+    for part in _chunked([str(x) for x in list_ids], 1000):
+        body = {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {"Ids": [int(x) for x in part]},
+                "FieldNames": ["Id", "Name"],
+            },
+        }
+        for rl in _paginate_items(RETARGETINGLISTS_URL, "RetargetingLists", body):
+            rid = rl.get("Id")
+            if rid is not None:
+                names[int(rid)] = str(rl.get("Name") or "")
+    return names
+
+
+def _fetch_autotargeting_by_campaign(campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {
+        cid: {"enabledGroups": 0, "totalGroups": 0, "categories": []} for cid in campaign_ids
+    }
+    categories_by_cid: Dict[str, set] = {cid: set() for cid in campaign_ids}
+    for part in _chunked(campaign_ids, 5):
+        body = {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {"CampaignIds": [int(x) for x in part]},
+                "FieldNames": ["Id", "AdGroupId", "CampaignId"],
+                "AutotargetingSettingsFieldNames": ["Categories", "BrandOptions"],
+            },
+        }
+        for kw in _paginate_items(KEYWORDS_URL, "Keywords", body):
+            cid = str(kw.get("CampaignId", ""))
+            if cid not in out:
+                continue
+            ats = kw.get("AutotargetingSettings")
+            if not isinstance(ats, dict):
+                continue
+            agid = kw.get("AdGroupId")
+            if agid is not None:
+                out[cid]["enabledGroups"] = int(out[cid]["enabledGroups"]) + 1
+            for cat in ats.get("Categories") or []:
+                if isinstance(cat, dict) and cat.get("Selected") == "YES":
+                    categories_by_cid[cid].add(str(cat.get("Category", "")))
+                elif isinstance(cat, str):
+                    categories_by_cid[cid].add(cat)
+    for cid in campaign_ids:
+        out[cid]["categories"] = sorted(c for c in categories_by_cid[cid] if c)
+    return out
+
+
+def _fetch_feeds_map(feed_ids: List[int]) -> Dict[int, str]:
+    if not feed_ids:
+        return {}
+    names: Dict[int, str] = {}
+    for part in _chunked([str(x) for x in feed_ids], 1000):
+        body = {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {"Ids": [int(x) for x in part]},
+                "FieldNames": ["Id", "Name"],
+            },
+        }
+        for f in _paginate_items(FEEDS_URL, "Feeds", body):
+            fid = f.get("Id")
+            if fid is not None:
+                names[int(fid)] = str(f.get("Name") or "")
+    return names
+
+
+def _build_campaign_settings(
+    campaign_id: str,
+    base: Dict[str, Any],
+    adgroups: List[Dict[str, Any]],
+    bidmodifiers: List[Dict[str, Any]],
+    audience_targets: List[Dict[str, Any]],
+    retargeting_names: Dict[int, str],
+    autotargeting: Dict[str, Any],
+    feed_names: Dict[int, str],
+    synced_at: str,
+) -> Dict[str, Any]:
+    regions: set[int] = set()
+    offer_groups: List[Dict[str, Any]] = []
+    for ag in adgroups:
+        for rid in ag.get("regionIds") or []:
+            regions.add(int(rid))
+        ag_type = str(ag.get("type") or "")
+        feed_id = ag.get("feedId")
+        if ag_type == "SMART_AD_GROUP" or feed_id is not None:
+            offer_groups.append({
+                "adGroupId": ag.get("id"),
+                "name": ag.get("name") or "—",
+                "type": ag_type,
+                "feedId": int(feed_id) if feed_id is not None else None,
+                "feedName": feed_names.get(int(feed_id)) if feed_id is not None else None,
+            })
+
+    retargeting_mods = [
+        m for m in bidmodifiers if m.get("type") == "RETARGETING_ADJUSTMENT"
+    ]
+    other_mods = [m for m in bidmodifiers if m.get("type") != "RETARGETING_ADJUSTMENT"]
+
+    for m in retargeting_mods:
+        if m.get("detail") and m["detail"].isdigit():
+            lid = int(m["detail"])
+            m["detail"] = retargeting_names.get(lid, m["detail"])
+
+    audience_view = []
+    for t in audience_targets:
+        lid = t.get("retargetingListId")
+        audience_view.append({
+            "id": t.get("id"),
+            "adGroupId": t.get("adGroupId"),
+            "name": None,
+            "retargetingListId": lid,
+            "retargetingListName": retargeting_names.get(int(lid)) if lid is not None else None,
+            "state": t.get("state"),
+        })
+
+    settings = {
+        "strategy": base.get("strategy") or {},
+        "audience": {
+            "targets": audience_view,
+            "retargetingModifiers": retargeting_mods,
+        },
+        "targeting": {
+            **(base.get("targeting") or {}),
+            "regions": sorted(regions),
+            "autotargeting": {
+                **autotargeting,
+                "totalGroups": len(adgroups),
+            },
+            "adGroupsTotal": len(adgroups),
+        },
+        "bidModifiers": {
+            "total": len(other_mods),
+            "items": other_mods,
+        },
+        "offerTargeting": {
+            "hasFeedGroups": len(offer_groups) > 0,
+            "groups": offer_groups,
+        },
+        "meta": {
+            **(base.get("meta") or {}),
+            "syncedAt": synced_at,
+        },
+    }
+    return settings
+
+
+_SETTINGS_UPSERT_SQL = """
+    INSERT INTO lime_campaign_settings (campaign_id, campaign_name, settings, synced_at)
+    VALUES (%(campaign_id)s, %(campaign_name)s, %(settings)s::jsonb, NOW())
+    ON CONFLICT (campaign_id) DO UPDATE SET
+       campaign_name = EXCLUDED.campaign_name,
+       settings = EXCLUDED.settings,
+       synced_at = NOW()
+"""
+
+
+def _upsert_campaign_settings(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    with psycopg2.connect(_pg_url()) as conn:
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(
+                    _SETTINGS_UPSERT_SQL,
+                    {
+                        "campaign_id": row["campaign_id"],
+                        "campaign_name": row.get("campaign_name"),
+                        "settings": json.dumps(row["settings"], ensure_ascii=False),
+                    },
+                )
+        conn.commit()
+    return len(rows)
+
+
+def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> int:
+    if not campaign_ids:
+        return 0
+
+    synced_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(f"[lime_direct] настройки кампаний ({len(campaign_ids)})...")
+
+    base_map = _fetch_campaigns_for_settings(campaign_ids)
+    adgroups_map = _fetch_adgroups_by_campaign(campaign_ids)
+    bidmodifiers_map = _fetch_bidmodifiers_by_campaign(campaign_ids)
+    audience_map = _fetch_audiencetargets_by_campaign(campaign_ids)
+    autotargeting_map = _fetch_autotargeting_by_campaign(campaign_ids)
+
+    list_ids: set[int] = set()
+    feed_ids: set[int] = set()
+    for cid in campaign_ids:
+        for t in audience_map.get(cid, []):
+            lid = t.get("retargetingListId")
+            if lid is not None:
+                list_ids.add(int(lid))
+        for m in bidmodifiers_map.get(cid, []):
+            if m.get("type") == "RETARGETING_ADJUSTMENT" and m.get("detail") and str(m["detail"]).isdigit():
+                list_ids.add(int(m["detail"]))
+        for ag in adgroups_map.get(cid, []):
+            fid = ag.get("feedId")
+            if fid is not None:
+                feed_ids.add(int(fid))
+
+    retargeting_names = _fetch_retargetinglists_map(sorted(list_ids))
+    feed_names = _fetch_feeds_map(sorted(feed_ids))
+
+    rows: List[Dict[str, Any]] = []
+    for cid in campaign_ids:
+        base = base_map.get(cid, {"meta": {}, "strategy": {}, "targeting": {}})
+        if names.get(cid):
+            base["campaign_name"] = names[cid]
+        settings = _build_campaign_settings(
+            cid,
+            base,
+            adgroups_map.get(cid, []),
+            bidmodifiers_map.get(cid, []),
+            audience_map.get(cid, []),
+            retargeting_names,
+            autotargeting_map.get(cid, {"enabledGroups": 0, "totalGroups": 0, "categories": []}),
+            feed_names,
+            synced_at,
+        )
+        rows.append({
+            "campaign_id": cid,
+            "campaign_name": names.get(cid) or base.get("campaign_name"),
+            "settings": settings,
+        })
+
+    n = _upsert_campaign_settings(rows)
+    print(f"[lime_direct] upsert {n} строк в lime_campaign_settings")
+    return n
 
 
 _UPSERT_SQL = """
@@ -496,8 +1055,8 @@ _UPSERT_SQL = """
        avg_impression_position, avg_click_position,
        bounce_rate, avg_pageviews,
        weekly_budget, daily_budget, target_cpa,
-       conversions,
-       package_strategy_id, package_strategy_name, budget_source, budget_type,
+       web_cart, web_checkout, web_purchase,
+       app_cart, app_checkout, app_purchase,
        state, status, campaign_type, updated_at)
     VALUES
       (%(date)s, %(campaign_id)s, %(campaign_name)s, %(client_login)s,
@@ -506,8 +1065,8 @@ _UPSERT_SQL = """
        %(avg_impression_position)s, %(avg_click_position)s,
        %(bounce_rate)s, %(avg_pageviews)s,
        %(weekly_budget)s, %(daily_budget)s, %(target_cpa)s,
-       %(conversions)s,
-       %(package_strategy_id)s, %(package_strategy_name)s, %(budget_source)s, %(budget_type)s,
+       %(web_cart)s, %(web_checkout)s, %(web_purchase)s,
+       %(app_cart)s, %(app_checkout)s, %(app_purchase)s,
        %(state)s, %(status)s, %(campaign_type)s, NOW())
     ON CONFLICT (date, campaign_id) DO UPDATE SET
        campaign_name = EXCLUDED.campaign_name,
@@ -524,11 +1083,12 @@ _UPSERT_SQL = """
        weekly_budget = EXCLUDED.weekly_budget,
        daily_budget = EXCLUDED.daily_budget,
        target_cpa = EXCLUDED.target_cpa,
-       conversions = EXCLUDED.conversions,
-       package_strategy_id = EXCLUDED.package_strategy_id,
-       package_strategy_name = EXCLUDED.package_strategy_name,
-       budget_source = EXCLUDED.budget_source,
-       budget_type = EXCLUDED.budget_type,
+       web_cart = EXCLUDED.web_cart,
+       web_checkout = EXCLUDED.web_checkout,
+       web_purchase = EXCLUDED.web_purchase,
+       app_cart = EXCLUDED.app_cart,
+       app_checkout = EXCLUDED.app_checkout,
+       app_purchase = EXCLUDED.app_purchase,
        state = EXCLUDED.state,
        status = EXCLUDED.status,
        campaign_type = EXCLUDED.campaign_type,
@@ -551,26 +1111,25 @@ def sync_lime_direct(days_back: int = 7) -> int:
     date_from = (today - timedelta(days=days_back)).isoformat()
     date_to = today.isoformat()
     client_login = _client_login()
-    goal_ids = _parse_goals()
+    goal_ids, id_to_key = _parse_goals()
 
     print(f"[lime_direct] отчёт {date_from} — {date_to} ({client_login})")
     if goal_ids:
         print(f"[lime_direct] цели LSC: {', '.join(goal_ids)}")
-    report_rows = _fetch_report(date_from, date_to, goal_ids)
+    report_rows = _fetch_report(date_from, date_to, goal_ids, id_to_key)
     print(f"[lime_direct] получено {len(report_rows)} строк отчёта")
-    if goal_ids and report_rows:
-        conv_sum = sum(
-            sum((r.get("conversions") or {}).values())
-            for r in report_rows
-        )
-        keys = len((report_rows[0].get("conversions") or {}))
-        print(f"[lime_direct] конверсии: {conv_sum:.0f} суммарно, {keys} целей в строке")
     if not report_rows:
         return 0
 
     campaign_ids = sorted({r["campaign_id"] for r in report_rows})
+    campaign_names = {r["campaign_id"]: r["campaign_name"] for r in report_rows}
     campaigns = _fetch_campaigns(campaign_ids)
     print(f"[lime_direct] стратегии/бюджеты по {len(campaigns)} кампаниям")
+
+    try:
+        _sync_campaign_settings(campaign_ids, campaign_names)
+    except Exception as e:
+        print(f"[lime_direct] WARN: настройки кампаний не синхронизированы: {e}")
 
     merged: List[Dict[str, Any]] = []
     for r in report_rows:
@@ -584,11 +1143,12 @@ def sync_lime_direct(days_back: int = 7) -> int:
             "state": c.get("state"),
             "status": c.get("status"),
             "campaign_type": c.get("campaign_type"),
-            "conversions": psycopg2.extras.Json(r.get("conversions", {})),
-            "package_strategy_id": c.get("package_strategy_id"),
-            "package_strategy_name": c.get("package_strategy_name"),
-            "budget_source": c.get("budget_source"),
-            "budget_type": c.get("budget_type"),
+            "web_cart": r.get("web_cart", 0),
+            "web_checkout": r.get("web_checkout", 0),
+            "web_purchase": r.get("web_purchase", 0),
+            "app_cart": r.get("app_cart", 0),
+            "app_checkout": r.get("app_checkout", 0),
+            "app_purchase": r.get("app_purchase", 0),
         })
 
     n = _upsert(merged)
