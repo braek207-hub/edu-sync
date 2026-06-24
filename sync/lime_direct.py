@@ -51,6 +51,7 @@ KEYWORDS_URL = "https://api.direct.yandex.com/json/v5/keywords"
 FEEDS_URL = "https://api.direct.yandex.com/json/v5/feeds"
 GOALS_URL = "https://api.direct.yandex.com/json/v5/goals"
 DICTIONARIES_URL = "https://api.direct.yandex.com/json/v5/dictionaries"
+SMARTADTARGETS_URL = "https://api.direct.yandex.com/json/v5/smartadtargets"
 
 REPORT_FIELDS = [
     "Date",
@@ -480,7 +481,11 @@ def _paginate_items(url: str, result_key: str, body_base: Dict[str, Any], limit:
 def _goal_ids_from_block(details: Dict[str, Any]) -> List[int]:
     gid = details.get("GoalId")
     if gid is not None:
-        return [int(gid)]
+        gid_int = int(gid)
+        # 13 = placeholder «приоритетные цели» в API Директа, не реальная цель.
+        if gid_int == 13:
+            return []
+        return [gid_int]
     return []
 
 
@@ -527,6 +532,7 @@ def _extract_strategy_channel_full(strategy_block: Any) -> Dict[str, Any]:
         "goalIds": [],
         "placementTypes": list(strategy_block.get("PlacementTypes") or []),
     }
+    goal_ids: List[int] = []
     for k, v in strategy_block.items():
         if k in ("BiddingStrategyType", "PlacementTypes"):
             continue
@@ -542,13 +548,15 @@ def _extract_strategy_channel_full(strategy_block: Any) -> Dict[str, Any]:
         if cpc is not None:
             out["averageCpc"] = cpc
         drr = _crr_to_drr_percent(v.get("Crr"))
-        if drr is not None:
+        if drr is not None and drr > 0:
             out["targetDrr"] = drr
         ceiling = _micros_to_float(v.get("BidCeiling"))
         if ceiling is not None:
             out["bidCeiling"] = ceiling
-        out["goalIds"] = _goal_ids_from_block(v)
-        break
+        for gid in _goal_ids_from_block(v):
+            if gid not in goal_ids:
+                goal_ids.append(gid)
+    out["goalIds"] = goal_ids
     return out
 
 
@@ -757,6 +765,35 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
     missing = [cid for cid in campaign_ids if cid not in out]
     if missing:
         print(f"  [lime_direct] WARN: campaigns.get не вернул {len(missing)} кампаний")
+        for part in _chunked(missing, 100):
+            body_retry = {
+                "method": "get",
+                "params": {
+                    "SelectionCriteria": {
+                        "Ids": [int(x) for x in part],
+                        "States": ["ON", "OFF", "SUSPENDED", "ENDED", "CONVERTED", "ARCHIVED"],
+                    },
+                    "FieldNames": field_names,
+                    "TextCampaignFieldNames": type_fields,
+                    "UnifiedCampaignFieldNames": type_fields,
+                    "MobileAppCampaignFieldNames": [
+                        "Settings", "BiddingStrategy", "PackageBiddingStrategy",
+                    ],
+                    "TextCampaignSearchStrategyPlacementTypesFieldNames": [
+                        "SearchResults", "ProductGallery", "DynamicPlaces",
+                    ],
+                    "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
+                        "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
+                    ],
+                },
+            }
+            try:
+                result_retry = _direct_post(CAMPAIGNS_URL, body_retry)
+                for c in result_retry.get("Campaigns") or []:
+                    _parse_campaign(c)
+            except RuntimeError as e:
+                print(f"  [lime_direct] campaigns.get retry: {e}")
+                break
 
     out["_counter_ids"] = sorted(counter_ids)
     return out
@@ -774,6 +811,7 @@ def _fetch_adgroups_by_campaign(campaign_ids: List[str]) -> Dict[str, List[Dict[
                     "RegionIds", "RestrictedRegionIds", "ServingStatus",
                 ],
                 "SmartAdGroupFieldNames": ["FeedId"],
+                "UnifiedAdGroupFieldNames": ["OfferRetargeting"],
             },
         }
         for ag in _paginate_items(ADGROUPS_URL, "AdGroups", body):
@@ -789,7 +827,13 @@ def _fetch_adgroups_by_campaign(campaign_ids: List[str]) -> Dict[str, List[Dict[
                     "type": ag.get("Type"),
                     "status": ag.get("Status"),
                     "regionIds": list(ag.get("RegionIds") or []),
+                    "restrictedRegionIds": list(ag.get("RestrictedRegionIds") or []),
                     "feedId": feed_id,
+                    "offerRetargeting": (
+                        (ag.get("UnifiedAdGroup") or {}).get("OfferRetargeting")
+                        if isinstance(ag.get("UnifiedAdGroup"), dict)
+                        else None
+                    ),
                 })
     return out
 
@@ -805,9 +849,11 @@ def _fetch_bidmodifiers_by_campaign(campaign_ids: List[str]) -> Dict[str, List[D
                     "Levels": ["CAMPAIGN", "AD_GROUP"],
                 },
                 "FieldNames": ["Id", "CampaignId", "AdGroupId", "Level", "Type"],
-                "MobileAdjustmentFieldNames": ["BidModifier"],
-                "TabletAdjustmentFieldNames": ["BidModifier"],
+                "MobileAdjustmentFieldNames": ["BidModifier", "OperatingSystemType"],
+                "TabletAdjustmentFieldNames": ["BidModifier", "OperatingSystemType"],
                 "DesktopAdjustmentFieldNames": ["BidModifier"],
+                "DesktopOnlyAdjustmentFieldNames": ["BidModifier"],
+                "SmartTvAdjustmentFieldNames": ["BidModifier"],
                 "RegionalAdjustmentFieldNames": ["RegionId", "BidModifier"],
                 "DemographicsAdjustmentFieldNames": ["Gender", "Age", "BidModifier"],
                 "RetargetingAdjustmentFieldNames": ["RetargetingConditionId", "BidModifier"],
@@ -825,17 +871,30 @@ def _fetch_bidmodifiers_by_campaign(campaign_ids: List[str]) -> Dict[str, List[D
             percent = None
             detail = None
             region_id = None
-            for key, sub in (
-                ("MobileAdjustment", None),
-                ("TabletAdjustment", None),
-                ("DesktopAdjustment", None),
+            label_override = None
+_OS_LABELS = {"ANDROID": "Android", "IOS": "iOS"}
+
+            for key, os_label in (
+                ("MobileAdjustment", "Смартфоны"),
+                ("TabletAdjustment", "Планшеты"),
+                ("DesktopAdjustment", "Десктоп"),
+                ("DesktopOnlyAdjustment", "Только десктоп"),
                 ("SmartAdAdjustment", None),
                 ("AdGroupAdjustment", None),
             ):
                 adj = bm.get(key)
                 if isinstance(adj, dict) and adj.get("BidModifier") is not None:
                     percent = int(adj["BidModifier"])
+                    os_type = adj.get("OperatingSystemType")
+                    if os_label and os_type:
+                        label_override = f"{os_label} {_OS_LABELS.get(str(os_type), os_type)}"
+                    elif key == "SmartTvAdjustment":
+                        label_override = "Smart TV"
                     break
+            smart_tv = bm.get("SmartTvAdjustment")
+            if isinstance(smart_tv, dict) and smart_tv.get("BidModifier") is not None:
+                percent = int(smart_tv["BidModifier"])
+                label_override = "Smart TV"
             reg = bm.get("RegionalAdjustment")
             if isinstance(reg, dict):
                 percent = int(reg.get("BidModifier") or 0)
@@ -852,6 +911,7 @@ def _fetch_bidmodifiers_by_campaign(campaign_ids: List[str]) -> Dict[str, List[D
             out[cid].append({
                 "id": bm.get("Id"),
                 "type": btype,
+                "typeLabel": label_override,
                 "level": bm.get("Level"),
                 "percent": percent,
                 "detail": detail,
@@ -926,10 +986,11 @@ def _fetch_autotargeting_by_campaign(
                 if cid not in out:
                     continue
                 keyword = str(kw.get("Keyword") or "").strip().lower()
-                if keyword == "---autotargeting":
+                state = str(kw.get("State") or "ON")
+                if keyword == "---autotargeting" and state == "ON":
                     out[cid]["enabledGroups"] = int(out[cid]["enabledGroups"]) + 1
                 ats = kw.get("AutotargetingSettings")
-                if isinstance(ats, dict):
+                if isinstance(ats, dict) and state == "ON":
                     out[cid]["enabledGroups"] = int(out[cid]["enabledGroups"]) + 1
                     for cat in ats.get("Categories") or []:
                         if isinstance(cat, dict) and cat.get("Selected") == "YES":
@@ -966,8 +1027,9 @@ def _fetch_feeds_map(feed_ids: List[int]) -> Dict[int, str]:
 def _fetch_geo_region_names(region_ids: List[int]) -> Dict[int, str]:
     if not region_ids:
         return {}
+    abs_ids = sorted({abs(int(r)) for r in region_ids})
     names: Dict[int, str] = {}
-    for part in _chunked([str(x) for x in region_ids], 500):
+    for part in _chunked([str(x) for x in abs_ids], 500):
         body = {
             "method": "getGeoRegions",
             "params": {
@@ -980,11 +1042,57 @@ def _fetch_geo_region_names(region_ids: List[int]) -> Dict[int, str]:
             for row in result.get("GeoRegions") or []:
                 rid = row.get("GeoRegionId")
                 if rid is not None:
-                    names[int(rid)] = str(row.get("GeoRegionName") or f"Регион {rid}")
+                    names[int(rid)] = str(row.get("GeoRegionName") or f"#{rid}")
         except RuntimeError as e:
             print(f"  [lime_direct] getGeoRegions skip: {e}")
             break
-    return names
+    out: Dict[int, str] = {}
+    for rid in region_ids:
+        abs_rid = abs(int(rid))
+        out[int(rid)] = names.get(abs_rid, f"#{abs_rid}")
+    return out
+
+
+def _format_regions_display(region_ids: List[int], geo_names: Dict[int, str]) -> str:
+    if not region_ids:
+        return ""
+    positives = sorted({int(r) for r in region_ids if int(r) > 0})
+    negatives = sorted({int(r) for r in region_ids if int(r) < 0}, key=abs)
+    if 225 in positives and negatives:
+        excluded = [geo_names.get(r, f"#{abs(r)}") for r in negatives]
+        return "Россия − " + ", − ".join(excluded)
+    parts: List[str] = []
+    for rid in sorted(region_ids, key=lambda x: (0 if x > 0 else 1, abs(x))):
+        name = geo_names.get(int(rid), f"#{abs(rid)}")
+        if int(rid) < 0:
+            parts.append(f"− {name}")
+        else:
+            parts.append(name)
+    return ", ".join(parts)
+
+
+def _fetch_offer_retargeting_flags(campaign_ids: List[str]) -> Dict[str, bool]:
+    """Офферный ретаргетинг через smartadtargets (CriterionType OFFER_RETARGETING)."""
+    out: Dict[str, bool] = {cid: False for cid in campaign_ids}
+    for part in _chunked(campaign_ids, 10):
+        body = {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {"CampaignIds": [int(x) for x in part]},
+                "FieldNames": ["Id", "CampaignId", "State", "CriterionType"],
+            },
+        }
+        try:
+            for row in _paginate_items(SMARTADTARGETS_URL, "SmartAdTargets", body):
+                cid = str(row.get("CampaignId", ""))
+                if cid not in out:
+                    continue
+                if str(row.get("CriterionType", "")) == "OFFER_RETARGETING" and str(row.get("State", "")) == "ON":
+                    out[cid] = True
+        except RuntimeError as e:
+            print(f"  [lime_direct] smartadtargets skip: {e}")
+            break
+    return out
 
 
 def _fetch_goals_map(counter_ids: List[int]) -> Dict[int, str]:
@@ -1022,13 +1130,20 @@ def _build_campaign_settings(
     feed_names: Dict[int, str],
     geo_names: Dict[int, str],
     goal_names: Dict[int, str],
+    offer_retargeting: bool,
     synced_at: str,
 ) -> Dict[str, Any]:
     regions: set[int] = set()
     offer_groups: List[Dict[str, Any]] = []
+    offer_retargeting_on = offer_retargeting
     for ag in adgroups:
         for rid in ag.get("regionIds") or []:
             regions.add(int(rid))
+        for rid in ag.get("restrictedRegionIds") or []:
+            rid_int = int(rid)
+            regions.add(-abs(rid_int) if rid_int > 0 else rid_int)
+        if ag.get("offerRetargeting") == "YES":
+            offer_retargeting_on = True
         ag_type = str(ag.get("type") or "")
         feed_id = ag.get("feedId")
         if ag_type == "SMART_AD_GROUP" or feed_id is not None:
@@ -1057,6 +1172,8 @@ def _build_campaign_settings(
             m["detail"] = retargeting_names.get(lid, m["detail"])
 
     strategy = dict(base.get("strategy") or {})
+    if strategy.get("priorityGoals"):
+        strategy["priorityGoals"] = [g for g in strategy["priorityGoals"] if int(g) != 13]
     for ch_key in ("search", "network"):
         ch = strategy.get(ch_key)
         if not isinstance(ch, dict):
@@ -1078,9 +1195,10 @@ def _build_campaign_settings(
 
     sorted_regions = sorted(regions)
     region_names = [
-        {"id": rid, "name": geo_names.get(rid, f"Регион {rid}")}
+        {"id": rid, "name": geo_names.get(rid, f"#{abs(rid)}")}
         for rid in sorted_regions
     ]
+    region_display = _format_regions_display(sorted_regions, geo_names)
 
     audience_view = []
     for t in audience_targets:
@@ -1104,6 +1222,8 @@ def _build_campaign_settings(
             **(base.get("targeting") or {}),
             "regions": sorted_regions,
             "regionNames": region_names,
+            "regionDisplay": region_display,
+            "offerRetargeting": offer_retargeting_on,
             "autotargeting": {
                 **autotargeting,
                 "totalGroups": len(adgroups),
@@ -1211,6 +1331,7 @@ def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> i
 
     geo_names = _fetch_geo_region_names(sorted(region_ids))
     goal_names = _fetch_goals_map(counter_ids)
+    offer_retargeting_map = _fetch_offer_retargeting_flags(campaign_ids)
 
     rows: List[Dict[str, Any]] = []
     for cid in campaign_ids:
@@ -1228,6 +1349,7 @@ def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> i
             feed_names,
             geo_names,
             goal_names,
+            offer_retargeting_map.get(cid, False),
             synced_at,
         )
         rows.append({
