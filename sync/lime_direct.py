@@ -834,35 +834,44 @@ def _fetch_retargetinglists_map(list_ids: List[int]) -> Dict[int, str]:
     return names
 
 
-def _fetch_autotargeting_by_campaign(campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {
-        cid: {"enabledGroups": 0, "totalGroups": 0, "categories": []} for cid in campaign_ids
-    }
+def _fetch_autotargeting_by_campaign(
+    campaign_ids: List[str],
+    adgroups_map: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, Dict[str, Any]]:
+    """Сводка автотаргетинга: totalGroups из adgroups; enabled — по keywords без лишних FieldNames."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for cid in campaign_ids:
+        total = len(adgroups_map.get(cid, []))
+        out[cid] = {"enabledGroups": 0, "totalGroups": total, "categories": []}
+
     categories_by_cid: Dict[str, set] = {cid: set() for cid in campaign_ids}
     for part in _chunked(campaign_ids, 5):
         body = {
             "method": "get",
             "params": {
                 "SelectionCriteria": {"CampaignIds": [int(x) for x in part]},
-                "FieldNames": ["Id", "AdGroupId", "CampaignId"],
-                "AutotargetingSettingsFieldNames": ["Categories", "BrandOptions"],
+                "FieldNames": ["Id", "AdGroupId", "CampaignId", "Keyword", "State"],
             },
         }
-        for kw in _paginate_items(KEYWORDS_URL, "Keywords", body):
-            cid = str(kw.get("CampaignId", ""))
-            if cid not in out:
-                continue
-            ats = kw.get("AutotargetingSettings")
-            if not isinstance(ats, dict):
-                continue
-            agid = kw.get("AdGroupId")
-            if agid is not None:
-                out[cid]["enabledGroups"] = int(out[cid]["enabledGroups"]) + 1
-            for cat in ats.get("Categories") or []:
-                if isinstance(cat, dict) and cat.get("Selected") == "YES":
-                    categories_by_cid[cid].add(str(cat.get("Category", "")))
-                elif isinstance(cat, str):
-                    categories_by_cid[cid].add(cat)
+        try:
+            for kw in _paginate_items(KEYWORDS_URL, "Keywords", body):
+                cid = str(kw.get("CampaignId", ""))
+                if cid not in out:
+                    continue
+                keyword = str(kw.get("Keyword") or "").strip().lower()
+                if keyword == "---autotargeting":
+                    out[cid]["enabledGroups"] = int(out[cid]["enabledGroups"]) + 1
+                ats = kw.get("AutotargetingSettings")
+                if isinstance(ats, dict):
+                    out[cid]["enabledGroups"] = int(out[cid]["enabledGroups"]) + 1
+                    for cat in ats.get("Categories") or []:
+                        if isinstance(cat, dict) and cat.get("Selected") == "YES":
+                            categories_by_cid[cid].add(str(cat.get("Category", "")))
+                        elif isinstance(cat, str):
+                            categories_by_cid[cid].add(cat)
+        except RuntimeError as e:
+            print(f"  [lime_direct] keywords/autotargeting skip: {e}")
+
     for cid in campaign_ids:
         out[cid]["categories"] = sorted(c for c in categories_by_cid[cid] if c)
     return out
@@ -1006,7 +1015,7 @@ def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> i
     adgroups_map = _fetch_adgroups_by_campaign(campaign_ids)
     bidmodifiers_map = _fetch_bidmodifiers_by_campaign(campaign_ids)
     audience_map = _fetch_audiencetargets_by_campaign(campaign_ids)
-    autotargeting_map = _fetch_autotargeting_by_campaign(campaign_ids)
+    autotargeting_map = _fetch_autotargeting_by_campaign(campaign_ids, adgroups_map)
 
     list_ids: set[int] = set()
     feed_ids: set[int] = set()
