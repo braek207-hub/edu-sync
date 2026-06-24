@@ -484,6 +484,36 @@ def _goal_ids_from_block(details: Dict[str, Any]) -> List[int]:
     return []
 
 
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        items = value.get("Items")
+        if isinstance(items, list):
+            return items
+    return []
+
+
+def _priority_goal_ids_from_block(block: Dict[str, Any]) -> List[int]:
+    out: List[int] = []
+    for pg in _as_list(block.get("PriorityGoals")):
+        if isinstance(pg, dict) and pg.get("GoalId") is not None:
+            out.append(int(pg["GoalId"]))
+        elif isinstance(pg, (int, float)):
+            out.append(int(pg))
+    return out
+
+
+def _counter_ids_from_block(block: Dict[str, Any]) -> List[int]:
+    out: List[int] = []
+    for counter in _as_list(block.get("CounterIds")):
+        if counter is not None:
+            out.append(int(counter))
+    return out
+
+
 def _extract_strategy_channel_full(strategy_block: Any) -> Dict[str, Any]:
     if not isinstance(strategy_block, dict):
         return {}
@@ -577,9 +607,9 @@ def _fetch_package_strategies_full(strategy_ids: List[int]) -> Tuple[Dict[int, D
                 "targetDrr": drr,
                 "goalIds": goal_ids,
             }
-            for counter in s.get("CounterIds") or []:
+            for counter in _counter_ids_from_block(s):
                 if counter is not None:
-                    counter_ids.append(int(counter))
+                    counter_ids.append(counter)
     return out, counter_ids
 
 
@@ -615,9 +645,8 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 break
 
         for block in (tc, uc, mc):
-            for counter in block.get("CounterIds") or []:
-                if counter is not None:
-                    counter_ids.add(int(counter))
+            for counter in _counter_ids_from_block(block):
+                counter_ids.add(counter)
 
         settings_opts: List[str] = []
         for block in (tc, uc, mc):
@@ -627,11 +656,7 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
 
         priority_goals: List[int] = []
         for block in (tc, uc, mc):
-            for pg in block.get("PriorityGoals") or []:
-                if isinstance(pg, dict) and pg.get("GoalId") is not None:
-                    priority_goals.append(int(pg["GoalId"]))
-                elif isinstance(pg, (int, float)):
-                    priority_goals.append(int(pg))
+            priority_goals.extend(_priority_goal_ids_from_block(block))
 
         placements: List[str] = []
         for key in (
