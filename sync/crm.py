@@ -75,7 +75,7 @@ def _payment_flag(raw: Any) -> int:
 def _sync_leads_raw(
     headers: List[str],
     values: List[List[Any]],
-    paid_by_lead_id: Dict[str, int] | None = None,
+    paid_by_lead_id: Dict[str, Dict[str, float]] | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Построчные лиды с сегментами — как GAS readCrmRawFromVals_.
 
@@ -183,6 +183,7 @@ def _sync_leads_raw(
                 "connections": 0.0,
                 "deals": 0.0,
                 "payments_from_leads": 0,
+                "revenue_from_leads": 0.0,
                 "project": "unknown",
                 "direction": "other",
                 "campaign_name": "",
@@ -200,10 +201,13 @@ def _sync_leads_raw(
                 bucket["connections"] += 1
         if li["deals"] != -1:
             bucket["deals"] += to_num(_cell(row, li["deals"]))
-        # Оплаты от лидов: join по leadId (Оплаты.«ID лида в SCRM» → Лиды.«ID»),
-        # приписываем оплату к дате создания лида. Колонки «Оплата» в Лидах нет.
+        # Оплаты+выручка от лидов: join по leadId (Оплаты.«ID лида в SCRM» → Лиды.«ID»),
+        # приписываем к дате создания лида. Колонки «Оплата» в Лидах нет.
         if paid_by_lead_id and lead_id:
-            bucket["payments_from_leads"] += paid_by_lead_id.get(lead_id, 0)
+            pm = paid_by_lead_id.get(lead_id)
+            if pm:
+                bucket["payments_from_leads"] += pm["count"]
+                bucket["revenue_from_leads"] += pm["revenue"]
 
     return agg, lead_dims_by_id
 
@@ -239,6 +243,7 @@ def _sync_leads_by_land(headers: List[str], values: List[List[Any]]) -> Dict[str
             ),
             "deals": int(to_num(_cell(row, li["deals"])) if li["deals"] != -1 else 0),
             "payments_from_leads": 0,
+            "revenue_from_leads": 0.0,
             "project": map_crm_land(land),
             "direction": detect_direction(land),
             "campaign_name": land,
@@ -260,6 +265,7 @@ def merge_leads_agg(
         dst["leads"] += src.get("leads", 0)
         dst["connections"] += src.get("connections", 0)
         dst["deals"] += src.get("deals", 0)
+        dst["revenue_from_leads"] = dst.get("revenue_from_leads", 0.0) + src.get("revenue_from_leads", 0.0)
         dst["payments_from_leads"] += src.get("payments_from_leads", 0)
         if not dst.get("campaign_name") and src.get("campaign_name"):
             dst["campaign_name"] = src["campaign_name"]
@@ -312,7 +318,7 @@ def _parse_leads_sheet(
     headers: List[str],
     values: List[List[Any]],
     sheet_name: str,
-    paid_by_lead_id: Dict[str, int] | None = None,
+    paid_by_lead_id: Dict[str, Dict[str, float]] | None = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dims]]:
     print(f"CRM Лиды [{sheet_name}]: заголовки = {headers[:12]}")
     lead_dims_by_id: Dict[str, Dims] = {}
@@ -351,13 +357,13 @@ def _load_all_lead_dims(
     return lead_dims_by_id
 
 
-def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, int]:
-    """leadId → число оплат (orders==1) из листов «Оплаты».
+def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, float]]:
+    """leadId → {count, revenue} из листов «Оплаты» (orders==1).
 
-    Источник признака оплаты лида: лист «Оплаты», колонка orders (==1) + колонка
-    «ID лида в SCRM». Используется для атрибуции оплат к дате создания лида.
+    Источник: лист «Оплаты», колонка orders (==1) + выручка + «ID лида в SCRM».
+    Используется для атрибуции оплат И выручки к дате создания лида.
     """
-    paid: Dict[str, int] = {}
+    paid: Dict[str, Dict[str, float]] = {}
     for sheet_name in crm_payments_sheets():
         try:
             values = read_sheet(service, spreadsheet_id, sheet_name)
@@ -370,6 +376,9 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, int]:
         i_orders = pick_index_loose(headers, ["orders", "оплат"])
         if len(headers) > 18 and re_match_orders(headers[18]):
             i_orders = 18
+        i_rev = pick_index_loose(headers, ["выручка", "revenue", "сумма", "оборот"])
+        if len(headers) > 17 and re_match_revenue(headers[17]):
+            i_rev = 17
         i_lead = pick_index_loose(headers, ["id лида в scrm", "lead id", "id лида"])
         if i_lead == -1:
             print(f"CRM Оплаты [{sheet_name}]: нет колонки ID лида — оплаты к лидам не привязать")
@@ -379,9 +388,15 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, int]:
             if not lead_id:
                 continue
             cnt = (1 if round(to_num(_cell(row, i_orders))) == 1 else 0) if i_orders != -1 else 1
-            if cnt:
-                paid[lead_id] = paid.get(lead_id, 0) + cnt
-    print(f"CRM Оплаты→лиды: {len(paid)} лидов с оплатами, всего оплат {sum(paid.values())}")
+            if not cnt:
+                continue
+            rev = to_num(_cell(row, i_rev)) if i_rev != -1 else 0.0
+            agg = paid.setdefault(lead_id, {"count": 0.0, "revenue": 0.0})
+            agg["count"] += cnt
+            agg["revenue"] += rev
+    total_c = sum(p["count"] for p in paid.values())
+    total_r = sum(p["revenue"] for p in paid.values())
+    print(f"CRM Оплаты→лиды: {len(paid)} лидов с оплатами, оплат {int(total_c)}, выручка {total_r:.0f}")
     return paid
 
 
@@ -539,6 +554,7 @@ def sync_crm_leads() -> int:
                 "connections": int(v["connections"]),
                 "deals": int(v["deals"]),
                 "payments_from_leads": int(v.get("payments_from_leads", 0)),
+                "revenue_from_leads": float(v.get("revenue_from_leads", 0.0)),
             }
         )
 
