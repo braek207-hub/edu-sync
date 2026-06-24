@@ -19,19 +19,31 @@ from typing import Any, Dict, List, Tuple
 
 import requests
 
-from sync.classify import map_crm_land
 from sync.crm import crm_leads_sheets, crm_payments_sheets, re_match_orders, re_match_revenue
 from sync.sheets import get_sheets_service, read_sheet
 from sync.utils import normalize_campaign_id, pick_index_loose, to_datetime_ms, to_num
 
 API_URL = "https://api-metrika.yandex.net/management/v1/counter/{counter}/offline_conversions/upload"
 
-# Счётчик Метрики по проекту/ленду (столбец «Ленд» → map_crm_land → проект).
-COUNTER_BY_PROJECT = {
-    "vuz": "98627983",
-    "vse": "96526110",
-    "provuz": "95348914",
-}
+COUNTER_VUZ = "98627983"
+COUNTER_VSE = "96526110"
+COUNTER_PROVUZ = "95348914"
+
+
+def _counter_for_land(land) -> str | None:
+    """Счётчик Метрики по ленду (столбец «Ленд»). Подстрочное сопоставление —
+    устойчивее строгого map_crm_land (значения вида vuz / vsekolledzhi_postupi /
+    provuz_postupi). provuz проверяем ДО vuz (provuz содержит vuz)."""
+    s = str(land or "").strip().lower()
+    if not s:
+        return None
+    if "provuz" in s:
+        return COUNTER_PROVUZ
+    if "vsekolled" in s or s == "vse":
+        return COUNTER_VSE
+    if "vuz" in s:
+        return COUNTER_VUZ
+    return None
 
 GOAL_CONNECTION = "connection"
 GOAL_DEAL = "deal"
@@ -97,6 +109,7 @@ def _collect_conversions(service, sid) -> List[Conversion]:
     pay = _load_payments_by_lead(service, sid)
     convs: List[Conversion] = []
     skipped_no_cid = 0
+    skipped_land: Dict[str, int] = {}  # ленды с ClientID, но без счётчика — диагностика
     for sheet in crm_leads_sheets():
         try:
             values = read_sheet(service, sid, sheet)
@@ -121,8 +134,11 @@ def _collect_conversions(service, sid) -> List[Conversion]:
             if not cid or cid == "0":
                 skipped_no_cid += 1
                 continue
-            counter = COUNTER_BY_PROJECT.get(map_crm_land(_cell(row, i_land)))
+            land = _cell(row, i_land)
+            counter = _counter_for_land(land)
             if not counter:
+                key = str(land).strip().lower()[:30] or "(пусто)"
+                skipped_land[key] = skipped_land.get(key, 0) + 1
                 continue
             lead = normalize_campaign_id(_cell(row, i_lead)) if i_lead != -1 else ""
             created_ts = _event_ts(_cell(row, i_created)) if i_created != -1 else None
@@ -137,7 +153,17 @@ def _collect_conversions(service, sid) -> List[Conversion]:
                 convs.append((counter, cid, GOAL_PAYMENT, pm["ts"] or created_ts, pm["revenue"], lead))
 
     convs = [c for c in convs if c[3]]  # без валидного ts не грузим
+    by_counter_cnt: Dict[str, int] = {}
+    by_target_cnt: Dict[str, int] = {}
+    for c in convs:
+        by_counter_cnt[c[0]] = by_counter_cnt.get(c[0], 0) + 1
+        by_target_cnt[c[2]] = by_target_cnt.get(c[2], 0) + 1
     print(f"Метрика: собрано {len(convs)} конверсий, пропущено {skipped_no_cid} лидов без ClientID")
+    print(f"  по целям: {by_target_cnt}")
+    print(f"  по счётчикам: {by_counter_cnt}")
+    if skipped_land:
+        top = sorted(skipped_land.items(), key=lambda x: -x[1])[:8]
+        print(f"  ленды без счётчика (с ClientID): {top}")
     return convs
 
 
