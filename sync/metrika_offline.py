@@ -129,6 +129,12 @@ def _collect_conversions(service, sid) -> List[Conversion]:
         if i_cid == -1 or i_land == -1:
             print(f"Метрика [{sheet}]: нет колонки ClientID/Ленд — пропуск листа")
             continue
+        land_sample = [str(_cell(r, i_land)).strip() for r in values[1:8]]
+        print(
+            f"Метрика [{sheet}]: индексы cid={i_cid} land={i_land} lead={i_lead} "
+            f"connect={i_connect} deal={i_deal} created={i_created}; "
+            f"заголовок land='{h[i_land] if i_land < len(h) else '?'}'; ленды-сэмпл={land_sample}"
+        )
         for row in values[1:]:
             cid = str(_cell(row, i_cid)).strip()
             if not cid or cid == "0":
