@@ -72,8 +72,17 @@ def _payment_flag(raw: Any) -> int:
     return 0
 
 
-def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
-    """Построчные лиды с сегментами — как GAS readCrmRawFromVals_."""
+def _sync_leads_raw(
+    headers: List[str],
+    values: List[List[Any]],
+    paid_by_lead_id: Dict[str, int] | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Построчные лиды с сегментами — как GAS readCrmRawFromVals_.
+
+    payments_from_leads считаем НЕ из листа «Лиды» (там нет колонки оплаты), а
+    join'ом по leadId: paid_by_lead_id[leadId] = число оплат из листа «Оплаты»
+    (orders==1), приписанных к дате создания лида.
+    """
     li = {
         "date": pick_index_loose(
             headers, ["date created", "дата создания", "дата", "date"]
@@ -191,8 +200,10 @@ def _sync_leads_raw(headers: List[str], values: List[List[Any]]) -> Dict[str, Di
                 bucket["connections"] += 1
         if li["deals"] != -1:
             bucket["deals"] += to_num(_cell(row, li["deals"]))
-        if li["payment_flag"] != -1:
-            bucket["payments_from_leads"] += _payment_flag(_cell(row, li["payment_flag"]))
+        # Оплаты от лидов: join по leadId (Оплаты.«ID лида в SCRM» → Лиды.«ID»),
+        # приписываем оплату к дате создания лида. Колонки «Оплата» в Лидах нет.
+        if paid_by_lead_id and lead_id:
+            bucket["payments_from_leads"] += paid_by_lead_id.get(lead_id, 0)
 
     return agg, lead_dims_by_id
 
@@ -298,13 +309,16 @@ def merge_payments_agg(
 
 
 def _parse_leads_sheet(
-    headers: List[str], values: List[List[Any]], sheet_name: str
+    headers: List[str],
+    values: List[List[Any]],
+    sheet_name: str,
+    paid_by_lead_id: Dict[str, int] | None = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dims]]:
     print(f"CRM Лиды [{sheet_name}]: заголовки = {headers[:12]}")
     lead_dims_by_id: Dict[str, Dims] = {}
     agg: Dict[str, Dict[str, Any]] = {}
     try:
-        agg, lead_dims_by_id = _sync_leads_raw(headers, values)
+        agg, lead_dims_by_id = _sync_leads_raw(headers, values, paid_by_lead_id)
         if agg:
             print(f"CRM Лиды [{sheet_name}]: режим построчный (utm campaign + сегменты)")
             return agg, lead_dims_by_id
@@ -335,6 +349,40 @@ def _load_all_lead_dims(
         except Exception:
             pass
     return lead_dims_by_id
+
+
+def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, int]:
+    """leadId → число оплат (orders==1) из листов «Оплаты».
+
+    Источник признака оплаты лида: лист «Оплаты», колонка orders (==1) + колонка
+    «ID лида в SCRM». Используется для атрибуции оплат к дате создания лида.
+    """
+    paid: Dict[str, int] = {}
+    for sheet_name in crm_payments_sheets():
+        try:
+            values = read_sheet(service, spreadsheet_id, sheet_name)
+        except Exception as e:
+            print(f"CRM Оплаты [{sheet_name}]: пропуск paid_by_lead — {e}")
+            continue
+        if len(values) < 2:
+            continue
+        headers = [str(x) for x in values[0]]
+        i_orders = pick_index_loose(headers, ["orders", "оплат"])
+        if len(headers) > 18 and re_match_orders(headers[18]):
+            i_orders = 18
+        i_lead = pick_index_loose(headers, ["id лида в scrm", "lead id", "id лида"])
+        if i_lead == -1:
+            print(f"CRM Оплаты [{sheet_name}]: нет колонки ID лида — оплаты к лидам не привязать")
+            continue
+        for row in values[1:]:
+            lead_id = normalize_campaign_id(_cell(row, i_lead))
+            if not lead_id:
+                continue
+            cnt = (1 if round(to_num(_cell(row, i_orders))) == 1 else 0) if i_orders != -1 else 1
+            if cnt:
+                paid[lead_id] = paid.get(lead_id, 0) + cnt
+    print(f"CRM Оплаты→лиды: {len(paid)} лидов с оплатами, всего оплат {sum(paid.values())}")
+    return paid
 
 
 def _parse_payments_sheet(
@@ -447,6 +495,10 @@ def sync_crm_leads() -> int:
     sheet_names = crm_leads_sheets()
     print(f"CRM Лиды: листы = {sheet_names}")
 
+    # Признак оплаты лида берём из листа «Оплаты» (orders==1) и приписываем к дате
+    # создания лида по leadId — в самом листе «Лиды» колонки оплаты нет.
+    paid_by_lead_id = _load_paid_by_lead_id(service, spreadsheet_id)
+
     lead_dims_by_id: Dict[str, Dims] = {}
     agg: Dict[str, Dict[str, Any]] = {}
 
@@ -460,7 +512,7 @@ def sync_crm_leads() -> int:
             print(f"CRM Лиды [{sheet_name}]: пустой лист или только заголовок")
             continue
         headers = [str(x) for x in values[0]]
-        sheet_agg, sheet_dims = _parse_leads_sheet(headers, values, sheet_name)
+        sheet_agg, sheet_dims = _parse_leads_sheet(headers, values, sheet_name, paid_by_lead_id)
         if not sheet_agg:
             continue
         merge_leads_agg(agg, sheet_agg)
