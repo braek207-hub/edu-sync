@@ -263,7 +263,7 @@ def _fetch_report(
 
     rows: List[Dict[str, Any]] = []
     reader = csv.DictReader(io.StringIO(r.text), delimiter="\t")
-    conv_cols = {f"Conversions_{gid}_LSC": key for gid, key in id_to_key.items()}
+    conv_cols = {f"Conversions_{gid}_LSC": gid for gid, _key in id_to_key.items()}
 
     for row in reader:
         cid = str(row.get("CampaignId", "")).strip()
@@ -282,9 +282,12 @@ def _fetch_report(
             "avg_click_position": _num(row.get("AvgClickPosition")),
             "bounce_rate": _num(row.get("BounceRate")),
             "avg_pageviews": _num(row.get("AvgPageviews")),
+            "conversions": {},
         }
-        for col, key in conv_cols.items():
-            item[key] = _int(row.get(col))
+        for col, gid in conv_cols.items():
+            val = _int(row.get(col))
+            if val:
+                item["conversions"][gid] = val
         rows.append(item)
     return rows
 
@@ -733,7 +736,10 @@ def _fetch_bidmodifiers_by_campaign(campaign_ids: List[str]) -> Dict[str, List[D
         body = {
             "method": "get",
             "params": {
-                "SelectionCriteria": {"CampaignIds": [int(x) for x in part]},
+                "SelectionCriteria": {
+                    "CampaignIds": [int(x) for x in part],
+                    "Levels": ["CAMPAIGN", "AD_GROUP"],
+                },
                 "FieldNames": ["Id", "CampaignId", "AdGroupId", "Level", "Type"],
                 "MobileAdjustmentFieldNames": ["BidModifier"],
                 "TabletAdjustmentFieldNames": ["BidModifier"],
@@ -1055,8 +1061,7 @@ _UPSERT_SQL = """
        avg_impression_position, avg_click_position,
        bounce_rate, avg_pageviews,
        weekly_budget, daily_budget, target_cpa,
-       web_cart, web_checkout, web_purchase,
-       app_cart, app_checkout, app_purchase,
+       conversions,
        state, status, campaign_type, updated_at)
     VALUES
       (%(date)s, %(campaign_id)s, %(campaign_name)s, %(client_login)s,
@@ -1065,8 +1070,7 @@ _UPSERT_SQL = """
        %(avg_impression_position)s, %(avg_click_position)s,
        %(bounce_rate)s, %(avg_pageviews)s,
        %(weekly_budget)s, %(daily_budget)s, %(target_cpa)s,
-       %(web_cart)s, %(web_checkout)s, %(web_purchase)s,
-       %(app_cart)s, %(app_checkout)s, %(app_purchase)s,
+       %(conversions)s::jsonb,
        %(state)s, %(status)s, %(campaign_type)s, NOW())
     ON CONFLICT (date, campaign_id) DO UPDATE SET
        campaign_name = EXCLUDED.campaign_name,
@@ -1083,12 +1087,7 @@ _UPSERT_SQL = """
        weekly_budget = EXCLUDED.weekly_budget,
        daily_budget = EXCLUDED.daily_budget,
        target_cpa = EXCLUDED.target_cpa,
-       web_cart = EXCLUDED.web_cart,
-       web_checkout = EXCLUDED.web_checkout,
-       web_purchase = EXCLUDED.web_purchase,
-       app_cart = EXCLUDED.app_cart,
-       app_checkout = EXCLUDED.app_checkout,
-       app_purchase = EXCLUDED.app_purchase,
+       conversions = EXCLUDED.conversions,
        state = EXCLUDED.state,
        status = EXCLUDED.status,
        campaign_type = EXCLUDED.campaign_type,
@@ -1143,12 +1142,7 @@ def sync_lime_direct(days_back: int = 7) -> int:
             "state": c.get("state"),
             "status": c.get("status"),
             "campaign_type": c.get("campaign_type"),
-            "web_cart": r.get("web_cart", 0),
-            "web_checkout": r.get("web_checkout", 0),
-            "web_purchase": r.get("web_purchase", 0),
-            "app_cart": r.get("app_cart", 0),
-            "app_checkout": r.get("app_checkout", 0),
-            "app_purchase": r.get("app_purchase", 0),
+            "conversions": json.dumps(r.get("conversions") or {}, ensure_ascii=False),
         })
 
     n = _upsert(merged)
