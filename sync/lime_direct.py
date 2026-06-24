@@ -116,18 +116,6 @@ GEO_REGION_EN_TO_RU: Dict[str, str] = {
     "Southern Federal District": "Южный федеральный округ",
 }
 
-_CAMPAIGN_STRATEGY_FIELDS: Dict[str, List[str]] = {
-    "StrategyMaximumClicksFieldNames": ["WeeklySpendLimit", "BidCeiling", "CustomPeriodBudget", "BudgetType"],
-    "StrategyMaximumConversionRateFieldNames": ["WeeklySpendLimit", "BidCeiling", "GoalId", "CustomPeriodBudget", "BudgetType"],
-    "StrategyAverageCpcFieldNames": ["AverageCpc", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
-    "StrategyAverageCpaFieldNames": ["AverageCpa", "GoalId", "WeeklySpendLimit", "BidCeiling", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
-    "StrategyAverageCpaMultipleGoalsFieldNames": ["WeeklySpendLimit", "BidCeiling", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
-    "StrategyPayForConversionFieldNames": ["Cpa", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
-    "StrategyPayForConversionMultipleGoalsFieldNames": ["GoalId", "WeeklySpendLimit", "CustomPeriodBudget"],
-    "StrategyAverageCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
-    "StrategyPayForConversionCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
-}
-
 
 def _geo_region_label(rid: int, api_name: str) -> str:
     abs_rid = abs(int(rid))
@@ -675,7 +663,9 @@ def _fetch_package_strategies_full(strategy_ids: List[int]) -> Tuple[Dict[int, D
         "StrategyMaximumConversionRateFieldNames": ["WeeklySpendLimit", "BidCeiling", "GoalId", "CustomPeriodBudget", "BudgetType"],
         "StrategyAverageCpcFieldNames": ["AverageCpc", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
         "StrategyAverageCpaFieldNames": ["AverageCpa", "GoalId", "WeeklySpendLimit", "BidCeiling", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
+        "StrategyAverageCpaMultipleGoalsFieldNames": ["WeeklySpendLimit", "BidCeiling", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
         "StrategyPayForConversionFieldNames": ["Cpa", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
+        "StrategyPayForConversionMultipleGoalsFieldNames": ["GoalId", "WeeklySpendLimit", "CustomPeriodBudget"],
         "StrategyAverageCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "ExplorationBudget", "CustomPeriodBudget", "BudgetType"],
         "StrategyPayForConversionCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
     }
@@ -833,7 +823,6 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
                     "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
                 ],
-                **_CAMPAIGN_STRATEGY_FIELDS,
             },
         }
         result = _direct_post(CAMPAIGNS_URL, body)
@@ -894,7 +883,6 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                     "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
                         "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
                     ],
-                    **_CAMPAIGN_STRATEGY_FIELDS,
                 },
             }
             try:
