@@ -129,18 +129,16 @@ def _collect_conversions(service, sid) -> List[Conversion]:
         if i_cid == -1 or i_land == -1:
             print(f"Метрика [{sheet}]: нет колонки ClientID/Ленд — пропуск листа")
             continue
-        land_dist: Dict[str, int] = {}
-        camp_sample = []
+        land_total: Dict[str, int] = {}
+        land_with_cid: Dict[str, int] = {}
         for r in values[1:]:
             lv = str(_cell(r, i_land)).strip().lower() or "(пусто)"
-            land_dist[lv] = land_dist.get(lv, 0) + 1
-        i_camp = pick_index_loose(h, ["utm campaign", "utm_campaign", "campaign", "кампания"])
-        camp_sample = [str(_cell(r, i_camp)).strip() for r in values[1:6]] if i_camp != -1 else []
-        print(
-            f"Метрика [{sheet}]: land col='{h[i_land] if i_land < len(h) else '?'}' (idx {i_land}); "
-            f"распределение лендов (топ): {sorted(land_dist.items(), key=lambda x: -x[1])[:10]}; "
-            f"utm_campaign idx={i_camp} сэмпл={camp_sample}"
-        )
+            land_total[lv] = land_total.get(lv, 0) + 1
+            cv = str(_cell(r, i_cid)).strip()
+            if cv and cv != "0":
+                land_with_cid[lv] = land_with_cid.get(lv, 0) + 1
+        report = [(k, land_with_cid.get(k, 0), v) for k, v in sorted(land_total.items(), key=lambda x: -x[1])[:8]]
+        print(f"Метрика [{sheet}]: ленд → (с ClientID / всего): {report}")
         for row in values[1:]:
             cid = str(_cell(row, i_cid)).strip()
             if not cid or cid == "0":
