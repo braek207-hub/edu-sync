@@ -52,11 +52,14 @@ def _client_login() -> str:
 def _headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {_token()}",
+        "Client-Login": _client_login(),
         "Accept-Language": "ru",
         "processingMode": "auto",
         "returnMoneyInMicros": "false",
+        "skipReportHeader": "true",
+        "skipColumnHeader": "true",
+        "skipReportSummary": "true",
         "Content-Type": "application/json",
-        "Client-Login": _client_login(),
     }
 
 
@@ -90,20 +93,22 @@ def _fetch_report(date_from: str, date_to: str) -> List[Dict[str, Any]]:
         raise RuntimeError("Reports API: превышено число попыток")
 
     rows: List[Dict[str, Any]] = []
-    reader = csv.DictReader(io.StringIO(r.text), delimiter="\t")
-    for row in reader:
-        cid = str(row.get("CampaignId", "")).strip()
+    reader = csv.reader(io.StringIO(r.text.lstrip("\ufeff")), delimiter="\t")
+    for parts in reader:
+        if len(parts) < 6:
+            continue
+        cid = str(parts[1]).strip()
         if not cid or cid == "--":
             continue
         rows.append(
             {
-                "date": str(row.get("Date", "")).strip(),
+                "date": str(parts[0]).strip(),
                 "campaign_id": cid,
-                "campaign_name": str(row.get("CampaignName", "")).strip() or None,
+                "campaign_name": str(parts[2]).strip() or None,
                 "client_login": _client_login(),
-                "cost": float(row.get("Cost") or 0),
-                "clicks": int(float(row.get("Clicks") or 0)),
-                "impressions": int(float(row.get("Impressions") or 0)),
+                "cost": float(parts[5] or 0),
+                "clicks": int(float(parts[4] or 0)),
+                "impressions": int(float(parts[3] or 0)),
             }
         )
     return rows
