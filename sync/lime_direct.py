@@ -117,6 +117,12 @@ GEO_REGION_EN_TO_RU: Dict[str, str] = {
 }
 
 
+_CRR_STRATEGY_FIELD_NAMES: Dict[str, List[str]] = {
+    "StrategyAverageCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "BudgetType"],
+    "StrategyPayForConversionCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "BudgetType"],
+}
+
+
 def _geo_region_label(rid: int, api_name: str) -> str:
     abs_rid = abs(int(rid))
     return GEO_REGION_RU.get(abs_rid) or GEO_REGION_EN_TO_RU.get(api_name, api_name)
@@ -597,30 +603,38 @@ def _enrich_channel_crr(ch: Dict[str, Any], raw_block: Any) -> Dict[str, Any]:
     return ch
 
 
-def _priority_goals_details_from_block(block: Dict[str, Any], bid_kind: str = "cpa") -> List[Dict[str, Any]]:
+def _priority_goals_details_from_block(
+    block: Dict[str, Any],
+    *,
+    is_crr_strategy: bool = False,
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for pg in _as_list(block.get("PriorityGoals")):
         if isinstance(pg, dict) and pg.get("GoalId") is not None:
             gid = int(pg["GoalId"])
             if gid == 13:
                 continue
-            # Value — ценность конверсии в валюте (микро), не ДРР.
             entry: Dict[str, Any] = {"goalId": gid, "bidKind": "cpa"}
-            val = pg.get("Value")
-            if val is not None:
-                entry["bidValue"] = _micros_to_float(int(val))
+            if not is_crr_strategy:
+                val = pg.get("Value")
+                if val is not None:
+                    entry["bidValue"] = _micros_to_float(int(val))
             out.append(entry)
         elif isinstance(pg, (int, float)):
             gid = int(pg)
             if gid != 13:
-                out.append({"goalId": gid, "bidKind": bid_kind, "bidValue": None})
+                out.append({"goalId": gid, "bidKind": "cpa", "bidValue": None})
     return out
 
 
-def _merge_priority_goals_details(blocks: List[Dict[str, Any]], bid_kind: str) -> List[Dict[str, Any]]:
+def _merge_priority_goals_details(
+    blocks: List[Dict[str, Any]],
+    *,
+    is_crr_strategy: bool = False,
+) -> List[Dict[str, Any]]:
     merged: Dict[int, Dict[str, Any]] = {}
     for block in blocks:
-        for item in _priority_goals_details_from_block(block, bid_kind):
+        for item in _priority_goals_details_from_block(block, is_crr_strategy=is_crr_strategy):
             merged[int(item["goalId"])] = item
     return list(merged.values())
 
@@ -790,7 +804,10 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
             (network_ch or {}).get("biddingStrategyType")
             or (search_ch or {}).get("biddingStrategyType")
         )
-        priority_goals_details = _merge_priority_goals_details([tc, uc, mc], bid_kind)
+        priority_goals_details = _merge_priority_goals_details(
+            [tc, uc, mc],
+            is_crr_strategy=(bid_kind == "drr"),
+        )
 
         placements: List[str] = []
         for key in (
@@ -846,9 +863,14 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
                     "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
                 ],
+                **_CRR_STRATEGY_FIELD_NAMES,
             },
         }
-        result = _direct_post(CAMPAIGNS_URL, body)
+        try:
+            result = _direct_post(CAMPAIGNS_URL, body)
+        except RuntimeError:
+            body["params"] = {k: v for k, v in body["params"].items() if k not in _CRR_STRATEGY_FIELD_NAMES}
+            result = _direct_post(CAMPAIGNS_URL, body)
         for c in result.get("Campaigns") or []:
             _parse_campaign(c)
 
@@ -913,10 +935,17 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                     "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
                         "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
                     ],
+                    **_CRR_STRATEGY_FIELD_NAMES,
                 },
             }
             try:
-                result_retry = _direct_post(CAMPAIGNS_URL, body_retry)
+                try:
+                    result_retry = _direct_post(CAMPAIGNS_URL, body_retry)
+                except RuntimeError:
+                    body_retry["params"] = {
+                        k: v for k, v in body_retry["params"].items() if k not in _CRR_STRATEGY_FIELD_NAMES
+                    }
+                    result_retry = _direct_post(CAMPAIGNS_URL, body_retry)
                 for c in result_retry.get("Campaigns") or []:
                     _parse_campaign(c)
             except RuntimeError as e:
