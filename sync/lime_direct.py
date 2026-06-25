@@ -118,8 +118,23 @@ GEO_REGION_EN_TO_RU: Dict[str, str] = {
 
 
 _CRR_STRATEGY_FIELD_NAMES: Dict[str, List[str]] = {
-    "StrategyAverageCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "BudgetType"],
-    "StrategyPayForConversionCrrFieldNames": ["Crr", "GoalId", "WeeklySpendLimit", "BudgetType"],
+    "StrategyAverageCrrFieldNames": [
+        "Crr", "GoalId", "WeeklySpendLimit", "ExplorationBudget", "CustomPeriodBudget", "BudgetType",
+    ],
+    "StrategyPayForConversionCrrFieldNames": [
+        "Crr", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType",
+    ],
+}
+
+_STRATEGY_DETAIL_FIELD_NAMES: Dict[str, List[str]] = {
+    "StrategyMaximumClicksFieldNames": ["WeeklySpendLimit", "BidCeiling", "CustomPeriodBudget", "BudgetType"],
+    "StrategyMaximumConversionRateFieldNames": ["WeeklySpendLimit", "BidCeiling", "GoalId", "CustomPeriodBudget", "BudgetType"],
+    "StrategyAverageCpcFieldNames": ["AverageCpc", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
+    "StrategyAverageCpaFieldNames": [
+        "AverageCpa", "GoalId", "WeeklySpendLimit", "BidCeiling", "ExplorationBudget", "CustomPeriodBudget", "BudgetType",
+    ],
+    "StrategyPayForConversionFieldNames": ["Cpa", "GoalId", "WeeklySpendLimit", "CustomPeriodBudget", "BudgetType"],
+    **_CRR_STRATEGY_FIELD_NAMES,
 }
 
 
@@ -244,10 +259,18 @@ def _weekly_from_details(details: Dict[str, Any]) -> Optional[float]:
 
 
 def _crr_to_drr_percent(crr: Any) -> Optional[float]:
-    """ДРР: Crr в API — доля в микро (1_000_000 = 100%)."""
-    frac = _micros_to_float(crr)
-    if frac is None:
+    """ДРР: Crr в API — доля × 1_000_000 (150000 = 15%) или целый процент (15)."""
+    if crr is None:
         return None
+    try:
+        val = int(crr)
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    if val <= 100:
+        return round(float(val), 2)
+    frac = val / 1_000_000.0
     return round(frac * 100, 2)
 
 
@@ -603,6 +626,87 @@ def _enrich_channel_crr(ch: Dict[str, Any], raw_block: Any) -> Dict[str, Any]:
     return ch
 
 
+def _apply_crr_to_row(row: Dict[str, Any], tc_bs: Dict[str, Any], uc_bs: Dict[str, Any], mc_bs: Dict[str, Any]) -> None:
+    """Дозаполняет targetDrr из сырого BiddingStrategy без полного перепарса кампании."""
+    strat = row.get("strategy") or {}
+    pairs = (
+        ("search", tc_bs.get("Search") or uc_bs.get("Search") or mc_bs.get("Search")),
+        ("network", tc_bs.get("Network") or uc_bs.get("Network") or mc_bs.get("Network")),
+    )
+    for ch_key, raw in pairs:
+        ch = strat.get(ch_key)
+        if not isinstance(ch, dict):
+            continue
+        bs = str(ch.get("biddingStrategyType") or "")
+        if "CRR" not in bs.upper() or ch.get("targetDrr"):
+            continue
+        drr = _crr_from_raw_strategy_block(raw)
+        if drr is not None:
+            ch["targetDrr"] = drr
+
+
+def _backfill_missing_crr(out: Dict[str, Dict[str, Any]], campaign_ids: List[str]) -> None:
+    missing: List[str] = []
+    for cid in campaign_ids:
+        row = out.get(cid)
+        if not row:
+            continue
+        strat = row.get("strategy") or {}
+        for ch_key in ("network", "search"):
+            ch = strat.get(ch_key)
+            if not isinstance(ch, dict):
+                continue
+            bs = str(ch.get("biddingStrategyType") or "")
+            if "CRR" in bs.upper() and not ch.get("targetDrr"):
+                missing.append(cid)
+                break
+    if not missing:
+        return
+
+    print(f"  [lime_direct] CRR backfill для {len(missing)} кампаний")
+    field_names = ["Id"]
+    type_fields = ["BiddingStrategy"]
+    for part in _chunked(missing, 100):
+        body = {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {"Ids": [int(x) for x in part]},
+                "FieldNames": field_names,
+                "TextCampaignFieldNames": type_fields,
+                "UnifiedCampaignFieldNames": type_fields,
+                "MobileAppCampaignFieldNames": type_fields,
+                **_STRATEGY_DETAIL_FIELD_NAMES,
+            },
+        }
+        try:
+            result = _direct_post(CAMPAIGNS_URL, body)
+        except RuntimeError as e:
+            print(f"  [lime_direct] CRR backfill campaigns.get: {e}")
+            continue
+        for c in result.get("Campaigns") or []:
+            cid = str(c.get("Id", ""))
+            row = out.get(cid)
+            if not row:
+                continue
+            tc_bs = (c.get("TextCampaign") or {}).get("BiddingStrategy") or {}
+            uc_bs = (c.get("UnifiedCampaign") or {}).get("BiddingStrategy") or {}
+            mc_bs = (c.get("MobileAppCampaign") or {}).get("BiddingStrategy") or {}
+            _apply_crr_to_row(row, tc_bs, uc_bs, mc_bs)
+
+    still_missing = 0
+    for cid in missing:
+        row = out.get(cid) or {}
+        strat = row.get("strategy") or {}
+        for ch_key in ("network", "search"):
+            ch = strat.get(ch_key)
+            if isinstance(ch, dict) and "CRR" in str(ch.get("biddingStrategyType") or "").upper():
+                if not ch.get("targetDrr"):
+                    still_missing += 1
+                    break
+    if still_missing:
+        print(f"  [lime_direct] WARN: Crr не получен для {still_missing} CRR-кампаний")
+
+
 def _priority_goals_details_from_block(
     block: Dict[str, Any],
     *,
@@ -868,7 +972,8 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
         }
         try:
             result = _direct_post(CAMPAIGNS_URL, body)
-        except RuntimeError:
+        except RuntimeError as e:
+            print(f"  [lime_direct] campaigns.get без CRR-полей: {e}")
             body["params"] = {k: v for k, v in body["params"].items() if k not in _CRR_STRATEGY_FIELD_NAMES}
             result = _direct_post(CAMPAIGNS_URL, body)
         for c in result.get("Campaigns") or []:
@@ -888,6 +993,7 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                     "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
                         "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
                     ],
+                    **_CRR_STRATEGY_FIELD_NAMES,
                 },
             }
             try:
@@ -913,6 +1019,8 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 bs = str(ch.get("biddingStrategyType") or "")
                 if "CRR" in bs.upper() and not ch.get("targetDrr") and full.get("targetDrr"):
                     ch["targetDrr"] = full["targetDrr"]
+
+    _backfill_missing_crr(out, campaign_ids)
 
     missing = [cid for cid in campaign_ids if cid not in out]
     if missing:
