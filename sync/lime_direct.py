@@ -572,6 +572,31 @@ def _priority_goal_ids_from_block(block: Dict[str, Any]) -> List[int]:
     return out
 
 
+def _crr_from_raw_strategy_block(block: Any) -> Optional[float]:
+    """Crr из сырого блока Network/Search (AverageCrr и т.п.)."""
+    if not isinstance(block, dict):
+        return None
+    for key in (
+        "AverageCrr", "PayForConversionCrr",
+        "AverageCrrMultipleGoals", "PayForConversionCrrMultipleGoals",
+    ):
+        sub = block.get(key)
+        if isinstance(sub, dict) and sub.get("Crr") is not None:
+            drr = _crr_to_drr_percent(sub.get("Crr"))
+            if drr is not None and drr > 0:
+                return drr
+    return None
+
+
+def _enrich_channel_crr(ch: Dict[str, Any], raw_block: Any) -> Dict[str, Any]:
+    if ch.get("targetDrr"):
+        return ch
+    drr = _crr_from_raw_strategy_block(raw_block)
+    if drr is not None:
+        ch["targetDrr"] = drr
+    return ch
+
+
 def _priority_goals_details_from_block(block: Dict[str, Any], bid_kind: str = "cpa") -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for pg in _as_list(block.get("PriorityGoals")):
@@ -579,13 +604,11 @@ def _priority_goals_details_from_block(block: Dict[str, Any], bid_kind: str = "c
             gid = int(pg["GoalId"])
             if gid == 13:
                 continue
-            entry: Dict[str, Any] = {"goalId": gid, "bidKind": bid_kind}
+            # Value — ценность конверсии в валюте (микро), не ДРР.
+            entry: Dict[str, Any] = {"goalId": gid, "bidKind": "cpa"}
             val = pg.get("Value")
             if val is not None:
-                if bid_kind == "drr":
-                    entry["bidValue"] = _crr_to_drr_percent(int(val))
-                else:
-                    entry["bidValue"] = _micros_to_float(int(val))
+                entry["bidValue"] = _micros_to_float(int(val))
             out.append(entry)
         elif isinstance(pg, (int, float)):
             gid = int(pg)
@@ -761,6 +784,8 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
 
         network_ch = _extract_strategy_channel_full(tc_bs.get("Network") or uc_bs.get("Network") or mc_bs.get("Network"))
         search_ch = _extract_strategy_channel_full(tc_bs.get("Search") or uc_bs.get("Search") or mc_bs.get("Search"))
+        network_ch = _enrich_channel_crr(network_ch, tc_bs.get("Network") or uc_bs.get("Network") or mc_bs.get("Network"))
+        search_ch = _enrich_channel_crr(search_ch, tc_bs.get("Search") or uc_bs.get("Search") or mc_bs.get("Search"))
         bid_kind = _infer_bid_kind(
             (network_ch or {}).get("biddingStrategyType")
             or (search_ch or {}).get("biddingStrategyType")
@@ -859,6 +884,13 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
         full = packages.get(int(pkg["id"]))
         if full:
             row["strategy"]["package"] = full
+            for ch_key in ("network", "search"):
+                ch = row["strategy"].get(ch_key)
+                if not isinstance(ch, dict):
+                    continue
+                bs = str(ch.get("biddingStrategyType") or "")
+                if "CRR" in bs.upper() and not ch.get("targetDrr") and full.get("targetDrr"):
+                    ch["targetDrr"] = full["targetDrr"]
 
     missing = [cid for cid in campaign_ids if cid not in out]
     if missing:
