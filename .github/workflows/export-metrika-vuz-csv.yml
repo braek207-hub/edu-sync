@@ -1,0 +1,48 @@
+name: Export Metrika VUZ CSV
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Окно в днях"
+        required: false
+        default: "21"
+        type: string
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Create Google SA key file
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: printf '%s' "$GCP_SA_KEY" > sa.json
+
+      - name: Export CSV
+        env:
+          PYTHONUNBUFFERED: "1"
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
+          CRM_LEADS_SHEETS: "Лиды,Лиды 2025"
+          CRM_PAYMENTS_SHEETS: "Оплаты,Оплаты 2025"
+        run: |
+          python scripts/export_metrika_vuz_csv.py \
+            --days "${{ github.event.inputs.days || '21' }}" \
+            --out exports/vuz_offline_manual.csv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vuz-offline-csv
+          path: exports/vuz_offline_manual.csv
+          retention-days: 7
