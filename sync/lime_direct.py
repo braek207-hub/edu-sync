@@ -663,35 +663,50 @@ def _backfill_missing_crr(out: Dict[str, Dict[str, Any]], campaign_ids: List[str
     if not missing:
         return
 
-    print(f"  [lime_direct] CRR backfill для {len(missing)} кампаний")
-    field_names = ["Id"]
+    print(f"  [lime_direct] CRR backfill для {len(missing)} кампаний (v501 campaigns.get)")
     type_fields = ["BiddingStrategy"]
     for part in _chunked(missing, 100):
-        body = {
-            "method": "get",
-            "params": {
-                "SelectionCriteria": {"Ids": [int(x) for x in part]},
-                "FieldNames": field_names,
-                "TextCampaignFieldNames": type_fields,
-                "UnifiedCampaignFieldNames": type_fields,
-                "MobileAppCampaignFieldNames": type_fields,
-                **_STRATEGY_DETAIL_FIELD_NAMES,
-            },
-        }
-        try:
-            result = _direct_post(CAMPAIGNS_URL, body)
-        except RuntimeError as e:
-            print(f"  [lime_direct] CRR backfill campaigns.get: {e}")
-            continue
-        for c in result.get("Campaigns") or []:
-            cid = str(c.get("Id", ""))
-            row = out.get(cid)
-            if not row:
+        for url in (CAMPAIGNS_V501_URL, CAMPAIGNS_URL):
+            body = {
+                "method": "get",
+                "params": {
+                    "SelectionCriteria": {"Ids": [int(x) for x in part]},
+                    "FieldNames": ["Id"],
+                    "TextCampaignFieldNames": type_fields,
+                    "UnifiedCampaignFieldNames": type_fields,
+                    "MobileAppCampaignFieldNames": type_fields,
+                },
+            }
+            try:
+                result = _direct_post(url, body)
+            except RuntimeError as e:
+                print(f"  [lime_direct] CRR backfill {url}: {e}")
                 continue
-            tc_bs = (c.get("TextCampaign") or {}).get("BiddingStrategy") or {}
-            uc_bs = (c.get("UnifiedCampaign") or {}).get("BiddingStrategy") or {}
-            mc_bs = (c.get("MobileAppCampaign") or {}).get("BiddingStrategy") or {}
-            _apply_crr_to_row(row, tc_bs, uc_bs, mc_bs)
+            for c in result.get("Campaigns") or []:
+                cid = str(c.get("Id", ""))
+                row = out.get(cid)
+                if not row:
+                    continue
+                tc_bs = (c.get("TextCampaign") or {}).get("BiddingStrategy") or {}
+                uc_bs = (c.get("UnifiedCampaign") or {}).get("BiddingStrategy") or {}
+                mc_bs = (c.get("MobileAppCampaign") or {}).get("BiddingStrategy") or {}
+                _apply_crr_to_row(row, tc_bs, uc_bs, mc_bs)
+                if not (row.get("strategy") or {}).get("network", {}).get("targetDrr") and not (
+                    row.get("strategy") or {}
+                ).get("search", {}).get("targetDrr"):
+                    for raw in (
+                        tc_bs.get("Network"),
+                        uc_bs.get("Network"),
+                        tc_bs.get("Search"),
+                        uc_bs.get("Search"),
+                    ):
+                        if isinstance(raw, dict):
+                            ac = raw.get("AverageCrr") or raw.get("PayForConversionCrr")
+                            if isinstance(ac, dict) and not ac.get("Crr"):
+                                print(
+                                    f"  [lime_direct] AverageCrr без Crr, cid={cid}, keys={list(ac.keys())}"
+                                )
+                                break
 
     still_missing = 0
     for cid in missing:
@@ -967,15 +982,9 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
                     "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
                 ],
-                **_CRR_STRATEGY_FIELD_NAMES,
             },
         }
-        try:
-            result = _direct_post(CAMPAIGNS_URL, body)
-        except RuntimeError as e:
-            print(f"  [lime_direct] campaigns.get без CRR-полей: {e}")
-            body["params"] = {k: v for k, v in body["params"].items() if k not in _CRR_STRATEGY_FIELD_NAMES}
-            result = _direct_post(CAMPAIGNS_URL, body)
+        result = _direct_post(CAMPAIGNS_URL, body)
         for c in result.get("Campaigns") or []:
             _parse_campaign(c)
 
@@ -993,7 +1002,6 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                     "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
                         "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
                     ],
-                    **_CRR_STRATEGY_FIELD_NAMES,
                 },
             }
             try:
@@ -1020,8 +1028,6 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 if "CRR" in bs.upper() and not ch.get("targetDrr") and full.get("targetDrr"):
                     ch["targetDrr"] = full["targetDrr"]
 
-    _backfill_missing_crr(out, campaign_ids)
-
     missing = [cid for cid in campaign_ids if cid not in out]
     if missing:
         print(f"  [lime_direct] WARN: campaigns.get не вернул {len(missing)} кампаний")
@@ -1043,22 +1049,21 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                     "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
                         "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
                     ],
-                    **_CRR_STRATEGY_FIELD_NAMES,
                 },
             }
             try:
                 try:
                     result_retry = _direct_post(CAMPAIGNS_URL, body_retry)
-                except RuntimeError:
-                    body_retry["params"] = {
-                        k: v for k, v in body_retry["params"].items() if k not in _CRR_STRATEGY_FIELD_NAMES
-                    }
-                    result_retry = _direct_post(CAMPAIGNS_URL, body_retry)
+                except RuntimeError as e:
+                    print(f"  [lime_direct] campaigns.get retry: {e}")
+                    break
                 for c in result_retry.get("Campaigns") or []:
                     _parse_campaign(c)
             except RuntimeError as e:
                 print(f"  [lime_direct] campaigns.get retry: {e}")
                 break
+
+    _backfill_missing_crr(out, campaign_ids)
 
     out["_counter_ids"] = sorted(counter_ids)
     return out
