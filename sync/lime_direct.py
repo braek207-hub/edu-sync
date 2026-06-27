@@ -1030,15 +1030,14 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
 
     missing = [cid for cid in campaign_ids if cid not in out]
     if missing:
-        print(f"  [lime_direct] WARN: campaigns.get не вернул {len(missing)} кампаний")
-        for part in _chunked(missing, 100):
-            body_retry = {
+        print(f"  [lime_direct] WARN: campaigns.get не вернул {len(missing)} кампаний, добираю")
+        all_states = ["ON", "OFF", "SUSPENDED", "ENDED", "CONVERTED", "ARCHIVED"]
+
+        def _full_params(ids: List[int]) -> Dict[str, Any]:
+            return {
                 "method": "get",
                 "params": {
-                    "SelectionCriteria": {
-                        "Ids": [int(x) for x in part],
-                        "States": ["ON", "OFF", "SUSPENDED", "ENDED", "CONVERTED", "ARCHIVED"],
-                    },
+                    "SelectionCriteria": {"Ids": ids, "States": all_states},
                     "FieldNames": field_names,
                     "TextCampaignFieldNames": type_fields,
                     "UnifiedCampaignFieldNames": type_fields,
@@ -1051,17 +1050,42 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                     ],
                 },
             }
+
+        # 1) батч с полными type-полями (continue, не break — один сбой не роняет остальные пачки)
+        for part in _chunked(missing, 100):
             try:
-                try:
-                    result_retry = _direct_post(CAMPAIGNS_URL, body_retry)
-                except RuntimeError as e:
-                    print(f"  [lime_direct] campaigns.get retry: {e}")
-                    break
+                result_retry = _direct_post(CAMPAIGNS_URL, _full_params([int(x) for x in part]))
                 for c in result_retry.get("Campaigns") or []:
                     _parse_campaign(c)
             except RuntimeError as e:
-                print(f"  [lime_direct] campaigns.get retry: {e}")
-                break
+                print(f"  [lime_direct] campaigns.get retry батч: {e}")
+
+        # 2) кто всё ещё не добран — поштучно: сначала полные поля, иначе только общие.
+        #    Общие поля (Id/Name/Type/State) не падают на отсутствии type-полей и
+        #    гарантируют, что карточка получит тип/статус. Лог Type — диагностика,
+        #    какие *FieldNames добавить, чтобы дотянуть полные настройки.
+        for cid in [c for c in missing if c not in out]:
+            try:
+                r = _direct_post(CAMPAIGNS_URL, _full_params([int(cid)]))
+                for c in r.get("Campaigns") or []:
+                    _parse_campaign(c)
+            except RuntimeError as e:
+                print(f"  [lime_direct] campaigns.get id={cid} полные поля: {e}")
+            if cid in out:
+                continue
+            try:
+                r = _direct_post(CAMPAIGNS_URL, {
+                    "method": "get",
+                    "params": {
+                        "SelectionCriteria": {"Ids": [int(cid)], "States": all_states},
+                        "FieldNames": field_names,
+                    },
+                })
+                for c in r.get("Campaigns") or []:
+                    _parse_campaign(c)
+                    print(f"  [lime_direct] id={cid} добран только общими полями, Type={c.get('Type')}")
+            except RuntimeError as e:
+                print(f"  [lime_direct] campaigns.get id={cid} общие поля: {e}")
 
     _backfill_missing_crr(out, campaign_ids)
 
