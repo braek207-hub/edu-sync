@@ -497,17 +497,16 @@ def upsert_polinarepik_metrica_visits(rows: List[Dict[str, Any]]) -> int:
         return 0
     sql = """
         INSERT INTO polinarepik_metrica_visits (
-            date, client_id, traffic_source, source_detail, utm_source, utm_medium, utm_campaign,
+            date, client_id, traffic_source, utm_source, utm_medium, utm_campaign,
             visits, bounce_rate, page_depth, cart_reaches, checkout_reaches, updated_at
         )
         VALUES (
-            %(date)s, %(client_id)s, %(traffic_source)s, %(source_detail)s, %(utm_source)s,
+            %(date)s, %(client_id)s, %(traffic_source)s, %(utm_source)s,
             %(utm_medium)s, %(utm_campaign)s, %(visits)s, %(bounce_rate)s, %(page_depth)s,
             %(cart_reaches)s, %(checkout_reaches)s, NOW()
         )
         ON CONFLICT (date, client_id, utm_campaign, utm_source, utm_medium) DO UPDATE SET
             traffic_source   = EXCLUDED.traffic_source,
-            source_detail    = EXCLUDED.source_detail,
             visits           = EXCLUDED.visits,
             bounce_rate      = EXCLUDED.bounce_rate,
             page_depth       = EXCLUDED.page_depth,
