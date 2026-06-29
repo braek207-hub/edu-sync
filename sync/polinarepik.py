@@ -19,8 +19,10 @@ import requests
 from sync.db import (
     delete_polinarepik_metrica_from,
     delete_polinarepik_metrica_purchases_from,
+    delete_polinarepik_metrica_sources_from,
     upsert_polinarepik_direct_stats,
     upsert_polinarepik_metrica_purchases,
+    upsert_polinarepik_metrica_sources,
     upsert_polinarepik_metrica_visits,
 )
 
@@ -29,6 +31,10 @@ DIRECT_CLIENT_LOGIN = "polinarepik-wear"
 METRICA_COUNTER_ID = "100764399"
 METRICA_ATTRIBUTION = "lastsign"
 DEFAULT_SYNC_DAYS = 60
+
+# Цели Метрики воронки (счётчик 100764399)
+METRICA_GOAL_CART = "512437503"      # Ecommerce: добавление в корзину
+METRICA_GOAL_CHECKOUT = "371515249"  # Инициация оформления заказа
 
 DIRECT_API_URL = "https://api.direct.yandex.com/json/v5/reports"
 METRICA_API_URL = "https://api-metrika.yandex.net/stat/v1/data"
@@ -187,6 +193,9 @@ def fetch_metrica_client_visits(date_from: str, date_to: str) -> list[dict[str, 
         raise RuntimeError("Metrika counter ID missing")
     attribution = metrica_attribution()
 
+    # clientID-гранулярность (для атрибуции заказов) + воронка/поведение. ВАЖНО: source_detail
+    # (lastsignSourceEngineName) НЕСОВМЕСТИМ с clientID (вырождает выдачу) → отдельный
+    # source-level запрос fetch_metrica_sources.
     dimensions = ",".join(
         [
             "ym:s:date",
@@ -197,15 +206,25 @@ def fetch_metrica_client_visits(date_from: str, date_to: str) -> list[dict[str, 
             "ym:s:lastSignUTMCampaign",
         ]
     )
+    metrics = ",".join(
+        [
+            "ym:s:visits",
+            "ym:s:bounceRate",   # отказы, % (0..100)
+            "ym:s:pageDepth",    # глубина просмотра, стр/визит
+            f"ym:s:goal{METRICA_GOAL_CART}reaches",      # добавление в корзину
+            f"ym:s:goal{METRICA_GOAL_CHECKOUT}reaches",  # инициация оформления
+        ]
+    )
 
-    aggregate: dict[tuple[str, str, str, str, str, str], int] = {}
+    # На ключ копим: визиты + взвешенные (visits) bounce/depth + достижения целей.
+    aggregate: dict[tuple, dict[str, float]] = {}
     limit = 100000
     offset = 1
 
     while True:
         params = {
             "ids": counter_id,
-            "metrics": "ym:s:visits",
+            "metrics": metrics,
             "dimensions": dimensions,
             "date1": date_from,
             "date2": date_to,
@@ -232,29 +251,117 @@ def fetch_metrica_client_visits(date_from: str, date_to: str) -> list[dict[str, 
             utm_source = (dims[3] if len(dims) > 3 else "") or ""
             utm_medium = (dims[4] if len(dims) > 4 else "") or ""
             utm_campaign = normalize_campaign_id(dims[5] if len(dims) > 5 else "") or ""
+            mets = record.get("metrics") or []
+            visits = int(float(mets[0] or 0)) if len(mets) > 0 else 0
+            if visits <= 0:
+                continue
+            bounce = float(mets[1] or 0) if len(mets) > 1 else 0.0
+            depth = float(mets[2] or 0) if len(mets) > 2 else 0.0
+            cart = int(float(mets[3] or 0)) if len(mets) > 3 else 0
+            checkout = int(float(mets[4] or 0)) if len(mets) > 4 else 0
+
+            key = (row_date, client_id, traffic_source, utm_source, utm_medium, utm_campaign)
+            acc = aggregate.get(key)
+            if acc is None:
+                acc = {"visits": 0, "bounce_w": 0.0, "depth_w": 0.0, "cart": 0, "checkout": 0}
+                aggregate[key] = acc
+            acc["visits"] += visits
+            acc["bounce_w"] += bounce * visits
+            acc["depth_w"] += depth * visits
+            acc["cart"] += cart
+            acc["checkout"] += checkout
+
+        if len(data) < limit:
+            break
+        offset += limit
+
+    out: list[dict[str, Any]] = []
+    for key, acc in sorted(aggregate.items()):
+        row_date, client_id, traffic_source, utm_source, utm_medium, utm_campaign = key
+        v = acc["visits"]
+        out.append(
+            {
+                "date": row_date,
+                "client_id": client_id,
+                "traffic_source": traffic_source,
+                "utm_source": utm_source,
+                "utm_medium": utm_medium,
+                "utm_campaign": utm_campaign,
+                "visits": v,
+                "bounce_rate": round(acc["bounce_w"] / v, 2) if v else 0.0,
+                "page_depth": round(acc["depth_w"] / v, 2) if v else 0.0,
+                "cart_reaches": acc["cart"],
+                "checkout_reaches": acc["checkout"],
+            }
+        )
+    return out
+
+
+def fetch_metrica_sources(date_from: str, date_to: str) -> list[dict[str, Any]]:
+    """Source-level (БЕЗ clientID): детальный источник Метрики (source_detail =
+    lastsignSourceEngineName: Яндекс: Директ / Google / ВКонтакте…) по (категория, utm).
+    Отдельный запрос, т.к. SourceEngineName несовместим с clientID. Для маппинга Канала."""
+    token = yandex_token()
+    counter_id = metrica_counter_id()
+    if not counter_id:
+        raise RuntimeError("Metrika counter ID missing")
+    attribution = metrica_attribution()
+
+    dimensions = ",".join(
+        [
+            "ym:s:date",
+            "ym:s:lastSignTrafficSource",
+            "ym:s:lastsignSourceEngineName",
+            "ym:s:lastSignUTMSource",
+            "ym:s:lastSignUTMMedium",
+            "ym:s:lastSignUTMCampaign",
+        ]
+    )
+    aggregate: dict[tuple, int] = {}
+    limit = 100000
+    offset = 1
+    while True:
+        params = {
+            "ids": counter_id,
+            "metrics": "ym:s:visits",
+            "dimensions": dimensions,
+            "date1": date_from,
+            "date2": date_to,
+            "accuracy": "full",
+            "proposed_accuracy": "false",
+            "attribution": attribution,
+            "lang": "ru",
+            "limit": limit,
+            "offset": offset,
+        }
+        payload = _metrica_get(params, token)
+        data = payload.get("data", [])
+        if not data:
+            break
+        for record in data:
+            dims = [str(d.get("name", "")).strip() for d in record.get("dimensions", [])]
+            if not dims or not dims[0]:
+                continue
+            traffic_source = dims[1] if len(dims) > 1 else ""
+            source_detail = (dims[2] if len(dims) > 2 else "") or ""
+            utm_source = (dims[3] if len(dims) > 3 else "") or ""
+            utm_medium = (dims[4] if len(dims) > 4 else "") or ""
+            utm_campaign = normalize_campaign_id(dims[5] if len(dims) > 5 else "") or ""
             visits = int(float((record.get("metrics") or [0])[0] or 0))
             if visits <= 0:
                 continue
-            key = (row_date, client_id, traffic_source, utm_source, utm_medium, utm_campaign)
+            key = (dims[0], traffic_source, source_detail, utm_source, utm_medium, utm_campaign)
             aggregate[key] = aggregate.get(key, 0) + visits
-
         if len(data) < limit:
             break
         offset += limit
 
     return [
         {
-            "date": row_date,
-            "client_id": client_id,
-            "traffic_source": traffic_source,
-            "utm_source": utm_source,
-            "utm_medium": utm_medium,
-            "utm_campaign": utm_campaign,
-            "visits": visits,
+            "date": d, "traffic_source": ts, "source_detail": sd,
+            "utm_source": us, "utm_medium": um, "utm_campaign": uc, "visits": v,
         }
-        for (row_date, client_id, traffic_source, utm_source, utm_medium, utm_campaign), visits in sorted(
-            aggregate.items()
-        )
+        for (d, ts, sd, us, um, uc), v in sorted(aggregate.items())
     ]
 
 
@@ -270,6 +377,20 @@ def sync_metrica(days_back: int) -> int:
     deleted = delete_polinarepik_metrica_from(date_from)
     print(f"  deleted from {date_from}: {deleted}")
     return upsert_polinarepik_metrica_visits(rows)
+
+
+def sync_metrica_sources(days_back: int) -> int:
+    today = date.today()
+    date_from = (today - timedelta(days=days_back)).isoformat()
+    date_to = today.isoformat()
+    print(f"Metrica sources (source_detail): {date_from} — {date_to}")
+    rows = fetch_metrica_sources(date_from, date_to)
+    print(f"  rows: {len(rows)}")
+    if not rows:
+        return 0
+    deleted = delete_polinarepik_metrica_sources_from(date_from)
+    print(f"  deleted from {date_from}: {deleted}")
+    return upsert_polinarepik_metrica_sources(rows)
 
 
 def _metrica_text(value: str) -> str:
@@ -400,6 +521,13 @@ def main() -> int:
     except Exception as e:
         print(f"ERROR metrica visits: {e}")
         errors.append(f"metrica visits: {e}")
+
+    try:
+        n = sync_metrica_sources(days)
+        print(f"Metrica sources upserted: {n}")
+    except Exception as e:
+        print(f"ERROR metrica sources: {e}")
+        errors.append(f"metrica sources: {e}")
 
     try:
         n = sync_metrica_purchases(days)

@@ -458,21 +458,62 @@ def delete_polinarepik_metrica_purchases_from(date_from: str) -> int:
     return deleted
 
 
+def delete_polinarepik_metrica_sources_from(date_from: str) -> int:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM polinarepik_metrica_sources WHERE date >= %s",
+                (date_from,),
+            )
+            deleted = cur.rowcount
+        conn.commit()
+    return deleted
+
+
+def upsert_polinarepik_metrica_sources(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    sql = """
+        INSERT INTO polinarepik_metrica_sources (
+            date, traffic_source, source_detail, utm_source, utm_medium, utm_campaign, visits, updated_at
+        )
+        VALUES (
+            %(date)s, %(traffic_source)s, %(source_detail)s, %(utm_source)s,
+            %(utm_medium)s, %(utm_campaign)s, %(visits)s, NOW()
+        )
+        ON CONFLICT (date, traffic_source, source_detail, utm_source, utm_medium, utm_campaign) DO UPDATE SET
+            visits     = EXCLUDED.visits,
+            updated_at = NOW()
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+        conn.commit()
+    return len(rows)
+
+
 def upsert_polinarepik_metrica_visits(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
     sql = """
         INSERT INTO polinarepik_metrica_visits (
-            date, client_id, traffic_source, utm_source, utm_medium, utm_campaign, visits, updated_at
+            date, client_id, traffic_source, source_detail, utm_source, utm_medium, utm_campaign,
+            visits, bounce_rate, page_depth, cart_reaches, checkout_reaches, updated_at
         )
         VALUES (
-            %(date)s, %(client_id)s, %(traffic_source)s, %(utm_source)s,
-            %(utm_medium)s, %(utm_campaign)s, %(visits)s, NOW()
+            %(date)s, %(client_id)s, %(traffic_source)s, %(source_detail)s, %(utm_source)s,
+            %(utm_medium)s, %(utm_campaign)s, %(visits)s, %(bounce_rate)s, %(page_depth)s,
+            %(cart_reaches)s, %(checkout_reaches)s, NOW()
         )
         ON CONFLICT (date, client_id, utm_campaign, utm_source, utm_medium) DO UPDATE SET
-            traffic_source = EXCLUDED.traffic_source,
-            visits         = EXCLUDED.visits,
-            updated_at     = NOW()
+            traffic_source   = EXCLUDED.traffic_source,
+            source_detail    = EXCLUDED.source_detail,
+            visits           = EXCLUDED.visits,
+            bounce_rate      = EXCLUDED.bounce_rate,
+            page_depth       = EXCLUDED.page_depth,
+            cart_reaches     = EXCLUDED.cart_reaches,
+            checkout_reaches = EXCLUDED.checkout_reaches,
+            updated_at       = NOW()
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
