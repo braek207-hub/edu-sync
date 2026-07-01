@@ -317,13 +317,24 @@ def fetch_metrica_sources(date_from: str, date_to: str) -> list[dict[str, Any]]:
             "ym:s:lastSignUTMCampaign",
         ]
     )
-    aggregate: dict[tuple, int] = {}
+    # source-level воронка (совместима с lastsignSourceEngineName, без clientID): визиты +
+    # взвешенные (visits) отказы/глубина + достижения целей корзина/чекаут.
+    metrics = ",".join(
+        [
+            "ym:s:visits",
+            "ym:s:bounceRate",   # отказы, % (0..100)
+            "ym:s:pageDepth",    # глубина просмотра, стр/визит
+            f"ym:s:goal{METRICA_GOAL_CART}reaches",      # добавление в корзину
+            f"ym:s:goal{METRICA_GOAL_CHECKOUT}reaches",  # инициация оформления
+        ]
+    )
+    aggregate: dict[tuple, dict[str, float]] = {}
     limit = 100000
     offset = 1
     while True:
         params = {
             "ids": counter_id,
-            "metrics": "ym:s:visits",
+            "metrics": metrics,
             "dimensions": dimensions,
             "date1": date_from,
             "date2": date_to,
@@ -347,22 +358,42 @@ def fetch_metrica_sources(date_from: str, date_to: str) -> list[dict[str, Any]]:
             utm_source = (dims[3] if len(dims) > 3 else "") or ""
             utm_medium = (dims[4] if len(dims) > 4 else "") or ""
             utm_campaign = normalize_campaign_id(dims[5] if len(dims) > 5 else "") or ""
-            visits = int(float((record.get("metrics") or [0])[0] or 0))
+            mets = record.get("metrics") or []
+            visits = int(float(mets[0] or 0)) if len(mets) > 0 else 0
             if visits <= 0:
                 continue
+            bounce = float(mets[1] or 0) if len(mets) > 1 else 0.0
+            depth = float(mets[2] or 0) if len(mets) > 2 else 0.0
+            cart = int(float(mets[3] or 0)) if len(mets) > 3 else 0
+            checkout = int(float(mets[4] or 0)) if len(mets) > 4 else 0
             key = (dims[0], traffic_source, source_detail, utm_source, utm_medium, utm_campaign)
-            aggregate[key] = aggregate.get(key, 0) + visits
+            acc = aggregate.get(key)
+            if acc is None:
+                acc = {"visits": 0, "bounce_w": 0.0, "depth_w": 0.0, "cart": 0, "checkout": 0}
+                aggregate[key] = acc
+            acc["visits"] += visits
+            acc["bounce_w"] += bounce * visits
+            acc["depth_w"] += depth * visits
+            acc["cart"] += cart
+            acc["checkout"] += checkout
         if len(data) < limit:
             break
         offset += limit
 
-    return [
-        {
-            "date": d, "traffic_source": ts, "source_detail": sd,
-            "utm_source": us, "utm_medium": um, "utm_campaign": uc, "visits": v,
-        }
-        for (d, ts, sd, us, um, uc), v in sorted(aggregate.items())
-    ]
+    out: list[dict[str, Any]] = []
+    for (d, ts, sd, us, um, uc), acc in sorted(aggregate.items()):
+        v = acc["visits"]
+        out.append(
+            {
+                "date": d, "traffic_source": ts, "source_detail": sd,
+                "utm_source": us, "utm_medium": um, "utm_campaign": uc, "visits": v,
+                "bounce_rate": round(acc["bounce_w"] / v, 2) if v else 0.0,
+                "page_depth": round(acc["depth_w"] / v, 2) if v else 0.0,
+                "cart_reaches": acc["cart"],
+                "checkout_reaches": acc["checkout"],
+            }
+        )
+    return out
 
 
 def sync_metrica(days_back: int) -> int:
