@@ -38,7 +38,11 @@ def ensure_schema() -> None:
           ADD COLUMN IF NOT EXISTS b24_grad_year TEXT NOT NULL DEFAULT 'unknown',
           ADD COLUMN IF NOT EXISTS b24_edu_level TEXT NOT NULL DEFAULT 'unknown',
           ADD COLUMN IF NOT EXISTS payments_from_leads INTEGER NOT NULL DEFAULT 0,
-          ADD COLUMN IF NOT EXISTS revenue_from_leads DOUBLE PRECISION NOT NULL DEFAULT 0
+          ADD COLUMN IF NOT EXISTS revenue_from_leads DOUBLE PRECISION NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS eff_leads INTEGER NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'unknown',
+          ADD COLUMN IF NOT EXISTS days_to_pay_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS days_to_pay_count INTEGER NOT NULL DEFAULT 0
         """,
         """
         ALTER TABLE crm_payments
@@ -67,7 +71,7 @@ def ensure_schema() -> None:
             cur.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS crm_leads_segment_key
-                ON crm_leads (date, campaign_id, city_ip_segment, b24_grad_year, b24_edu_level)
+                ON crm_leads (date, campaign_id, city_ip_segment, b24_grad_year, b24_edu_level, audience)
                 """
             )
             cur.execute(
@@ -259,23 +263,30 @@ def replace_crm_leads(rows: List[Dict[str, Any]]) -> int:
     sql = """
         INSERT INTO crm_leads (
             date, campaign_id, project, direction,
-            city_ip_segment, b24_grad_year, b24_edu_level,
-            leads, connections, deals, payments_from_leads, revenue_from_leads
+            city_ip_segment, b24_grad_year, b24_edu_level, audience,
+            leads, eff_leads, connections, deals,
+            payments_from_leads, revenue_from_leads,
+            days_to_pay_sum, days_to_pay_count
         )
         VALUES (
             %(date)s, %(campaign_id)s, %(project)s, %(direction)s,
-            %(city_ip_segment)s, %(b24_grad_year)s, %(b24_edu_level)s,
-            %(leads)s, %(connections)s, %(deals)s, %(payments_from_leads)s, %(revenue_from_leads)s
+            %(city_ip_segment)s, %(b24_grad_year)s, %(b24_edu_level)s, %(audience)s,
+            %(leads)s, %(eff_leads)s, %(connections)s, %(deals)s,
+            %(payments_from_leads)s, %(revenue_from_leads)s,
+            %(days_to_pay_sum)s, %(days_to_pay_count)s
         )
-        ON CONFLICT (date, campaign_id, city_ip_segment, b24_grad_year, b24_edu_level)
+        ON CONFLICT (date, campaign_id, city_ip_segment, b24_grad_year, b24_edu_level, audience)
         DO UPDATE SET
-            project     = EXCLUDED.project,
-            direction   = EXCLUDED.direction,
-            leads       = EXCLUDED.leads,
-            connections = EXCLUDED.connections,
-            deals       = EXCLUDED.deals,
+            project             = EXCLUDED.project,
+            direction           = EXCLUDED.direction,
+            leads               = EXCLUDED.leads,
+            eff_leads           = EXCLUDED.eff_leads,
+            connections         = EXCLUDED.connections,
+            deals               = EXCLUDED.deals,
             payments_from_leads = EXCLUDED.payments_from_leads,
-            revenue_from_leads = EXCLUDED.revenue_from_leads
+            revenue_from_leads  = EXCLUDED.revenue_from_leads,
+            days_to_pay_sum     = EXCLUDED.days_to_pay_sum,
+            days_to_pay_count   = EXCLUDED.days_to_pay_count
     """
     # Заменяем только диапазон загружаемых дат (>= самой ранней даты в данных),
     # а не всю таблицу: историю вне диапазона (напр. 2025 при daily) сохраняем.

@@ -1,6 +1,6 @@
 import os
 import re
-from collections import defaultdict
+from datetime import date as _date
 from typing import Any, Dict, List, Tuple
 
 from sync.classify import (
@@ -72,16 +72,39 @@ def _payment_flag(raw: Any) -> int:
     return 0
 
 
+_JUNK_STATUSES = ["дубл", "спам", "тест", "ошибк", "повтор"]
+
+
+def _normalize_audience(raw: Any) -> str:
+    s = str(raw or "").strip().lower()
+    if "родител" in s:
+        return "parent"
+    if "школьник" in s or "ученик" in s:
+        return "pupil"
+    return "unknown"
+
+
+def _is_junk_status(raw: Any) -> bool:
+    s = str(raw or "").strip().lower()
+    return any(sub in s for sub in _JUNK_STATUSES)
+
+
 def _sync_leads_raw(
     headers: List[str],
     values: List[List[Any]],
-    paid_by_lead_id: Dict[str, Dict[str, float]] | None = None,
-) -> Dict[str, Dict[str, Any]]:
+    paid_by_lead_id: Dict[str, Dict[str, Any]] | None = None,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, "Dims"]]:
     """Построчные лиды с сегментами — как GAS readCrmRawFromVals_.
 
-    payments_from_leads считаем НЕ из листа «Лиды» (там нет колонки оплаты), а
-    join'ом по leadId: paid_by_lead_id[leadId] = число оплат из листа «Оплаты»
-    (orders==1), приписанных к дате создания лида.
+    payments_from_leads:
+      1) если в листе «Лиды» есть колонка «Оплата»/«payment» — читаем флаг из неё
+         (поле payment_flag: "1"/"да" → 1, иначе 0);
+      2) если передан paid_by_lead_id — join по leadId из листа «Оплаты» (orders==1);
+      при наличии обоих источников суммируем (обычно одно из двух).
+
+    eff_leads: все лиды кроме junk-статусов (дубль/спам/тест/ошибка/повтор).
+    audience: «Родитель» → "parent", «Школьник»/«Ученик» → "pupil", иначе "unknown".
+    days_to_pay_sum / days_to_pay_count: сумма/счётчик дней от создания до оплаты.
     """
     li = {
         "date": pick_index_loose(
@@ -127,6 +150,8 @@ def _sync_leads_raw(
             ["б24 уровень образования", "уровень образования", "класс/курс"],
         ),
         "payment_flag": pick_index_loose(headers, ["оплата", "payment", "payments"]),
+        "status": pick_index_loose(headers, ["этап", "статус", "stage"]),
+        "audience": pick_index_loose(headers, ["родитель", "школьник", "аудитория"]),
     }
     if li["date"] == -1:
         raise ValueError("CRM(Лиды): не найдена колонка даты")
@@ -170,7 +195,14 @@ def _sync_leads_raw(
         if lead_id:
             lead_dims_by_id[lead_id] = (city, grad, edu)
 
-        key = f"{date_iso}|{cid}|{city}|{grad}|{edu}"
+        # audience — часть ключа сегмента
+        aud = (
+            _normalize_audience(_cell(row, li["audience"]))
+            if li["audience"] != -1
+            else "unknown"
+        )
+
+        key = f"{date_iso}|{cid}|{city}|{grad}|{edu}|{aud}"
         bucket = agg.setdefault(
             key,
             {
@@ -179,11 +211,15 @@ def _sync_leads_raw(
                 "city_ip_segment": city,
                 "b24_grad_year": grad,
                 "b24_edu_level": edu,
+                "audience": aud,
                 "leads": 0,
+                "eff_leads": 0,
                 "connections": 0.0,
                 "deals": 0.0,
                 "payments_from_leads": 0,
                 "revenue_from_leads": 0.0,
+                "days_to_pay_sum": 0.0,
+                "days_to_pay_count": 0,
                 "project": "unknown",
                 "direction": "other",
                 "campaign_name": "",
@@ -193,7 +229,13 @@ def _sync_leads_raw(
         _apply_meta(bucket, _cell(row, li["campaign"]), land)
         if land:
             bucket["project"] = resolve_row_project(None, bucket.get("campaign_name", ""), land)
+
         bucket["leads"] += 1
+
+        # eff_leads: не считаем junk-статусы
+        if li["status"] == -1 or not _is_junk_status(_cell(row, li["status"])):
+            bucket["eff_leads"] += 1
+
         if li["connections"] != -1:
             bucket["connections"] += to_num(_cell(row, li["connections"]))
         elif li["date_connect"] != -1:
@@ -201,13 +243,27 @@ def _sync_leads_raw(
                 bucket["connections"] += 1
         if li["deals"] != -1:
             bucket["deals"] += to_num(_cell(row, li["deals"]))
-        # Оплаты+выручка от лидов: join по leadId (Оплаты.«ID лида в SCRM» → Лиды.«ID»),
-        # приписываем к дате создания лида. Колонки «Оплата» в Лидах нет.
+
+        # payment_flag из колонки «Оплата» в листе Лиды (если есть)
+        if li["payment_flag"] != -1:
+            bucket["payments_from_leads"] += _payment_flag(_cell(row, li["payment_flag"]))
+
+        # join по leadId из листа «Оплаты»
         if paid_by_lead_id and lead_id:
             pm = paid_by_lead_id.get(lead_id)
             if pm:
                 bucket["payments_from_leads"] += pm["count"]
                 bucket["revenue_from_leads"] += pm["revenue"]
+                # days-to-pay: earliest pay_date из paid_by_lead_id
+                pay_date = pm.get("pay_date")
+                if pay_date:
+                    try:
+                        days = (_date.fromisoformat(pay_date) - _date.fromisoformat(date_iso)).days
+                        if days >= 0:
+                            bucket["days_to_pay_sum"] += days
+                            bucket["days_to_pay_count"] += 1
+                    except (ValueError, TypeError):
+                        pass
 
     return agg, lead_dims_by_id
 
@@ -230,20 +286,25 @@ def _sync_leads_by_land(headers: List[str], values: List[List[Any]]) -> Dict[str
         if not date_iso or not land:
             continue
         cid = f"land:{land}"
-        key = f"{date_iso}|{cid}|rf|unknown|unknown"
+        key = f"{date_iso}|{cid}|rf|unknown|unknown|unknown"
+        n_leads = int(to_num(_cell(row, li["leads"])))
         agg[key] = {
             "date": date_iso,
             "campaign_id": cid,
             "city_ip_segment": "rf",
             "b24_grad_year": "unknown",
             "b24_edu_level": "unknown",
-            "leads": int(to_num(_cell(row, li["leads"]))),
+            "audience": "unknown",
+            "leads": n_leads,
+            "eff_leads": n_leads,  # нет колонки статуса — все лиды считаем эффективными
             "connections": int(
                 to_num(_cell(row, li["connections"])) if li["connections"] != -1 else 0
             ),
             "deals": int(to_num(_cell(row, li["deals"])) if li["deals"] != -1 else 0),
             "payments_from_leads": 0,
             "revenue_from_leads": 0.0,
+            "days_to_pay_sum": 0.0,
+            "days_to_pay_count": 0,
             "project": map_crm_land(land),
             "direction": detect_direction(land),
             "campaign_name": land,
@@ -256,17 +317,20 @@ def merge_leads_agg(
     target: Dict[str, Dict[str, Any]],
     source: Dict[str, Dict[str, Any]],
 ) -> None:
-    """Суммирует leads/connections/deals при совпадении segment key."""
+    """Суммирует leads/connections/deals/eff_leads/days_to_pay при совпадении segment key."""
     for key, src in source.items():
         if key not in target:
             target[key] = dict(src)
             continue
         dst = target[key]
         dst["leads"] += src.get("leads", 0)
+        dst["eff_leads"] = dst.get("eff_leads", 0) + src.get("eff_leads", 0)
         dst["connections"] += src.get("connections", 0)
         dst["deals"] += src.get("deals", 0)
         dst["revenue_from_leads"] = dst.get("revenue_from_leads", 0.0) + src.get("revenue_from_leads", 0.0)
         dst["payments_from_leads"] += src.get("payments_from_leads", 0)
+        dst["days_to_pay_sum"] = dst.get("days_to_pay_sum", 0.0) + src.get("days_to_pay_sum", 0.0)
+        dst["days_to_pay_count"] = dst.get("days_to_pay_count", 0) + src.get("days_to_pay_count", 0)
         if not dst.get("campaign_name") and src.get("campaign_name"):
             dst["campaign_name"] = src["campaign_name"]
         if dst.get("project") == "unknown" and src.get("project") not in (
@@ -357,13 +421,14 @@ def _load_all_lead_dims(
     return lead_dims_by_id
 
 
-def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, float]]:
-    """leadId → {count, revenue} из листов «Оплаты» (orders==1).
+def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, Any]]:
+    """leadId → {count, revenue, pay_date} из листов «Оплаты» (orders==1).
 
-    Источник: лист «Оплаты», колонка orders (==1) + выручка + «ID лида в SCRM».
-    Используется для атрибуции оплат И выручки к дате создания лида.
+    Источник: лист «Оплаты», колонка orders (==1) + выручка + «ID лида в SCRM»
+    + «date pay»/«дата оплаты» (берём самую раннюю дату для окна конверсии).
+    Используется для атрибуции оплат, выручки и дней до оплаты к дате создания лида.
     """
-    paid: Dict[str, Dict[str, float]] = {}
+    paid: Dict[str, Dict[str, Any]] = {}
     for sheet_name in crm_payments_sheets():
         try:
             values = read_sheet(service, spreadsheet_id, sheet_name)
@@ -383,6 +448,7 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, f
         if i_lead == -1:
             print(f"CRM Оплаты [{sheet_name}]: нет колонки ID лида — оплаты к лидам не привязать")
             continue
+        i_pay_date = pick_index_loose(headers, ["date pay", "дата оплаты"])
         for row in values[1:]:
             lead_id = normalize_campaign_id(_cell(row, i_lead))
             if not lead_id:
@@ -391,9 +457,14 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, f
             if not cnt:
                 continue
             rev = to_num(_cell(row, i_rev)) if i_rev != -1 else 0.0
-            agg = paid.setdefault(lead_id, {"count": 0.0, "revenue": 0.0})
+            pay_date_iso = to_iso_date(_cell(row, i_pay_date)) if i_pay_date != -1 else ""
+            agg = paid.setdefault(lead_id, {"count": 0.0, "revenue": 0.0, "pay_date": None})
             agg["count"] += cnt
             agg["revenue"] += rev
+            # Сохраняем самую раннюю дату оплаты для расчёта окна конверсии
+            if pay_date_iso:
+                if agg["pay_date"] is None or pay_date_iso < agg["pay_date"]:
+                    agg["pay_date"] = pay_date_iso
     total_c = sum(p["count"] for p in paid.values())
     total_r = sum(p["revenue"] for p in paid.values())
     print(f"CRM Оплаты→лиды: {len(paid)} лидов с оплатами, оплат {int(total_c)}, выручка {total_r:.0f}")
@@ -550,11 +621,15 @@ def sync_crm_leads() -> int:
                 "city_ip_segment": v["city_ip_segment"],
                 "b24_grad_year": v["b24_grad_year"],
                 "b24_edu_level": v["b24_edu_level"],
+                "audience": v.get("audience", "unknown"),
                 "leads": int(v["leads"]),
+                "eff_leads": int(v.get("eff_leads", v["leads"])),
                 "connections": int(v["connections"]),
                 "deals": int(v["deals"]),
                 "payments_from_leads": int(v.get("payments_from_leads", 0)),
                 "revenue_from_leads": float(v.get("revenue_from_leads", 0.0)),
+                "days_to_pay_sum": float(v.get("days_to_pay_sum", 0.0)),
+                "days_to_pay_count": int(v.get("days_to_pay_count", 0)),
             }
         )
 
