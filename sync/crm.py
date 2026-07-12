@@ -244,14 +244,14 @@ def _sync_leads_raw(
         if li["deals"] != -1:
             bucket["deals"] += to_num(_cell(row, li["deals"]))
 
-        # payment_flag из колонки «Оплата» в листе Лиды (если есть)
-        if li["payment_flag"] != -1:
-            bucket["payments_from_leads"] += _payment_flag(_cell(row, li["payment_flag"]))
-
-        # join по leadId из листа «Оплаты»
+        # payments_from_leads: join из «Оплаты» — авторитетный источник; колонка
+        # «Оплата» в Лидах — только фолбэк, когда по leadId нет join-матча (иначе
+        # был бы двойной счёт одной оплаты). days-to-pay считаем лишь по join'у.
+        paid_via_join = False
         if paid_by_lead_id and lead_id:
             pm = paid_by_lead_id.get(lead_id)
             if pm:
+                paid_via_join = True
                 bucket["payments_from_leads"] += pm["count"]
                 bucket["revenue_from_leads"] += pm["revenue"]
                 # days-to-pay: earliest pay_date из paid_by_lead_id
@@ -264,6 +264,8 @@ def _sync_leads_raw(
                             bucket["days_to_pay_count"] += 1
                     except (ValueError, TypeError):
                         pass
+        if not paid_via_join and li["payment_flag"] != -1:
+            bucket["payments_from_leads"] += _payment_flag(_cell(row, li["payment_flag"]))
 
     return agg, lead_dims_by_id
 
