@@ -142,7 +142,9 @@ def _json_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {_token()}",
         "Client-Login": _client_login(),
-        "Accept-Language": "en",
+        # ru: гео-словарь Директа отдаёт названия регионов по-русски (Москва и обл.
+        # вместо "Moscow and Moscow Oblast"). Enum-коды не локализуются → селекторы целы.
+        "Accept-Language": "ru",
         "Content-Type": "application/json; charset=utf-8",
     }
 
