@@ -1148,26 +1148,32 @@ def _fetch_smart_targets(campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
 
 
 def _fetch_goals_map(counter_ids: List[int]) -> Dict[int, str]:
+    """Имена целей из API Я.Метрики (Direct /v5/goals не существует → отдавал 404).
+
+    Счётчики берём из CounterIds кампаний; токен YM_TOKEN (тот же, что metrika_offline).
+    Metrika Management: GET counter/{id}/goals → [{id, name}].
+    """
     if not counter_ids:
         return {}
+    token = os.environ.get("YM_TOKEN", "").strip()
+    if not token:
+        print("  [edu_direct_settings] YM_TOKEN не задан — имена целей пропущены")
+        return {}
     names: Dict[int, str] = {}
-    for part in _chunked([str(x) for x in counter_ids], 10):
-        body = {
-            "method": "get",
-            "params": {
-                "SelectionCriteria": {"CounterIds": [int(x) for x in part]},
-                "FieldNames": ["Id", "Name"],
-            },
-        }
+    for counter in counter_ids:
         try:
-            result = _direct_post(GOALS_URL, body)
-            for g in result.get("Goals") or []:
-                gid = g.get("Id")
+            r = requests.get(
+                f"https://api-metrika.yandex.net/management/v1/counter/{int(counter)}/goals",
+                headers={"Authorization": f"OAuth {token}"},
+                timeout=60,
+            )
+            r.raise_for_status()
+            for g in (r.json().get("goals") or []):
+                gid = g.get("id")
                 if gid is not None:
-                    names[int(gid)] = str(g.get("Name") or "")
-        except RuntimeError as e:
-            print(f"  [edu_direct_settings] goals.get skip: {e}")
-            break
+                    names[int(gid)] = str(g.get("name") or "")
+        except Exception as e:
+            print(f"  [edu_direct_settings] metrika goals счётчик {counter} skip: {e}")
     return names
 
 

@@ -33,6 +33,7 @@ jobs:
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
           DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
           DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
+          YM_TOKEN: ${{ secrets.YM_TOKEN }}
         run: python -m sync.edu_direct_settings
 
       - name: Revalidate dashboard cache
