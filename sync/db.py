@@ -30,7 +30,8 @@ def ensure_schema() -> None:
           ADD COLUMN IF NOT EXISTS w_avg_traffic_vol DOUBLE PRECISION NOT NULL DEFAULT 0,
           ADD COLUMN IF NOT EXISTS w_avg_impr_pos DOUBLE PRECISION NOT NULL DEFAULT 0,
           ADD COLUMN IF NOT EXISTS w_avg_click_pos DOUBLE PRECISION NOT NULL DEFAULT 0,
-          ADD COLUMN IF NOT EXISTS w_auction_win_share DOUBLE PRECISION NOT NULL DEFAULT 0
+          ADD COLUMN IF NOT EXISTS w_auction_win_share DOUBLE PRECISION NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS conversions INTEGER NOT NULL DEFAULT 0
         """,
         """
         ALTER TABLE crm_leads
@@ -216,17 +217,20 @@ def upsert_direct_stats(rows: List[Dict[str, Any]]) -> int:
         r.setdefault("w_avg_impr_pos", 0)
         r.setdefault("w_avg_click_pos", 0)
         r.setdefault("w_auction_win_share", 0)
+        r.setdefault("conversions", 0)
     sql = """
         INSERT INTO direct_stats (
             date, campaign_id, campaign_name, project, direction,
             cost, clicks, impressions,
-            w_avg_eff_bid, w_avg_traffic_vol, w_avg_impr_pos, w_avg_click_pos, w_auction_win_share
+            w_avg_eff_bid, w_avg_traffic_vol, w_avg_impr_pos, w_avg_click_pos, w_auction_win_share,
+            conversions
         )
         VALUES (
             %(date)s, %(campaign_id)s, %(campaign_name)s, %(project)s, %(direction)s,
             %(cost)s, %(clicks)s, %(impressions)s,
             %(w_avg_eff_bid)s, %(w_avg_traffic_vol)s, %(w_avg_impr_pos)s,
-            %(w_avg_click_pos)s, %(w_auction_win_share)s
+            %(w_avg_click_pos)s, %(w_auction_win_share)s,
+            %(conversions)s
         )
         ON CONFLICT (date, campaign_id) DO UPDATE SET
             campaign_name = COALESCE(NULLIF(EXCLUDED.campaign_name, ''), direct_stats.campaign_name),
@@ -247,7 +251,8 @@ def upsert_direct_stats(rows: List[Dict[str, Any]]) -> int:
             w_avg_traffic_vol = EXCLUDED.w_avg_traffic_vol,
             w_avg_impr_pos = EXCLUDED.w_avg_impr_pos,
             w_avg_click_pos = EXCLUDED.w_avg_click_pos,
-            w_auction_win_share = EXCLUDED.w_auction_win_share
+            w_auction_win_share = EXCLUDED.w_auction_win_share,
+            conversions = EXCLUDED.conversions
     """
     with get_connection() as conn:
         with conn.cursor() as cur:

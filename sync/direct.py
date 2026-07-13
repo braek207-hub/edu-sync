@@ -31,6 +31,19 @@ FIELD_NAMES = [
 DEFAULT_INCREMENTAL_DAYS = 7
 DEFAULT_FULL_DATE_FROM = "2026-01-01"
 
+# Цели-конверсии EDU по проектам (выбор Павла, ID из Метрики). В коде, не в секрете.
+# vuz=ВУЗ; vse=ВсеКолледжи (Страница «Спасибо»); provuz=ПроВУЗ (Страница «Спасибо»).
+EDU_CONVERSION_GOALS: Dict[str, List[str]] = {
+    "vuz": ["360811375"],
+    "vse": ["330070378"],
+    "provuz": ["330389387"],
+}
+
+
+def _report_fields(goals: List[str]) -> List[str]:
+    """Поля отчёта: базовые + Conversions (это МЕТРИКА, не измерение → строки не множит)."""
+    return FIELD_NAMES + (["Conversions"] if goals else [])
+
 
 def _direct_clients() -> List[dict]:
     raw_json = os.environ.get("DIRECT_CLIENTS_JSON", "").strip()
@@ -77,7 +90,7 @@ def _report_headers(login: str) -> dict:
     }
 
 
-def _parse_report_tsv(text: str) -> List[Dict[str, Any]]:
+def _parse_report_tsv(text: str, fields: List[str] = FIELD_NAMES) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     lines = [ln for ln in text.lstrip("\ufeff").splitlines() if ln.strip()]
     if not lines:
@@ -87,8 +100,8 @@ def _parse_report_tsv(text: str) -> List[Dict[str, Any]]:
     for parts in reader:
         if len(parts) < 6:
             continue
-        padded = parts + [""] * (len(FIELD_NAMES) - len(parts))
-        row = dict(zip(FIELD_NAMES, padded[: len(FIELD_NAMES)]))
+        padded = parts + [""] * (len(fields) - len(parts))
+        row = dict(zip(fields, padded[: len(fields)]))
         campaign_id = str(row.get("CampaignId", "")).strip()
         if not campaign_id or campaign_id == "--":
             continue
@@ -122,6 +135,8 @@ def _parse_report_tsv(text: str) -> List[Dict[str, Any]]:
                 "w_avg_impr_pos": w_impr,
                 "w_avg_click_pos": w_click,
                 "w_auction_win_share": 0.0,
+                # Conversions по цели-конверсии проекта (LSC). Метрика отчёта; 0 если целей нет.
+                "conversions": int(to_num_gas(row.get("Conversions", 0))) if "Conversions" in fields else 0,
             }
         )
     return rows
@@ -130,7 +145,7 @@ def _parse_report_tsv(text: str) -> List[Dict[str, Any]]:
 def _report_body(login: str, date_from: str, date_to: str, goals: List[str]) -> dict:
     params: Dict[str, Any] = {
         "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
-        "FieldNames": FIELD_NAMES,
+        "FieldNames": _report_fields(goals),
         "ReportName": f"edu_sync_{login}_{date_from}_{date_to}",
         "ReportType": "CUSTOM_REPORT",
         "DateRangeType": "CUSTOM_DATE",
@@ -177,7 +192,7 @@ def _fetch_report(login: str, date_from: str, date_to: str, goals: List[str]) ->
     else:
         raise RuntimeError(f"Директ API [{login}]: превышено число попыток")
 
-    return _parse_report_tsv(resp.text)
+    return _parse_report_tsv(resp.text, _report_fields(goals))
 
 
 def sync_direct_api_range(
@@ -192,9 +207,8 @@ def sync_direct_api_range(
     for client in clients:
         login = client["login"]
         try:
-            chunk = _fetch_report(
-                login, date_from, date_to, client.get("goal_ids") or []
-            )
+            goals = EDU_CONVERSION_GOALS.get(client.get("project") or "") or client.get("goal_ids") or []
+            chunk = _fetch_report(login, date_from, date_to, goals)
             print(f"  [{login}] получено {len(chunk)} строк")
             all_rows.extend(chunk)
         except Exception as e:
