@@ -1,0 +1,40 @@
+name: Sync EDU Direct Campaign Settings
+
+on:
+  schedule:
+    # 07:20 UTC = 10:20 Moscow (after main Direct stats sync which runs at 07:00 UTC)
+    - cron: "20 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: edu-direct-settings-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync EDU campaign settings
+        env:
+          PYTHONUNBUFFERED: "1"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+          DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
+        run: python -m sync.edu_direct_settings
+
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
