@@ -50,6 +50,10 @@ _AGE_RU = {
     "AGE_55": "55+",
 }
 
+# Счётчики Метрики EDU по проектам (vuz/vse/provuz) — для резолва имён целей,
+# когда campaigns.get не отдал CounterIds кампании (иначе goalNames пуст).
+EDU_METRIKA_COUNTERS = [98627983, 96526110, 95348914]
+
 # Русские названия регионов (API getGeoRegions часто отдаёт EN для округов).
 GEO_REGION_RU: Dict[int, str] = {
     225: "Россия",
@@ -1356,7 +1360,9 @@ def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> i
     print(f"[edu_direct_settings] настройки кампаний ({len(campaign_ids)})...")
 
     base_map = _fetch_campaigns_for_settings(campaign_ids)
-    counter_ids = list(base_map.pop("_counter_ids", []) or [])
+    # Всегда включаем известные счётчики EDU (vuz/vse/provuz) — у части кампаний
+    # campaigns.get не отдаёт CounterIds → без этого их goalNames пуст, цель = «Цель #ID».
+    counter_ids = sorted(set(list(base_map.pop("_counter_ids", []) or [])) | set(EDU_METRIKA_COUNTERS))
 
     adgroups_map = _fetch_adgroups_by_campaign(campaign_ids)
     bidmodifiers_map = _fetch_bidmodifiers_by_campaign(campaign_ids)
