@@ -447,7 +447,18 @@ def _extract_strategy_channel_full(strategy_block: Any) -> Dict[str, Any]:
         "targetDrr": None,
         "bidCeiling": None,
         "goalIds": [],
-        "placementTypes": list(strategy_block.get("PlacementTypes") or []),
+        # PlacementTypes от API = {SearchResults:"YES", ProductGallery:"NO", ...}.
+        # list(dict) брал ВСЕ ключи → выключенные площадки (Value=NO) показывались.
+        # Фильтруем по включённым (Value=YES); устойчиво к nested {Value:...} и к list-форме.
+        "placementTypes": (
+            [
+                k
+                for k, v in strategy_block["PlacementTypes"].items()
+                if str(v.get("Value") if isinstance(v, dict) else v).upper() == "YES"
+            ]
+            if isinstance(strategy_block.get("PlacementTypes"), dict)
+            else list(strategy_block.get("PlacementTypes") or [])
+        ),
     }
     goal_ids: List[int] = []
     for k, v in strategy_block.items():
