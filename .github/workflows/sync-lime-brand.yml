@@ -1,0 +1,27 @@
+name: Sync LIME Brand Traffic
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # понедельник 09:00 MSK — закрытая прошлая неделя
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Apply lime migrations
+        run: python scripts/apply_lime_migrations.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      - name: Sync brand traffic
+        run: python sync_brand.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          WORDSTAT_WEBMASTER_TOKEN: ${{ secrets.WORDSTAT_WEBMASTER_TOKEN }}
+          YANDEX_SEARCHAPI_KEY: ${{ secrets.YANDEX_SEARCHAPI_KEY }}
+          YANDEX_CLOUD_FOLDER_ID: ${{ secrets.YANDEX_CLOUD_FOLDER_ID }}
