@@ -523,12 +523,9 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, A
         if len(values) < 2:
             continue
         headers = [str(x) for x in values[0]]
-        i_orders = pick_index_loose(headers, ["orders", "оплат"])
-        if len(headers) > 18 and re_match_orders(headers[18]):
-            i_orders = 18
-        i_rev = pick_index_loose(headers, ["выручка", "revenue", "сумма", "оборот"])
-        if len(headers) > 17 and re_match_revenue(headers[17]):
-            i_rev = 17
+        # Счётчик оплат и выручка — по имени, устойчиво к вставке столбцов (см. find_*).
+        i_orders = find_orders_index(headers)
+        i_rev = find_revenue_index(headers)
         i_lead = pick_index_loose(headers, ["id лида в scrm", "lead id", "id лида"])
         if i_lead == -1:
             print(f"CRM Оплаты [{sheet_name}]: нет колонки ID лида — оплаты к лидам не привязать")
@@ -594,17 +591,14 @@ def _parse_payments_sheet(
         "campaign": pick_index_loose(
             headers, ["кампания", "utm campaign", "utm_campaign", "utm_campaign"]
         ),
-        "revenue": pick_index_loose(headers, ["выручка", "revenue", "сумма", "оборот"]),
-        "orders": pick_index_loose(headers, ["orders", "оплат"]),
+        # Выручка и счётчик оплат — по имени, устойчиво к вставке столбцов (см. find_*).
+        "revenue": find_revenue_index(headers),
+        "orders": find_orders_index(headers),
         "land": pick_index_loose(headers, ["ленд", "land"]),
         "lead_id": pick_index_loose(
             headers, ["id лида в scrm", "lead id", "id лида"]
         ),
     }
-    if len(headers) > 17 and re_match_revenue(headers[17]):
-        pi["revenue"] = 17
-    if len(headers) > 18 and re_match_orders(headers[18]):
-        pi["orders"] = 18
 
     if pi["pay_date"] == -1:
         raise ValueError(f'CRM(Оплаты [{sheet_name}]): не найдена колонка "date pay"')
@@ -835,3 +829,36 @@ def re_match_revenue(header: str) -> bool:
 
 def re_match_orders(header: str) -> bool:
     return bool(re.search(r"orders|оплат", str(header), re.I))
+
+
+def find_orders_index(headers: List[str]) -> int:
+    """Индекс СЧЁТЧИКА оплат («orders»/«Оплаты»), устойчиво к вставке столбцов.
+
+    Раньше искали pick_index_loose(["orders","оплат"]) + хардкод индекса 18. Но «оплат»
+    как ПОДСТРОКА ловит «Дата оплаты» (тоже содержит «оплат»), и если она левее счётчика,
+    pick_index_loose возвращал ЕЁ → счётчик читал дату → round(to_num(дата))!=1 → 0 оплат.
+    Костыль headers[18]==orders чинил это, но вставка столбца сдвинула счётчик с индекса 18
+    → костыль отвалился → все оплаты обнулились. Теперь ищем по имени, ИСКЛЮЧАЯ дат-столбцы.
+    """
+    hs = [str(x or "").strip().lower() for x in headers]
+    for i, hh in enumerate(hs):
+        if hh in ("orders", "оплаты", "оплата", "кол-во оплат", "количество оплат", "оплат"):
+            return i
+    for i, hh in enumerate(hs):
+        if re.search(r"orders|оплат", hh) and not re.search(
+            r"дата|date|сертификат|оформлен|срок", hh
+        ):
+            return i
+    return -1
+
+
+def find_revenue_index(headers: List[str]) -> int:
+    """Индекс ВЫРУЧКИ. Приоритет «выручка»/«revenue»; избегаем «Сумма (в оборот)» (turnover)."""
+    hs = [str(x or "").strip().lower() for x in headers]
+    for i, hh in enumerate(hs):
+        if "выруч" in hh or "revenue" in hh:
+            return i
+    for i, hh in enumerate(hs):
+        if ("сумма" in hh or "оборот" in hh) and "в оборот" not in hh:
+            return i
+    return -1
