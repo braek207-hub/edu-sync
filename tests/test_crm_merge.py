@@ -136,7 +136,7 @@ def test_eff_leads_excludes_junk_statuses():
         ["7", "01.03.2026", "vuz", "99999", "Новый"],       # реальный
         ["8", "01.03.2026", "vuz", "99999", "В работе"],    # реальный
     ]
-    agg, _ = _sync_leads_raw(headers, values)
+    agg, _, _ = _sync_leads_raw(headers, values)
     key = "2026-03-01|99999|rf|unknown|unknown|unknown"
     row = agg[key]
     assert row["leads"] == 8       # все 8 строк считаются
@@ -151,7 +151,7 @@ def test_eff_leads_all_real_when_no_status_column():
         ["1", "05.03.2026", "vuz", "111"],
         ["2", "05.03.2026", "vuz", "111"],
     ]
-    agg, _ = _sync_leads_raw(headers, values)
+    agg, _, _ = _sync_leads_raw(headers, values)
     key = "2026-03-05|111|rf|unknown|unknown|unknown"
     assert agg[key]["leads"] == 2
     assert agg[key]["eff_leads"] == 2
@@ -169,7 +169,7 @@ def test_audience_keying_splits_parent_and_pupil():
         ["3", "10.03.2026", "vuz", "55555", "Родитель"],
         ["4", "10.03.2026", "vuz", "55555", ""],           # unknown
     ]
-    agg, _ = _sync_leads_raw(headers, values)
+    agg, _, _ = _sync_leads_raw(headers, values)
     key_parent  = "2026-03-10|55555|rf|unknown|unknown|parent"
     key_pupil   = "2026-03-10|55555|rf|unknown|unknown|pupil"
     key_unknown = "2026-03-10|55555|rf|unknown|unknown|unknown"
@@ -187,7 +187,7 @@ def test_audience_uchenik_maps_to_pupil():
         headers,
         ["1", "11.03.2026", "vuz", "77777", "Ученик"],
     ]
-    agg, _ = _sync_leads_raw(headers, values)
+    agg, _, _ = _sync_leads_raw(headers, values)
     key = "2026-03-11|77777|rf|unknown|unknown|pupil"
     assert key in agg
     assert agg[key]["audience"] == "pupil"
@@ -209,7 +209,7 @@ def test_days_to_pay_computed_from_paid_by_lead_id():
         "lead-B": {"count": 1, "revenue": 3000.0, "pay_date": "2026-04-11"},
         # lead-C не в paid_by_lead_id
     }
-    agg, _ = _sync_leads_raw(headers, values, paid_by_lead_id=paid_by_lead_id)
+    agg, _, _ = _sync_leads_raw(headers, values, paid_by_lead_id=paid_by_lead_id)
     key = "2026-04-01|88888|rf|unknown|unknown|unknown"
     row = agg[key]
     assert row["days_to_pay_sum"] == 15.0    # 5 + 10
@@ -228,7 +228,7 @@ def test_days_to_pay_ignores_negative_days():
     paid_by_lead_id = {
         "lead-X": {"count": 1, "revenue": 1000.0, "pay_date": "2026-04-14"},  # -1 день
     }
-    agg, _ = _sync_leads_raw(headers, values, paid_by_lead_id=paid_by_lead_id)
+    agg, _, _ = _sync_leads_raw(headers, values, paid_by_lead_id=paid_by_lead_id)
     key = "2026-04-15|44444|rf|unknown|unknown|unknown"
     row = agg[key]
     assert row["days_to_pay_sum"] == 0.0

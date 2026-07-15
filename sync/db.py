@@ -55,6 +55,44 @@ def ensure_schema() -> None:
         ALTER TABLE strategy_snapshots
           ADD COLUMN IF NOT EXISTS serving TEXT NOT NULL DEFAULT ''
         """,
+        # Детализация лидов (drill-down EDU-дашборда) — отдельный per-lead путь.
+        # Идемпотентно; зеркалит supabase/migrations/20260714120000_crm_lead_details.sql.
+        """
+        CREATE TABLE IF NOT EXISTS crm_lead_details (
+          lead_id          TEXT PRIMARY KEY,
+          client_id        TEXT,
+          campaign_id      TEXT NOT NULL,
+          land             TEXT,
+          utm_term         TEXT,
+          created_date     DATE NOT NULL,
+          connection_date  DATE,
+          payment_date     DATE,
+          stage            TEXT,
+          responsible      TEXT,
+          dispatcher       TEXT,
+          subdivision      TEXT,
+          city_raw         TEXT,
+          city_ip_segment  TEXT NOT NULL DEFAULT 'rf',
+          b24_grad_year    TEXT NOT NULL DEFAULT 'unknown',
+          b24_edu_level    TEXT NOT NULL DEFAULT 'unknown',
+          audience         TEXT,
+          is_eff           BOOLEAN NOT NULL DEFAULT false,
+          is_connected     BOOLEAN NOT NULL DEFAULT false,
+          is_deal          BOOLEAN NOT NULL DEFAULT false,
+          is_paid          BOOLEAN NOT NULL DEFAULT false,
+          project          TEXT,
+          direction        TEXT,
+          deal_id          TEXT,
+          payment_stage    TEXT,
+          utm_source       TEXT,
+          product          TEXT,
+          product_group    TEXT,
+          amount_turnover  NUMERIC(14, 2),
+          amount           NUMERIC(14, 2),
+          cert_date        DATE,
+          synced_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
     ]
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -90,6 +128,20 @@ def ensure_schema() -> None:
                 ON crm_payments (date, campaign_id, city_ip_segment, b24_grad_year, b24_edu_level)
                 """
             )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_crm_lead_details_campaign_created
+                ON crm_lead_details (campaign_id, created_date)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_crm_lead_details_created_project
+                ON crm_lead_details (created_date, project)
+                """
+            )
+            # RLS on: доступ только серверный (см. аудит panda-bi-audit-cleanup).
+            cur.execute("ALTER TABLE crm_lead_details ENABLE ROW LEVEL SECURITY")
         conn.commit()
 
 
@@ -306,6 +358,79 @@ def replace_crm_leads(rows: List[Dict[str, Any]]) -> int:
 
 def upsert_crm_leads(rows: List[Dict[str, Any]]) -> int:
     return replace_crm_leads(rows)
+
+
+def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
+    """Индивидуальные лиды (детализация drill-down). ОТДЕЛЬНЫЙ путь — агрегат не трогает.
+
+    Заменяет диапазон created_date >= min(created_date) (историю вне окна сохраняем),
+    как replace_crm_leads. ON CONFLICT (lead_id) — идемпотентный upsert (дедуп внутри
+    батча при одном lead_id в двух листах).
+    """
+    if not rows:
+        return 0
+    ensure_schema()
+    sql = """
+        INSERT INTO crm_lead_details (
+            lead_id, client_id, campaign_id, land, utm_term,
+            created_date, connection_date, payment_date,
+            stage, responsible, dispatcher, subdivision,
+            city_raw, city_ip_segment, b24_grad_year, b24_edu_level, audience,
+            is_eff, is_connected, is_deal, is_paid,
+            project, direction,
+            deal_id, payment_stage, utm_source, product, product_group,
+            amount_turnover, amount, cert_date, synced_at
+        )
+        VALUES (
+            %(lead_id)s, %(client_id)s, %(campaign_id)s, %(land)s, %(utm_term)s,
+            %(created_date)s::date, %(connection_date)s::date, %(payment_date)s::date,
+            %(stage)s, %(responsible)s, %(dispatcher)s, %(subdivision)s,
+            %(city_raw)s, %(city_ip_segment)s, %(b24_grad_year)s, %(b24_edu_level)s, %(audience)s,
+            %(is_eff)s, %(is_connected)s, %(is_deal)s, %(is_paid)s,
+            %(project)s, %(direction)s,
+            %(deal_id)s, %(payment_stage)s, %(utm_source)s, %(product)s, %(product_group)s,
+            %(amount_turnover)s, %(amount)s, %(cert_date)s::date, NOW()
+        )
+        ON CONFLICT (lead_id) DO UPDATE SET
+            client_id       = EXCLUDED.client_id,
+            campaign_id     = EXCLUDED.campaign_id,
+            land            = EXCLUDED.land,
+            utm_term        = EXCLUDED.utm_term,
+            created_date    = EXCLUDED.created_date,
+            connection_date = EXCLUDED.connection_date,
+            payment_date    = EXCLUDED.payment_date,
+            stage           = EXCLUDED.stage,
+            responsible     = EXCLUDED.responsible,
+            dispatcher      = EXCLUDED.dispatcher,
+            subdivision     = EXCLUDED.subdivision,
+            city_raw        = EXCLUDED.city_raw,
+            city_ip_segment = EXCLUDED.city_ip_segment,
+            b24_grad_year   = EXCLUDED.b24_grad_year,
+            b24_edu_level   = EXCLUDED.b24_edu_level,
+            audience        = EXCLUDED.audience,
+            is_eff          = EXCLUDED.is_eff,
+            is_connected    = EXCLUDED.is_connected,
+            is_deal         = EXCLUDED.is_deal,
+            is_paid         = EXCLUDED.is_paid,
+            project         = EXCLUDED.project,
+            direction       = EXCLUDED.direction,
+            deal_id         = EXCLUDED.deal_id,
+            payment_stage   = EXCLUDED.payment_stage,
+            utm_source      = EXCLUDED.utm_source,
+            product         = EXCLUDED.product,
+            product_group   = EXCLUDED.product_group,
+            amount_turnover = EXCLUDED.amount_turnover,
+            amount          = EXCLUDED.amount,
+            cert_date       = EXCLUDED.cert_date,
+            synced_at       = NOW()
+    """
+    min_date = min(str(r["created_date"]) for r in rows)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM crm_lead_details WHERE created_date >= %s", (min_date,))
+            psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+        conn.commit()
+    return len(rows)
 
 
 def replace_monthly_plans(rows: List[Dict[str, Any]]) -> int:
