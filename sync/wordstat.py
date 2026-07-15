@@ -22,6 +22,12 @@ def _monday(date_str: str) -> str:
     return (d - dt.timedelta(days=d.weekday())).isoformat()
 
 
+def _sunday(date_str: str) -> str:
+    """ISO-воскресенье недели (конец недели) — граница toDate для PERIOD_WEEKLY."""
+    d = dt.date.fromisoformat(date_str[:10])
+    return (d + dt.timedelta(days=6 - d.weekday())).isoformat()
+
+
 def aggregate_weekly(responses: list[dict]) -> dict[str, int]:
     """Σ count по всем фразам, ключ = ISO-понедельник недели.
 
@@ -39,15 +45,17 @@ def aggregate_weekly(responses: list[dict]) -> dict[str, int]:
 def fetch_phrase(phrase: str, from_date: str, to_date: str) -> dict:
     """GetDynamics по одной фразе за период (weekly, регион ru). Даты — YYYY-MM-DD."""
     api_key = os.environ["YANDEX_SEARCHAPI_KEY"]
-    folder_id = os.environ["YANDEX_CLOUD_FOLDER_ID"]
+    folder_id = os.environ.get("YANDEX_CLOUD_FOLDER_ID")  # опц.: ключ привязан к каталогу СА
+    # API требует fromDate=понедельник, toDate=воскресенье (граница недели) для PERIOD_WEEKLY.
     body = {
         "phrase": phrase,
         "period": "PERIOD_WEEKLY",
-        "fromDate": f"{from_date}T00:00:00Z",
-        "toDate": f"{to_date}T23:59:59Z",
+        "fromDate": f"{_monday(from_date)}T00:00:00Z",
+        "toDate": f"{_sunday(to_date)}T23:59:59Z",
         "regions": [RUSSIA_REGION],
-        "folderId": folder_id,
     }
+    if folder_id:
+        body["folderId"] = folder_id
     r = requests.post(
         WORDSTAT_URL, json=body, timeout=60,
         headers={"Authorization": f"Api-Key {api_key}", "Content-Type": "application/json"},

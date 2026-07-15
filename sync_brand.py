@@ -22,19 +22,22 @@ def main() -> None:
 
     errors: list[str] = []
 
-    # Wordstat спрос (Cloud Search API) — только если заданы креды
-    if os.environ.get("YANDEX_SEARCHAPI_KEY") and os.environ.get("YANDEX_CLOUD_FOLDER_ID"):
+    # Wordstat спрос (Cloud Search API) — нужен только API-ключ (folderId опц.).
+    # WORDSTAT_FROM=YYYY-MM-DD → бэкфилл с этой даты; иначе инкремент последних недель.
+    if os.environ.get("YANDEX_SEARCHAPI_KEY"):
         try:
             from sync.wordstat import sync_wordstat_demand
 
-            frm = (dt.date.today() - dt.timedelta(weeks=INCREMENTAL_WEEKS)).isoformat()
+            frm = os.environ.get("WORDSTAT_FROM") or (
+                dt.date.today() - dt.timedelta(weeks=INCREMENTAL_WEEKS)
+            ).isoformat()
             n = sync_wordstat_demand(frm, dt.date.today().isoformat())
-            print(f"wordstat: {n} недель")
+            print(f"wordstat: {n} недель (с {frm})")
         except Exception as e:
             print(f"ОШИБКА wordstat: {e}")
             errors.append(f"wordstat: {e}")
     else:
-        print("wordstat: пропуск (нет YANDEX_SEARCHAPI_KEY / YANDEX_CLOUD_FOLDER_ID)")
+        print("wordstat: пропуск (нет YANDEX_SEARCHAPI_KEY)")
 
     # Вебмастер SEO
     if os.environ.get("WORDSTAT_WEBMASTER_TOKEN"):
