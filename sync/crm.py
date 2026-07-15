@@ -11,6 +11,7 @@ from sync.classify import (
     resolve_row_project,
 )
 from sync.sheets import get_sheets_service, read_sheet
+from sync.product_parse import parse_product
 from sync.utils import normalize_campaign_id, pick_index_loose, to_iso_date, to_num
 
 CRM_LEADS_SHEET = "Лиды"
@@ -766,6 +767,16 @@ def sync_crm_leads() -> int:
         bucket = agg.get(d.pop("_key", ""))
         d["project"] = bucket.get("project", "unknown") if bucket else "unknown"
         d["direction"] = bucket.get("direction", "other") if bucket else "other"
+        # Разбор строки продукта на измерения (уровень/ступень/форма/УГСН-направление/…)
+        parsed = parse_product(d.get("product"))
+        d["prod_level"] = parsed["level"]
+        d["prod_stage"] = parsed["stage"]
+        d["prod_form"] = parsed["form"]
+        d["prod_ugsn"] = parsed["ugsn"]
+        d["prod_direction"] = parsed["direction"]
+        d["prod_specialty"] = parsed["specialty"]
+        d["prod_profile"] = parsed["profile"]
+        d["prod_faculty"] = parsed["faculty"]
 
     from sync.db import upsert_lead_details
 

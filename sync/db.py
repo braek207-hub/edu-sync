@@ -87,6 +87,14 @@ def ensure_schema() -> None:
           utm_source       TEXT,
           product          TEXT,
           product_group    TEXT,
+          prod_level       TEXT,
+          prod_stage       TEXT,
+          prod_form        TEXT,
+          prod_ugsn        TEXT,
+          prod_direction   TEXT,
+          prod_specialty   TEXT,
+          prod_profile     TEXT,
+          prod_faculty     TEXT,
           amount_turnover  NUMERIC(14, 2),
           amount           NUMERIC(14, 2),
           cert_date        DATE,
@@ -138,6 +146,20 @@ def ensure_schema() -> None:
                 """
                 CREATE INDEX IF NOT EXISTS idx_crm_lead_details_created_project
                 ON crm_lead_details (created_date, project)
+                """
+            )
+            # Разбор продукта на измерения (для существующей таблицы в проде).
+            cur.execute(
+                """
+                ALTER TABLE crm_lead_details
+                  ADD COLUMN IF NOT EXISTS prod_level     TEXT,
+                  ADD COLUMN IF NOT EXISTS prod_stage     TEXT,
+                  ADD COLUMN IF NOT EXISTS prod_form      TEXT,
+                  ADD COLUMN IF NOT EXISTS prod_ugsn      TEXT,
+                  ADD COLUMN IF NOT EXISTS prod_direction TEXT,
+                  ADD COLUMN IF NOT EXISTS prod_specialty TEXT,
+                  ADD COLUMN IF NOT EXISTS prod_profile   TEXT,
+                  ADD COLUMN IF NOT EXISTS prod_faculty   TEXT
                 """
             )
             # RLS on: доступ только серверный (см. аудит panda-bi-audit-cleanup).
@@ -379,6 +401,7 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
             is_eff, is_connected, is_deal, is_paid,
             project, direction,
             deal_id, payment_stage, utm_source, product, product_group,
+            prod_level, prod_stage, prod_form, prod_ugsn, prod_direction, prod_specialty, prod_profile, prod_faculty,
             amount_turnover, amount, cert_date, synced_at
         )
         VALUES (
@@ -389,6 +412,7 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
             %(is_eff)s, %(is_connected)s, %(is_deal)s, %(is_paid)s,
             %(project)s, %(direction)s,
             %(deal_id)s, %(payment_stage)s, %(utm_source)s, %(product)s, %(product_group)s,
+            %(prod_level)s, %(prod_stage)s, %(prod_form)s, %(prod_ugsn)s, %(prod_direction)s, %(prod_specialty)s, %(prod_profile)s, %(prod_faculty)s,
             %(amount_turnover)s, %(amount)s, %(cert_date)s::date, NOW()
         )
         ON CONFLICT (lead_id) DO UPDATE SET
@@ -419,6 +443,14 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
             utm_source      = EXCLUDED.utm_source,
             product         = EXCLUDED.product,
             product_group   = EXCLUDED.product_group,
+            prod_level      = EXCLUDED.prod_level,
+            prod_stage      = EXCLUDED.prod_stage,
+            prod_form       = EXCLUDED.prod_form,
+            prod_ugsn       = EXCLUDED.prod_ugsn,
+            prod_direction  = EXCLUDED.prod_direction,
+            prod_specialty  = EXCLUDED.prod_specialty,
+            prod_profile    = EXCLUDED.prod_profile,
+            prod_faculty    = EXCLUDED.prod_faculty,
             amount_turnover = EXCLUDED.amount_turnover,
             amount          = EXCLUDED.amount,
             cert_date       = EXCLUDED.cert_date,
