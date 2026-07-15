@@ -535,8 +535,19 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, A
         i_deal = pick_index_loose(headers, ["id сделки в битрикс", "id сделки", "deal id"])
         i_stage = pick_index_loose(headers, ["этап", "stage"])
         i_usource = pick_index_loose(headers, ["источник (utm source)", "utm source", "utm_source"])
-        i_product = pick_index_loose(headers, ["продукты", "продукт"])
         i_pgroup = pick_index_loose(headers, ["группа продуктов", "группа продукт"])
+        # «Продукты» (детальный) ≠ «Группа продуктов»: оба содержат «продукт», и группа
+        # идёт в листе раньше → pick_index_loose брал её для обоих (product == product_group).
+        # Берём колонку с «продукт», но БЕЗ «группа» → именно детальный продукт.
+        i_product = next(
+            (
+                i
+                for i, h in enumerate(headers)
+                if "продукт" in str(h or "").strip().lower()
+                and "группа" not in str(h or "").strip().lower()
+            ),
+            -1,
+        )
         i_turnover = pick_index_loose(headers, ["сумма (в оборот)", "в оборот", "сумма"])
         i_cert = pick_index_loose(headers, ["дата получения сертификата", "сертификат"])
         for row in values[1:]:
