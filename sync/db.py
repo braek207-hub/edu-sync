@@ -101,6 +101,21 @@ def ensure_schema() -> None:
           synced_at        TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
+        # Поведение визитов Метрики (per clientID × дата) для AI-скоринга лидов.
+        # Зеркалит supabase/migrations/20260716120000_edu_visit_behavior.sql.
+        """
+        CREATE TABLE IF NOT EXISTS edu_visit_behavior (
+          counter_id       BIGINT       NOT NULL,
+          visit_date       DATE         NOT NULL,
+          client_id        TEXT         NOT NULL,
+          visits           INTEGER      NOT NULL DEFAULT 0,
+          bounce_rate      NUMERIC(6, 2) NOT NULL DEFAULT 0,
+          page_depth       NUMERIC(6, 2) NOT NULL DEFAULT 0,
+          avg_duration_sec NUMERIC(8, 1) NOT NULL DEFAULT 0,
+          synced_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+          PRIMARY KEY (counter_id, visit_date, client_id)
+        )
+        """,
     ]
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -164,6 +179,13 @@ def ensure_schema() -> None:
             )
             # RLS on: доступ только серверный (см. аудит panda-bi-audit-cleanup).
             cur.execute("ALTER TABLE crm_lead_details ENABLE ROW LEVEL SECURITY")
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_edu_visit_behavior_client
+                ON edu_visit_behavior (client_id)
+                """
+            )
+            cur.execute("ALTER TABLE edu_visit_behavior ENABLE ROW LEVEL SECURITY")
         conn.commit()
 
 
@@ -766,6 +788,53 @@ def record_uploaded_conversions(rows: List[tuple]) -> int:
         INSERT INTO metrika_uploaded_conversions (counter_id, client_id, target, event_ts)
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (counter_id, client_id, target) DO NOTHING
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+        conn.commit()
+    return len(rows)
+
+
+# ── Поведение визитов Метрики для скоринга лидов (edu_visit_behavior) ──
+
+def load_lead_client_ids() -> set:
+    """client_id всех лидов (crm_lead_details) — фильтр поведения: скорим лидов, не весь
+    трафик счётчика. На vuz заполнено ~97%, на прочих лендах пусто (см. память
+    edu-client-id-fill-by-land) → на практике это client_id лидов vuz."""
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT client_id FROM crm_lead_details
+                WHERE client_id IS NOT NULL AND client_id <> '' AND client_id <> '0'
+                """
+            )
+            return {r[0] for r in cur.fetchall()}
+
+
+def upsert_edu_visit_behavior(rows: List[Dict[str, Any]]) -> int:
+    """Поведение визитов per (counter_id, visit_date, client_id). Чистый upsert —
+    поведение накапливается/уточняется (Метрика доливает с лагом), окно не сносим."""
+    if not rows:
+        return 0
+    ensure_schema()
+    sql = """
+        INSERT INTO edu_visit_behavior (
+            counter_id, visit_date, client_id,
+            visits, bounce_rate, page_depth, avg_duration_sec, synced_at
+        )
+        VALUES (
+            %(counter_id)s, %(visit_date)s::date, %(client_id)s,
+            %(visits)s, %(bounce_rate)s, %(page_depth)s, %(avg_duration_sec)s, NOW()
+        )
+        ON CONFLICT (counter_id, visit_date, client_id) DO UPDATE SET
+            visits           = EXCLUDED.visits,
+            bounce_rate      = EXCLUDED.bounce_rate,
+            page_depth       = EXCLUDED.page_depth,
+            avg_duration_sec = EXCLUDED.avg_duration_sec,
+            synced_at        = NOW()
     """
     with get_connection() as conn:
         with conn.cursor() as cur:

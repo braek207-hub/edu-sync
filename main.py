@@ -132,6 +132,15 @@ def main() -> None:
         print(f"ОШИБКА metrika_offline: {e}")
         errors.append(f"metrika_offline: {e}")
 
+    # Поведение визитов Метрики (vuz) для AI-скоринга лидов (если задан YM_TOKEN).
+    try:
+        from sync.edu_visits import sync_edu_visits
+
+        sync_edu_visits()
+    except Exception as e:
+        print(f"ОШИБКА edu_visits: {e}")
+        errors.append(f"edu_visits: {e}")
+
     try:
         from sync.validate_sheets import run_validation
 
