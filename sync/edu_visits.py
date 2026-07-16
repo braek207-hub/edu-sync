@@ -146,3 +146,14 @@ def sync_edu_visits(days_back: int = 90) -> int:
     if not rows:
         return 0
     return upsert_edu_visit_behavior(rows)
+
+
+if __name__ == "__main__":
+    import sys
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    days = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("EDU_VISITS_DAYS", "90"))
+    n = sync_edu_visits(days)
+    print(f"EDU visits: upsert {n} строк")

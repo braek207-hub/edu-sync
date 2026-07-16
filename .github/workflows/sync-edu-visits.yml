@@ -1,0 +1,37 @@
+name: Sync EDU Visit Behavior (Metrika)
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Окно бэкфилла в днях (по умолчанию 90)"
+        required: false
+        default: "90"
+
+concurrency:
+  group: edu-visits-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync EDU visit behavior (vuz)
+        env:
+          PYTHONUNBUFFERED: "1"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          YM_TOKEN: ${{ secrets.YM_TOKEN }}
+          EDU_VISITS_DAYS: ${{ github.event.inputs.days }}
+        run: python -m sync.edu_visits
