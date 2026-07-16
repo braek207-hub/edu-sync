@@ -1,0 +1,27 @@
+name: Sync EDU Market Demand
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # понедельник 09:00 MSK — закрытая прошлая неделя
+  workflow_dispatch:
+    inputs:
+      wordstat_from:
+        description: "Бэкфилл спроса с даты (YYYY-MM-DD), напр. 2024-01-01. Пусто = инкремент."
+        required: false
+        default: ""
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Sync EDU market demand
+        run: python sync_edu_demand.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          YANDEX_SEARCHAPI_KEY: ${{ secrets.YANDEX_SEARCHAPI_KEY }}
+          WORDSTAT_FROM: ${{ github.event.inputs.wordstat_from }}
