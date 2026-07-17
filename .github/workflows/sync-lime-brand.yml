@@ -29,9 +29,9 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
       - name: Write Google service-account key
         env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GSC_SA_KEY: ${{ secrets.GSC_SA_KEY }}   # lime-reports SA (Search Console API включён; ≠ GCP_SA_KEY проекта Sheets)
         run: |
-          if [ -n "$GCP_SA_KEY" ]; then printf '%s' "$GCP_SA_KEY" > sa.json; fi
+          if [ -n "$GSC_SA_KEY" ]; then printf '%s' "$GSC_SA_KEY" > sa.json; fi
       - name: Sync brand traffic
         run: python sync_brand.py
         env:
@@ -39,7 +39,5 @@ jobs:
           WORDSTAT_WEBMASTER_TOKEN: ${{ secrets.WORDSTAT_WEBMASTER_TOKEN }}
           YANDEX_SEARCHAPI_KEY: ${{ secrets.YANDEX_SEARCHAPI_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
-          TRENDSMCP_API_KEY: ${{ secrets.TRENDSMCP_API_KEY }}
           WORDSTAT_FROM: ${{ github.event.inputs.wordstat_from }}
           GSC_FROM: ${{ github.event.inputs.gsc_from }}
-          GTRENDS_FROM: ${{ github.event.inputs.gsc_from }}
