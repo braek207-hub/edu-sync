@@ -9,6 +9,10 @@ on:
         description: "Бэкфилл спроса Wordstat с даты (YYYY-MM-DD), напр. 2023-01-02. Пусто = инкремент."
         required: false
         default: ""
+      gsc_from:
+        description: "Бэкфилл GSC/Google-спроса с даты (YYYY-MM-DD), напр. 2025-04-01 (GSC ~16 мес истории). Пусто = инкремент."
+        required: false
+        default: ""
 
 jobs:
   sync:
@@ -23,10 +27,19 @@ jobs:
         run: python scripts/apply_lime_migrations.py
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      - name: Write Google service-account key
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          if [ -n "$GCP_SA_KEY" ]; then printf '%s' "$GCP_SA_KEY" > sa.json; fi
       - name: Sync brand traffic
         run: python sync_brand.py
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           WORDSTAT_WEBMASTER_TOKEN: ${{ secrets.WORDSTAT_WEBMASTER_TOKEN }}
           YANDEX_SEARCHAPI_KEY: ${{ secrets.YANDEX_SEARCHAPI_KEY }}
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          TRENDSMCP_API_KEY: ${{ secrets.TRENDSMCP_API_KEY }}
           WORDSTAT_FROM: ${{ github.event.inputs.wordstat_from }}
+          GSC_FROM: ${{ github.event.inputs.gsc_from }}
+          GTRENDS_FROM: ${{ github.event.inputs.gsc_from }}
