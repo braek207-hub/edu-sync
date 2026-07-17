@@ -159,7 +159,7 @@ def fetch_edu_client_visits(
     return out
 
 
-def sync_edu_visits(days_back: int = 90) -> int:
+def sync_edu_visits(days_back: int = 90, chunk_days: int = 30) -> int:
     token = _token()
     if not token:
         print("EDU visits: YM_TOKEN не задан — пропуск")
@@ -170,16 +170,22 @@ def sync_edu_visits(days_back: int = 90) -> int:
         return 0
 
     today = date.today()
-    date_from = (today - timedelta(days=days_back)).isoformat()
-    date_to = today.isoformat()
-    print(f"EDU visits (vuz {COUNTER_VUZ}): {date_from} — {date_to}, лидов-client_id={len(keep)}")
+    start = today - timedelta(days=days_back)
+    print(f"EDU visits (vuz {COUNTER_VUZ}): {start} — {today}, лидов-client_id={len(keep)}, чанк={chunk_days}д")
 
-    rows = fetch_edu_client_visits(COUNTER_VUZ, date_from, date_to, token, keep)
-    matched = len({r["client_id"] for r in rows})
-    print(f"  визитных строк для лидов: {len(rows)} (уникальных client_id с поведением: {matched})")
-    if not rows:
-        return 0
-    return upsert_edu_visit_behavior(rows)
+    # Reporting API с 7 dimensions за большой период отвечает 400 «Запрос слишком сложный»
+    # (недетерминированно). Тянем окнами по chunk_days — каждый запрос проще и стабилен.
+    total = 0
+    cur = start
+    while cur <= today:
+        c_from = cur
+        c_to = min(cur + timedelta(days=chunk_days - 1), today)
+        rows = fetch_edu_client_visits(COUNTER_VUZ, c_from.isoformat(), c_to.isoformat(), token, keep)
+        n = upsert_edu_visit_behavior(rows) if rows else 0
+        print(f"  {c_from} — {c_to}: {n} строк")
+        total += n
+        cur = c_to + timedelta(days=1)
+    return total
 
 
 if __name__ == "__main__":
