@@ -45,6 +45,15 @@ jobs:
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_direct
 
+      - name: Run LIME Direct KZ sync
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIME_DIRECT_TOKEN: ${{ secrets.LIME_DIRECT_KZ_TOKEN }}
+          LIME_DIRECT_CLIENT_LOGIN: ${{ secrets.LIME_DIRECT_KZ_CLIENT_LOGIN }}
+          LIME_DIRECT_DAYS_BACK: ${{ github.event.inputs.days_back || '7' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_direct
+
       - name: Revalidate dashboard cache
         if: success()
         run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
