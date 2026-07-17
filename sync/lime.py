@@ -16,18 +16,23 @@ SYNC_DAYS = int(os.environ.get("LIME_SYNC_DAYS") or "7")
 SYNC_FROM = (os.environ.get("LIME_SYNC_FROM") or "").strip() or None
 SYNC_TO = (os.environ.get("LIME_SYNC_TO") or "").strip() or None
 
-MYSQL_CFG = dict(
-    host=os.environ["LIME_DB_HOST"],
-    port=int(os.environ.get("LIME_DB_PORT") or "3306"),
-    db=os.environ["LIME_DB_SCHEMA"],
-    user=os.environ["LIME_DB_USER"],
-    password=os.environ["LIME_DB_PASSWORD"],
-    charset="utf8mb4",
-    connect_timeout=30,
-    cursorclass=pymysql.cursors.DictCursor,
-)
 
-PG_URL = os.environ["DATABASE_URL"].split("?")[0]
+def _mysql_cfg() -> dict:
+    return dict(
+        host=os.environ["LIME_DB_HOST"],
+        port=int(os.environ.get("LIME_DB_PORT") or "3306"),
+        db=os.environ["LIME_DB_SCHEMA"],
+        user=os.environ["LIME_DB_USER"],
+        password=os.environ["LIME_DB_PASSWORD"],
+        charset="utf8mb4",
+        connect_timeout=30,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+def _pg_url() -> str:
+    return os.environ["DATABASE_URL"].split("?")[0]
+
 
 PAID_CHANNELS = {"SEM", "SMM paid", "Retargeting"}
 
@@ -203,7 +208,7 @@ def sync_chunk(conn_my, day_from: str, day_to: str):
     agg = aggregate(rows)
     data = agg_to_rows(agg)
 
-    conn_pg = psycopg2.connect(PG_URL, connect_timeout=30)
+    conn_pg = psycopg2.connect(_pg_url(), connect_timeout=30)
     try:
         with conn_pg.cursor() as cur:
             cur.execute(DELETE_SQL, (day_from, day_to))
@@ -232,7 +237,7 @@ def sync_lime() -> None:
 
     print(f"[lime-sync] syncing {label}...")
 
-    conn_my = pymysql.connect(**MYSQL_CFG)
+    conn_my = pymysql.connect(**_mysql_cfg())
     try:
         total_raw = 0
         total_agg = 0
