@@ -158,6 +158,14 @@ INSERT INTO lime_stats (
 ) VALUES %s
 """
 
+# RU/KZ-синк владеет всеми регионами витрины lc_simple_view (region <> 'gcc').
+# GCC-синк (sync/lime_gcc.py) удаляет строго region='gcc'. Так два независимых
+# ingest'а в одну таблицу lime_stats не затирают данные друг друга.
+DELETE_SQL = """
+DELETE FROM lime_stats
+WHERE date >= %s AND date <= %s AND (region IS NULL OR region <> 'gcc')
+"""
+
 
 def agg_to_rows(agg):
     return [
@@ -198,10 +206,7 @@ def sync_chunk(conn_my, day_from: str, day_to: str):
     conn_pg = psycopg2.connect(PG_URL, connect_timeout=30)
     try:
         with conn_pg.cursor() as cur:
-            cur.execute(
-                "DELETE FROM lime_stats WHERE date >= %s AND date <= %s",
-                (day_from, day_to),
-            )
+            cur.execute(DELETE_SQL, (day_from, day_to))
             psycopg2.extras.execute_values(cur, INSERT_SQL, data, page_size=500)
         conn_pg.commit()
     except Exception:
