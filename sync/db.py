@@ -185,6 +185,17 @@ def ensure_schema() -> None:
                 ON edu_visit_behavior (client_id)
                 """
             )
+            # Признаки визита для скоринга (доминирующее значение на client_id×дата).
+            cur.execute(
+                """
+                ALTER TABLE edu_visit_behavior
+                  ADD COLUMN IF NOT EXISTS device_category TEXT,
+                  ADD COLUMN IF NOT EXISTS os              TEXT,
+                  ADD COLUMN IF NOT EXISTS browser         TEXT,
+                  ADD COLUMN IF NOT EXISTS region_city     TEXT,
+                  ADD COLUMN IF NOT EXISTS traffic_source  TEXT
+                """
+            )
             cur.execute("ALTER TABLE edu_visit_behavior ENABLE ROW LEVEL SECURITY")
         conn.commit()
 
@@ -823,17 +834,24 @@ def upsert_edu_visit_behavior(rows: List[Dict[str, Any]]) -> int:
     sql = """
         INSERT INTO edu_visit_behavior (
             counter_id, visit_date, client_id,
-            visits, bounce_rate, page_depth, avg_duration_sec, synced_at
+            visits, bounce_rate, page_depth, avg_duration_sec,
+            device_category, os, browser, region_city, traffic_source, synced_at
         )
         VALUES (
             %(counter_id)s, %(visit_date)s::date, %(client_id)s,
-            %(visits)s, %(bounce_rate)s, %(page_depth)s, %(avg_duration_sec)s, NOW()
+            %(visits)s, %(bounce_rate)s, %(page_depth)s, %(avg_duration_sec)s,
+            %(device_category)s, %(os)s, %(browser)s, %(region_city)s, %(traffic_source)s, NOW()
         )
         ON CONFLICT (counter_id, visit_date, client_id) DO UPDATE SET
             visits           = EXCLUDED.visits,
             bounce_rate      = EXCLUDED.bounce_rate,
             page_depth       = EXCLUDED.page_depth,
             avg_duration_sec = EXCLUDED.avg_duration_sec,
+            device_category  = EXCLUDED.device_category,
+            os               = EXCLUDED.os,
+            browser          = EXCLUDED.browser,
+            region_city      = EXCLUDED.region_city,
+            traffic_source   = EXCLUDED.traffic_source,
             synced_at        = NOW()
     """
     with get_connection() as conn:

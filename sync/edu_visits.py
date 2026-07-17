@@ -46,15 +46,33 @@ def _metrica_get(params: Dict[str, Any], token: str) -> Dict[str, Any]:
     raise RuntimeError("Metrica API: max retries")
 
 
+def _clean(s: str) -> str:
+    """Пустышки Метрики → NULL (не пишем «(not set)» в признак)."""
+    s = (s or "").strip()
+    return "" if s in {"(not set)", "not_set", "--", "0"} else s
+
+
 def fetch_edu_client_visits(
     counter_id: str, date_from: str, date_to: str, token: str, keep_cids: set
 ) -> List[Dict[str, Any]]:
-    """per (date, clientID): визиты + взвешенные (по визитам) отказы/глубина/время.
-    Фильтр keep_cids на стороне Python — Reporting API не умеет фильтровать по списку id."""
-    dimensions = "ym:s:date,ym:s:clientID"
+    """per (date, clientID): визиты + взвешенные (по визитам) отказы/глубина/время +
+    признаки визита (устройство/ОС/браузер/город/канал). Категориальные схлопываем до
+    ДОМИНИРУЮЩЕЙ по визитам комбинации (обычно у client×date она одна). Фильтр keep_cids
+    на стороне Python — Reporting API не умеет фильтровать по списку id."""
+    dimensions = ",".join(
+        [
+            "ym:s:date",
+            "ym:s:clientID",
+            "ym:s:deviceCategory",
+            "ym:s:operatingSystem",
+            "ym:s:browser",
+            "ym:s:regionCity",
+            "ym:s:lastSignTrafficSource",
+        ]
+    )
     metrics = "ym:s:visits,ym:s:bounceRate,ym:s:pageDepth,ym:s:avgVisitDurationSeconds"
 
-    aggregate: Dict[tuple, Dict[str, float]] = {}
+    aggregate: Dict[tuple, Dict[str, Any]] = {}
     limit = 100000
     offset = 1
 
@@ -93,16 +111,24 @@ def fetch_edu_client_visits(
             bounce = float(mets[1] or 0) if len(mets) > 1 else 0.0
             depth = float(mets[2] or 0) if len(mets) > 2 else 0.0
             duration = float(mets[3] or 0) if len(mets) > 3 else 0.0
+            combo = (
+                _clean(dims[2] if len(dims) > 2 else ""),  # device
+                _clean(dims[3] if len(dims) > 3 else ""),  # os
+                _clean(dims[4] if len(dims) > 4 else ""),  # browser
+                _clean(dims[5] if len(dims) > 5 else ""),  # city
+                _clean(dims[6] if len(dims) > 6 else ""),  # traffic_source
+            )
 
             key = (row_date, client_id)
             acc = aggregate.get(key)
             if acc is None:
-                acc = {"visits": 0, "bounce_w": 0.0, "depth_w": 0.0, "dur_w": 0.0}
+                acc = {"visits": 0, "bounce_w": 0.0, "depth_w": 0.0, "dur_w": 0.0, "combos": {}}
                 aggregate[key] = acc
             acc["visits"] += visits
             acc["bounce_w"] += bounce * visits
             acc["depth_w"] += depth * visits
             acc["dur_w"] += duration * visits
+            acc["combos"][combo] = acc["combos"].get(combo, 0) + visits
 
         if len(data) < limit:
             break
@@ -111,6 +137,9 @@ def fetch_edu_client_visits(
     out: List[Dict[str, Any]] = []
     for (row_date, client_id), acc in sorted(aggregate.items()):
         v = acc["visits"]
+        device, os_, browser, city, source = max(
+            acc["combos"].items(), key=lambda kv: kv[1]
+        )[0]
         out.append(
             {
                 "counter_id": int(counter_id),
@@ -120,6 +149,11 @@ def fetch_edu_client_visits(
                 "bounce_rate": round(acc["bounce_w"] / v, 2) if v else 0.0,
                 "page_depth": round(acc["depth_w"] / v, 2) if v else 0.0,
                 "avg_duration_sec": round(acc["dur_w"] / v, 1) if v else 0.0,
+                "device_category": device or None,
+                "os": os_ or None,
+                "browser": browser or None,
+                "region_city": city or None,
+                "traffic_source": source or None,
             }
         )
     return out
