@@ -10,6 +10,10 @@ on:
         description: "Days back to sync (default 7)"
         required: false
         default: "7"
+      fx_backfill:
+        description: "1 = дозаполнить cost_rub на всей истории (строки без курса)"
+        required: false
+        default: "0"
 
 concurrency:
   group: lime-direct-sync
@@ -58,6 +62,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           GOOGLE_ADS_FX_DAYS_BACK: "30"
+          GOOGLE_ADS_FX_BACKFILL: ${{ github.event.inputs.fx_backfill || '0' }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.google_ads_fx
 

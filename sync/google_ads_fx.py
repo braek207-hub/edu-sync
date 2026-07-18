@@ -18,13 +18,26 @@ import psycopg2.extras
 from sync.fx import CBR_IDS, to_rub as fx_to_rub
 
 DAYS_BACK = int(os.environ.get("GOOGLE_ADS_FX_DAYS_BACK") or "30")
+BACKFILL = (os.environ.get("GOOGLE_ADS_FX_BACKFILL") or "").strip() == "1"
 
-# Пары (дата, валюта), которые надо сконвертировать: только незаполненные/устаревшие.
-SELECT_PAIRS = """
-SELECT DISTINCT date::text AS date, COALESCE(currency, 'USD') AS currency
-FROM lime_google_ads_stats
-WHERE date >= %s AND date <= %s
-"""
+_SELECT_BASE = (
+    "SELECT DISTINCT date::text AS date, COALESCE(currency, 'USD') AS currency "
+    "FROM lime_google_ads_stats"
+)
+
+
+def build_pairs_query(backfill: bool, frm: str, to: str) -> tuple:
+    """Пары (дата, валюта) для конвертации.
+
+    backfill=True — вся история, только незаполненные строки. Нужен потому, что шаг
+    конвертации появился в workflow позже самих данных: с окном 30 дней история
+    с июня 2025 навсегда осталась бы без cost_rub, а дашборд читает именно его.
+    Условие cost_rub IS NULL заодно делает шаг самозалечивающимся — пропущенный
+    день подхватится следующим прогоном, а не потеряется молча.
+    """
+    if backfill:
+        return f"{_SELECT_BASE} WHERE cost_rub IS NULL", ()
+    return f"{_SELECT_BASE} WHERE date >= %s AND date <= %s", (frm, to)
 
 UPDATE_SQL = """
 UPDATE lime_google_ads_stats
@@ -50,7 +63,8 @@ def sync_google_ads_fx() -> int:
     updated = 0
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(SELECT_PAIRS, (frm_s, to_s))
+            sql, params = build_pairs_query(BACKFILL, frm_s, to_s)
+            cur.execute(sql, params)
             pairs = cur.fetchall()
 
         with conn.cursor() as cur:
