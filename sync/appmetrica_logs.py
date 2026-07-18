@@ -50,7 +50,11 @@ def fetch_purchase_events(app_id: str, token: str, date_since: str, date_until: 
         "application_id": app_id,
         "date_since": f"{date_since} 00:00:00",
         "date_until": f"{date_until} 23:59:59",
-        "date_dimension": "default",
+        # 'receive' (время приёма сервером), а не 'default': откалибровано по эталону
+        # AppMetrica UI (янв-2026, M0). С 'default' покупки завышались на +0.5..0.8%
+        # из-за сдвига границы месяца; с 'receive' VK совпадает точно (206), остальные
+        # в пределах 0.3-0.4% (остаток — антифрод-фильтрация отчётов, в сыром логе её нет).
+        "date_dimension": "receive",
         "fields": EVENT_FIELDS,
         "event_name": event_name,  # серверный фильтр по имени события
     }
