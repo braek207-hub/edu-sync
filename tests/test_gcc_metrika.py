@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from sync.gcc_metrika import parse_metrika_traffic
+from sync.gcc_metrika import parse_metrika_traffic, residual_rows
 
 
 def test_parse_metrika_traffic():
@@ -42,3 +42,62 @@ def test_parse_metrika_traffic_with_domain():
     assert {r["country"] for r in rows} == {
         "ОАЭ", "Саудовская Аравия", "Кувейт", "Катар", "Оман"
     }
+
+# === Остаток: визиты, не разнесённые по доменам (T5) ===
+#
+# Метрика при кроссе ym:s:startURLDomain с lastsignTrafficSource+lastsignSourceEngine
+# теряет ~2% визитов (4496 → 4396 на 2026-07-17), причём потеря есть и в per-domain
+# запросе с фильтром. Чтобы GCC-тотал не просел, разницу пишем строкой country=None.
+
+
+def test_residual_adds_unattributed_visits():
+    totals = [{"date": "2026-07-17", "country": None, "traffic_source": "ad",
+               "source_engine": "Google Ads", "visits": 1200, "users": 900}]
+    by_country = [
+        {"date": "2026-07-17", "country": "ОАЭ", "traffic_source": "ad",
+         "source_engine": "Google Ads", "visits": 1125, "users": 850},
+        {"date": "2026-07-17", "country": "Катар", "traffic_source": "ad",
+         "source_engine": "Google Ads", "visits": 42, "users": 30},
+    ]
+    rows = residual_rows(totals, by_country)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["country"] is None
+    assert r["traffic_source"] == "ad" and r["source_engine"] == "Google Ads"
+    assert r["visits"] == 1200 - 1125 - 42
+    assert r["users"] == 900 - 850 - 30
+
+
+def test_residual_skips_fully_attributed_channels():
+    totals = [{"date": "2026-07-17", "country": None, "traffic_source": "direct",
+               "source_engine": None, "visits": 100, "users": 90}]
+    by_country = [{"date": "2026-07-17", "country": "ОАЭ", "traffic_source": "direct",
+                   "source_engine": None, "visits": 100, "users": 90}]
+    assert residual_rows(totals, by_country) == []
+
+
+def test_residual_never_negative():
+    """Если разбивка дала больше тотала (расхождение округлений) — строки не создаём."""
+    totals = [{"date": "2026-07-17", "country": None, "traffic_source": "ad",
+               "source_engine": "Instagram", "visits": 10, "users": 8}]
+    by_country = [{"date": "2026-07-17", "country": "ОАЭ", "traffic_source": "ad",
+                   "source_engine": "Instagram", "visits": 12, "users": 11}]
+    assert residual_rows(totals, by_country) == []
+
+
+def test_residual_channel_missing_in_country_split():
+    """Канал есть в тотале, но целиком выпал из разбивки → весь его объём в остаток."""
+    totals = [{"date": "2026-07-17", "country": None, "traffic_source": "referral",
+               "source_engine": "shop.app", "visits": 25, "users": 20}]
+    rows = residual_rows(totals, [])
+    assert len(rows) == 1 and rows[0]["visits"] == 25 and rows[0]["country"] is None
+
+
+def test_residual_users_clamped_at_zero():
+    """Визиты просели, а юзеры нет — отрицательных юзеров не пишем."""
+    totals = [{"date": "2026-07-17", "country": None, "traffic_source": "ad",
+               "source_engine": "Google Ads", "visits": 100, "users": 50}]
+    by_country = [{"date": "2026-07-17", "country": "ОАЭ", "traffic_source": "ad",
+                   "source_engine": "Google Ads", "visits": 90, "users": 55}]
+    rows = residual_rows(totals, by_country)
+    assert len(rows) == 1 and rows[0]["visits"] == 10 and rows[0]["users"] == 0

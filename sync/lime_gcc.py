@@ -36,19 +36,25 @@ SYNC_DAYS = int(os.environ.get("LIME_GCC_SYNC_DAYS") or "7")
 
 DELETE_SQL = "DELETE FROM lime_stats WHERE region = 'gcc' AND date >= %s AND date <= %s"
 
-INSERT_SQL = """
-INSERT INTO lime_stats (
-    date, data_source, region, channel, subchannel, traffic_type,
-    campaign_id, campaign_name,
-    cost, clicks, impressions, sessions, users, clients,
-    purchases_count, purchases_revenue, customers,
-    new_users, new_customers, new_customers_revenue
-) VALUES %s
-"""
+# Порядок колонок = порядок полей в кортежах merge_rows(). Держим одним списком, чтобы
+# добавление колонки не разъезжалось с индексами в сводке dry-run.
+COLUMNS = (
+    "date", "data_source", "region", "country", "channel", "subchannel", "traffic_type",
+    "campaign_id", "campaign_name",
+    "cost", "clicks", "impressions", "sessions", "users", "clients",
+    "purchases_count", "purchases_revenue", "customers",
+    "new_users", "new_customers", "new_customers_revenue",
+)
+
+INSERT_SQL = f"INSERT INTO lime_stats ({', '.join(COLUMNS)}) VALUES %s"
 
 
 def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s) -> list[tuple]:
-    """Свернуть трафик (Метрика) + заказы/расход (Triple Whale) по (channel, subchannel).
+    """Свернуть трафик (Метрика) + заказы/расход (Triple Whale) по (country, channel, subchannel).
+
+    Страна берётся из самого источника: Метрика — домен витрины, TW-заказы — journey.
+    Источники без гео-разбивки (расход из TW summary-page — он на весь магазин) дают
+    country=None: такие строки не приписываются ни одной стране, но входят в GCC-тотал.
 
     Args:
         metrika_rows: sync.gcc_metrika.fetch_metrika_traffic() за день date_s.
@@ -58,12 +64,12 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s) -> l
         date_s: дата строк (YYYY-MM-DD).
 
     Returns:
-        Список кортежей в порядке колонок INSERT_SQL, по одному на (channel, subchannel).
+        Список кортежей в порядке COLUMNS, по одному на (country, channel, subchannel).
     """
-    agg: dict[tuple[str, str], dict] = {}
+    agg: dict[tuple[str | None, str, str], dict] = {}
 
-    def _bucket(channel, subchannel, traffic_type):
-        key = (channel, subchannel)
+    def _bucket(country, channel, subchannel, traffic_type):
+        key = (country, channel, subchannel)
         row = agg.get(key)
         if row is None:
             row = {
@@ -81,25 +87,26 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s) -> l
 
     for m in metrika_rows:
         channel, subchannel, traffic_type = map_metrika_channel(m["traffic_source"], m["source_engine"])
-        row = _bucket(channel, subchannel, traffic_type)
+        row = _bucket(m.get("country"), channel, subchannel, traffic_type)
         row["sessions"] += int(m["visits"] or 0)
         row["users"] += int(m["users"] or 0)
 
     for o in tw_order_rows:
-        row = _bucket(o["channel"], o["subchannel"], o.get("traffic_type"))
+        row = _bucket(o.get("country"), o["channel"], o["subchannel"], o.get("traffic_type"))
         row["orders"] += int(o["orders"] or 0)
         row["revenue"] += float(o["revenue"] or 0)
 
     for sp in tw_spend_rows:
-        row = _bucket(sp["channel"], sp["subchannel"], sp.get("traffic_type"))
+        # summary-page даёт расход на магазин целиком; гео-разбивка расхода — T4 (Google) и Фаза 2 (Meta).
+        row = _bucket(sp.get("country"), sp["channel"], sp["subchannel"], sp.get("traffic_type"))
         row["cost"] += float(sp["cost"] or 0)
 
     out: list[tuple] = []
-    for (channel, subchannel), row in agg.items():
+    for (country, channel, subchannel), row in agg.items():
         cost_rub = round(row["cost"] * fx_rate, 2)
         revenue_rub = round(row["revenue"] * fx_rate, 2)
         out.append((
-            date_s, "web", "gcc", channel, subchannel, row["traffic_type"],
+            date_s, "web", "gcc", country, channel, subchannel, row["traffic_type"],
             "", "",                                            # campaign_id, campaign_name (channel-level, пусто)
             cost_rub, 0, 0, row["sessions"], row["users"], 0,   # cost, clicks, impressions, sessions, users, clients
             row["orders"], revenue_rub, 0,                      # purchases_count, purchases_revenue, customers
@@ -124,11 +131,28 @@ def _sync_range(frm: date, to: date, conn) -> int:
         rows = merge_rows(metrika, orders, spend, fx_rate, day_s)
 
         if conn is None:
-            cost_sum = sum(r[8] for r in rows)
-            revenue_sum = sum(r[15] for r in rows)
-            orders_sum = sum(r[14] for r in rows)
+            i_country = COLUMNS.index("country")
+            i_cost = COLUMNS.index("cost")
+            i_revenue = COLUMNS.index("purchases_revenue")
+            i_orders = COLUMNS.index("purchases_count")
+            i_sessions = COLUMNS.index("sessions")
+            cost_sum = sum(r[i_cost] for r in rows)
+            revenue_sum = sum(r[i_revenue] for r in rows)
+            orders_sum = sum(r[i_orders] for r in rows)
             print(f"lime_gcc: [DRY-RUN] {day_s} → {len(rows)} строк "
                   f"(cost={cost_sum:.2f}₽, revenue={revenue_sum:.2f}₽, orders={orders_sum})")
+            by_country: dict[str | None, list[float]] = {}
+            for r in rows:
+                acc = by_country.setdefault(r[i_country], [0, 0.0, 0, 0.0])
+                acc[0] += r[i_sessions]
+                acc[1] += r[i_revenue]
+                acc[2] += r[i_orders]
+                acc[3] += r[i_cost]
+            for country, (sessions, revenue, orders_n, cost) in sorted(
+                by_country.items(), key=lambda kv: -kv[1][0]
+            ):
+                print(f"    {str(country or '(тотал GCC)'):<22} визиты={sessions:<7} "
+                      f"заказы={orders_n:<5} выручка={revenue:.0f}₽ расход={cost:.0f}₽")
         else:
             with conn.cursor() as cur:
                 cur.execute(DELETE_SQL, (day_s, day_s))

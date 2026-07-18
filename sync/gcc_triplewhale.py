@@ -4,9 +4,13 @@
 Каналы/подканалы совпадают с sync.gcc_channels.map_metrika_channel — нужно
 для мержа трафика (Метрика) с деньгами (Triple Whale) по (channel, subchannel).
 """
+import re
+
 import requests
 
-from sync.gcc_channels import map_tw_source
+from sync.gcc_channels import map_domain_country, map_tw_source
+
+_HOST_RE = re.compile(r"https?://([^/]+)", re.I)
 
 TW_ORDERS_URL = "https://api.triplewhale.com/api/v2/attribution/get-orders-with-journeys-v2"
 TW_SPEND_URL = "https://api.triplewhale.com/api/v2/summary-page/get-data"
@@ -39,25 +43,53 @@ def order_source(order: dict) -> str | None:
     return None
 
 
+def order_country(order: dict) -> str | None:
+    """Страна Залива, в которой оформлен заказ — по домену витрины из journey.
+
+    `journey` (доступен только при `excludeJourneyData: false`) отсортирован по убыванию
+    времени, поэтому берём первый тачпоинт с распознаваемым доменом — самый близкий к
+    моменту заказа. События `add2c` не несут `path` и пропускаются. Правило и его цена
+    (расхождение с «доминирующим доменом» — 2 заказа из 84) — зонд P3, docs/GCC_CONTRACTS.md.
+
+    Args:
+        order: элемент `ordersWithJourneys`.
+
+    Returns:
+        Название страны или None (нет journey / только не-GCC домены) — тогда заказ
+        попадает лишь в GCC-тотал.
+    """
+    for touchpoint in order.get("journey") or []:
+        match = _HOST_RE.match(touchpoint.get("path") or "")
+        if not match:
+            continue
+        country = map_domain_country(match.group(1))
+        if country:
+            return country
+    return None
+
+
 def aggregate_orders_by_channel(orders: list[dict], date: str) -> list[dict]:
-    """Свернуть заказы attribution-эндпоинта в строки заказы/выручка по каналу.
+    """Свернуть заказы attribution-эндпоинта в строки заказы/выручка по каналу и стране.
 
     Args:
         orders: список `ordersWithJourneys`.
         date: дата синка (сутки), проставляется во все строки — НЕ берётся из created_at заказов.
 
     Returns:
-        Список дектов {date, channel, subchannel, traffic_type, orders, revenue}.
+        Список дектов {date, country, channel, subchannel, traffic_type, orders, revenue}.
+        country=None (заказ без journey) — отдельная строка, суммируется в GCC-тотал.
     """
-    agg: dict[tuple[str, str, str], dict] = {}
+    agg: dict[tuple[str | None, str, str, str], dict] = {}
     for order in orders:
         src = order_source(order)
         channel, subchannel, traffic_type = map_tw_source(src)
-        key = (channel, subchannel, traffic_type)
+        country = order_country(order)
+        key = (country, channel, subchannel, traffic_type)
         row = agg.setdefault(
             key,
             {
                 "date": date,
+                "country": country,
                 "channel": channel,
                 "subchannel": subchannel,
                 "traffic_type": traffic_type,
@@ -86,11 +118,13 @@ def fetch_tw_orders(api_key: str, shop: str, date_from: str, date_to: str) -> li
     orders: list[dict] = []
     end_date = date_to
     while True:
+        # journey нужен для страны заказа (order_country). Ответ раздувается
+        # (84 заказа ≈ 29k тачпоинтов) — не логировать заказы целиком.
         body = {
             "shop": shop,
             "startDate": date_from,
             "endDate": end_date,
-            "excludeJourneyData": True,
+            "excludeJourneyData": False,
         }
         resp = requests.post(TW_ORDERS_URL, headers=headers, json=body, timeout=90)
         resp.raise_for_status()
