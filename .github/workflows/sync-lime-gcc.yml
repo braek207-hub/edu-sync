@@ -7,9 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       sync_days:
-        description: "Days back to sync (default 7)"
+        description: "Days back to sync (default 7). Игнорируется, если заданы sync_from И sync_to"
         required: false
         default: "7"
+      sync_from:
+        description: "Бэкфилл: дата начала YYYY-MM-DD (только вместе с sync_to)"
+        required: false
+      sync_to:
+        description: "Бэкфилл: дата конца YYYY-MM-DD"
+        required: false
 
 concurrency:
   group: lime-gcc-sync
@@ -18,7 +24,8 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 180 мин — под бэкфилл (дневной прогон занимает ~1 мин и выходит сразу)
+    timeout-minutes: 180
 
     steps:
       - uses: actions/checkout@v4
@@ -38,5 +45,8 @@ jobs:
           GCC_TRIPLEWHALE_API_KEY: ${{ secrets.GCC_TRIPLEWHALE_API_KEY }}
           GCC_TW_SHOP_DOMAIN: ${{ secrets.GCC_TW_SHOP_DOMAIN }}
           LIME_GCC_SYNC_DAYS: ${{ github.event.inputs.sync_days || '7' }}
+          # Пусто на кроне → синк уходит в режим SYNC_DAYS (в коде `if frm and to`)
+          LIME_GCC_SYNC_FROM: ${{ github.event.inputs.sync_from }}
+          LIME_GCC_SYNC_TO: ${{ github.event.inputs.sync_to }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_gcc
