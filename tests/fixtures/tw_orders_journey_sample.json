@@ -1,0 +1,600 @@
+{
+  "ordersWithJourneys": [
+    {
+      "order_id": "REDACTED",
+      "order_name": "REDACTED",
+      "total_price": 455,
+      "currency": "AED",
+      "created_at": "2026-07-17T23:54:35+0400",
+      "attribution": {
+        "firstClick": [],
+        "lastClick": [],
+        "fullFirstClick": [
+          {
+            "source": "facebook-ads",
+            "campaignId": "120249836435880017",
+            "adsetId": "120249836435900017",
+            "adId": "120249836435890017",
+            "clickDate": "2026-07-07T15:09:32+0400"
+          }
+        ],
+        "fullLastClick": [
+          {
+            "source": "facebook-ads",
+            "campaignId": "120251056296950017",
+            "adsetId": "120251056296970017",
+            "adId": "120251056296960017",
+            "clickDate": "2026-07-17T23:33:55+0400"
+          }
+        ],
+        "lastPlatformClick": [
+          {
+            "source": "facebook-ads",
+            "campaignId": "120251056296950017",
+            "adsetId": "120251056296970017",
+            "adId": "120251056296960017",
+            "clickDate": "2026-07-17T23:33:55+0400"
+          }
+        ],
+        "linear": [
+          {
+            "source": "facebook-ads",
+            "campaignId": "120249836435880017",
+            "adsetId": "120249836435900017",
+            "adId": "120249836435890017",
+            "clickDate": "2026-07-07T15:09:32+0400"
+          },
+          {
+            "source": "facebook-ads",
+            "campaignId": "120251056296950017",
+            "adsetId": "120251056296970017",
+            "adId": "120251056296960017",
+            "clickDate": "2026-07-17T23:33:55+0400"
+          }
+        ],
+        "linearAll": [
+          {
+            "source": "facebook-ads",
+            "campaignId": "120251056296950017",
+            "adsetId": "120251056296970017",
+            "adId": "120251056296960017",
+            "clickDate": "2026-07-17T23:33:55+0400"
+          }
+        ]
+      },
+      "journey": [
+        {
+          "time": "2026-07-17T23:52:19+04:00",
+          "event": "page loaded",
+          "path": "https://ae.limestore.com/cart"
+        },
+        {
+          "time": "2026-07-17T23:52:03+04:00",
+          "event": "page loaded",
+          "path": "https://ae.limestore.com/products/cotton-linen-blazer-1"
+        },
+        {
+          "time": "2026-07-17T23:51:41+04:00",
+          "event": "add2c",
+          "productId": 9682726093122
+        },
+        {
+          "time": "2026-07-17T23:51:17+04:00",
+          "event": "page loaded",
+          "path": "https://ae.limestore.com/products/basic-cotton-t-shirt-6"
+        },
+        {
+          "time": "2026-07-17T23:51:07+04:00",
+          "event": "page loaded",
+          "path": "https://ae.limestore.com/collections/sale-tops-woman-1"
+        },
+        {
+          "time": "2026-07-17T23:50:35+04:00",
+          "event": "page loaded",
+          "path": "https://ae.limestore.com/products/belted-mini-dress-1"
+        }
+      ]
+    },
+    {
+      "order_id": "REDACTED",
+      "order_name": "REDACTED",
+      "total_price": 499,
+      "currency": "AED",
+      "created_at": "2026-07-17T23:46:45+0400",
+      "attribution": {
+        "firstClick": [],
+        "lastClick": [],
+        "fullFirstClick": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "lime-shop.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2025-08-06T21:41:28+0400"
+          }
+        ],
+        "fullLastClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T23:44:58+0400"
+          }
+        ],
+        "lastPlatformClick": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "lime-shop.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2025-08-17T15:25:02+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "google",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-04-30T23:34:35+0400"
+          },
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T23:44:58+0400"
+          }
+        ],
+        "linear": [
+          {
+            "source": "google-ads",
+            "campaignId": "21087796023",
+            "adsetId": "160367002512",
+            "adId": "693309639810",
+            "clickDate": "2026-06-27T12:04:19+0400"
+          },
+          {
+            "source": "google-ads",
+            "campaignId": "21087796023",
+            "adsetId": "160367002512",
+            "adId": "693309639810",
+            "clickDate": "2026-04-28T18:28:44+0400"
+          },
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-13T16:30:14+0400"
+          },
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T23:44:58+0400"
+          }
+        ],
+        "linearAll": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "lime-shop.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2025-08-17T15:25:02+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "google",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-04-30T23:34:35+0400"
+          },
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T23:44:58+0400"
+          }
+        ]
+      },
+      "journey": [
+        {
+          "time": "2026-07-17T23:45:30+04:00",
+          "event": "add2c",
+          "productId": 10169864126786
+        },
+        {
+          "time": "2026-07-17T23:45:29+04:00",
+          "event": "page loaded",
+          "path": "https://ae.limestore.com/cart"
+        },
+        {
+          "time": "2026-07-17T23:45:20+04:00",
+          "event": "page loaded",
+          "path": "https://ae.limestore.com/products/suede-loafers-11"
+        },
+        {
+          "time": "2026-07-17T23:45:20+04:00",
+          "event": "page loaded",
+          "path": "https://ae.limestore.com/products/suede-loafers-11"
+        },
+        {
+          "time": "2026-07-17T23:45:11+04:00",
+          "event": "add2c",
+          "productId": 10169864126786
+        },
+        {
+          "time": "2026-07-17T23:45:03+04:00",
+          "event": "page loaded",
+          "path": "https://ae.limestore.com/products/suede-loafers-8"
+        }
+      ]
+    },
+    {
+      "order_id": "REDACTED",
+      "order_name": "REDACTED",
+      "total_price": 1737,
+      "currency": "AED",
+      "created_at": "2026-07-17T22:50:03+0400",
+      "attribution": {
+        "firstClick": [],
+        "lastClick": [],
+        "fullFirstClick": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "limestore.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-10T13:32:27+0400"
+          }
+        ],
+        "fullLastClick": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "limestore.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-17T16:36:41+0400"
+          }
+        ],
+        "lastPlatformClick": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "limestore.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-17T16:36:41+0400"
+          }
+        ],
+        "linear": [],
+        "linearAll": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "limestore.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-17T16:36:41+0400"
+          }
+        ]
+      },
+      "journey": [
+        {
+          "time": "2026-07-17T22:48:16+04:00",
+          "event": "page loaded",
+          "path": "https://sa.limestore.com/cart"
+        },
+        {
+          "time": "2026-07-17T22:47:00+04:00",
+          "event": "page loaded",
+          "path": "https://sa.limestore.com/products/cotton-dress-with-frog-fastening"
+        },
+        {
+          "time": "2026-07-17T22:45:07+04:00",
+          "event": "page loaded",
+          "path": "https://sa.limestore.com/cart"
+        },
+        {
+          "time": "2026-07-17T22:44:44+04:00",
+          "event": "page loaded",
+          "path": "https://sa.limestore.com/products/lace-bodice-embroidered-cotton-dress-1"
+        },
+        {
+          "time": "2026-07-17T22:44:43+04:00",
+          "event": "page loaded",
+          "path": "https://sa.limestore.com/cart"
+        },
+        {
+          "time": "2026-07-17T22:44:43+04:00",
+          "event": "page loaded",
+          "path": "https://sa.limestore.com/cart"
+        }
+      ]
+    },
+    {
+      "order_id": "REDACTED",
+      "order_name": "REDACTED",
+      "total_price": 587,
+      "currency": "AED",
+      "created_at": "2026-07-17T20:10:35+0400",
+      "attribution": {
+        "firstClick": [],
+        "lastClick": [],
+        "fullFirstClick": [
+          {
+            "source": "Non-attributed",
+            "clickDate": "2026-07-17T20:10:35+0400"
+          }
+        ],
+        "fullLastClick": [
+          {
+            "source": "Non-attributed",
+            "clickDate": "2026-07-17T20:10:35+0400"
+          }
+        ],
+        "lastPlatformClick": [
+          {
+            "source": "Non-attributed",
+            "clickDate": "2026-07-17T20:10:35+0400"
+          }
+        ],
+        "linear": [
+          {
+            "source": "Non-attributed",
+            "clickDate": "2026-07-17T20:10:35+0400"
+          }
+        ],
+        "linearAll": [
+          {
+            "source": "Non-attributed",
+            "clickDate": "2026-07-17T20:10:35+0400"
+          }
+        ]
+      },
+      "journey": []
+    },
+    {
+      "order_id": "REDACTED",
+      "order_name": "REDACTED",
+      "total_price": 67,
+      "currency": "AED",
+      "created_at": "2026-07-17T18:39:19+0400",
+      "attribution": {
+        "firstClick": [],
+        "lastClick": [],
+        "fullFirstClick": [
+          {
+            "source": "Non-attributed",
+            "clickDate": "2026-07-17T18:39:19+0400"
+          }
+        ],
+        "fullLastClick": [
+          {
+            "source": "Non-attributed",
+            "clickDate": "2026-07-17T18:39:19+0400"
+          }
+        ],
+        "lastPlatformClick": [
+          {
+            "source": "Non-attributed",
+            "clickDate": "2026-07-17T18:39:19+0400"
+          }
+        ],
+        "linear": [
+          {
+            "source": "Non-attributed",
+            "clickDate": "2026-07-17T18:39:19+0400"
+          }
+        ],
+        "linearAll": [
+          {
+            "source": "Non-attributed",
+            "clickDate": "2026-07-17T18:39:19+0400"
+          }
+        ]
+      },
+      "journey": []
+    },
+    {
+      "order_id": "REDACTED",
+      "order_name": "REDACTED",
+      "total_price": 1306,
+      "currency": "AED",
+      "created_at": "2026-07-17T17:45:18+0400",
+      "attribution": {
+        "firstClick": [],
+        "lastClick": [],
+        "fullFirstClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "22939132072",
+            "adsetId": "183142403903",
+            "adId": "771057044536",
+            "clickDate": "2026-07-17T11:58:46+0400"
+          }
+        ],
+        "fullLastClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "22939132072",
+            "adsetId": "183142403903",
+            "adId": "771057044536",
+            "clickDate": "2026-07-17T12:09:28+0400"
+          }
+        ],
+        "lastPlatformClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "22939132072",
+            "adsetId": "183142403903",
+            "adId": "771057044536",
+            "clickDate": "2026-07-17T12:09:28+0400"
+          }
+        ],
+        "linear": [
+          {
+            "source": "google-ads",
+            "campaignId": "22939132072",
+            "adsetId": "183142403903",
+            "adId": "771057044536",
+            "clickDate": "2026-07-17T12:09:28+0400"
+          }
+        ],
+        "linearAll": [
+          {
+            "source": "google-ads",
+            "campaignId": "22939132072",
+            "adsetId": "183142403903",
+            "adId": "771057044536",
+            "clickDate": "2026-07-17T12:09:28+0400"
+          }
+        ]
+      },
+      "journey": [
+        {
+          "time": "2026-07-17T17:43:40+04:00",
+          "event": "page loaded",
+          "path": "https://sa.limestore.com/cart"
+        },
+        {
+          "time": "2026-07-17T17:43:38+04:00",
+          "event": "add2c",
+          "productId": 10282744480066
+        },
+        {
+          "time": "2026-07-17T17:43:32+04:00",
+          "event": "page loaded",
+          "path": "https://sa.limestore.com/products/jacquard-weave-robe-1"
+        },
+        {
+          "time": "2026-07-17T17:43:30+04:00",
+          "event": "page loaded",
+          "path": "https://sa.limestore.com/search"
+        },
+        {
+          "time": "2026-07-17T17:34:31+04:00",
+          "event": "page loaded",
+          "path": "https://sa.limestore.com/cart"
+        },
+        {
+          "time": "2026-07-17T14:44:04+04:00",
+          "event": "page loaded",
+          "path": "https://sa.limestore.com/cart"
+        }
+      ]
+    },
+    {
+      "order_id": "REDACTED",
+      "order_name": "REDACTED",
+      "total_price": 595,
+      "currency": "AED",
+      "created_at": "2026-07-17T11:56:29+0400",
+      "attribution": {
+        "firstClick": [],
+        "lastClick": [],
+        "fullFirstClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23147258308",
+            "adsetId": "192676227768",
+            "adId": "779474312624",
+            "clickDate": "2026-07-15T19:12:58+0400"
+          }
+        ],
+        "fullLastClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23147258308",
+            "adsetId": "192676227768",
+            "adId": "779474312624",
+            "clickDate": "2026-07-17T11:39:49+0400"
+          }
+        ],
+        "lastPlatformClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23147258308",
+            "adsetId": "192676227768",
+            "adId": "779474312624",
+            "clickDate": "2026-07-17T11:39:49+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "google",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-15T19:24:21+0400"
+          }
+        ],
+        "linear": [
+          {
+            "source": "google-ads",
+            "campaignId": "23147258308",
+            "adsetId": "192676227768",
+            "adId": "779474312624",
+            "clickDate": "2026-07-17T11:39:49+0400"
+          },
+          {
+            "source": "google-ads",
+            "campaignId": "23147258308",
+            "adsetId": "192676227768",
+            "adId": "779474312624",
+            "clickDate": "2026-07-15T19:21:00+0400"
+          }
+        ],
+        "linearAll": [
+          {
+            "source": "google-ads",
+            "campaignId": "23147258308",
+            "adsetId": "192676227768",
+            "adId": "779474312624",
+            "clickDate": "2026-07-17T11:39:49+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "google",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-15T19:24:21+0400"
+          }
+        ]
+      },
+      "journey": [
+        {
+          "time": "2026-07-17T13:19:24+04:00",
+          "event": "page loaded",
+          "path": "https://kw.limestore.com/cart"
+        },
+        {
+          "time": "2026-07-17T13:18:59+04:00",
+          "event": "page loaded",
+          "path": "https://kw.limestore.com/cart"
+        },
+        {
+          "time": "2026-07-17T12:51:59+04:00",
+          "event": "page loaded",
+          "path": "https://kw.limestore.com/products/suede-loafers-16"
+        },
+        {
+          "time": "2026-07-17T12:51:47+04:00",
+          "event": "page loaded",
+          "path": "https://kw.limestore.com/cart"
+        },
+        {
+          "time": "2026-07-17T12:51:46+04:00",
+          "event": "add2c",
+          "productId": 10372781932866
+        },
+        {
+          "time": "2026-07-17T12:51:42+04:00",
+          "event": "page loaded",
+          "path": "https://kw.limestore.com/products/suede-loafers-16"
+        }
+      ]
+    }
+  ],
+  "totalForRange": 84,
+  "count": 84,
+  "finishedRange": true
+}

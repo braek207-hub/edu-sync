@@ -4,9 +4,12 @@ Discovery-скрипт (B1 плана LIME GCC). НЕ пишет в БД — т�
 ответы, чтобы зафиксировать реальные форматы полей для клиентов B2/B3.
 
 Запуск (из d:\\vscode\\edu-sync, .env подхватывается автоматически):
-    python scripts/probe_gcc_apis.py tw    # Triple Whale summary-page
-    python scripts/probe_gcc_apis.py ga4   # GA4 трафик по каналам
+    python scripts/probe_gcc_apis.py tw       # Triple Whale summary-page
+    python scripts/probe_gcc_apis.py ga4      # GA4 трафик по каналам
     python scripts/probe_gcc_apis.py both
+    python scripts/probe_gcc_apis.py domain   # P1: Метрика — dimension домена (страны GCC)
+    python scripts/probe_gcc_apis.py journey  # P3: TW journey — страна заказа
+    python scripts/probe_gcc_apis.py savejourney tests/fixtures/tw_orders_journey_sample.json
 
 Env:
     GCC_TRIPLEWHALE_API_KEY   — ключ TW (scopes Read)
@@ -285,8 +288,144 @@ def save_tw_fixtures(orders_path: str, spend_path: str):
     print(f"saved spend fixture ({len(metrics)} metrics) → {spend_path}")
 
 
+def probe_metrika_domain():
+    """P1: какой dimension делит трафик GCC по доменам стран (ae./sa./kw./qa./om./bh.)."""
+    counter = (os.environ.get("GCC_METRICA_COUNTER_ID") or "98232701").strip()
+    token = (os.environ.get("GCC_METRICA_TOKEN") or "").strip()
+    if not token:
+        print("[domain] SKIP: нет GCC_METRICA_TOKEN")
+        return
+    end = date.today() - timedelta(days=1)
+    start = end - timedelta(days=6)
+    for dim in ("ym:s:startURLDomain", "ym:s:URLDomain"):
+        params = {
+            "ids": counter, "date1": start.isoformat(), "date2": end.isoformat(),
+            "metrics": "ym:s:visits,ym:s:users", "dimensions": dim,
+            "accuracy": "full", "limit": 100,
+        }
+        r = requests.get("https://api-metrika.yandex.net/stat/v1/data",
+                         headers={"Authorization": f"OAuth {token}"}, params=params, timeout=60)
+        print(f"\n[domain] {dim} HTTP {r.status_code}")
+        d = r.json()
+        if "data" not in d:
+            print("[domain]", json.dumps(d, ensure_ascii=False)[:400])
+            continue
+        print(f"[domain] rows={len(d['data'])} totals={d.get('totals')}")
+        for row in d["data"]:
+            print(f"   {(row['dimensions'][0].get('name') or '—'):<28} {row['metrics']}")
+
+
+def probe_tw_journey():
+    """P3: журнал тачпоинтов заказа → какой домен (страна) определяет заказ."""
+    import re
+    from collections import Counter
+
+    key = (os.environ.get("GCC_TRIPLEWHALE_API_KEY") or "").strip()
+    shop = (os.environ.get("GCC_TW_SHOP_DOMAIN") or "").strip()
+    if not key:
+        print("[journey] SKIP: нет GCC_TRIPLEWHALE_API_KEY")
+        return
+    start, end = _yesterday_range()
+    r = requests.post(
+        "https://api.triplewhale.com/api/v2/attribution/get-orders-with-journeys-v2",
+        headers={"x-api-key": key, "content-type": "application/json"},
+        json={"shop": shop, "startDate": start, "endDate": end, "excludeJourneyData": False},
+        timeout=120)
+    print(f"[journey] HTTP {r.status_code}")
+    orders = (r.json() or {}).get("ordersWithJourneys") or []
+    print(f"[journey] заказов: {len(orders)}")
+    if not orders:
+        return
+    host_re = re.compile(r"https?://([^/]+)", re.I)
+    gcc = ("ae", "bh", "kw", "sa", "qa", "om")
+
+    def prefixes(order):
+        out = []
+        for tp in order.get("journey") or []:
+            m = host_re.match(tp.get("path") or "")
+            p = m.group(1).lower().split(".")[0] if m else None
+            if p in gcc:
+                out.append(p)
+        return out
+
+    events = Counter()
+    for o in orders:
+        for tp in o.get("journey") or []:
+            events[tp.get("event")] += 1
+    print(f"[journey] события: {dict(events)}")
+    j0 = orders[0].get("journey") or []
+    print(f"[journey] порядок: [0]={j0[0].get('time') if j0 else '—'} "
+          f"[-1]={j0[-1].get('time') if j0 else '—'} (ожидаем убывание времени)")
+
+    dist, mixed, disagree, none = Counter(), 0, 0, 0
+    for o in orders:
+        ps = prefixes(o)
+        if not ps:
+            none += 1
+            dist[None] += 1
+            continue
+        if len(set(ps)) > 1:
+            mixed += 1
+        if ps[0] != Counter(ps).most_common(1)[0][0]:
+            disagree += 1
+        dist[ps[0]] += 1
+    print(f"[journey] смешанных доменов: {mixed} | last != dominant: {disagree} | без страны: {none}")
+    print(f"[journey] распределение по правилу last-touchpoint: {dict(dist)}")
+
+
+def save_journey_fixture(path: str):
+    """Сохранить компактную фикстуру заказов с journey (PII вырезан, journey до 6 тачпоинтов)."""
+    import re
+    from collections import Counter
+
+    key = (os.environ.get("GCC_TRIPLEWHALE_API_KEY") or "").strip()
+    shop = (os.environ.get("GCC_TW_SHOP_DOMAIN") or "").strip()
+    start, end = _yesterday_range()
+    r = requests.post(
+        "https://api.triplewhale.com/api/v2/attribution/get-orders-with-journeys-v2",
+        headers={"x-api-key": key, "content-type": "application/json"},
+        json={"shop": shop, "startDate": start, "endDate": end, "excludeJourneyData": False},
+        timeout=120)
+    orders = (r.json() or {}).get("ordersWithJourneys") or []
+    host_re = re.compile(r"https?://([^/]+)", re.I)
+    gcc = ("ae", "bh", "kw", "sa", "qa", "om")
+
+    def country_of(order):
+        for tp in order.get("journey") or []:
+            m = host_re.match(tp.get("path") or "")
+            p = m.group(1).lower().split(".")[0] if m else None
+            if p in gcc:
+                return p
+        return "none"
+
+    picked, seen = [], Counter()
+    for o in orders:
+        c = country_of(o)
+        if seen[c] >= 2 or len(picked) >= 10:
+            continue
+        seen[c] += 1
+        trimmed = {k: v for k, v in o.items() if k not in ("customer_id", "email", "customer")}
+        trimmed["order_id"] = "REDACTED"
+        trimmed["order_name"] = "REDACTED"
+        trimmed["journey"] = (o.get("journey") or [])[:6]
+        picked.append(trimmed)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"ordersWithJourneys": picked, "totalForRange": len(orders),
+                   "count": len(orders), "finishedRange": True}, f, ensure_ascii=False, indent=2)
+    print(f"saved {len(picked)} orders (страны {dict(seen)}) → {path}")
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "both"
+    if which == "savejourney":
+        save_journey_fixture(sys.argv[2])
+        sys.exit(0)
+    if which == "domain":
+        probe_metrika_domain()
+        sys.exit(0)
+    if which == "journey":
+        probe_tw_journey()
+        sys.exit(0)
     if which == "savetw":
         save_tw_fixtures(sys.argv[2], sys.argv[3])
         sys.exit(0)

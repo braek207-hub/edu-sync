@@ -69,7 +69,30 @@
   Link traffic/*.com, Internal, Messenger/Telegram, QR.
 - Маппинг → таксономия: Ad+engine → SEM(Google/Yandex)/SMM paid(Meta); Search engine → SEO;
   Social network → SMM organic; Mailing → CRM/Email; Direct → Direct; Link → Referrals.
-- Деление по странам GCC (Фаза 2): dimension `ym:s:startURLDomain` или `ym:s:URLDomain` (ae./bh./sa.…) — проверить.
+
+### Деление по странам ✅ ЗОНД P1 (2026-07-18)
+
+- Рабочий dimension — **`ym:s:startURLDomain`**. `ym:s:URLDomain` **не существует**
+  (HTTP 400 `invalid_parameter ... error code: 4001`) — не использовать.
+- Проба за 7 дней (2026-07-12…07-18), только этот dimension: **все 6 стран присутствуют**,
+  totals visits=35660 / users=25660 — сумма по доменам = totals (деление полное, без «прочего»):
+
+  | домен | visits | users |
+  |---|---|---|
+  | ae.limestore.com | 30656 | 21854 |
+  | sa.limestore.com | 3087 | 2306 |
+  | kw.limestore.com | 806 | 644 |
+  | qa.limestore.com | 756 | 633 |
+  | om.limestore.com | 275 | 239 |
+  | bh.limestore.com | 80 | 71 |
+
+- В связке с прод-набором измерений работает:
+  `dimensions=ym:s:date,ym:s:startURLDomain,ym:s:lastsignTrafficSource,ym:s:lastsignSourceEngine`
+  (проба за 2026-07-17 — строки вида `2026-07-17 / sa.limestore.com / Ad traffic / Google Ads`).
+- Фикстура: `tests/fixtures/metrika_domain_sample.json` (обрезана до 2 строк на домен).
+- ⚠️ В окне пробы трафик только на `*.limestore.com`, но сайт счётчика — `ae.lime-shop.com`,
+  и в journey TW встречается `ae.lime-shop.com` → **страну определять по префиксу домена**
+  (`ae|bh|kw|sa|qa|om`), а не по полному хосту.
 
 ## GA4 — Data API ⚠️ ОТКЛОНЁН (в пользу Метрики)
 
@@ -79,6 +102,58 @@
 - Ошибка: **Google Analytics Data API не включён** в GCP-проекте `131094257045` (проект сервис-аккаунта `D:\vscode\LIME\google_credentials.json`).
 - Fix: включить API → https://console.developers.google.com/apis/api/analyticsdata.googleapis.com/overview?project=131094257045 → подождать пару минут → повторить зонд. Авторизация валидна (дошли до API).
 - `hostName` в измерениях — чтобы проверить деление трафика по доменам стран GCC (Фаза 2).
+
+## TW journey → страна заказа ✅ ЗОНД P3 (2026-07-18)
+
+Запрос тот же, что и для заказов, но **`"excludeJourneyData": false`**.
+
+- Каждый заказ получает поле **`journey`** — список тачпоинтов `{time, event, path}`.
+  События только двух видов: `page loaded` (26634 шт. за день, есть `path`) и
+  `add2c` (2207 шт., `path` НЕТ — вместо него `productId`).
+  **Событий checkout/purchase в journey нет** — страну берём из URL страниц.
+- `journey` отсортирован **по убыванию времени**: `journey[0]` — самый свежий тачпоинт
+  (ближайший к моменту заказа), `journey[-1]` — самый ранний (глубина ~10 дней).
+- **Правило:** `order_country` = префикс хоста первого тачпоинта, у которого `path` даёт
+  хост с префиксом из `ae|bh|kw|sa|qa|om` (т.е. самый свежий тачпоинт со страной).
+  Нет такого → `country = NULL` (заказ попадает только в GCC-тотал).
+- Проверка на 84 заказах (2026-07-17): смешанные домены в journey у 9 заказов (10.7%),
+  но правило «свежий» расходится с «доминирующим по числу тачпоинтов» лишь у **2 из 84** (2.4%);
+  без страны — 3 заказа (3.6%). Распределение по правилу: ae 77, sa 3, kw 1, NULL 3.
+- Хосты в journey бывают и `*.limestore.com`, и `*.lime-shop.com` → матчить **префикс**, не хост.
+- Фикстура: `tests/fixtures/tw_orders_journey_sample.json` (7 заказов, journey обрезан до 6
+  тачпоинтов, PII вырезан: order_id/order_name = REDACTED, без customer_id/email).
+- ⚠️ Цена: `excludeJourneyData: false` раздувает ответ (84 заказа ≈ 29k тачпоинтов) — в синке
+  парсить потоково и не логировать journey целиком.
+
+## Google Ads — гео-расход ⛔ ЗОНД P2 BLOCKED (нет кабинета GCC)
+
+**Статус: missing-data.** В `lime_google_ads_stats` есть только `region='kz'` (981 строка,
+1 аккаунт) — Script в GCC-аккаунте ещё не поставлен (действие Павла). Контракт ниже — по
+докам Google Ads API, **требует живой проверки при установке Script**.
+
+- Ресурс: **`FROM geographic_view`** — метрики агрегированы по стране, одна строка на страну
+  (плюс разрез по другим сегментам). Поля: `geographic_view.country_criterion_id`,
+  `geographic_view.location_type`.
+- Кандидат-запрос для `AdsApp.search()` (Script, тот же стиль, что r1 в
+  `docs/integrations/google-ads-ingest-script.js` в репо EDU v2):
+  ```
+  SELECT campaign.id, segments.date, geographic_view.country_criterion_id,
+         metrics.impressions, metrics.clicks, metrics.cost_micros
+  FROM geographic_view
+  WHERE segments.date BETWEEN '<from>' AND '<to>'
+    AND geographic_view.location_type = 'LOCATION_OF_PRESENCE'
+  ```
+- ⚠️ `location_type` обязателен в WHERE: без него строки идут и по `LOCATION_OF_PRESENCE`
+  (физическое местоположение), и по `AREA_OF_INTEREST` → расход задвоится. Для «расход по
+  стране покупателя» берём LOP.
+- `country_criterion_id` — числовой id гео-таргета, **не** название. Резолвить в стране
+  отдельным запросом, а не хардкодом id:
+  ```
+  SELECT geo_target_constant.id, geo_target_constant.name, geo_target_constant.country_code
+  FROM geo_target_constant WHERE geo_target_constant.id IN (<ids из первого запроса>)
+  ```
+  → `country_code` (AE/BH/KW/SA/QA/OM) → та же таблица стран, что и для доменов.
+- `cost_micros` делить на 1 000 000; валюта = валюта аккаунта (`getCurrencyCode()`), далее →₽.
 
 ## Открытые вопросы к Павлу
 
