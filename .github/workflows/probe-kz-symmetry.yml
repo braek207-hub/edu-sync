@@ -1,4 +1,4 @@
-name: Probe KZ symmetry
+name: Probe GSC history depth
 
 # Разовый зонд: занижен ли казахстанский спрос из-за того, что KZ считается только
 # по корневому домену. В БД не пишет. Удалить после проверки.
@@ -20,6 +20,6 @@ jobs:
           GSC_SA_KEY: ${{ secrets.GSC_SA_KEY }}
         run: printf '%s' "$GSC_SA_KEY" > sa.json
       - name: Probe
-        run: python scripts/probe_kz_symmetry.py
+        run: python scripts/probe_gsc_history_depth.py
         env:
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
