@@ -2,14 +2,64 @@ import json
 import os
 import sys
 
+import pytest
+import requests
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from sync import gcc_triplewhale as tw
 from sync.gcc_triplewhale import (
     aggregate_orders_by_channel,
     order_country,
     order_source,
     spend_by_channel,
 )
+
+
+class _FakeResp:
+    def __init__(self, status_code: int, payload: dict | None = None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+def test_tw_post_retries_transient_timeout(monkeypatch):
+    """Транзиентный ReadTimeout (он ронял бэкфилл на 516 дней) должен ретраиться."""
+    calls = {"n": 0}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise requests.exceptions.ReadTimeout("read timed out")
+        return _FakeResp(200, {"ok": True})
+
+    monkeypatch.setattr(tw.requests, "post", fake_post)
+    monkeypatch.setattr(tw.time, "sleep", lambda _s: None)
+
+    assert tw._tw_post("url", {}, {}, timeout=1) == {"ok": True}
+    assert calls["n"] == 3
+
+
+def test_tw_post_does_not_retry_4xx(monkeypatch):
+    """4xx — постоянная ошибка (ключ/тело): падаем сразу, без повторов."""
+    calls = {"n": 0}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        return _FakeResp(403)
+
+    monkeypatch.setattr(tw.requests, "post", fake_post)
+    monkeypatch.setattr(tw.time, "sleep", lambda _s: None)
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        tw._tw_post("url", {}, {}, timeout=1)
+    assert calls["n"] == 1
 
 
 def _load(name):

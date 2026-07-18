@@ -5,6 +5,7 @@
 для мержа трафика (Метрика) с деньгами (Triple Whale) по (channel, subchannel).
 """
 import re
+import time
 
 import requests
 
@@ -14,6 +15,38 @@ _HOST_RE = re.compile(r"https?://([^/]+)", re.I)
 
 TW_ORDERS_URL = "https://api.triplewhale.com/api/v2/attribution/get-orders-with-journeys-v2"
 TW_SPEND_URL = "https://api.triplewhale.com/api/v2/summary-page/get-data"
+
+# Ретраи: один транзиентный ReadTimeout у TW ронял весь бэкфилл (516 дней) на середине.
+TW_RETRIES = 4
+TW_BACKOFF_SEC = 5
+
+
+def _tw_post(url: str, headers: dict, body: dict, timeout: int) -> dict:
+    """POST в Triple Whale с ретраями транзиентных сбоев.
+
+    Повторяем таймауты/обрывы соединения и 5xx/429 с линейным бэкоффом.
+    4xx (кроме 429) — постоянная ошибка (неверный ключ/тело), падаем сразу.
+    После исчерпания попыток пробрасываем исключение: день должен упасть громко,
+    а не пропасть тихо (иначе в истории будет дыра).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, TW_RETRIES + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+        else:
+            if resp.status_code < 500 and resp.status_code != 429:
+                resp.raise_for_status()
+                return resp.json()
+            last_exc = requests.exceptions.HTTPError(f"TW HTTP {resp.status_code}", response=resp)
+        if attempt < TW_RETRIES:
+            sleep_s = TW_BACKOFF_SEC * attempt
+            print(f"gcc_tw: транзиентная ошибка {type(last_exc).__name__}, "
+                  f"попытка {attempt}/{TW_RETRIES}, повтор через {sleep_s}с")
+            time.sleep(sleep_s)
+    assert last_exc is not None
+    raise last_exc
 
 # metricId (summary-page) → (channel, subchannel); совпадают с map_metrika_channel/map_tw_source.
 SPEND_METRIC_MAP = {
@@ -126,9 +159,7 @@ def fetch_tw_orders(api_key: str, shop: str, date_from: str, date_to: str) -> li
             "endDate": end_date,
             "excludeJourneyData": False,
         }
-        resp = requests.post(TW_ORDERS_URL, headers=headers, json=body, timeout=90)
-        resp.raise_for_status()
-        data = resp.json()
+        data = _tw_post(TW_ORDERS_URL, headers, body, timeout=180)
         orders.extend(data.get("ordersWithJourneys") or [])
         earliest_date = data.get("earliestDate")
         if data.get("totalForRange") == data.get("count") or not earliest_date:
@@ -150,9 +181,7 @@ def fetch_tw_spend(api_key: str, shop: str, day: str) -> dict[str, float]:
     """
     headers = {"x-api-key": api_key, "content-type": "application/json"}
     body = {"shopDomain": shop, "period": {"start": day, "end": day}, "todayHour": 25}
-    resp = requests.post(TW_SPEND_URL, headers=headers, json=body, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
+    data = _tw_post(TW_SPEND_URL, headers, body, timeout=120)
     return {
         m["metricId"]: (m.get("values") or {}).get("current")
         for m in data.get("metrics") or []
