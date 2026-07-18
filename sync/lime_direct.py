@@ -33,6 +33,7 @@ import csv
 import json
 import hashlib
 import time
+import traceback
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1934,7 +1935,12 @@ def sync_lime_direct(days_back: int = 7) -> int:
     try:
         _sync_campaign_settings(campaign_ids, campaign_names)
     except Exception as e:
+        # С traceback, а не только текстом: «invalid literal for int(): 'Items'»
+        # повторялся неделями, и по одному сообщению нельзя было понять, в какой
+        # из веток разбора настроек он возникает. Настройки при этом молча не
+        # синхронизировались — state/campaign_type оставались неполными.
         print(f"[lime_direct] WARN: настройки кампаний не синхронизированы: {e}")
+        traceback.print_exc()
 
     merged: List[Dict[str, Any]] = []
     for r in report_rows:
