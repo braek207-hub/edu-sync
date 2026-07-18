@@ -163,12 +163,20 @@ INSERT INTO lime_stats (
 ) VALUES %s
 """
 
-# RU/KZ-синк владеет всеми регионами витрины lc_simple_view (region <> 'gcc').
-# GCC-синк (sync/lime_gcc.py) удаляет строго region='gcc'. Так два независимых
-# ingest'а в одну таблицу lime_stats не затирают данные друг друга.
-DELETE_SQL = """
+# Регионы lime_stats, которыми владеют ОТДЕЛЬНЫЕ синки: каждый сам удаляет и пишет свой
+# срез, а этот синк-витрина обязан их не трогать.
+#   gcc        → sync/lime_gcc.py (Залив: Метрика + Triple Whale)
+#   kz_metrika → sync/lime_kz_metrika.py (KZ напрямую из Метрики)
+# Держим СПИСКОМ, а не условием в тексте SQL: добавление четвёртого синка обязано
+# зарегистрировать регион здесь. Пропуск такой регистрации — реальный баг (2026-07-18):
+# kz_metrika отсутствовал в исключениях, и ежедневный прогон этого синка стирал бы
+# чужой срез целиком, молча и каждый день.
+FOREIGN_REGIONS = ("gcc", "kz_metrika")
+
+_FOREIGN_LIST = ", ".join(f"'{r}'" for r in FOREIGN_REGIONS)
+DELETE_SQL = f"""
 DELETE FROM lime_stats
-WHERE date >= %s AND date <= %s AND (region IS NULL OR region <> 'gcc')
+WHERE date >= %s AND date <= %s AND (region IS NULL OR region NOT IN ({_FOREIGN_LIST}))
 """
 
 

@@ -131,18 +131,20 @@ def build_rows(metrika_rows, campaign_maps, cost_map, fx_rate: float, date_s: st
     # Не бросаем исключение: сам трафик Метрики собран корректно, деньги можно долить
     # бэкфиллом позже, когда fx-синк починят — падать из-за чужого синка не нужно. Только
     # громкое предупреждение, чтобы кто-то заметил разрыв и перезапустил google_ads_fx.
-    zero_cost_google_rows = sum(
-        1
+    # Считаем уникальные campaign_id, а не строки-группы свёртки: одна кампания, чьи визиты
+    # разложились по нескольким (channel, subchannel), иначе задвоила бы число в предупреждении.
+    zero_cost_google_campaigns = {
+        campaign_id
         for (channel, subchannel, campaign_id), acc in agg.items()
         if campaign_id
         and acc["kz_cabinet"]
         and channel == "SEM"
         and "google" in subchannel.lower()
         and float(cost_map.get((date_s, campaign_id), 0.0)) == 0.0
-    )
-    if zero_cost_google_rows:
-        print(f"lime_kz_metrika: WARN {date_s} — {zero_cost_google_rows} строк(и) платного "
-              f"Google с нулевым расходом (проверь синк google_ads_fx / lime_google_ads_stats.cost_rub)")
+    }
+    if zero_cost_google_campaigns:
+        print(f"lime_kz_metrika: WARN {date_s} — {len(zero_cost_google_campaigns)} кампани(я/й) "
+              f"платного Google с нулевым расходом (проверь синк google_ads_fx / lime_google_ads_stats.cost_rub)")
 
     return out
 
@@ -172,7 +174,10 @@ def _sync_range(frm: date, to: date, conn) -> int:
         if conn is None:
             i_sessions, i_orders = COLUMNS.index("sessions"), COLUMNS.index("purchases_count")
             i_revenue, i_cost = COLUMNS.index("purchases_revenue"), COLUMNS.index("cost")
-            print(f"lime_kz_metrika: [DRY-RUN] {day_s} → {len(rows)} строк "
+            # Без conn campaign_maps/cost_map пусты (см. ветку выше) — ни одна кампания не
+            # резолвится и расход всегда 0, даже если он реально есть. Не путать с «расхода нет».
+            print(f"lime_kz_metrika: [DRY-RUN, БЕЗ БД: кампании не резолвятся, расход не считается] "
+                  f"{day_s} → {len(rows)} строк "
                   f"(визиты={sum(r[i_sessions] for r in rows)}, "
                   f"заказы={sum(r[i_orders] for r in rows)}, "
                   f"выручка={sum(r[i_revenue] for r in rows):.0f}₽, "

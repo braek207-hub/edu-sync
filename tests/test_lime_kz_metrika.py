@@ -79,12 +79,20 @@ def test_paid_row_marked_paid_so_drr_and_cpo_work():
 
 
 def test_cost_counted_once_per_campaign_per_day():
-    """Расход кампании не задваивается, если её визиты пришли двумя строками каналов."""
+    """Расход кампании не задваивается, если её визиты пришли двумя строками каналов.
+
+    Обе строки — одна кампания ("Поиск. Бренд"), но разный traffic_source даёт разный
+    channel/subchannel (map_metrika_channel: ad+Yandex → SEM/Яндекс.Директ, direct → Direct/Direct),
+    поэтому свёртка build_rows кладёт их в ДВЕ разные группы (channel, subchannel, campaign_id)
+    при одной и той же кампании. Так тест реально нагружает множество `spent` в build_rows:
+    без него расход кампании попал бы в обе группы и задвоился.
+    """
     cost_map = {("2026-07-15", "119566511"): 4450.0}
     rows = build_rows(
-        [_row(direct_campaign_name="Поиск. Бренд", source_engine="Yandex: Direct"),
-         _row(direct_campaign_name="Поиск. Бренд", source_engine="Yandex.Direct: Undetermined")],
+        [_row(direct_campaign_name="Поиск. Бренд", traffic_source="ad", source_engine="Yandex: Direct"),
+         _row(direct_campaign_name="Поиск. Бренд", traffic_source="direct", source_engine=None)],
         MAPS, cost_map, 0.162, "2026-07-15")
+    assert len(rows) == 2  # разные группы свёртки — иначе задвоение расхода скрыто ещё до защиты
     assert sum(r[I["cost"]] for r in rows) == 4450.0
 
 
@@ -98,6 +106,54 @@ def test_warns_when_paid_google_rows_have_zero_cost(capsys):
     out = capsys.readouterr().out
     assert "lime_kz_metrika: WARN" in out
     assert "2026-07-15" in out
+
+
+def test_all_24_columns_mapped_correctly_by_name():
+    """Позиционный контракт build_rows: каждое поле COLUMNS проверяется по имени со своим,
+    легко различимым значением — случайная перестановка позиций (например cart_reaches
+    с checkout_reaches) должна ломать этот тест, а не проходить незамеченной."""
+    cost_map = {("2026-07-15", "119566511"): 4450.0}
+    rows = build_rows(
+        [_row(
+            direct_campaign_name="Поиск. Бренд", traffic_source="ad", source_engine="Yandex: Direct",
+            visits=111.0, users=82.0, new_users=37.0,
+            bounce_rate=45.0, page_depth=6.5,
+            cart_reaches=23.0, checkout_reaches=9.0,
+            orders=7.0, revenue=40000.0,
+        )],
+        MAPS, cost_map, 0.3, "2026-07-15")
+    assert len(rows) == 1
+    r = rows[0]
+
+    expected = {
+        "date": "2026-07-15",
+        "data_source": "web",
+        "region": "kz_metrika",
+        "channel": "SEM",
+        "subchannel": "Яндекс.Директ",
+        "traffic_type": "Платный",
+        "campaign_id": "119566511",
+        "campaign_name": "Поиск. Бренд",
+        "cost": 4450.0,
+        "clicks": 0.0,
+        "impressions": 0.0,
+        "sessions": 111,
+        "users": 82,
+        "clients": 0,
+        "purchases_count": 7,
+        "purchases_revenue": 12000.0,   # 40000 тенге × 0.3
+        "customers": 0,
+        "new_users": 37,
+        "new_customers": 0,
+        "new_customers_revenue": 0.0,
+        "bounce_rate": 45.0,
+        "page_depth": 6.5,
+        "cart_reaches": 23,
+        "checkout_reaches": 9,
+    }
+    assert set(expected) == set(COLUMNS)  # ни одна колонка не забыта и не выдумана
+    for name, value in expected.items():
+        assert r[I[name]] == value, f"{name}: expected {value!r}, got {r[I[name]]!r}"
 
 
 def test_no_warning_when_google_cost_present(capsys):
