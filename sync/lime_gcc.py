@@ -45,7 +45,7 @@ COLUMNS = (
     "cost", "clicks", "impressions", "sessions", "users", "clients",
     "purchases_count", "purchases_revenue", "customers",
     "new_users", "new_customers", "new_customers_revenue",
-    "bounce_rate", "page_depth",
+    "bounce_rate", "page_depth", "cart_reaches", "checkout_reaches",
 )
 
 INSERT_SQL = f"INSERT INTO lime_stats ({', '.join(COLUMNS)}) VALUES %s"
@@ -92,6 +92,8 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
                 # Взвешенные на визиты — иначе среднее от средних соврёт при склейке строк.
                 "bounce_w": 0.0,
                 "depth_w": 0.0,
+                "cart": 0,
+                "checkout": 0,
             }
             agg[key] = row
         elif not row["traffic_type"]:
@@ -106,6 +108,8 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
         row["new_users"] += int(m.get("new_users") or 0)
         row["bounce_w"] += float(m.get("bounce_w") or 0)
         row["depth_w"] += float(m.get("depth_w") or 0)
+        row["cart"] += int(m.get("cart_reaches") or 0)
+        row["checkout"] += int(m.get("checkout_reaches") or 0)
 
     for o in tw_order_rows:
         row = _bucket(o.get("country"), o.get("campaign"), o["channel"], o["subchannel"],
@@ -143,6 +147,7 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
             # polinarepik_metrica_visits, хендлер взвешивает обратно (SUM(x * sessions)).
             round(row["bounce_w"] / sessions * 100, 4) if sessions else None,
             round(row["depth_w"] / sessions, 4) if sessions else None,
+            row["cart"], row["checkout"],
         ))
     return out
 

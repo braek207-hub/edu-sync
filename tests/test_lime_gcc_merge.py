@@ -8,7 +8,7 @@ from sync.lime_gcc import COLUMNS, merge_rows
 COLS = ["date", "data_source", "region", "country", "channel", "subchannel", "traffic_type", "campaign_id",
         "campaign_name", "cost", "clicks", "impressions", "sessions", "users", "clients",
         "purchases_count", "purchases_revenue", "customers", "new_users", "new_customers", "new_customers_revenue",
-        "bounce_rate", "page_depth"]
+        "bounce_rate", "page_depth", "cart_reaches", "checkout_reaches"]
 
 
 def test_merge_joins_by_channel_and_converts():
@@ -230,3 +230,17 @@ def test_merge_funnel_absent_without_traffic():
               "traffic_type": "Платный", "cost": 100.0}]
     r = dict(zip(COLS, merge_rows([], [], spend, 20.0, "2026-07-17")[0]))
     assert r["bounce_rate"] is None and r["page_depth"] is None and r["new_users"] == 0
+
+
+def test_merge_writes_goal_reaches():
+    """Цели Метрики (корзина/оформление) суммируются как объёмные."""
+    metrika = [
+        {"date": "2026-07-17", "country": "ОАЭ", "campaign": None, "traffic_source": "ad",
+         "source_engine": "Google Ads", "visits": 100, "users": 80,
+         "cart_reaches": 20, "checkout_reaches": 7},
+        {"date": "2026-07-17", "country": "ОАЭ", "campaign": None, "traffic_source": "ad",
+         "source_engine": "Google Ads", "visits": 50, "users": 40,
+         "cart_reaches": 5, "checkout_reaches": 2},
+    ]
+    r = dict(zip(COLS, merge_rows(metrika, [], [], 20.0, "2026-07-17")[0]))
+    assert r["cart_reaches"] == 25 and r["checkout_reaches"] == 9

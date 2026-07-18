@@ -1,5 +1,7 @@
 """Функции для работы с Яндекс.Метрика Stat API (счётчик 98232701, трафик GCC)."""
 
+import os
+
 import requests
 
 from sync.gcc_channels import map_domain_country
@@ -25,6 +27,15 @@ COUNTRY_DIMENSIONS = (
     "ym:s:lastsignSearchEngine",
 )
 
+# Цели счётчика GCC (проверено 2026-07-18 на живых данных за неделю):
+#   344184922 «Ecommerce: добавление в корзину» — 7955 достижений, работает;
+#   344184921 «Автоцель: просмотр корзины» — 2446, взята как шаг «оформление»:
+#   штатная автоцель 367696661 «начало оформления заказа» на этом счётчике не
+#   срабатывает (0 достижений), «возврат из платёжной системы» тоже 0.
+# Переопределяются через env, если Павел заведёт настоящую цель чекаута.
+GOAL_CART = os.environ.get("GCC_METRICA_GOAL_CART") or "344184922"
+GOAL_CHECKOUT = os.environ.get("GCC_METRICA_GOAL_CHECKOUT") or "344184921"
+
 # Порядок метрик в запросе = порядок чтения в parse_metrika_traffic.
 METRICS = (
     "ym:s:visits",
@@ -32,6 +43,8 @@ METRICS = (
     "ym:s:newUsers",
     "ym:s:bounceRate",
     "ym:s:pageDepth",
+    f"ym:s:goal{GOAL_CART}reaches",
+    f"ym:s:goal{GOAL_CHECKOUT}reaches",
 )
 
 # utm_source → название площадки в терминах map_metrika_channel.
@@ -104,6 +117,7 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
         - source_engine (str|None): площадка, восстановленная из utm (см. resolve_engine)
         - visits, users, new_users (float)
         - bounce_w, depth_w (float): отказы/глубина, взвешенные на визиты (аддитивны)
+        - cart_reaches, checkout_reaches (float): достижения целей корзины/оформления
     """
     queried = (resp.get("query") or {}).get("dimensions") or []
     pos = {name: i for i, name in enumerate(queried)}
@@ -138,6 +152,8 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
                 # иначе при суммировании строк среднее от средних соврёт.
                 "bounce_w": (metrics[3] or 0) / 100 * (visits or 0) if len(metrics) > 3 else None,
                 "depth_w": (metrics[4] or 0) * (visits or 0) if len(metrics) > 4 else None,
+                "cart_reaches": metrics[5] if len(metrics) > 5 else None,
+                "checkout_reaches": metrics[6] if len(metrics) > 6 else None,
             }
         )
     return rows
