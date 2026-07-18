@@ -3,7 +3,7 @@
 Недельные брендовые SEO-клики (Σ бренд-запросов по обоим хостам).
 Контракт query-analytics/list: text_indicator_to_statistics[].{text_indicator.value,
 statistics[].{date, field(CLICKS/IMPRESSIONS/CTR/POSITION/DEMAND), value}}.
-Серверный бренд-фильтр: filters.text_filters TEXT_CONTAINS 'лайм' / 'lime'.
+Серверный бренд-фильтр: filters.text_filters TEXT_CONTAINS по написаниям из brand_terms.
 
 Env: WORDSTAT_WEBMASTER_TOKEN, DATABASE_URL.
 """
@@ -12,16 +12,14 @@ import os
 
 import requests
 
+from sync.brand_terms import is_brand_query, terms_for
+
 WM_BASE = "https://api.webmaster.yandex.net/v4"
 USER_ID = "1343007866"
 HOSTS = ["https:limestore.com:443", "https:lime-shop.com:443"]
-BRAND_TERMS = ["лайм", "lime"]
+# Написания бренда — из sync/brand_terms.py (общий источник с GSC-синком).
+BRAND_TERMS = terms_for("ru")
 PAGE_LIMIT = 500
-
-
-def is_brand_query(q: str) -> bool:
-    s = (q or "").lower()
-    return "lime" in s or "лайм" in s
 
 
 def _monday(date_str: str) -> str:
@@ -48,11 +46,11 @@ def parse_query_analytics(data: dict) -> dict[str, list[dict]]:
     return out
 
 
-def aggregate_seo_weekly(rows: list[dict]) -> dict[str, dict]:
+def aggregate_seo_weekly(rows: list[dict], region: str = "ru") -> dict[str, dict]:
     """[{query,date,clicks,impressions}] → {week_start: {clicks, impressions}} (только бренд)."""
     out: dict[str, dict] = {}
     for r in rows:
-        if not is_brand_query(r.get("query", "")):
+        if not is_brand_query(r.get("query", ""), region):
             continue
         wk = _monday(r["date"])
         acc = out.setdefault(wk, {"clicks": 0, "impressions": 0})
