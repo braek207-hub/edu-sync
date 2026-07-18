@@ -12,5 +12,4 @@ secrets-local/
 *.json
 !package.json
 !config/lime_direct_goals.json
-!tests/fixtures/tw_orders_sample.json
-!tests/fixtures/tw_spend_sample.json
+!tests/fixtures/*.json
