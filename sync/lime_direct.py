@@ -325,6 +325,40 @@ def _report_sig(fields: List[str], goal_ids: List[str]) -> str:
     return hashlib.md5(src).hexdigest()[:8]
 
 
+def _pick_conversion_columns(
+    header: List[str],
+    goal_ids: List[str],
+    id_to_step: Dict[str, str],
+) -> Dict[str, str]:
+    """Сопоставить колонки конверсий отчёта целям — по ПРЕФИКСУ, не по точному имени.
+
+    Имя колонки — `Conversions_<goalId>_<модель атрибуции>`, и модель ставит API,
+    а не мы: на запрос AttributionModels=["LSC"] Директ отдаёт колонки `_LSCCD`
+    (Last Significant Click Cross-Device). Захардкоженный суффикс `_LSC` перестал
+    совпадать — все 12 целей молча стали нулями, отчёт при этом приходил успешно.
+
+    Поиск по префиксу переживает смену модели. Несовпадение остаётся громким:
+    молчание в этом месте уже стоило месяца пустых колонок в дашборде.
+    """
+    cols: Dict[str, str] = {}
+    missing: List[str] = []
+    for gid in goal_ids:
+        if gid not in id_to_step:
+            continue
+        prefix = f"Conversions_{gid}_"
+        match = next((c for c in header if c.startswith(prefix)), None)
+        if match:
+            cols[match] = gid
+        else:
+            missing.append(gid)
+    if missing:
+        print(
+            f"  [lime_direct] WARN: в отчёте нет колонок для целей {missing[:5]}"
+            f" (всего {len(missing)}); пришли: {[c for c in header if c.startswith('Conv')][:5]}"
+        )
+    return cols
+
+
 def _merge_report_chunks(chunks: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """Склеить порции отчёта по (date, campaign_id).
 
@@ -409,20 +443,7 @@ def _fetch_report_chunk(
 
     rows: List[Dict[str, Any]] = []
     reader = csv.DictReader(io.StringIO(r.text), delimiter="\t")
-    # Только цели ЭТОЙ порции: в TSV порции колонок остальных целей нет.
-    conv_cols = {f"Conversions_{gid}_LSC": gid for gid in goal_ids if gid in id_to_key}
-
-    # Несовпадение имён колонок целей обязано быть громким: именно так цели «терялись»
-    # молча — отчёт приходил успешно, конверсии складывались в {}, и колонки дашборда
-    # были пустыми месяц без единой ошибки в логе.
-    if conv_cols:
-        header = list(reader.fieldnames or [])
-        missing = [c for c in conv_cols if c not in header]
-        if missing:
-            print(
-                f"  [lime_direct] WARN: колонок конверсий нет в отчёте: {missing[:3]}"
-                f" (всего {len(missing)}); пришли: {[c for c in header if c.startswith('Conv')][:5]}"
-            )
+    conv_cols = _pick_conversion_columns(list(reader.fieldnames or []), goal_ids, id_to_key)
 
     for row in reader:
         cid = str(row.get("CampaignId", "")).strip()

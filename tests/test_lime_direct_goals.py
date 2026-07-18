@@ -6,7 +6,12 @@
 поэтому _parse_goals возвращал ([], {}) → отчёт запрашивался без секции Goals →
 conversions={} с середины июня. Мертвы были все 12 колонок целей в дашборде.
 """
-from sync.lime_direct import GOALS_PER_REPORT, _merge_report_chunks, _parse_goals
+from sync.lime_direct import (
+    GOALS_PER_REPORT,
+    _merge_report_chunks,
+    _parse_goals,
+    _pick_conversion_columns,
+)
 
 # Зеркало config/lime-direct-goals.json дашборда. Синк и дашборд обязаны сходиться
 # по id: расхождение обнулит цели молча, без ошибки.
@@ -74,6 +79,32 @@ def test_merge_report_chunks_unions_conversions():
     assert len(merged) == 1
     assert merged[0]["conversions"] == {"4": 5, "194380276": 2, "3023504302": 7}
     assert merged[0]["clicks"] == 10, "объёмные поля не должны суммироваться дважды"
+
+
+def test_pick_conversion_columns_matches_lsccd_suffix():
+    """Директ отдаёт _LSCCD на запрос LSC — захардкоженный суффикс обнулял все цели.
+
+    Заголовки взяты из боевого прогона 2026-07-18 (run 29652806276).
+    """
+    header = [
+        "Date", "CampaignId", "Clicks", "Cost",
+        "Conversions_4_LSCCD", "Conversions_194380276_LSCCD",
+    ]
+    cols = _pick_conversion_columns(header, ["4", "194380276"], {"4": "install", "194380276": "cart"})
+    assert cols == {"Conversions_4_LSCCD": "4", "Conversions_194380276_LSCCD": "194380276"}
+
+
+def test_pick_conversion_columns_survives_model_change():
+    """Смена модели атрибуции не должна снова обнулять цели."""
+    header = ["Date", "Conversions_4_LC", "Conversions_9_SOMETHINGNEW"]
+    cols = _pick_conversion_columns(header, ["4", "9"], {"4": "install", "9": "cart"})
+    assert cols == {"Conversions_4_LC": "4", "Conversions_9_SOMETHINGNEW": "9"}
+
+
+def test_pick_conversion_columns_reports_missing():
+    header = ["Date", "Clicks"]
+    cols = _pick_conversion_columns(header, ["4"], {"4": "install"})
+    assert cols == {}
 
 
 def test_merge_report_chunks_keeps_rows_missing_in_other_chunk():
