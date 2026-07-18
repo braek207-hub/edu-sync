@@ -28,6 +28,7 @@ import psycopg2.extras
 
 from sync.fx import to_rub as fx_to_rub
 from sync.gcc_channels import map_metrika_channel
+from sync.gcc_google_geo import fetch_geo_spend
 from sync.gcc_metrika import fetch_metrika_traffic
 from sync.gcc_triplewhale import aggregate_orders_by_channel, fetch_tw_orders, fetch_tw_spend, spend_by_channel
 
@@ -49,7 +50,8 @@ COLUMNS = (
 INSERT_SQL = f"INSERT INTO lime_stats ({', '.join(COLUMNS)}) VALUES %s"
 
 
-def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s) -> list[tuple]:
+def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
+               rub_spend_rows=()) -> list[tuple]:
     """Свернуть трафик (Метрика) + заказы/расход (Triple Whale) по (country, channel, subchannel).
 
     Страна берётся из самого источника: Метрика — домен витрины, TW-заказы — journey.
@@ -59,9 +61,11 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s) -> l
     Args:
         metrika_rows: sync.gcc_metrika.fetch_metrika_traffic() за день date_s.
         tw_order_rows: sync.gcc_triplewhale.aggregate_orders_by_channel() за день date_s.
-        tw_spend_rows: sync.gcc_triplewhale.spend_by_channel() за день date_s.
+        tw_spend_rows: sync.gcc_triplewhale.spend_by_channel() за день date_s (в AED).
         fx_rate: курс AED→RUB (sync.fx.to_rub("AED", date_s)).
         date_s: дата строк (YYYY-MM-DD).
+        rub_spend_rows: расход, УЖЕ пересчитанный в рубли (гео-расход Google из кабинета,
+            sync.gcc_google_geo) — курс к нему не применяется повторно.
 
     Returns:
         Список кортежей в порядке COLUMNS, по одному на (country, channel, subchannel).
@@ -79,6 +83,7 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s) -> l
                 "orders": 0,
                 "revenue": 0.0,
                 "cost": 0.0,
+                "cost_rub": 0.0,
             }
             agg[key] = row
         elif not row["traffic_type"]:
@@ -97,13 +102,18 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s) -> l
         row["revenue"] += float(o["revenue"] or 0)
 
     for sp in tw_spend_rows:
-        # summary-page даёт расход на магазин целиком; гео-разбивка расхода — T4 (Google) и Фаза 2 (Meta).
+        # summary-page даёт расход на магазин целиком (country=None); гео-разбивка Meta — Фаза 2.
         row = _bucket(sp.get("country"), sp["channel"], sp["subchannel"], sp.get("traffic_type"))
         row["cost"] += float(sp["cost"] or 0)
 
+    for sp in rub_spend_rows:
+        # Уже в рублях (гео-расход Google из кабинета) — в отдельную корзину, мимо курса.
+        row = _bucket(sp.get("country"), sp["channel"], sp["subchannel"], sp.get("traffic_type"))
+        row["cost_rub"] += float(sp["cost"] or 0)
+
     out: list[tuple] = []
     for (country, channel, subchannel), row in agg.items():
-        cost_rub = round(row["cost"] * fx_rate, 2)
+        cost_rub = round(row["cost"] * fx_rate + row["cost_rub"], 2)
         revenue_rub = round(row["revenue"] * fx_rate, 2)
         out.append((
             date_s, "web", "gcc", country, channel, subchannel, row["traffic_type"],
@@ -126,9 +136,15 @@ def _sync_range(frm: date, to: date, conn) -> int:
         day_s = day.isoformat()
         metrika = fetch_metrika_traffic(METRICA_COUNTER_ID, token, day_s, day_s)
         orders = aggregate_orders_by_channel(fetch_tw_orders(tw_key, shop, day_s, day_s), day_s)
-        spend = spend_by_channel(fetch_tw_spend(tw_key, shop, day_s), day_s)
+        tw_metrics = fetch_tw_spend(tw_key, shop, day_s)
+        # Расход Google берём из кабинета (разложен по странам), если Script там уже стоит;
+        # тогда ga_adCost из TW выбрасываем — иначе один и тот же расход посчитается дважды.
+        google_geo = fetch_geo_spend(conn, day_s)
+        if google_geo:
+            tw_metrics = {k: v for k, v in tw_metrics.items() if k != "ga_adCost"}
+        spend = spend_by_channel(tw_metrics, day_s)
         fx_rate = fx_to_rub("AED", day_s)
-        rows = merge_rows(metrika, orders, spend, fx_rate, day_s)
+        rows = merge_rows(metrika, orders, spend, fx_rate, day_s, rub_spend_rows=google_geo)
 
         if conn is None:
             i_country = COLUMNS.index("country")

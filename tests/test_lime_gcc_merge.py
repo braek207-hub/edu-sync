@@ -96,3 +96,43 @@ def test_merge_backward_compatible_without_country_key():
                 "visits": 30, "users": 25}]
     rows = [dict(zip(COLS, r)) for r in merge_rows(metrika, [], [], 20.0, "2026-07-17")]
     assert len(rows) == 1 and rows[0]["country"] is None and rows[0]["sessions"] == 30
+
+
+# === Гео-расход Google: рублёвые строки не конвертируются повторно (T4) ===
+
+
+def test_merge_rub_spend_rows_not_reconverted():
+    """Расход Google уже в ₽ (конвертирован читателем) — курс к нему не применяем."""
+    rub_spend = [{"date": "2026-07-17", "country": "ОАЭ", "channel": "SEM",
+                  "subchannel": "Google.Adwords", "traffic_type": "Платный", "cost": 1000.0}]
+    rows = [dict(zip(COLS, r)) for r in merge_rows([], [], [], 20.0, "2026-07-17",
+                                                   rub_spend_rows=rub_spend)]
+    assert len(rows) == 1
+    assert rows[0]["cost"] == 1000.0        # не 20000 — повторной конвертации нет
+    assert rows[0]["country"] == "ОАЭ"
+
+
+def test_merge_rub_spend_joins_country_bucket_with_traffic():
+    """Гео-расход склеивается с трафиком той же страны и канала в одну строку."""
+    metrika = [{"date": "2026-07-17", "country": "ОАЭ", "traffic_source": "ad",
+                "source_engine": "Google Ads", "visits": 500, "users": 400}]
+    rub_spend = [{"date": "2026-07-17", "country": "ОАЭ", "channel": "SEM",
+                  "subchannel": "Google.Adwords", "traffic_type": "Платный", "cost": 1000.0}]
+    rows = [dict(zip(COLS, r)) for r in merge_rows(metrika, [], [], 20.0, "2026-07-17",
+                                                   rub_spend_rows=rub_spend)]
+    assert len(rows) == 1
+    assert rows[0]["sessions"] == 500 and rows[0]["cost"] == 1000.0
+
+
+def test_merge_aed_and_rub_spend_coexist():
+    """Meta (AED из TW) и Google (₽ из кабинета) в одном дне считаются каждый по-своему."""
+    aed_spend = [{"date": "2026-07-17", "channel": "SMM paid", "subchannel": "Meta Ads",
+                  "traffic_type": "Платный", "cost": 100.0}]
+    rub_spend = [{"date": "2026-07-17", "country": "Катар", "channel": "SEM",
+                  "subchannel": "Google.Adwords", "traffic_type": "Платный", "cost": 500.0}]
+    rows = [dict(zip(COLS, r)) for r in merge_rows([], [], aed_spend, 20.0, "2026-07-17",
+                                                   rub_spend_rows=rub_spend)]
+    meta = [r for r in rows if r["subchannel"] == "Meta Ads"][0]
+    google = [r for r in rows if r["subchannel"] == "Google.Adwords"][0]
+    assert meta["cost"] == 2000.0           # 100 AED × 20
+    assert google["cost"] == 500.0          # уже ₽
