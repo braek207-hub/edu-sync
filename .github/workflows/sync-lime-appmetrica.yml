@@ -1,0 +1,34 @@
+name: Sync LIME AppMetrica
+
+on:
+  schedule:
+    - cron: "30 4 * * *"   # ежедневно 07:30 MSK — когорты пересобираются целиком
+  workflow_dispatch:
+    inputs:
+      cohort_months:
+        description: "Сколько месяцев когорт тянуть (по умолчанию 7)."
+        required: false
+        default: ""
+      max_life:
+        description: "Столбцов месяцев жизни когорты (по умолчанию 6)."
+        required: false
+        default: ""
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # Выгрузка Logs API за 7 месяцев (~0.9 млн установок + ~1.2 млн покупок) идёт долго.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Sync LIME AppMetrica
+        run: python sync_lime_appmetrica.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          APPMETRICA_TOKEN: ${{ secrets.APPMETRICA_TOKEN }}
+          APP_COHORT_MONTHS: ${{ github.event.inputs.cohort_months }}
+          APP_MAX_LIFE: ${{ github.event.inputs.max_life }}

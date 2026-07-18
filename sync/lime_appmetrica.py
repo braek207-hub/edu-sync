@@ -156,12 +156,12 @@ def sync_lime_appmetrica() -> None:
     if not token:
         print("[lime-appmetrica] APPMETRICA_TOKEN не задан — пропуск")
         return
-    app_id = os.environ.get("APPMETRICA_APP_ID", "4415407")
-    event_name = os.environ.get("APPMETRICA_EVENT_NAME", "purchase")
-    months = int(os.environ.get("APP_COHORT_MONTHS", "7"))
-    max_life = int(os.environ.get("APP_MAX_LIFE", "6"))
-    keep_reattr = _truthy(os.environ.get("APP_KEEP_REATTR", "0"))
-    keep_reinstall = _truthy(os.environ.get("APP_KEEP_REINSTALL", "0"))
+    app_id = os.environ.get("APPMETRICA_APP_ID") or "4415407"
+    event_name = os.environ.get("APPMETRICA_EVENT_NAME") or "purchase"
+    months = int(os.environ.get("APP_COHORT_MONTHS") or "7")
+    max_life = int(os.environ.get("APP_MAX_LIFE") or "6")
+    keep_reattr = _truthy(os.environ.get("APP_KEEP_REATTR") or "0")
+    keep_reinstall = _truthy(os.environ.get("APP_KEEP_REINSTALL") or "0")
 
     since, until = sync_window(months, date.today())
     print(f"[lime-appmetrica] окно {since}..{until}, app={app_id}, event={event_name}")
