@@ -33,8 +33,8 @@ def test_regions_cover_kz_and_gcc():
     assert REGIONS["kz"]["sites"] == ["https://limestore.com/"]
     assert REGIONS["kz"]["countries"] == {"kaz": ""}
     gcc = REGIONS["gcc"]
-    # Эксперимент 2026-07-18: корневой домен временно выключен, остались 6 витрин Залива.
-    # Вернётся — поправить на 7 и раскомментировать проверку ниже.
+    # Только витрины Залива: корневой домен в GCC не входит (клики с него ведут на
+    # глобальный сайт, а не в магазин) — см. комментарий в sync/gsc.py.
     assert len(gcc["sites"]) == 6
     assert "https://limestore.com/" not in gcc["sites"]
     assert all(s.endswith(".limestore.com/") for s in gcc["sites"])
