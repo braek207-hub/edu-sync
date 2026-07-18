@@ -4,20 +4,86 @@ import requests
 
 from sync.gcc_channels import map_domain_country
 
-# Измерения канала (были прод-набором до дробления по странам) — дают точный GCC-тотал.
+# Измерения канала (эталон тотала: без домена и без разбивок).
 CHANNEL_DIMENSIONS = (
     "ym:s:date",
     "ym:s:lastsignTrafficSource",
-    "ym:s:lastsignSourceEngine",
 )
 
-# Те же + домен витрины → страна Залива (зонд P1; ym:s:URLDomain не существует, HTTP 400).
+# Прод-набор. ⚠️ Движка источника здесь НЕТ намеренно: `lastsignSourceEngine`,
+# `lastsignSourceEngineName` и `lastsignAdvEngine` выбрасывают мелкие комбинации вместо
+# схлопывания в «прочее» — Бахрейн терял 505 визитов и 7 источников → 299 и один Internal
+# (зонд 2026-07-18, docs/GCC_CONTRACTS.md). utm-метки и searchEngine такого не делают:
+# полный набор ниже даёт 210 827 визитов = эталон, потерь нет.
+# Площадку рекламы восстанавливаем из utm (resolve_engine), а не из движка.
 COUNTRY_DIMENSIONS = (
     "ym:s:date",
     "ym:s:startURLDomain",
     "ym:s:lastsignTrafficSource",
-    "ym:s:lastsignSourceEngine",
+    "ym:s:UTMSource",
+    "ym:s:UTMCampaign",
+    "ym:s:lastsignSearchEngine",
 )
+
+# Порядок метрик в запросе = порядок чтения в parse_metrika_traffic.
+METRICS = (
+    "ym:s:visits",
+    "ym:s:users",
+    "ym:s:newUsers",
+    "ym:s:bounceRate",
+    "ym:s:pageDepth",
+)
+
+# utm_source → название площадки в терминах map_metrika_channel.
+_UTM_SOURCE_ENGINE = {
+    "google": "Google Ads",
+    "googleads": "Google Ads",
+    "google-ads": "Google Ads",
+    "adwords": "Google Ads",
+    "ig": "Instagram",
+    "instagram": "Instagram",
+    "facebook": "Facebook",
+    "fb": "Facebook",
+    "meta": "Facebook",
+    "tiktok": "TikTok",
+    "snapchat": "Snapchat",
+    "yandex": "Yandex.Direct",
+}
+
+
+def resolve_engine(traffic_source, utm_source, campaign, search_engine):
+    """Восстановить площадку («движок») источника без режущего измерения Метрики.
+
+    Args:
+        traffic_source: id источника ("ad", "organic", "social", ...).
+        utm_source: метка utm_source визита.
+        campaign: метка utm_campaign (у Google Ads это id кампании через ValueTrack).
+        search_engine: `ym:s:lastsignSearchEngine` — поисковик, не режет выдачу.
+
+    Returns:
+        Название площадки для map_metrika_channel либо None — тогда подканал
+        останется generic, но визит не потеряется (у малых стран реклама часто без меток).
+    """
+    src = (utm_source or "").strip().lower()
+    if src in _UTM_SOURCE_ENGINE:
+        return _UTM_SOURCE_ENGINE[src]
+
+    camp = (campaign or "").strip()
+    if camp:
+        low = camp.lower()
+        if any(x in low for x in ("instagram", "facebook", "_fb", "meta")):
+            return "Instagram"
+        if camp.isdigit():
+            # Google Ads пишет id кампании (10-12 цифр), у Meta id заметно длиннее (17-19).
+            if 10 <= len(camp) <= 12:
+                return "Google Ads"
+            if len(camp) >= 15:
+                return "Instagram"
+
+    if (traffic_source or "") in ("organic", "search") and search_engine:
+        return search_engine
+
+    return None
 
 
 def parse_metrika_traffic(resp: dict) -> list[dict]:
@@ -33,9 +99,11 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
         Список дектов с ключами:
         - date (str): YYYY-MM-DD
         - country (str|None): страна Залива по домену витрины (None вне GCC)
+        - campaign (str|None): utm_campaign (у Google Ads это id кампании)
         - traffic_source (str|None): id источника (напр. "ad", "organic")
-        - source_engine (str|None): название движка (напр. "Google Ads")
-        - visits (float), users (float)
+        - source_engine (str|None): площадка, восстановленная из utm (см. resolve_engine)
+        - visits, users, new_users (float)
+        - bounce_w, depth_w (float): отказы/глубина, взвешенные на визиты (аддитивны)
     """
     queried = (resp.get("query") or {}).get("dimensions") or []
     pos = {name: i for i, name in enumerate(queried)}
@@ -49,14 +117,27 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
         dims = item.get("dimensions", [])
         metrics = item.get("metrics", [])
 
+        traffic_source = dim(dims, "ym:s:lastsignTrafficSource", "id")
+        campaign = dim(dims, "ym:s:UTMCampaign", "name") or None
+        utm_source = dim(dims, "ym:s:UTMSource", "name") or None
+        search_engine = dim(dims, "ym:s:lastsignSearchEngine", "name") or None
+        visits = metrics[0] if len(metrics) > 0 else None
+
         rows.append(
             {
                 "date": dim(dims, "ym:s:date", "name"),
                 "country": map_domain_country(dim(dims, "ym:s:startURLDomain", "name")),
-                "traffic_source": dim(dims, "ym:s:lastsignTrafficSource", "id"),
-                "source_engine": dim(dims, "ym:s:lastsignSourceEngine", "name"),
-                "visits": metrics[0] if len(metrics) > 0 else None,
+                "campaign": campaign,
+                "traffic_source": traffic_source,
+                # Совместимо с map_metrika_channel: снаружи это по-прежнему «движок».
+                "source_engine": resolve_engine(traffic_source, utm_source, campaign, search_engine),
+                "visits": visits,
                 "users": metrics[1] if len(metrics) > 1 else None,
+                "new_users": metrics[2] if len(metrics) > 2 else None,
+                # Отказы и глубина — средние по строке. Наружу отдаём взвешенными на визиты,
+                # иначе при суммировании строк среднее от средних соврёт.
+                "bounce_w": (metrics[3] or 0) / 100 * (visits or 0) if len(metrics) > 3 else None,
+                "depth_w": (metrics[4] or 0) * (visits or 0) if len(metrics) > 4 else None,
             }
         )
     return rows
@@ -79,7 +160,11 @@ def residual_rows(total_rows: list[dict], country_rows: list[dict]) -> list[dict
         Строки-остатки в формате parse_metrika_traffic (только там, где остаток > 0).
     """
     def key(row):
-        return (row["date"], row["traffic_source"], row["source_engine"])
+        # Только (дата, источник) — ровно то, что запрашивает CHANNEL_DIMENSIONS.
+        # Площадка сюда НЕ входит: эталонный запрос её не знает (source_engine=None),
+        # а у детальных строк она восстановлена из utm → ключи не совпали бы и остаток
+        # продублировал бы весь трафик канала (поймано dry-run: 100 → 2523 визита).
+        return (row["date"], row["traffic_source"])
 
     attributed: dict[tuple, list[int]] = {}
     for row in country_rows:
@@ -112,7 +197,7 @@ def _fetch(counter_id, token: str, date_from: str, date_to: str, dimensions) -> 
             "ids": counter_id,
             "date1": date_from,
             "date2": date_to,
-            "metrics": "ym:s:visits,ym:s:users,ym:s:pageviews,ym:s:bounceRate",
+            "metrics": ",".join(METRICS),
             "dimensions": ",".join(dimensions),
             "accuracy": "full",
             "limit": 100000,

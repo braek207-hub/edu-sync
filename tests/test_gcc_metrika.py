@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from sync.gcc_metrika import parse_metrika_traffic, residual_rows
+from sync.gcc_metrika import parse_metrika_traffic, residual_rows, resolve_engine
 
 
 def test_parse_metrika_traffic():
@@ -16,7 +16,10 @@ def test_parse_metrika_traffic():
     first = rows[0]
     assert first["date"] == "2026-07-17"
     assert first["traffic_source"] == "ad"
-    assert first["source_engine"] == "Google Ads"
+    # Фикстура записана старым запросом (движок читался напрямую). Теперь площадка
+    # восстанавливается из utm/searchEngine, которых в этом ответе нет → None.
+    # Площадку проверяют тесты resolve_engine ниже.
+    assert first["source_engine"] is None
     assert first["visits"] == 1392.0 and first["users"] == 1024.0
     # строка direct: engine None
     direct = [r for r in rows if r["traffic_source"] == "direct"][0]
@@ -36,7 +39,7 @@ def test_parse_metrika_traffic_with_domain():
     first = rows[0]
     assert first["date"] == "2026-07-17"
     assert first["traffic_source"] == "ad"
-    assert first["source_engine"] == "Google Ads"
+    assert first["source_engine"] is None   # см. комментарий выше: в фикстуре нет utm
     assert first["country"] == "ОАЭ"
     # в фикстуре есть несколько стран, все распознаны
     assert {r["country"] for r in rows} == {
@@ -101,3 +104,72 @@ def test_residual_users_clamped_at_zero():
                    "source_engine": "Google Ads", "visits": 90, "users": 55}]
     rows = residual_rows(totals, by_country)
     assert len(rows) == 1 and rows[0]["visits"] == 10 and rows[0]["users"] == 0
+
+
+# === Площадка по utm вместо режущего движка ===
+# Зонд 2026-07-18: lastsignSourceEngine/Name/AdvEngine выбрасывают мелкие комбинации
+# (Бахрейн: 505 визитов и 7 источников → 480 и 3). utm-метки и searchEngine — не режут.
+
+
+def test_engine_google_by_utm_source():
+    assert resolve_engine("ad", "google", None, None) == "Google Ads"
+    assert resolve_engine("ad", "GOOGLE", None, None) == "Google Ads"
+
+
+def test_engine_meta_by_utm_source():
+    for src in ("ig", "instagram", "facebook", "fb", "meta"):
+        assert resolve_engine("ad", src, None, None) in ("Instagram", "Facebook")
+
+
+def test_engine_google_by_campaign_id_shape():
+    """Google Ads пишет в utm_campaign свой id (ValueTrack) — 10-12 цифр."""
+    assert resolve_engine("ad", None, "21087796023", None) == "Google Ads"
+
+
+def test_engine_meta_by_campaign_id_shape():
+    """У Meta id заметно длиннее (17-19 цифр)."""
+    assert resolve_engine("ad", None, "120239706697970017", None) == "Instagram"
+
+
+def test_engine_meta_by_campaign_text_label():
+    assert resolve_engine("ad", None, "Instagram_Stories-CPO_SALE70_UAE", None) == "Instagram"
+
+
+def test_engine_search_from_search_engine_dim():
+    assert resolve_engine("organic", None, None, "Google") == "Google"
+    assert resolve_engine("organic", None, None, "Bing") == "Bing"
+
+
+def test_engine_none_when_nothing_known():
+    """Нет меток (у Бахрейна реклама идёт без utm) → generic-подканал, но визит не теряется."""
+    assert resolve_engine("ad", None, None, None) is None
+    assert resolve_engine("internal", None, None, None) is None
+
+
+def test_engine_feeds_existing_channel_map():
+    """Синтетический движок совместим с map_metrika_channel — мерж не трогаем."""
+    from sync.gcc_channels import map_metrika_channel
+    assert map_metrika_channel("ad", resolve_engine("ad", "google", None, None)) == (
+        "SEM", "Google.Adwords", "Платный")
+    assert map_metrika_channel("ad", resolve_engine("ad", "ig", None, None)) == (
+        "SMM paid", "Meta Ads", "Платный")
+    ch, sub, tt = map_metrika_channel("ad", resolve_engine("ad", None, None, None))
+    assert ch == "SEM" and tt == "Платный"
+
+
+def test_residual_matches_channel_only_reference():
+    """Эталон запрашивает только (дата, источник) — площадка в ключ сверки не входит.
+
+    Регрессия dry-run 2026-07-17: с площадкой в ключе строки не матчились и остаток
+    раздувался со 100 до 2523 визитов, задваивая трафик.
+    """
+    totals = [{"date": "2026-07-17", "country": None, "campaign": None,
+               "traffic_source": "ad", "source_engine": None, "visits": 1000, "users": 800}]
+    by_country = [
+        {"date": "2026-07-17", "country": "ОАЭ", "campaign": "21087796023",
+         "traffic_source": "ad", "source_engine": "Google Ads", "visits": 700, "users": 600},
+        {"date": "2026-07-17", "country": "Катар", "campaign": None,
+         "traffic_source": "ad", "source_engine": "Instagram", "visits": 250, "users": 180},
+    ]
+    rows = residual_rows(totals, by_country)
+    assert len(rows) == 1 and rows[0]["visits"] == 50
