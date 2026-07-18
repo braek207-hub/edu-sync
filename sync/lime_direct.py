@@ -78,6 +78,16 @@ GOALS_CONFIG_PATH = os.path.join(
 # Целей 12 → отчёт запрашивается порциями, результаты склеиваются по (date, campaign_id).
 GOALS_PER_REPORT = 10
 
+# Модель атрибуции. LSC (последний значимый клик) Яндексом ОТКЛЮЧЕНА: действующие
+# значения — FCCD / LC / LSCCD / AUTO, а запрос LSC молча конвертируется в LSCCD
+# (https://yandex.ru/dev/direct/doc/reports/spec.html). Просим LSCCD явно: иначе имя
+# колонки определяет подмена на стороне API, а не мы.
+#
+# LSCCD — та же логика, что LSC (последний значимый клик за 90 дней), плюс склейка
+# устройств одного пользователя. Для LIME это существенно: клик с десктопа и установка
+# приложения на телефоне теперь один человек, а не два.
+ATTRIBUTION_MODEL = "LSCCD"
+
 _OS_LABELS = {"ANDROID": "Android", "IOS": "iOS"}
 
 _GENDER_RU = {"GENDER_MALE": "Мужчины", "GENDER_FEMALE": "Женщины"}
@@ -318,7 +328,7 @@ def _pick_weekly(*values: Optional[float]) -> Optional[float]:
 
 def _report_sig(fields: List[str], goal_ids: List[str]) -> str:
     src = json.dumps(
-        {"fields": fields, "goals": goal_ids, "attr": ["LSC"]},
+        {"fields": fields, "goals": goal_ids, "attr": [ATTRIBUTION_MODEL]},
         sort_keys=True,
         ensure_ascii=False,
     ).encode("utf-8")
@@ -422,7 +432,7 @@ def _fetch_report_chunk(
     }
     if goal_ids:
         params["Goals"] = [int(g) for g in goal_ids]
-        params["AttributionModels"] = ["LSC"]
+        params["AttributionModels"] = [ATTRIBUTION_MODEL]
 
     body = {"params": params}
     payload = json.dumps(body).encode("utf-8")
