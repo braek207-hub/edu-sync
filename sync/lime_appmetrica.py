@@ -169,10 +169,20 @@ def sync_lime_appmetrica() -> None:
     installs_raw = fetch_installations(app_id, token, since, until)
     purchases_raw = fetch_purchase_events(app_id, token, since, until, event_name)
     print(f"[lime-appmetrica] сырьё: installs={len(installs_raw)}, purchases={len(purchases_raw)}")
+    if not purchases_raw:
+        print("[lime-appmetrica] WARNING: purchases_raw пуст — покупки не найдены за окно")
 
     first = first_install_per_device(installs_raw, keep_reattr, keep_reinstall)
     installs_rows = build_installs_weekly(first)
     cohort_rows = build_cohorts(first, purchases_raw, max_life)
+
+    if not installs_rows:
+        raise RuntimeError(
+            "[lime-appmetrica] installs_rows пуст после агрегации — отказ от записи, "
+            "чтобы не затереть данные витрины. Вероятные причины: пустой ответ Logs API "
+            "(проверить APPMETRICA_TOKEN, APPMETRICA_APP_ID) или неверное окно дат "
+            f"({since}..{until})."
+        )
 
     _write(installs_rows, cohort_rows)
     print(f"[lime-appmetrica] записано: install-строк={len(installs_rows)}, "

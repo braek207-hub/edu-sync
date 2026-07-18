@@ -1,4 +1,9 @@
+import os
 from datetime import date, datetime
+from unittest.mock import patch
+
+import pytest
+
 from sync import lime_appmetrica as m
 
 
@@ -82,6 +87,15 @@ def test_window_months_back():
     assert until == "2026-07-18"
 
 
+def test_window_months_back_crosses_year_boundary():
+    # today=15.02.2026, months=7: first=01.02.2026, mo=2-6=-4 → нормализация
+    # (mo+=12→8, y-=1→2025) → since=2025-08-01. 7 месяцев включительно:
+    # авг,сен,окт,ноя,дек,янв,фев.
+    since, until = m.sync_window(months=7, today=date(2026, 2, 15))
+    assert since == "2025-08-01"
+    assert until == "2026-02-15"
+
+
 def test_build_cohorts_excludes_devices_whose_first_purchase_is_beyond_window():
     # d1 покупает внутри окна (life 2), d2 покупает только далеко за пределами
     # окна (life ~9 при install в январе, purchase в октябре, max_life=3).
@@ -102,3 +116,17 @@ def test_build_cohorts_excludes_devices_whose_first_purchase_is_beyond_window():
     assert rows[(cm, pub, 2)] == (2, 1)   # только d1
     assert rows[(cm, pub, 3)] == (2, 1)   # d2 не попадает даже в финальный (max_life) бакет
     # cohort_size остаётся 2 — оба устройства установили приложение, просто d2 не купил в окне.
+
+
+def test_sync_refuses_to_wipe_when_installs_raw_is_empty():
+    # Пустой ответ Logs API (транзиентный сбой / неверный APPMETRICA_APP_ID / неверное
+    # окно дат) — это НЕ ошибка на уровне HTTP, просто [] (fetch_installations.json()
+    # .get("data", [])). Если это молча проходит в _write — DELETE отработает,
+    # INSERT вставит 0 строк, витрина обнулится до следующего успешного запуска.
+    with patch.dict(os.environ, {"APPMETRICA_TOKEN": "test-token"}, clear=False), \
+         patch("sync.lime_appmetrica.fetch_installations", return_value=[]), \
+         patch("sync.lime_appmetrica.fetch_purchase_events", return_value=[]), \
+         patch("sync.lime_appmetrica._write") as mock_write:
+        with pytest.raises(RuntimeError):
+            m.sync_lime_appmetrica()
+    mock_write.assert_not_called()   # ключевая проверка: без неё тест прошёл бы даже при wipe
