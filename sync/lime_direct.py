@@ -1820,11 +1820,16 @@ def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> i
 
     region_ids: set[int] = set()
     goal_ids_needed: set[int] = set()
+    # Все коллекции ниже — через _as_list: API Директа отдаёт их то списком, то
+    # обёрткой {"Items": [...]}. При обёртке `for x in dict` перебирает КЛЮЧИ, и
+    # int('Items') роняет весь синк настроек. Обёртку уже чинили для CounterIds и
+    # PriorityGoals (aa5a584), но эти места пропустили — настройки не синхронизировались
+    # молча, state/campaign_type оставались заполнены у 1173 из 1603 строк.
     for cid in campaign_ids:
         for ag in adgroups_map.get(cid, []):
-            for rid in ag.get("regionIds") or []:
+            for rid in _as_list(ag.get("regionIds")):
                 region_ids.add(int(rid))
-            for rid in ag.get("restrictedRegionIds") or []:
+            for rid in _as_list(ag.get("restrictedRegionIds")):
                 rid_int = int(rid)
                 region_ids.add(-abs(rid_int) if rid_int > 0 else rid_int)
         for m in bidmodifiers_map.get(cid, []):
@@ -1835,15 +1840,15 @@ def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> i
         strat = base.get("strategy") or {}
         for ch_key in ("search", "network"):
             ch = strat.get(ch_key) or {}
-            for gid in ch.get("goalIds") or []:
+            for gid in _as_list(ch.get("goalIds")):
                 goal_ids_needed.add(int(gid))
         pkg = strat.get("package") or {}
-        for gid in pkg.get("goalIds") or []:
+        for gid in _as_list(pkg.get("goalIds")):
             goal_ids_needed.add(int(gid))
-        for gid in strat.get("priorityGoals") or []:
+        for gid in _as_list(strat.get("priorityGoals")):
             goal_ids_needed.add(int(gid))
-        for pg in strat.get("priorityGoalsDetails") or []:
-            if pg.get("goalId") is not None:
+        for pg in _as_list(strat.get("priorityGoalsDetails")):
+            if isinstance(pg, dict) and pg.get("goalId") is not None:
                 goal_ids_needed.add(int(pg["goalId"]))
 
     geo_names = _fetch_geo_region_names(sorted(region_ids))
