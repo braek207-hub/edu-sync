@@ -73,6 +73,10 @@ GOALS_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "config", "lime_direct_goals.json"
 )
 
+# Жёсткий лимит Reports API: «Array Goals cannot contain more than 10 elements».
+# Целей 12 → отчёт запрашивается порциями, результаты склеиваются по (date, campaign_id).
+GOALS_PER_REPORT = 10
+
 _OS_LABELS = {"ANDROID": "Android", "IOS": "iOS"}
 
 _GENDER_RU = {"GENDER_MALE": "Мужчины", "GENDER_FEMALE": "Женщины"}
@@ -320,7 +324,48 @@ def _report_sig(fields: List[str], goal_ids: List[str]) -> str:
     return hashlib.md5(src).hexdigest()[:8]
 
 
+def _merge_report_chunks(chunks: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Склеить порции отчёта по (date, campaign_id).
+
+    Объёмные поля (клики/расход/позиции) одинаковы во всех порциях — период и набор
+    кампаний те же, меняется только список запрошенных целей. Поэтому берём строку
+    из первой порции, где она встретилась, и ДОБАВЛЯЕМ к ней conversions остальных.
+    Суммировать объёмные поля нельзя — это задвоило бы расход.
+    """
+    merged: Dict[tuple, Dict[str, Any]] = {}
+    for chunk in chunks:
+        for row in chunk:
+            key = (row.get("date"), row.get("campaign_id"))
+            base = merged.get(key)
+            if base is None:
+                merged[key] = dict(row)
+                continue
+            base.setdefault("conversions", {}).update(row.get("conversions") or {})
+    return list(merged.values())
+
+
 def _fetch_report(
+    date_from: str,
+    date_to: str,
+    goal_ids: List[str],
+    id_to_key: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """Отчёт Реports API. Цели запрашиваются порциями: API принимает максимум 10.
+
+    Лимит («Array Goals cannot contain more than 10 elements») и стал причиной того,
+    что 2026-06-24 список целей урезали до шести ключей в env — вместе с ним потеряли
+    ступень install. Порционный запрос закрывает лимит без потери целей.
+    """
+    if len(goal_ids) > GOALS_PER_REPORT:
+        chunks = [
+            _fetch_report_chunk(date_from, date_to, part, id_to_key)
+            for part in _chunked(goal_ids, GOALS_PER_REPORT)
+        ]
+        return _merge_report_chunks(chunks)
+    return _fetch_report_chunk(date_from, date_to, goal_ids, id_to_key)
+
+
+def _fetch_report_chunk(
     date_from: str,
     date_to: str,
     goal_ids: List[str],
@@ -363,7 +408,8 @@ def _fetch_report(
 
     rows: List[Dict[str, Any]] = []
     reader = csv.DictReader(io.StringIO(r.text), delimiter="\t")
-    conv_cols = {f"Conversions_{gid}_LSC": gid for gid, _key in id_to_key.items()}
+    # Только цели ЭТОЙ порции: в TSV порции колонок остальных целей нет.
+    conv_cols = {f"Conversions_{gid}_LSC": gid for gid in goal_ids if gid in id_to_key}
 
     for row in reader:
         cid = str(row.get("CampaignId", "")).strip()

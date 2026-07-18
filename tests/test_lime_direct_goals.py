@@ -6,7 +6,7 @@
 поэтому _parse_goals возвращал ([], {}) → отчёт запрашивался без секции Goals →
 conversions={} с середины июня. Мертвы были все 12 колонок целей в дашборде.
 """
-from sync.lime_direct import _parse_goals
+from sync.lime_direct import GOALS_PER_REPORT, _merge_report_chunks, _parse_goals
 
 # Зеркало config/lime-direct-goals.json дашборда. Синк и дашборд обязаны сходиться
 # по id: расхождение обнулит цели молча, без ошибки.
@@ -48,3 +48,37 @@ def test_parse_goals_ignores_env(monkeypatch):
     monkeypatch.setenv("LIME_DIRECT_GOALS", "")
     goal_ids, _ = _parse_goals()
     assert len(goal_ids) == 12
+
+
+def test_goals_exceed_single_report_limit():
+    """12 целей не влезают в один отчёт — Reports API принимает максимум 10.
+
+    Именно на этот лимит напоролся переход на env: вместо порционных запросов
+    список урезали до шести ключей и потеряли install.
+    """
+    goal_ids, _ = _parse_goals()
+    assert len(goal_ids) > GOALS_PER_REPORT
+
+
+def test_merge_report_chunks_unions_conversions():
+    """Порции склеиваются по (date, campaign_id): conversions объединяются."""
+    chunk_a = [{
+        "date": "2026-07-01", "campaign_id": "1", "clicks": 10,
+        "conversions": {"4": 5, "194380276": 2},
+    }]
+    chunk_b = [{
+        "date": "2026-07-01", "campaign_id": "1", "clicks": 10,
+        "conversions": {"3023504302": 7},
+    }]
+    merged = _merge_report_chunks([chunk_a, chunk_b])
+    assert len(merged) == 1
+    assert merged[0]["conversions"] == {"4": 5, "194380276": 2, "3023504302": 7}
+    assert merged[0]["clicks"] == 10, "объёмные поля не должны суммироваться дважды"
+
+
+def test_merge_report_chunks_keeps_rows_missing_in_other_chunk():
+    """Кампания, попавшая только в одну порцию, не теряется."""
+    chunk_a = [{"date": "2026-07-01", "campaign_id": "1", "clicks": 10, "conversions": {"4": 5}}]
+    chunk_b = [{"date": "2026-07-01", "campaign_id": "2", "clicks": 3, "conversions": {"4": 1}}]
+    merged = _merge_report_chunks([chunk_a, chunk_b])
+    assert {r["campaign_id"] for r in merged} == {"1", "2"}
