@@ -2,7 +2,7 @@
 
 Контракт cbr.ru: XML_daily.asp?date_req=DD/MM/YYYY, windows-1251, десятичная запятая.
 Курс на выходной/праздник = курс последнего рабочего дня (штатное поведение ЦБ).
-Поддерживает USD и AED (и любые другие валюты в CBR_IDS).
+Поддерживает USD, AED и KZT (и любые другие валюты в CBR_IDS).
 """
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -10,7 +10,7 @@ from datetime import datetime
 import requests
 
 CBR_URL = "https://www.cbr.ru/scripts/XML_daily.asp"
-CBR_IDS = {"USD": "R01235", "AED": "R01230"}
+CBR_IDS = {"USD": "R01235", "AED": "R01230", "KZT": "R01335"}
 _CACHE: dict[tuple[str, str], float] = {}
 
 
