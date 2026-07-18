@@ -7,7 +7,8 @@ from sync.lime_gcc import COLUMNS, merge_rows
 
 COLS = ["date", "data_source", "region", "country", "channel", "subchannel", "traffic_type", "campaign_id",
         "campaign_name", "cost", "clicks", "impressions", "sessions", "users", "clients",
-        "purchases_count", "purchases_revenue", "customers", "new_users", "new_customers", "new_customers_revenue"]
+        "purchases_count", "purchases_revenue", "customers", "new_users", "new_customers", "new_customers_revenue",
+        "bounce_rate", "page_depth"]
 
 
 def test_merge_joins_by_channel_and_converts():
@@ -190,3 +191,42 @@ def test_merge_totals_survive_campaign_grain():
     ]
     rows = [dict(zip(COLS, r)) for r in merge_rows(metrika, [], [], 20.0, "2026-07-17")]
     assert sum(r["sessions"] for r in rows) == 420
+
+
+# === Воронка: новые пользователи, отказы, глубина (T5) ===
+# Конвенция Polina: в БД bounce_rate в процентах, page_depth — среднее по строке;
+# взвешивание на визиты делает хендлер (SUM(bounce_rate * visits)).
+
+
+def test_merge_writes_funnel_metrics():
+    metrika = [{"date": "2026-07-17", "country": "ОАЭ", "campaign": None, "traffic_source": "ad",
+                "source_engine": "Google Ads", "visits": 100, "users": 80,
+                "new_users": 60, "bounce_w": 30.0, "depth_w": 400.0}]
+    r = dict(zip(COLS, merge_rows(metrika, [], [], 20.0, "2026-07-17")[0]))
+    assert r["new_users"] == 60
+    assert r["bounce_rate"] == 30.0    # 30 отказов на 100 визитов → 30%
+    assert r["page_depth"] == 4.0      # 400 / 100 визитов
+
+
+def test_merge_funnel_weighted_across_rows():
+    """Две строки одного среза усредняются ПО ВИЗИТАМ, а не арифметически."""
+    metrika = [
+        {"date": "2026-07-17", "country": "ОАЭ", "campaign": None, "traffic_source": "ad",
+         "source_engine": "Google Ads", "visits": 900, "users": 800,
+         "new_users": 500, "bounce_w": 90.0, "depth_w": 3600.0},
+        {"date": "2026-07-17", "country": "ОАЭ", "campaign": None, "traffic_source": "ad",
+         "source_engine": "Google Ads", "visits": 100, "users": 90,
+         "new_users": 50, "bounce_w": 50.0, "depth_w": 100.0},
+    ]
+    r = dict(zip(COLS, merge_rows(metrika, [], [], 20.0, "2026-07-17")[0]))
+    assert r["new_users"] == 550
+    assert r["bounce_rate"] == 14.0    # (90+50)/1000 → 14%, а не (10%+50%)/2
+    assert r["page_depth"] == 3.7      # (3600+100)/1000
+
+
+def test_merge_funnel_absent_without_traffic():
+    """Строка только с расходом (нет визитов) — деления на ноль нет, поля пустые."""
+    spend = [{"date": "2026-07-17", "channel": "SMM paid", "subchannel": "Meta Ads",
+              "traffic_type": "Платный", "cost": 100.0}]
+    r = dict(zip(COLS, merge_rows([], [], spend, 20.0, "2026-07-17")[0]))
+    assert r["bounce_rate"] is None and r["page_depth"] is None and r["new_users"] == 0

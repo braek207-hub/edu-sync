@@ -45,6 +45,7 @@ COLUMNS = (
     "cost", "clicks", "impressions", "sessions", "users", "clients",
     "purchases_count", "purchases_revenue", "customers",
     "new_users", "new_customers", "new_customers_revenue",
+    "bounce_rate", "page_depth",
 )
 
 INSERT_SQL = f"INSERT INTO lime_stats ({', '.join(COLUMNS)}) VALUES %s"
@@ -87,6 +88,10 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
                 "revenue": 0.0,
                 "cost": 0.0,
                 "cost_rub": 0.0,
+                "new_users": 0,
+                # Взвешенные на визиты — иначе среднее от средних соврёт при склейке строк.
+                "bounce_w": 0.0,
+                "depth_w": 0.0,
             }
             agg[key] = row
         elif not row["traffic_type"]:
@@ -98,6 +103,9 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
         row = _bucket(m.get("country"), m.get("campaign"), channel, subchannel, traffic_type)
         row["sessions"] += int(m["visits"] or 0)
         row["users"] += int(m["users"] or 0)
+        row["new_users"] += int(m.get("new_users") or 0)
+        row["bounce_w"] += float(m.get("bounce_w") or 0)
+        row["depth_w"] += float(m.get("depth_w") or 0)
 
     for o in tw_order_rows:
         row = _bucket(o.get("country"), o.get("campaign"), o["channel"], o["subchannel"],
@@ -124,12 +132,17 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
     for (country, campaign, channel, subchannel), row in agg.items():
         cost_rub = round(row["cost"] * fx_rate + row["cost_rub"], 2)
         revenue_rub = round(row["revenue"] * fx_rate, 2)
+        sessions = row["sessions"]
         out.append((
             date_s, "web", "gcc", country, channel, subchannel, row["traffic_type"],
             campaign, row["campaign_name"],                    # campaign_id, campaign_name
             cost_rub, 0, 0, row["sessions"], row["users"], 0,   # cost, clicks, impressions, sessions, users, clients
             row["orders"], revenue_rub, 0,                      # purchases_count, purchases_revenue, customers
-            0, 0, 0.0,                                          # new_users, new_customers, new_customers_revenue
+            row["new_users"], 0, 0.0,                           # new_users, new_customers, new_customers_revenue
+            # Средневзвешенные по визитам; проценты и «страниц за визит» — конвенция
+            # polinarepik_metrica_visits, хендлер взвешивает обратно (SUM(x * sessions)).
+            round(row["bounce_w"] / sessions * 100, 4) if sessions else None,
+            round(row["depth_w"] / sessions, 4) if sessions else None,
         ))
     return out
 
