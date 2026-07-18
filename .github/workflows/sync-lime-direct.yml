@@ -61,6 +61,15 @@ jobs:
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.google_ads_fx
 
+      # Идёт ПОСЛЕ конвертации Google в рубли: склейка читает готовый cost_rub.
+      - name: Run LIME KZ Metrika sync (region=kz_metrika)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIME_METRIKA_TOKEN: ${{ secrets.LIME_METRIKA_TOKEN }}
+          LIME_KZ_METRIKA_DAYS_BACK: "30"
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_kz_metrika
+
       - name: Revalidate dashboard cache
         if: success()
         run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
