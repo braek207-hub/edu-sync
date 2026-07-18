@@ -33,8 +33,11 @@ def test_regions_cover_kz_and_gcc():
     assert REGIONS["kz"]["sites"] == ["https://limestore.com/"]
     assert REGIONS["kz"]["countries"] == {"kaz": ""}
     gcc = REGIONS["gcc"]
-    assert len(gcc["sites"]) == 7                      # 6 поддоменов + корневой
-    assert "https://limestore.com/" in gcc["sites"]    # корневой обслуживает спрос Залива
+    # Эксперимент 2026-07-18: корневой домен временно выключен, остались 6 витрин Залива.
+    # Вернётся — поправить на 7 и раскомментировать проверку ниже.
+    assert len(gcc["sites"]) == 6
+    assert "https://limestore.com/" not in gcc["sites"]
+    assert all(s.endswith(".limestore.com/") for s in gcc["sites"])
     assert gcc["countries"]["are"] == "ОАЭ"
     assert gcc["countries"]["sau"] == "Саудовская Аравия"
     assert len(gcc["countries"]) == 6
