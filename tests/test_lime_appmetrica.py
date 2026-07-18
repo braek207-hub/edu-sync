@@ -35,15 +35,45 @@ def test_first_install_filters_reinstall():
     assert fi == {}                                           # переустановка отфильтрована
 
 
-def test_build_installs_weekly_counts_devices():
-    fi = {
-        "d1": {"install_dt": datetime(2026, 1, 6), "publisher": "VK Ads"},   # пн 05.01
-        "d2": {"install_dt": datetime(2026, 1, 8), "publisher": "VK Ads"},   # та же неделя
-        "d3": {"install_dt": datetime(2026, 1, 6), "publisher": "Organic"},
-    }
-    rows = dict(((w, p), n) for (w, p, n) in m.build_installs_weekly(fi))
-    assert rows[(date(2026, 1, 5), "VK Ads")] == 2
+def _inst(dev, dt, pub, reinst="0", reattr="0"):
+    return {"appmetrica_device_id": dev, "install_datetime": dt, "publisher_name": pub,
+            "is_reinstallation": reinst, "is_reattribution": reattr}
+
+
+def test_build_installs_weekly_counts_unique_devices_per_week():
+    installs = [
+        _inst("d1", "2026-01-06 10:00:00", "VK Ads"),      # пн 05.01
+        _inst("d2", "2026-01-08 10:00:00", "VK Ads"),      # та же неделя
+        _inst("d1", "2026-01-09 11:00:00", "VK Ads"),      # то же устройство в той же неделе
+        _inst("d3", "2026-01-06 10:00:00", "Organic"),
+    ]
+    rows = dict(((w, p), n) for (w, p, n) in m.build_installs_weekly(installs, False, False))
+    assert rows[(date(2026, 1, 5), "VK Ads")] == 2        # d1 не задваивается
     assert rows[(date(2026, 1, 5), "Organic")] == 1
+
+
+def test_build_installs_weekly_counts_device_again_in_a_later_week():
+    """Ключевое отличие от когорт: повторная установка в другой неделе ДОЛЖНА считаться.
+    Глобальный дедуп по первой установке терял такие устройства в свежих неделях."""
+    installs = [
+        _inst("d1", "2026-01-06 10:00:00", "VK Ads"),
+        _inst("d1", "2026-02-10 10:00:00", "VK Ads"),     # то же устройство, другая неделя
+    ]
+    rows = dict(((w, p), n) for (w, p, n) in m.build_installs_weekly(installs, False, False))
+    assert rows[(date(2026, 1, 5), "VK Ads")] == 1
+    assert rows[(date(2026, 2, 9), "VK Ads")] == 1        # не потеряно
+
+
+def test_build_installs_weekly_respects_filters():
+    installs = [
+        _inst("d1", "2026-01-06 10:00:00", "VK Ads", reattr="true"),
+        _inst("d2", "2026-01-06 10:00:00", "VK Ads", reinst="true"),
+        _inst("d3", "2026-01-06 10:00:00", "VK Ads"),
+    ]
+    rows = dict(((w, p), n) for (w, p, n) in m.build_installs_weekly(installs, False, False))
+    assert rows[(date(2026, 1, 5), "VK Ads")] == 1        # остаётся только d3
+    rows_keep = dict(((w, p), n) for (w, p, n) in m.build_installs_weekly(installs, True, True))
+    assert rows_keep[(date(2026, 1, 5), "VK Ads")] == 3
 
 
 def test_build_cohorts_cumulative_unique_buyers():

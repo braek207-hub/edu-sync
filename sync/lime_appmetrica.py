@@ -60,11 +60,27 @@ def first_install_per_device(installs: list[dict], keep_reattribution: bool,
     return best
 
 
-def build_installs_weekly(first_installs: dict[str, dict]) -> list[tuple]:
-    agg: dict[tuple, int] = defaultdict(int)
-    for info in first_installs.values():
-        agg[(iso_monday(info["install_dt"]), info["publisher"])] += 1
-    return [(w, p, n) for (w, p), n in agg.items()]
+def build_installs_weekly(installs: list[dict], keep_reattribution: bool,
+                          keep_reinstall: bool) -> list[tuple]:
+    """Установки недели = уникальные устройства, установившие ИМЕННО в эту неделю.
+
+    Дедуп локальный, внутри (неделя × партнёр), а НЕ по первой установке за всё окно:
+    иначе устройство, поставившее приложение повторно, выпадало бы из свежих недель
+    (сверка со слайдами: глобальный дедуп давал −606 на неделе 29.06, локальный +206).
+    Когорты — наоборот, живут на первой установке (см. build_cohorts).
+    """
+    seen: dict[tuple, set] = defaultdict(set)
+    for r in installs:
+        if not keep_reinstall and _truthy(r.get("is_reinstallation")):
+            continue
+        if not keep_reattribution and _truthy(r.get("is_reattribution")):
+            continue
+        dev = r.get("appmetrica_device_id")
+        if not dev:
+            continue
+        wk = iso_monday(parse_dt(r["install_datetime"]))
+        seen[(wk, r.get("publisher_name") or "unknown")].add(dev)
+    return [(w, p, len(devs)) for (w, p), devs in seen.items()]
 
 
 def build_cohorts(first_installs: dict[str, dict], purchases: list[dict],
@@ -173,7 +189,9 @@ def sync_lime_appmetrica() -> None:
         print("[lime-appmetrica] WARNING: purchases_raw пуст — покупки не найдены за окно")
 
     first = first_install_per_device(installs_raw, keep_reattr, keep_reinstall)
-    installs_rows = build_installs_weekly(first)
+    # Недельные установки — по сырым строкам (дедуп внутри недели); когорты — по первой
+    # установке устройства. Это два разных вопроса и две разные агрегации.
+    installs_rows = build_installs_weekly(installs_raw, keep_reattr, keep_reinstall)
     cohort_rows = build_cohorts(first, purchases_raw, max_life)
 
     if not installs_rows:
