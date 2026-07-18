@@ -57,16 +57,16 @@ Workflow: `.github/workflows/sync-lime-direct.yml` → таблица `lime_dire
 | `DATABASE_URL` | ✅ | уже есть |
 | `LIME_DIRECT_TOKEN` | ✅ | OAuth Яндекс Директ, scope `direct:api` |
 | `LIME_DIRECT_CLIENT_LOGIN` | ✅ | логин рекламируемого аккаунта LIME |
-| `LIME_DIRECT_GOALS` | опц. | JSON ID целей для Reports API (LSC), см. ниже |
 
-**`LIME_DIRECT_GOALS`** — одной строкой JSON (6 целей):
+**Цели Директа — не секрет.** Список берётся из `config/lime_direct_goals.json`
+(12 целей на 4 ступени: install / cart / checkout / purchase, с разбивкой по
+платформам web / app_ios / app_android). Файл зеркалит `config/lime-direct-goals.json`
+дашборда — при правке менять оба, иначе цели молча обнулятся.
 
-```json
-{"web_cart":123,"web_checkout":456,"web_purchase":789,"app_cart":111,"app_checkout":222,"app_purchase":333}
-```
-
-ID целей — в Директе → цели счётчика Метрики/AppMetrica, привязанные к кампаниям.
-Без секрета синк работает как Phase 1 (без колонок конверсий).
+Env `LIME_DIRECT_GOALS` больше не используется. Он появился 2026-06-24 (коммит
+`47dc2b6`) вместо файлового чтения, имел плоский формат на шесть ключей и не содержал
+ступени `install` вовсе. В CI задан не был → отчёт запрашивался без секции `Goals` →
+`conversions={}` и все 12 колонок целей в дашборде были мертвы до 2026-07-18.
 
 Расписание: ежедневно 10:00 МСК. Ручной запуск: Actions → **Sync LIME Direct → Supabase** → Run workflow.
 

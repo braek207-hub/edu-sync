@@ -10,7 +10,7 @@ sync/lime_direct.py — синк кабинета Яндекс Директ дл
       Impressions, Clicks, Cost (с НДС),
       AvgEffectiveBid, AvgTrafficVolume, AvgImpressionPosition, AvgClickPosition,
       BounceRate (%), AvgPageviews,
-      Conversions по целям (LSC) — если задан LIME_DIRECT_GOALS.
+      Conversions по целям (LSC) — цели из config/lime_direct_goals.json.
   - Campaigns.get (снапшот): DailyBudget, BiddingStrategy, PackageBiddingStrategy
     → weekly_budget (в т.ч. APP / товарные / пакетные стратегии).
   - Настройки кампаний (per campaign, lime_campaign_settings):
@@ -23,7 +23,8 @@ ENV:
     LIME_DIRECT_TOKEN
     LIME_DIRECT_CLIENT_LOGIN
     LIME_DIRECT_DAYS_BACK  (default 7)
-    LIME_DIRECT_GOALS      (optional JSON, см. _parse_goals)
+
+Цели НЕ в env: список берётся из config/lime_direct_goals.json (см. _parse_goals).
 """
 
 import os
@@ -68,13 +69,8 @@ REPORT_FIELDS = [
     "AvgPageviews",
 ]
 
-GOAL_KEYS = (
-    "web_cart",
-    "web_checkout",
-    "web_purchase",
-    "app_cart",
-    "app_checkout",
-    "app_purchase",
+GOALS_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "config", "lime_direct_goals.json"
 )
 
 _OS_LABELS = {"ANDROID": "Android", "IOS": "iOS"}
@@ -179,26 +175,29 @@ def _pg_url() -> str:
 
 
 def _parse_goals() -> Tuple[List[str], Dict[str, str]]:
+    """ID целей для Reports API — из config/lime_direct_goals.json.
+
+    Файл зеркалит config/lime-direct-goals.json дашборда: 12 целей на 4 ступени
+    (install/cart/checkout/purchase) с разбивкой по платформам.
+
+    Читаем файл, а не env: плоский env-формат на шесть ключей не выражает 12 целей
+    и не имеет ступени install вовсе. На этой замене синк потерял установки
+    2026-06-24 (коммит 47dc2b6) — conversions приходил как {}, а в дашборде молча
+    умерли все 12 колонок целей.
+
+    Возвращает (список id для Reports API, map goal_id → ступень).
     """
-    LIME_DIRECT_GOALS — JSON вида:
-      {"web_cart": 123, "web_checkout": 456, "web_purchase": 789,
-       "app_cart": 111, "app_checkout": 222, "app_purchase": 333}
-    Возвращает (список id для Reports API, map goal_id → ключ колонки).
-    """
-    raw = os.environ.get("LIME_DIRECT_GOALS", "").strip()
-    if not raw:
-        return [], {}
-    cfg = json.loads(raw)
+    with open(GOALS_CONFIG_PATH, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
     goal_ids: List[str] = []
-    id_to_key: Dict[str, str] = {}
-    for key in GOAL_KEYS:
-        val = cfg.get(key)
-        if val is None or val == "":
+    id_to_step: Dict[str, str] = {}
+    for g in cfg.get("goals") or []:
+        gid = str(int(g["id"]))
+        if gid in id_to_step:
             continue
-        gid = str(int(val))
         goal_ids.append(gid)
-        id_to_key[gid] = key
-    return goal_ids, id_to_key
+        id_to_step[gid] = str(g["step"])
+    return goal_ids, id_to_step
 
 
 def _report_headers() -> Dict[str, str]:
