@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-"""sync/lime_kz_cabinet.py — KZ рекламный расход из кабинетов → lime_stats (region='kz', channel='SEM').
+"""sync/lime_kz_cabinet.py — Google Ads KZ → lime_stats (region=kz, subchannel=Google.Adwords).
 
-Кабинетные данные (Яндекс Директ LIME-KZ1 + Google Ads KZ) чище MySQL-среза, поэтому этим срезом
-lime_stats владеет ОТДЕЛЬНЫЙ ингест (по образцу GCC): lime.py исключает region='kz'&channel='SEM'
-из своего delete+insert, а этот синк его пишет. Так два ингеста не затирают друг друга.
+Google Ads KZ в MySQL (lc_simple_view) НЕТ вообще, поэтому его строки инжектим прямо в lime_stats
+(база из MySQL отсутствует). Яндекс Директ KZ (LIME-KZ1) НЕ трогаем — он приходит из MySQL с
+пользователями и дообогащается кабинетом (lime_direct_stats) на чтении в хендлере.
 
-Валюта: Яндекс KZ = рубли (как есть), Google KZ = USD → RUB по курсу ЦБ (sync/fx.py).
-Пишет ТОЛЬКО рекламные метрики (cost/clicks/impressions). Заказы/выручка/визиты KZ остаются из
-MySQL (lime.py, region='kz', прочие каналы). Гранулярность — per (date, campaign).
+Владение срезом: lime.py исключает region='kz' AND subchannel='Google.Adwords' из своего
+delete+insert (см. DELETE_SQL там), а этот синк им владеет — не затираем друг друга (как GCC).
+Валюта Google KZ = валюта аккаунта (обычно USD) → RUB по ЦБ (fx.to_rub). Пишем cost/clicks/
+impressions + имя; заказы/визиты = 0 (у Google KZ нет MySQL-атрибуции).
 
-ENV: DATABASE_URL, LIME_KZ_CABINET_DAYS_BACK (default 30).
-Запуск: python -m sync.lime_kz_cabinet
+ENV: DATABASE_URL, LIME_KZ_CABINET_DAYS_BACK (default 30). Запуск: python -m sync.lime_kz_cabinet
 """
 import os
 from datetime import date, timedelta
@@ -22,23 +22,10 @@ from sync.fx import CBR_IDS, to_rub as fx_to_rub
 
 DAYS_BACK = int(os.environ.get("LIME_KZ_CABINET_DAYS_BACK") or "30")
 
-# Кабинет Яндекс Директ KZ (LIME-KZ1) — расход уже в рублях.
-SELECT_YANDEX = """
-SELECT date::text AS date, campaign_id, MAX(campaign_name) AS campaign_name,
-       SUM(COALESCE(cost, 0))::float AS cost,
-       SUM(COALESCE(clicks, 0))::int AS clicks,
-       SUM(COALESCE(impressions, 0))::int AS impressions
-FROM lime_direct_stats
-WHERE client_login = 'LIME-KZ1' AND date >= %s AND date <= %s
-GROUP BY date, campaign_id
-"""
-
-# Кабинет Google Ads KZ — расход в валюте аккаунта (обычно USD), конвертируем на чтении.
 SELECT_GOOGLE = """
 SELECT date::text AS date, campaign_id, MAX(campaign_name) AS campaign_name,
        COALESCE(currency, 'USD') AS currency,
-       SUM(COALESCE(cost, 0))::float AS cost,
-       SUM(COALESCE(clicks, 0))::int AS clicks,
+       SUM(COALESCE(cost, 0))::float AS cost, SUM(COALESCE(clicks, 0))::int AS clicks,
        SUM(COALESCE(impressions, 0))::int AS impressions
 FROM lime_google_ads_stats
 WHERE region = 'kz' AND date >= %s AND date <= %s
@@ -47,7 +34,7 @@ GROUP BY date, campaign_id, currency
 
 DELETE_SQL = """
 DELETE FROM lime_stats
-WHERE region = 'kz' AND channel = 'SEM' AND date >= %s AND date <= %s
+WHERE region = 'kz' AND subchannel = 'Google.Adwords' AND date >= %s AND date <= %s
 """
 
 INSERT_SQL = """
@@ -62,36 +49,26 @@ INSERT INTO lime_stats (
 
 
 def _to_rub(cost, currency, date_s) -> float:
-    """Расход кабинета → рубли. RUB как есть, USD по курсу ЦБ, иначе не гадаем курс."""
+    """RUB как есть; валюты из CBR (USD/AED) по курсу ЦБ; иначе не гадаем."""
     c = (currency or "").upper()
     if c in ("RUB", "RUR", ""):
         return float(cost)
     if c in CBR_IDS:
         return float(cost) * fx_to_rub(c, date_s)
-    print(f"lime_kz_cabinet: WARN неизвестная валюта {currency!r} — cost НЕ сконвертирован в рубли")
+    print(f"lime_kz_cabinet: WARN валюта {currency!r} не сконвертирована в рубли")
     return float(cost)
 
 
-def _row(date_s, subchannel, campaign_id, campaign_name, cost, clicks, impressions):
-    # Только рекламные метрики; заказы/визиты KZ — из MySQL (lime.py). data_source='web'
-    # (детализацию web/app по кампаниям опустим на этом слое).
-    return (
-        date_s, "web", "kz", "SEM", subchannel, "Платный",
-        str(campaign_id) if campaign_id else "", campaign_name or "",
-        float(cost), float(clicks), float(impressions), 0, 0, 0,
-        0, 0.0, 0, 0, 0, 0.0,
-    )
-
-
-def build_rows(yandex_rows, google_rows) -> list[tuple]:
+def build_rows(google_rows) -> list[tuple]:
     out: list[tuple] = []
-    for r in yandex_rows:
-        out.append(_row(r["date"], "Яндекс.Директ", r["campaign_id"], r["campaign_name"],
-                        r["cost"], r["clicks"], r["impressions"]))
     for r in google_rows:
-        cost_rub = _to_rub(r["cost"], r["currency"], r["date"])
-        out.append(_row(r["date"], "Google.Adwords", r["campaign_id"], r["campaign_name"],
-                        cost_rub, r["clicks"], r["impressions"]))
+        cost = _to_rub(r["cost"], r["currency"], r["date"])
+        out.append((
+            r["date"], "web", "kz", "SEM", "Google.Adwords", "Платный",
+            str(r["campaign_id"]) if r["campaign_id"] else "", r["campaign_name"] or "",
+            cost, float(r["clicks"]), float(r["impressions"]), 0, 0, 0,
+            0, 0.0, 0, 0, 0, 0.0,
+        ))
     return out
 
 
@@ -102,16 +79,13 @@ def sync_lime_kz_cabinet() -> int:
     frm = to - timedelta(days=DAYS_BACK)
     frm_s, to_s = frm.isoformat(), to.isoformat()
 
-    url = os.environ["DATABASE_URL"].split("?")[0]
-    conn = psycopg2.connect(url, connect_timeout=30)
+    conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(SELECT_YANDEX, (frm_s, to_s))
-            yandex_rows = cur.fetchall()
             cur.execute(SELECT_GOOGLE, (frm_s, to_s))
             google_rows = cur.fetchall()
 
-        rows = build_rows(yandex_rows, google_rows)
+        rows = build_rows(google_rows)
         with conn.cursor() as cur:
             cur.execute(DELETE_SQL, (frm_s, to_s))
             if rows:
@@ -123,8 +97,7 @@ def sync_lime_kz_cabinet() -> int:
     finally:
         conn.close()
 
-    print(f"lime_kz_cabinet: {frm_s}..{to_s} → {len(rows)} строк "
-          f"(Яндекс {len(yandex_rows)}, Google {len(google_rows)})")
+    print(f"lime_kz_cabinet: {frm_s}..{to_s} → {len(rows)} строк Google KZ")
     return len(rows)
 
 

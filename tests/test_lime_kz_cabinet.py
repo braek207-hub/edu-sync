@@ -8,23 +8,19 @@ from sync.lime_kz_cabinet import _to_rub, build_rows
 
 def test_to_rub_rub_passthrough():
     assert _to_rub(478248.0, "RUB", "2026-07-10") == 478248.0
-    assert _to_rub(100.0, "", "2026-07-10") == 100.0  # пустая валюта = рубли (Директ)
-    # неизвестная валюта не гадается (возврат как есть)
-    assert _to_rub(50.0, "EUR", "2026-07-10") == 50.0
+    assert _to_rub(100.0, "", "2026-07-10") == 100.0  # пустая валюта = рубли
+    assert _to_rub(50.0, "ZZZ", "2026-07-10") == 50.0  # неизвестная не гадается
 
 
-def test_build_rows_maps_subchannels_and_structure():
-    yandex = [{"date": "2026-07-10", "campaign_id": "709305529", "campaign_name": "ya.direct KZ (Видео)",
-               "cost": 32355.0, "clicks": 1264, "impressions": 231153}]
-    # currency=RUB чтобы не дёргать сеть (usd_to_rub) в тесте
+def test_build_rows_google_only_structure():
+    # Google KZ → строки lime_stats (region=kz, subchannel=Google.Adwords, currency=RUB чтобы без сети)
     google = [{"date": "2026-07-10", "campaign_id": "111", "campaign_name": "Бренд. Поиск KZ",
                "currency": "RUB", "cost": 2177.0, "clicks": 20981, "impressions": 45587}]
-    rows = build_rows(yandex, google)
-    assert len(rows) == 2
-    ya, go = rows
-    # (date, data_source, region, channel, subchannel, traffic_type, campaign_id, campaign_name, cost, clicks, impressions, ...)
-    assert ya[2] == "kz" and ya[3] == "SEM" and ya[4] == "Яндекс.Директ" and ya[5] == "Платный"
-    assert ya[6] == "709305529" and ya[8] == 32355.0 and ya[9] == 1264.0 and ya[10] == 231153.0
-    assert go[4] == "Google.Adwords" and go[8] == 2177.0
-    # заказы/визиты нулевые (реклама-only слой)
-    assert ya[11] == 0 and ya[14] == 0 and ya[15] == 0.0
+    rows = build_rows(google)
+    assert len(rows) == 1
+    r = rows[0]
+    # (date, data_source, region, channel, subchannel, traffic_type, campaign_id, campaign_name, cost, clicks, impressions, sessions, users, ...)
+    assert r[2] == "kz" and r[3] == "SEM" and r[4] == "Google.Adwords" and r[5] == "Платный"
+    assert r[6] == "111" and r[7] == "Бренд. Поиск KZ"
+    assert r[8] == 2177.0 and r[9] == 20981.0 and r[10] == 45587.0
+    assert r[12] == 0 and r[13] == 0  # users, clients = 0 (нет MySQL-атрибуции у Google KZ)
