@@ -54,6 +54,13 @@ jobs:
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_direct
 
+      - name: Aggregate KZ cabinets → lime_stats (region=kz/SEM)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIME_KZ_CABINET_DAYS_BACK: "30"
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_kz_cabinet
+
       - name: Revalidate dashboard cache
         if: success()
         run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate

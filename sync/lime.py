@@ -122,6 +122,11 @@ def aggregate(rows):
     for r in rows:
         channel, subchannel = classify(r["source"] or "", r["medium"] or "")
         is_paid = channel in PAID_CHANNELS
+        # KZ платный поиск (region=kz, channel=SEM) владеет отдельный синк lime_kz_cabinet.py —
+        # кабинетные данные (Директ KZ + Google Ads KZ) чище MySQL-среза. Пропускаем kz-SEM из
+        # MySQL, чтобы не задваивать и не затирать кабинетные строки.
+        if (r["region"] or "") == "kz" and channel == "SEM":
+            continue
         cid = r["campaign_id"]
         cname = r["campaign_name"]
         bad = {None, "(not set)", "<NA>", ""}
@@ -163,12 +168,16 @@ INSERT INTO lime_stats (
 ) VALUES %s
 """
 
-# RU/KZ-синк владеет всеми регионами витрины lc_simple_view (region <> 'gcc').
-# GCC-синк (sync/lime_gcc.py) удаляет строго region='gcc'. Так два независимых
-# ingest'а в одну таблицу lime_stats не затирают данные друг друга.
+# RU/KZ-синк владеет витриной lc_simple_view, КРОМЕ двух срезов:
+#   • region='gcc' — свой GCC-ингест;
+#   • region='kz' AND channel='SEM' — синк sync/lime_kz_cabinet.py (кабинетные данные
+#     Директ KZ + Google Ads KZ, чище MySQL-среза).
+# Так независимые ingest'ы в одну таблицу lime_stats не затирают данные друг друга.
 DELETE_SQL = """
 DELETE FROM lime_stats
-WHERE date >= %s AND date <= %s AND (region IS NULL OR region <> 'gcc')
+WHERE date >= %s AND date <= %s
+  AND (region IS NULL OR region <> 'gcc')
+  AND NOT (region = 'kz' AND channel = 'SEM')
 """
 
 
