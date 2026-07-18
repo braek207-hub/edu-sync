@@ -1,0 +1,65 @@
+# Разовый бэкфилл KZ-среза Метрики (region='kz_metrika') за произвольный период.
+# Ежедневный синк живёт в sync-lime-direct.yml и берёт скользящее окно 30 дней; здесь —
+# ручной прогон вглубь истории. Синк идемпотентен (delete+insert по дню внутри своего
+# региона), поэтому повторный запуск на том же периоде безопасен.
+#
+# Расход: у истории до июня 2026 его нет — Директ KZ начал синкаться 03.06.2026, а Google
+# конвертируется в рубли скользящим окном. Визиты/заказы/выручка/воронка приедут полностью,
+# ДРР и CPO в старой части будут завышенно хорошими. Синк про это громко предупреждает
+# по каждой дате — это ожидаемо для бэкфилла, а не поломка.
+#
+# Если прогон упирается в таймаут (каждый день = отдельный запрос к Метрике + курс ЦБ),
+# гоняй по кварталам: период задаётся входами.
+name: Backfill LIME KZ Metrika
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "С даты (YYYY-MM-DD)"
+        required: true
+        default: "2025-01-01"
+        type: string
+      date_to:
+        description: "По дату (YYYY-MM-DD), включительно"
+        required: true
+        default: "2025-03-31"
+        type: string
+
+concurrency:
+  group: lime-kz-metrika-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Apply DB migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/apply_lime_migrations.py
+
+      - name: Backfill KZ Metrika
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIME_METRIKA_TOKEN: ${{ secrets.LIME_METRIKA_TOKEN }}
+          LIME_KZ_METRIKA_FROM: ${{ github.event.inputs.date_from }}
+          LIME_KZ_METRIKA_TO: ${{ github.event.inputs.date_to }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_kz_metrika
+
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
