@@ -5,8 +5,15 @@
   1. Директ — по имени из ym:s:lastsignDirectClickOrderName (id у измерения нет);
      имена в кабинетах уникальны, неоднозначное имя считаем нераспознанным.
   2. Google PMax — utm_campaign содержит реальный campaign_id.
-  3. Google поиск — utm_campaign статичный 'g', id группы объявлений в utm_content
-     разрешается через справочник lime_google_ads_ad_groups.
+  3. Google поиск — utm_campaign статичный 'g', id под-сущности кампании (группы
+     объявлений ИЛИ объявления — шаблон отслеживания может подставить любую) в utm_content
+     разрешается через справочник lime_google_ads_entities.
+
+Справочник изначально хранил только id групп объявлений: гипотеза, что utm_content — это
+id группы, не подтвердилась (реальные id групп 12-значные, начинаются с 1-2, а Метрика
+шлёт значения в диапазоне 7-8 — вероятнее всего id объявления, макрос {creative}). Поэтому
+справочник общий (kind='ad_group'|'ad'), а резолвинг ищет id независимо от вида сущности:
+id групп и объявлений не пересекаются, коллизия по формату исключена.
 
 Расход берём ТОЛЬКО по кампаниям KZ-кабинетов: в гео-срез попадает пролив RU-кабинета,
 чей расход принадлежит региону RU и там уже учтён.
@@ -16,7 +23,7 @@ from typing import NamedTuple
 
 KZ_DIRECT_LOGIN = "LIME-KZ1"
 
-# Порог протухания справочника групп объявлений.
+# Порог протухания справочника сущностей кампании (группы объявлений + объявления).
 # Справочник наполняет Google Ads Script из рекламного кабинета через /api/ingest/google-ads —
 # он вне этого репозитория, вне workflow и без расписания, поэтому его остановку никто не
 # заметит: синк отработает «успешно», просто расход поисковых кампаний Google станет 0.
@@ -25,7 +32,7 @@ KZ_DIRECT_LOGIN = "LIME-KZ1"
 # и ручную паузу кабинета, но ловит настоящую остановку задолго до того, как протухшая склейка
 # испортит месячный отчёт. Совпадает с окном бэкфилла LIME_KZ_METRIKA_DAYS_BACK=30 по духу:
 # предупреждение приходит, пока данные ещё в зоне пересчёта.
-ADGROUP_MAX_AGE_DAYS = 7
+ENTITY_MAX_AGE_DAYS = 7
 
 
 class CampaignRef(NamedTuple):
@@ -37,14 +44,15 @@ class CampaignRef(NamedTuple):
 NO_CAMPAIGN = CampaignRef("", "", False)
 
 
-def resolve_campaign(row: dict, direct_map: dict, google_map: dict, adgroup_map: dict) -> CampaignRef:
+def resolve_campaign(row: dict, direct_map: dict, google_map: dict, entity_map: dict) -> CampaignRef:
     """Определить кампанию строки Метрики.
 
     Args:
         row: строка sync.lime_kz_metrika_api.parse_metrika_kz.
         direct_map: имя кампании → (campaign_id, kz_cabinet) либо None при неоднозначности.
         google_map: campaign_id → имя (только кампании Google KZ).
-        adgroup_map: ad_group_id → (campaign_id, campaign_name).
+        entity_map: entity_id (id группы объявлений ИЛИ id объявления — id обоих видов не
+            пересекаются) → (campaign_id, campaign_name).
 
     Returns:
         CampaignRef; NO_CAMPAIGN если кампанию распознать нельзя.
@@ -62,7 +70,7 @@ def resolve_campaign(row: dict, direct_map: dict, google_map: dict, adgroup_map:
         return CampaignRef(utm_campaign, google_map[utm_campaign], True)
 
     utm_content = (row.get("utm_content") or "").strip()
-    hit = adgroup_map.get(utm_content)
+    hit = entity_map.get(utm_content)
     if hit:
         campaign_id, campaign_name = hit
         return CampaignRef(campaign_id, campaign_name, True)
@@ -85,17 +93,19 @@ GROUP BY campaign_id
 """
 
 # Таблица мультирегиональна (ingest пишет kz/ru/gcc) — без фильтра региона чужая
-# группа объявлений может отдать id RU/GCC-кампании с флагом kz_cabinet=True.
-SELECT_ADGROUPS = """
-SELECT ad_group_id, campaign_id, COALESCE(campaign_name, '') AS campaign_name
-FROM lime_google_ads_ad_groups
+# сущность может отдать id RU/GCC-кампании с флагом kz_cabinet=True.
+# kind не фильтруем: id групп объявлений и id объявлений не пересекаются по формату
+# (см. модуль-докстринг), резолвинг ищет по entity_id независимо от вида сущности.
+SELECT_ENTITIES = """
+SELECT entity_id, campaign_id, COALESCE(campaign_name, '') AS campaign_name
+FROM lime_google_ads_entities
 WHERE region = 'kz'
 """
 
 # Свежесть справочника — по тому же срезу region='kz', что и сам справочник выше.
-SELECT_ADGROUPS_FRESHNESS = """
+SELECT_ENTITIES_FRESHNESS = """
 SELECT COUNT(*)::int AS row_count, MAX(updated_at) AS newest
-FROM lime_google_ads_ad_groups
+FROM lime_google_ads_entities
 WHERE region = 'kz'
 """
 
@@ -145,8 +155,8 @@ def load_google_map(conn, frm: str, to: str) -> dict:
         return {str(cid): (name or "") for cid, name in cur.fetchall()}
 
 
-def warn_if_adgroups_stale(row_count: int, newest, now: datetime | None = None) -> bool:
-    """Предупредить, если справочник групп объявлений пуст или протух.
+def warn_if_entities_stale(row_count: int, newest, now: datetime | None = None) -> bool:
+    """Предупредить, если справочник сущностей кампании пуст или протух.
 
     Пустой/протухший справочник не роняет синк, но тихо обнуляет расход поисковых кампаний
     Google KZ: utm_content не резолвится → campaign_id пустой → cost_map не отдаёт расход,
@@ -162,12 +172,12 @@ def warn_if_adgroups_stale(row_count: int, newest, now: datetime | None = None) 
     """
     if row_count > 0 and newest is None:
         # Строки есть, а updated_at пуст — колонка NOT NULL DEFAULT now(), так быть не должно.
-        print("lime_kz_campaigns: WARN справочник lime_google_ads_ad_groups без updated_at — "
-              "проверь схему (миграция 010) и ingest /api/ingest/google-ads")
+        print("lime_kz_campaigns: WARN справочник lime_google_ads_entities без updated_at — "
+              "проверь схему (миграция 012) и ingest /api/ingest/google-ads")
         return True
 
     if row_count == 0:
-        print("lime_kz_campaigns: WARN справочник групп объявлений lime_google_ads_ad_groups ПУСТ "
+        print("lime_kz_campaigns: WARN справочник сущностей lime_google_ads_entities ПУСТ "
               "→ поисковые кампании Google KZ не резолвятся и их расход станет 0 при живых "
               "визитах. Проверь Google Ads Script в кабинете (ingest /api/ingest/google-ads)")
         return True
@@ -177,24 +187,24 @@ def warn_if_adgroups_stale(row_count: int, newest, now: datetime | None = None) 
     if newest.tzinfo is None:
         newest = newest.replace(tzinfo=timezone.utc)
     age = now - newest
-    if age > timedelta(days=ADGROUP_MAX_AGE_DAYS):
-        print(f"lime_kz_campaigns: WARN справочник lime_google_ads_ad_groups не обновлялся "
-              f"{age.days} дн. (порог {ADGROUP_MAX_AGE_DAYS}, последняя запись "
+    if age > timedelta(days=ENTITY_MAX_AGE_DAYS):
+        print(f"lime_kz_campaigns: WARN справочник lime_google_ads_entities не обновлялся "
+              f"{age.days} дн. (порог {ENTITY_MAX_AGE_DAYS}, последняя запись "
               f"{newest.date().isoformat()}) → склейка поисковых кампаний Google KZ идёт по "
-              f"устаревшим группам, расход новых кампаний станет 0. Проверь Google Ads Script "
+              f"устаревшим сущностям, расход новых кампаний станет 0. Проверь Google Ads Script "
               f"в кабинете (ingest /api/ingest/google-ads)")
         return True
     return False
 
 
-def load_adgroup_map(conn) -> dict:
+def load_entity_map(conn) -> dict:
     with conn.cursor() as cur:
-        cur.execute(SELECT_ADGROUPS_FRESHNESS)
+        cur.execute(SELECT_ENTITIES_FRESHNESS)
         row_count, newest = cur.fetchone()
-        cur.execute(SELECT_ADGROUPS)
-        out = {str(ag): (str(cid), name) for ag, cid, name in cur.fetchall()}
+        cur.execute(SELECT_ENTITIES)
+        out = {str(eid): (str(cid), name) for eid, cid, name in cur.fetchall()}
     # Проверяем ровно тот срез, что и загружаем (region='kz'), и один раз за прогон синка.
-    warn_if_adgroups_stale(int(row_count or 0), newest)
+    warn_if_entities_stale(int(row_count or 0), newest)
     return out
 
 

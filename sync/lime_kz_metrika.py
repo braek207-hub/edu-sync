@@ -24,9 +24,9 @@ import psycopg2.extras
 
 from sync.fx import to_rub as fx_to_rub
 from sync.lime_kz_campaigns import (
-    load_adgroup_map,
     load_cost_map,
     load_direct_map,
+    load_entity_map,
     load_google_map,
     resolve_campaign,
 )
@@ -150,8 +150,8 @@ def build_rows(metrika_rows, campaign_maps, cost_map, fx_rate: float, date_s: st
     # Гейт выше требует непустой campaign_id и потому ловит лишь один сценарий (кампания
     # известна, расход не доехал). Реальные отказы соседей дают как раз ПУСТОЙ campaign_id
     # и проходили молча:
-    #   • протух справочник lime_google_ads_ad_groups (его пишет скрипт в кабинете Google Ads —
-    #     вне workflow и без расписания) → метка группы не резолвится → расход Google = 0;
+    #   • протух справочник lime_google_ads_entities (его пишет скрипт в кабинете Google Ads —
+    #     вне workflow и без расписания) → id сущности не резолвится → расход Google = 0;
     #   • имя кампании Директа стало неоднозначным (кампанию продублировали в кабинете с тем же
     #     именем) → load_direct_map кладёт None → строка нераспознана → расход этой кампании
     #     исчезает целиком, и предупреждения про Директ не было вообще;
@@ -171,7 +171,7 @@ def build_rows(metrika_rows, campaign_maps, cost_map, fx_rate: float, date_s: st
     if unresolved_paid_rows:
         print(f"lime_kz_metrika: WARN {date_s} — {unresolved_paid_rows} строк(и) платного трафика "
               f"без распознанной кампании ({int(unresolved_paid_visits)} визитов): расход по ним "
-              f"не проставлен (проверь справочник lime_google_ads_ad_groups, "
+              f"не проставлен (проверь справочник lime_google_ads_entities, "
               f"неоднозначные имена кампаний Директа и статистику Google Ads за дату)")
 
     return out
@@ -185,7 +185,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
         campaign_maps = (
             load_direct_map(conn, frm_s, to_s),
             load_google_map(conn, frm_s, to_s),
-            load_adgroup_map(conn),
+            load_entity_map(conn),
         )
         cost_map = load_cost_map(conn, frm_s, to_s)
     else:
