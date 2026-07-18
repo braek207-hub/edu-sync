@@ -13,6 +13,10 @@ on:
         description: "Бэкфилл GSC/Google-спроса с даты (YYYY-MM-DD), напр. 2025-04-01 (GSC ~16 мес истории). Пусто = инкремент."
         required: false
         default: ""
+      gcc_gsc_from:
+        description: "Бэкфилл GCC с даты (YYYY-MM-DD). История начинается с 2025-10-01. Пусто = инкремент."
+        required: false
+        default: ""
 
 jobs:
   sync:
@@ -41,3 +45,4 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
           WORDSTAT_FROM: ${{ github.event.inputs.wordstat_from }}
           GSC_FROM: ${{ github.event.inputs.gsc_from }}
+          GCC_GSC_FROM: ${{ github.event.inputs.gcc_gsc_from }}

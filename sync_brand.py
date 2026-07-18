@@ -55,17 +55,20 @@ def main() -> None:
     # Google Search Console SEO (сервис-аккаунт как пользователь ресурсов).
     # GSC_FROM=YYYY-MM-DD → бэкфилл; иначе инкремент последних недель.
     if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("GOOGLE_SERVICE_ACCOUNT"):
-        try:
-            from sync.gsc import sync_gsc_seo
+        # KZ и GCC — один источник (Search Console), разные ресурсы и страны.
+        # GCC_GSC_FROM отдельно от GSC_FROM: история GCC начинается с 2025-10.
+        for reg, from_env in (("kz", "GSC_FROM"), ("gcc", "GCC_GSC_FROM")):
+            try:
+                from sync.gsc import sync_gsc_seo
 
-            frm = os.environ.get("GSC_FROM") or (
-                dt.date.today() - dt.timedelta(weeks=INCREMENTAL_WEEKS)
-            ).isoformat()
-            n = sync_gsc_seo(frm, dt.date.today().isoformat())
-            print(f"gsc: {n} недель (с {frm})")
-        except Exception as e:
-            print(f"ОШИБКА gsc: {e}")
-            errors.append(f"gsc: {e}")
+                frm = os.environ.get(from_env) or (
+                    dt.date.today() - dt.timedelta(weeks=INCREMENTAL_WEEKS)
+                ).isoformat()
+                n = sync_gsc_seo(frm, dt.date.today().isoformat(), reg)
+                print(f"gsc[{reg}]: {n} строк неделя×страна (с {frm})")
+            except Exception as e:
+                print(f"ОШИБКА gsc[{reg}]: {e}")
+                errors.append(f"gsc[{reg}]: {e}")
     else:
         print("gsc: пропуск (нет GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_SERVICE_ACCOUNT)")
 
