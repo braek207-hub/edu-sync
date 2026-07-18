@@ -411,6 +411,18 @@ def _fetch_report_chunk(
     # Только цели ЭТОЙ порции: в TSV порции колонок остальных целей нет.
     conv_cols = {f"Conversions_{gid}_LSC": gid for gid in goal_ids if gid in id_to_key}
 
+    # Несовпадение имён колонок целей обязано быть громким: именно так цели «терялись»
+    # молча — отчёт приходил успешно, конверсии складывались в {}, и колонки дашборда
+    # были пустыми месяц без единой ошибки в логе.
+    if conv_cols:
+        header = list(reader.fieldnames or [])
+        missing = [c for c in conv_cols if c not in header]
+        if missing:
+            print(
+                f"  [lime_direct] WARN: колонок конверсий нет в отчёте: {missing[:3]}"
+                f" (всего {len(missing)}); пришли: {[c for c in header if c.startswith('Conv')][:5]}"
+            )
+
     for row in reader:
         cid = str(row.get("CampaignId", "")).strip()
         if not cid or cid == "--":
