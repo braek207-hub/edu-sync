@@ -67,19 +67,31 @@ def sync_google_ads_fx() -> int:
             cur.execute(sql, params)
             pairs = cur.fetchall()
 
+        failed = 0
         with conn.cursor() as cur:
             for p in pairs:
                 cur_code = (p["currency"] or "").upper()
                 if cur_code in ("RUB", "RUR", ""):
                     cur.execute(UPDATE_RUB_SQL, (p["date"], p["currency"]))
                 elif cur_code in CBR_IDS:
-                    rate = fx_to_rub(cur_code, p["date"])
+                    # Недоступность ЦБ на ОДНУ дату не должна ронять прогон: раньше
+                    # ConnectTimeout здесь убивал весь workflow вместе с шагами после
+                    # него. Пропущенная дата подхватится следующим прогоном — строка
+                    # остаётся с cost_rub IS NULL, а режим backfill её и выбирает.
+                    try:
+                        rate = fx_to_rub(cur_code, p["date"])
+                    except Exception as e:
+                        failed += 1
+                        print(f"google_ads_fx: WARN курс {cur_code} на {p['date']} не получен: {e}")
+                        continue
                     cur.execute(UPDATE_SQL, (rate, p["date"], p["currency"]))
                 else:
                     print(f"google_ads_fx: WARN валюта {cur_code!r} ({p['date']}) — cost_rub не заполнен")
                     continue
                 updated += cur.rowcount
         conn.commit()
+        if failed:
+            print(f"google_ads_fx: WARN {failed} дат без курса — подхватятся следующим прогоном")
     except Exception:
         conn.rollback()
         raise
