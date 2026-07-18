@@ -72,9 +72,12 @@ WHERE region = 'kz' AND date >= %s AND date <= %s
 GROUP BY campaign_id
 """
 
+# Таблица мультирегиональна (ingest пишет kz/ru/gcc) — без фильтра региона чужая
+# группа объявлений может отдать id RU/GCC-кампании с флагом kz_cabinet=True.
 SELECT_ADGROUPS = """
 SELECT ad_group_id, campaign_id, COALESCE(campaign_name, '') AS campaign_name
 FROM lime_google_ads_ad_groups
+WHERE region = 'kz'
 """
 
 # Расход KZ-кабинетов: Директ LIME-KZ1 (cost уже с НДС) + Google KZ (cost_rub посчитан
@@ -102,10 +105,10 @@ def load_direct_map(conn, frm: str, to: str) -> dict:
         rows = cur.fetchall()
 
     seen: dict[str, set] = {}
-    logins: dict[str, str] = {}
+    logins: dict[tuple[str, str], str] = {}
     for name, campaign_id, client_login in rows:
         seen.setdefault(name, set()).add(str(campaign_id))
-        logins[f"{name}|{campaign_id}"] = client_login or ""
+        logins[(name, str(campaign_id))] = client_login or ""
 
     out: dict = {}
     for name, ids in seen.items():
@@ -113,7 +116,7 @@ def load_direct_map(conn, frm: str, to: str) -> dict:
             out[name] = None  # одно имя на несколько кампаний — не гадаем
             continue
         campaign_id = next(iter(ids))
-        out[name] = (campaign_id, logins.get(f"{name}|{campaign_id}") == KZ_DIRECT_LOGIN)
+        out[name] = (campaign_id, logins.get((name, campaign_id)) == KZ_DIRECT_LOGIN)
     return out
 
 
@@ -132,11 +135,28 @@ def load_adgroup_map(conn) -> dict:
 def load_cost_map(conn, frm: str, to: str) -> dict:
     """(дата, campaign_id) → расход в рублях. Только KZ-кабинеты."""
     out: dict[tuple[str, str], float] = {}
+    direct_ids: set = set()
+    google_ids: set = set()
     with conn.cursor() as cur:
         cur.execute(SELECT_COST_DIRECT, (KZ_DIRECT_LOGIN, frm, to))
         for date_s, campaign_id, cost in cur.fetchall():
-            out[(date_s, str(campaign_id))] = out.get((date_s, str(campaign_id)), 0.0) + float(cost or 0)
+            cid = str(campaign_id)
+            direct_ids.add(cid)
+            out[(date_s, cid)] = out.get((date_s, cid), 0.0) + float(cost or 0)
         cur.execute(SELECT_COST_GOOGLE, (frm, to))
         for date_s, campaign_id, cost in cur.fetchall():
-            out[(date_s, str(campaign_id))] = out.get((date_s, str(campaign_id)), 0.0) + float(cost or 0)
+            cid = str(campaign_id)
+            google_ids.add(cid)
+            out[(date_s, cid)] = out.get((date_s, cid), 0.0) + float(cost or 0)
+
+    # Ключ (дата, campaign_id) общий для Директа и Google — площадка в нём не закодирована.
+    # Если id численно совпадут, расход двух разных кампаний тихо сольётся в одну сумму.
+    # Не падаем: совпадение id между площадками не блокирует остальной синк и само по себе
+    # не значит порчу данных (может быть безобидным совпадением) — но должно быть замечено
+    # и разобрано вручную, поэтому громкое предупреждение вместо тихой неверной суммы.
+    collisions = direct_ids & google_ids
+    if collisions:
+        print(f"lime_kz_campaigns: WARN campaign_id пересекается между Директ и Google KZ, "
+              f"расход мог слиться: {sorted(collisions)}")
+
     return out

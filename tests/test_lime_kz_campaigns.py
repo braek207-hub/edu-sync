@@ -66,3 +66,11 @@ def test_direct_wins_over_utm_when_both_present():
 
 def test_organic_row_has_no_campaign():
     assert resolve_campaign(_row(), DIRECT_MAP, GOOGLE_MAP, ADGROUP_MAP) == NO_CAMPAIGN
+
+
+def test_utm_campaign_wins_over_utm_content_when_both_present():
+    """PMax utm_campaign проверяется раньше пути через справочник групп по utm_content:
+    если оба валидны одновременно, до adgroup_map дело не доходит."""
+    ref = resolve_campaign(_row(utm_campaign="23952118304", utm_content="782935363650"),
+                           DIRECT_MAP, GOOGLE_MAP, ADGROUP_MAP)
+    assert ref == CampaignRef("23952118304", "PMax Retargeting", True)
