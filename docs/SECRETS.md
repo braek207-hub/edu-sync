@@ -74,6 +74,28 @@ ID целей — в Директе → цели счётчика Метрики
 - `panda-bi/supabase/migrations/20260616000000_lime_direct_stats.sql`
 - `panda-bi/supabase/migrations/20260618000000_lime_direct_goals.sql` (конверсии)
 
+### LIME GCC (регион Залива, Shopify)
+
+Workflow: `.github/workflows/sync-lime-gcc.yml` → таблица `lime_stats` (region='gcc') в Supabase.
+Отдельный ингест: витрины PROCONTEXT для GCC нет, собираем сами. Трафик — Яндекс.Метрика,
+заказы/выручка+расход — Triple Whale, конверт AED→₽ (курс ЦБ). Пишет ТОЛЬКО region='gcc'
+(delete+insert по этому срезу), не пересекается с RU/KZ. Детали контракта: `docs/GCC_CONTRACTS.md`.
+
+| Секрет | Обязателен | Описание |
+|--------|------------|----------|
+| `DATABASE_URL` | ✅ | уже есть |
+| `GCC_METRICA_TOKEN` | ✅ | OAuth Яндекса с доступом к Метрике счётчика GCC (то же значение, что `YANDEX_TOKEN` медийного синка LIME — Директ+Метрика+Медиаметрика) |
+| `GCC_TRIPLEWHALE_API_KEY` | ✅ | Triple Whale Data-Out API key (scopes Read: Summary Page + Pixel Attribution) |
+| `GCC_TW_SHOP_DOMAIN` | ✅ | постоянный домен магазина `lime-shop-prod.myshopify.com` |
+
+Не секреты (зашиты в `sync/lime_gcc.py` / код):
+- счётчик Метрики GCC (UAE): `98232701` (env `GCC_METRICA_COUNTER_ID` для override)
+- валюта магазина: AED → ₽ по курсу ЦБ (`sync/fx.py`)
+- sync days: `7` (или input workflow)
+
+⚠️ `GCC_METRICA_TOKEN`: сейчас = `YANDEX_TOKEN`, который **захардкожен** в `d:\vscode\LIME\config.py` —
+отозвать/перевыпустить и хранить только в секретах.
+
 ### GAS
 
 В Apps Script: **Project Settings → Script properties → `SPREADSHEET_ID`** — это ID Google-книги с листами `Лиды`, `Оплаты`, Direct.

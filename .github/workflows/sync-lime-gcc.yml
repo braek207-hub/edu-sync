@@ -1,0 +1,42 @@
+name: Sync LIME GCC → Supabase
+
+on:
+  schedule:
+    # 05:30 UTC = 08:30 Moscow (после дневного sync-lime)
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+    inputs:
+      sync_days:
+        description: "Days back to sync (default 7)"
+        required: false
+        default: "7"
+
+concurrency:
+  group: lime-gcc-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run GCC sync
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GCC_METRICA_TOKEN: ${{ secrets.GCC_METRICA_TOKEN }}
+          GCC_TRIPLEWHALE_API_KEY: ${{ secrets.GCC_TRIPLEWHALE_API_KEY }}
+          GCC_TW_SHOP_DOMAIN: ${{ secrets.GCC_TW_SHOP_DOMAIN }}
+          LIME_GCC_SYNC_DAYS: ${{ github.event.inputs.sync_days || '7' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_gcc
