@@ -20,4 +20,13 @@ CREATE TABLE IF NOT EXISTS lime_google_ads_stats (
   updated_at      timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (date, region, customer_id, campaign_id)
 );
-ALTER TABLE lime_google_ads_stats ENABLE ROW LEVEL SECURITY;
+-- Условно: ALTER ... ENABLE RLS берёт ACCESS EXCLUSIVE lock даже если RLS уже включён,
+-- а миграции применяются при КАЖДОМ прогоне синка → на живой записи ловили statement timeout.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = 'public' AND c.relname = 'lime_google_ads_stats' AND c.relrowsecurity)
+  THEN
+    EXECUTE 'ALTER TABLE lime_google_ads_stats ENABLE ROW LEVEL SECURITY';
+  END IF;
+END $$;
