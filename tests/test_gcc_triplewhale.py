@@ -17,7 +17,7 @@ def test_order_source_first_touchpoint():
     assert order_source(orders[0]) == "facebook-ads"
 
 
-def test_order_source_fallback_to_last_click():
+def test_order_source_fallback_to_full_last_click():
     # заказ без lastPlatformClick/lastClick — источник берётся из fullLastClick
     order = {
         "attribution": {
@@ -27,6 +27,18 @@ def test_order_source_fallback_to_last_click():
         }
     }
     assert order_source(order) == "direct"
+
+
+def test_order_source_fallback_to_last_click():
+    # заказ без lastPlatformClick — источник берётся из lastClick
+    order = {
+        "attribution": {
+            "lastPlatformClick": [],
+            "lastClick": [{"source": "google-ads"}],
+            "fullLastClick": [{"source": "direct"}],
+        }
+    }
+    assert order_source(order) == "google-ads"
 
 
 def test_order_source_none_when_no_touchpoints():

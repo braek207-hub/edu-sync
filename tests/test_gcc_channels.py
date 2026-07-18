@@ -118,3 +118,7 @@ def test_tw_none():
 def test_tw_catch_all():
     ch, sub, tt = map_tw_source("some_weird_source")
     assert ch == "Others" and sub == "some_weird_source" and tt == "Бесплатный"
+
+
+def test_tw_pinterest():
+    assert map_tw_source("pinterest-ads") == ("SMM paid", "Pinterest Ads", "Платный")

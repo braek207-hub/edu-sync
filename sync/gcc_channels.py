@@ -130,6 +130,8 @@ def map_tw_source(source: str | None) -> tuple[str, str, str]:
         return "SEM", "Google.Adwords", "Платный"
     if s_lower == "facebook-ads":
         return "SMM paid", "Meta Ads", "Платный"
+    if s_lower == "pinterest-ads":
+        return "SMM paid", "Pinterest Ads", "Платный"
     if s_lower == "snapchat-ads":
         return "SMM paid", "Snapchat Ads", "Платный"
     if s_lower == "tiktok-ads":
