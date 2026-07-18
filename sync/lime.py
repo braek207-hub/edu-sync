@@ -163,15 +163,12 @@ INSERT INTO lime_stats (
 ) VALUES %s
 """
 
-# RU/KZ-синк владеет витриной lc_simple_view, КРОМЕ: region='gcc' (свой GCC-ингест) и
-# среза region='kz' AND subchannel='Google.Adwords' — им владеет sync/lime_kz_cabinet.py
-# (в MySQL Google KZ нет вообще; кабинетные строки Google KZ инжектятся отдельно и не должны
-# затираться). Яндекс KZ остаётся из MySQL (там есть users), дообогащается кабинетом на чтении.
+# RU/KZ-синк владеет всеми регионами витрины lc_simple_view (region <> 'gcc').
+# GCC-синк (sync/lime_gcc.py) удаляет строго region='gcc'. Так два независимых
+# ingest'а в одну таблицу lime_stats не затирают данные друг друга.
 DELETE_SQL = """
 DELETE FROM lime_stats
-WHERE date >= %s AND date <= %s
-  AND (region IS NULL OR region <> 'gcc')
-  AND NOT (region = 'kz' AND subchannel = 'Google.Adwords')
+WHERE date >= %s AND date <= %s AND (region IS NULL OR region <> 'gcc')
 """
 
 

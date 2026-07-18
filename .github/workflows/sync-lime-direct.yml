@@ -54,12 +54,12 @@ jobs:
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_direct
 
-      - name: Aggregate KZ cabinets → lime_stats (region=kz/SEM)
+      - name: Google Ads → рубли (cost_rub по курсу ЦБ)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          LIME_KZ_CABINET_DAYS_BACK: "30"
+          GOOGLE_ADS_FX_DAYS_BACK: "30"
           PYTHONIOENCODING: "utf-8"
-        run: python -m sync.lime_kz_cabinet
+        run: python -m sync.google_ads_fx
 
       - name: Revalidate dashboard cache
         if: success()
