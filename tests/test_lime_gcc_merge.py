@@ -136,3 +136,57 @@ def test_merge_aed_and_rub_spend_coexist():
     google = [r for r in rows if r["subchannel"] == "Google.Adwords"][0]
     assert meta["cost"] == 2000.0           # 100 AED × 20
     assert google["cost"] == 500.0          # уже ₽
+
+
+# === Кампании: склейка трафика, заказов и расхода по id (T6) ===
+
+
+def test_merge_joins_three_sources_on_campaign_id():
+    """Метрика (визиты), TW (заказы) и кабинет (расход) сходятся в одну строку по id."""
+    metrika = [{"date": "2026-07-17", "country": "ОАЭ", "campaign": "21087796023",
+                "traffic_source": "ad", "source_engine": "Google Ads",
+                "visits": 500, "users": 400}]
+    orders = [{"date": "2026-07-17", "country": "ОАЭ", "campaign": "21087796023",
+               "channel": "SEM", "subchannel": "Google.Adwords", "traffic_type": "Платный",
+               "orders": 10, "revenue": 1000.0}]
+    rub_spend = [{"date": "2026-07-17", "country": "ОАЭ", "campaign_id": "21087796023",
+                  "campaign_name": "Поиск. Бренд. AE", "channel": "SEM",
+                  "subchannel": "Google.Adwords", "traffic_type": "Платный", "cost": 2000.0}]
+    rows = [dict(zip(COLS, r)) for r in merge_rows(metrika, orders, [], 20.0, "2026-07-17",
+                                                   rub_spend_rows=rub_spend)]
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["campaign_id"] == "21087796023" and r["campaign_name"] == "Поиск. Бренд. AE"
+    assert r["sessions"] == 500 and r["purchases_count"] == 10
+    assert r["purchases_revenue"] == 20000.0 and r["cost"] == 2000.0
+
+
+def test_merge_splits_campaigns_within_country():
+    metrika = [
+        {"date": "2026-07-17", "country": "ОАЭ", "campaign": "111", "traffic_source": "ad",
+         "source_engine": "Google Ads", "visits": 300, "users": 250},
+        {"date": "2026-07-17", "country": "ОАЭ", "campaign": "222", "traffic_source": "ad",
+         "source_engine": "Google Ads", "visits": 100, "users": 90},
+    ]
+    rows = [dict(zip(COLS, r)) for r in merge_rows(metrika, [], [], 20.0, "2026-07-17")]
+    assert len(rows) == 2
+    assert {(r["campaign_id"], r["sessions"]) for r in rows} == {("111", 300), ("222", 100)}
+
+
+def test_merge_rows_without_campaign_stay_empty():
+    """Органика/директ кампаний не имеют — пустая строка кампании, а не выдуманная."""
+    metrika = [{"date": "2026-07-17", "country": "ОАЭ", "campaign": None,
+                "traffic_source": "direct", "source_engine": None, "visits": 50, "users": 45}]
+    rows = [dict(zip(COLS, r)) for r in merge_rows(metrika, [], [], 20.0, "2026-07-17")]
+    assert rows[0]["campaign_id"] == "" and rows[0]["campaign_name"] == ""
+
+
+def test_merge_totals_survive_campaign_grain():
+    """Появление кампании в ключе не меняет суммы дня."""
+    metrika = [
+        {"date": "2026-07-17", "country": "ОАЭ", "campaign": c, "traffic_source": "ad",
+         "source_engine": "Google Ads", "visits": v, "users": v}
+        for c, v in (("111", 300), ("222", 100), (None, 20))
+    ]
+    rows = [dict(zip(COLS, r)) for r in merge_rows(metrika, [], [], 20.0, "2026-07-17")]
+    assert sum(r["sessions"] for r in rows) == 420

@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from sync import gcc_triplewhale as tw
 from sync.gcc_triplewhale import (
     aggregate_orders_by_channel,
+    order_campaign,
     order_country,
     order_source,
     spend_by_channel,
@@ -187,3 +188,48 @@ def test_aggregate_orders_same_channel_different_countries_stay_split():
     assert len(rows) == 2
     assert {(r["country"], r["revenue"]) for r in rows} == {("ОАЭ", 100.0), ("Саудовская Аравия", 300.0)}
     assert all(r["subchannel"] == "Google.Adwords" for r in rows)
+
+
+# === Кампания заказа (attribution.campaignId) ===
+# В journey utm нет вовсе (проверено на 28843 тачпоинтах живых данных — TW чистит
+# query-параметры), поэтому кампания берётся только из attribution.
+
+
+def test_order_campaign_from_same_model_as_source():
+    order = {"attribution": {"lastPlatformClick": [
+        {"source": "facebook-ads", "campaignId": "120251056296950017"}]}}
+    assert order_campaign(order) == "120251056296950017"
+
+
+def test_order_campaign_fallback_chain():
+    order = {"attribution": {"lastPlatformClick": [],
+                             "lastClick": [{"source": "google-ads", "campaignId": "21087796023"}]}}
+    assert order_campaign(order) == "21087796023"
+
+
+def test_order_campaign_none_for_organic():
+    """Органика/директ кампании не имеют — не выдумываем."""
+    assert order_campaign({"attribution": {"lastClick": [{"source": "organic_and_social"}]}}) is None
+    assert order_campaign({}) is None
+
+
+def test_aggregate_orders_splits_by_campaign():
+    orders = [
+        {"total_price": 100, "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}],
+         "attribution": {"lastPlatformClick": [{"source": "google-ads", "campaignId": "21087796023"}]}},
+        {"total_price": 300, "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}],
+         "attribution": {"lastPlatformClick": [{"source": "google-ads", "campaignId": "23274908571"}]}},
+    ]
+    rows = aggregate_orders_by_channel(orders, "2026-07-17")
+    assert len(rows) == 2
+    assert {(r["campaign"], r["revenue"]) for r in rows} == {
+        ("21087796023", 100.0), ("23274908571", 300.0)}
+    assert all(r["country"] == "ОАЭ" and r["subchannel"] == "Google.Adwords" for r in rows)
+
+
+def test_aggregate_orders_totals_unchanged_by_campaign_split():
+    orders = _load("tw_orders_journey_sample.json")["ordersWithJourneys"]
+    rows = aggregate_orders_by_channel(orders, "2026-07-17")
+    assert sum(r["orders"] for r in rows) == len(orders)
+    assert abs(sum(r["revenue"] for r in rows)
+               - sum(float(o["total_price"]) for o in orders)) < 0.01

@@ -70,14 +70,17 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
     Returns:
         Список кортежей в порядке COLUMNS, по одному на (country, channel, subchannel).
     """
-    agg: dict[tuple[str | None, str, str], dict] = {}
+    agg: dict[tuple[str | None, str, str, str], dict] = {}
 
-    def _bucket(country, channel, subchannel, traffic_type):
-        key = (country, channel, subchannel)
+    def _bucket(country, campaign, channel, subchannel, traffic_type):
+        # Кампания в ключе: id одинаков в utm Метрики, attribution TW и кабинете Google,
+        # поэтому визиты, заказы и расход одной кампании сходятся в одну строку.
+        key = (country, campaign or "", channel, subchannel)
         row = agg.get(key)
         if row is None:
             row = {
                 "traffic_type": traffic_type,
+                "campaign_name": "",
                 "sessions": 0,
                 "users": 0,
                 "orders": 0,
@@ -92,32 +95,38 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
 
     for m in metrika_rows:
         channel, subchannel, traffic_type = map_metrika_channel(m["traffic_source"], m["source_engine"])
-        row = _bucket(m.get("country"), channel, subchannel, traffic_type)
+        row = _bucket(m.get("country"), m.get("campaign"), channel, subchannel, traffic_type)
         row["sessions"] += int(m["visits"] or 0)
         row["users"] += int(m["users"] or 0)
 
     for o in tw_order_rows:
-        row = _bucket(o.get("country"), o["channel"], o["subchannel"], o.get("traffic_type"))
+        row = _bucket(o.get("country"), o.get("campaign"), o["channel"], o["subchannel"],
+                      o.get("traffic_type"))
         row["orders"] += int(o["orders"] or 0)
         row["revenue"] += float(o["revenue"] or 0)
 
     for sp in tw_spend_rows:
         # summary-page даёт расход на магазин целиком (country=None); гео-разбивка Meta — Фаза 2.
-        row = _bucket(sp.get("country"), sp["channel"], sp["subchannel"], sp.get("traffic_type"))
+        row = _bucket(sp.get("country"), None, sp["channel"], sp["subchannel"],
+                      sp.get("traffic_type"))
         row["cost"] += float(sp["cost"] or 0)
 
     for sp in rub_spend_rows:
         # Уже в рублях (гео-расход Google из кабинета) — в отдельную корзину, мимо курса.
-        row = _bucket(sp.get("country"), sp["channel"], sp["subchannel"], sp.get("traffic_type"))
+        row = _bucket(sp.get("country"), sp.get("campaign_id"), sp["channel"], sp["subchannel"],
+                      sp.get("traffic_type"))
         row["cost_rub"] += float(sp["cost"] or 0)
+        # Имя кампании знает только кабинет — Метрика и TW отдают голый id.
+        if sp.get("campaign_name") and not row["campaign_name"]:
+            row["campaign_name"] = sp["campaign_name"]
 
     out: list[tuple] = []
-    for (country, channel, subchannel), row in agg.items():
+    for (country, campaign, channel, subchannel), row in agg.items():
         cost_rub = round(row["cost"] * fx_rate + row["cost_rub"], 2)
         revenue_rub = round(row["revenue"] * fx_rate, 2)
         out.append((
             date_s, "web", "gcc", country, channel, subchannel, row["traffic_type"],
-            "", "",                                            # campaign_id, campaign_name (channel-level, пусто)
+            campaign, row["campaign_name"],                    # campaign_id, campaign_name
             cost_rub, 0, 0, row["sessions"], row["users"], 0,   # cost, clicks, impressions, sessions, users, clients
             row["orders"], revenue_rub, 0,                      # purchases_count, purchases_revenue, customers
             0, 0, 0.0,                                          # new_users, new_customers, new_customers_revenue

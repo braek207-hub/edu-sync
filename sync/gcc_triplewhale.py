@@ -76,6 +76,28 @@ def order_source(order: dict) -> str | None:
     return None
 
 
+def order_campaign(order: dict) -> str | None:
+    """Кампания площадки, которой TW приписал заказ.
+
+    Берём из того же тачпоинта, что и order_source, — иначе источник и кампания
+    разъедутся по разным моделям атрибуции. В `journey` меток нет вовсе (TW чистит
+    query-параметры: 0 utm на 28 843 тачпоинтах живых данных), поэтому attribution —
+    единственный путь. id совпадает с utm_campaign в Метрике и с campaign_id кабинета.
+
+    Args:
+        order: элемент `ordersWithJourneys`.
+
+    Returns:
+        id кампании либо None (органика/директ/CRM кампаний не имеют).
+    """
+    attribution = order.get("attribution") or {}
+    for model in ("lastPlatformClick", "lastClick", "fullLastClick"):
+        touchpoints = attribution.get(model) or []
+        if touchpoints and touchpoints[0].get("source"):
+            return touchpoints[0].get("campaignId") or None
+    return None
+
+
 def order_country(order: dict) -> str | None:
     """Страна Залива, в которой оформлен заказ — по домену витрины из journey.
 
@@ -109,20 +131,23 @@ def aggregate_orders_by_channel(orders: list[dict], date: str) -> list[dict]:
         date: дата синка (сутки), проставляется во все строки — НЕ берётся из created_at заказов.
 
     Returns:
-        Список дектов {date, country, channel, subchannel, traffic_type, orders, revenue}.
+        Список дектов {date, country, campaign, channel, subchannel, traffic_type,
+        orders, revenue}.
         country=None (заказ без journey) — отдельная строка, суммируется в GCC-тотал.
     """
-    agg: dict[tuple[str | None, str, str, str], dict] = {}
+    agg: dict[tuple[str | None, str | None, str, str, str], dict] = {}
     for order in orders:
         src = order_source(order)
         channel, subchannel, traffic_type = map_tw_source(src)
         country = order_country(order)
-        key = (country, channel, subchannel, traffic_type)
+        campaign = order_campaign(order)
+        key = (country, campaign, channel, subchannel, traffic_type)
         row = agg.setdefault(
             key,
             {
                 "date": date,
                 "country": country,
+                "campaign": campaign,
                 "channel": channel,
                 "subchannel": subchannel,
                 "traffic_type": traffic_type,

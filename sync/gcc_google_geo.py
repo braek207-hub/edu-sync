@@ -16,9 +16,11 @@ CHANNEL = "SEM"
 SUBCHANNEL = "Google.Adwords"
 
 SELECT_SQL = """
-SELECT COALESCE(country, '') AS country,
-       COALESCE(cost, 0)     AS cost,
-       COALESCE(currency, '') AS currency
+SELECT COALESCE(country, '')       AS country,
+       COALESCE(campaign_id, '')   AS campaign_id,
+       COALESCE(campaign_name, '') AS campaign_name,
+       COALESCE(cost, 0)           AS cost,
+       COALESCE(currency, '')      AS currency
 FROM lime_google_ads_stats
 WHERE region = 'gcc' AND date = %s::date
 """
@@ -28,16 +30,18 @@ def aggregate_geo_spend(db_rows, date_s: str, rate_for) -> list[dict]:
     """Свернуть строки кабинета в расход по стране (в рублях).
 
     Args:
-        db_rows: записи {country, cost, currency} за один день.
+        db_rows: записи {country, campaign_id, campaign_name, cost, currency} за один день.
         date_s: дата строк (YYYY-MM-DD).
         rate_for: (currency) -> курс к рублю; бросает при неизвестной валюте.
 
     Returns:
-        [{date, country, channel, subchannel, traffic_type, cost}] — cost в ₽.
-        country=None для строки-остатка (пустая страна) — так же, как у прочих
+        [{date, country, campaign_id, campaign_name, channel, subchannel, traffic_type, cost}]
+        — cost в ₽. country=None для строки-остатка (пустая страна) — так же, как у прочих
         источников без гео-разбивки; такие строки идут только в GCC-тотал.
+        campaign_id совпадает с utm_campaign в Метрике (Google Ads пишет туда id через
+        ValueTrack), поэтому расход кабинета садится на ту же кампанию, что и её трафик.
     """
-    totals: dict[str | None, float] = {}
+    totals: dict[tuple[str | None, str, str], float] = {}
     for row in db_rows:
         cost = float(row.get("cost") or 0)
         if not cost:
@@ -50,18 +54,22 @@ def aggregate_geo_spend(db_rows, date_s: str, rate_for) -> list[dict]:
             print(f"gcc_google_geo: WARN валюта {currency!r} ({date_s}) — строка пропущена")
             continue
         country = (row.get("country") or "").strip() or None
-        totals[country] = totals.get(country, 0.0) + cost * rate
+        key = (country, (row.get("campaign_id") or "").strip(),
+               (row.get("campaign_name") or "").strip())
+        totals[key] = totals.get(key, 0.0) + cost * rate
 
     return [
         {
             "date": date_s,
             "country": country,
+            "campaign_id": campaign_id,
+            "campaign_name": campaign_name,
             "channel": CHANNEL,
             "subchannel": SUBCHANNEL,
             "traffic_type": "Платный",
             "cost": round(cost_rub, 2),
         }
-        for country, cost_rub in totals.items()
+        for (country, campaign_id, campaign_name), cost_rub in totals.items()
     ]
 
 
