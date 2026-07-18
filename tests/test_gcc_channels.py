@@ -3,7 +3,12 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from sync.gcc_channels import map_channel, map_metrika_channel, map_tw_source
+from sync.gcc_channels import (
+    map_channel,
+    map_domain_country,
+    map_metrika_channel,
+    map_tw_source,
+)
 
 
 def test_google_ads_paid():
@@ -122,3 +127,31 @@ def test_tw_catch_all():
 
 def test_tw_pinterest():
     assert map_tw_source("pinterest-ads") == ("SMM paid", "Pinterest Ads", "Платный")
+
+
+# === Страны GCC по домену (зонд P1/P3: ae./sa./kw./qa./om./bh.) ===
+
+
+def test_domain_country_all_six():
+    assert map_domain_country("ae.limestore.com") == "ОАЭ"
+    assert map_domain_country("bh.limestore.com") == "Бахрейн"
+    assert map_domain_country("kw.limestore.com") == "Кувейт"
+    assert map_domain_country("sa.limestore.com") == "Саудовская Аравия"
+    assert map_domain_country("qa.limestore.com") == "Катар"
+    assert map_domain_country("om.limestore.com") == "Оман"
+
+
+def test_domain_country_second_host():
+    """В journey TW встречается и lime-shop.com — матчим префикс, не хост."""
+    assert map_domain_country("ae.lime-shop.com") == "ОАЭ"
+
+
+def test_domain_country_case_and_spaces():
+    assert map_domain_country("  SA.LimeStore.com  ") == "Саудовская Аравия"
+
+
+def test_domain_country_unknown():
+    assert map_domain_country("www.limestore.com") is None
+    assert map_domain_country("limestore.com") is None
+    assert map_domain_country("") is None
+    assert map_domain_country(None) is None

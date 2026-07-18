@@ -2,42 +2,55 @@
 
 import requests
 
+from sync.gcc_channels import map_domain_country
+
+# Прод-набор измерений. startURLDomain даёт страну Залива (зонд P1: делит трафик на все 6
+# стран, сумма по доменам = totals; ym:s:URLDomain не существует — HTTP 400).
+DIMENSIONS = (
+    "ym:s:date",
+    "ym:s:startURLDomain",
+    "ym:s:lastsignTrafficSource",
+    "ym:s:lastsignSourceEngine",
+)
+
 
 def parse_metrika_traffic(resp: dict) -> list[dict]:
     """Разбор ответа Metrika Stat API в список строк трафика.
 
+    Позиции измерений читаются из `resp["query"]["dimensions"]` (API возвращает эхо запроса),
+    поэтому добавление/удаление измерения не ломает разбор.
+
     Args:
-        resp: полный ответ API с ключами "data", "totals" и т.д.
+        resp: полный ответ API с ключами "query", "data", "totals" и т.д.
 
     Returns:
         Список дектов с ключами:
-        - date (str): YYYY-MM-DD из dimensions[0].name
-        - traffic_source (str|None): из dimensions[1].id
-        - source_engine (str|None): из dimensions[2].name
-        - visits (float): из metrics[0]
-        - users (float): из metrics[1]
+        - date (str): YYYY-MM-DD
+        - country (str|None): страна Залива по домену витрины (None вне GCC)
+        - traffic_source (str|None): id источника (напр. "ad", "organic")
+        - source_engine (str|None): название движка (напр. "Google Ads")
+        - visits (float), users (float)
     """
+    queried = (resp.get("query") or {}).get("dimensions") or []
+    pos = {name: i for i, name in enumerate(queried)}
+
+    def dim(dims: list, attr: str, field: str):
+        i = pos.get(attr)
+        return dims[i].get(field) if i is not None and i < len(dims) else None
+
     rows = []
     for item in resp.get("data", []):
         dims = item.get("dimensions", [])
         metrics = item.get("metrics", [])
 
-        # Извлекаем dimensions
-        date = dims[0].get("name") if len(dims) > 0 else None
-        traffic_source = dims[1].get("id") if len(dims) > 1 else None
-        source_engine = dims[2].get("name") if len(dims) > 2 else None
-
-        # Извлекаем metrics
-        visits = metrics[0] if len(metrics) > 0 else None
-        users = metrics[1] if len(metrics) > 1 else None
-
         rows.append(
             {
-                "date": date,
-                "traffic_source": traffic_source,
-                "source_engine": source_engine,
-                "visits": visits,
-                "users": users,
+                "date": dim(dims, "ym:s:date", "name"),
+                "country": map_domain_country(dim(dims, "ym:s:startURLDomain", "name")),
+                "traffic_source": dim(dims, "ym:s:lastsignTrafficSource", "id"),
+                "source_engine": dim(dims, "ym:s:lastsignSourceEngine", "name"),
+                "visits": metrics[0] if len(metrics) > 0 else None,
+                "users": metrics[1] if len(metrics) > 1 else None,
             }
         )
     return rows
@@ -64,7 +77,7 @@ def fetch_metrika_traffic(
         "date1": date_from,
         "date2": date_to,
         "metrics": "ym:s:visits,ym:s:users,ym:s:pageviews,ym:s:bounceRate",
-        "dimensions": "ym:s:date,ym:s:lastsignTrafficSource,ym:s:lastsignSourceEngine",
+        "dimensions": ",".join(DIMENSIONS),
         "accuracy": "full",
         "limit": 100000,
     }

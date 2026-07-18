@@ -5,6 +5,33 @@
 """
 
 
+# Страны Залива: префикс поддомена витрины → название для дашборда.
+# Один Shopify обслуживает все страны через домены *.limestore.com и *.lime-shop.com
+# (зонды P1/P3, docs/GCC_CONTRACTS.md) → матчим ПРЕФИКС, а не полный хост.
+GCC_DOMAIN_COUNTRY = {
+    "ae": "ОАЭ",
+    "bh": "Бахрейн",
+    "kw": "Кувейт",
+    "sa": "Саудовская Аравия",
+    "qa": "Катар",
+    "om": "Оман",
+}
+
+
+def map_domain_country(domain: str | None) -> str | None:
+    """Домен витрины GCC → страна Залива.
+
+    Args:
+        domain: хост, напр. "ae.limestore.com" / "sa.lime-shop.com".
+
+    Returns:
+        Название страны или None, если префикс не из списка GCC
+        (www./голый домен/пусто) — такие строки идут только в GCC-тотал.
+    """
+    prefix = (domain or "").strip().lower().split(".")[0]
+    return GCC_DOMAIN_COUNTRY.get(prefix)
+
+
 def map_channel(source: str, medium: str) -> tuple[str, str]:
     s = (source or "").lower().strip()
     m = (medium or "").lower().strip()
