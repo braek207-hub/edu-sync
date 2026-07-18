@@ -146,6 +146,34 @@ def build_rows(metrika_rows, campaign_maps, cost_map, fx_rate: float, date_s: st
         print(f"lime_kz_metrika: WARN {date_s} — {len(zero_cost_google_campaigns)} кампани(я/й) "
               f"платного Google с нулевым расходом (проверь синк google_ads_fx / lime_google_ads_stats.cost_rub)")
 
+    # Общий признак ВСЕХ отказов склейки: платный визит, чью кампанию распознать не удалось.
+    # Гейт выше требует непустой campaign_id и потому ловит лишь один сценарий (кампания
+    # известна, расход не доехал). Реальные отказы соседей дают как раз ПУСТОЙ campaign_id
+    # и проходили молча:
+    #   • протух справочник lime_google_ads_ad_groups (его пишет скрипт в кабинете Google Ads —
+    #     вне workflow и без расписания) → метка группы не резолвится → расход Google = 0;
+    #   • имя кампании Директа стало неоднозначным (кампанию продублировали в кабинете с тем же
+    #     именем) → load_direct_map кладёт None → строка нераспознана → расход этой кампании
+    #     исчезает целиком, и предупреждения про Директ не было вообще;
+    #   • пустая статистика Google за дату → google_map пуст → PMax-визиты не резолвятся.
+    # Во всех трёх случаях визиты и заказы на месте, а расход падает — ДРР, CPO и окупаемость
+    # выглядят ЛУЧШЕ реальности. Такую ошибку нельзя оставлять тихой.
+    # Не падаем: сам трафик Метрики собран корректно, деньги доливаются бэкфиллом после починки
+    # соседа. Считаем строки свёртки (а не уникальные кампании): кампания здесь неизвестна
+    # по определению, поэтому единица счёта — группа (channel, subchannel).
+    unresolved_paid_rows = 0
+    unresolved_paid_visits = 0.0
+    for (channel, subchannel, campaign_id), acc in agg.items():
+        if campaign_id or acc["traffic_type"] != "Платный":
+            continue
+        unresolved_paid_rows += 1
+        unresolved_paid_visits += acc["visits"]
+    if unresolved_paid_rows:
+        print(f"lime_kz_metrika: WARN {date_s} — {unresolved_paid_rows} строк(и) платного трафика "
+              f"без распознанной кампании ({int(unresolved_paid_visits)} визитов): расход по ним "
+              f"не проставлен (проверь справочник lime_google_ads_ad_groups, "
+              f"неоднозначные имена кампаний Директа и статистику Google Ads за дату)")
+
     return out
 
 

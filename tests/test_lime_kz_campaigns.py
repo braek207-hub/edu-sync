@@ -1,6 +1,14 @@
 # -*- coding: utf-8 -*-
 """Склейка визитов Метрики с кампаниями кабинетов + правило расхода."""
-from sync.lime_kz_campaigns import NO_CAMPAIGN, CampaignRef, resolve_campaign
+from datetime import datetime, timedelta, timezone
+
+from sync.lime_kz_campaigns import (
+    ADGROUP_MAX_AGE_DAYS,
+    NO_CAMPAIGN,
+    CampaignRef,
+    resolve_campaign,
+    warn_if_adgroups_stale,
+)
 
 DIRECT_MAP = {
     "Смарт баннеры CPO": ("117776765", True),            # LIME-KZ1
@@ -74,3 +82,52 @@ def test_utm_campaign_wins_over_utm_content_when_both_present():
     ref = resolve_campaign(_row(utm_campaign="23952118304", utm_content="782935363650"),
                            DIRECT_MAP, GOOGLE_MAP, ADGROUP_MAP)
     assert ref == CampaignRef("23952118304", "PMax Retargeting", True)
+
+
+# ── Свежесть справочника групп объявлений ────────────────────────────────────
+# Справочник наполняет Google Ads Script в рекламном кабинете — вне workflow и без
+# расписания. Его остановка не роняет синк: расход поисковых кампаний Google KZ просто
+# станет 0 при живых визитах (ДРР/CPO/окупаемость выглядят лучше реальности). Значит
+# протухание обязано быть громким.
+
+NOW = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+
+
+def test_warns_when_adgroup_dictionary_is_empty(capsys):
+    """Пустой справочник — ровно то состояние, в котором ни одна группа не резолвится."""
+    assert warn_if_adgroups_stale(0, None, now=NOW) is True
+    out = capsys.readouterr().out
+    assert "lime_kz_campaigns: WARN" in out
+    assert "lime_google_ads_ad_groups" in out
+    assert "ПУСТ" in out
+
+
+def test_warns_when_adgroup_dictionary_is_stale(capsys):
+    """Записи есть, но скрипт в кабинете давно не отрабатывал → склейка по устаревшим группам."""
+    stale = NOW - timedelta(days=ADGROUP_MAX_AGE_DAYS + 1)
+    assert warn_if_adgroups_stale(120, stale, now=NOW) is True
+    out = capsys.readouterr().out
+    assert "lime_kz_campaigns: WARN" in out
+    assert str(ADGROUP_MAX_AGE_DAYS + 1) in out          # возраст в днях
+    assert stale.date().isoformat() in out               # дата последней записи
+
+
+def test_no_warning_when_adgroup_dictionary_is_fresh(capsys):
+    """Свежий справочник — тишина, иначе предупреждение обесценится шумом."""
+    fresh = NOW - timedelta(days=1)
+    assert warn_if_adgroups_stale(120, fresh, now=NOW) is False
+    assert "WARN" not in capsys.readouterr().out
+
+
+def test_freshness_threshold_boundary_is_not_noisy(capsys):
+    """Ровно на пороге ещё молчим — предупреждаем строго при превышении."""
+    edge = NOW - timedelta(days=ADGROUP_MAX_AGE_DAYS)
+    assert warn_if_adgroups_stale(5, edge, now=NOW) is False
+    assert "WARN" not in capsys.readouterr().out
+
+
+def test_naive_timestamp_does_not_crash_the_check(capsys):
+    """updated_at timestamptz приходит aware, но naive-значение не должно ронять синк."""
+    naive = (NOW - timedelta(days=ADGROUP_MAX_AGE_DAYS + 2)).replace(tzinfo=None)
+    assert warn_if_adgroups_stale(7, naive, now=NOW) is True
+    assert "lime_kz_campaigns: WARN" in capsys.readouterr().out

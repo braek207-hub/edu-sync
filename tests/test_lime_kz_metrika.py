@@ -165,3 +165,69 @@ def test_no_warning_when_google_cost_present(capsys):
     assert rows[0][I["cost"]] == 5000.0
     out = capsys.readouterr().out
     assert "WARN" not in out
+
+
+# ── Тихий ноль по расходу: нераспознанные ПЛАТНЫЕ визиты ─────────────────────
+# Гейт про Google требует непустой campaign_id и ловит лишь сценарий «кампания известна,
+# расход не доехал». Все реальные отказы соседей дают ПУСТОЙ campaign_id: протухший
+# справочник групп, неоднозначное имя кампании Директа, пустая статистика Google за дату.
+# Во всех случаях визиты и заказы на месте, а расход падает — метрики выглядят лучше правды.
+
+
+def test_warns_when_paid_visits_have_no_resolved_campaign(capsys):
+    """Протухший справочник групп: utm_content не резолвится → платный визит без кампании."""
+    rows = build_rows(
+        [_row(traffic_source="ad", source_engine="Google Ads",
+              utm_campaign="g", utm_content="782935363650", visits=4200.0)],
+        (DIRECT_MAP, GOOGLE_MAP, {}),   # справочник групп пуст — как сейчас в проде
+        {}, 0.162, "2026-07-15")
+    assert rows[0][I["campaign_id"]] == ""
+    assert rows[0][I["traffic_type"]] == "Платный"
+    assert rows[0][I["cost"]] == 0.0
+
+    out = capsys.readouterr().out
+    assert "lime_kz_metrika: WARN" in out
+    assert "2026-07-15" in out          # дата
+    assert "1 строк" in out             # число строк
+    assert "4200 визитов" in out        # сумма визитов
+
+
+def test_warns_when_direct_campaign_name_is_ambiguous(capsys):
+    """Кампанию продублировали в кабинете с тем же именем → load_direct_map кладёт None.
+    Расход этой кампании исчезает целиком, а предупреждения про Директ не было вообще."""
+    maps = ({"Дубль имени": None}, GOOGLE_MAP, ADGROUP_MAP)
+    rows = build_rows(
+        [_row(direct_campaign_name="Дубль имени", visits=900.0)],
+        maps, {("2026-07-15", "119566511"): 5000.0}, 0.162, "2026-07-15")
+    assert rows[0][I["campaign_id"]] == ""
+    assert rows[0][I["cost"]] == 0.0
+
+    out = capsys.readouterr().out
+    assert "lime_kz_metrika: WARN" in out
+    assert "900 визитов" in out
+
+
+def test_unresolved_paid_visits_summed_across_rows(capsys):
+    """Несколько групп свёртки — в предупреждении их число и суммарные визиты."""
+    rows = build_rows(
+        [_row(traffic_source="ad", source_engine="Google Ads", visits=1000.0),
+         _row(traffic_source="ad", source_engine="TikTok", visits=250.0)],
+        (DIRECT_MAP, GOOGLE_MAP, {}), {}, 0.162, "2026-07-15")
+    assert len(rows) == 2
+    out = capsys.readouterr().out
+    assert "2 строк" in out
+    assert "1250 визитов" in out
+
+
+def test_no_unresolved_warning_for_free_traffic(capsys):
+    """Органика без кампании — норма, а не поломка склейки: предупреждать нельзя."""
+    build_rows([_row(traffic_source="organic", source_engine="Google", visits=5000.0)],
+               (DIRECT_MAP, GOOGLE_MAP, ADGROUP_MAP), {}, 0.162, "2026-07-15")
+    assert "WARN" not in capsys.readouterr().out
+
+
+def test_no_unresolved_warning_when_paid_campaign_resolves(capsys):
+    """Кампания распознана и расход есть — тишина."""
+    build_rows([_row(direct_campaign_name="Поиск. Бренд", visits=800.0)],
+               MAPS, {("2026-07-15", "119566511"): 4450.0}, 0.162, "2026-07-15")
+    assert "WARN" not in capsys.readouterr().out

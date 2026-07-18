@@ -11,9 +11,21 @@
 Расход берём ТОЛЬКО по кампаниям KZ-кабинетов: в гео-срез попадает пролив RU-кабинета,
 чей расход принадлежит региону RU и там уже учтён.
 """
+from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
 KZ_DIRECT_LOGIN = "LIME-KZ1"
+
+# Порог протухания справочника групп объявлений.
+# Справочник наполняет Google Ads Script из рекламного кабинета через /api/ingest/google-ads —
+# он вне этого репозитория, вне workflow и без расписания, поэтому его остановку никто не
+# заметит: синк отработает «успешно», просто расход поисковых кампаний Google станет 0.
+# 7 дней: скрипт в кабинете рассчитан на ежедневный прогон, так что свежая запись должна
+# появляться минимум раз в сутки; недельное окно переживает разовый сбой, длинные праздники
+# и ручную паузу кабинета, но ловит настоящую остановку задолго до того, как протухшая склейка
+# испортит месячный отчёт. Совпадает с окном бэкфилла LIME_KZ_METRIKA_DAYS_BACK=30 по духу:
+# предупреждение приходит, пока данные ещё в зоне пересчёта.
+ADGROUP_MAX_AGE_DAYS = 7
 
 
 class CampaignRef(NamedTuple):
@@ -80,6 +92,13 @@ FROM lime_google_ads_ad_groups
 WHERE region = 'kz'
 """
 
+# Свежесть справочника — по тому же срезу region='kz', что и сам справочник выше.
+SELECT_ADGROUPS_FRESHNESS = """
+SELECT COUNT(*)::int AS row_count, MAX(updated_at) AS newest
+FROM lime_google_ads_ad_groups
+WHERE region = 'kz'
+"""
+
 # Расход KZ-кабинетов: Директ LIME-KZ1 (cost уже с НДС) + Google KZ (cost_rub посчитан
 # sync/google_ads_fx.py по курсу ЦБ; если его ещё нет — строка расхода пропускается,
 # чтобы не подмешать доллары в рубли).
@@ -126,10 +145,57 @@ def load_google_map(conn, frm: str, to: str) -> dict:
         return {str(cid): (name or "") for cid, name in cur.fetchall()}
 
 
+def warn_if_adgroups_stale(row_count: int, newest, now: datetime | None = None) -> bool:
+    """Предупредить, если справочник групп объявлений пуст или протух.
+
+    Пустой/протухший справочник не роняет синк, но тихо обнуляет расход поисковых кампаний
+    Google KZ: utm_content не резолвится → campaign_id пустой → cost_map не отдаёт расход,
+    хотя визиты и заказы на месте (ДРР/CPO/окупаемость выглядят лучше реальности).
+
+    Args:
+        row_count: число строк справочника для региона KZ.
+        newest: MAX(updated_at) справочника (aware datetime) либо None у пустой таблицы.
+        now: точка отсчёта (для тестов); по умолчанию текущий UTC.
+
+    Returns:
+        True, если предупреждение напечатано.
+    """
+    if row_count > 0 and newest is None:
+        # Строки есть, а updated_at пуст — колонка NOT NULL DEFAULT now(), так быть не должно.
+        print("lime_kz_campaigns: WARN справочник lime_google_ads_ad_groups без updated_at — "
+              "проверь схему (миграция 010) и ingest /api/ingest/google-ads")
+        return True
+
+    if row_count == 0:
+        print("lime_kz_campaigns: WARN справочник групп объявлений lime_google_ads_ad_groups ПУСТ "
+              "→ поисковые кампании Google KZ не резолвятся и их расход станет 0 при живых "
+              "визитах. Проверь Google Ads Script в кабинете (ingest /api/ingest/google-ads)")
+        return True
+
+    now = now or datetime.now(timezone.utc)
+    # timestamptz из psycopg2 приходит aware; подстраховка на случай naive-значения.
+    if newest.tzinfo is None:
+        newest = newest.replace(tzinfo=timezone.utc)
+    age = now - newest
+    if age > timedelta(days=ADGROUP_MAX_AGE_DAYS):
+        print(f"lime_kz_campaigns: WARN справочник lime_google_ads_ad_groups не обновлялся "
+              f"{age.days} дн. (порог {ADGROUP_MAX_AGE_DAYS}, последняя запись "
+              f"{newest.date().isoformat()}) → склейка поисковых кампаний Google KZ идёт по "
+              f"устаревшим группам, расход новых кампаний станет 0. Проверь Google Ads Script "
+              f"в кабинете (ingest /api/ingest/google-ads)")
+        return True
+    return False
+
+
 def load_adgroup_map(conn) -> dict:
     with conn.cursor() as cur:
+        cur.execute(SELECT_ADGROUPS_FRESHNESS)
+        row_count, newest = cur.fetchone()
         cur.execute(SELECT_ADGROUPS)
-        return {str(ag): (str(cid), name) for ag, cid, name in cur.fetchall()}
+        out = {str(ag): (str(cid), name) for ag, cid, name in cur.fetchall()}
+    # Проверяем ровно тот срез, что и загружаем (region='kz'), и один раз за прогон синка.
+    warn_if_adgroups_stale(int(row_count or 0), newest)
+    return out
 
 
 def load_cost_map(conn, frm: str, to: str) -> dict:
