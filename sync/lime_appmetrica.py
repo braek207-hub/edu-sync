@@ -7,6 +7,7 @@ cohorts  → устройства-покупатели по когорте (ме
 import os
 from collections import defaultdict
 from datetime import date, datetime
+from urllib.parse import parse_qs
 
 import psycopg2
 import psycopg2.extras
@@ -60,6 +61,18 @@ def first_install_per_device(installs: list[dict], keep_reattribution: bool,
     return best
 
 
+def utm_source_of(raw: str) -> str:
+    """utm_source из параметров ссылки трекера. Нет параметра → пустая строка."""
+    if not raw:
+        return ""
+    try:
+        q = parse_qs(raw)
+    except Exception:
+        return ""
+    vals = q.get("utm_source")
+    return (vals[0] if vals else "")[:64]
+
+
 def build_installs_weekly(installs: list[dict], keep_reattribution: bool,
                           keep_reinstall: bool) -> list[tuple]:
     """Установки недели = уникальные устройства, установившие ИМЕННО в эту неделю.
@@ -68,8 +81,15 @@ def build_installs_weekly(installs: list[dict], keep_reattribution: bool,
     иначе устройство, поставившее приложение повторно, выпадало бы из свежих недель
     (сверка со слайдами: глобальный дедуп давал −606 на неделе 29.06, локальный +206).
     Когорты — наоборот, живут на первой установке (см. build_cohorts).
+
+    Детализация: за устройством закрепляется ОДИН utm_source — от самой ранней его
+    установки в этой неделе у этого партнёра. Иначе устройство с двумя установками под
+    разными utm попало бы в две детальные строки, и детали не сложились бы в родителя.
+
+    Возвращает (week, publisher, detail, installs); detail="" — «без параметров».
     """
-    seen: dict[tuple, set] = defaultdict(set)
+    # (week, publisher, device) → (самая ранняя дата, её utm_source)
+    first_in_week: dict[tuple, tuple] = {}
     for r in installs:
         if not keep_reinstall and _truthy(r.get("is_reinstallation")):
             continue
@@ -78,9 +98,16 @@ def build_installs_weekly(installs: list[dict], keep_reattribution: bool,
         dev = r.get("appmetrica_device_id")
         if not dev:
             continue
-        wk = iso_monday(parse_dt(r["install_datetime"]))
-        seen[(wk, r.get("publisher_name") or "unknown")].add(dev)
-    return [(w, p, len(devs)) for (w, p), devs in seen.items()]
+        dt = parse_dt(r["install_datetime"])
+        key = (iso_monday(dt), r.get("publisher_name") or "unknown", dev)
+        cur = first_in_week.get(key)
+        if cur is None or dt < cur[0]:
+            first_in_week[key] = (dt, utm_source_of(r.get("click_url_parameters") or ""))
+
+    agg: dict[tuple, int] = defaultdict(int)
+    for (wk, pub, _dev), (_dt, detail) in first_in_week.items():
+        agg[(wk, pub, detail)] += 1
+    return [(w, p, d, n) for (w, p, d), n in agg.items()]
 
 
 def build_cohorts(first_installs: dict[str, dict], purchases: list[dict],
@@ -149,7 +176,7 @@ def _write(installs_rows: list[tuple], cohort_rows: list[tuple]) -> None:
             cur.execute("DELETE FROM lime_app_installs")
             psycopg2.extras.execute_values(
                 cur,
-                "INSERT INTO lime_app_installs (week, publisher, installs) VALUES %s",
+                "INSERT INTO lime_app_installs (week, publisher, detail, installs) VALUES %s",
                 installs_rows, page_size=500,
             )
             cur.execute("DELETE FROM lime_app_cohorts")
@@ -176,7 +203,11 @@ def sync_lime_appmetrica() -> None:
     event_name = os.environ.get("APPMETRICA_EVENT_NAME") or "purchase"
     months = int(os.environ.get("APP_COHORT_MONTHS") or "7")
     max_life = int(os.environ.get("APP_MAX_LIFE") or "6")
-    keep_reattr = _truthy(os.environ.get("APP_KEEP_REATTR") or "0")
+    # Переатрибуции СЧИТАЕМ (дефолт "1"): AppMetrica их засчитывает как установки.
+    # Откалибровано по слайдам — на промо-неделе 15.06 (14% недели = переатрибуции)
+    # без них строка «Сайт-баннер» расходилась на -254, с ними на -1; по устоявшимся
+    # неделям ошибка -0.30% -> +0.15%. Переустановки по-прежнему отбрасываем.
+    keep_reattr = _truthy(os.environ.get("APP_KEEP_REATTR") or "1")
     keep_reinstall = _truthy(os.environ.get("APP_KEEP_REINSTALL") or "0")
 
     since, until = sync_window(months, date.today())

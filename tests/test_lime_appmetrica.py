@@ -35,9 +35,20 @@ def test_first_install_filters_reinstall():
     assert fi == {}                                           # переустановка отфильтрована
 
 
-def _inst(dev, dt, pub, reinst="0", reattr="0"):
-    return {"appmetrica_device_id": dev, "install_datetime": dt, "publisher_name": pub,
-            "is_reinstallation": reinst, "is_reattribution": reattr}
+def _by_pub(rows):
+    """Свернуть детальные строки до (неделя, партнёр) — родительский итог."""
+    agg = {}
+    for (w, p, _d, n) in rows:
+        agg[(w, p)] = agg.get((w, p), 0) + n
+    return agg
+
+
+def _inst(dev, dt, pub, reinst="0", reattr="0", utm=None):
+    r = {"appmetrica_device_id": dev, "install_datetime": dt, "publisher_name": pub,
+         "is_reinstallation": reinst, "is_reattribution": reattr}
+    if utm:
+        r["click_url_parameters"] = "utm_source=" + utm
+    return r
 
 
 def test_build_installs_weekly_counts_unique_devices_per_week():
@@ -47,7 +58,7 @@ def test_build_installs_weekly_counts_unique_devices_per_week():
         _inst("d1", "2026-01-09 11:00:00", "VK Ads"),      # то же устройство в той же неделе
         _inst("d3", "2026-01-06 10:00:00", "Organic"),
     ]
-    rows = dict(((w, p), n) for (w, p, n) in m.build_installs_weekly(installs, False, False))
+    rows = _by_pub(m.build_installs_weekly(installs, False, False))
     assert rows[(date(2026, 1, 5), "VK Ads")] == 2        # d1 не задваивается
     assert rows[(date(2026, 1, 5), "Organic")] == 1
 
@@ -59,7 +70,7 @@ def test_build_installs_weekly_counts_device_again_in_a_later_week():
         _inst("d1", "2026-01-06 10:00:00", "VK Ads"),
         _inst("d1", "2026-02-10 10:00:00", "VK Ads"),     # то же устройство, другая неделя
     ]
-    rows = dict(((w, p), n) for (w, p, n) in m.build_installs_weekly(installs, False, False))
+    rows = _by_pub(m.build_installs_weekly(installs, False, False))
     assert rows[(date(2026, 1, 5), "VK Ads")] == 1
     assert rows[(date(2026, 2, 9), "VK Ads")] == 1        # не потеряно
 
@@ -70,9 +81,9 @@ def test_build_installs_weekly_respects_filters():
         _inst("d2", "2026-01-06 10:00:00", "VK Ads", reinst="true"),
         _inst("d3", "2026-01-06 10:00:00", "VK Ads"),
     ]
-    rows = dict(((w, p), n) for (w, p, n) in m.build_installs_weekly(installs, False, False))
+    rows = _by_pub(m.build_installs_weekly(installs, False, False))
     assert rows[(date(2026, 1, 5), "VK Ads")] == 1        # остаётся только d3
-    rows_keep = dict(((w, p), n) for (w, p, n) in m.build_installs_weekly(installs, True, True))
+    rows_keep = _by_pub(m.build_installs_weekly(installs, True, True))
     assert rows_keep[(date(2026, 1, 5), "VK Ads")] == 3
 
 
@@ -160,3 +171,32 @@ def test_sync_refuses_to_wipe_when_installs_raw_is_empty():
         with pytest.raises(RuntimeError):
             m.sync_lime_appmetrica()
     mock_write.assert_not_called()   # ключевая проверка: без неё тест прошёл бы даже при wipe
+
+
+def test_build_installs_weekly_splits_by_utm_source():
+    installs = [
+        _inst("d1", "2026-01-06 10:00:00", "Website", utm="ya.direct"),
+        _inst("d2", "2026-01-07 10:00:00", "Website", utm="google"),
+        _inst("d3", "2026-01-08 10:00:00", "Website"),          # без параметров
+    ]
+    rows = {(w, p, d): n for (w, p, d, n) in m.build_installs_weekly(installs, False, False)}
+    wk = date(2026, 1, 5)
+    assert rows[(wk, "Website", "ya.direct")] == 1
+    assert rows[(wk, "Website", "google")] == 1
+    assert rows[(wk, "Website", "")] == 1
+
+
+def test_details_sum_exactly_to_parent_when_device_switches_utm():
+    """Устройство с двумя установками в неделе под разными utm не должно задваиваться:
+    за ним закрепляется utm самой ранней установки, иначе детали не сложатся в родителя."""
+    installs = [
+        _inst("d1", "2026-01-06 10:00:00", "Website", utm="google"),   # раньше
+        _inst("d1", "2026-01-09 10:00:00", "Website", utm="ig"),       # позже, то же устройство
+        _inst("d2", "2026-01-07 10:00:00", "Website", utm="ig"),
+    ]
+    rows = m.build_installs_weekly(installs, False, False)
+    wk = date(2026, 1, 5)
+    by_detail = {d: n for (w, p, d, n) in rows}
+    assert by_detail["google"] == 1        # d1 закреплён за ранним utm
+    assert by_detail["ig"] == 1            # только d2
+    assert _by_pub(rows)[(wk, "Website")] == 2   # детали == родитель, без задвоения
