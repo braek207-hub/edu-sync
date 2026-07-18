@@ -4,8 +4,14 @@ installs → недельные установки по партнёру (уни
 cohorts  → устройства-покупатели по когорте (месяц × партнёр) накопительно по месяцам жизни.
 Сырьё не хранится — только агрегаты. Границы недели/месяца — по времени установки/события.
 """
+import os
 from collections import defaultdict
 from datetime import date, datetime
+
+import psycopg2
+import psycopg2.extras
+
+from sync.appmetrica_logs import fetch_installations, fetch_purchase_events
 
 
 def parse_dt(s: str) -> datetime:
@@ -104,3 +110,70 @@ def build_cohorts(first_installs: dict[str, dict], purchases: list[dict],
             cumulative += new_buyers[key].get(lm, 0)
             out.append((cm, pub, lm, size, cumulative))
     return out
+
+
+def sync_window(months: int, today: date) -> tuple[str, str]:
+    first = date(today.year, today.month, 1)
+    y, mo = first.year, first.month - (months - 1)
+    while mo <= 0:
+        mo += 12
+        y -= 1
+    since = date(y, mo, 1)
+    return since.isoformat(), today.isoformat()
+
+
+def _pg_url() -> str:
+    return os.environ["DATABASE_URL"].split("?")[0]
+
+
+def _write(installs_rows: list[tuple], cohort_rows: list[tuple]) -> None:
+    conn = psycopg2.connect(_pg_url(), connect_timeout=30)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM lime_app_installs")
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO lime_app_installs (week, publisher, installs) VALUES %s",
+                installs_rows, page_size=500,
+            )
+            cur.execute("DELETE FROM lime_app_cohorts")
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO lime_app_cohorts "
+                "(cohort_month, publisher, life_month, cohort_size, buyers) VALUES %s",
+                cohort_rows, page_size=500,
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def sync_lime_appmetrica() -> None:
+    token = os.environ.get("APPMETRICA_TOKEN")
+    if not token:
+        print("[lime-appmetrica] APPMETRICA_TOKEN не задан — пропуск")
+        return
+    app_id = os.environ.get("APPMETRICA_APP_ID", "4415407")
+    event_name = os.environ.get("APPMETRICA_EVENT_NAME", "purchase")
+    months = int(os.environ.get("APP_COHORT_MONTHS", "7"))
+    max_life = int(os.environ.get("APP_MAX_LIFE", "6"))
+    keep_reattr = _truthy(os.environ.get("APP_KEEP_REATTR", "0"))
+    keep_reinstall = _truthy(os.environ.get("APP_KEEP_REINSTALL", "0"))
+
+    since, until = sync_window(months, date.today())
+    print(f"[lime-appmetrica] окно {since}..{until}, app={app_id}, event={event_name}")
+
+    installs_raw = fetch_installations(app_id, token, since, until)
+    purchases_raw = fetch_purchase_events(app_id, token, since, until, event_name)
+    print(f"[lime-appmetrica] сырьё: installs={len(installs_raw)}, purchases={len(purchases_raw)}")
+
+    first = first_install_per_device(installs_raw, keep_reattr, keep_reinstall)
+    installs_rows = build_installs_weekly(first)
+    cohort_rows = build_cohorts(first, purchases_raw, max_life)
+
+    _write(installs_rows, cohort_rows)
+    print(f"[lime-appmetrica] записано: install-строк={len(installs_rows)}, "
+          f"cohort-строк={len(cohort_rows)}")

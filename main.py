@@ -141,6 +141,15 @@ def main() -> None:
         print(f"ОШИБКА edu_visits: {e}")
         errors.append(f"edu_visits: {e}")
 
+    # LIME · AppMetrica: установки + когорты покупателей (если задан APPMETRICA_TOKEN).
+    try:
+        from sync.lime_appmetrica import sync_lime_appmetrica
+
+        sync_lime_appmetrica()
+    except Exception as e:
+        print(f"ОШИБКА lime_appmetrica: {e}")
+        errors.append(f"lime_appmetrica: {e}")
+
     try:
         from sync.validate_sheets import run_validation
 

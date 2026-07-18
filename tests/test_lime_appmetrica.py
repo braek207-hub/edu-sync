@@ -76,6 +76,12 @@ def test_build_cohorts_ignores_purchase_before_install():
     assert rows[(date(2026, 2, 1), "VK Ads", 2)] == (1, 1)   # накопительно держится
 
 
+def test_window_months_back():
+    since, until = m.sync_window(months=7, today=date(2026, 7, 18))
+    assert since == "2026-01-01"      # 6 полных месяцев назад от начала июля + текущий
+    assert until == "2026-07-18"
+
+
 def test_build_cohorts_excludes_devices_whose_first_purchase_is_beyond_window():
     # d1 покупает внутри окна (life 2), d2 покупает только далеко за пределами
     # окна (life ~9 при install в январе, purchase в октябре, max_life=3).
