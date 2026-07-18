@@ -61,7 +61,38 @@ def test_build_cohorts_cumulative_unique_buyers():
 
 
 def test_build_cohorts_ignores_purchase_before_install():
+    # d1: покупка ДО установки (должна быть проигнорирована guard'ом lm < 0) +
+    # настоящая покупка ВНУТРИ окна (life 1). Если guard убрать — first_life
+    # защёлкнется на отрицательном месяце и d1 исчезнет из всех бакетов;
+    # с guard'ом d1 должен считаться начиная с life_month своей ВАЛИДНОЙ покупки.
     fi = {"d1": {"install_dt": datetime(2026, 2, 1), "publisher": "VK Ads"}}
-    purchases = [{"appmetrica_device_id": "d1", "event_datetime": "2026-01-01 10:00:00"}]
+    purchases = [
+        {"appmetrica_device_id": "d1", "event_datetime": "2026-01-01 10:00:00"},  # до установки — игнор
+        {"appmetrica_device_id": "d1", "event_datetime": "2026-03-15 10:00:00"},  # life 1 — валидна
+    ]
     rows = {(cm, p, lm): (sz, b) for (cm, p, lm, sz, b) in m.build_cohorts(fi, purchases, max_life=2)}
-    assert rows[(date(2026, 2, 1), "VK Ads", 0)] == (1, 0)   # покупка до установки игнор
+    assert rows[(date(2026, 2, 1), "VK Ads", 0)] == (1, 0)   # к M0 покупок ещё нет
+    assert rows[(date(2026, 2, 1), "VK Ads", 1)] == (1, 1)   # к M1 — валидная покупка учтена
+    assert rows[(date(2026, 2, 1), "VK Ads", 2)] == (1, 1)   # накопительно держится
+
+
+def test_build_cohorts_excludes_devices_whose_first_purchase_is_beyond_window():
+    # d1 покупает внутри окна (life 2), d2 покупает только далеко за пределами
+    # окна (life ~9 при install в январе, purchase в октябре, max_life=3).
+    # d2 не должен попасть НИ В ОДИН бакет, включая max_life — клэмп min(lm, max_life)
+    # раздувал бы финальный (max_life) столбец, по которому сверяют с UI AppMetrica.
+    fi = {
+        "d1": {"install_dt": datetime(2026, 1, 5), "publisher": "VK Ads"},
+        "d2": {"install_dt": datetime(2026, 1, 10), "publisher": "VK Ads"},
+    }
+    purchases = [
+        {"appmetrica_device_id": "d1", "event_datetime": "2026-03-15 10:00:00"},  # life 2 — внутри окна
+        {"appmetrica_device_id": "d2", "event_datetime": "2026-10-01 10:00:00"},  # life 9 — за окном
+    ]
+    rows = {(cm, p, lm): (sz, b) for (cm, p, lm, sz, b) in m.build_cohorts(fi, purchases, max_life=3)}
+    cm, pub = date(2026, 1, 1), "VK Ads"
+    assert rows[(cm, pub, 0)] == (2, 0)
+    assert rows[(cm, pub, 1)] == (2, 0)
+    assert rows[(cm, pub, 2)] == (2, 1)   # только d1
+    assert rows[(cm, pub, 3)] == (2, 1)   # d2 не попадает даже в финальный (max_life) бакет
+    # cohort_size остаётся 2 — оба устройства установили приложение, просто d2 не купил в окне.

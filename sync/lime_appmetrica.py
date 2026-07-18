@@ -86,9 +86,15 @@ def build_cohorts(first_installs: dict[str, dict], purchases: list[dict],
             first_life[dev] = lm
 
     # новые покупатели по life_month на когорту.
+    # Устройство считается с life_month его ПЕРВОЙ покупки. Если первая покупка
+    # позже отчётного окна (lm > max_life) — устройство ещё не покупало ни в
+    # одном отчётном месяце, поэтому исключаем его, а не клэмпим в max_life
+    # (клэмп раздувал бы финальный кумулятивный столбец, по которому сверяем с UI AppMetrica).
     new_buyers: dict[tuple, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     for dev, lm in first_life.items():
-        new_buyers[device_cohort[dev]][min(lm, max_life)] += 1
+        if lm > max_life:
+            continue
+        new_buyers[device_cohort[dev]][lm] += 1
 
     out: list[tuple] = []
     for key, size in cohort_size.items():
