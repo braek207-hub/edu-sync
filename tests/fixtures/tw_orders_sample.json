@@ -1,0 +1,457 @@
+{
+  "ordersWithJourneys": [
+    {
+      "order_id": "REDACTED",
+      "total_price": 455,
+      "currency": "AED",
+      "created_at": "2026-07-17T23:54:35+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "facebook-ads",
+            "campaignId": "120251056296950017",
+            "adsetId": "120251056296970017",
+            "adId": "120251056296960017",
+            "clickDate": "2026-07-17T23:33:55+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "facebook-ads",
+            "campaignId": "120251056296950017",
+            "adsetId": "120251056296970017",
+            "adId": "120251056296960017",
+            "clickDate": "2026-07-17T23:33:55+0400"
+          }
+        ]
+      }
+    },
+    {
+      "order_id": "REDACTED",
+      "total_price": 499,
+      "currency": "AED",
+      "created_at": "2026-07-17T23:46:45+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T23:44:58+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "lime-shop.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2025-08-17T15:25:02+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "google",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-04-30T23:34:35+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T23:44:58+0400"
+          }
+        ]
+      }
+    },
+    {
+      "order_id": "REDACTED",
+      "total_price": 499,
+      "currency": "AED",
+      "created_at": "2026-07-17T23:38:34+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T23:35:26+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T23:35:26+0400"
+          }
+        ]
+      }
+    },
+    {
+      "order_id": "REDACTED",
+      "total_price": 146,
+      "currency": "AED",
+      "created_at": "2026-07-17T23:38:32+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "google",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2024-12-28T01:40:37+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "e.mail.ru",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2024-12-02T23:23:37+0400"
+          },
+          {
+            "source": "google-ads",
+            "campaignId": "21087796023",
+            "adsetId": "160367002512",
+            "adId": "693309639810",
+            "clickDate": "2025-01-11T01:11:12+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "21087796023",
+            "adsetId": "160367002512",
+            "adId": "693309639810",
+            "clickDate": "2025-01-11T01:11:12+0400"
+          }
+        ]
+      }
+    },
+    {
+      "order_id": "REDACTED",
+      "total_price": 1737,
+      "currency": "AED",
+      "created_at": "2026-07-17T22:50:03+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "limestore.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-17T16:36:41+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "limestore.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-17T16:36:41+0400"
+          }
+        ]
+      }
+    },
+    {
+      "order_id": "REDACTED",
+      "total_price": 555,
+      "currency": "AED",
+      "created_at": "2026-07-17T22:39:44+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T13:13:27+0400"
+          },
+          {
+            "source": "facebook-ads",
+            "campaignId": "120242850886950017",
+            "adsetId": "120242850886960017",
+            "adId": "120242850990950017",
+            "clickDate": "2026-02-28T21:03:39+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "google",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-05-29T10:41:20+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "limestore.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-05-25T14:13:35+0400"
+          },
+          {
+            "source": "copilot.com",
+            "campaignId": "",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-03-11T13:45:57+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T13:13:27+0400"
+          }
+        ]
+      }
+    },
+    {
+      "order_id": "REDACTED",
+      "total_price": 2514,
+      "currency": "AED",
+      "created_at": "2026-07-17T22:14:52+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T20:51:04+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T20:51:04+0400"
+          }
+        ]
+      }
+    },
+    {
+      "order_id": "REDACTED",
+      "total_price": 117,
+      "currency": "AED",
+      "created_at": "2026-07-17T21:51:21+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T21:41:33+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-07-17T21:41:33+0400"
+          }
+        ]
+      }
+    },
+    {
+      "order_id": "REDACTED",
+      "total_price": 348,
+      "currency": "AED",
+      "created_at": "2026-07-17T21:20:42+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "facebook-ads",
+            "campaignId": "120239706697970017",
+            "adsetId": "120239706697990017",
+            "adId": "120239706697980017",
+            "clickDate": "2026-07-17T21:17:27+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "facebook-ads",
+            "campaignId": "120239706697970017",
+            "adsetId": "120239706697990017",
+            "adId": "120239706697980017",
+            "clickDate": "2026-07-17T21:17:27+0400"
+          }
+        ]
+      }
+    },
+    {
+      "order_id": "REDACTED",
+      "total_price": 1148,
+      "currency": "AED",
+      "created_at": "2026-07-17T21:15:19+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "limestore.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-03-01T12:13:06+0400"
+          },
+          {
+            "source": "google-ads",
+            "campaignId": "23274908571",
+            "adsetId": "190500934244",
+            "adId": "784736724613",
+            "clickDate": "2026-02-11T12:54:48+0400"
+          },
+          {
+            "source": "manual_mindbox",
+            "campaignId": "26.07.04_The2000sSpirit",
+            "adsetId": "04.07.26",
+            "adId": "04.07.26",
+            "clickDate": "2026-07-07T23:14:52+0400"
+          },
+          {
+            "source": "mindbox_pd_cart",
+            "campaignId": "CartPriceDrop",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-05-09T23:57:11+0400"
+          },
+          {
+            "source": "mindbox_bcat",
+            "campaignId": "AbandonedCategory",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-02-25T19:09:44+0400"
+          },
+          {
+            "source": "mindbox_bcat_rm",
+            "campaignId": "AbandonedCategoryReminder1Day",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-12T03:15:40+0400"
+          },
+          {
+            "source": "mindbox_bv",
+            "campaignId": "AbandonedView",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-04T12:38:41+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "mindbox_bcat_rm",
+            "campaignId": "AbandonedCategoryReminder1Day",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-12T03:15:40+0400"
+          }
+        ]
+      }
+    },
+    {
+      "order_id": "REDACTED",
+      "total_price": 683,
+      "currency": "AED",
+      "created_at": "2026-07-17T21:12:17+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "google-ads",
+            "campaignId": "21087796023",
+            "adsetId": "160367002512",
+            "adId": "693309639810",
+            "clickDate": "2025-12-28T16:59:08+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "google",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-01-20T16:02:58+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "limestore.com",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-01-20T16:01:51+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "google",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-01-20T16:02:58+0400"
+          }
+        ]
+      }
+    },
+    {
+      "order_id": "REDACTED",
+      "total_price": 67,
+      "currency": "AED",
+      "created_at": "2026-07-17T20:28:03+0400",
+      "attribution": {
+        "lastPlatformClick": [
+          {
+            "source": "facebook-ads",
+            "campaignId": "120244734507290017",
+            "adsetId": "120244734507300017",
+            "adId": "120244734507310017",
+            "clickDate": "2026-04-26T02:17:55+0400"
+          },
+          {
+            "source": "organic_and_social",
+            "campaignId": "shop.app",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-14T11:37:58+0400"
+          },
+          {
+            "source": "google-ads",
+            "campaignId": "21087796023",
+            "adsetId": "160367002512",
+            "adId": "693309639810",
+            "clickDate": "2026-04-25T00:23:09+0400"
+          }
+        ],
+        "lastClick": [],
+        "fullLastClick": [
+          {
+            "source": "organic_and_social",
+            "campaignId": "shop.app",
+            "adsetId": "",
+            "adId": "",
+            "clickDate": "2026-07-14T11:37:58+0400"
+          }
+        ]
+      }
+    }
+  ],
+  "totalForRange": 84,
+  "count": 84,
+  "finishedRange": true
+}

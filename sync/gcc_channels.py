@@ -109,3 +109,54 @@ def map_metrika_channel(
 
     # === DEFAULT (прочее, включая None) ===
     return "Others", (source_engine or "Unknown"), "Бесплатный"
+
+
+def map_tw_source(source: str | None) -> tuple[str, str, str]:
+    """Маппинг Triple Whale attribution `source` (per-order, last touchpoint) → таксономия дашборда.
+
+    Args:
+        source: значение `attribution.<model>[0].source` (напр. "google-ads",
+            "organic_and_social", "manual_mindbox", "Direct", "copilot.com", None)
+
+    Returns:
+        (channel, subchannel, traffic_type) где traffic_type ∈ {"Платный", "Бесплатный"}.
+        Ключи channel/subchannel совпадают с map_metrika_channel — нужно для мержа B4.
+    """
+    s = (source or "").strip()
+    s_lower = s.lower()
+
+    # === Платные платформы (точные имена сервисов TW) ===
+    if s_lower == "google-ads":
+        return "SEM", "Google.Adwords", "Платный"
+    if s_lower == "facebook-ads":
+        return "SMM paid", "Meta Ads", "Платный"
+    if s_lower == "snapchat-ads":
+        return "SMM paid", "Snapchat Ads", "Платный"
+    if s_lower == "tiktok-ads":
+        return "SMM paid", "TikTok Ads", "Платный"
+    if s_lower in ("bing", "microsoft-ads"):
+        return "SEM", "Bing", "Платный"
+
+    # === CRM (mindbox шлёт несколько source-веток: manual_mindbox, mindbox_*) ===
+    if "mindbox" in s_lower:
+        return "CRM", "Mindbox", "Бесплатный"
+    if s_lower == "klaviyo" or s_lower == "email":
+        return "CRM", "Email", "Бесплатный"
+
+    # === Органика/соцсети (TW сводит их в один source) ===
+    if s_lower == "organic_and_social":
+        return "SEO", "Organic & Social", "Бесплатный"
+
+    # === Direct ===
+    if s_lower == "direct":
+        return "Direct", "Direct", "Бесплатный"
+
+    # === Referral-домены (source = сам домен, напр. copilot.com, shop.app) ===
+    if "." in s_lower:
+        return "Referrals", s, "Бесплатный"
+
+    # === Не атрибутировано / неизвестное ===
+    if not s_lower or s_lower == "non-attributed":
+        return "Others", "Non-attributed", "Бесплатный"
+
+    return "Others", s, "Бесплатный"
