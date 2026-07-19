@@ -145,3 +145,55 @@ def test_naive_timestamp_does_not_crash_the_check(capsys):
     naive = (NOW - timedelta(days=ENTITY_MAX_AGE_DAYS + 2)).replace(tzinfo=None)
     assert warn_if_entities_stale(7, naive, now=NOW) is True
     assert "lime_kz_campaigns: WARN" in capsys.readouterr().out
+
+
+# ── Meta: четвёртый путь резолвинга ──────────────────────────────────────────
+# Замер июня 2026: 54 429 визитов Meta в kz_metrika лежали БЕЗ кампании — resolve_campaign
+# знал только Директ, Google PMax и справочник сущностей. Сравнивать по кампаниям Meta
+# с Роистатом было нечем.
+
+def _meta_row(utm_campaign, engine="Instagram"):
+    return {"direct_campaign_name": None, "utm_campaign": utm_campaign,
+            "utm_content": None, "source_engine": engine}
+
+
+def test_meta_campaign_from_utm_strips_placement_prefix():
+    """utm_campaign = «{Плейсмент}-{Имя кампании}» → имя после первого дефиса.
+
+    Сверено с Роистатом на июне: отрезав префикс, получаем ровно marker_level_2.title
+    (12 из 20 кампаний, 99.7% визитов Роистата и 98.3% Метрики по Meta).
+    """
+    ref = resolve_campaign(_meta_row("Instagram_Stories-CPO: ЛЕТНИЙ SALE_ЖЕНЩИНЫ"), {}, {}, {})
+    assert ref.campaign_name == "CPO: ЛЕТНИЙ SALE_ЖЕНЩИНЫ"
+    assert ref.campaign_id == ""      # у Метрики id кампаний Meta нет
+    assert ref.kz_cabinet is False    # кабинета Meta у нас нет — расход не проставляем
+
+
+def test_meta_campaign_keeps_hyphens_inside_name():
+    """Режем только ПЕРВЫЙ дефис: в именах кампаний дефисы встречаются («ЛЕН – Copy»)."""
+    ref = resolve_campaign(_meta_row("Instagram_Feed-CPO: SALE -70% Ж"), {}, {}, {})
+    assert ref.campaign_name == "CPO: SALE -70% Ж"
+
+
+def test_meta_campaign_without_placement_prefix_kept_whole():
+    ref = resolve_campaign(_meta_row("CPO: НОВИНКИ_24"), {}, {}, {})
+    assert ref.campaign_name == "CPO: НОВИНКИ_24"
+
+
+def test_meta_path_ignores_non_social_engines():
+    """Дефис в utm у поисковой кампании не должен приниматься за плейсмент Meta."""
+    ref = resolve_campaign(_meta_row("brand-search", engine="Google Ads"), {}, {}, {})
+    assert ref == NO_CAMPAIGN
+
+
+def test_meta_empty_utm_stays_unresolved():
+    assert resolve_campaign(_meta_row(""), {}, {}, {}) == NO_CAMPAIGN
+    assert resolve_campaign(_meta_row(None), {}, {}, {}) == NO_CAMPAIGN
+
+
+def test_meta_path_does_not_shadow_google_pmax():
+    """utm_campaign = числовой id PMax резолвится Google-путём, а не Meta."""
+    ref = resolve_campaign(_meta_row("23952118304", engine="Instagram"),
+                           {}, {"23952118304": "PMax Retargeting"}, {})
+    assert ref.campaign_id == "23952118304"
+    assert ref.campaign_name == "PMax Retargeting"

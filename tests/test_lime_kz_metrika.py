@@ -231,3 +231,75 @@ def test_no_unresolved_warning_when_paid_campaign_resolves(capsys):
     build_rows([_row(direct_campaign_name="Поиск. Бренд", visits=800.0)],
                MAPS, {("2026-07-15", "119566511"): 4450.0}, 0.162, "2026-07-15")
     assert "WARN" not in capsys.readouterr().out
+
+
+# ── Ключ свёртки: кампании без id не должны схлопываться друг в друга ────────
+
+def _meta(utm, visits, **kw):
+    # Боевая форма: платный Meta приходит как traffic_source='ad' + engine='Instagram'
+    # → канал «SMM paid / Meta Ads», traffic_type «Платный». Со 'social' это была бы
+    # органика, и гейт на шум в предупреждениях ничего бы не проверял.
+    return _row(traffic_source="ad", source_engine="Instagram",
+                utm_campaign=utm, visits=visits, **kw)
+
+
+def test_meta_campaigns_do_not_collapse_into_one_row():
+    """У Meta нет campaign_id, и ключ свёртки по одному id слил бы все её кампании.
+
+    Замер июня: 20 кампаний Meta, крупнейшие — 13 040 и 10 206 визитов. Одна строка
+    вместо двадцати сделала бы детализацию по кампаниям Meta бессмысленной.
+    """
+    rows = build_rows(
+        [_meta("Instagram_Stories-CPO: ЛЕТНИЙ SALE_ЖЕНЩИНЫ", 13040.0),
+         _meta("Instagram_Stories-CPO: ЛЕТНИЙ SALE ВИДЕО", 10206.0)],
+        MAPS, {}, 0.162, "2026-07-15")
+    names = sorted(r[I["campaign_name"]] for r in rows)
+    assert names == ["CPO: ЛЕТНИЙ SALE ВИДЕО", "CPO: ЛЕТНИЙ SALE_ЖЕНЩИНЫ"]
+    assert sorted(r[I["sessions"]] for r in rows) == [10206, 13040]
+
+
+def test_same_meta_campaign_from_different_placements_merges():
+    """Stories и Feed одной кампании — одна строка: плейсмент не часть кампании."""
+    rows = build_rows(
+        [_meta("Instagram_Stories-CPO: НОВИНКИ_24", 2357.0),
+         _meta("Instagram_Feed-CPO: НОВИНКИ_24", 1963.0)],
+        MAPS, {}, 0.162, "2026-07-15")
+    assert len(rows) == 1
+    assert rows[0][I["campaign_name"]] == "CPO: НОВИНКИ_24"
+    assert rows[0][I["sessions"]] == 4320
+
+
+def test_unresolved_rows_still_collapse_to_channel():
+    """Прежнее поведение: строки БЕЗ кампании схлопываются, мусорных кампаний не плодим."""
+    rows = build_rows(
+        [_row(traffic_source="organic", source_engine="Google", visits=100.0),
+         _row(traffic_source="organic", source_engine="Google", visits=50.0)],
+        MAPS, {}, 0.162, "2026-07-15")
+    assert len(rows) == 1
+    assert rows[0][I["campaign_name"]] == ""
+    assert rows[0][I["sessions"]] == 150
+
+
+def test_meta_rows_get_no_cost():
+    """Кабинета Meta у нас нет — расход по её кампаниям проставлять неоткуда."""
+    rows = build_rows([_meta("Instagram_Stories-CPO: ЛЕТНИЙ SALE_ЖЕНЩИНЫ", 13040.0)],
+                      MAPS, {("2026-07-15", ""): 99999.0}, 0.162, "2026-07-15")
+    assert rows[0][I["cost"]] == 0.0
+
+
+def test_meta_with_resolved_name_is_not_reported_unresolved(capsys):
+    """Кампания Meta распознана по имени — id у неё нет по природе, это не отказ склейки.
+
+    Без этой оговорки синк ругался бы каждый день на два десятка кампаний Meta, и
+    предупреждение про настоящие отказы утонуло бы в шуме.
+    """
+    build_rows([_meta("Instagram_Stories-CPO: ЛЕТНИЙ SALE_ЖЕНЩИНЫ", 13040.0)],
+               MAPS, {}, 0.162, "2026-07-15")
+    assert "без распознанной кампании" not in capsys.readouterr().out
+
+
+def test_paid_row_without_any_campaign_is_still_reported(capsys):
+    """Настоящий отказ склейки — ни id, ни имени — по-прежнему кричит."""
+    build_rows([_row(traffic_source="ad", source_engine="Yandex: Direct", visits=900.0)],
+               MAPS, {}, 0.162, "2026-07-15")
+    assert "без распознанной кампании" in capsys.readouterr().out

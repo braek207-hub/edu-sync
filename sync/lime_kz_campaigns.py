@@ -23,6 +23,14 @@ from typing import NamedTuple
 
 KZ_DIRECT_LOGIN = "LIME-KZ1"
 
+# Meta: у Метрики нет ни id кампании, ни имени — только utm_campaign вида
+# «{Плейсмент}-{Имя кампании}» (Instagram_Stories-CPO: ЛЕТНИЙ SALE_ЖЕНЩИНЫ). Отрезав
+# префикс до первого дефиса, получаем ровно имя кампании из кабинета Meta — сверено с
+# Роистатом (marker_level_2.title) на июне 2026: 12 из 20 кампаний, 99.7% визитов
+# Роистата и 98.3% визитов Метрики по Meta. До этой ветки 54 429 визитов Meta в срезе
+# лежали вообще без кампании.
+META_ENGINES = ("instagram", "facebook", "meta")
+
 # Порог протухания справочника сущностей кампании (группы объявлений + объявления).
 # Справочник наполняет Google Ads Script из рекламного кабинета через /api/ingest/google-ads —
 # он вне этого репозитория, вне workflow и без расписания, поэтому его остановку никто не
@@ -68,6 +76,15 @@ def resolve_campaign(row: dict, direct_map: dict, google_map: dict, entity_map: 
     utm_campaign = (row.get("utm_campaign") or "").strip()
     if utm_campaign in google_map:
         return CampaignRef(utm_campaign, google_map[utm_campaign], True)
+
+    engine = (row.get("source_engine") or "").lower()
+    if utm_campaign and any(e in engine for e in META_ENGINES):
+        # Первый дефис — граница плейсмента; внутри имени дефисы встречаются («SALE -70%»).
+        name = utm_campaign.split("-", 1)[1].strip() if "-" in utm_campaign else utm_campaign
+        if name:
+            # id пустой: у Метрики его нет, а kz_cabinet=False — кабинета Meta у нас
+            # нет, расход по этим кампаниям проставлять неоткуда.
+            return CampaignRef("", name, False)
 
     utm_content = (row.get("utm_content") or "").strip()
     hit = entity_map.get(utm_content)

@@ -54,9 +54,11 @@ DELETE_SQL = f"DELETE FROM lime_stats WHERE region = '{REGION}' AND date >= %s A
 def build_rows(metrika_rows, campaign_maps, cost_map, fx_rate: float, date_s: str) -> list[tuple]:
     """Свернуть строки Метрики в кортежи lime_stats порядка COLUMNS.
 
-    Ключ свёртки — (channel, subchannel, campaign_id). Нераспознанные кампании дают
-    campaign_id='' и схлопываются до уровня канала. Расход берётся из cost_map один раз
-    на кампанию за день (её визиты могут прийти несколькими строками каналов).
+    Ключ свёртки — (channel, subchannel, campaign_id, campaign_name). Имя в ключе наравне
+    с id, потому что у кампаний Meta id нет: свёртка по одному id слила бы все её кампании
+    в одну строку. Нераспознанные дают пустые и id, и имя — и схлопываются до уровня канала.
+    Расход берётся из cost_map один раз на кампанию за день (её визиты могут прийти
+    несколькими строками каналов).
 
     Args:
         metrika_rows: строки sync.lime_kz_metrika_api.parse_metrika_kz за date_s.
@@ -76,7 +78,11 @@ def build_rows(metrika_rows, campaign_maps, cost_map, fx_rate: float, date_s: st
             m.get("traffic_source"), m.get("source_engine")
         )
         ref = resolve_campaign(m, direct_map, google_map, adgroup_map)
-        key = (channel, subchannel, ref.campaign_id)
+        # Имя входит в ключ наравне с id: у кампаний Meta id нет (Метрика его не отдаёт),
+        # и свёртка по одному campaign_id слила бы все двадцать кампаний Meta в одну
+        # строку. Нераспознанные строки несут пустые и id, и имя — они по-прежнему
+        # схлопываются до уровня канала и мусорных кампаний не создают.
+        key = (channel, subchannel, ref.campaign_id, ref.campaign_name)
         acc = agg.get(key)
         if acc is None:
             acc = {
@@ -104,7 +110,7 @@ def build_rows(metrika_rows, campaign_maps, cost_map, fx_rate: float, date_s: st
     # Расход — один раз на кампанию за день, даже если её визиты разложились по каналам.
     spent: set[str] = set()
     out: list[tuple] = []
-    for (channel, subchannel, campaign_id), acc in agg.items():
+    for (channel, subchannel, campaign_id, _cname), acc in agg.items():
         cost = 0.0
         if campaign_id and acc["kz_cabinet"] and campaign_id not in spent:
             cost = float(cost_map.get((date_s, campaign_id), 0.0))
@@ -136,7 +142,7 @@ def build_rows(metrika_rows, campaign_maps, cost_map, fx_rate: float, date_s: st
     # разложились по нескольким (channel, subchannel), иначе задвоила бы число в предупреждении.
     zero_cost_google_campaigns = {
         campaign_id
-        for (channel, subchannel, campaign_id), acc in agg.items()
+        for (channel, subchannel, campaign_id, _cname), acc in agg.items()
         if campaign_id
         and acc["kz_cabinet"]
         and channel == "SEM"
@@ -162,10 +168,15 @@ def build_rows(metrika_rows, campaign_maps, cost_map, fx_rate: float, date_s: st
     # Не падаем: сам трафик Метрики собран корректно, деньги доливаются бэкфиллом после починки
     # соседа. Считаем строки свёртки (а не уникальные кампании): кампания здесь неизвестна
     # по определению, поэтому единица счёта — группа (channel, subchannel).
+    #
+    # Признак отказа — отсутствие И id, И имени. Одного пустого id мало: у кампаний Meta
+    # id нет по природе (Метрика его не отдаёт, кабинета у нас нет), они распознаются по
+    # имени из utm_campaign. Проверяй только id — и синк начнёт ругаться на два десятка
+    # живых кампаний Meta каждый день, а настоящие отказы утонут в этом шуме.
     unresolved_paid_rows = 0
     unresolved_paid_visits = 0.0
-    for (channel, subchannel, campaign_id), acc in agg.items():
-        if campaign_id or acc["traffic_type"] != "Платный":
+    for (channel, subchannel, campaign_id, campaign_name), acc in agg.items():
+        if campaign_id or campaign_name or acc["traffic_type"] != "Платный":
             continue
         unresolved_paid_rows += 1
         unresolved_paid_visits += acc["visits"]
