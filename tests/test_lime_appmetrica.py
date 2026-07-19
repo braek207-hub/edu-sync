@@ -35,6 +35,12 @@ def test_first_install_filters_reinstall():
     assert fi == {}                                           # переустановка отфильтрована
 
 
+def _buy(dev, ym, amount=1000.0, txn=None):
+    """Факт покупки: (device, месяц покупки, transaction_id, сумма)."""
+    y, mo = ym
+    return (dev, date(y, mo, 1), txn or f"{dev}-{y}{mo:02d}", amount)
+
+
 def _by_pub(rows):
     """Свернуть детальные строки до (неделя, партнёр) — родительский итог."""
     agg = {}
@@ -94,11 +100,11 @@ def test_build_cohorts_cumulative_unique_buyers():
         "d3": {"install_dt": datetime(2026, 1, 25), "publisher": "VK Ads"},
     }
     purchases = [
-        {"appmetrica_device_id": "d1", "event_datetime": "2026-01-15 10:00:00"},  # life 0
-        {"appmetrica_device_id": "d1", "event_datetime": "2026-03-15 10:00:00"},  # повтор — не двоит
-        {"appmetrica_device_id": "d2", "event_datetime": "2026-02-05 10:00:00"},  # life 1
+        _buy("d1", (2026, 1)),  # life 0
+        _buy("d1", (2026, 3)),  # повтор — не двоит
+        _buy("d2", (2026, 2)),  # life 1
     ]
-    rows = {(cm, p, lm): (sz, b) for (cm, p, lm, sz, b) in m.build_cohorts(fi, purchases, max_life=3)}
+    rows = {(cm, p, lm): (sz, b) for (cm, p, lm, sz, b, _o, _r) in m.build_cohorts(fi, purchases, max_life=3)}
     cm, p = date(2026, 1, 1), "VK Ads"
     assert rows[(cm, p, 0)] == (3, 1)   # cohort_size=3, купил 1 к M0 (d1)
     assert rows[(cm, p, 1)] == (3, 2)   # накопительно к M1: d1+d2
@@ -113,10 +119,10 @@ def test_build_cohorts_ignores_purchase_before_install():
     # с guard'ом d1 должен считаться начиная с life_month своей ВАЛИДНОЙ покупки.
     fi = {"d1": {"install_dt": datetime(2026, 2, 1), "publisher": "VK Ads"}}
     purchases = [
-        {"appmetrica_device_id": "d1", "event_datetime": "2026-01-01 10:00:00"},  # до установки — игнор
-        {"appmetrica_device_id": "d1", "event_datetime": "2026-03-15 10:00:00"},  # life 1 — валидна
+        _buy("d1", (2026, 1)),  # до установки — игнор
+        _buy("d1", (2026, 3)),  # life 1 — валидна
     ]
-    rows = {(cm, p, lm): (sz, b) for (cm, p, lm, sz, b) in m.build_cohorts(fi, purchases, max_life=2)}
+    rows = {(cm, p, lm): (sz, b) for (cm, p, lm, sz, b, _o, _r) in m.build_cohorts(fi, purchases, max_life=2)}
     assert rows[(date(2026, 2, 1), "VK Ads", 0)] == (1, 0)   # к M0 покупок ещё нет
     assert rows[(date(2026, 2, 1), "VK Ads", 1)] == (1, 1)   # к M1 — валидная покупка учтена
     assert rows[(date(2026, 2, 1), "VK Ads", 2)] == (1, 1)   # накопительно держится
@@ -147,10 +153,10 @@ def test_build_cohorts_excludes_devices_whose_first_purchase_is_beyond_window():
         "d2": {"install_dt": datetime(2026, 1, 10), "publisher": "VK Ads"},
     }
     purchases = [
-        {"appmetrica_device_id": "d1", "event_datetime": "2026-03-15 10:00:00"},  # life 2 — внутри окна
-        {"appmetrica_device_id": "d2", "event_datetime": "2026-10-01 10:00:00"},  # life 9 — за окном
+        _buy("d1", (2026, 3)),  # life 2 — внутри окна
+        _buy("d2", (2026, 10)),  # life 9 — за окном
     ]
-    rows = {(cm, p, lm): (sz, b) for (cm, p, lm, sz, b) in m.build_cohorts(fi, purchases, max_life=3)}
+    rows = {(cm, p, lm): (sz, b) for (cm, p, lm, sz, b, _o, _r) in m.build_cohorts(fi, purchases, max_life=3)}
     cm, pub = date(2026, 1, 1), "VK Ads"
     assert rows[(cm, pub, 0)] == (2, 0)
     assert rows[(cm, pub, 1)] == (2, 0)
@@ -200,3 +206,50 @@ def test_details_sum_exactly_to_parent_when_device_switches_utm():
     assert by_detail["google"] == 1        # d1 закреплён за ранним utm
     assert by_detail["ig"] == 1            # только d2
     assert _by_pub(rows)[(wk, "Website")] == 2   # детали == родитель, без задвоения
+
+
+def test_purchase_facts_dedups_by_transaction_id():
+    """Одно событие иногда приходит дважды — без дедупа задвоились бы заказы и выручка."""
+    events = [
+        {"appmetrica_device_id": "d1", "event_datetime": "2026-01-10 10:00:00",
+         "event_json": '{"transaction_id": 111, "value": 4599}'},
+        {"appmetrica_device_id": "d1", "event_datetime": "2026-01-10 10:00:05",
+         "event_json": '{"transaction_id": 111, "value": 4599}'},   # дубль
+        {"appmetrica_device_id": "d1", "event_datetime": "2026-01-20 10:00:00",
+         "event_json": '{"transaction_id": 222, "value": 1000}'},
+    ]
+    facts = m.purchase_facts(events)
+    assert len(facts) == 2                       # дубль отброшен
+    assert sum(f[3] for f in facts) == 5599.0    # выручка не задвоена
+
+
+def test_purchase_facts_survives_broken_json():
+    events = [
+        {"appmetrica_device_id": "d1", "event_datetime": "2026-01-10 10:00:00",
+         "event_json": "не json"},
+        {"appmetrica_device_id": "d2", "event_datetime": "2026-01-10 10:00:00"},
+    ]
+    facts = m.purchase_facts(events)
+    assert len(facts) == 2                       # события не теряем
+    assert all(f[3] == 0.0 for f in facts)       # сумма неизвестна → 0
+
+
+def test_build_cohorts_orders_and_revenue_are_cumulative():
+    """Покупатель считается один раз, заказы и выручка — каждый раз."""
+    fi = {"d1": {"install_dt": datetime(2026, 1, 5), "publisher": "VK Ads"}}
+    purchases = [
+        _buy("d1", (2026, 1), 1000.0, "t1"),
+        _buy("d1", (2026, 2), 500.0, "t2"),
+        _buy("d1", (2026, 2), 300.0, "t3"),
+    ]
+    rows = {lm: (sz, b, o, r) for (cm, p, lm, sz, b, o, r) in m.build_cohorts(fi, purchases, 2)}
+    assert rows[0] == (1, 1, 1, 1000.0)          # M0: 1 покупатель, 1 заказ, 1000
+    assert rows[1] == (1, 1, 3, 1800.0)          # M1: покупатель тот же, заказов уже 3
+    assert rows[2] == (1, 1, 3, 1800.0)          # M2: новых нет, накопленное держится
+
+
+def test_month_chunks_splits_window_by_calendar_months():
+    ch = m.month_chunks("2026-01-15", "2026-03-10")
+    assert ch == [("2026-01-15", "2026-01-31"),
+                  ("2026-02-01", "2026-02-28"),
+                  ("2026-03-01", "2026-03-10")]

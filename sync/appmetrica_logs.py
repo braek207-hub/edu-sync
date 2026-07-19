@@ -19,7 +19,10 @@ INSTALL_FIELDS = (
     "click_url_parameters,"
     "is_reattribution,is_reinstallation"
 )
-EVENT_FIELDS = "appmetrica_device_id,event_name,event_datetime"
+# event_json нужен ради суммы заказа и transaction_id (в нём же лежит корзина —
+# она не используется, но выбросить её на стороне API нельзя, поэтому события
+# тянутся помесячными чанками, см. sync_lime_appmetrica).
+EVENT_FIELDS = "appmetrica_device_id,event_name,event_datetime,event_json"
 
 
 def _export(endpoint: str, params: dict, token: str) -> list[dict]:

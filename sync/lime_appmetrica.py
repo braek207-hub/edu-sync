@@ -4,9 +4,10 @@ installs → недельные установки по партнёру (уни
 cohorts  → устройства-покупатели по когорте (месяц × партнёр) накопительно по месяцам жизни.
 Сырьё не хранится — только агрегаты. Границы недели/месяца — по времени установки/события.
 """
+import json
 import os
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from urllib.parse import parse_qs
 
 import psycopg2
@@ -110,7 +111,38 @@ def build_installs_weekly(installs: list[dict], keep_reattribution: bool,
     return [(w, p, d, n) for (w, p, d), n in agg.items()]
 
 
-def build_cohorts(first_installs: dict[str, dict], purchases: list[dict],
+def purchase_facts(events: list[dict]) -> list[tuple]:
+    """Сырые события покупки → факты (device, месяц покупки, transaction_id, сумма).
+
+    Дедуп по transaction_id: одно и то же событие иногда приходит дважды (0.4% на
+    замере), и без дедупа задваивались бы и заказы, и выручка. Событие без
+    transaction_id считаем отдельным заказом (ключ = None + позиция).
+    """
+    seen: set = set()
+    out: list[tuple] = []
+    for e in events:
+        dev = e.get("appmetrica_device_id")
+        if not dev:
+            continue
+        try:
+            payload = json.loads(e.get("event_json") or "{}")
+        except (ValueError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        txn = payload.get("transaction_id")
+        txn = str(txn) if txn is not None else None
+        if txn is not None:
+            if txn in seen:
+                continue
+            seen.add(txn)
+        value = payload.get("value")
+        amount = float(value) if isinstance(value, (int, float)) else 0.0
+        out.append((dev, month_start(parse_dt(e["event_datetime"])), txn, amount))
+    return out
+
+
+def build_cohorts(first_installs: dict[str, dict], purchases: list[tuple],
                   max_life: int) -> list[tuple]:
     # device → (cohort_month, publisher); размер когорты.
     device_cohort: dict[str, tuple] = {}
@@ -121,37 +153,42 @@ def build_cohorts(first_installs: dict[str, dict], purchases: list[dict],
         device_cohort[dev] = key
         cohort_size[key] += 1
 
-    # device → life_month его ПЕРВОЙ покупки (>=0).
+    # Покупатели, заказы и выручка считаются по-разному:
+    #  • покупатель — устройство, засчитывается ОДИН раз, с месяца первой покупки;
+    #  • заказ и выручка — каждая покупка отдельно, в свой месяц жизни.
     first_life: dict[str, int] = {}
-    for p in purchases:
-        dev = p.get("appmetrica_device_id")
+    new_orders: dict[tuple, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    new_revenue: dict[tuple, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+
+    for dev, pmonth, _txn, amount in purchases:
         ck = device_cohort.get(dev)
         if not ck:
             continue
-        lm = month_diff(month_start(parse_dt(p["event_datetime"])), ck[0])
-        if lm < 0:
+        lm = month_diff(pmonth, ck[0])
+        if lm < 0 or lm > max_life:
             continue
         if dev not in first_life or lm < first_life[dev]:
             first_life[dev] = lm
+        new_orders[ck][lm] += 1
+        new_revenue[ck][lm] += amount
 
-    # новые покупатели по life_month на когорту.
-    # Устройство считается с life_month его ПЕРВОЙ покупки. Если первая покупка
-    # позже отчётного окна (lm > max_life) — устройство ещё не покупало ни в
-    # одном отчётном месяце, поэтому исключаем его, а не клэмпим в max_life
-    # (клэмп раздувал бы финальный кумулятивный столбец, по которому сверяем с UI AppMetrica).
+    # Новые покупатели по life_month на когорту. Устройство считается с life_month
+    # его ПЕРВОЙ покупки. Покупка позже отчётного окна отфильтрована выше — иначе
+    # она раздувала бы финальный кумулятивный столбец, по которому сверяем с UI AppMetrica.
     new_buyers: dict[tuple, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     for dev, lm in first_life.items():
-        if lm > max_life:
-            continue
         new_buyers[device_cohort[dev]][lm] += 1
 
     out: list[tuple] = []
     for key, size in cohort_size.items():
         cm, pub = key
-        cumulative = 0
+        buyers = orders = 0
+        revenue = 0.0
         for lm in range(0, max_life + 1):
-            cumulative += new_buyers[key].get(lm, 0)
-            out.append((cm, pub, lm, size, cumulative))
+            buyers += new_buyers[key].get(lm, 0)
+            orders += new_orders[key].get(lm, 0)
+            revenue += new_revenue[key].get(lm, 0.0)
+            out.append((cm, pub, lm, size, buyers, orders, round(revenue, 2)))
     return out
 
 
@@ -163,6 +200,22 @@ def sync_window(months: int, today: date) -> tuple[str, str]:
         y -= 1
     since = date(y, mo, 1)
     return since.isoformat(), today.isoformat()
+
+
+def month_chunks(since: str, until: str) -> list[tuple[str, str]]:
+    """Разбить окно на календарные месяцы: [(YYYY-MM-DD, YYYY-MM-DD), ...].
+
+    Нужно, чтобы не тянуть события с event_json за всё окно одним запросом.
+    """
+    start = datetime.strptime(since, "%Y-%m-%d").date()
+    end = datetime.strptime(until, "%Y-%m-%d").date()
+    out: list[tuple[str, str]] = []
+    cur = date(start.year, start.month, 1)
+    while cur <= end:
+        nxt = date(cur.year + (cur.month // 12), (cur.month % 12) + 1, 1)
+        out.append((max(cur, start).isoformat(), min(nxt - timedelta(days=1), end).isoformat()))
+        cur = nxt
+    return out
 
 
 def _pg_url() -> str:
@@ -183,7 +236,8 @@ def _write(installs_rows: list[tuple], cohort_rows: list[tuple]) -> None:
             psycopg2.extras.execute_values(
                 cur,
                 "INSERT INTO lime_app_cohorts "
-                "(cohort_month, publisher, life_month, cohort_size, buyers) VALUES %s",
+                "(cohort_month, publisher, life_month, cohort_size, buyers, orders, revenue) "
+                "VALUES %s",
                 cohort_rows, page_size=500,
             )
         conn.commit()
@@ -214,7 +268,15 @@ def sync_lime_appmetrica() -> None:
     print(f"[lime-appmetrica] окно {since}..{until}, app={app_id}, event={event_name}")
 
     installs_raw = fetch_installations(app_id, token, since, until)
-    purchases_raw = fetch_purchase_events(app_id, token, since, until, event_name)
+    # События тянем ПОМЕСЯЧНО и сразу сворачиваем в факты: с event_json (там корзина)
+    # всё окно одним куском — сотни мегабайт в памяти.
+    purchases_raw: list[tuple] = []
+    for chunk_since, chunk_until in month_chunks(since, until):
+        chunk = fetch_purchase_events(app_id, token, chunk_since, chunk_until, event_name)
+        purchases_raw.extend(purchase_facts(chunk))
+        print(f"[lime-appmetrica] покупки {chunk_since}..{chunk_until}: "
+              f"событий={len(chunk)}, фактов накоплено={len(purchases_raw)}", flush=True)
+        del chunk
     print(f"[lime-appmetrica] сырьё: installs={len(installs_raw)}, purchases={len(purchases_raw)}")
     if not purchases_raw:
         print("[lime-appmetrica] WARNING: purchases_raw пуст — покупки не найдены за окно")
