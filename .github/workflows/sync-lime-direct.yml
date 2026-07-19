@@ -14,6 +14,17 @@ on:
         description: "1 = дозаполнить cost_rub на всей истории (строки без курса)"
         required: false
         default: "0"
+      # Отдельное окно для Роистата: его история глубже, чем у остальных синков, а гнать
+      # days_back=565 нельзя — Директ и Метрика пересчитывали бы полтора года впустую
+      # (одна Метрика на 60 днях идёт 9 минут).
+      roistat_from:
+        description: "Бэкфилл Роистата: дата начала YYYY-MM-DD (нужны обе даты)"
+        required: false
+        default: ""
+      roistat_to:
+        description: "Бэкфилл Роистата: дата конца YYYY-MM-DD"
+        required: false
+        default: ""
 
 concurrency:
   group: lime-direct-sync
@@ -86,6 +97,9 @@ jobs:
           ROISTAT_API_KEY: ${{ secrets.ROISTAT_API_KEY }}
           ROISTAT_PROJECT_ID: ${{ secrets.ROISTAT_PROJECT_ID }}
           LIME_KZ_ROISTAT_DAYS_BACK: ${{ github.event.inputs.days_back || '30' }}
+          # Заданы обе даты — синк идёт по ним и игнорирует DAYS_BACK (см. sync_lime_kz_roistat).
+          LIME_KZ_ROISTAT_FROM: ${{ github.event.inputs.roistat_from }}
+          LIME_KZ_ROISTAT_TO: ${{ github.event.inputs.roistat_to }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_kz_roistat
 
