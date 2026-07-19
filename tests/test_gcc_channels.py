@@ -91,7 +91,14 @@ def test_tw_bing():
 
 
 def test_tw_organic_social():
-    assert map_tw_source("organic_and_social") == ("SEO", "Organic & Social", "Бесплатный")
+    """Без реферера расщепить нечем — отдельная корзина, а не приписка к SEO.
+
+    Раньше сюда падала ВСЯ органика и соцсети одной кучей (SEO/«Organic & Social»),
+    из-за чего SMM (organic) стоял с нулём заказов при живом трафике. Теперь деление
+    идёт по домену-реферу из campaignId — см. tests/test_gcc_taxonomy_canon.py.
+    """
+    assert map_tw_source("organic_and_social") == ("Others", "Organic & Social", "Бесплатный")
+    assert map_tw_source("organic_and_social", "google") == ("SEO", "SEO Google", "Бесплатный")
 
 
 def test_tw_mindbox():

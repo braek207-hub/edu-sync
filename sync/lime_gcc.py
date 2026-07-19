@@ -101,7 +101,9 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
         return row
 
     for m in metrika_rows:
-        channel, subchannel, traffic_type = map_metrika_channel(m["traffic_source"], m["source_engine"])
+        channel, subchannel, traffic_type = map_metrika_channel(
+            m["traffic_source"], m["source_engine"], m.get("utm_source")
+        )
         row = _bucket(m.get("country"), m.get("campaign"), channel, subchannel, traffic_type)
         row["sessions"] += int(m["visits"] or 0)
         row["users"] += int(m["users"] or 0)

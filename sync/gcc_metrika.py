@@ -143,6 +143,8 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
                 "country": map_domain_country(dim(dims, "ym:s:startURLDomain", "name")),
                 "campaign": campaign,
                 "traffic_source": traffic_source,
+                # Нужен маппингу, чтобы отличить рассылку Mindbox от прочей почты.
+                "utm_source": utm_source,
                 # Совместимо с map_metrika_channel: снаружи это по-прежнему «движок».
                 "source_engine": resolve_engine(traffic_source, utm_source, campaign, search_engine),
                 "visits": visits,

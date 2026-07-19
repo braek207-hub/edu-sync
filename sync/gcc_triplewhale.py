@@ -59,6 +59,24 @@ SPEND_METRIC_MAP = {
 }
 
 
+def order_touchpoint(order: dict) -> dict:
+    """Тачпоинт, которым атрибутирован заказ: первый непустой из моделей по приоритету.
+
+    Источник и кампания обязаны браться из ОДНОГО тачпоинта, иначе разъедутся по разным
+    моделям атрибуции. Зонд P4: ключей `lastClick`/`firstClick` в ответе нет вовсе,
+    цепочка фактически всегда останавливается на `lastPlatformClick`.
+
+    Returns:
+        Тачпоинт {source, campaignId, adsetId, adId, clickDate} либо {} если атрибуции нет.
+    """
+    attribution = order.get("attribution") or {}
+    for model in ("lastPlatformClick", "lastClick", "fullLastClick"):
+        touchpoints = attribution.get(model) or []
+        if touchpoints and isinstance(touchpoints[0], dict) and touchpoints[0].get("source"):
+            return touchpoints[0]
+    return {}
+
+
 def order_source(order: dict) -> str | None:
     """Источник заказа: первый непустой source из lastPlatformClick → lastClick → fullLastClick.
 
@@ -137,10 +155,16 @@ def aggregate_orders_by_channel(orders: list[dict], date: str) -> list[dict]:
     """
     agg: dict[tuple[str | None, str | None, str, str, str], dict] = {}
     for order in orders:
-        src = order_source(order)
-        channel, subchannel, traffic_type = map_tw_source(src)
+        touchpoint = order_touchpoint(order)
+        src = touchpoint.get("source") or None
+        # У organic_and_social в campaignId лежит домен-реферер, а НЕ id кампании
+        # (зонд P4). Он нужен маппингу, чтобы расщепить органику и соцсети, но в
+        # колонку кампании его класть нельзя — иначе «yandex.ru» станет кампанией.
+        raw_campaign = (touchpoint.get("campaignId") or "").strip() or None
+        is_referrer = (src or "").lower() == "organic_and_social"
+        channel, subchannel, traffic_type = map_tw_source(src, raw_campaign)
         country = order_country(order)
-        campaign = order_campaign(order)
+        campaign = None if is_referrer else raw_campaign
         key = (country, campaign, channel, subchannel, traffic_type)
         row = agg.setdefault(
             key,

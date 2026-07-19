@@ -103,6 +103,33 @@
 - Fix: включить API → https://console.developers.google.com/apis/api/analyticsdata.googleapis.com/overview?project=131094257045 → подождать пару минут → повторить зонд. Авторизация валидна (дошли до API).
 - `hostName` в измерениях — чтобы проверить деление трафика по доменам стран GCC (Фаза 2).
 
+## TW attribution: расщепление organic_and_social ✅ ЗОНД P4 (2026-07-19)
+
+Скрипт: `scripts/probe_tw_attribution_models.py` (печатает только агрегаты, без ключа).
+
+- **Моделей в ответе пять, а не семь:** `lastPlatformClick`, `fullLastClick`, `fullFirstClick`,
+  `linear`, `linearAll`. Ключей **`lastClick` и `firstClick` НЕТ вовсе** → фоллбэк-цепочка в
+  `order_source()` (lastPlatformClick → lastClick → fullLastClick) фактически всегда
+  останавливается на первой модели.
+- **Поля тачпоинта:** `source`, `clickDate`, `campaignId`, `adsetId`, `adId`. Реферера
+  отдельным полем НЕТ.
+- 🔑 **Главная находка: `campaignId` перегружен.** У рекламных платформ там числовой id
+  кампании, а у `source == "organic_and_social"` — **домен-реферер**:
+
+  ```json
+  {"source": "organic_and_social", "campaignId": "yandex.ru",     "adsetId": "", "adId": ""}
+  {"source": "organic_and_social", "campaignId": "lime-shop.com", "adsetId": "", "adId": ""}
+  ```
+
+  Значит органику и соцсети можно делить **по факту**, а не пропорцией по визитам.
+- Словарь рефереров (зонд, 100 заказов): `limestore.com`, `sa.limestore.com`, `lime-shop.com`
+  (свои домены), `google`, `instagram` (голые имена, не FQDN), `shopify.com`, `shop.app`
+  (экосистема Shopify), `limeshop-uae.maestra.io` (Maestra = международный бренд Mindbox → CRM).
+  ⚠️ Формат смешанный: то голое имя движка, то полный домен — матчить обе формы.
+- Модели `linear`/`linearAll` приписывают часть этих заказов google-ads/facebook-ads
+  (мультитач). Мы остаёмся на last-click — смена модели атрибуции это отдельное решение,
+  не побочный эффект правки маппера.
+
 ## TW journey → страна заказа ✅ ЗОНД P3 (2026-07-18)
 
 Запрос тот же, что и для заказов, но **`"excludeJourneyData": false`**.
