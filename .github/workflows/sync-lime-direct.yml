@@ -78,6 +78,17 @@ jobs:
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_kz_metrika
 
+      # Идёт ПОСЛЕ синка кабинета Директа: расход Директа берётся из lime_direct_stats
+      # (в самом Роистате он в рублях под видом тенге), и тот должен быть свежим.
+      - name: Run LIME KZ Roistat sync (region=kz_roistat)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ROISTAT_API_KEY: ${{ secrets.ROISTAT_API_KEY }}
+          ROISTAT_PROJECT_ID: ${{ secrets.ROISTAT_PROJECT_ID }}
+          LIME_KZ_ROISTAT_DAYS_BACK: ${{ github.event.inputs.days_back || '30' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_kz_roistat
+
       - name: Revalidate dashboard cache
         if: success()
         run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate

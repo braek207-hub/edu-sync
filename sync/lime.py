@@ -171,7 +171,7 @@ INSERT INTO lime_stats (
 # зарегистрировать регион здесь. Пропуск такой регистрации — реальный баг (2026-07-18):
 # kz_metrika отсутствовал в исключениях, и ежедневный прогон этого синка стирал бы
 # чужой срез целиком, молча и каждый день.
-FOREIGN_REGIONS = ("gcc", "kz_metrika")
+FOREIGN_REGIONS = ("gcc", "kz_metrika", "kz_roistat")
 
 _FOREIGN_LIST = ", ".join(f"'{r}'" for r in FOREIGN_REGIONS)
 DELETE_SQL = f"""
