@@ -27,6 +27,7 @@ import psycopg2
 import psycopg2.extras
 
 from sync.fx import to_rub as fx_to_rub
+from sync.gcc_campaign_bridge import bridge_metrika_campaign, fetch_campaign_index
 from sync.gcc_channels import map_metrika_channel
 from sync.gcc_google_geo import fetch_geo_spend
 from sync.gcc_metrika import fetch_metrika_traffic
@@ -53,7 +54,7 @@ INSERT_SQL = f"INSERT INTO lime_stats ({', '.join(COLUMNS)}) VALUES %s"
 
 
 def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
-               rub_spend_rows=()) -> list[tuple]:
+               rub_spend_rows=(), campaign_index=None) -> list[tuple]:
     """Свернуть трафик (Метрика) + заказы/расход (Triple Whale) по (country, channel, subchannel).
 
     Страна берётся из самого источника: Метрика — домен витрины, TW-заказы — journey.
@@ -105,7 +106,11 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
         channel, subchannel, traffic_type = map_metrika_channel(
             m["traffic_source"], m["source_engine"], m.get("utm_source")
         )
-        row = _bucket(m.get("country"), m.get("campaign"), channel, subchannel, traffic_type)
+        # Метрика пишет в utm имя кампании Meta с префиксом плейсмента, а заказы и расход
+        # ссылаются на числовой id — переводим метку в id, иначе визиты не сойдутся
+        # с деньгами той же кампании. Неопознанные метки остаются как есть.
+        campaign = bridge_metrika_campaign(m.get("campaign"), campaign_index or {})
+        row = _bucket(m.get("country"), campaign, channel, subchannel, traffic_type)
         row["sessions"] += int(m["visits"] or 0)
         row["users"] += int(m["users"] or 0)
         row["new_users"] += int(m.get("new_users") or 0)
@@ -164,6 +169,14 @@ def _sync_range(frm: date, to: date, conn) -> int:
     tw_key = os.environ["GCC_TRIPLEWHALE_API_KEY"]
     shop = os.environ["GCC_TW_SHOP_DOMAIN"]
 
+    # Справочник кампаний строим ОДИН раз на весь прогон и с запасом назад: у дневного
+    # синка в своём дне может не быть расхода по кампании, чей трафик уже идёт, и метка
+    # осталась бы неопознанной.
+    campaign_index = fetch_campaign_index(
+        tw_key, shop, (frm - timedelta(days=90)).isoformat(), to.isoformat()
+    )
+    print(f"lime_gcc: справочник кампаний — {len(campaign_index)} имён")
+
     total = 0
     day = frm
     while day <= to:
@@ -185,7 +198,8 @@ def _sync_range(frm: date, to: date, conn) -> int:
             tw_metrics = {k: v for k, v in tw_metrics.items() if k not in covered}
         spend = spend_by_channel(tw_metrics, day_s) + ads_spend
         fx_rate = fx_to_rub("AED", day_s)
-        rows = merge_rows(metrika, orders, spend, fx_rate, day_s, rub_spend_rows=google_geo)
+        rows = merge_rows(metrika, orders, spend, fx_rate, day_s,
+                          rub_spend_rows=google_geo, campaign_index=campaign_index)
 
         if conn is None:
             i_country = COLUMNS.index("country")
