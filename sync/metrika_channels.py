@@ -128,5 +128,12 @@ def map_metrika_channel(
     if source_id == "internal":
         return "Internal", "Internal", "Бесплатный"
 
+    # === QR (офлайн → онлайн: упаковка, печать, POSM) ===
+    # Метрика зовёт источник `qrcode`, Triple Whale — `qr`. Раньше первый уходил в
+    # Others/Unknown, второй в Others/qr, и визиты по QR не могли встретиться со своими
+    # заказами. Имя общее для обеих сторон.
+    if source_id in ("qrcode", "qr"):
+        return "Others", "QR", "Бесплатный"
+
     # === DEFAULT ===
     return "Others", (source_engine or "Unknown"), "Бесплатный"

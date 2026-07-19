@@ -174,6 +174,12 @@ def map_tw_source(source: str | None, referrer: str | None = None) -> tuple[str,
     if "." in s_lower:
         return "Referrals", s, "Бесплатный"
 
+    # === QR (офлайн → онлайн) ===
+    # Метрика зовёт этот источник `qrcode`, TW — `qr`; имя подканала общее, иначе визиты
+    # по QR и заказы по QR стоят разными строками и CR не считается.
+    if s_lower in ("qr", "qrcode"):
+        return "Others", "QR", "Бесплатный"
+
     # === Не атрибутировано / неизвестное ===
     if not s_lower or s_lower == "non-attributed":
         return "Others", "Non-attributed", "Бесплатный"

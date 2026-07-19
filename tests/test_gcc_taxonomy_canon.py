@@ -137,3 +137,24 @@ class TestCrmByUtmTag:
 
     def test_real_ads_untouched(self):
         assert map_metrika_channel("ad", "Google Ads", "google")[:2] == ("SEM", "Google.Adwords")
+
+
+class TestQrMeetsItself:
+    """QR-трафик: Метрика зовёт источник qrcode, Triple Whale — qr.
+
+    Раньше первый уходил в Others/Unknown, второй в Others/qr — визиты по QR и заказы
+    по QR стояли разными строками, CR не считался. Найдено аудитом покрытия 2026-07-19
+    (проверкой, во что маппится КАЖДЫЙ живой источник обеих сторон).
+    """
+
+    def test_both_sides_land_in_same_bucket(self):
+        traffic = map_metrika_channel("qrcode", None, None)[:2]
+        orders = map_tw_source("qr")[:2]
+        assert traffic == orders == ("Others", "QR")
+
+    def test_alias_spellings(self):
+        assert map_metrika_channel("qr", None, None)[:2] == ("Others", "QR")
+        assert map_tw_source("qrcode")[:2] == ("Others", "QR")
+
+    def test_qr_is_free_traffic(self):
+        assert map_metrika_channel("qrcode", None, None)[2] == "Бесплатный"
