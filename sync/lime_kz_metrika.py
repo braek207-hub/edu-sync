@@ -22,6 +22,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync.ecommerce_health import detect_ecommerce_drop
 from sync.fx import to_rub as fx_to_rub
 from sync.lime_kz_campaigns import (
     load_cost_map,
@@ -177,6 +178,33 @@ def build_rows(metrika_rows, campaign_maps, cost_map, fx_rate: float, date_s: st
     return out
 
 
+# Базовая конверсия — по предыдущим дням ЭТОГО же среза. `date < %s` обязателен: строки
+# текущего дня уже записаны выше, и без отсечки день сравнивался бы сам с собой.
+SELECT_BASELINE = """
+SELECT COALESCE(SUM(sessions), 0)::int, COALESCE(SUM(purchases_count), 0)::int
+FROM lime_stats
+WHERE region = %s AND date < %s::date AND date >= %s::date - 14
+GROUP BY date
+"""
+
+
+def _warn_on_ecommerce_drop(conn, day_s: str, rows: list[tuple]) -> None:
+    """Громко предупредить, если за день собралось подозрительно мало заказов.
+
+    Не падаем и не откатываем: строки уже записаны и сам трафик собран корректно —
+    молчание тут страшнее, чем шум (см. sync/ecommerce_health.py).
+    """
+    i_sessions, i_orders = COLUMNS.index("sessions"), COLUMNS.index("purchases_count")
+    visits = sum(r[i_sessions] for r in rows)
+    orders = sum(r[i_orders] for r in rows)
+    with conn.cursor() as cur:
+        cur.execute(SELECT_BASELINE, (REGION, day_s, day_s))
+        baseline = [(int(v), int(o)) for v, o in cur.fetchall()]
+    drop = detect_ecommerce_drop(visits, orders, baseline)
+    if drop:
+        print(f"lime_kz_metrika: WARN {day_s} — {drop}")
+
+
 def _sync_range(frm: date, to: date, conn) -> int:
     token = os.environ["LIME_METRIKA_TOKEN"]
     frm_s, to_s = frm.isoformat(), to.isoformat()
@@ -217,6 +245,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
                     psycopg2.extras.execute_values(cur, INSERT_SQL, rows, page_size=500)
             conn.commit()
             print(f"lime_kz_metrika: {day_s} → {len(rows)} строк")
+            _warn_on_ecommerce_drop(conn, day_s, rows)
 
         total += len(rows)
         day += timedelta(days=1)
