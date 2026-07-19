@@ -121,6 +121,59 @@ def build_installs_daily(installs: list[dict], keep_reattribution: bool,
     return [(d, p, det, c, n) for (d, p, det, c), n in agg.items()]
 
 
+def build_installs_daily_with_cohort(installs: list[dict], purchases: list[tuple],
+                                     keep_reattribution: bool,
+                                     keep_reinstall: bool) -> list[tuple]:
+    """Дневные установки + пожизненные заказы/выручка устройств, установившихся в этот день.
+
+    Зачем: главная таблица дашборда суммирует дневные строки по выбранному диапазону.
+    Так «выручка по установкам за период» складывается простым суммированием дней.
+
+    ВАЖНО, две разные привязки в одной строке:
+      • installs — устройство считается в КАЖДЫЙ день, когда оно ставило приложение
+        (дневной дедуп), иначе свежие периоды недосчитываются;
+      • cohort_orders / cohort_revenue — привязаны к ПЕРВОЙ установке устройства,
+        как и месячные когорты. Иначе повторная установка приписала бы одни и те же
+        деньги дважды.
+    Числа НАКОПИТЕЛЬНЫЕ на момент синка: когорта продолжает покупать, поэтому выручка
+    прошлых дней растёт от прогона к прогону. Это природа когортной метрики.
+
+    Возвращает (date, publisher, detail, campaign_id, installs, cohort_orders, cohort_revenue).
+    """
+    base = build_installs_daily(installs, keep_reattribution, keep_reinstall)
+
+    # Первая установка устройства → её день/партнёр/метки (когортная привязка).
+    first: dict[str, tuple] = {}
+    for r in installs:
+        if not keep_reinstall and _truthy(r.get("is_reinstallation")):
+            continue
+        if not keep_reattribution and _truthy(r.get("is_reattribution")):
+            continue
+        dev = r.get("appmetrica_device_id")
+        if not dev:
+            continue
+        dt = parse_dt(r["install_datetime"])
+        cur = first.get(dev)
+        if cur is None or dt < cur[0]:
+            params = r.get("click_url_parameters") or ""
+            first[dev] = (dt, r.get("publisher_name") or "unknown",
+                          param_of(params, "utm_source"), param_of(params, "campaign_id"))
+
+    orders: dict[tuple, int] = defaultdict(int)
+    revenue: dict[tuple, float] = defaultdict(float)
+    for dev, _pmonth, _txn, amount in purchases:
+        f = first.get(dev)
+        if not f:
+            continue
+        key = (f[0].date(), f[1], f[2], f[3])
+        orders[key] += 1
+        revenue[key] += amount
+
+    return [(d, p, det, c, n, orders.get((d, p, det, c), 0),
+             round(revenue.get((d, p, det, c), 0.0), 2))
+            for (d, p, det, c, n) in base]
+
+
 def purchase_facts(events: list[dict]) -> list[tuple]:
     """Сырые события покупки → факты (device, месяц покупки, transaction_id, сумма).
 
@@ -239,7 +292,8 @@ def _write(installs_rows: list[tuple], cohort_rows: list[tuple]) -> None:
             cur.execute("DELETE FROM lime_app_installs")
             psycopg2.extras.execute_values(
                 cur,
-                "INSERT INTO lime_app_installs (date, publisher, detail, campaign_id, installs) "
+                "INSERT INTO lime_app_installs "
+                "(date, publisher, detail, campaign_id, installs, cohort_orders, cohort_revenue) "
                 "VALUES %s",
                 installs_rows, page_size=500,
             )
@@ -295,7 +349,8 @@ def sync_lime_appmetrica() -> None:
     first = first_install_per_device(installs_raw, keep_reattr, keep_reinstall)
     # Недельные установки — по сырым строкам (дедуп внутри недели); когорты — по первой
     # установке устройства. Это два разных вопроса и две разные агрегации.
-    installs_rows = build_installs_daily(installs_raw, keep_reattr, keep_reinstall)
+    installs_rows = build_installs_daily_with_cohort(
+        installs_raw, purchases_raw, keep_reattr, keep_reinstall)
     cohort_rows = build_cohorts(first, purchases_raw, max_life)
 
     if not installs_rows:

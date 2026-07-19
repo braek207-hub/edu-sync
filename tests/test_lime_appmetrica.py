@@ -267,3 +267,36 @@ def test_month_chunks_splits_window_by_calendar_months():
     assert ch == [("2026-01-15", "2026-01-31"),
                   ("2026-02-01", "2026-02-28"),
                   ("2026-03-01", "2026-03-10")]
+
+
+def test_daily_cohort_attributes_money_to_first_install_not_every_install():
+    """Устройство переустановило приложение — установка считается в оба дня,
+    но деньги приписываются только первому дню, иначе выручка задвоится."""
+    installs = [
+        _inst("d1", "2026-01-06 10:00:00", "VK Ads"),
+        _inst("d1", "2026-02-10 10:00:00", "VK Ads"),   # переустановка
+    ]
+    purchases = [_buy("d1", (2026, 3), 5000.0, "t1")]
+    rows = {(d, p): (n, o, rev)
+            for (d, p, _det, _c, n, o, rev) in
+            m.build_installs_daily_with_cohort(installs, purchases, False, False)}
+    assert rows[(date(2026, 1, 6), "VK Ads")] == (1, 1, 5000.0)   # деньги здесь
+    assert rows[(date(2026, 2, 10), "VK Ads")] == (1, 0, 0.0)     # установка есть, денег нет
+
+
+def test_daily_cohort_sums_lifetime_revenue_per_install_day():
+    installs = [
+        _inst("d1", "2026-01-06 10:00:00", "Yandex.Direct", camp="704121835"),
+        _inst("d2", "2026-01-06 11:00:00", "Yandex.Direct", camp="704121835"),
+    ]
+    purchases = [
+        _buy("d1", (2026, 1), 1000.0, "t1"),
+        _buy("d1", (2026, 5), 2000.0, "t2"),   # покупка сильно позже — всё равно этот день
+        _buy("d2", (2026, 2), 3000.0, "t3"),
+    ]
+    rows = m.build_installs_daily_with_cohort(installs, purchases, False, False)
+    assert len(rows) == 1
+    (_d, pub, _det, camp, n, orders, revenue) = rows[0]
+    assert (pub, camp, n) == ("Yandex.Direct", "704121835", 2)
+    assert orders == 3
+    assert revenue == 6000.0
