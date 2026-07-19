@@ -78,6 +78,20 @@
               "icon": "https://cloud.roistat.com/img/arrow-right.png",
               "hash": null,
               "metadata": []
+            },
+            "marker_level_2": {
+              "value": "",
+              "title": "",
+              "icon": "",
+              "hash": null,
+              "metadata": []
+            },
+            "marker_level_3": {
+              "value": "",
+              "title": "",
+              "icon": "",
+              "hash": null,
+              "metadata": []
             }
           },
           "isHasChild": false,
@@ -86,43 +100,43 @@
         {
           "metrics": [
             {
-              "value": 799,
+              "value": 17,
               "formatted": null,
               "metric_name": "visitCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 799,
+              "value": 17,
               "formatted": null,
               "metric_name": "visits",
               "attribution_model_id": "default"
             },
             {
-              "value": 54,
+              "value": 1,
               "formatted": null,
               "metric_name": "leadCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 49,
+              "value": 1,
               "formatted": null,
               "metric_name": "paidLeadCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 2018600,
+              "value": 17980,
               "formatted": null,
               "metric_name": "paidLeadsPrice",
               "attribution_model_id": "default"
             },
             {
-              "value": 199930,
+              "value": 0,
               "formatted": null,
               "metric_name": "progressLeadsPrice",
               "attribution_model_id": "default"
             },
             {
-              "value": 3990,
+              "value": 0,
               "formatted": null,
               "metric_name": "revenue_сanceled",
               "attribution_model_id": "default"
@@ -134,19 +148,19 @@
               "attribution_model_id": "default"
             },
             {
-              "value": 47,
+              "value": 1,
               "formatted": null,
               "metric_name": "paidClientCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 1,
+              "value": 0,
               "formatted": null,
               "metric_name": "canceledLeadCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 4,
+              "value": 0,
               "formatted": null,
               "metric_name": "progressLeadCount",
               "attribution_model_id": "default"
@@ -159,6 +173,20 @@
               "icon": "https://cloud.roistat.com/img/MagnifyingGlass.png",
               "hash": null,
               "metadata": []
+            },
+            "marker_level_2": {
+              "value": "bing",
+              "title": "Bing",
+              "icon": "https://favicon.yandex.net/favicon/bing.com",
+              "hash": null,
+              "metadata": []
+            },
+            "marker_level_3": {
+              "value": "",
+              "title": "Нет значения",
+              "icon": "",
+              "hash": null,
+              "metadata": []
             }
           },
           "isHasChild": false,
@@ -167,31 +195,126 @@
         {
           "metrics": [
             {
-              "value": 22,
+              "value": 2109,
               "formatted": null,
               "metric_name": "visitCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 22,
+              "value": 2109,
               "formatted": null,
               "metric_name": "visits",
               "attribution_model_id": "default"
             },
             {
-              "value": 3,
+              "value": 57,
               "formatted": null,
               "metric_name": "leadCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 3,
+              "value": 50,
               "formatted": null,
               "metric_name": "paidLeadCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 72950,
+              "value": 1677730,
+              "formatted": null,
+              "metric_name": "paidLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 240860,
+              "formatted": null,
+              "metric_name": "progressLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 129910,
+              "formatted": null,
+              "metric_name": "revenue_сanceled",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 137843.609,
+              "formatted": null,
+              "metric_name": "visitsCost",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 45,
+              "formatted": null,
+              "metric_name": "paidClientCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 1,
+              "formatted": null,
+              "metric_name": "canceledLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 6,
+              "formatted": null,
+              "metric_name": "progressLeadCount",
+              "attribution_model_id": "default"
+            }
+          ],
+          "dimensions": {
+            "marker_level_1": {
+              "value": "google5",
+              "title": "Google Ads 1",
+              "icon": "https://cloud.roistat.com/img/engines/ga.png",
+              "hash": null,
+              "metadata": []
+            },
+            "marker_level_2": {
+              "value": "g",
+              "title": "Поиск",
+              "icon": "",
+              "hash": null,
+              "metadata": []
+            },
+            "marker_level_3": {
+              "value": "23237404958",
+              "title": "Бренд. Поиск 2. Гео: Казахстан #3",
+              "icon": "",
+              "hash": null,
+              "metadata": []
+            }
+          },
+          "isHasChild": false,
+          "hashes": []
+        },
+        {
+          "metrics": [
+            {
+              "value": 1049,
+              "formatted": null,
+              "metric_name": "visitCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 1049,
+              "formatted": null,
+              "metric_name": "visits",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "leadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "paidLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
               "formatted": null,
               "metric_name": "paidLeadsPrice",
               "attribution_model_id": "default"
@@ -209,13 +332,13 @@
               "attribution_model_id": "default"
             },
             {
-              "value": 0,
+              "value": 82769.625,
               "formatted": null,
               "metric_name": "visitsCost",
               "attribution_model_id": "default"
             },
             {
-              "value": 3,
+              "value": 0,
               "formatted": null,
               "metric_name": "paidClientCount",
               "attribution_model_id": "default"
@@ -235,8 +358,22 @@
           ],
           "dimensions": {
             "marker_level_1": {
-              "value": ":utm:ig",
-              "title": "ig",
+              "value": "google5",
+              "title": "Google Ads 1",
+              "icon": "https://cloud.roistat.com/img/engines/ga.png",
+              "hash": null,
+              "metadata": []
+            },
+            "marker_level_2": {
+              "value": "d",
+              "title": "КМС",
+              "icon": "",
+              "hash": null,
+              "metadata": []
+            },
+            "marker_level_3": {
+              "value": "23952158615",
+              "title": "Медийная кампания КМС 18.06.26-25.06.26",
               "icon": "",
               "hash": null,
               "metadata": []
@@ -248,37 +385,37 @@
         {
           "metrics": [
             {
-              "value": 684,
+              "value": 291,
               "formatted": null,
               "metric_name": "visitCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 684,
+              "value": 291,
               "formatted": null,
               "metric_name": "visits",
               "attribution_model_id": "default"
             },
             {
-              "value": 21,
+              "value": 7,
               "formatted": null,
               "metric_name": "leadCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 20,
+              "value": 7,
               "formatted": null,
               "metric_name": "paidLeadCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 800450,
+              "value": 221810,
               "formatted": null,
               "metric_name": "paidLeadsPrice",
               "attribution_model_id": "default"
             },
             {
-              "value": 9980,
+              "value": 0,
               "formatted": null,
               "metric_name": "progressLeadsPrice",
               "attribution_model_id": "default"
@@ -290,13 +427,13 @@
               "attribution_model_id": "default"
             },
             {
-              "value": 75768.485,
+              "value": 17397.944,
               "formatted": null,
               "metric_name": "visitsCost",
               "attribution_model_id": "default"
             },
             {
-              "value": 18,
+              "value": 7,
               "formatted": null,
               "metric_name": "paidClientCount",
               "attribution_model_id": "default"
@@ -308,7 +445,7 @@
               "attribution_model_id": "default"
             },
             {
-              "value": 1,
+              "value": 0,
               "formatted": null,
               "metric_name": "progressLeadCount",
               "attribution_model_id": "default"
@@ -321,85 +458,18 @@
               "icon": "https://favicon.yandex.net/favicon/direct.yandex.ru",
               "hash": null,
               "metadata": []
-            }
-          },
-          "isHasChild": false,
-          "hashes": []
-        },
-        {
-          "metrics": [
-            {
-              "value": 56,
-              "formatted": null,
-              "metric_name": "visitCount",
-              "attribution_model_id": "default"
             },
-            {
-              "value": 56,
-              "formatted": null,
-              "metric_name": "visits",
-              "attribution_model_id": "default"
+            "marker_level_2": {
+              "value": "context",
+              "title": "РСЯ",
+              "icon": "",
+              "hash": null,
+              "metadata": []
             },
-            {
-              "value": 0,
-              "formatted": null,
-              "metric_name": "leadCount",
-              "attribution_model_id": "default"
-            },
-            {
-              "value": 0,
-              "formatted": null,
-              "metric_name": "paidLeadCount",
-              "attribution_model_id": "default"
-            },
-            {
-              "value": 0,
-              "formatted": null,
-              "metric_name": "paidLeadsPrice",
-              "attribution_model_id": "default"
-            },
-            {
-              "value": 0,
-              "formatted": null,
-              "metric_name": "progressLeadsPrice",
-              "attribution_model_id": "default"
-            },
-            {
-              "value": 0,
-              "formatted": null,
-              "metric_name": "revenue_сanceled",
-              "attribution_model_id": "default"
-            },
-            {
-              "value": 0,
-              "formatted": null,
-              "metric_name": "visitsCost",
-              "attribution_model_id": "default"
-            },
-            {
-              "value": 0,
-              "formatted": null,
-              "metric_name": "paidClientCount",
-              "attribution_model_id": "default"
-            },
-            {
-              "value": 0,
-              "formatted": null,
-              "metric_name": "canceledLeadCount",
-              "attribution_model_id": "default"
-            },
-            {
-              "value": 0,
-              "formatted": null,
-              "metric_name": "progressLeadCount",
-              "attribution_model_id": "default"
-            }
-          ],
-          "dimensions": {
-            "marker_level_1": {
-              "value": "direct17",
-              "title": "direct",
-              "icon": "https://favicon.yandex.net/favicon/direct.yandex.ru",
+            "marker_level_3": {
+              "value": "117776765",
+              "title": "Смарт баннеры CPO",
+              "icon": "",
               "hash": null,
               "metadata": []
             }
@@ -410,67 +480,67 @@
         {
           "metrics": [
             {
-              "value": 4631,
+              "value": 4043,
               "formatted": null,
               "metric_name": "visitCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 4631,
+              "value": 4043,
               "formatted": null,
               "metric_name": "visits",
               "attribution_model_id": "default"
             },
             {
-              "value": 94,
+              "value": 31,
               "formatted": null,
               "metric_name": "leadCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 82,
+              "value": 29,
               "formatted": null,
               "metric_name": "paidLeadCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 2721160,
+              "value": 1641860,
               "formatted": null,
               "metric_name": "paidLeadsPrice",
               "attribution_model_id": "default"
             },
             {
-              "value": 341790,
+              "value": 61930,
               "formatted": null,
               "metric_name": "progressLeadsPrice",
               "attribution_model_id": "default"
             },
             {
-              "value": 182890,
+              "value": 0,
               "formatted": null,
               "metric_name": "revenue_сanceled",
               "attribution_model_id": "default"
             },
             {
-              "value": 350803.69,
+              "value": 167156.542,
               "formatted": null,
               "metric_name": "visitsCost",
               "attribution_model_id": "default"
             },
             {
-              "value": 74,
+              "value": 27,
               "formatted": null,
               "metric_name": "paidClientCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 3,
+              "value": 0,
               "formatted": null,
               "metric_name": "canceledLeadCount",
               "attribution_model_id": "default"
             },
             {
-              "value": 9,
+              "value": 2,
               "formatted": null,
               "metric_name": "progressLeadCount",
               "attribution_model_id": "default"
@@ -478,9 +548,23 @@
           ],
           "dimensions": {
             "marker_level_1": {
-              "value": "google5",
-              "title": "Google Ads 1",
-              "icon": "https://cloud.roistat.com/img/engines/ga.png",
+              "value": "facebook3",
+              "title": "Facebook",
+              "icon": "",
+              "hash": null,
+              "metadata": []
+            },
+            "marker_level_2": {
+              "value": "120254142253170405",
+              "title": "CPO: ЛЕТНИЙ SALE_ЖЕНЩИНЫ",
+              "icon": "",
+              "hash": null,
+              "metadata": []
+            },
+            "marker_level_3": {
+              "value": "120254142253190405",
+              "title": "CPO_Ж",
+              "icon": "",
               "hash": null,
               "metadata": []
             }
@@ -540,7 +624,7 @@
             "attribution_model_id": "default"
           },
           {
-            "value": 572,
+            "value": 575,
             "formatted": null,
             "metric_name": "paidClientCount",
             "attribution_model_id": "default"
@@ -568,7 +652,7 @@
         "visits": 0,
         "leads": 0
       },
-      "total_count": 31
+      "total_count": 91
     }
   ],
   "status": "success"
