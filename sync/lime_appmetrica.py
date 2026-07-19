@@ -62,35 +62,43 @@ def first_install_per_device(installs: list[dict], keep_reattribution: bool,
     return best
 
 
-def utm_source_of(raw: str) -> str:
-    """utm_source из параметров ссылки трекера. Нет параметра → пустая строка."""
+def param_of(raw: str, key: str) -> str:
+    """Значение параметра ссылки трекера. Нет параметра → пустая строка."""
     if not raw:
         return ""
     try:
         q = parse_qs(raw)
     except Exception:
         return ""
-    vals = q.get("utm_source")
+    vals = q.get(key)
     return (vals[0] if vals else "")[:64]
 
 
-def build_installs_weekly(installs: list[dict], keep_reattribution: bool,
-                          keep_reinstall: bool) -> list[tuple]:
-    """Установки недели = уникальные устройства, установившие ИМЕННО в эту неделю.
+def build_installs_daily(installs: list[dict], keep_reattribution: bool,
+                         keep_reinstall: bool) -> list[tuple]:
+    """Установки дня = уникальные устройства, установившие ИМЕННО в этот день.
 
-    Дедуп локальный, внутри (неделя × партнёр), а НЕ по первой установке за всё окно:
-    иначе устройство, поставившее приложение повторно, выпадало бы из свежих недель
+    Грань дневная, потому что главная таблица дашборда суммирует дневные строки по
+    произвольному диапазону дат — недельная метрика на таком диапазоне ломается
+    (диапазон режет неделю пополам). Виджет APP сворачивает дни в недели сам.
+
+    Дедуп локальный, внутри (день × партнёр), а НЕ по первой установке за всё окно:
+    иначе устройство, поставившее приложение повторно, выпадало бы из свежих периодов
     (сверка со слайдами: глобальный дедуп давал −606 на неделе 29.06, локальный +206).
-    Когорты — наоборот, живут на первой установке (см. build_cohorts).
+    Разница дневного дедупа и недельного пренебрежима (~41 устройство за 13 недель) —
+    калибровка по слайдам сохраняется. Когорты живут на первой установке (build_cohorts).
 
-    Детализация: за устройством закрепляется ОДИН utm_source — от самой ранней его
-    установки в этой неделе у этого партнёра. Иначе устройство с двумя установками под
-    разными utm попало бы в две детальные строки, и детали не сложились бы в родителя.
+    Детализация: за устройством закрепляются utm_source и campaign_id самой ранней его
+    установки в этом дне у этого партнёра — иначе устройство с двумя установками под
+    разными метками попало бы в две строки, и детали не сложились бы в родителя.
 
-    Возвращает (week, publisher, detail, installs); detail="" — «без параметров».
+    campaign_id есть только у Директа (~96%); у VK в трекере лежит группа объявлений,
+    а не кампания, поэтому там пусто — метрика ляжет на грань канала.
+
+    Возвращает (date, publisher, detail, campaign_id, installs).
     """
-    # (week, publisher, device) → (самая ранняя дата, её utm_source)
-    first_in_week: dict[tuple, tuple] = {}
+    # (date, publisher, device) → (самая ранняя дата, utm_source, campaign_id)
+    first_in_day: dict[tuple, tuple] = {}
     for r in installs:
         if not keep_reinstall and _truthy(r.get("is_reinstallation")):
             continue
@@ -100,15 +108,17 @@ def build_installs_weekly(installs: list[dict], keep_reattribution: bool,
         if not dev:
             continue
         dt = parse_dt(r["install_datetime"])
-        key = (iso_monday(dt), r.get("publisher_name") or "unknown", dev)
-        cur = first_in_week.get(key)
+        key = (dt.date(), r.get("publisher_name") or "unknown", dev)
+        cur = first_in_day.get(key)
         if cur is None or dt < cur[0]:
-            first_in_week[key] = (dt, utm_source_of(r.get("click_url_parameters") or ""))
+            params = r.get("click_url_parameters") or ""
+            first_in_day[key] = (dt, param_of(params, "utm_source"),
+                                 param_of(params, "campaign_id"))
 
     agg: dict[tuple, int] = defaultdict(int)
-    for (wk, pub, _dev), (_dt, detail) in first_in_week.items():
-        agg[(wk, pub, detail)] += 1
-    return [(w, p, d, n) for (w, p, d), n in agg.items()]
+    for (day, pub, _dev), (_dt, detail, campaign) in first_in_day.items():
+        agg[(day, pub, detail, campaign)] += 1
+    return [(d, p, det, c, n) for (d, p, det, c), n in agg.items()]
 
 
 def purchase_facts(events: list[dict]) -> list[tuple]:
@@ -229,7 +239,8 @@ def _write(installs_rows: list[tuple], cohort_rows: list[tuple]) -> None:
             cur.execute("DELETE FROM lime_app_installs")
             psycopg2.extras.execute_values(
                 cur,
-                "INSERT INTO lime_app_installs (week, publisher, detail, installs) VALUES %s",
+                "INSERT INTO lime_app_installs (date, publisher, detail, campaign_id, installs) "
+                "VALUES %s",
                 installs_rows, page_size=500,
             )
             cur.execute("DELETE FROM lime_app_cohorts")
@@ -284,7 +295,7 @@ def sync_lime_appmetrica() -> None:
     first = first_install_per_device(installs_raw, keep_reattr, keep_reinstall)
     # Недельные установки — по сырым строкам (дедуп внутри недели); когорты — по первой
     # установке устройства. Это два разных вопроса и две разные агрегации.
-    installs_rows = build_installs_weekly(installs_raw, keep_reattr, keep_reinstall)
+    installs_rows = build_installs_daily(installs_raw, keep_reattr, keep_reinstall)
     cohort_rows = build_cohorts(first, purchases_raw, max_life)
 
     if not installs_rows:

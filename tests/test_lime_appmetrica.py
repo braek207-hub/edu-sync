@@ -42,55 +42,71 @@ def _buy(dev, ym, amount=1000.0, txn=None):
 
 
 def _by_pub(rows):
-    """Свернуть детальные строки до (неделя, партнёр) — родительский итог."""
+    """Свернуть детальные строки до (день, партнёр) — родительский итог."""
     agg = {}
-    for (w, p, _d, n) in rows:
-        agg[(w, p)] = agg.get((w, p), 0) + n
+    for (d, p, _det, _camp, n) in rows:
+        agg[(d, p)] = agg.get((d, p), 0) + n
     return agg
 
 
-def _inst(dev, dt, pub, reinst="0", reattr="0", utm=None):
+def _inst(dev, dt, pub, reinst="0", reattr="0", utm=None, camp=None):
     r = {"appmetrica_device_id": dev, "install_datetime": dt, "publisher_name": pub,
          "is_reinstallation": reinst, "is_reattribution": reattr}
+    parts = []
     if utm:
-        r["click_url_parameters"] = "utm_source=" + utm
+        parts.append("utm_source=" + utm)
+    if camp:
+        parts.append("campaign_id=" + camp)
+    if parts:
+        r["click_url_parameters"] = "&".join(parts)
     return r
 
 
-def test_build_installs_weekly_counts_unique_devices_per_week():
-    installs = [
-        _inst("d1", "2026-01-06 10:00:00", "VK Ads"),      # пн 05.01
-        _inst("d2", "2026-01-08 10:00:00", "VK Ads"),      # та же неделя
-        _inst("d1", "2026-01-09 11:00:00", "VK Ads"),      # то же устройство в той же неделе
-        _inst("d3", "2026-01-06 10:00:00", "Organic"),
-    ]
-    rows = _by_pub(m.build_installs_weekly(installs, False, False))
-    assert rows[(date(2026, 1, 5), "VK Ads")] == 2        # d1 не задваивается
-    assert rows[(date(2026, 1, 5), "Organic")] == 1
-
-
-def test_build_installs_weekly_counts_device_again_in_a_later_week():
-    """Ключевое отличие от когорт: повторная установка в другой неделе ДОЛЖНА считаться.
-    Глобальный дедуп по первой установке терял такие устройства в свежих неделях."""
+def test_build_installs_daily_counts_unique_devices_per_day():
     installs = [
         _inst("d1", "2026-01-06 10:00:00", "VK Ads"),
-        _inst("d1", "2026-02-10 10:00:00", "VK Ads"),     # то же устройство, другая неделя
+        _inst("d1", "2026-01-06 18:00:00", "VK Ads"),   # то же устройство, тот же день
+        _inst("d2", "2026-01-06 10:00:00", "VK Ads"),
+        _inst("d3", "2026-01-06 10:00:00", "Organic"),
     ]
-    rows = _by_pub(m.build_installs_weekly(installs, False, False))
-    assert rows[(date(2026, 1, 5), "VK Ads")] == 1
-    assert rows[(date(2026, 2, 9), "VK Ads")] == 1        # не потеряно
+    rows = _by_pub(m.build_installs_daily(installs, False, False))
+    assert rows[(date(2026, 1, 6), "VK Ads")] == 2      # d1 не задваивается
+    assert rows[(date(2026, 1, 6), "Organic")] == 1
 
 
-def test_build_installs_weekly_respects_filters():
+def test_build_installs_daily_counts_device_again_on_another_day():
+    """Повторная установка в другой день ДОЛЖНА считаться — в отличие от когорт."""
+    installs = [
+        _inst("d1", "2026-01-06 10:00:00", "VK Ads"),
+        _inst("d1", "2026-02-10 10:00:00", "VK Ads"),
+    ]
+    rows = _by_pub(m.build_installs_daily(installs, False, False))
+    assert rows[(date(2026, 1, 6), "VK Ads")] == 1
+    assert rows[(date(2026, 2, 10), "VK Ads")] == 1
+
+
+def test_build_installs_daily_respects_filters():
     installs = [
         _inst("d1", "2026-01-06 10:00:00", "VK Ads", reattr="true"),
         _inst("d2", "2026-01-06 10:00:00", "VK Ads", reinst="true"),
         _inst("d3", "2026-01-06 10:00:00", "VK Ads"),
     ]
-    rows = _by_pub(m.build_installs_weekly(installs, False, False))
-    assert rows[(date(2026, 1, 5), "VK Ads")] == 1        # остаётся только d3
-    rows_keep = _by_pub(m.build_installs_weekly(installs, True, True))
-    assert rows_keep[(date(2026, 1, 5), "VK Ads")] == 3
+    # переатрибуции считаем, переустановки нет
+    rows = _by_pub(m.build_installs_daily(installs, True, False))
+    assert rows[(date(2026, 1, 6), "VK Ads")] == 2
+    rows_strict = _by_pub(m.build_installs_daily(installs, False, False))
+    assert rows_strict[(date(2026, 1, 6), "VK Ads")] == 1
+
+
+def test_build_installs_daily_keeps_campaign_id_for_direct():
+    """campaign_id нужен, чтобы приклеить установки к строке кампании в таблице."""
+    installs = [
+        _inst("d1", "2026-01-06 10:00:00", "Yandex.Direct", utm="ya.direct", camp="704121835"),
+        _inst("d2", "2026-01-06 10:00:00", "VK Ads", utm="vk_ads"),   # у VK кампании нет
+    ]
+    rows = {(p, camp): n for (_d, p, _det, camp, n) in m.build_installs_daily(installs, False, False)}
+    assert rows[("Yandex.Direct", "704121835")] == 1
+    assert rows[("VK Ads", "")] == 1                    # пусто, а не мусор
 
 
 def test_build_cohorts_cumulative_unique_buyers():
@@ -179,33 +195,31 @@ def test_sync_refuses_to_wipe_when_installs_raw_is_empty():
     mock_write.assert_not_called()   # ключевая проверка: без неё тест прошёл бы даже при wipe
 
 
-def test_build_installs_weekly_splits_by_utm_source():
+def test_build_installs_daily_splits_by_utm_source():
     installs = [
         _inst("d1", "2026-01-06 10:00:00", "Website", utm="ya.direct"),
-        _inst("d2", "2026-01-07 10:00:00", "Website", utm="google"),
-        _inst("d3", "2026-01-08 10:00:00", "Website"),          # без параметров
+        _inst("d2", "2026-01-06 10:00:00", "Website", utm="google"),
+        _inst("d3", "2026-01-06 10:00:00", "Website"),          # без параметров
     ]
-    rows = {(w, p, d): n for (w, p, d, n) in m.build_installs_weekly(installs, False, False)}
-    wk = date(2026, 1, 5)
-    assert rows[(wk, "Website", "ya.direct")] == 1
-    assert rows[(wk, "Website", "google")] == 1
-    assert rows[(wk, "Website", "")] == 1
+    rows = {(p, det): n for (_d, p, det, _c, n) in m.build_installs_daily(installs, False, False)}
+    assert rows[("Website", "ya.direct")] == 1
+    assert rows[("Website", "google")] == 1
+    assert rows[("Website", "")] == 1
 
 
 def test_details_sum_exactly_to_parent_when_device_switches_utm():
-    """Устройство с двумя установками в неделе под разными utm не должно задваиваться:
+    """Устройство с двумя установками в дне под разными utm не должно задваиваться:
     за ним закрепляется utm самой ранней установки, иначе детали не сложатся в родителя."""
     installs = [
         _inst("d1", "2026-01-06 10:00:00", "Website", utm="google"),   # раньше
-        _inst("d1", "2026-01-09 10:00:00", "Website", utm="ig"),       # позже, то же устройство
-        _inst("d2", "2026-01-07 10:00:00", "Website", utm="ig"),
+        _inst("d1", "2026-01-06 18:00:00", "Website", utm="ig"),       # позже, то же устройство
+        _inst("d2", "2026-01-06 12:00:00", "Website", utm="ig"),
     ]
-    rows = m.build_installs_weekly(installs, False, False)
-    wk = date(2026, 1, 5)
-    by_detail = {d: n for (w, p, d, n) in rows}
+    rows = m.build_installs_daily(installs, False, False)
+    by_detail = {det: n for (_d, _p, det, _c, n) in rows}
     assert by_detail["google"] == 1        # d1 закреплён за ранним utm
     assert by_detail["ig"] == 1            # только d2
-    assert _by_pub(rows)[(wk, "Website")] == 2   # детали == родитель, без задвоения
+    assert _by_pub(rows)[(date(2026, 1, 6), "Website")] == 2   # детали == родитель
 
 
 def test_purchase_facts_dedups_by_transaction_id():
