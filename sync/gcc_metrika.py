@@ -12,12 +12,10 @@ CHANNEL_DIMENSIONS = (
     "ym:s:lastsignTrafficSource",
 )
 
-# Прод-набор. ⚠️ Движка источника здесь НЕТ намеренно: `lastsignSourceEngine`,
-# `lastsignSourceEngineName` и `lastsignAdvEngine` выбрасывают мелкие комбинации вместо
+# Набор для НЕрекламного трафика. ⚠️ Движка источника здесь нет намеренно:
+# `lastsignSourceEngine` в кроссе с доменом выбрасывает мелкие комбинации вместо
 # схлопывания в «прочее» — Бахрейн терял 505 визитов и 7 источников → 299 и один Internal
-# (зонд 2026-07-18, docs/GCC_CONTRACTS.md). utm-метки и searchEngine такого не делают:
-# полный набор ниже даёт 210 827 визитов = эталон, потерь нет.
-# Площадку рекламы восстанавливаем из utm (resolve_engine), а не из движка.
+# (зонд 2026-07-18). utm-метки и searchEngine такого не делают: потерь нет.
 COUNTRY_DIMENSIONS = (
     "ym:s:date",
     "ym:s:startURLDomain",
@@ -25,6 +23,31 @@ COUNTRY_DIMENSIONS = (
     "ym:s:UTMSource",
     "ym:s:UTMCampaign",
     "ym:s:lastsignSearchEngine",
+)
+
+# Реклама — отдельным запросом С движком. Зонд П4 (2026-07-19, docs/GCC_CONTRACTS.md):
+# обрезка бьёт по ХВОСТУ, поэтому на узкой выборке «только реклама» она почти не работает —
+# движок стоит 0.44% против 42% на общем запросе, а площадка известна у 100% платных
+# визитов (Google Ads 49%, Instagram 37%, Facebook 14%; корзины «без движка» нет).
+# До этого площадка бралась из utm, и 23% платного трафика висело подканалом «Ad».
+AD_FILTER = "ym:s:lastsignTrafficSource=='ad'"
+NONAD_FILTER = "ym:s:lastsignTrafficSource!='ad'"
+
+# Площадка + кампания: стоит 3.13%, разницу добираем строкой-остатком с известной площадкой.
+AD_DIMENSIONS = (
+    "ym:s:date",
+    "ym:s:startURLDomain",
+    "ym:s:lastsignTrafficSource",
+    "ym:s:lastsignSourceEngine",
+    "ym:s:UTMCampaign",
+)
+
+# Та же грань без кампании (0.44%) — эталон для остатка внутри рекламы.
+AD_ENGINE_DIMENSIONS = (
+    "ym:s:date",
+    "ym:s:startURLDomain",
+    "ym:s:lastsignTrafficSource",
+    "ym:s:lastsignSourceEngine",
 )
 
 # Цели счётчика GCC (проверено 2026-07-18 на живых данных за неделю):
@@ -137,6 +160,13 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
         search_engine = dim(dims, "ym:s:lastsignSearchEngine", "name") or None
         visits = metrics[0] if len(metrics) > 0 else None
 
+        # Настоящий движок есть только в рекламном запросе. Где он есть — берём его,
+        # он точнее восстановленного из utm и покрывает визиты вовсе без меток.
+        real_engine = dim(dims, "ym:s:lastsignSourceEngine", "name") or None
+        engine = real_engine or resolve_engine(
+            traffic_source, utm_source, campaign, search_engine
+        )
+
         rows.append(
             {
                 "date": dim(dims, "ym:s:date", "name"),
@@ -145,8 +175,7 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
                 "traffic_source": traffic_source,
                 # Нужен маппингу, чтобы отличить рассылку Mindbox от прочей почты.
                 "utm_source": utm_source,
-                # Совместимо с map_metrika_channel: снаружи это по-прежнему «движок».
-                "source_engine": resolve_engine(traffic_source, utm_source, campaign, search_engine),
+                "source_engine": engine,
                 "visits": visits,
                 "users": metrics[1] if len(metrics) > 1 else None,
                 "new_users": metrics[2] if len(metrics) > 2 else None,
@@ -207,20 +236,55 @@ def residual_rows(total_rows: list[dict], country_rows: list[dict]) -> list[dict
     return out
 
 
-def _fetch(counter_id, token: str, date_from: str, date_to: str, dimensions) -> list[dict]:
+def ad_engine_residual(engine_rows: list[dict], detail_rows: list[dict]) -> list[dict]:
+    """Платные визиты, не попавшие в разрез с кампанией → строки с площадкой, без кампании.
+
+    Кампания стоит 3.13% визитов (зонд П4), и теряются они на хвосте — то есть на мелких
+    странах. Разницу по (дата, страна, площадка) дописываем отдельной строкой: площадка
+    сохраняется, теряется только кампания. Без этого платный тотал просел бы на 3%.
+    """
+    def key(row):
+        return (row["date"], row["country"], row["source_engine"])
+
+    attributed: dict[tuple, list[float]] = {}
+    for row in detail_rows:
+        acc = attributed.setdefault(key(row), [0.0, 0.0])
+        acc[0] += float(row["visits"] or 0)
+        acc[1] += float(row["users"] or 0)
+
+    out = []
+    for row in engine_rows:
+        seen_v, seen_u = attributed.get(key(row), (0.0, 0.0))
+        visits = float(row["visits"] or 0) - seen_v
+        if visits <= 0:
+            continue
+        out.append({
+            **row,
+            "campaign": None,
+            "visits": visits,
+            "users": max(float(row["users"] or 0) - seen_u, 0.0),
+        })
+    return out
+
+
+def _fetch(counter_id, token: str, date_from: str, date_to: str, dimensions,
+           filters: str | None = None) -> list[dict]:
+    params = {
+        "ids": counter_id,
+        "date1": date_from,
+        "date2": date_to,
+        "metrics": ",".join(METRICS),
+        "dimensions": ",".join(dimensions),
+        "accuracy": "full",
+        "limit": 100000,
+    }
+    if filters:
+        params["filters"] = filters
     resp = requests.get(
         "https://api-metrika.yandex.net/stat/v1/data",
         headers={"Authorization": f"OAuth {token}"},
-        params={
-            "ids": counter_id,
-            "date1": date_from,
-            "date2": date_to,
-            "metrics": ",".join(METRICS),
-            "dimensions": ",".join(dimensions),
-            "accuracy": "full",
-            "limit": 100000,
-        },
-        timeout=30,
+        params=params,
+        timeout=60,
     )
     resp.raise_for_status()
     return parse_metrika_traffic(resp.json())
@@ -243,6 +307,15 @@ def fetch_metrika_traffic(
     Returns:
         Строки parse_metrika_traffic: по странам + остатки (country=None).
     """
-    by_country = _fetch(counter_id, token, date_from, date_to, COUNTRY_DIMENSIONS)
+    # Нерекламный трафик — прежним набором (движок бы его порезал).
+    nonad = _fetch(counter_id, token, date_from, date_to, COUNTRY_DIMENSIONS, NONAD_FILTER)
+
+    # Реклама — своим запросом С движком: на узкой выборке обрезка почти не работает,
+    # и площадка известна даже у визитов вовсе без utm-меток (зонд П4).
+    ad_detail = _fetch(counter_id, token, date_from, date_to, AD_DIMENSIONS, AD_FILTER)
+    ad_engine = _fetch(counter_id, token, date_from, date_to, AD_ENGINE_DIMENSIONS, AD_FILTER)
+    ad = ad_detail + ad_engine_residual(ad_engine, ad_detail)
+
+    by_country = nonad + ad
     totals = _fetch(counter_id, token, date_from, date_to, CHANNEL_DIMENSIONS)
     return by_country + residual_rows(totals, by_country)

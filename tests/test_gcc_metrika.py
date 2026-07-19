@@ -16,10 +16,10 @@ def test_parse_metrika_traffic():
     first = rows[0]
     assert first["date"] == "2026-07-17"
     assert first["traffic_source"] == "ad"
-    # Фикстура записана старым запросом (движок читался напрямую). Теперь площадка
-    # восстанавливается из utm/searchEngine, которых в этом ответе нет → None.
-    # Площадку проверяют тесты resolve_engine ниже.
-    assert first["source_engine"] is None
+    # Движок в ответе есть — читаем его напрямую (зонд П4: на выборке «только реклама»
+    # он безопасен и покрывает визиты вовсе без utm). Восстановление из utm осталось
+    # фоллбэком для ответов, где движка нет, — его проверяют тесты resolve_engine ниже.
+    assert first["source_engine"] == "Google Ads"
     assert first["visits"] == 1392.0 and first["users"] == 1024.0
     # строка direct: engine None
     direct = [r for r in rows if r["traffic_source"] == "direct"][0]
@@ -39,7 +39,7 @@ def test_parse_metrika_traffic_with_domain():
     first = rows[0]
     assert first["date"] == "2026-07-17"
     assert first["traffic_source"] == "ad"
-    assert first["source_engine"] is None   # см. комментарий выше: в фикстуре нет utm
+    assert first["source_engine"] == "Google Ads"   # движок есть в ответе — берём его
     assert first["country"] == "ОАЭ"
     # в фикстуре есть несколько стран, все распознаны
     assert {r["country"] for r in rows} == {
@@ -173,3 +173,55 @@ def test_residual_matches_channel_only_reference():
     ]
     rows = residual_rows(totals, by_country)
     assert len(rows) == 1 and rows[0]["visits"] == 50
+
+
+# === Остаток внутри рекламы (П4) ===
+#
+# Кампания стоит 3.13% платных визитов (зонд П4), теряются они на хвосте — на мелких
+# странах. Разницу дописываем строкой с площадкой, но без кампании: тотал точный,
+# площадка сохранена, теряется только кампания.
+
+
+def _ad_row(country, engine, visits, users, campaign=None):
+    return {"date": "2026-07-17", "country": country, "campaign": campaign,
+            "traffic_source": "ad", "source_engine": engine,
+            "visits": visits, "users": users}
+
+
+def test_ad_residual_keeps_platform_and_total():
+    from sync.gcc_metrika import ad_engine_residual
+
+    engine_rows = [_ad_row("ОАЭ", "Google Ads", 1000, 800)]
+    detail_rows = [
+        _ad_row("ОАЭ", "Google Ads", 700, 560, campaign="21067876545"),
+        _ad_row("ОАЭ", "Google Ads", 200, 160, campaign="21067876546"),
+    ]
+    residual = ad_engine_residual(engine_rows, detail_rows)
+
+    assert len(residual) == 1
+    assert residual[0]["visits"] == 100
+    assert residual[0]["source_engine"] == "Google Ads"
+    assert residual[0]["campaign"] is None
+    total = sum(r["visits"] for r in detail_rows + residual)
+    assert total == engine_rows[0]["visits"]
+
+
+def test_ad_residual_silent_when_detail_complete():
+    from sync.gcc_metrika import ad_engine_residual
+
+    engine_rows = [_ad_row("Катар", "Instagram", 500, 400)]
+    detail_rows = [_ad_row("Катар", "Instagram", 500, 400, campaign="x")]
+    assert ad_engine_residual(engine_rows, detail_rows) == []
+
+
+def test_ad_residual_separates_platforms():
+    from sync.gcc_metrika import ad_engine_residual
+
+    engine_rows = [_ad_row("ОАЭ", "Google Ads", 300, 200),
+                   _ad_row("ОАЭ", "Instagram", 400, 300)]
+    detail_rows = [_ad_row("ОАЭ", "Google Ads", 300, 200, campaign="g1")]
+    residual = ad_engine_residual(engine_rows, detail_rows)
+
+    assert len(residual) == 1
+    assert residual[0]["source_engine"] == "Instagram"
+    assert residual[0]["visits"] == 400
