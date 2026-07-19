@@ -23,6 +23,41 @@ def test_free_channels():
     assert map_roistat_channel("Визиты с сайтов") == ("Referrals", "Реферал", "Бесплатный")
 
 
+# ── Подканалы: level_2 несёт разбивку и ложится на канон LIME ────────────────
+# Замер июня: SEO › Google 10 284 / Яндекс 1 076 / Bing 119; «Визиты с сайтов» — 81 домен
+# реферера; manual_mindbox_kz › email. Смотреть только level_1 значит потерять подканал
+# и не сойтись с Метрикой и витриной при сравнении.
+
+def test_seo_splits_by_engine_like_the_canon():
+    assert map_roistat_channel("SEO", "Google", "google")[1] == "SEO Google"
+    assert map_roistat_channel("SEO", "Яндекс", "yandex")[1] == "SEO Yandex"
+    assert map_roistat_channel("SEO", "Bing", "bing")[1] == "SEO Others"
+    assert map_roistat_channel("SEO", "Mail.Ru", "mail")[1] == "SEO Others"
+
+
+def test_referrals_subchannel_is_referrer_domain():
+    """Канон: «Referrals → домен реферера». У Роистата он ровно на level_2."""
+    assert map_roistat_channel("Визиты с сайтов", "l.instagram.com")[1] == "l.instagram.com"
+    assert map_roistat_channel("Визиты с сайтов", "")[1] == "Реферал"
+
+
+def test_crm_subchannel_is_mindbox():
+    """Канон витрины — «Mindbox»; level_1 Роистата прямо называет систему."""
+    assert map_roistat_channel("manual_mindbox_kz", "email") == ("CRM", "Mindbox", "Бесплатный")
+    assert map_roistat_channel("mindboxkz_bk", "email")[1] == "Mindbox"
+
+
+def test_paid_channels_ignore_level2_which_is_campaign_type():
+    """У Google/Директа level_2 — тип кампании, а не подканал: канон его не знает."""
+    assert map_roistat_channel("Google Ads 1", "Поиск", "g")[1] == "Google.Adwords"
+    assert map_roistat_channel("Google Ads 1", "КМС", "d")[1] == "Google.Adwords"
+    assert map_roistat_channel("Яндекс.Директ 1", "РСЯ", "context")[1] == "Яндекс.Директ"
+
+
+def test_direct_has_no_level2():
+    assert map_roistat_channel("Прямые визиты", "") == ("Direct", "Direct", "Бесплатный")
+
+
 def test_channel_name_with_nbsp_still_maps():
     """Подписи приходят с U+00A0; маппер обязан быть к этому устойчив сам."""
     assert map_roistat_channel("Google\xa0Ads\xa01") == ("SEM", "Google.Adwords", "Платный")

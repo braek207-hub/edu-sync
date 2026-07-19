@@ -9,9 +9,13 @@ kz_roistat, kz_metrika и kz описывают ОДНИ продажи разн
 Незнакомый канал НЕ угадываем: он уходит в Others с собственным именем в subchannel, чтобы
 появление нового источника было видно в дашборде, а не растворилось.
 
-Ограничение, которое надо знать: Роистат не различает поисковики внутри SEO — у него один
-канал «SEO», тогда как Метрика даёт «SEO Google» и «SEO Yandex» отдельно. Поэтому по SEO
-сводная сходится на уровне канала, но не подканала.
+Подканал живёт на marker_level_2 и ложится на канон один в один (замер июня 2026):
+  SEO             › Google 10 284 / Яндекс 1 076 / Bing 119 / Mail.Ru 67  → SEO Google|Yandex|Others
+  Визиты с сайтов › 81 домен реферера (l.instagram.com 2 500, acs.tiptoppay.kz 65)  → домен
+  manual_mindbox  › email  → Mindbox
+  Прямые визиты   › пусто  → Direct
+У платных каналов level_2 — это ТИП кампании (Поиск / КМС / PMax / РСЯ), а не подканал:
+канон такой ступени не знает, поэтому там подканал задаётся каналом.
 """
 
 PAID = "Платный"
@@ -55,17 +59,44 @@ def _norm(name: str) -> str:
     return (name or "").replace("\xa0", " ").strip()
 
 
-def map_roistat_channel(name: str) -> tuple[str, str, str]:
-    """(channel, subchannel, traffic_type) в таксономии LIME."""
+# Канон SEO знает три ступени; Роистат отдаёт движок в value уровня (google/yandex/bing/…).
+_SEO_CANON = (("google", "SEO Google"), ("yandex", "SEO Yandex"))
+
+
+def _seo_subchannel(level2_id: str, level2: str) -> str:
+    probe = f"{_norm(level2_id)} {_norm(level2)}".lower()
+    for needle, canon in _SEO_CANON:
+        if needle in probe:
+            return canon
+    return "SEO Others"
+
+
+def map_roistat_channel(name: str, level2: str = "", level2_id: str = "") -> tuple[str, str, str]:
+    """(channel, subchannel, traffic_type) в таксономии LIME.
+
+    Args:
+        name: marker_level_1 (канал).
+        level2: подпись marker_level_2 — подканал у SEO/Referrals/CRM, тип кампании у
+            платных каналов, пусто у Direct.
+        level2_id: value того же уровня (у SEO это код движка: google/yandex/bing).
+    """
     key = _norm(name)
     if not key:
         return ("Others", "Unknown", FREE)
     if key in IS_OFFLINE:
         return ("Offline", key, FREE)
+
+    if key == "SEO":
+        return ("SEO", _seo_subchannel(level2_id, level2), FREE)
+    if key == "Визиты с сайтов":
+        # Канон: «Referrals → домен реферера»; у Роистата домен ровно на level_2.
+        return ("Referrals", _norm(level2) or "Реферал", FREE)
+    if key.lower().startswith(("mindbox", "manual_mindbox")):
+        # level_2 у рассылок = «email»; канон витрины называет систему — Mindbox.
+        return ("CRM", "Mindbox", FREE)
+
     if key in _MAP:
         return _MAP[key]
-    if key.lower().startswith(("mindbox", "manual_mindbox")):
-        return ("CRM", key, FREE)
     return ("Others", key, FREE)
 
 
