@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Зонд П2-c: SQL-эндпоинт Triple Whale — есть ли расход по странам и кампаниям.
+"""Зонд П2-e: SQL-эндпоинт Triple Whale — расход по странам и кампаниям.
 
-История вопроса: summary-page отдаёт расход одной цифрой на магазин, и 13 форм
-параметра фильтра по стране он молча игнорирует. Но в UI фильтр по стране есть,
-значит данные существуют. Документация (triplewhale.readme.io/llms.txt) показала
-эндпоинт «Execute Custom SQL Query» — прямой SQL по хранилищу Orcabase.
-
-POST https://api.triplewhale.com/api/v2/orcabase/api/sql
-Authorization: Bearer <ключ>   ← НЕ x-api-key, в отличие от остальных эндпоинтов
+⚠️ Первая версия этого зонда авторизовалась через `Authorization: Bearer` и получила
+401 Invalid iss, из чего был сделан вывод «эндпоинт нам закрыт». Вывод неверный:
+справочная страница (triplewhale.readme.io/reference/data-out-execute-custom-sql-query)
+задаёт схему `{"type": "apiKey", "in": "header", "name": "x-api-key"}` — то есть
+обычный ключ. Отличается и тело: shopId (не shopDomain), period.startDate/endDate,
+а в самом SQL параметры @startDate / @endDate.
 
 Только SELECT. Запуск: python -m scripts.probe_tw_sql
 """
@@ -24,54 +23,57 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 load_dotenv()
 
 URL = "https://api.triplewhale.com/api/v2/orcabase/api/sql"
-PERIOD = {"start": "2026-06-01", "end": "2026-06-30"}
+PERIOD = {"startDate": "2026-06-01", "endDate": "2026-06-30"}
 
 
-def run(query: str, label: str, quiet: bool = False):
-    body = {"query": query, "period": PERIOD}
+def sql(query: str, label: str, show: int = 700):
+    body = {
+        "shopId": os.environ["GCC_TW_SHOP_DOMAIN"],
+        "query": query,
+        "period": PERIOD,
+    }
     for attempt in range(1, 4):
         try:
             r = requests.post(
                 URL,
-                headers={"Authorization": f"Bearer {os.environ['GCC_TRIPLEWHALE_API_KEY']}",
+                headers={"x-api-key": os.environ["GCC_TRIPLEWHALE_API_KEY"],
                          "Content-Type": "application/json"},
                 json=body, timeout=180,
             )
         except Exception as exc:
-            time.sleep(5 * attempt)
             if attempt == 3:
                 print(f"[{label}] сеть: {type(exc).__name__}")
                 return None
+            time.sleep(5 * attempt)
             continue
         break
 
     if r.status_code != 200:
-        print(f"[{label}] HTTP {r.status_code}: {(r.text or '')[:300]}")
+        print(f"[{label}] HTTP {r.status_code}: {(r.text or '')[:280]}")
         return None
     try:
         data = r.json()
     except Exception:
-        print(f"[{label}] 200, но не JSON: {(r.text or '')[:200]}")
+        print(f"[{label}] 200, не JSON: {(r.text or '')[:200]}")
         return None
-    if not quiet:
-        preview = json.dumps(data, ensure_ascii=False)[:700]
-        print(f"[{label}] OK: {preview}")
+    print(f"[{label}] OK: {json.dumps(data, ensure_ascii=False)[:show]}")
     return data
 
 
 def main():
-    print("=== 1. Доступ ===")
-    if run("SELECT 1 AS ok", "смоук") is None:
-        print("SQL-эндпоинт недоступен этим ключом — дальше смысла нет")
+    print("=== 1. Доступ (x-api-key, как в справочнике) ===")
+    if sql("SELECT 1 AS ok", "смоук") is None:
+        print("\nНе открылся и так — дальше по документации смотреть нечего.")
         return
 
-    print("\n=== 2. Какие таблицы видны ===")
-    for q, label in [
-        ("SELECT table_name FROM INFORMATION_SCHEMA.TABLES LIMIT 200", "information_schema"),
-        ("SHOW TABLES", "show tables"),
-    ]:
-        if run(q, label):
-            break
+    print("\n=== 2. Пример из документации: расход по каналам ===")
+    sql("SELECT channel, SUM(spend) AS spend FROM ads_table "
+        "WHERE event_date BETWEEN @startDate AND @endDate GROUP BY channel "
+        "ORDER BY spend DESC", "ads_table по каналам")
+
+    print("\n=== 3. Какие колонки есть у ads_table ===")
+    sql("SELECT * FROM ads_table WHERE event_date BETWEEN @startDate AND @endDate LIMIT 1",
+        "одна строка ads_table", show=1500)
 
 
 if __name__ == "__main__":

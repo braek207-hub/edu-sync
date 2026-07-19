@@ -30,6 +30,7 @@ from sync.fx import to_rub as fx_to_rub
 from sync.gcc_channels import map_metrika_channel
 from sync.gcc_google_geo import fetch_geo_spend
 from sync.gcc_metrika import fetch_metrika_traffic
+from sync.gcc_tw_ads import fetch_ads_spend, spend_metrics_covered
 from sync.gcc_triplewhale import aggregate_orders_by_channel, fetch_tw_orders, fetch_tw_spend, spend_by_channel
 
 METRICA_COUNTER_ID = os.environ.get("GCC_METRICA_COUNTER_ID") or "98232701"
@@ -120,10 +121,14 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
         row["revenue"] += float(o["revenue"] or 0)
 
     for sp in tw_spend_rows:
-        # summary-page даёт расход на магазин целиком (country=None); гео-разбивка Meta — Фаза 2.
-        row = _bucket(sp.get("country"), None, sp["channel"], sp["subchannel"],
-                      sp.get("traffic_type"))
+        # Два вида строк: из summary-page (весь магазин, country/campaign = None) и из
+        # ads_table по кампаниям (страна выведена из имени кампании). Ключ берём как есть —
+        # первые садятся в тотал GCC, вторые на свою страну и кампанию.
+        row = _bucket(sp.get("country"), sp.get("campaign_id"), sp["channel"],
+                      sp["subchannel"], sp.get("traffic_type"))
         row["cost"] += float(sp["cost"] or 0)
+        if sp.get("campaign_name") and not row["campaign_name"]:
+            row["campaign_name"] = sp["campaign_name"]
 
     for sp in rub_spend_rows:
         # Уже в рублях (гео-расход Google из кабинета) — в отдельную корзину, мимо курса.
@@ -171,7 +176,14 @@ def _sync_range(frm: date, to: date, conn) -> int:
         google_geo = fetch_geo_spend(conn, day_s)
         if google_geo:
             tw_metrics = {k: v for k, v in tw_metrics.items() if k != "ga_adCost"}
-        spend = spend_by_channel(tw_metrics, day_s)
+        # Расход прочих площадок (Meta и др.) — по кампаниям из SQL-эндпоинта TW: там
+        # есть имя кампании, а оно несёт страну. Перекрытые метрики выбрасываем из
+        # summary-page, иначе тот же расход посчитается дважды.
+        ads_spend = fetch_ads_spend(tw_key, shop, day_s, day_s)
+        if ads_spend:
+            covered = spend_metrics_covered()
+            tw_metrics = {k: v for k, v in tw_metrics.items() if k not in covered}
+        spend = spend_by_channel(tw_metrics, day_s) + ads_spend
         fx_rate = fx_to_rub("AED", day_s)
         rows = merge_rows(metrika, orders, spend, fx_rate, day_s, rub_spend_rows=google_geo)
 
