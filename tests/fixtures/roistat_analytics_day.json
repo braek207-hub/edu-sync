@@ -1,0 +1,575 @@
+{
+  "data": [
+    {
+      "items": [
+        {
+          "metrics": [
+            {
+              "value": 2666,
+              "formatted": null,
+              "metric_name": "visitCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 2666,
+              "formatted": null,
+              "metric_name": "visits",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 319,
+              "formatted": null,
+              "metric_name": "leadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 293,
+              "formatted": null,
+              "metric_name": "paidLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 12632220,
+              "formatted": null,
+              "metric_name": "paidLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 821240,
+              "formatted": null,
+              "metric_name": "progressLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 180910,
+              "formatted": null,
+              "metric_name": "revenue_сanceled",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "visitsCost",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 261,
+              "formatted": null,
+              "metric_name": "paidClientCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 5,
+              "formatted": null,
+              "metric_name": "canceledLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 21,
+              "formatted": null,
+              "metric_name": "progressLeadCount",
+              "attribution_model_id": "default"
+            }
+          ],
+          "dimensions": {
+            "marker_level_1": {
+              "value": "",
+              "title": "Прямые визиты",
+              "icon": "https://cloud.roistat.com/img/arrow-right.png",
+              "hash": null,
+              "metadata": []
+            }
+          },
+          "isHasChild": false,
+          "hashes": []
+        },
+        {
+          "metrics": [
+            {
+              "value": 799,
+              "formatted": null,
+              "metric_name": "visitCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 799,
+              "formatted": null,
+              "metric_name": "visits",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 54,
+              "formatted": null,
+              "metric_name": "leadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 49,
+              "formatted": null,
+              "metric_name": "paidLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 2018600,
+              "formatted": null,
+              "metric_name": "paidLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 199930,
+              "formatted": null,
+              "metric_name": "progressLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 3990,
+              "formatted": null,
+              "metric_name": "revenue_сanceled",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "visitsCost",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 47,
+              "formatted": null,
+              "metric_name": "paidClientCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 1,
+              "formatted": null,
+              "metric_name": "canceledLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 4,
+              "formatted": null,
+              "metric_name": "progressLeadCount",
+              "attribution_model_id": "default"
+            }
+          ],
+          "dimensions": {
+            "marker_level_1": {
+              "value": "seo",
+              "title": "SEO",
+              "icon": "https://cloud.roistat.com/img/MagnifyingGlass.png",
+              "hash": null,
+              "metadata": []
+            }
+          },
+          "isHasChild": false,
+          "hashes": []
+        },
+        {
+          "metrics": [
+            {
+              "value": 22,
+              "formatted": null,
+              "metric_name": "visitCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 22,
+              "formatted": null,
+              "metric_name": "visits",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 3,
+              "formatted": null,
+              "metric_name": "leadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 3,
+              "formatted": null,
+              "metric_name": "paidLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 72950,
+              "formatted": null,
+              "metric_name": "paidLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "progressLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "revenue_сanceled",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "visitsCost",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 3,
+              "formatted": null,
+              "metric_name": "paidClientCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "canceledLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "progressLeadCount",
+              "attribution_model_id": "default"
+            }
+          ],
+          "dimensions": {
+            "marker_level_1": {
+              "value": ":utm:ig",
+              "title": "ig",
+              "icon": "",
+              "hash": null,
+              "metadata": []
+            }
+          },
+          "isHasChild": false,
+          "hashes": []
+        },
+        {
+          "metrics": [
+            {
+              "value": 684,
+              "formatted": null,
+              "metric_name": "visitCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 684,
+              "formatted": null,
+              "metric_name": "visits",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 21,
+              "formatted": null,
+              "metric_name": "leadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 20,
+              "formatted": null,
+              "metric_name": "paidLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 800450,
+              "formatted": null,
+              "metric_name": "paidLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 9980,
+              "formatted": null,
+              "metric_name": "progressLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "revenue_сanceled",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 75768.485,
+              "formatted": null,
+              "metric_name": "visitsCost",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 18,
+              "formatted": null,
+              "metric_name": "paidClientCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "canceledLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 1,
+              "formatted": null,
+              "metric_name": "progressLeadCount",
+              "attribution_model_id": "default"
+            }
+          ],
+          "dimensions": {
+            "marker_level_1": {
+              "value": "direct6",
+              "title": "Яндекс.Директ 1",
+              "icon": "https://favicon.yandex.net/favicon/direct.yandex.ru",
+              "hash": null,
+              "metadata": []
+            }
+          },
+          "isHasChild": false,
+          "hashes": []
+        },
+        {
+          "metrics": [
+            {
+              "value": 56,
+              "formatted": null,
+              "metric_name": "visitCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 56,
+              "formatted": null,
+              "metric_name": "visits",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "leadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "paidLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "paidLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "progressLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "revenue_сanceled",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "visitsCost",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "paidClientCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "canceledLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 0,
+              "formatted": null,
+              "metric_name": "progressLeadCount",
+              "attribution_model_id": "default"
+            }
+          ],
+          "dimensions": {
+            "marker_level_1": {
+              "value": "direct17",
+              "title": "direct",
+              "icon": "https://favicon.yandex.net/favicon/direct.yandex.ru",
+              "hash": null,
+              "metadata": []
+            }
+          },
+          "isHasChild": false,
+          "hashes": []
+        },
+        {
+          "metrics": [
+            {
+              "value": 4631,
+              "formatted": null,
+              "metric_name": "visitCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 4631,
+              "formatted": null,
+              "metric_name": "visits",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 94,
+              "formatted": null,
+              "metric_name": "leadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 82,
+              "formatted": null,
+              "metric_name": "paidLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 2721160,
+              "formatted": null,
+              "metric_name": "paidLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 341790,
+              "formatted": null,
+              "metric_name": "progressLeadsPrice",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 182890,
+              "formatted": null,
+              "metric_name": "revenue_сanceled",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 350803.69,
+              "formatted": null,
+              "metric_name": "visitsCost",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 74,
+              "formatted": null,
+              "metric_name": "paidClientCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 3,
+              "formatted": null,
+              "metric_name": "canceledLeadCount",
+              "attribution_model_id": "default"
+            },
+            {
+              "value": 9,
+              "formatted": null,
+              "metric_name": "progressLeadCount",
+              "attribution_model_id": "default"
+            }
+          ],
+          "dimensions": {
+            "marker_level_1": {
+              "value": "google5",
+              "title": "Google Ads 1",
+              "icon": "https://cloud.roistat.com/img/engines/ga.png",
+              "hash": null,
+              "metadata": []
+            }
+          },
+          "isHasChild": false,
+          "hashes": []
+        }
+      ],
+      "mean": {
+        "metrics": [
+          {
+            "value": 16826,
+            "formatted": null,
+            "metric_name": "visitCount",
+            "attribution_model_id": "default"
+          },
+          {
+            "value": 16826,
+            "formatted": null,
+            "metric_name": "visits",
+            "attribution_model_id": "default"
+          },
+          {
+            "value": 697,
+            "formatted": null,
+            "metric_name": "leadCount",
+            "attribution_model_id": "default"
+          },
+          {
+            "value": 637,
+            "formatted": null,
+            "metric_name": "paidLeadCount",
+            "attribution_model_id": "default"
+          },
+          {
+            "value": 27455980,
+            "formatted": null,
+            "metric_name": "paidLeadsPrice",
+            "attribution_model_id": "default"
+          },
+          {
+            "value": 1745610,
+            "formatted": null,
+            "metric_name": "progressLeadsPrice",
+            "attribution_model_id": "default"
+          },
+          {
+            "value": 375770,
+            "formatted": null,
+            "metric_name": "revenue_сanceled",
+            "attribution_model_id": "default"
+          },
+          {
+            "value": 770774.148,
+            "formatted": null,
+            "metric_name": "visitsCost",
+            "attribution_model_id": "default"
+          },
+          {
+            "value": 572,
+            "formatted": null,
+            "metric_name": "paidClientCount",
+            "attribution_model_id": "default"
+          },
+          {
+            "value": 11,
+            "formatted": null,
+            "metric_name": "canceledLeadCount",
+            "attribution_model_id": "default"
+          },
+          {
+            "value": 49,
+            "formatted": null,
+            "metric_name": "progressLeadCount",
+            "attribution_model_id": "default"
+          }
+        ],
+        "dimensions": [],
+        "isHasChild": false,
+        "hashes": []
+      },
+      "dateFrom": "2026-06-18T00:00:00+00:00",
+      "dateTo": "2026-06-19T00:00:00+00:00",
+      "unprocessed": {
+        "visits": 0,
+        "leads": 0
+      },
+      "total_count": 31
+    }
+  ],
+  "status": "success"
+}
