@@ -21,6 +21,7 @@ GCC_TW_SHOP_DOMAIN, DATABASE_URL, LIME_GCC_SYNC_FROM/LIME_GCC_SYNC_TO или LIM
 Запуск: python -m sync.lime_gcc
 """
 import os
+import time
 from datetime import date, timedelta
 
 import psycopg2
@@ -164,6 +165,37 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
     return out
 
 
+DEADLOCK_RETRIES = 4
+DEADLOCK_BACKOFF_SEC = 3
+
+
+def _write_day(conn, day_s: str, rows: list[tuple]) -> None:
+    """DELETE+INSERT за день с повтором при дедлоке.
+
+    В `lime_stats` пишут несколько синков (GCC, kz_metrika, витрина), и Postgres ловит
+    взаимную блокировку на пересечении индексов: бэкфилл 2026-07-19 упал на 236-м дне из
+    245 с `DeadlockDetected`, потеряв час прогона. Жертву транзакции достаточно повторить —
+    операция идемпотентна (удаляем и пишем ровно свой день своего региона).
+    """
+    for attempt in range(1, DEADLOCK_RETRIES + 1):
+        try:
+            with conn.cursor() as cur:
+                cur.execute(DELETE_SQL, (day_s, day_s))
+                if rows:
+                    psycopg2.extras.execute_values(cur, INSERT_SQL, rows, page_size=500)
+            conn.commit()
+            return
+        except (psycopg2.errors.DeadlockDetected,
+                psycopg2.errors.LockNotAvailable) as exc:
+            conn.rollback()
+            if attempt == DEADLOCK_RETRIES:
+                raise
+            sleep_s = DEADLOCK_BACKOFF_SEC * attempt
+            print(f"lime_gcc: {day_s} — {type(exc).__name__}, "
+                  f"попытка {attempt}/{DEADLOCK_RETRIES}, повтор через {sleep_s}с")
+            time.sleep(sleep_s)
+
+
 def _sync_range(frm: date, to: date, conn) -> int:
     token = os.environ["GCC_METRICA_TOKEN"]
     tw_key = os.environ["GCC_TRIPLEWHALE_API_KEY"]
@@ -225,11 +257,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
                 print(f"    {str(country or '(тотал GCC)'):<22} визиты={sessions:<7} "
                       f"заказы={orders_n:<5} выручка={revenue:.0f}₽ расход={cost:.0f}₽")
         else:
-            with conn.cursor() as cur:
-                cur.execute(DELETE_SQL, (day_s, day_s))
-                if rows:
-                    psycopg2.extras.execute_values(cur, INSERT_SQL, rows, page_size=500)
-            conn.commit()
+            _write_day(conn, day_s, rows)
             print(f"lime_gcc: {day_s} → {len(rows)} строк")
 
         total += len(rows)

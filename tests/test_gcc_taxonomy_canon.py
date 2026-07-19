@@ -102,3 +102,38 @@ class TestTwMeetsMetrika:
         traffic = map_metrika_channel(source_id, metrika_engine)[:2]
         orders = split_organic_and_social(tw_referrer)[:2]
         assert traffic == orders, f"визиты {traffic} и заказы {orders} не встретятся"
+
+
+class TestCrmByUtmTag:
+    """Метка utm достовернее эвристики Метрики (замер 2026-07-19).
+
+    Почтовый клиент срезает реферер, и Метрика пишет половину кликов из триггерных
+    писем в Direct: mindbox_bv — 63 визита Mailing и 61 Direct, mindbox_bcat — 40 и 57.
+    Метка utm_source при этом стоит. Без приоритета метки заказы CRM не встречались
+    со своими визитами: сходилось 53% CRM-заказов.
+    """
+
+    @pytest.mark.parametrize("traffic_source", ["direct", "email", "ad", "referral", None])
+    def test_mindbox_tag_wins_over_metrika_guess(self, traffic_source):
+        assert map_metrika_channel(traffic_source, None, "mindbox_bv")[:2] == ("CRM", "Mindbox")
+
+    @pytest.mark.parametrize("utm", [
+        "manual_mindbox", "mindbox_bcat", "mindbox_pd_view", "mindbox_welcome",
+        "limeshop-uae.maestra.io",
+    ])
+    def test_all_mindbox_flavours(self, utm):
+        assert map_metrika_channel("direct", None, utm)[:2] == ("CRM", "Mindbox")
+
+    def test_klaviyo_is_plain_email(self):
+        assert map_metrika_channel("direct", None, "klaviyo")[:2] == ("CRM", "Email")
+
+    def test_crm_traffic_is_free(self):
+        assert map_metrika_channel("ad", "Google Ads", "mindbox_bk")[2] == "Бесплатный"
+
+    def test_plain_direct_untouched(self):
+        """Обычный direct без метки остаётся Direct — ветка не должна ловить лишнее."""
+        assert map_metrika_channel("direct", None, None)[:2] == ("Direct", "Direct")
+        assert map_metrika_channel("direct", None, "google")[:2] == ("Direct", "Direct")
+
+    def test_real_ads_untouched(self):
+        assert map_metrika_channel("ad", "Google Ads", "google")[:2] == ("SEM", "Google.Adwords")

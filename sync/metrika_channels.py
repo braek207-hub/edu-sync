@@ -71,6 +71,16 @@ def map_metrika_channel(
     engine = (source_engine or "").lower().strip()
     utm = (utm_source or "").lower().strip()
 
+    # === CRM ПО МЕТКЕ — раньше всех остальных веток ===
+    # Почтовый клиент срезает реферер, и Метрика записывает половину кликов из триггерных
+    # писем в Direct: mindbox_bv — 63 визита Mailing и 61 Direct, mindbox_bcat — 40 и 57
+    # (замер 30 дней, 2026-07-19). Метка utm_source при этом стоит. Явная метка достовернее
+    # эвристики Метрики, иначе заказы CRM не встречаются со своими визитами.
+    if any(marker in utm for marker in ("mindbox", "maestra")):
+        return "CRM", "Mindbox", "Бесплатный"
+    if "klaviyo" in utm:
+        return "CRM", "Email", "Бесплатный"
+
     # === AD (платный трафик) ===
     if source_id == "ad":
         if "google" in engine:
