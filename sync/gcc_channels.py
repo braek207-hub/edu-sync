@@ -184,4 +184,16 @@ def map_tw_source(source: str | None, referrer: str | None = None) -> tuple[str,
     if not s_lower or s_lower == "non-attributed":
         return "Others", "Non-attributed", "Бесплатный"
 
-    return "Others", s, "Бесплатный"
+    # === Артефакты данных, а не источники ===
+    # `Excluded` — служебная пометка TW; `{{...}}` — неразвёрнутый макрос рекламной
+    # системы; строка с utm_medium=/%26 — склеенный URL, попавший в поле источника.
+    # Такое в Referrals пускать нельзя: это не партнёр, а мусор, и его надо видеть.
+    if s_lower == "excluded" or "{{" in s or "utm_medium=" in s_lower or "%26" in s_lower:
+        return "Others", s, "Бесплатный"
+
+    # === Партнёры, PR, спецпроекты ===
+    # Всё остальное, что TW не отнёс к платформе/CRM/органике/директу, — это метка
+    # партнёра или размещения (shopmy, followish, pr_gcc_retail_posm, grazia_magazine).
+    # По решению Павла (2026-07-19) такие источники идут в Referrals, а не в Others:
+    # Others должен означать «не разобрались», а тут мы как раз разобрались.
+    return "Referrals", s, "Бесплатный"

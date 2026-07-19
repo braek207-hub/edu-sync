@@ -31,7 +31,13 @@ COUNTRY_DIMENSIONS = (
 # визитов (Google Ads 49%, Instagram 37%, Facebook 14%; корзины «без движка» нет).
 # До этого площадка бралась из utm, и 23% платного трафика висело подканалом «Ad».
 AD_FILTER = "ym:s:lastsignTrafficSource=='ad'"
-NONAD_FILTER = "ym:s:lastsignTrafficSource!='ad'"
+# Соцсети — тоже своим запросом с движком: без него сеть неизвестна и визиты идут
+# «SMM (organic)/Others», не встречаясь с заказами TW, где сеть названа (зонд 2026-07-19:
+# 3 766 визитов, из них instagram.com 71.9%, Facebook 28.1%). Обрезка тут заметнее, чем
+# у рекламы (−7.43% против −0.44%: хвост меньше), поэтому разницу добираем остатком.
+SOCIAL_FILTER = "ym:s:lastsignTrafficSource=='social'"
+NONAD_FILTER = ("ym:s:lastsignTrafficSource!='ad' "
+                "AND ym:s:lastsignTrafficSource!='social'")
 
 # Площадка + кампания: стоит 3.13%, разницу добираем строкой-остатком с известной площадкой.
 AD_DIMENSIONS = (
@@ -43,6 +49,7 @@ AD_DIMENSIONS = (
 )
 
 # Та же грань без кампании (0.44%) — эталон для остатка внутри рекламы.
+# Она же используется для соцсетей: кампаний у них нет, нужна только сеть.
 AD_ENGINE_DIMENSIONS = (
     "ym:s:date",
     "ym:s:startURLDomain",
@@ -313,7 +320,7 @@ def fetch_metrika_traffic(
     Returns:
         Строки parse_metrika_traffic: по странам + остатки (country=None).
     """
-    # Нерекламный трафик — прежним набором (движок бы его порезал).
+    # Прочий трафик — прежним набором (движок бы его порезал).
     nonad = _fetch(counter_id, token, date_from, date_to, COUNTRY_DIMENSIONS, NONAD_FILTER)
 
     # Реклама — своим запросом С движком: на узкой выборке обрезка почти не работает,
@@ -322,6 +329,14 @@ def fetch_metrika_traffic(
     ad_engine = _fetch(counter_id, token, date_from, date_to, AD_ENGINE_DIMENSIONS, AD_FILTER)
     ad = ad_detail + ad_engine_residual(ad_engine, ad_detail)
 
-    by_country = nonad + ad
+    # Соцсети — тем же приёмом: сеть нужна, чтобы визиты встретились с заказами TW.
+    # Эталон здесь без домена: обрезка (−7.43%) съедает именно страновой разрез.
+    social_detail = _fetch(counter_id, token, date_from, date_to,
+                           AD_ENGINE_DIMENSIONS, SOCIAL_FILTER)
+    social_total = _fetch(counter_id, token, date_from, date_to,
+                          CHANNEL_DIMENSIONS, SOCIAL_FILTER)
+    social = social_detail + residual_rows(social_total, social_detail)
+
+    by_country = nonad + ad + social
     totals = _fetch(counter_id, token, date_from, date_to, CHANNEL_DIMENSIONS)
     return by_country + residual_rows(totals, by_country)

@@ -43,11 +43,17 @@ def _seo_subchannel(source_engine: str | None) -> str:
 
 
 def _social_subchannel(source_engine: str | None) -> str:
+    """Имя сети в канонической форме.
+
+    Метрика непоследовательна: отдаёт то «instagram.com», то «Facebook» (замер 2026-07-19).
+    Домен обрезаем, иначе «Instagram.com» не встретится с «Instagram» из Triple Whale
+    и заказы соцсетей встанут отдельной строкой от своих визитов.
+    """
     engine = (source_engine or "").strip()
     low = engine.lower()
     for known in _SOCIAL_KNOWN:
         if known in low:
-            return engine.capitalize() if engine else "Others"
+            return known.capitalize()
     return "Others"
 
 

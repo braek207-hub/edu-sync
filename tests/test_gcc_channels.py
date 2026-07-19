@@ -128,8 +128,14 @@ def test_tw_none():
 
 
 def test_tw_catch_all():
+    """Неопознанный источник — это партнёрская метка, а не «непонятно что».
+
+    Решение Павла 2026-07-19: такие источники идут в Referrals (shopmy, followish,
+    pr_gcc_retail_posm). В Others остаются только Non-attributed и артефакты данных —
+    см. TestPartnersGoToReferrals в test_gcc_taxonomy_canon.py.
+    """
     ch, sub, tt = map_tw_source("some_weird_source")
-    assert ch == "Others" and sub == "some_weird_source" and tt == "Бесплатный"
+    assert ch == "Referrals" and sub == "some_weird_source" and tt == "Бесплатный"
 
 
 def test_tw_pinterest():

@@ -158,3 +158,56 @@ class TestQrMeetsItself:
 
     def test_qr_is_free_traffic(self):
         assert map_metrika_channel("qrcode", None, None)[2] == "Бесплатный"
+
+
+class TestSocialNetworkNames:
+    """Метрика отдаёт то «instagram.com», то «Facebook» — домен надо срезать.
+
+    Иначе «Instagram.com» из Метрики не встретится с «Instagram» из Triple Whale,
+    и заказы соцсетей встанут отдельной строкой от своих визитов.
+    """
+
+    @pytest.mark.parametrize("engine", ["instagram.com", "Instagram", "www.instagram.com"])
+    def test_instagram_variants_collapse(self, engine):
+        assert map_metrika_channel("social", engine)[:2] == ("SMM (organic)", "Instagram")
+
+    def test_facebook_without_domain(self):
+        assert map_metrika_channel("social", "Facebook")[:2] == ("SMM (organic)", "Facebook")
+
+    def test_meets_tw_side(self):
+        traffic = map_metrika_channel("social", "instagram.com")[:2]
+        orders = split_organic_and_social("instagram")[:2]
+        assert traffic == orders
+
+    def test_unknown_network_is_others(self):
+        assert map_metrika_channel("social", "какая-то-сеть")[:2] == ("SMM (organic)", "Others")
+
+
+class TestPartnersGoToReferrals:
+    """Решение Павла 2026-07-19: партнёрские и PR-метки — это Referrals, а не Others.
+
+    Others должен означать «не разобрались»; партнёр — разобрались.
+    """
+
+    @pytest.mark.parametrize("source", [
+        "shopmy", "followish", "checkmate", "pr_gcc_retail_posm",
+        "grazia_magazine", "pr_gcc_retail_cards",
+    ])
+    def test_partner_sources(self, source):
+        assert map_tw_source(source)[:2] == ("Referrals", source)
+
+    @pytest.mark.parametrize("source", [
+        "Excluded",                                    # служебная пометка TW
+        "{{site_source_name}}",                        # неразвёрнутый макрос
+        "google%26utm_medium=cpc%26utm_campaign=210",  # склеенный URL
+    ])
+    def test_artifacts_stay_visible_in_others(self, source):
+        """Мусор в Referrals прятать нельзя — его надо видеть и чинить в кабинете."""
+        assert map_tw_source(source)[0] == "Others"
+
+    def test_non_attributed_untouched(self):
+        assert map_tw_source("non-attributed")[:2] == ("Others", "Non-attributed")
+
+    def test_platforms_untouched(self):
+        assert map_tw_source("google-ads")[:2] == ("SEM", "Google.Adwords")
+        assert map_tw_source("manual_mindbox")[:2] == ("CRM", "Mindbox")
