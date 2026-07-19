@@ -196,6 +196,46 @@ def _write_day(conn, day_s: str, rows: list[tuple]) -> None:
             time.sleep(sleep_s)
 
 
+def _month_spans(frm: date, to: date) -> list[tuple[date, date]]:
+    """Разбить период на календарные месяцы (границы включительно).
+
+    Помесячно, а не одним куском: у Stat API limit=100000 строк на ответ, и на длинном
+    диапазоне с пятью измерениями выдача упёрлась бы в него молча — без ошибки, просто
+    обрезанная. Месяц GCC даёт ~3-4 тысячи строк, запас двадцатикратный.
+    """
+    spans: list[tuple[date, date]] = []
+    start = frm
+    while start <= to:
+        if start.month == 12:
+            next_month = date(start.year + 1, 1, 1)
+        else:
+            next_month = date(start.year, start.month + 1, 1)
+        end = min(next_month - timedelta(days=1), to)
+        spans.append((start, end))
+        start = end + timedelta(days=1)
+    return spans
+
+
+def _fetch_metrika_by_month(token: str, frm: date, to: date) -> dict[str, list[dict]]:
+    """Трафик за весь период помесячно, разложенный по дням.
+
+    Returns:
+        {"YYYY-MM-DD": [строки parse_metrika_traffic за этот день]}.
+        Дни без трафика в словаре отсутствуют — вызывающий берёт пустой список.
+    """
+    by_day: dict[str, list[dict]] = {}
+    spans = _month_spans(frm, to)
+    for i, (span_from, span_to) in enumerate(spans, 1):
+        rows = fetch_metrika_traffic(
+            METRICA_COUNTER_ID, token, span_from.isoformat(), span_to.isoformat()
+        )
+        for row in rows:
+            by_day.setdefault(str(row.get("date") or "")[:10], []).append(row)
+        print(f"lime_gcc: Метрика {span_from}…{span_to} → {len(rows)} строк "
+              f"(месяц {i} из {len(spans)})")
+    return by_day
+
+
 def _sync_range(frm: date, to: date, conn) -> int:
     token = os.environ["GCC_METRICA_TOKEN"]
     tw_key = os.environ["GCC_TRIPLEWHALE_API_KEY"]
@@ -209,11 +249,19 @@ def _sync_range(frm: date, to: date, conn) -> int:
     )
     print(f"lime_gcc: справочник кампаний — {len(campaign_index)} имён")
 
+    # Метрику тянем ПОМЕСЯЧНО, а не по дню. `ym:s:date` стоит в измерениях, поэтому
+    # диапазон возвращает те же построчные данные. На день уходит пять запросов
+    # (нерекламный + реклама детально/эталон + соцсети детально/эталон), и по дню это
+    # 5×657 = 3285 обращений на полную историю — Метрика отвечает 429 и не отпускает
+    # даже после пяти ретраев с паузой (прогон 2026-07-19 умер на первом же дне).
+    # Помесячно — 5 запросов на месяц, ~110 на всю историю.
+    metrika_by_day = _fetch_metrika_by_month(token, frm, to)
+
     total = 0
     day = frm
     while day <= to:
         day_s = day.isoformat()
-        metrika = fetch_metrika_traffic(METRICA_COUNTER_ID, token, day_s, day_s)
+        metrika = metrika_by_day.get(day_s, [])
         orders = aggregate_orders_by_channel(fetch_tw_orders(tw_key, shop, day_s, day_s), day_s)
         tw_metrics = fetch_tw_spend(tw_key, shop, day_s)
         # Расход Google берём из кабинета (разложен по странам), если Script там уже стоит;
