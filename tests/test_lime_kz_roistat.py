@@ -121,3 +121,14 @@ def test_rows_carry_region_and_date():
     assert col(rows[0], "region") == "kz_roistat"
     assert col(rows[0], "date") == "2026-06-18"
     assert col(rows[0], "data_source") == "web"
+
+
+def test_users_are_not_faked_from_visits():
+    """У Roistat API уникальных посетителей нет — приравнивать их к визитам нельзя.
+
+    Замер июня показал ровно 1.000 «посетителя» на визит против 0.757 у Метрики:
+    выдуманное число выглядело как данные. Ноль честнее — ячейка даст прочерк.
+    """
+    rows = build_rows([api_row("SEO", visits=10284, leads=5)], FX, {}, "2026-06-18")
+    assert col(rows[0], "sessions") == 10284
+    assert col(rows[0], "users") == 0

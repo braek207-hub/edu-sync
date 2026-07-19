@@ -99,9 +99,13 @@ def build_rows(api_rows, fx_rate: float, cabinet_cost: dict, date_s: str) -> lis
             date_s, "web", REGION, channel, subchannel, traffic_type,
             campaign_id, campaign_name,
             round(cost, 2), 0.0, 0.0,
-            # Уникальных посетителей Роистат в этом наборе метрик не отдаёт; визиты —
-            # приближение. Метрики «на пользователя» по этому срезу смотреть нельзя.
-            visits, visits, 0,
+            # users=0, а НЕ visits: уникальных посетителей у Roistat API нет вовсе —
+            # 48 метрик, и ни одной про посетителей (в интерфейсе колонка есть, наружу
+            # не отдаётся). Приравняв их к визитам, я получил ровно 1.000 посетителя на
+            # визит против настоящих 0.757 у Метрики — цифра выглядела как данные, но
+            # была выдумкой. Ноль честнее: ячейка покажет прочерк, а пользователей для
+            # свода берём у Метрики, которая их знает.
+            visits, 0, 0,
             int(r["leads"]), round(gross_revenue, 2), int(r["paid_clients"]),
             0, 0, 0.0,
             int(r["paid_leads"]), round(float(r["paid_revenue"]) * fx_rate, 2),
