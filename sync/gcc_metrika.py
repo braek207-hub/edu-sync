@@ -246,24 +246,30 @@ def ad_engine_residual(engine_rows: list[dict], detail_rows: list[dict]) -> list
     def key(row):
         return (row["date"], row["country"], row["source_engine"])
 
-    attributed: dict[tuple, list[float]] = {}
+    # Вычитать надо ВСЕ аддитивные метрики, а не только визиты: bounce_w/depth_w взвешены
+    # на визиты, и если оставить их от строки-эталона целиком, они сложатся с детальными
+    # и отказы с глубиной задвоятся почти вдвое (знаменатель-то останется прежним).
+    ADDITIVE = ("visits", "users", "new_users", "bounce_w", "depth_w",
+                "cart_reaches", "checkout_reaches")
+
+    attributed: dict[tuple, dict[str, float]] = {}
     for row in detail_rows:
-        acc = attributed.setdefault(key(row), [0.0, 0.0])
-        acc[0] += float(row["visits"] or 0)
-        acc[1] += float(row["users"] or 0)
+        acc = attributed.setdefault(key(row), {m: 0.0 for m in ADDITIVE})
+        for metric in ADDITIVE:
+            acc[metric] += float(row.get(metric) or 0)
 
     out = []
     for row in engine_rows:
-        seen_v, seen_u = attributed.get(key(row), (0.0, 0.0))
-        visits = float(row["visits"] or 0) - seen_v
+        seen = attributed.get(key(row), {})
+        visits = float(row.get("visits") or 0) - float(seen.get("visits") or 0)
         if visits <= 0:
             continue
-        out.append({
-            **row,
-            "campaign": None,
-            "visits": visits,
-            "users": max(float(row["users"] or 0) - seen_u, 0.0),
-        })
+        residual = {**row, "campaign": None}
+        for metric in ADDITIVE:
+            residual[metric] = max(
+                float(row.get(metric) or 0) - float(seen.get(metric) or 0), 0.0
+            )
+        out.append(residual)
     return out
 
 

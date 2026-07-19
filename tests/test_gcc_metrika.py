@@ -225,3 +225,38 @@ def test_ad_residual_separates_platforms():
     assert len(residual) == 1
     assert residual[0]["source_engine"] == "Instagram"
     assert residual[0]["visits"] == 400
+
+
+def test_ad_residual_does_not_double_count_weighted_metrics():
+    """Отказы/глубина взвешены на визиты — остаток обязан нести РАЗНИЦУ, не полную корзину.
+
+    Регрессия: остаток копировался как {**row}, поэтому bounce_w эталонной строки
+    складывался с bounce_w детальных, а знаменатель (визиты) оставался прежним —
+    отказы и глубина задваивались почти вдвое.
+    """
+    from sync.gcc_metrika import ad_engine_residual
+
+    engine_rows = [{
+        "date": "2026-07-17", "country": "ОАЭ", "campaign": None, "traffic_source": "ad",
+        "source_engine": "Google Ads", "visits": 1000, "users": 800, "new_users": 500,
+        "bounce_w": 300.0, "depth_w": 4000.0, "cart_reaches": 100, "checkout_reaches": 40,
+    }]
+    detail_rows = [{
+        "date": "2026-07-17", "country": "ОАЭ", "campaign": "c1", "traffic_source": "ad",
+        "source_engine": "Google Ads", "visits": 900, "users": 720, "new_users": 450,
+        "bounce_w": 270.0, "depth_w": 3600.0, "cart_reaches": 90, "checkout_reaches": 36,
+    }]
+    residual = ad_engine_residual(engine_rows, detail_rows)
+    assert len(residual) == 1
+    r = residual[0]
+
+    # Каждая аддитивная метрика — ровно разница.
+    assert r["visits"] == 100 and r["users"] == 80 and r["new_users"] == 50
+    assert r["bounce_w"] == 30.0 and r["depth_w"] == 400.0
+    assert r["cart_reaches"] == 10 and r["checkout_reaches"] == 4
+
+    # И главное: собранная ставка отказов совпадает с эталонной, а не удваивается.
+    total_visits = sum(x["visits"] for x in detail_rows + residual)
+    total_bounce = sum(x["bounce_w"] for x in detail_rows + residual)
+    assert total_visits == engine_rows[0]["visits"]
+    assert total_bounce / total_visits == engine_rows[0]["bounce_w"] / engine_rows[0]["visits"]
