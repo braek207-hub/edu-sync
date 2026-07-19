@@ -71,7 +71,10 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           LIME_METRIKA_TOKEN: ${{ secrets.LIME_METRIKA_TOKEN }}
-          LIME_KZ_METRIKA_DAYS_BACK: "30"
+          # Было захардкожено "30", из-за чего бэкфилл этого среза через UI был невозможен:
+          # ручной прогон с days_back=50 всё равно пересчитывал 30 дней, и правки склейки
+          # не доезжали до старых дат (2026-07-19: кампании Meta появились только с 20.06).
+          LIME_KZ_METRIKA_DAYS_BACK: ${{ github.event.inputs.days_back || '30' }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_kz_metrika
 
