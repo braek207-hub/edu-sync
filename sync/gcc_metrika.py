@@ -1,6 +1,7 @@
 """Функции для работы с Яндекс.Метрика Stat API (счётчик 98232701, трафик GCC)."""
 
 import os
+import time
 
 import requests
 
@@ -280,8 +281,19 @@ def ad_engine_residual(engine_rows: list[dict], detail_rows: list[dict]) -> list
     return out
 
 
+METRIKA_RETRIES = 5
+METRIKA_BACKOFF_SEC = 10
+
+
 def _fetch(counter_id, token: str, date_from: str, date_to: str, dimensions,
            filters: str | None = None) -> list[dict]:
+    """Запрос к Stat API с ретраями лимита.
+
+    ⚠️ На день уходит ПЯТЬ запросов (нерекламный + реклама детально/эталон + соцсети
+    детально/эталон), и на бэкфилле в сотни дней Метрика отвечает 429: прогон 2026-07-19
+    умер на 124-м дне из 245, потеряв полчаса. Повторяем 429 и 5xx с нарастающей паузой,
+    уважая Retry-After; 4xx кроме 429 — постоянная ошибка, падаем сразу.
+    """
     params = {
         "ids": counter_id,
         "date1": date_from,
@@ -293,14 +305,33 @@ def _fetch(counter_id, token: str, date_from: str, date_to: str, dimensions,
     }
     if filters:
         params["filters"] = filters
-    resp = requests.get(
-        "https://api-metrika.yandex.net/stat/v1/data",
-        headers={"Authorization": f"OAuth {token}"},
-        params=params,
-        timeout=60,
-    )
-    resp.raise_for_status()
-    return parse_metrika_traffic(resp.json())
+
+    last_exc: Exception | None = None
+    for attempt in range(1, METRIKA_RETRIES + 1):
+        try:
+            resp = requests.get(
+                "https://api-metrika.yandex.net/stat/v1/data",
+                headers={"Authorization": f"OAuth {token}"},
+                params=params,
+                timeout=60,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+        else:
+            if resp.status_code != 429 and resp.status_code < 500:
+                resp.raise_for_status()
+                return parse_metrika_traffic(resp.json())
+            last_exc = requests.exceptions.HTTPError(
+                f"Metrika HTTP {resp.status_code}", response=resp
+            )
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                time.sleep(min(int(retry_after), 120))
+                continue
+        if attempt < METRIKA_RETRIES:
+            time.sleep(METRIKA_BACKOFF_SEC * attempt)
+    assert last_exc is not None
+    raise last_exc
 
 
 def fetch_metrika_traffic(
