@@ -6,7 +6,14 @@ KZ и RU живут на одном счётчике 23504302 и на одном
 Проверено зондом: кросс измерений ниже не теряет ни визита против запроса «по дате»
 (0.00% по всем метрикам), поэтому компенсация остатка, как в GCC, не нужна.
 """
+import os
+import time
+
 import requests
+
+# Повторы на транзиентные ошибки Stat API (см. fetch_kz_traffic). Пауза растёт линейно.
+RETRIES = int(os.environ.get("LIME_KZ_METRIKA_RETRIES") or "3")
+RETRY_SLEEP = int(os.environ.get("LIME_KZ_METRIKA_RETRY_SLEEP") or "5")
 
 # Порядок важен только для нашего запроса: разбор читает позиции из эха ответа.
 DIMENSIONS = (
@@ -87,6 +94,11 @@ def parse_metrika_kz(resp: dict) -> list[dict]:
 def fetch_kz_traffic(counter_id, token: str, date_from: str, date_to: str) -> list[dict]:
     """Забрать KZ-срез (гео Казахстан) за период.
 
+    Повторяет запрос при неуспешном ответе: Stat API периодически отдаёт транзиентную
+    ошибку на отдельной дате (2026-07-19: HTTP 400 на 2026-04-05, тот же запрос минутой
+    позже — 200). Без повтора одна такая осечка роняет весь прогон, а для ежедневного
+    синка это тихо пропущенный день.
+
     Args:
         counter_id: id счётчика (23504302).
         token: OAuth-токен Яндекса с доступом к счётчику.
@@ -94,21 +106,31 @@ def fetch_kz_traffic(counter_id, token: str, date_from: str, date_to: str) -> li
 
     Returns:
         Строки parse_metrika_kz.
+
+    Raises:
+        requests.HTTPError: если все попытки вернули ошибку.
     """
-    resp = requests.get(
-        API_URL,
-        headers={"Authorization": f"OAuth {token}"},
-        params={
-            "ids": counter_id,
-            "date1": date_from,
-            "date2": date_to,
-            "metrics": ",".join(METRICS),
-            "dimensions": ",".join(DIMENSIONS),
-            "filters": GEO_FILTER,
-            "accuracy": "full",
-            "limit": 100000,
-        },
-        timeout=120,
-    )
+    params = {
+        "ids": counter_id,
+        "date1": date_from,
+        "date2": date_to,
+        "metrics": ",".join(METRICS),
+        "dimensions": ",".join(DIMENSIONS),
+        "filters": GEO_FILTER,
+        "accuracy": "full",
+        "limit": 100000,
+    }
+    headers = {"Authorization": f"OAuth {token}"}
+
+    resp = None
+    for attempt in range(1, RETRIES + 1):
+        resp = requests.get(API_URL, headers=headers, params=params, timeout=120)
+        if resp.status_code == 200:
+            return parse_metrika_kz(resp.json())
+        if attempt < RETRIES:
+            print(f"lime_kz_metrika_api: WARN {date_from} HTTP {resp.status_code}, "
+                  f"попытка {attempt} из {RETRIES}, повтор через {RETRY_SLEEP * attempt}с")
+            time.sleep(RETRY_SLEEP * attempt)
+
     resp.raise_for_status()
-    return parse_metrika_kz(resp.json())
+    return []  # недостижимо: raise_for_status уже бросил на не-200
