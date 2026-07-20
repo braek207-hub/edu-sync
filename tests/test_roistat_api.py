@@ -92,3 +92,53 @@ def test_missing_metric_is_zero_not_crash():
 def test_empty_response_gives_no_rows():
     assert parse_analytics({"data": []}) == []
     assert parse_analytics({}) == []
+
+
+from sync.roistat_api import COHORT_METRICS, cohort_period, parse_cohort
+
+
+def test_cohort_period_is_exclusive_on_to():
+    assert cohort_period("2026-05-01", "2026-07-20") == {"from": "01.05.2026", "to": "20.07.2026"}
+
+
+def test_cohort_metrics_include_new_and_repeat():
+    """Новизна когорты берётся в той же выгрузке: new_sales+repeatedSales=paidLeadCount по визиту."""
+    assert "new_sales" in COHORT_METRICS
+    assert "repeatedSales" in COHORT_METRICS
+    assert "paidLeadCount" in COHORT_METRICS
+    assert "paidLeadsPrice" in COHORT_METRICS
+
+
+def test_parse_cohort_reads_visit_date_from_daily_bucket():
+    resp = {"data": [{"items": [
+        {"dimensions": {
+            "daily": {"value": "2026-06-08", "title": "2026-06-08"},
+            "marker_level_1": {"value": "", "title": "Прямые\xa0визиты"},
+            "marker_level_2": {"value": "", "title": ""},
+            "marker_level_3": {"value": "", "title": ""}},
+         "metrics": [
+            {"metric_name": "paidLeadCount", "value": 409},
+            {"metric_name": "paidLeadsPrice", "value": 18031810},
+            {"metric_name": "new_sales", "value": 86},
+            {"metric_name": "repeatedSales", "value": 323}]}]}]}
+    rows = parse_cohort(resp)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["visit_date"] == "2026-06-08"
+    assert r["channel"] == "Прямые визиты"          # NBSP нормализован
+    assert r["cohort_orders"] == 409
+    assert r["cohort_revenue"] == 18031810
+    assert r["cohort_new"] == 86
+    assert r["cohort_repeat"] == 323
+    assert r["cohort_new"] + r["cohort_repeat"] == r["cohort_orders"]
+
+
+def test_parse_cohort_missing_metric_is_zero():
+    resp = {"data": [{"items": [
+        {"dimensions": {"daily": {"value": "2026-06-08", "title": "2026-06-08"},
+                        "marker_level_1": {"value": "g", "title": "Google\xa0Ads\xa01"},
+                        "marker_level_2": {}, "marker_level_3": {}},
+         "metrics": []}]}]}
+    rows = parse_cohort(resp)
+    assert rows[0]["cohort_orders"] == 0.0
+    assert rows[0]["channel"] == "Google Ads 1"

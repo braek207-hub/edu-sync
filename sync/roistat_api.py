@@ -72,6 +72,97 @@ def denbsp(s: str) -> str:
     return (s or "").replace("\xa0", " ").strip()
 
 
+# Когортная выгрузка: те же продажи, но разложенные по дате ВИЗИТА (dim daily), плюс
+# новизна клиента. new_sales + repeatedSales = paidLeadCount на грани визита (проверено
+# на июне 2026). Отдельный набор, чтобы не смешивать с дневной выгрузкой по дате оплаты.
+COHORT_METRICS = ("paidLeadCount", "paidLeadsPrice", "new_sales", "repeatedSales")
+COHORT_DIMENSIONS = ("daily", "marker_level_1", "marker_level_2", "marker_level_3")
+
+_COHORT_FIELD = {
+    "paidLeadCount": "cohort_orders",
+    "paidLeadsPrice": "cohort_revenue",
+    "new_sales": "cohort_new",
+    "repeatedSales": "cohort_repeat",
+}
+
+
+def cohort_period(frm_iso: str, to_iso: str) -> dict:
+    """Окно ОПЛАТЫ для когортной выгрузки. `to` эксклюзивен, как у Роистата."""
+    frm = date.fromisoformat(frm_iso)
+    to = date.fromisoformat(to_iso)
+    return {"from": frm.strftime("%d.%m.%Y"), "to": to.strftime("%d.%m.%Y")}
+
+
+def parse_cohort(resp: dict) -> list[dict]:
+    """Разобрать когортный ответ: строка на грань (дата визита × уровни каналов).
+
+    `daily` несёт дату ВИЗИТА (Роистат раскладывает продажи периода оплаты по визиту).
+    """
+    out: list[dict] = []
+    for group in resp.get("data") or []:
+        for item in group.get("items") or []:
+            dims = item.get("dimensions") or {}
+
+            def level(name: str) -> tuple[str, str]:
+                lvl = dims.get(name) or {}
+                return (denbsp(lvl.get("value") or ""), denbsp(lvl.get("title") or ""))
+
+            day = dims.get("daily") or {}
+            visit_date = denbsp(day.get("title") or day.get("value") or "")
+            ch_id, ch_name = level("marker_level_1")
+            l2_id, l2_name = level("marker_level_2")
+            l3_id, l3_name = level("marker_level_3")
+            row = {
+                "visit_date": visit_date,
+                "channel": ch_name or ch_id,
+                "level2_id": l2_id, "level2": l2_name,
+                "level3_id": l3_id, "level3": l3_name,
+                "cohort_orders": 0.0, "cohort_revenue": 0.0,
+                "cohort_new": 0.0, "cohort_repeat": 0.0,
+            }
+            for m in item.get("metrics") or []:
+                field = _COHORT_FIELD.get(m.get("metric_name"))
+                if field:
+                    row[field] = float(m.get("value") or 0)
+            out.append(row)
+    return out
+
+
+def fetch_cohort(frm_iso: str, to_iso: str, project: str, key: str) -> list[dict]:
+    """Когортные строки за окно оплаты [frm; to). Ретраит транзиентные ошибки.
+
+    Raises:
+        RuntimeError: если API вернул status=error после всех попыток.
+    """
+    qs = urllib.parse.urlencode({"key": key, "project": project})
+    body = json.dumps({
+        "dimensions": list(COHORT_DIMENSIONS),
+        "metrics": list(COHORT_METRICS),
+        "period": cohort_period(frm_iso, to_iso),
+    }).encode("utf-8")
+
+    last = None
+    for attempt in range(1, RETRIES + 1):
+        req = urllib.request.Request(
+            f"{API_URL}?{qs}", data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as r:
+                resp = json.loads(r.read().decode("utf-8"))
+            if resp.get("status") == "error":
+                last = str(resp.get("description") or resp.get("error"))
+            else:
+                return parse_cohort(resp)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            last = f"{type(e).__name__}: {e}"
+        if attempt < RETRIES:
+            print(f"roistat_api: WARN cohort {frm_iso}..{to_iso} — {last}, попытка {attempt}/{RETRIES}")
+            time.sleep(RETRY_SLEEP * attempt)
+
+    raise RuntimeError(f"roistat_api: когорта {frm_iso}..{to_iso} не забрана за {RETRIES} попыток: {last}")
+
+
 def day_period(day_iso: str) -> dict:
     """Период для ОДНОГО дня. `to` эксклюзивен, поэтому это следующая дата."""
     d = date.fromisoformat(day_iso)
