@@ -28,7 +28,7 @@ def test_region_registered_so_lime_sync_does_not_wipe_it():
 
 def test_revenue_converted_from_tenge():
     rows = build_rows([api_row("SEO", visits=100, leads=10, paid_leads=8,
-                               paid_revenue=1_000_000)], FX, {}, "2026-06-18")
+                               paid_revenue=1_000_000)], FX, {}, "2026-06-18", {})
     assert round(col(rows[0], "net_revenue")) == round(1_000_000 * FX)
 
 
@@ -36,7 +36,7 @@ def test_gross_revenue_includes_canceled_and_in_progress():
     """purchases_* — созданные заказы, значит и выручка по ним должна быть полной."""
     rows = build_rows([api_row("SEO", leads=10, paid_leads=6, paid_revenue=600.0,
                                progress_revenue=300.0, canceled_revenue=100.0)],
-                      FX, {}, "2026-06-18")
+                      FX, {}, "2026-06-18", {})
     # Деньги пишем с точностью до копеек — сравниваем в той же точности.
     assert col(rows[0], "purchases_revenue") == round(1000.0 * FX, 2)
     assert col(rows[0], "net_revenue") == round(600.0 * FX, 2)
@@ -55,7 +55,7 @@ def test_direct_cost_comes_from_cabinet_by_campaign():
         [api_row("Яндекс.Директ 1", level2_id="context", level2="РСЯ",
                  level3_id="117776765", level3="Смарт баннеры CPO",
                  visits=7418, cost=75_768.485)],
-        FX, {"117776765": 487_143.0}, "2026-06-18")
+        FX, {"117776765": 487_143.0}, "2026-06-18", {})
     assert col(rows[0], "cost") == 487_143.0
 
 
@@ -64,7 +64,7 @@ def test_direct_campaign_without_cabinet_cost_gets_zero_not_roistat_number():
     rows = build_rows(
         [api_row("Яндекс.Директ 1", level3_id="999", level3="Неизвестная",
                  visits=10, cost=50_000.0)],
-        FX, {}, "2026-06-18")
+        FX, {}, "2026-06-18", {})
     assert col(rows[0], "cost") == 0.0
 
 
@@ -72,7 +72,7 @@ def test_meta_cost_taken_from_roistat_and_converted():
     """Meta — единственный источник расхода: кабинета у нас нет."""
     rows = build_rows([api_row("Facebook", level2_id="120254142253170405",
                                level2="CPO: ЛЕТНИЙ SALE_ЖЕНЩИНЫ", visits=13040,
-                               cost=815_916.0)], FX, {}, "2026-06-18")
+                               cost=815_916.0)], FX, {}, "2026-06-18", {})
     assert round(col(rows[0], "cost")) == round(815_916.0 * FX)
 
 
@@ -81,7 +81,7 @@ def test_google_cost_taken_from_roistat():
     rows = build_rows([api_row("Google Ads 1", level2_id="d", level2="КМС",
                                level3_id="23952158615",
                                level3="Медийная кампания КМС 18.06.26-25.06.26",
-                               visits=7583, cost=507_212.0)], FX, {}, "2026-06-18")
+                               visits=7583, cost=507_212.0)], FX, {}, "2026-06-18", {})
     assert round(col(rows[0], "cost")) == round(507_212.0 * FX)
     assert col(rows[0], "campaign_id") == "23952158615"
 
@@ -89,7 +89,7 @@ def test_google_cost_taken_from_roistat():
 def test_offline_deals_have_no_visits_and_no_cost():
     rows = build_rows([api_row("Сделки, созданные самостоятельно", leads=463,
                                paid_leads=387, paid_revenue=15_008_760)],
-                      FX, {}, "2026-06-18")
+                      FX, {}, "2026-06-18", {})
     assert col(rows[0], "sessions") == 0
     assert col(rows[0], "cost") == 0.0
     assert col(rows[0], "channel") == "Offline"
@@ -97,27 +97,27 @@ def test_offline_deals_have_no_visits_and_no_cost():
 
 
 def test_clients_are_filled_for_cac():
-    rows = build_rows([api_row("SEO", visits=100, paid_clients=7)], FX, {}, "2026-06-18")
+    rows = build_rows([api_row("SEO", visits=100, paid_clients=7)], FX, {}, "2026-06-18", {})
     assert col(rows[0], "customers") == 7
 
 
 def test_campaign_id_and_subchannel_from_levels():
     """Кампания с level_3, подканал SEO — с level_2 (замер: SEO › Google 10 284)."""
     rows = build_rows([api_row("SEO", level2_id="google", level2="Google", visits=10284)],
-                      FX, {}, "2026-06-18")
+                      FX, {}, "2026-06-18", {})
     assert col(rows[0], "subchannel") == "SEO Google"
     assert col(rows[0], "campaign_id") == ""
 
 
 def test_referral_subchannel_is_domain():
     rows = build_rows([api_row("Визиты с сайтов", level2="l.instagram.com", visits=2500)],
-                      FX, {}, "2026-06-18")
+                      FX, {}, "2026-06-18", {})
     assert col(rows[0], "channel") == "Referrals"
     assert col(rows[0], "subchannel") == "l.instagram.com"
 
 
 def test_rows_carry_region_and_date():
-    rows = build_rows([api_row("SEO", visits=1)], FX, {}, "2026-06-18")
+    rows = build_rows([api_row("SEO", visits=1)], FX, {}, "2026-06-18", {})
     assert col(rows[0], "region") == "kz_roistat"
     assert col(rows[0], "date") == "2026-06-18"
     assert col(rows[0], "data_source") == "web"
@@ -129,6 +129,69 @@ def test_users_are_not_faked_from_visits():
     Замер июня показал ровно 1.000 «посетителя» на визит против 0.757 у Метрики:
     выдуманное число выглядело как данные. Ноль честнее — ячейка даст прочерк.
     """
-    rows = build_rows([api_row("SEO", visits=10284, leads=5)], FX, {}, "2026-06-18")
+    rows = build_rows([api_row("SEO", visits=10284, leads=5)], FX, {}, "2026-06-18", {})
     assert col(rows[0], "sessions") == 10284
     assert col(rows[0], "users") == 0
+
+
+def test_columns_have_cohort_fields():
+    for c in ("cohort_orders", "cohort_revenue", "cohort_new_sales", "cohort_repeat_sales"):
+        assert c in COLUMNS
+
+
+def test_cohort_key_includes_subchannel():
+    """Ключ склейки — полная грань (campaign_id, channel, subchannel), иначе задвоение."""
+    from sync.lime_kz_roistat import cohort_key
+
+    # SEO с level2 движка google → subchannel «SEO Google» (map_roistat_channel).
+    row = {"channel": "SEO", "level2_id": "google", "level2": "Google",
+           "level3_id": "", "level3": ""}
+    assert cohort_key(row) == ("", "SEO", "SEO Google")
+
+
+def test_cohort_written_on_visit_date_row_by_full_key():
+    """Когорта склеивается с дневной строкой по (visit_date, campaign_id, channel, subchannel)."""
+    # SEO Others: level2 без движка → subchannel «SEO Others».
+    cmap = {("2026-06-08", "", "SEO", "SEO Others"): (56.0, 24.0, 32.0, 2_066_820.0)}
+    rows = build_rows([api_row("SEO", visits=100)], FX, {}, "2026-06-08", cmap)
+    assert col(rows[0], "cohort_orders") == 56
+    assert col(rows[0], "cohort_new_sales") == 24
+    assert col(rows[0], "cohort_repeat_sales") == 32
+    assert round(col(rows[0], "cohort_revenue"), 2) == round(2_066_820.0 * FX, 2)
+
+
+def test_cohort_not_doubled_across_subchannels():
+    """Когорта подканала SEO Google НЕ попадает в строку SEO Others того же канала."""
+    cmap = {("2026-06-08", "", "SEO", "SEO Google"): (56.0, 24.0, 32.0, 2_066_820.0)}
+    # Дневная строка SEO Others (level2 без движка) — когорты для неё в map нет.
+    rows = build_rows([api_row("SEO", level2_id="bing", level2="Bing", visits=100)],
+                      FX, {}, "2026-06-08", cmap)
+    assert col(rows[0], "cohort_orders") is None
+
+
+def test_cohort_absent_is_null_not_zero():
+    """Нет когорты для грани → NULL (None), чтобы ячейка дала «—», а не 0."""
+    rows = build_rows([api_row("SEO", visits=100)], FX, {}, "2026-06-08", {})
+    assert col(rows[0], "cohort_orders") is None
+    assert col(rows[0], "cohort_revenue") is None
+
+
+def test_cohort_new_plus_repeat_equals_orders():
+    cmap = {("2026-06-08", "", "Прямые визиты", "Direct"): (409.0, 86.0, 323.0, 18_031_810.0)}
+    rows = build_rows([api_row("Прямые визиты", visits=2666)], FX, {}, "2026-06-08", cmap)
+    assert col(rows[0], "cohort_new_sales") + col(rows[0], "cohort_repeat_sales") == col(rows[0], "cohort_orders")
+
+
+def test_merge_cohort_rows_accumulates_across_chunks():
+    """Один visit_date получает заказы из разных чанков окна оплаты → суммируются, не перезапись."""
+    from sync.lime_kz_roistat import _merge_cohort_rows
+
+    def cr(o, n, rp, rev):
+        return {"channel": "SEO", "level2_id": "", "level2": "", "level3_id": "", "level3": "",
+                "visit_date": "2026-06-08", "cohort_orders": o, "cohort_new": n,
+                "cohort_repeat": rp, "cohort_revenue": rev}
+
+    cmap = {}
+    _merge_cohort_rows(cmap, [cr(10, 4, 6, 1000.0)])   # чанк оплаты 1
+    _merge_cohort_rows(cmap, [cr(5, 2, 3, 500.0)])     # чанк оплаты 2, та же грань визита
+    assert cmap[("2026-06-08", "", "SEO", "SEO Others")] == (15.0, 6.0, 9.0, 1500.0)
