@@ -1,22 +1,32 @@
-from sync.edu_demand import aggregate_weekly_by_phrase, EDU_DEMAND_PHRASES
+from sync.edu_demand import EDU_DEMAND_PHRASES, EDU_DEMAND_REGIONS, aggregate_weekly_by_phrase
 
 
-def test_phrases_are_root_terms_no_nesting():
-    # Крупные корни, нет вложенных «поступить в …» / «… заочно».
-    assert "колледж" in EDU_DEMAND_PHRASES
-    assert "вуз" in EDU_DEMAND_PHRASES
-    assert all("поступить" not in p and "заочно" not in p for p in EDU_DEMAND_PHRASES)
-    assert len(EDU_DEMAND_PHRASES) == len(set(EDU_DEMAND_PHRASES))  # без дублей
+def test_phrases_expanded_no_duplicates():
+    # Расширенный набор: новые уровневые фразы присутствуют, дублей нет.
+    assert "магистратура" in EDU_DEMAND_PHRASES
+    assert "аспирантура" in EDU_DEMAND_PHRASES
+    assert "переподготовка" in EDU_DEMAND_PHRASES
+    assert "заочное обучение" in EDU_DEMAND_PHRASES
+    assert len(EDU_DEMAND_PHRASES) == len(set(EDU_DEMAND_PHRASES))
 
 
-def test_aggregate_snaps_to_iso_monday():
-    # date из API — понедельник недели; count приходит строкой (proto int64).
-    resp = {"results": [
-        {"date": "2025-06-02", "count": "12000", "share": "1.0"},
-        {"date": "2025-06-09", "count": "9000", "share": "1.0"},
-    ]}
-    out = aggregate_weekly_by_phrase("колледж", resp)
-    assert out == {"2025-06-02": 12000, "2025-06-09": 9000}
+def test_phrases_are_roots_no_poostupit_nesting():
+    # Корни, а не вложенные «поступить в …» (широкое соответствие ловит вложенное само).
+    # NB: «заочное обучение» — самостоятельный корень (не вложенное «… заочно»), допустимо.
+    assert all("поступить" not in p for p in EDU_DEMAND_PHRASES)
+
+
+def test_two_regions_ru_and_msk():
+    keys = [k for k, _ in EDU_DEMAND_REGIONS]
+    assert keys == ["ru", "msk"]
+    assert EDU_DEMAND_REGIONS[0][1] == ["225"]
+    assert EDU_DEMAND_REGIONS[1][1] and EDU_DEMAND_REGIONS[1][1][0] != "225"
+
+
+def test_aggregate_weekly_by_phrase_sums_by_monday():
+    resp = {"results": [{"date": "2026-06-01", "count": "10"}, {"date": "2026-06-03", "count": "5"}]}
+    out = aggregate_weekly_by_phrase("вуз", resp)
+    assert out["2026-06-01"] == 15  # оба дня в неделе Пн 2026-06-01
 
 
 def test_aggregate_reduces_midweek_date_to_monday():

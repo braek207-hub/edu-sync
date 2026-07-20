@@ -42,8 +42,8 @@ def aggregate_weekly(responses: list[dict]) -> dict[str, int]:
     return out
 
 
-def fetch_phrase(phrase: str, from_date: str, to_date: str) -> dict:
-    """GetDynamics по одной фразе за период (weekly, регион ru). Даты — YYYY-MM-DD."""
+def fetch_phrase(phrase: str, from_date: str, to_date: str, regions: list[str] | None = None) -> dict:
+    """GetDynamics по одной фразе за период (weekly). regions — список region-id (дефолт РФ)."""
     api_key = os.environ["YANDEX_SEARCHAPI_KEY"]
     folder_id = os.environ.get("YANDEX_CLOUD_FOLDER_ID")  # опц.: ключ привязан к каталогу СА
     # API требует fromDate=понедельник, toDate=воскресенье (граница недели) для PERIOD_WEEKLY.
@@ -52,7 +52,7 @@ def fetch_phrase(phrase: str, from_date: str, to_date: str) -> dict:
         "period": "PERIOD_WEEKLY",
         "fromDate": f"{_monday(from_date)}T00:00:00Z",
         "toDate": f"{_sunday(to_date)}T23:59:59Z",
-        "regions": [RUSSIA_REGION],
+        "regions": regions or [RUSSIA_REGION],
     }
     if folder_id:
         body["folderId"] = folder_id

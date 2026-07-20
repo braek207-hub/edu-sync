@@ -8,17 +8,27 @@ Env: YANDEX_SEARCHAPI_KEY, DATABASE_URL.
 """
 from sync.wordstat import fetch_phrase, _monday
 
+MSK_REGION_ID = "1"  # «Москва и область» (совпадает с CRM msk_mo); проверено probe в Step 1
+
 # Крупные корни без вложенности: широкое соответствие корня уже включает вложенные
 # запросы («поступить в колледж», «колледж заочно»), их не добавляем — иначе Σ двоит.
+# Уровневые корни без вложенности. Маппинг фраза→сегмент — в дашборде (lib/dashboard/demand-traffic.ts).
 EDU_DEMAND_PHRASES: list[str] = [
-    "колледж",
-    "техникум",
-    "вуз",
-    "университет",
-    "институт",
-    "высшее образование",
-    "дистанционное обучение",
-    "профессиональная переподготовка",
+    # СПО
+    "колледж", "техникум", "училище", "ссуз", "среднее профессиональное",
+    # Высшее (ВПО)
+    "вуз", "университет", "институт", "высшее образование", "бакалавриат", "специалитет",
+    # Магистратура / Аспирантура (отдельные сегменты)
+    "магистратура", "аспирантура",
+    # Дистант / Заочно
+    "дистанционное обучение", "дистанционное образование", "заочное обучение",
+    # ДПО (широкая «переподготовка» вместо узкой «профессиональная переподготовка»)
+    "переподготовка", "повышение квалификации", "профпереподготовка",
+]
+
+EDU_DEMAND_REGIONS: list[tuple[str, list[str]]] = [
+    ("ru", ["225"]),
+    ("msk", [MSK_REGION_ID]),
 ]
 
 
@@ -32,11 +42,14 @@ def aggregate_weekly_by_phrase(phrase: str, resp: dict) -> dict[str, int]:
 
 
 def sync_edu_wordstat_demand(from_date: str, to_date: str) -> int:
-    """Синк спроса по всем EDU-фразам за период. Возвращает число строк (week×phrase)."""
-    rows: list[tuple[str, str, int]] = []  # (week_start, phrase, frequency)
-    for phrase in EDU_DEMAND_PHRASES:
-        weekly = aggregate_weekly_by_phrase(phrase, fetch_phrase(phrase, from_date, to_date))
-        rows.extend((wk, phrase, freq) for wk, freq in weekly.items())
+    """Синк спроса по всем EDU-фразам за период × два региона (ru, msk). Строки = week×phrase×region."""
+    rows: list[tuple[str, str, str, int]] = []  # (week_start, region, phrase, frequency)
+    for region_key, region_ids in EDU_DEMAND_REGIONS:
+        for phrase in EDU_DEMAND_PHRASES:
+            weekly = aggregate_weekly_by_phrase(
+                phrase, fetch_phrase(phrase, from_date, to_date, regions=region_ids)
+            )
+            rows.extend((wk, region_key, phrase, freq) for wk, freq in weekly.items())
     if not rows:
         return 0
 
@@ -47,11 +60,11 @@ def sync_edu_wordstat_demand(from_date: str, to_date: str) -> int:
             cur.executemany(
                 """
                 INSERT INTO edu_wordstat_demand (week_start, region, phrase, frequency, updated_at)
-                VALUES (%s, 'ru', %s, %s, now())
+                VALUES (%s, %s, %s, %s, now())
                 ON CONFLICT (week_start, region, phrase)
                 DO UPDATE SET frequency = EXCLUDED.frequency, updated_at = now()
                 """,
-                [(wk, phrase, freq) for wk, phrase, freq in sorted(rows)],
+                [(wk, region_key, phrase, freq) for wk, region_key, phrase, freq in sorted(rows)],
             )
         conn.commit()
     return len(rows)
