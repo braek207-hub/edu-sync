@@ -72,13 +72,15 @@ def denbsp(s: str) -> str:
     return (s or "").replace("\xa0", " ").strip()
 
 
-# Когортная выгрузка: те же продажи, но разложенные по дате ВИЗИТА (dim daily), плюс
-# новизна клиента. new_sales + repeatedSales = paidLeadCount на грани визита (проверено
-# на июне 2026). Отдельный набор, чтобы не смешивать с дневной выгрузкой по дате оплаты.
-COHORT_METRICS = ("paidLeadCount", "paidLeadsPrice", "new_sales", "repeatedSales")
+# Когортная выгрузка: заявки И оплаченные продажи, разложенные по дате ВИЗИТА (dim daily),
+# плюс новизна клиента. leadCount = заявки визитов; paidLeadCount = оплаченные продажи;
+# new_sales + repeatedSales = paidLeadCount на грани визита (проверено на июне 2026).
+# Отдельный набор, чтобы не смешивать с дневной выгрузкой по дате оплаты.
+COHORT_METRICS = ("leadCount", "paidLeadCount", "paidLeadsPrice", "new_sales", "repeatedSales")
 COHORT_DIMENSIONS = ("daily", "marker_level_1", "marker_level_2", "marker_level_3")
 
 _COHORT_FIELD = {
+    "leadCount": "cohort_leads",
     "paidLeadCount": "cohort_orders",
     "paidLeadsPrice": "cohort_revenue",
     "new_sales": "cohort_new",
@@ -117,6 +119,7 @@ def parse_cohort(resp: dict) -> list[dict]:
                 "channel": ch_name or ch_id,
                 "level2_id": l2_id, "level2": l2_name,
                 "level3_id": l3_id, "level3": l3_name,
+                "cohort_leads": 0.0,
                 "cohort_orders": 0.0, "cohort_revenue": 0.0,
                 "cohort_new": 0.0, "cohort_repeat": 0.0,
             }

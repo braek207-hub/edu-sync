@@ -56,6 +56,7 @@ COLUMNS = (
     "new_users", "new_customers", "new_customers_revenue",
     "net_purchases_count", "net_revenue",
     "cohort_orders", "cohort_revenue", "cohort_new_sales", "cohort_repeat_sales",
+    "cohort_leads",
 )
 
 INSERT_SQL = f"INSERT INTO lime_stats ({', '.join(COLUMNS)}) VALUES %s"
@@ -93,7 +94,7 @@ def build_rows(api_rows, fx_rate: float, cabinet_cost: dict, date_s: str, cohort
         cabinet_cost: campaign_id → расход из кабинета в рублях за этот день.
         date_s: дата строк YYYY-MM-DD.
         cohort_map: (visit_date, campaign_id, channel, subchannel) → (orders, new, repeat,
-            revenue_kzt), построен build_cohort_map за окно оплаты.
+            revenue_kzt, leads), построен build_cohort_map за окно оплаты.
 
     Returns:
         Список кортежей в порядке COLUMNS.
@@ -122,6 +123,7 @@ def build_rows(api_rows, fx_rate: float, cabinet_cost: dict, date_s: str, cohort
         c_new = int(cohort[1]) if cohort else None
         c_repeat = int(cohort[2]) if cohort else None
         c_rev = round(float(cohort[3]) * fx_rate, 2) if cohort else None
+        c_leads = int(cohort[4]) if cohort else None
 
         out.append((
             date_s, "web", REGION, channel, subchannel, traffic_type,
@@ -137,7 +139,7 @@ def build_rows(api_rows, fx_rate: float, cabinet_cost: dict, date_s: str, cohort
             int(r["leads"]), round(gross_revenue, 2), int(r["paid_clients"]),
             0, 0, 0.0,
             int(r["paid_leads"]), round(float(r["paid_revenue"]) * fx_rate, 2),
-            c_orders, c_rev, c_new, c_repeat,
+            c_orders, c_rev, c_new, c_repeat, c_leads,
         ))
     return out
 
@@ -164,9 +166,10 @@ def _merge_cohort_rows(cohort_map: dict, cohort_rows: list[dict]) -> None:
     for cr in cohort_rows:
         cid, ch, sub = cohort_key(cr)
         k = (cr["visit_date"], cid, ch, sub)
-        o, n, rp, rev = cohort_map.get(k, (0.0, 0.0, 0.0, 0.0))
+        o, n, rp, rev, ld = cohort_map.get(k, (0.0, 0.0, 0.0, 0.0, 0.0))
         cohort_map[k] = (o + cr["cohort_orders"], n + cr["cohort_new"],
-                         rp + cr["cohort_repeat"], rev + cr["cohort_revenue"])
+                         rp + cr["cohort_repeat"], rev + cr["cohort_revenue"],
+                         ld + cr["cohort_leads"])
 
 
 def build_cohort_map(frm: date, to: date, key: str) -> dict:
