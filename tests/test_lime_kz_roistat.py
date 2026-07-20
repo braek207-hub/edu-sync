@@ -135,7 +135,7 @@ def test_users_are_not_faked_from_visits():
 
 
 def test_columns_have_cohort_fields():
-    for c in ("cohort_orders", "cohort_revenue", "cohort_new_sales", "cohort_repeat_sales", "cohort_leads"):
+    for c in ("cohort_orders", "cohort_revenue", "cohort_new_sales", "cohort_repeat_sales", "cohort_leads", "cohort_clients"):
         assert c in COLUMNS
 
 
@@ -152,18 +152,19 @@ def test_cohort_key_includes_subchannel():
 def test_cohort_written_on_visit_date_row_by_full_key():
     """Когорта склеивается с дневной строкой по (visit_date, campaign_id, channel, subchannel)."""
     # SEO Others: level2 без движка → subchannel «SEO Others».
-    cmap = {("2026-06-08", "", "SEO", "SEO Others"): (56.0, 24.0, 32.0, 2_066_820.0, 70.0)}
+    cmap = {("2026-06-08", "", "SEO", "SEO Others"): (56.0, 24.0, 32.0, 2_066_820.0, 70.0, 48.0)}
     rows = build_rows([api_row("SEO", visits=100)], FX, {}, "2026-06-08", cmap)
     assert col(rows[0], "cohort_orders") == 56
     assert col(rows[0], "cohort_new_sales") == 24
     assert col(rows[0], "cohort_repeat_sales") == 32
     assert round(col(rows[0], "cohort_revenue"), 2) == round(2_066_820.0 * FX, 2)
     assert col(rows[0], "cohort_leads") == 70
+    assert col(rows[0], "cohort_clients") == 48
 
 
 def test_cohort_not_doubled_across_subchannels():
     """Когорта подканала SEO Google НЕ попадает в строку SEO Others того же канала."""
-    cmap = {("2026-06-08", "", "SEO", "SEO Google"): (56.0, 24.0, 32.0, 2_066_820.0, 70.0)}
+    cmap = {("2026-06-08", "", "SEO", "SEO Google"): (56.0, 24.0, 32.0, 2_066_820.0, 70.0, 48.0)}
     # Дневная строка SEO Others (level2 без движка) — когорты для неё в map нет.
     rows = build_rows([api_row("SEO", level2_id="bing", level2="Bing", visits=100)],
                       FX, {}, "2026-06-08", cmap)
@@ -178,7 +179,7 @@ def test_cohort_absent_is_null_not_zero():
 
 
 def test_cohort_new_plus_repeat_equals_orders():
-    cmap = {("2026-06-08", "", "Прямые визиты", "Direct"): (409.0, 86.0, 323.0, 18_031_810.0, 480.0)}
+    cmap = {("2026-06-08", "", "Прямые визиты", "Direct"): (409.0, 86.0, 323.0, 18_031_810.0, 480.0, 350.0)}
     rows = build_rows([api_row("Прямые визиты", visits=2666)], FX, {}, "2026-06-08", cmap)
     assert col(rows[0], "cohort_new_sales") + col(rows[0], "cohort_repeat_sales") == col(rows[0], "cohort_orders")
 
@@ -187,12 +188,12 @@ def test_merge_cohort_rows_accumulates_across_chunks():
     """Один visit_date получает заказы из разных чанков окна оплаты → суммируются, не перезапись."""
     from sync.lime_kz_roistat import _merge_cohort_rows
 
-    def cr(o, n, rp, rev, ld):
+    def cr(o, n, rp, rev, ld, cl):
         return {"channel": "SEO", "level2_id": "", "level2": "", "level3_id": "", "level3": "",
                 "visit_date": "2026-06-08", "cohort_orders": o, "cohort_new": n,
-                "cohort_repeat": rp, "cohort_revenue": rev, "cohort_leads": ld}
+                "cohort_repeat": rp, "cohort_revenue": rev, "cohort_leads": ld, "cohort_clients": cl}
 
     cmap = {}
-    _merge_cohort_rows(cmap, [cr(10, 4, 6, 1000.0, 12)])   # чанк оплаты 1
-    _merge_cohort_rows(cmap, [cr(5, 2, 3, 500.0, 6)])      # чанк оплаты 2, та же грань визита
-    assert cmap[("2026-06-08", "", "SEO", "SEO Others")] == (15.0, 6.0, 9.0, 1500.0, 18.0)
+    _merge_cohort_rows(cmap, [cr(10, 4, 6, 1000.0, 12, 8)])   # чанк оплаты 1
+    _merge_cohort_rows(cmap, [cr(5, 2, 3, 500.0, 6, 4)])      # чанк оплаты 2, та же грань визита
+    assert cmap[("2026-06-08", "", "SEO", "SEO Others")] == (15.0, 6.0, 9.0, 1500.0, 18.0, 12.0)

@@ -76,7 +76,8 @@ def denbsp(s: str) -> str:
 # плюс новизна клиента. leadCount = заявки визитов; paidLeadCount = оплаченные продажи;
 # new_sales + repeatedSales = paidLeadCount на грани визита (проверено на июне 2026).
 # Отдельный набор, чтобы не смешивать с дневной выгрузкой по дате оплаты.
-COHORT_METRICS = ("leadCount", "paidLeadCount", "paidLeadsPrice", "new_sales", "repeatedSales")
+COHORT_METRICS = ("leadCount", "paidLeadCount", "paidLeadsPrice", "new_sales", "repeatedSales",
+                  "paidClientCount")
 COHORT_DIMENSIONS = ("daily", "marker_level_1", "marker_level_2", "marker_level_3")
 
 _COHORT_FIELD = {
@@ -85,6 +86,7 @@ _COHORT_FIELD = {
     "paidLeadsPrice": "cohort_revenue",
     "new_sales": "cohort_new",
     "repeatedSales": "cohort_repeat",
+    "paidClientCount": "cohort_clients",
 }
 
 
@@ -119,7 +121,7 @@ def parse_cohort(resp: dict) -> list[dict]:
                 "channel": ch_name or ch_id,
                 "level2_id": l2_id, "level2": l2_name,
                 "level3_id": l3_id, "level3": l3_name,
-                "cohort_leads": 0.0,
+                "cohort_leads": 0.0, "cohort_clients": 0.0,
                 "cohort_orders": 0.0, "cohort_revenue": 0.0,
                 "cohort_new": 0.0, "cohort_repeat": 0.0,
             }
