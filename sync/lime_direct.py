@@ -41,6 +41,8 @@ import requests
 import psycopg2
 import psycopg2.extras
 
+from sync.fx import to_rub as fx_to_rub
+
 REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports"
 CAMPAIGNS_URL = "https://api.direct.yandex.com/json/v5/campaigns"
 CAMPAIGNS_V501_URL = "https://api.direct.yandex.com/json/v501/campaigns"
@@ -1948,6 +1950,42 @@ def _upsert(rows: List[Dict[str, Any]]) -> int:
     return len(rows)
 
 
+# Денежные поля кабинета — в валюте аккаунта. Для казахстанского кабинета (KZT) их
+# конвертируем в рубли по курсу ЦБ на дату строки и домножаем на НДС. Почему так:
+#   • Валюта: аккаунт lime-kz1 ведётся в тенге (clients.get Currency=KZT), а таблица
+#     общая с рублёвым РФ-кабинетом — без конверсии тенге подмешивались бы к рублям.
+#   • НДС: Reports API в KZ отдаёт Cost БЕЗ НДС (проверено IncludeVAT=YES ≡ NO,
+#     2026-07-22), казахстанские 16% рекламодатель платит сам (reverse-charge).
+#     У РФ-кабинета Cost уже с НДС (IncludeVAT=YES даёт +22%), его не трогаем.
+# Управляется через env, а НЕ по client_login: логин — не признак валюты аккаунта.
+_MONEY_FIELDS = ("cost", "avg_effective_bid", "weekly_budget", "daily_budget", "target_cpa")
+
+
+def _convert_money(rows: List[Dict[str, Any]], src_currency: str, vat_mult: float) -> None:
+    """In-place: денежные поля → рубли (курс ЦБ на дату строки) × vat_mult.
+
+    src_currency пустой/RUB и vat_mult==1 → no-op (РФ-прогон, ничего не меняем).
+    Курс — на дату каждой строки (fx кэширует XML ЦБ по дате). Падение ЦБ роняет
+    синк намеренно: записать тенге под видом рублей хуже явной ошибки.
+    """
+    cur = (src_currency or "").strip().upper()
+    convert_fx = cur not in ("", "RUB", "RUR")
+    if not convert_fx and vat_mult == 1.0:
+        return
+    rate_cache: Dict[str, float] = {}
+    for r in rows:
+        factor = vat_mult
+        if convert_fx:
+            d = r["date"]
+            if d not in rate_cache:
+                rate_cache[d] = fx_to_rub(cur, d)
+            factor *= rate_cache[d]
+        for f in _MONEY_FIELDS:
+            v = r.get(f)
+            if v is not None:
+                r[f] = round(float(v) * factor, 2)
+
+
 def sync_lime_direct(days_back: int = 7) -> int:
     today = date.today()
     date_from = (today - timedelta(days=days_back)).isoformat()
@@ -1992,6 +2030,12 @@ def sync_lime_direct(days_back: int = 7) -> int:
             "campaign_type": c.get("campaign_type"),
             "conversions": json.dumps(r.get("conversions") or {}, ensure_ascii=False),
         })
+
+    src_currency = os.environ.get("LIME_DIRECT_SRC_CURRENCY", "")
+    vat_mult = float(os.environ.get("LIME_DIRECT_VAT_MULT", "1") or "1")
+    _convert_money(merged, src_currency, vat_mult)
+    if (src_currency.strip().upper() not in ("", "RUB", "RUR")) or vat_mult != 1.0:
+        print(f"[lime_direct] деньги → рубли: валюта={src_currency or 'RUB'}, НДС×{vat_mult}")
 
     n = _upsert(merged)
     print(f"[lime_direct] upsert {n} строк в lime_direct_stats")

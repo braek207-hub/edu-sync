@@ -126,7 +126,8 @@ FROM lime_google_ads_entities
 WHERE region = 'kz'
 """
 
-# Расход KZ-кабинетов: Директ LIME-KZ1 (cost уже с НДС) + Google KZ (cost_rub посчитан
+# Расход KZ-кабинетов: Директ LIME-KZ1 (cost уже в рублях с НДС — тенге сконвертированы
+# в sync/lime_direct.py по курсу ЦБ + казахстанский НДС 16%) + Google KZ (cost_rub посчитан
 # sync/google_ads_fx.py по курсу ЦБ; если его ещё нет — строка расхода пропускается,
 # чтобы не подмешать доллары в рубли).
 SELECT_COST_DIRECT = """

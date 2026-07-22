@@ -46,6 +46,8 @@ COHORT_CHUNK_DAYS = int(os.environ.get("LIME_KZ_ROISTAT_COHORT_CHUNK") or "14")
 
 # Каналы, чей расход в Роистате лежит в рублях под видом тенге (валютная ловушка выше) —
 # берём его из кабинета по campaign_id. Значение — логин кабинета в lime_direct_stats.
+# Кабинет сам уже в рублях с НДС (тенге сконвертированы в sync/lime_direct.py), поэтому
+# ниже cabinet-расход берётся как есть, без домножения на fx_rate.
 CABINET_COST_CHANNELS = {"Яндекс.Директ 1": "LIME-KZ1"}
 
 COLUMNS = (

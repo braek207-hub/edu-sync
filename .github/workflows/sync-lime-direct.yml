@@ -66,6 +66,11 @@ jobs:
           LIME_DIRECT_TOKEN: ${{ secrets.LIME_DIRECT_KZ_TOKEN }}
           LIME_DIRECT_CLIENT_LOGIN: ${{ secrets.LIME_DIRECT_KZ_CLIENT_LOGIN }}
           LIME_DIRECT_DAYS_BACK: ${{ github.event.inputs.days_back || '7' }}
+          # Кабинет lime-kz1 в тенге → рубли по курсу ЦБ + казахстанский НДС 16%.
+          # Reports API в KZ отдаёт Cost без НДС (IncludeVAT=YES≡NO, проверено 2026-07-22),
+          # поэтому 16% добавляем сами. РФ-шаг выше этих env не задаёт → остаётся в рублях.
+          LIME_DIRECT_SRC_CURRENCY: "KZT"
+          LIME_DIRECT_VAT_MULT: "1.16"
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_direct
 
