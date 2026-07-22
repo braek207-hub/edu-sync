@@ -87,3 +87,9 @@ jobs:
           YM_TOKEN: ${{ secrets.YM_TOKEN }}
           METRIKA_DRY_RUN: ${{ github.event.inputs.metrika_dry_run || 'false' }}
         run: python main.py
+
+      # Сброс серверного кэша Panda-BI (unstable_cache 24ч): иначе правки плана/CRM/директа
+      # в дашборде видны лишь через сутки. Как в sync-lime/decortier/edu-direct-settings.
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
