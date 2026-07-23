@@ -1,0 +1,46 @@
+name: Sync LIME Media → Supabase
+
+# Медийка LIME (Ф4): Urban Ads (публичный API). Гео/Медиаметрика (headless) добавятся шагами сюда.
+on:
+  schedule:
+    # 07:10 UTC = 10:10 Moscow (после основного lime-direct в 07:00)
+    - cron: "10 7 * * *"
+  workflow_dispatch:
+    inputs:
+      days_back:
+        description: "Days back to sync (default 14)"
+        required: false
+        default: "14"
+
+concurrency:
+  group: lime-media-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Urban Ads sync (source=urban.ads)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          API_LIME_URBAN: ${{ secrets.API_LIME_URBAN }}
+          LIME_URBAN_BUSINESS_ID: "216787226"
+          LIME_URBAN_DAYS_BACK: ${{ github.event.inputs.days_back || '14' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_urban
+
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
