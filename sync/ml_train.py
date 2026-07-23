@@ -120,6 +120,7 @@ def train_and_eval(rows, today: Optional[date] = None) -> dict[str, Any]:
     p_final = compose_cascade(pc, pd, pp)
     y_final = [1 if r["label_paid"] else 0 for r in te_mat]
 
+    from sklearn.metrics import average_precision_score
     lift_final = lift_at_decile(y_final, p_final)
     br = brier(y_final, p_final)
 
@@ -128,9 +129,16 @@ def train_and_eval(rows, today: Optional[date] = None) -> dict[str, Any]:
     lift_pilot = lift_at_decile(y_final, pilot)
     base_pred = fit_logistic_baseline(tr_rows, cat_names,
                                       [1 if r["label_paid"] else 0 for r in train])
-    lift_base = lift_at_decile(y_final, base_pred(te_mat_rows))
+    base_scores = base_pred(te_mat_rows)
+    lift_base = lift_at_decile(y_final, base_scores)
 
-    gate = decide_gate(lift_final, lift_base, lift_pilot)
+    # PR-AUC (average precision) — не сатурирует на топ-дециле как lift; ОСНОВНАЯ метрика гейта
+    has_pos = sum(y_final) > 0
+    ap_final = float(average_precision_score(y_final, p_final)) if has_pos else 0.0
+    ap_base = float(average_precision_score(y_final, base_scores)) if has_pos else 0.0
+    ap_pilot = float(average_precision_score(y_final, pilot)) if has_pos else 0.0
+
+    gate = decide_gate(ap_final, ap_base, ap_pilot)
     version = today.strftime("%Y%m%d")
 
     # ── Tweedie для чека ──
@@ -156,10 +164,12 @@ def train_and_eval(rows, today: Optional[date] = None) -> dict[str, Any]:
     }
     run = {
         "version": version, "n_train": len(train), "n_pos_pay": sum(y_final),
-        "prauc_pay": None, "brier_pay": br, "lift_final": lift_final,
+        "prauc_pay": ap_final, "brier_pay": br, "lift_final": lift_final,
         "lift_baseline": lift_base, "lift_pilot": lift_pilot, "gate_passed": gate,
         "stage_metrics": {"n_connect_pos": int(sum(y_c)), "n_deal_pos": int(sum(y_d)),
-                          "n_pay_pos": int(sum(y_p))},
+                          "n_pay_pos": int(sum(y_p)),
+                          "ap_final": ap_final, "ap_base": ap_base, "ap_pilot": ap_pilot,
+                          "lift_final": lift_final, "lift_base": lift_base},
     }
     return {"run": run, "artifacts": artifacts}
 
