@@ -32,6 +32,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Install Playwright Chromium (для headless-медийки без API)
+        run: python -m playwright install --with-deps chromium
+
       - name: Run Urban Ads sync (source=urban.ads)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -40,6 +43,18 @@ jobs:
           LIME_URBAN_DAYS_BACK: ${{ github.event.inputs.days_back || '14' }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_urban
+
+      # Медиаметрика (post-view) — нет API, ходим по сохранённой сессии Яндекса.
+      # continue-on-error: сессия может протухнуть/датацентр-IP заблокироваться —
+      # не роняем весь workflow (Urban уже записался выше).
+      - name: Run Mediametrica sync (source=mediametrica)
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          YANDEX_STORAGE_STATE: ${{ secrets.YANDEX_STORAGE_STATE }}
+          LIME_MM_DAYS_BACK: ${{ github.event.inputs.days_back || '14' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_mediametrica
 
       - name: Revalidate dashboard cache
         if: success()
