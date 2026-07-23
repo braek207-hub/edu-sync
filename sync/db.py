@@ -783,6 +783,44 @@ def ensure_metrika_table() -> None:
         conn.commit()
 
 
+def ensure_ml_feature_tables() -> None:
+    """Идемпотентно создаёт feature store и кривую созревания (ML-скоринг EDU)."""
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS edu_lead_features (
+          lead_id TEXT PRIMARY KEY,
+          client_id TEXT,
+          land TEXT NOT NULL,
+          created_date DATE NOT NULL,
+          label_paid BOOLEAN,
+          label_connected BOOLEAN,
+          label_deal BOOLEAN,
+          is_matured BOOLEAN NOT NULL DEFAULT FALSE,
+          amount DOUBLE PRECISION,
+          days_to_pay INTEGER,
+          features JSONB NOT NULL DEFAULT '{}'::jsonb,
+          built_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_elf_created ON edu_lead_features(created_date)",
+        "CREATE INDEX IF NOT EXISTS idx_elf_client ON edu_lead_features(client_id)",
+        """
+        CREATE TABLE IF NOT EXISTS edu_ml_maturation (
+          land TEXT NOT NULL,
+          age_days INTEGER NOT NULL,
+          matured_fraction DOUBLE PRECISION NOT NULL,
+          built_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (land, age_days)
+        )
+        """,
+    ]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        for stmt in statements:
+            cur.execute(stmt)
+        conn.commit()
+
+
 def load_uploaded_conversion_keys() -> set:
     ensure_metrika_table()
     with get_connection() as conn:
