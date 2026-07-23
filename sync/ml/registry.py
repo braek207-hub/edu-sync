@@ -24,6 +24,7 @@ REGISTRY: list[FeatureSpec] = [
     FeatureSpec("b24_edu_level", "at_creation", "cat"),
     FeatureSpec("city_ip_segment", "at_creation", "cat"),
     FeatureSpec("direction", "at_creation", "cat"),
+    FeatureSpec("campaign_id", "at_creation", "cat"),
     # product_group / utm_source в crm_lead_details заполняются от привязанного продукта/заказа
     # НА ЭТАПЕ ОПЛАТЫ (null у 100% неоплативших) → это outcome-утечка, НЕ выбирать в фичи.
     FeatureSpec("product_group", "outcome", "cat"),
@@ -41,10 +42,15 @@ REGISTRY: list[FeatureSpec] = [
     FeatureSpec("beh_source", "pre_lead", "cat"),
     FeatureSpec("missing_behavior", "pre_lead", "num"),   # 1 если нет поведения/client_id
     FeatureSpec("repeat_lead", "pre_lead", "num"),        # >1 лида у client_id
+    FeatureSpec("visits_before_lead", "pre_lead", "num"),
+    FeatureSpec("days_since_first_touch", "pre_lead", "num"),
+    FeatureSpec("sessions_before", "pre_lead", "num"),
+    FeatureSpec("had_repeat_visit", "pre_lead", "num"),
     # L1 — известно только ПОСЛЕ дозвона
     FeatureSpec("time_to_connection_days", "post_connection", "num"),
     FeatureSpec("dispatcher", "post_connection", "cat"),
     FeatureSpec("responsible", "post_connection", "cat"),
+    FeatureSpec("mins_to_connection", "post_connection", "num"),
 ]
 
 

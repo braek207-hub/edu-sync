@@ -25,3 +25,11 @@ def test_post_connection_is_superset_of_creation():
 
 def test_feature_key_maps_to_jsonb():
     assert feature_key("audience") == "f__audience"
+
+def test_phase2_features_registered():
+    atc = set(select_features("at_creation"))
+    pc = set(select_features("post_connection"))
+    assert "campaign_id" in atc
+    assert "visits_before_lead" in atc         # pre_lead виден @creation
+    assert "mins_to_connection" not in atc      # post_connection
+    assert "mins_to_connection" in pc
