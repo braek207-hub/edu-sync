@@ -14,6 +14,7 @@ from sync.ml.cascade import build_stage_matrix, compose_cascade
 from sync.ml.metrics import brier, lift_at_decile
 
 HOLDOUT_MONTHS = 3
+MATURITY_DAYS = 90
 POINT = "at_creation"
 
 
@@ -21,11 +22,18 @@ def decide_gate(lift_final: float, lift_baseline: float, lift_pilot: float) -> b
     return lift_final > max(lift_baseline, lift_pilot)
 
 
-def time_split(rows, holdout_months: int = HOLDOUT_MONTHS, today: Optional[date] = None):
+def time_split(rows, holdout_months=HOLDOUT_MONTHS, maturity_days=MATURITY_DAYS, today=None):
+    """Только созревшие когорты (метка pay наблюдаема). test = held-out окно
+    [today-(maturity+holdout), today-maturity): все is_matured, не в train.
+    train = старше него. Молодые (age<maturity) исключены — оценивать P(pay) нечем.
+    Анти-утечка по человеку (цель GroupKFold, I1): из test убираем лиды с client_id из train."""
     today = today or date.today()
-    cutoff = today - timedelta(days=30 * holdout_months)
-    train = [r for r in rows if r["created_date"] < cutoff]
-    test = [r for r in rows if r["created_date"] >= cutoff]
+    end = today - timedelta(days=maturity_days)
+    start = today - timedelta(days=maturity_days + 30 * holdout_months)
+    train = [r for r in rows if r["created_date"] < start]
+    test = [r for r in rows if start <= r["created_date"] < end]
+    train_clients = {r.get("client_id") for r in train if r.get("client_id")}
+    test = [r for r in test if not (r.get("client_id") and r["client_id"] in train_clients)]
     return train, test
 
 
@@ -53,6 +61,16 @@ def train_and_eval(rows, today: Optional[date] = None) -> dict[str, Any]:
     today = today or date.today()
     train, test = time_split(rows, today=today)
 
+    def _degenerate(reason):
+        return {"run": {"version": today.strftime("%Y%m%d"), "n_train": len(train),
+                        "n_pos_pay": 0, "prauc_pay": None, "brier_pay": None,
+                        "lift_final": 0.0, "lift_baseline": 0.0, "lift_pilot": 0.0,
+                        "gate_passed": False, "stage_metrics": {"skipped": reason}},
+                "artifacts": {}}
+
+    if not train or not test:
+        return _degenerate("empty train/test after split")
+
     def matrix(subset):
         feats = [r["features"] for r in subset]
         return build_stage_matrix(feats, POINT)
@@ -63,22 +81,29 @@ def train_and_eval(rows, today: Optional[date] = None) -> dict[str, Any]:
 
     # connect: все
     y_c = [1 if r["label_connected"] else 0 for r in train]
+
+    # deal|connect
+    idx_conn = [i for i, r in enumerate(train) if r["label_connected"]]
+    y_d = [1 if train[i]["label_deal"] else 0 for i in idx_conn]
+
+    # pay|deal (только созревшие)
+    idx_deal = [i for i, r in enumerate(train) if r["label_deal"] and r["is_matured"]]
+    y_p = [1 if train[i]["label_paid"] else 0 for i in idx_deal]
+
+    if (sum(y_c) == 0 or len(idx_conn) == 0 or sum(y_d) == 0
+            or len(idx_deal) == 0 or sum(y_p) == 0):
+        return _degenerate("single-class or empty stage subpopulation")
+
     spw_c = max(1.0, (len(y_c) - sum(y_c)) / max(1, sum(y_c)))
     m_c, nm, ci = _fit_stage(tr_rows, cat_names, y_c, spw_c)
     cal_c = IsotonicRegression(out_of_bounds="clip").fit(
         _proba(m_c, tr_rows, nm, ci), y_c)
 
-    # deal|connect
-    idx_conn = [i for i, r in enumerate(train) if r["label_connected"]]
-    y_d = [1 if train[i]["label_deal"] else 0 for i in idx_conn]
     spw_d = max(1.0, (len(y_d) - sum(y_d)) / max(1, sum(y_d)))
     m_d, _, _ = _fit_stage([tr_rows[i] for i in idx_conn], cat_names, y_d, spw_d)
     cal_d = IsotonicRegression(out_of_bounds="clip").fit(
         _proba(m_d, [tr_rows[i] for i in idx_conn], nm, ci), y_d)
 
-    # pay|deal (только созревшие)
-    idx_deal = [i for i, r in enumerate(train) if r["label_deal"] and r["is_matured"]]
-    y_p = [1 if train[i]["label_paid"] else 0 for i in idx_deal]
     spw_p = max(1.0, (len(y_p) - sum(y_p)) / max(1, sum(y_p)))
     m_p, _, _ = _fit_stage([tr_rows[i] for i in idx_deal], cat_names, y_p, spw_p)
     cal_p = IsotonicRegression(out_of_bounds="clip").fit(
@@ -86,6 +111,8 @@ def train_and_eval(rows, today: Optional[date] = None) -> dict[str, Any]:
 
     # ── оценка на holdout (итоговый P(pay), метка = matured & paid) ──
     te_mat = [r for r in test if r["is_matured"]]
+    if not te_mat:
+        return _degenerate("empty matured holdout")
     te_mat_rows, _, _ = matrix(te_mat)
     pc = cal_c.predict(_proba(m_c, te_mat_rows, nm, ci))
     pd = cal_d.predict(_proba(m_d, te_mat_rows, nm, ci))
