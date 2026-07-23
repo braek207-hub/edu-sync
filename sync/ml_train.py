@@ -1,5 +1,7 @@
 """Оркестратор обучения каскада EDU (land=vuz). Гоняется в CI (train-edu-ml.yml):
-load_feature_matrix → time-split → 3 CatBoost + isotonic → метрики + гейт → артефакты + edu_ml_runs.
+load_feature_matrix → time-split → CatBoost + isotonic → метрики + гейт → артефакты + edu_ml_runs.
+Обучает ДВЕ точки скоринга: at_creation (все лиды, полный каскад connect×deal×pay) и
+post_connection (только дозвонившиеся — connect тривиален, P(pay)=P(deal)×P(pay|deal)).
 Локально не запускается (БД недоступна)."""
 
 from datetime import date, timedelta
@@ -15,7 +17,15 @@ from sync.ml.metrics import brier, lift_at_decile
 
 HOLDOUT_MONTHS = 3
 MATURITY_DAYS = 90
-POINT = "at_creation"
+POINTS = ["at_creation", "post_connection"]
+SUFFIX = {"at_creation": "atc", "post_connection": "pc"}
+
+
+def point_subset(rows, point):
+    """Субпопуляция под точку скоринга: at_creation = все; post_connection = дозвонившиеся."""
+    if point == "post_connection":
+        return [r for r in rows if r.get("label_connected")]
+    return list(rows)
 
 
 def decide_gate(lift_final: float, lift_baseline: float, lift_pilot: float) -> bool:
@@ -56,16 +66,18 @@ def _proba(model, rows, names, cat_idx):
     return model.predict_proba(Pool(X, cat_features=cat_idx))[:, 1]
 
 
-def train_and_eval(rows, today: Optional[date] = None) -> dict[str, Any]:
+def _train_one_point(rows, point: str, today: date) -> dict[str, Any]:
     from sklearn.isotonic import IsotonicRegression
-    today = today or date.today()
-    train, test = time_split(rows, today=today)
+    pop = point_subset(rows, point)
+    train, test = time_split(pop, today=today)
+    is_pc = point == "post_connection"
 
     def _degenerate(reason):
-        return {"run": {"version": today.strftime("%Y%m%d"), "n_train": len(train),
-                        "n_pos_pay": 0, "prauc_pay": None, "brier_pay": None,
-                        "lift_final": 0.0, "lift_baseline": 0.0, "lift_pilot": 0.0,
-                        "gate_passed": False, "stage_metrics": {"skipped": reason}},
+        return {"run": {"version": today.strftime("%Y%m%d"), "scoring_point": point,
+                        "n_train": len(train), "n_pos_pay": 0, "prauc_pay": None,
+                        "brier_pay": None, "lift_final": 0.0, "lift_baseline": 0.0,
+                        "lift_pilot": 0.0, "gate_passed": False,
+                        "stage_metrics": {"skipped": reason}},
                 "artifacts": {}}
 
     if not train or not test:
@@ -73,34 +85,37 @@ def train_and_eval(rows, today: Optional[date] = None) -> dict[str, Any]:
 
     def matrix(subset):
         feats = [r["features"] for r in subset]
-        return build_stage_matrix(feats, POINT)
+        return build_stage_matrix(feats, point)
 
     # ── стадии ──
     tr_rows, names, cat_names = matrix(train)
     te_rows, _, _ = matrix(test)
 
-    # connect: все
+    # connect: только для at_creation (в post_connection все дозвонились — P(connect)=1)
     y_c = [1 if r["label_connected"] else 0 for r in train]
 
-    # deal|connect
-    idx_conn = [i for i, r in enumerate(train) if r["label_connected"]]
+    # deal|connect (в post_connection все connected → вся train-субпопуляция)
+    idx_conn = list(range(len(train))) if is_pc else [i for i, r in enumerate(train) if r["label_connected"]]
     y_d = [1 if train[i]["label_deal"] else 0 for i in idx_conn]
 
     # pay|deal (только созревшие)
     idx_deal = [i for i, r in enumerate(train) if r["label_deal"] and r["is_matured"]]
     y_p = [1 if train[i]["label_paid"] else 0 for i in idx_deal]
 
-    if (sum(y_c) == 0 or len(idx_conn) == 0 or sum(y_d) == 0
+    connect_ok = is_pc or sum(y_c) > 0
+    if (not connect_ok or len(idx_conn) == 0 or sum(y_d) == 0
             or len(idx_deal) == 0 or sum(y_p) == 0):
         return _degenerate("single-class or empty stage subpopulation")
 
-    spw_c = max(1.0, (len(y_c) - sum(y_c)) / max(1, sum(y_c)))
-    m_c, nm, ci = _fit_stage(tr_rows, cat_names, y_c, spw_c)
-    cal_c = IsotonicRegression(out_of_bounds="clip").fit(
-        _proba(m_c, tr_rows, nm, ci), y_c)
+    m_c = cal_c = None
+    if not is_pc:
+        spw_c = max(1.0, (len(y_c) - sum(y_c)) / max(1, sum(y_c)))
+        m_c, nm0, ci0 = _fit_stage(tr_rows, cat_names, y_c, spw_c)
+        cal_c = IsotonicRegression(out_of_bounds="clip").fit(
+            _proba(m_c, tr_rows, nm0, ci0), y_c)
 
     spw_d = max(1.0, (len(y_d) - sum(y_d)) / max(1, sum(y_d)))
-    m_d, _, _ = _fit_stage([tr_rows[i] for i in idx_conn], cat_names, y_d, spw_d)
+    m_d, nm, ci = _fit_stage([tr_rows[i] for i in idx_conn], cat_names, y_d, spw_d)
     cal_d = IsotonicRegression(out_of_bounds="clip").fit(
         _proba(m_d, [tr_rows[i] for i in idx_conn], nm, ci), y_d)
 
@@ -114,7 +129,10 @@ def train_and_eval(rows, today: Optional[date] = None) -> dict[str, Any]:
     if not te_mat:
         return _degenerate("empty matured holdout")
     te_mat_rows, _, _ = matrix(te_mat)
-    pc = cal_c.predict(_proba(m_c, te_mat_rows, nm, ci))
+    if is_pc:
+        pc = np.ones(len(te_mat_rows))
+    else:
+        pc = cal_c.predict(_proba(m_c, te_mat_rows, nm, ci))
     pd = cal_d.predict(_proba(m_d, te_mat_rows, nm, ci))
     pp = cal_p.predict(_proba(m_p, te_mat_rows, nm, ci))
     p_final = compose_cascade(pc, pd, pp)
@@ -155,17 +173,20 @@ def train_and_eval(rows, today: Optional[date] = None) -> dict[str, Any]:
         tw = None
 
     artifacts = {
-        "cb_connect": serialize_catboost(m_c), "cb_deal": serialize_catboost(m_d),
-        "cb_pay": serialize_catboost(m_p),
-        "cal_connect": serialize_pickle(cal_c), "cal_deal": serialize_pickle(cal_d),
-        "cal_pay": serialize_pickle(cal_p),
+        "cb_deal": serialize_catboost(m_d), "cb_pay": serialize_catboost(m_p),
+        "cal_deal": serialize_pickle(cal_d), "cal_pay": serialize_pickle(cal_p),
         "tweedie": serialize_pickle({"model": tw, "vec": tw_vec}),
-        "manifest": serialize_pickle({"names": nm, "cat_idx": ci, "point": POINT}),
+        "manifest": serialize_pickle({"names": nm, "cat_idx": ci, "point": point}),
     }
+    if not is_pc:
+        artifacts["cb_connect"] = serialize_catboost(m_c)
+        artifacts["cal_connect"] = serialize_pickle(cal_c)
+
     run = {
-        "version": version, "n_train": len(train), "n_pos_pay": sum(y_final),
-        "prauc_pay": ap_final, "brier_pay": br, "lift_final": lift_final,
-        "lift_baseline": lift_base, "lift_pilot": lift_pilot, "gate_passed": gate,
+        "version": version, "scoring_point": point, "n_train": len(train),
+        "n_pos_pay": sum(y_final), "prauc_pay": ap_final, "brier_pay": br,
+        "lift_final": lift_final, "lift_baseline": lift_base, "lift_pilot": lift_pilot,
+        "gate_passed": gate,
         "stage_metrics": {"n_connect_pos": int(sum(y_c)), "n_deal_pos": int(sum(y_d)),
                           "n_pay_pos": int(sum(y_p)),
                           "ap_final": ap_final, "ap_base": ap_base, "ap_pilot": ap_pilot,
@@ -174,17 +195,28 @@ def train_and_eval(rows, today: Optional[date] = None) -> dict[str, Any]:
     return {"run": run, "artifacts": artifacts}
 
 
-def run_training() -> dict[str, Any]:
+def train_and_eval(rows, today: Optional[date] = None) -> list[dict[str, Any]]:
+    """Обучает обе точки скоринга; возвращает список результатов per point."""
+    today = today or date.today()
+    return [_train_one_point(rows, point, today) for point in POINTS]
+
+
+def run_training() -> list[dict[str, Any]]:
     db.ensure_ml_scoring_tables()
     rows = db.load_feature_matrix()
-    result = train_and_eval(rows)
-    for kind, blob in result["artifacts"].items():
-        db.save_artifact(result["run"]["version"], kind, blob)
-    db.insert_ml_run(result["run"])
-    r = result["run"]
-    print(f"train v{r['version']}: lift_final={r['lift_final']:.2f} "
-          f"base={r['lift_baseline']:.2f} pilot={r['lift_pilot']:.2f} gate={r['gate_passed']}")
-    return r
+    results = train_and_eval(rows)
+    runs = []
+    for res in results:
+        r = res["run"]
+        sfx = SUFFIX[r["scoring_point"]]
+        for kind, blob in res["artifacts"].items():
+            db.save_artifact(r["version"], f"{kind}_{sfx}", blob)
+        db.insert_ml_run(r)
+        print(f"train v{r['version']} [{r['scoring_point']}]: "
+              f"lift_final={r['lift_final']:.2f} base={r['lift_baseline']:.2f} "
+              f"pilot={r['lift_pilot']:.2f} gate={r['gate_passed']}")
+        runs.append(r)
+    return runs
 
 
 if __name__ == "__main__":

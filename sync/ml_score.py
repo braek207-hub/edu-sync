@@ -1,6 +1,7 @@
 """Оркестратор скоринга+прогноза EDU (land=vuz). Гоняется в CI (score-edu-ml.yml):
-грузит последнюю прошедшую гейт модель → скорит лиды → edu_lead_scores → прогноз → edu_revenue_forecast.
-Публикует ТОЛЬКО если есть версия с gate_passed=true."""
+грузит последнюю прошедшую гейт модель ПО КАЖДОЙ точке → скорит субпопуляцию →
+edu_lead_scores(scoring_point) → прогноз (только at_creation) → edu_revenue_forecast.
+Публикует точку ТОЛЬКО если есть её версия с gate_passed=true."""
 
 from datetime import date, timedelta
 from typing import Any, Optional
@@ -11,9 +12,9 @@ from sync import db
 from sync.ml.artifacts import deserialize_catboost, deserialize_pickle
 from sync.ml.cascade import build_stage_matrix, compose_cascade
 from sync.ml.forecast import aggregate_forecast, expected_revenue
+from sync.ml_train import POINTS, point_subset
 
 MATURITY_DAYS = 90
-POINT = "at_creation"
 
 
 def to_deciles(scores) -> list[int]:
@@ -44,30 +45,32 @@ def _maturation_remaining(today: date) -> dict[int, float]:
         return {int(a): max(0.0, 1.0 - float(f)) for a, f in cur.fetchall()}
 
 
-def run_scoring(today: Optional[date] = None) -> dict[str, Any]:
-    today = today or date.today()
-    db.ensure_ml_scoring_tables()
-    loaded = db.load_latest_passing_artifacts()
+def _score_point(point: str, rows: list) -> Optional[dict[str, Any]]:
+    """Скорит субпопуляцию точки, если есть прошедшая гейт модель. Возвращает
+    {version, pop, X, p_final, tw, n} для последующего прогноза, либо None (нет модели)."""
+    loaded = db.load_latest_passing_artifacts(point)
     if loaded is None:
-        print("нет модели с gate_passed=true — скоринг пропущен")
-        return {"scored": 0, "forecast_segments": 0}
+        print(f"нет модели {point} — пропуск")
+        return None
     version, blobs = loaded
     man = deserialize_pickle(blobs["manifest"])
     nm, ci = man["names"], man["cat_idx"]
-    m_c = deserialize_catboost(blobs["cb_connect"])
     m_d = deserialize_catboost(blobs["cb_deal"])
     m_p = deserialize_catboost(blobs["cb_pay"])
-    cal_c = deserialize_pickle(blobs["cal_connect"])
     cal_d = deserialize_pickle(blobs["cal_deal"])
     cal_p = deserialize_pickle(blobs["cal_pay"])
     tw = deserialize_pickle(blobs["tweedie"])
 
-    rows = db.load_feature_matrix()
-    feats = [r["features"] for r in rows]
-    X, _, _ = build_stage_matrix(feats, POINT)
+    pop = point_subset(rows, point)
+    X, _, _ = build_stage_matrix([r["features"] for r in pop], point)
     from catboost import Pool
     Xm = [[r[n] for n in nm] for r in X]
-    pc = cal_c.predict(m_c.predict_proba(Pool(Xm, cat_features=ci))[:, 1])
+    if "cb_connect" in blobs:
+        m_c = deserialize_catboost(blobs["cb_connect"])
+        cal_c = deserialize_pickle(blobs["cal_connect"])
+        pc = cal_c.predict(m_c.predict_proba(Pool(Xm, cat_features=ci))[:, 1])
+    else:
+        pc = np.ones(len(pop))
     pd = cal_d.predict(m_d.predict_proba(Pool(Xm, cat_features=ci))[:, 1])
     pp = cal_p.predict(m_p.predict_proba(Pool(Xm, cat_features=ci))[:, 1])
     p_final = compose_cascade(pc, pd, pp)
@@ -77,37 +80,60 @@ def run_scoring(today: Optional[date] = None) -> dict[str, Any]:
     shap = m_p.get_feature_importance(type="ShapValues", data=Pool(Xm, cat_features=ci))
 
     score_rows = []
-    for i, r in enumerate(rows):
+    for i, r in enumerate(pop):
         contrib = shap[i][:-1]  # последний столбец — expected value
         top_idx = np.argsort(-np.abs(contrib))[:3]
         top = [{"feature": nm[j], "shap": float(contrib[j])} for j in top_idx]
         score_rows.append({
-            "lead_id": r["lead_id"], "scoring_point": POINT,
+            "lead_id": r["lead_id"], "scoring_point": point,
             "p_connect": float(pc[i]), "p_deal": float(pd[i]), "p_pay": float(p_final[i]),
             "decile": deciles[i], "top_shap": top, "model_version": version,
         })
     n = db.upsert_lead_scores(score_rows)
+    return {"version": version, "pop": pop, "X": X, "p_final": p_final, "tw": tw, "n": n}
 
-    # ── прогноз выручки ──
-    remaining = _maturation_remaining(today)
-    tw_model, tw_vec = tw["model"], tw["vec"]
-    fc_items = []
-    for i, r in enumerate(rows):
-        if not is_pending(r, today):
+
+def run_scoring(today: Optional[date] = None) -> dict[str, Any]:
+    today = today or date.today()
+    db.ensure_ml_scoring_tables()
+    rows = db.load_feature_matrix()
+
+    total_scored = 0
+    atc = None
+    for point in POINTS:
+        res = _score_point(point, rows)
+        if res is None:
             continue
-        age = (today - r["created_date"]).days
-        rem = remaining.get(age, remaining.get(min(remaining, key=lambda k: abs(k - age)), 0.0)) if remaining else 0.0
-        exp_amt = float(tw_model.predict(tw_vec.transform([X[i]]))[0]) if tw_model else 0.0
-        exp_rev = expected_revenue(p_final[i], exp_amt, rem)
-        fc_items.append({"segment": r["direction"] or "__na__", "exp_rev": exp_rev, "p_pay": float(p_final[i])})
+        total_scored += res["n"]
+        if point == "at_creation":
+            atc = res
 
-    fc_rows = aggregate_forecast(fc_items)
-    for fr in fc_rows:
-        fr["as_of_date"] = today
-        fr["model_version"] = version
-    k = db.upsert_revenue_forecast(fc_rows)
-    print(f"score v{version}: leads={n} forecast_segments={k}")
-    return {"scored": n, "forecast_segments": k}
+    # ── прогноз выручки (только at_creation — вся популяция лидов) ──
+    k = 0
+    if atc is None:
+        print("нет модели at_creation — прогноз пропущен")
+    else:
+        version, pop, X, p_final = atc["version"], atc["pop"], atc["X"], atc["p_final"]
+        remaining = _maturation_remaining(today)
+        tw_model, tw_vec = atc["tw"]["model"], atc["tw"]["vec"]
+        fc_items = []
+        for i, r in enumerate(pop):
+            if not is_pending(r, today):
+                continue
+            age = (today - r["created_date"]).days
+            rem = remaining.get(age, remaining.get(min(remaining, key=lambda k: abs(k - age)), 0.0)) if remaining else 0.0
+            exp_amt = float(tw_model.predict(tw_vec.transform([X[i]]))[0]) if tw_model else 0.0
+            exp_rev = expected_revenue(p_final[i], exp_amt, rem)
+            fc_items.append({"segment": r["direction"] or "__na__", "exp_rev": exp_rev, "p_pay": float(p_final[i])})
+
+        fc_rows = aggregate_forecast(fc_items)
+        for fr in fc_rows:
+            fr["as_of_date"] = today
+            fr["model_version"] = version
+        k = db.upsert_revenue_forecast(fc_rows)
+
+    print(f"score: leads={total_scored} forecast_segments={k}")
+    return {"scored": total_scored, "forecast_segments": k}
 
 
 if __name__ == "__main__":

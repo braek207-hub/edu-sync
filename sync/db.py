@@ -846,12 +846,15 @@ def ensure_ml_scoring_tables() -> None:
         """,
         """
         CREATE TABLE IF NOT EXISTS edu_ml_runs (
-          version TEXT PRIMARY KEY, trained_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          version TEXT NOT NULL,
+          scoring_point TEXT NOT NULL DEFAULT 'at_creation',
+          trained_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           n_train INTEGER NOT NULL, n_pos_pay INTEGER NOT NULL,
           prauc_pay DOUBLE PRECISION, brier_pay DOUBLE PRECISION,
           lift_final DOUBLE PRECISION, lift_baseline DOUBLE PRECISION,
           lift_pilot DOUBLE PRECISION, gate_passed BOOLEAN NOT NULL DEFAULT FALSE,
-          stage_metrics JSONB NOT NULL DEFAULT '{}'::jsonb
+          stage_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+          PRIMARY KEY (version, scoring_point)
         )
         """,
         """
@@ -873,9 +876,29 @@ def ensure_ml_scoring_tables() -> None:
         )
         """,
     ]
+    # Идемпотентная миграция для СУЩЕСТВУЮЩЕЙ прод-таблицы edu_ml_runs (Ф1b: version PK).
+    # Добавляем scoring_point и меняем PK (version) → (version, scoring_point).
+    migrations = [
+        "ALTER TABLE edu_ml_runs ADD COLUMN IF NOT EXISTS scoring_point TEXT NOT NULL DEFAULT 'at_creation'",
+        """
+        DO $$
+        BEGIN
+          IF EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'edu_ml_runs'::regclass AND contype = 'p'
+              AND pg_get_constraintdef(oid) = 'PRIMARY KEY (version)'
+          ) THEN
+            ALTER TABLE edu_ml_runs DROP CONSTRAINT edu_ml_runs_pkey;
+            ALTER TABLE edu_ml_runs ADD PRIMARY KEY (version, scoring_point);
+          END IF;
+        END $$;
+        """,
+    ]
     with get_connection() as conn:
         cur = conn.cursor()
         for stmt in statements:
+            cur.execute(stmt)
+        for stmt in migrations:
             cur.execute(stmt)
         conn.commit()
 
@@ -908,19 +931,23 @@ def save_artifact(version: str, kind: str, blob: bytes) -> None:
         conn.commit()
 
 
-def load_latest_passing_artifacts():
+def load_latest_passing_artifacts(point):
+    """Последняя прошедшая гейт версия ДЛЯ ТОЧКИ point; артефакты с суффиксом точки,
+    ключи возвращаются каноническими (без суффикса). None если такой версии нет."""
+    suffix = "_" + {"at_creation": "atc", "post_connection": "pc"}[point]
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT version FROM edu_ml_runs WHERE gate_passed=true "
-            "ORDER BY trained_at DESC LIMIT 1"
+            "SELECT version FROM edu_ml_runs WHERE gate_passed=true AND scoring_point=%s "
+            "ORDER BY trained_at DESC LIMIT 1", (point,)
         )
         row = cur.fetchone()
         if not row:
             return None
         version = row[0]
-        cur.execute("SELECT kind, blob FROM edu_ml_artifacts WHERE version=%s", (version,))
-        blobs = {k: bytes(b) for k, b in cur.fetchall()}
+        cur.execute("SELECT kind, blob FROM edu_ml_artifacts WHERE version=%s AND kind LIKE %s",
+                    (version, "%" + suffix))
+        blobs = {k[:-len(suffix)]: bytes(b) for k, b in cur.fetchall()}
     return version, blobs
 
 
@@ -931,17 +958,18 @@ def insert_ml_run(row: Dict[str, Any]) -> None:
         cur.execute(
             """
             INSERT INTO edu_ml_runs
-              (version, trained_at, n_train, n_pos_pay, prauc_pay, brier_pay,
+              (version, scoring_point, trained_at, n_train, n_pos_pay, prauc_pay, brier_pay,
                lift_final, lift_baseline, lift_pilot, gate_passed, stage_metrics)
-            VALUES (%s,now(),%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-            ON CONFLICT (version) DO UPDATE SET
+            VALUES (%s,%s,now(),%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+            ON CONFLICT (version, scoring_point) DO UPDATE SET
               trained_at=now(), n_train=EXCLUDED.n_train, n_pos_pay=EXCLUDED.n_pos_pay,
               prauc_pay=EXCLUDED.prauc_pay, brier_pay=EXCLUDED.brier_pay,
               lift_final=EXCLUDED.lift_final, lift_baseline=EXCLUDED.lift_baseline,
               lift_pilot=EXCLUDED.lift_pilot, gate_passed=EXCLUDED.gate_passed,
               stage_metrics=EXCLUDED.stage_metrics
             """,
-            (row["version"], row["n_train"], row["n_pos_pay"], row.get("prauc_pay"),
+            (row["version"], row.get("scoring_point", "at_creation"), row["n_train"],
+             row["n_pos_pay"], row.get("prauc_pay"),
              row.get("brier_pay"), row.get("lift_final"), row.get("lift_baseline"),
              row.get("lift_pilot"), row.get("gate_passed", False),
              _json.dumps(row.get("stage_metrics", {}), ensure_ascii=False)),
