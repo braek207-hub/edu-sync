@@ -32,8 +32,8 @@ DAYS_BACK = int(os.environ.get("LIME_RU_METRIKA_DAYS_BACK") or "30")
 
 COLUMNS = (
     "date", "channel", "subchannel", "traffic_type", "campaign_id", "campaign_name",
-    "visits", "users", "new_users", "bounce_w", "depth_w",
-    "cart", "checkout", "orders", "revenue",
+    "visits", "users", "new_users", "bounce_w", "depth_w", "duration_w",
+    "card_view", "look_image", "cart", "checkout", "orders", "revenue",
 )
 
 INSERT_SQL = f"INSERT INTO lime_metrika_campaign_ru ({', '.join(COLUMNS)}) VALUES %s"
@@ -71,7 +71,8 @@ def build_rows(metrika_rows, date_s: str) -> list[tuple]:
             acc = {
                 "traffic_type": traffic_type,
                 "visits": 0.0, "users": 0.0, "new_users": 0.0,
-                "bounce_w": 0.0, "depth_w": 0.0,
+                "bounce_w": 0.0, "depth_w": 0.0, "duration_w": 0.0,
+                "card_view": 0.0, "look_image": 0.0,
                 "cart": 0.0, "checkout": 0.0, "orders": 0.0, "revenue": 0.0,
             }
             agg[key] = acc
@@ -82,6 +83,10 @@ def build_rows(metrika_rows, date_s: str) -> list[tuple]:
         acc["new_users"] += float(m.get("new_users") or 0)
         acc["bounce_w"] += float(m.get("bounce_rate") or 0) * visits
         acc["depth_w"] += float(m.get("page_depth") or 0) * visits
+        # Время на сайте — среднее (сек), взвешиваем по визитам: ставка = duration_w / visits.
+        acc["duration_w"] += float(m.get("avg_duration") or 0) * visits
+        acc["card_view"] += float(m.get("card_view") or 0)
+        acc["look_image"] += float(m.get("look_image") or 0)
         acc["cart"] += float(m.get("cart_reaches") or 0)
         acc["checkout"] += float(m.get("checkout_reaches") or 0)
         acc["orders"] += float(m.get("orders") or 0)
@@ -92,7 +97,8 @@ def build_rows(metrika_rows, date_s: str) -> list[tuple]:
         out.append((
             date_s, channel, subchannel, acc["traffic_type"], campaign_id, campaign_name,
             int(acc["visits"]), int(acc["users"]), int(acc["new_users"]),
-            round(acc["bounce_w"], 2), round(acc["depth_w"], 2),
+            round(acc["bounce_w"], 2), round(acc["depth_w"], 2), round(acc["duration_w"], 2),
+            int(acc["card_view"]), int(acc["look_image"]),
             int(acc["cart"]), int(acc["checkout"]), int(acc["orders"]), round(acc["revenue"], 2),
         ))
     return out

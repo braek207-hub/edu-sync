@@ -14,12 +14,14 @@ def test_aggregates_by_channel_campaign_weighted_bounce():
         {"traffic_source": "ad", "source_engine": "Yandex.Direct",
          "utm_campaign": "709091521", "direct_campaign_name": "Медийка Баннеры",
          "visits": 100, "users": 90, "new_users": 40,
-         "bounce_rate": 30.0, "page_depth": 2.0,
+         "bounce_rate": 30.0, "page_depth": 2.0, "avg_duration": 60.0,
+         "card_view": 12, "look_image": 4,
          "cart_reaches": 5, "checkout_reaches": 2, "orders": 1, "revenue": 5000.0},
         {"traffic_source": "ad", "source_engine": "Yandex.Direct",
          "utm_campaign": "709091521", "direct_campaign_name": "Медийка Баннеры",
          "visits": 300, "users": 250, "new_users": 100,
-         "bounce_rate": 10.0, "page_depth": 4.0,
+         "bounce_rate": 10.0, "page_depth": 4.0, "avg_duration": 100.0,
+         "card_view": 30, "look_image": 10,
          "cart_reaches": 15, "checkout_reaches": 8, "orders": 3, "revenue": 15000.0},
     ]
     rows = build_rows(metrika, "2026-04-20")
@@ -34,6 +36,10 @@ def test_aggregates_by_channel_campaign_weighted_bounce():
     assert _col(r, "bounce_w") == 6000.0
     # depth_w = 2*100 + 4*300 = 1400 → 1400/400 = 3.5
     assert _col(r, "depth_w") == 1400.0
+    # duration_w = 60*100 + 100*300 = 36000 → 36000/400 = 90 сек
+    assert _col(r, "duration_w") == 36000.0
+    assert _col(r, "card_view") == 42
+    assert _col(r, "look_image") == 14
 
 
 def test_separate_campaigns_stay_separate():
