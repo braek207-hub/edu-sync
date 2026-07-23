@@ -107,6 +107,33 @@ def test_lead_details_extracted_with_all_fields():
     assert c["amount"] is None
 
 
+def test_lead_details_ts_columns():
+    """Ф2: created_ts/connected_ts несут время (не только дату), в отличие от
+    created_date/connection_date. Дата-без-времени → T00:00:00 (паритет со старым полем)."""
+    values_with_time = [
+        HEADERS,
+        # строка со временем в обеих датах
+        ["40000001", "01.06.2026 10:24", "705494889", "vuz", "заочное обучение",
+         "Сделка создана", "Иванов И.", "Петров П.", "КЦ1",
+         "Москва", "2008", "университеты 9 класс", "", "Да",
+         "1", "1", "0", "05.06.2026 11:30"],
+    ]
+    _agg, _dims, details = _sync_leads_raw(values_with_time[0], values_with_time)
+    d = _by_id(details)
+    row = d["40000001"]
+    assert row["created_ts"] == "2026-06-01T10:24:00"
+    assert row["connected_ts"] == "2026-06-05T11:30:00"
+
+    # дата-без-времени (существующая фикстура VALUES: строка A) → T00:00:00
+    _agg2, _dims2, details2 = _sync_leads_raw(HEADERS, VALUES, paid_by_lead_id=PAID)
+    d2 = _by_id(details2)
+    assert d2["31995795"]["created_ts"] == "2026-06-01T00:00:00"
+    assert d2["31995795"]["connected_ts"] == "2026-06-05T00:00:00"
+
+    # без даты соединения (строка B) → None
+    assert d2["31995860"]["connected_ts"] is None
+
+
 def test_lead_details_flags_parity_with_aggregate():
     """Σ per-lead флагов == агрегат по бакетам (гейт корректности drill-down)."""
     agg, _dims, details = _sync_leads_raw(HEADERS, VALUES, paid_by_lead_id=PAID)

@@ -12,7 +12,13 @@ from sync.classify import (
 )
 from sync.sheets import get_sheets_service, read_sheet
 from sync.product_parse import parse_product
-from sync.utils import normalize_campaign_id, pick_index_loose, to_iso_date, to_num
+from sync.utils import (
+    normalize_campaign_id,
+    pick_index_loose,
+    to_iso_date,
+    to_iso_datetime,
+    to_num,
+)
 
 CRM_LEADS_SHEET = "Лиды"
 CRM_PAYMENTS_SHEET = "Оплаты"
@@ -321,6 +327,11 @@ def _sync_leads_raw(
                     "utm_term": _txt_cell(row, li["utm_term"]),
                     "created_date": date_iso,
                     "connection_date": d_conn_date or None,
+                    "created_ts": to_iso_datetime(_cell(row, li["date"])) or None,
+                    "connected_ts": (
+                        to_iso_datetime(_cell(row, li["date_connect"]))
+                        if li["date_connect"] != -1 else None
+                    ) or None,
                     "payment_date": pm_d.get("pay_date") if pm_d else None,
                     "stage": _txt_cell(row, li["status"]),
                     "responsible": _txt_cell(row, li["responsible"]),

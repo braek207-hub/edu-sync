@@ -66,6 +66,8 @@ def ensure_schema() -> None:
           utm_term         TEXT,
           created_date     DATE NOT NULL,
           connection_date  DATE,
+          created_ts       timestamptz,
+          connected_ts     timestamptz,
           payment_date     DATE,
           stage            TEXT,
           responsible      TEXT,
@@ -175,6 +177,14 @@ def ensure_schema() -> None:
                   ADD COLUMN IF NOT EXISTS prod_specialty TEXT,
                   ADD COLUMN IF NOT EXISTS prod_profile   TEXT,
                   ADD COLUMN IF NOT EXISTS prod_faculty   TEXT
+                """
+            )
+            # Ф2: точное время заявки/дозвона (для существующей таблицы в проде).
+            cur.execute(
+                """
+                ALTER TABLE crm_lead_details
+                  ADD COLUMN IF NOT EXISTS created_ts   timestamptz,
+                  ADD COLUMN IF NOT EXISTS connected_ts timestamptz
                 """
             )
             # RLS on: доступ только серверный (см. аудит panda-bi-audit-cleanup).
@@ -428,7 +438,7 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
     sql = """
         INSERT INTO crm_lead_details (
             lead_id, client_id, campaign_id, land, utm_term,
-            created_date, connection_date, payment_date,
+            created_date, connection_date, created_ts, connected_ts, payment_date,
             stage, responsible, dispatcher, subdivision,
             city_raw, city_ip_segment, b24_grad_year, b24_edu_level, audience,
             is_eff, is_connected, is_deal, is_paid,
@@ -439,7 +449,9 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
         )
         VALUES (
             %(lead_id)s, %(client_id)s, %(campaign_id)s, %(land)s, %(utm_term)s,
-            %(created_date)s::date, %(connection_date)s::date, %(payment_date)s::date,
+            %(created_date)s::date, %(connection_date)s::date,
+            %(created_ts)s::timestamptz, %(connected_ts)s::timestamptz,
+            %(payment_date)s::date,
             %(stage)s, %(responsible)s, %(dispatcher)s, %(subdivision)s,
             %(city_raw)s, %(city_ip_segment)s, %(b24_grad_year)s, %(b24_edu_level)s, %(audience)s,
             %(is_eff)s, %(is_connected)s, %(is_deal)s, %(is_paid)s,
@@ -455,6 +467,8 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
             utm_term        = EXCLUDED.utm_term,
             created_date    = EXCLUDED.created_date,
             connection_date = EXCLUDED.connection_date,
+            created_ts      = EXCLUDED.created_ts,
+            connected_ts    = EXCLUDED.connected_ts,
             payment_date    = EXCLUDED.payment_date,
             stage           = EXCLUDED.stage,
             responsible     = EXCLUDED.responsible,
