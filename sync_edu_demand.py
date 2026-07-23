@@ -24,6 +24,12 @@ def main() -> None:
         return
 
     from sync.edu_demand import sync_edu_wordstat_demand
+    from sync.wordstat import demand_up_to_date
+
+    # Крон ежедневный: пока прошлой закрытой недели нет — дёргаем API; как появилась — пропуск.
+    if not os.environ.get("WORDSTAT_FROM") and demand_up_to_date("edu_wordstat_demand"):
+        print("edu-demand: последняя закрытая неделя уже есть — пропуск (до закрытия новой)")
+        return
 
     frm = os.environ.get("WORDSTAT_FROM") or (
         dt.date.today() - dt.timedelta(weeks=INCREMENTAL_WEEKS)

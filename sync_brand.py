@@ -26,13 +26,17 @@ def main() -> None:
     # WORDSTAT_FROM=YYYY-MM-DD → бэкфилл с этой даты; иначе инкремент последних недель.
     if os.environ.get("YANDEX_SEARCHAPI_KEY"):
         try:
-            from sync.wordstat import sync_wordstat_demand
+            from sync.wordstat import sync_wordstat_demand, demand_up_to_date
 
-            frm = os.environ.get("WORDSTAT_FROM") or (
-                dt.date.today() - dt.timedelta(weeks=INCREMENTAL_WEEKS)
-            ).isoformat()
-            n = sync_wordstat_demand(frm, dt.date.today().isoformat())
-            print(f"wordstat: {n} недель (с {frm})")
+            # Крон ежедневный: пока прошлой закрытой недели нет — дёргаем API; появилась — пропуск.
+            if not os.environ.get("WORDSTAT_FROM") and demand_up_to_date("lime_wordstat_demand"):
+                print("wordstat: последняя закрытая неделя уже есть — пропуск (до закрытия новой)")
+            else:
+                frm = os.environ.get("WORDSTAT_FROM") or (
+                    dt.date.today() - dt.timedelta(weeks=INCREMENTAL_WEEKS)
+                ).isoformat()
+                n = sync_wordstat_demand(frm, dt.date.today().isoformat())
+                print(f"wordstat: {n} недель (с {frm})")
         except Exception as e:
             print(f"ОШИБКА wordstat: {e}")
             errors.append(f"wordstat: {e}")

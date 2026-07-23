@@ -28,6 +28,29 @@ def _sunday(date_str: str) -> str:
     return (d + dt.timedelta(days=6 - d.weekday())).isoformat()
 
 
+def last_closed_week_monday(today: dt.date | None = None) -> str:
+    """ISO-понедельник ПОСЛЕДНЕЙ полностью закрытой недели (предыдущей от текущей)."""
+    d = today or dt.date.today()
+    cur_monday = d - dt.timedelta(days=d.weekday())
+    return (cur_monday - dt.timedelta(days=7)).isoformat()
+
+
+def demand_up_to_date(table: str, region: str = "ru", today: dt.date | None = None) -> bool:
+    """True, если в demand-таблице уже есть спрос за последнюю ЗАКРЫТУЮ неделю → синк можно
+    пропустить. Cloud Wordstat API отдаёт закрытую неделю с лагом ~1-2 нед; крон ежедневный
+    дёргает API только пока прошлой недели нет, а как появилась — отдыхает до закрытия следующей.
+    table — доверенный литерал (имя demand-таблицы), не пользовательский ввод."""
+    from sync.db import get_connection
+
+    target = last_closed_week_monday(today)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT max(week_start) FROM {table} WHERE region = %s", (region,))
+            row = cur.fetchone()
+    mx = row[0] if row and row[0] else None
+    return mx is not None and mx.isoformat() >= target
+
+
 def aggregate_weekly(responses: list[dict]) -> dict[str, int]:
     """Σ count по всем фразам, ключ = ISO-понедельник недели.
 

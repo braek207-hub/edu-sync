@@ -2,7 +2,7 @@ name: Sync BJORN Market Demand
 
 on:
   schedule:
-    - cron: "0 6 * * 1"   # понедельник 09:00 MSK — закрытая прошлая неделя
+    - cron: "0 5 * * *"   # ежедневно 08:00 MSK; гард в синке пропускает, если прошлая неделя уже залита
   workflow_dispatch:
     inputs:
       wordstat_from:
