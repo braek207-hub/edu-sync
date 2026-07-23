@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from sync.utils import normalize_campaign_id, to_iso_date, to_num
+from sync.utils import normalize_campaign_id, to_iso_date, to_iso_datetime, to_num
 
 
 def test_normalize_campaign_id():
@@ -29,3 +29,19 @@ def test_pick_index_prefers_longer_header():
 def test_to_num():
     assert to_num("1 234,56") == 1234.56
     assert to_num("") == 0
+
+
+def test_iso_datetime_dotted():
+    assert to_iso_datetime("01.07.2026 10:24") == "2026-07-01T10:24:00"
+
+
+def test_iso_datetime_dotted_seconds():
+    assert to_iso_datetime("01.07.2026 10:24:35") == "2026-07-01T10:24:35"
+
+
+def test_iso_datetime_date_only():
+    assert to_iso_datetime("01.07.2026") == "2026-07-01T00:00:00"
+
+
+def test_iso_datetime_empty():
+    assert to_iso_datetime("") == "" and to_iso_datetime(None) == ""

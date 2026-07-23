@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List
 
 
@@ -119,6 +119,34 @@ def to_iso_date(v, tz: str = "Europe/Moscow") -> str:
         d = datetime.strptime(s[:10], "%Y-%m-%d")
         return d.strftime("%Y-%m-%d")
     except ValueError:
+        return ""
+
+
+def to_iso_datetime(v, tz: str = "Europe/Moscow") -> str:
+    """ISO timestamp с временем. Ячейки Sheets: datetime, 'ДД.ММ.ГГГГ ЧЧ:ММ[:СС]',
+    ISO, серийное число (дни от 1899-12-30). Дата без времени → T00:00:00."""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%dT%H:%M:%S")
+    s = str(v).strip()
+    if not s:
+        return ""
+    m = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?", s)
+    if m:
+        dd, mm, yy = m.group(1), m.group(2), m.group(3)
+        hh, mi, ss = m.group(4) or "00", m.group(5) or "00", m.group(6) or "00"
+        return f"{yy}-{mm}-{dd}T{hh}:{mi}:{ss}"
+    m2 = re.match(r"^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?", s)
+    if m2:
+        hh, mi, ss = m2.group(2) or "00", m2.group(3) or "00", m2.group(4) or "00"
+        return f"{m2.group(1)}T{hh}:{mi}:{ss}"
+    try:
+        serial = float(s)
+        base = datetime(1899, 12, 30)
+        dt = base + timedelta(days=serial)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, OverflowError):
         return ""
 
 
