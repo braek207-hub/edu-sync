@@ -119,6 +119,9 @@ def build_feature_rows(
             "f__product_group": clean_cat(ld.get("product_group")),
             "f__utm_source": clean_cat(ld.get("utm_source")),
             "f__created_dow": created.weekday(),
+            # created_ts = MSK-настенное время (to_iso_datetime) в timestamptz. .hour
+            # корректен, пока синк-запись и сборка фич в одном TZ (CI/Supabase = UTC).
+            # Не запускать сборку с PGTZ=Europe/Moscow — сдвинет час на смещение UTC.
             "f__created_hour": created_ts.hour if created_ts else 0,
             "f__days_to_deadline": days_to_deadline(created, deadlines),
             "f__beh_visits": sum(_num(v.get("visits")) for v in before),
