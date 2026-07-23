@@ -14,7 +14,11 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
+from datetime import date, timedelta
 from typing import Any, Dict, Tuple
+
+import psycopg2
+import psycopg2.extras
 
 BASE = "https://ads.vk.com/api/v2"
 TOKEN_URL = f"{BASE}/oauth2/token.json"
@@ -139,3 +143,73 @@ def _campaigns_from_json(js: dict) -> dict:
 def fetch_active_campaigns(token: str) -> dict:
     js = _api_get(token, "campaigns.json?limit=500&fields=id,name,status,objective&_status__in=active")
     return _campaigns_from_json(js)
+
+
+_UPSERT_SQL = """
+    INSERT INTO lime_vk_ads_stats
+      (date, region, campaign_id, campaign_name, objective, status,
+       shows, clicks, spent, goals_total, vk_result, conversions, updated_at)
+    VALUES
+      (%(date)s, %(region)s, %(campaign_id)s, %(campaign_name)s, %(objective)s, %(status)s,
+       %(shows)s, %(clicks)s, %(spent)s, %(goals_total)s, %(vk_result)s, %(conversions)s::jsonb, NOW())
+    ON CONFLICT (date, campaign_id) DO UPDATE SET
+       region = EXCLUDED.region, campaign_name = EXCLUDED.campaign_name,
+       objective = EXCLUDED.objective, status = EXCLUDED.status,
+       shows = EXCLUDED.shows, clicks = EXCLUDED.clicks, spent = EXCLUDED.spent,
+       goals_total = EXCLUDED.goals_total, vk_result = EXCLUDED.vk_result,
+       conversions = EXCLUDED.conversions, updated_at = NOW()
+"""
+
+
+def _pg_url() -> str:
+    return os.environ["DATABASE_URL"].split("?")[0]
+
+
+def _upsert(rows: list) -> int:
+    if not rows:
+        return 0
+    with psycopg2.connect(_pg_url(), connect_timeout=30) as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, _UPSERT_SQL, rows, page_size=500)
+        conn.commit()
+    return len(rows)
+
+
+def _chunked(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def sync_lime_vk_ads(days_back: int = 14) -> int:
+    client_id = os.environ.get("VK_CLIENT_ID", "").strip()
+    secret = os.environ.get("VK_CLIENT_SECRET", "").strip()
+    if not client_id or not secret:
+        raise RuntimeError("VK_CLIENT_ID / VK_CLIENT_SECRET не заданы")
+
+    token = _get_token(client_id, secret)
+    campaigns = fetch_active_campaigns(token)
+    ids = list(campaigns.keys())
+    print(f"[lime_vk_ads] активных кампаний: {len(ids)}")
+
+    to = date.today()
+    frm = to - timedelta(days=days_back)
+    df, dt = frm.isoformat(), to.isoformat()
+
+    base_map, goals_map = {}, {}
+    for batch in _chunked(ids, STAT_BATCH):
+        csv = ",".join(batch)
+        base_map.update(parse_base_stats(
+            _api_get(token, f"statistics/campaigns/day.json?id={csv}&date_from={df}&date_to={dt}")))
+        time.sleep(2)  # rate-limit
+        goals_map.update(parse_goal_stats(
+            _api_get(token, f"statistics/goals/campaigns/day.json?id={csv}&date_from={df}&date_to={dt}")))
+        time.sleep(2)
+
+    rows = build_rows(base_map, goals_map, campaigns)
+    n = _upsert(rows)
+    print(f"[lime_vk_ads] upsert {n} строк в lime_vk_ads_stats ({df}..{dt})")
+    return n
+
+
+if __name__ == "__main__":
+    sync_lime_vk_ads(days_back=int(os.environ.get("LIME_VK_DAYS_BACK", "14")))
