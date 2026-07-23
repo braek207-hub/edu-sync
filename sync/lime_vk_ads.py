@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """sync/lime_vk_ads.py — кабинет VK Реклама (ads.vk.com) → lime_vk_ads_stats.
 
+Уровень = КАМПАНИИ (ad_plans в API v2). Внимание: в API v2 «campaigns» — это ГРУППЫ
+объявлений, а кампании интерфейса VK = ad_plans. Метрика размечает визиты по ad_plan_id,
+поэтому расход/конверсии тянем на уровне ad_plans (campaign_id в таблице = ad_plan_id).
+
 Паритет с Директом: расход/клики/показы + конверсии по типам (jsonb). Валюта RUB —
 конверсии валюты нет; spent как в кабинете (без НДС). Rate-limit строгий: батчи id,
 паузы, ретрай 429, токен кэшируется на прогон.
@@ -172,13 +176,18 @@ def _campaigns_from_json(js: dict) -> dict:
     return out
 
 
-def fetch_active_campaigns(token: str) -> dict:
-    """Активные кампании (id → мета). Пагинация: VK max limit=50 на страницу (limit=500 → 400)."""
+def fetch_ad_plans(token: str) -> dict:
+    """Кампании (ad_plan_id → мета) ВСЕХ статусов. Пагинация: VK max limit=50 на страницу.
+
+    Уровень ad_plans = кампании в интерфейсе VK (в API v2 «campaigns» — это ГРУППЫ объявлений,
+    уровнем ниже). Метрика размечает визиты по ad_plan_id, поэтому расход/конверсии берём здесь.
+    Без фильтра статуса: история включает blocked/deleted кампании, которые крутились в прошлом.
+    """
     out: dict = {}
     offset = 0
     while True:
         js = _api_get(token,
-            f"campaigns.json?limit=50&offset={offset}&fields=id,name,status,objective&_status__in=active")
+            f"ad_plans.json?limit=50&offset={offset}&fields=id,name,status,objective")
         out.update(_campaigns_from_json(js))
         if len(js.get("items", [])) < 50:
             break
@@ -228,9 +237,9 @@ def sync_lime_vk_ads(days_back: int = 14) -> int:
         raise RuntimeError("VK_CLIENT_ID / VK_CLIENT_SECRET не заданы")
 
     token = _get_token(client_id, secret)
-    campaigns = fetch_active_campaigns(token)
-    ids = list(campaigns.keys())
-    print(f"[lime_vk_ads] активных кампаний: {len(ids)}")
+    plans = fetch_ad_plans(token)
+    ids = list(plans.keys())
+    print(f"[lime_vk_ads] кампаний (ad_plans): {len(ids)}")
 
     to = date.today()
     frm = to - timedelta(days=days_back)
@@ -240,13 +249,13 @@ def sync_lime_vk_ads(days_back: int = 14) -> int:
     for batch in _chunked(ids, STAT_BATCH):
         csv = ",".join(batch)
         base_map.update(parse_base_stats(
-            _api_get(token, f"statistics/campaigns/day.json?id={csv}&date_from={df}&date_to={dt}")))
+            _api_get(token, f"statistics/ad_plans/day.json?id={csv}&date_from={df}&date_to={dt}")))
         time.sleep(2)  # rate-limit
         goals_map.update(parse_goal_stats(
-            _api_get(token, f"statistics/goals/campaigns/day.json?id={csv}&date_from={df}&date_to={dt}")))
+            _api_get(token, f"statistics/goals/ad_plans/day.json?id={csv}&date_from={df}&date_to={dt}")))
         time.sleep(2)
 
-    rows = build_rows(base_map, goals_map, campaigns)
+    rows = build_rows(base_map, goals_map, plans)
     n = _upsert(rows)
     print(f"[lime_vk_ads] upsert {n} строк в lime_vk_ads_stats ({df}..{dt})")
     return n
