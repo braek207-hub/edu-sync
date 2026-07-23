@@ -1,7 +1,8 @@
 """Сериализация артефактов модели в bytes (для хранения bytea в edu_ml_artifacts)."""
 
-import io
+import os
 import pickle
+import tempfile
 
 
 def serialize_pickle(obj) -> bytes:
@@ -13,13 +14,26 @@ def deserialize_pickle(blob) -> object:
 
 
 def serialize_catboost(model) -> bytes:
-    buf = io.BytesIO()
-    model.save_model(buf, format="cbm")
-    return buf.getvalue()
+    # CatBoost.save_model принимает только путь (str/Path), не файловый объект.
+    fd, path = tempfile.mkstemp(suffix=".cbm")
+    os.close(fd)
+    try:
+        model.save_model(path, format="cbm")
+        with open(path, "rb") as fh:
+            return fh.read()
+    finally:
+        os.remove(path)
 
 
 def deserialize_catboost(blob):
     from catboost import CatBoostClassifier
-    m = CatBoostClassifier()
-    m.load_model(io.BytesIO(bytes(blob)), format="cbm")
-    return m
+    fd, path = tempfile.mkstemp(suffix=".cbm")
+    os.close(fd)
+    try:
+        with open(path, "wb") as fh:
+            fh.write(bytes(blob))
+        m = CatBoostClassifier()
+        m.load_model(path, format="cbm")
+        return m
+    finally:
+        os.remove(path)
