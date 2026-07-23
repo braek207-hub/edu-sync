@@ -10,8 +10,18 @@ def test_load_vuz_lead_frame_shape():
     rows = db.load_vuz_lead_frame()
     assert len(rows) > 1000
     r = rows[0]
-    for key in ("lead_id", "client_id", "created_date", "is_paid", "dispatcher"):
+    for key in ("lead_id", "client_id", "created_date", "is_paid", "dispatcher",
+                "campaign_id", "created_ts"):
         assert key in r
+
+def test_load_vuz_behavior_dated_shape():
+    out = db.load_vuz_behavior_dated()
+    assert isinstance(out, dict)
+    for rows in out.values():
+        assert isinstance(rows, list)
+        for r in rows:
+            assert "visit_date" in r
+            assert "visits" in r
 
 def test_upsert_and_maturation_roundtrip():
     db.ensure_ml_feature_tables()

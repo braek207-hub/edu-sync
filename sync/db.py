@@ -1086,8 +1086,9 @@ def upsert_edu_visit_behavior(rows: List[Dict[str, Any]]) -> int:
 def load_vuz_lead_frame() -> List[Dict[str, Any]]:
     sql = """
         SELECT lead_id, NULLIF(client_id,'') AS client_id, land,
+               campaign_id, created_ts, connected_ts,
                created_date::date AS created_date,
-               0 AS created_hour,  -- created_date = DATE (без времени); час недоступен в Ф1a, оживёт в Ф1b с hit-level Метрикой
+               EXTRACT(HOUR FROM created_ts)::int AS created_hour,
                connection_date::date AS connection_date,
                payment_date::date AS payment_date,
                is_paid, is_connected, is_deal, amount,
@@ -1123,6 +1124,28 @@ def load_vuz_behavior_frame() -> Dict[str, Dict[str, Any]]:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(sql)
         return {r["client_id"]: dict(r) for r in cur.fetchall()}
+
+
+def load_vuz_behavior_dated() -> Dict[str, List[Dict[str, Any]]]:
+    """Поведение по client_id с разбивкой по дате визита (не агрегат за всё время) —
+    для per-visit-date фич Ф2 (см. build_feature_rows, behavior_dated)."""
+    sql = """
+        SELECT client_id, visit_date::date AS visit_date, SUM(visits) AS visits,
+               CASE WHEN SUM(visits)>0 THEN SUM(avg_duration_sec*visits)/SUM(visits) ELSE 0 END AS avg_duration_sec,
+               CASE WHEN SUM(visits)>0 THEN SUM(bounce_rate*visits)/SUM(visits) ELSE 0 END AS bounce_rate,
+               CASE WHEN SUM(visits)>0 THEN SUM(page_depth*visits)/SUM(visits) ELSE 0 END AS page_depth,
+               (ARRAY_AGG(device_category ORDER BY visits DESC))[1] AS device,
+               (ARRAY_AGG(traffic_source ORDER BY visits DESC))[1] AS source
+        FROM edu_visit_behavior WHERE client_id IS NOT NULL AND client_id<>''
+        GROUP BY client_id, visit_date
+    """
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    with get_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql)
+        for r in cur.fetchall():
+            out.setdefault(r["client_id"], []).append(dict(r))
+    return out
 
 
 def upsert_lead_features(rows: List[Dict[str, Any]]) -> int:
