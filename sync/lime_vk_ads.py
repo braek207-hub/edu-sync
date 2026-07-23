@@ -215,12 +215,18 @@ def _pg_url() -> str:
     return os.environ["DATABASE_URL"].split("?")[0]
 
 
-def _upsert(rows: list) -> int:
-    if not rows:
-        return 0
+_DELETE_WINDOW_SQL = "DELETE FROM lime_vk_ads_stats WHERE date >= %s AND date <= %s"
+
+
+def _upsert(rows: list, frm: str, to: str) -> int:
+    """Delete+insert по окну [frm; to]: синк владеет срезом (как lime_kz_cabinet/roistat).
+    Чистит окно перед записью — иначе исчезнувшие из выдачи сущности или строки прежнего
+    уровня осели бы мусором. Одна транзакция: пустой прогон окна не теряет данные безвозвратно."""
     with psycopg2.connect(_pg_url(), connect_timeout=30) as conn:
         with conn.cursor() as cur:
-            psycopg2.extras.execute_batch(cur, _UPSERT_SQL, rows, page_size=500)
+            cur.execute(_DELETE_WINDOW_SQL, (frm, to))
+            if rows:
+                psycopg2.extras.execute_batch(cur, _UPSERT_SQL, rows, page_size=500)
         conn.commit()
     return len(rows)
 
@@ -256,8 +262,8 @@ def sync_lime_vk_ads(days_back: int = 14) -> int:
         time.sleep(2)
 
     rows = build_rows(base_map, goals_map, plans)
-    n = _upsert(rows)
-    print(f"[lime_vk_ads] upsert {n} строк в lime_vk_ads_stats ({df}..{dt})")
+    n = _upsert(rows, df, dt)
+    print(f"[lime_vk_ads] {n} строк в lime_vk_ads_stats ({df}..{dt})")
     return n
 
 
