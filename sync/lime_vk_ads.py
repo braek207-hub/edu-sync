@@ -44,3 +44,24 @@ def parse_base_stats(api_json: Dict[str, Any]) -> Dict[Tuple[str, str], Dict[str
                 "vk_result": _int(vk.get("result")),
             }
     return out
+
+
+def parse_goal_stats(api_json: Dict[str, Any]) -> Dict[Tuple[str, str], Dict[str, Dict[str, Any]]]:
+    """(date, campaign_id) → {goal: {count, value, view_through}}; строки одной цели суммируются."""
+    out: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+    for item in api_json.get("items", []):
+        cid = str(item.get("id", "")).strip()
+        if not cid:
+            continue
+        for row in item.get("rows", []):
+            date = str(row.get("date", "")).strip()
+            bucket = out.setdefault((date, cid), {})
+            for g in row.get("goals", []):
+                name = str(g.get("goal", "")).strip()
+                if not name:
+                    continue
+                agg = bucket.setdefault(name, {"count": 0, "value": 0.0, "view_through": 0})
+                agg["count"] += _int(g.get("count"))
+                agg["value"] = round(agg["value"] + _num(g.get("value")), 2)
+                agg["view_through"] += _int(g.get("view_through_count"))
+    return out
