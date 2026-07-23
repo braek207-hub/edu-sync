@@ -130,45 +130,63 @@ def poll_report(report_id: str, max_wait_sec: int = 300) -> str:
     raise RuntimeError(f"report {report_id}: не готов за {max_wait_sec}с")
 
 
+def _collect_row_lists(node: Any, out: List[List[Dict[str, Any]]]) -> None:
+    """Рекурсивно собирает все списки-из-словарей (кандидаты в строки отчёта)."""
+    if isinstance(node, list):
+        if node and all(isinstance(x, dict) for x in node):
+            out.append(node)
+        else:
+            for x in node:
+                _collect_row_lists(x, out)
+    elif isinstance(node, dict):
+        for v in node.values():
+            _collect_row_lists(v, out)
+
+
 def download_rows(file_url: str) -> List[Dict[str, Any]]:
-    """Скачивает ZIP с JSON-листами, возвращает строки листа date×campaign (без срезов)."""
+    """Скачивает файл отчёта (ZIP с JSON-листами или голый JSON), возвращает строки
+    листа date×campaign. Диагностично логирует структуру — чтобы не гадать про формат."""
     if not file_url:
+        print("[urban] file_url пуст (NO_DATA) — в периоде нет данных")
         return []
     resp = requests.get(file_url, timeout=60)
     resp.raise_for_status()
     raw = resp.content
 
-    sheets: List[List[Dict[str, Any]]] = []
+    docs: List[Any] = []
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-            for name in zf.namelist():
-                if not name.lower().endswith(".json"):
-                    continue
-                parsed = json.loads(zf.read(name).decode("utf-8"))
-                rows = parsed if isinstance(parsed, list) else parsed.get("data") or parsed.get("rows") or []
-                if isinstance(rows, list) and rows:
-                    sheets.append(rows)
+            names = zf.namelist()
+            print(f"[urban] ZIP-файлы: {names}")
+            for name in names:
+                if name.lower().endswith(".json"):
+                    docs.append(json.loads(zf.read(name).decode("utf-8")))
     except zipfile.BadZipFile:
-        # На случай если отдали не ZIP, а голый JSON.
-        parsed = json.loads(raw.decode("utf-8"))
-        rows = parsed if isinstance(parsed, list) else parsed.get("data") or parsed.get("rows") or []
-        if isinstance(rows, list):
-            sheets.append(rows)
+        print(f"[urban] не ZIP ({len(raw)} байт) — парсим как голый JSON")
+        docs.append(json.loads(raw.decode("utf-8")))
 
-    # Берём лист, где строки имеют date+campaignId и НЕ содержат ключей-срезов.
+    sheets: List[List[Dict[str, Any]]] = []
+    for doc in docs:
+        _collect_row_lists(doc, sheets)
+
+    # Диагностика: показать форму каждого найденного списка строк.
+    for i, rows in enumerate(sheets):
+        sample = sorted(str(k) for k in rows[0].keys()) if rows else []
+        print(f"[urban] лист #{i}: {len(rows)} строк, ключи={sample}")
+
+    # 1) Лист с date+campaignId без ключей-срезов (нужный грейн).
     for rows in sheets:
-        sample = {str(k).lower() for k in (rows[0].keys() if isinstance(rows[0], dict) else [])}
+        sample = {str(k).lower() for k in rows[0].keys()}
         has_grain = ("date" in sample) and any(k in sample for k in ("campaignid", "campaign_id"))
         if has_grain and not (sample & SLICE_KEYS):
             return rows
-    # Фолбэк: первый лист с date+campaign, даже если со срезом (лучше залогировать, чем потерять).
+    # 2) Фолбэк: любой лист с date+campaign.
     for rows in sheets:
-        sample = {str(k).lower() for k in (rows[0].keys() if isinstance(rows[0], dict) else [])}
+        sample = {str(k).lower() for k in rows[0].keys()}
         if ("date" in sample) and any(k in sample for k in ("campaignid", "campaign_id")):
-            print(f"[urban] предупреждение: подходящий лист date×campaign без срезов не найден, "
-                  f"взят лист с ключами {sorted(sample)}")
+            print(f"[urban] предупреждение: без-срезового листа нет, взят {sorted(sample)}")
             return rows
-    print(f"[urban] в отчёте нет листа date×campaign; листов: {len(sheets)}")
+    print(f"[urban] нет листа date×campaign; всего листов: {len(sheets)}")
     return []
 
 
