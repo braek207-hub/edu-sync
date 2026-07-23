@@ -28,3 +28,27 @@ def test_parse_goal_stats_sums_same_goal():
     assert out[key]["jse:vk_ecom_product"] == {"count": 2, "value": 24998.0, "view_through": 0}
     # две строки ec:detail за дату суммируются
     assert out[key]["ec:detail"] == {"count": 5, "value": 0.0, "view_through": 1}
+
+
+def test_build_rows_merges_base_goals_meta():
+    from sync.lime_vk_ads import build_rows
+    base = {("2026-07-15", "122821840"): {"shows": 100, "clicks": 5, "spent": 250.0,
+                                          "goals_total": 8, "vk_result": 1}}
+    goals = {("2026-07-15", "122821840"): {"ec:detail": {"count": 5, "value": 0.0, "view_through": 0}}}
+    meta = {"122821840": {"name": "Внутренняя, Ж", "objective": "site_conversions", "status": "active"}}
+    rows = build_rows(base, goals, meta)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["region"] == "ru"
+    assert r["campaign_name"] == "Внутренняя, Ж"
+    assert r["objective"] == "site_conversions"
+    assert r["spent"] == 250.0
+    assert json.loads(r["conversions"]) == {"ec:detail": {"count": 5, "value": 0.0, "view_through": 0}}
+
+
+def test_build_rows_row_without_goals_gets_empty_jsonb():
+    from sync.lime_vk_ads import build_rows
+    base = {("2026-07-16", "999"): {"shows": 1, "clicks": 0, "spent": 0.0, "goals_total": 0, "vk_result": 0}}
+    rows = build_rows(base, {}, {})
+    assert json.loads(rows[0]["conversions"]) == {}
+    assert rows[0]["campaign_name"] is None

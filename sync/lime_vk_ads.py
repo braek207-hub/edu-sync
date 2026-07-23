@@ -8,6 +8,7 @@
 ENV: DATABASE_URL, VK_CLIENT_ID, VK_CLIENT_SECRET, LIME_VK_DAYS_BACK (default 14).
 Запуск: python -m sync.lime_vk_ads
 """
+import json
 from typing import Any, Dict, Tuple
 
 
@@ -65,3 +66,26 @@ def parse_goal_stats(api_json: Dict[str, Any]) -> Dict[Tuple[str, str], Dict[str
                 agg["value"] = round(agg["value"] + _num(g.get("value")), 2)
                 agg["view_through"] += _int(g.get("view_through_count"))
     return out
+
+
+def build_rows(base_map, goals_map, campaigns_meta) -> list:
+    """Слить базу + конверсии + мету кампании в строки upsert. Ведёт база (только где есть статистика)."""
+    rows = []
+    for (date, cid), base in base_map.items():
+        meta = campaigns_meta.get(cid, {})
+        conv = goals_map.get((date, cid), {})
+        rows.append({
+            "date": date,
+            "region": "ru",
+            "campaign_id": cid,
+            "campaign_name": meta.get("name"),
+            "objective": meta.get("objective"),
+            "status": meta.get("status"),
+            "shows": base["shows"],
+            "clicks": base["clicks"],
+            "spent": base["spent"],
+            "goals_total": base["goals_total"],
+            "vk_result": base["vk_result"],
+            "conversions": json.dumps(conv, ensure_ascii=False),
+        })
+    return rows
