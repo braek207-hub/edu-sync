@@ -1,4 +1,4 @@
-from sync.ml.registry import REGISTRY, select_features, FeatureSpec
+from sync.ml.registry import REGISTRY, select_features, feature_key, FeatureSpec
 
 def test_registry_has_no_duplicate_names():
     names = [f.name for f in REGISTRY]
@@ -22,3 +22,6 @@ def test_post_connection_is_superset_of_creation():
     assert set(select_features("at_creation")).issubset(
         set(select_features("post_connection"))
     )
+
+def test_feature_key_maps_to_jsonb():
+    assert feature_key("audience") == "f__audience"

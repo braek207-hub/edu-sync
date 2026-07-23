@@ -57,3 +57,9 @@ def select_features(point: Availability) -> list[str]:
         for spec in REGISTRY
         if spec.availability in _ORDER and _ORDER[spec.availability] <= cutoff
     ]
+
+
+def feature_key(name: str) -> str:
+    """Физический ключ фичи в JSONB-колонке `features` (build_feature_rows пишет с
+    префиксом f__). Ф1b выбирает фичи так: [feature_key(n) for n in select_features(point)]."""
+    return f"f__{name}"

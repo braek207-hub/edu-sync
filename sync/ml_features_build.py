@@ -17,7 +17,7 @@ def assemble(leads, behavior, deadlines, today):
     """Чистая часть: строки фич + кривая созревания (по созревшим оплатам)."""
     rows = build_feature_rows(leads, behavior, deadlines, today)
     paid_dtp = [r["days_to_pay"] for r in rows
-                if r["label_paid"] and r["days_to_pay"] is not None]
+                if r["is_matured"] and r["label_paid"] and r["days_to_pay"] is not None]
     maturation = maturation_table(paid_dtp, horizon=120)
     return rows, maturation
 

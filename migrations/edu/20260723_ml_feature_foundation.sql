@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS edu_lead_features (
   is_matured     BOOLEAN NOT NULL DEFAULT FALSE,
   amount         DOUBLE PRECISION,          -- outcome, для Tweedie в Ф1b
   days_to_pay    INTEGER,                   -- outcome
-  -- фичи хранятся как JSONB с флагом точки доступности внутри имени: f__<point>__<name>
+  -- фичи в JSONB с префиксом f__<name> (см. sync/ml/registry.py:feature_key)
   features       JSONB NOT NULL DEFAULT '{}'::jsonb,
   built_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
