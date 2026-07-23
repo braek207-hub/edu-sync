@@ -9,7 +9,17 @@ ENV: DATABASE_URL, VK_CLIENT_ID, VK_CLIENT_SECRET, LIME_VK_DAYS_BACK (default 14
 Запуск: python -m sync.lime_vk_ads
 """
 import json
+import os
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
 from typing import Any, Dict, Tuple
+
+BASE = "https://ads.vk.com/api/v2"
+TOKEN_URL = f"{BASE}/oauth2/token.json"
+STAT_BATCH = 20
+RETRY_429 = 5
 
 
 def _num(v: Any) -> float:
@@ -89,3 +99,43 @@ def build_rows(base_map, goals_map, campaigns_meta) -> list:
             "conversions": json.dumps(conv, ensure_ascii=False),
         })
     return rows
+
+
+def _get_token(client_id: str, secret: str) -> str:
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials", "client_id": client_id, "client_secret": secret,
+    }).encode("utf-8")
+    req = urllib.request.Request(TOKEN_URL, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return json.loads(r.read().decode("utf-8"))["access_token"]
+
+
+def _api_get(token: str, path: str, *, _sleep=time.sleep) -> dict:
+    """GET ads.vk.com с ретраем 429 (rate-limit): backoff 5·attempt сек."""
+    for attempt in range(RETRY_429 + 1):
+        req = urllib.request.Request(f"{BASE}/{path}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < RETRY_429:
+                _sleep(5 * (attempt + 1))
+                continue
+            raise
+
+
+def _campaigns_from_json(js: dict) -> dict:
+    out = {}
+    for it in js.get("items", []):
+        cid = str(it.get("id", "")).strip()
+        if cid:
+            out[cid] = {"name": it.get("name"), "objective": it.get("objective"),
+                        "status": it.get("status")}
+    return out
+
+
+def fetch_active_campaigns(token: str) -> dict:
+    js = _api_get(token, "campaigns.json?limit=500&fields=id,name,status,objective&_status__in=active")
+    return _campaigns_from_json(js)

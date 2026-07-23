@@ -2,7 +2,7 @@
 """Парсинг статистики VK Реклама (ads.vk.com API v2) в строки lime_vk_ads_stats.
 Фикстуры — обрезанные реальные ответы probe 2026-07-22."""
 import json, os
-from sync.lime_vk_ads import parse_base_stats, parse_goal_stats
+from sync.lime_vk_ads import parse_base_stats, parse_goal_stats, _campaigns_from_json
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -52,3 +52,13 @@ def test_build_rows_row_without_goals_gets_empty_jsonb():
     rows = build_rows(base, {}, {})
     assert json.loads(rows[0]["conversions"]) == {}
     assert rows[0]["campaign_name"] is None
+
+
+def test_campaigns_from_json():
+    js = {"items": [
+        {"id": 122821840, "name": "A", "objective": "site_conversions", "status": "active"},
+        {"id": 70911932, "name": "B", "objective": "storeproductssales", "status": "blocked"},
+    ]}
+    out = _campaigns_from_json(js)
+    assert out["122821840"] == {"name": "A", "objective": "site_conversions", "status": "active"}
+    assert "70911932" in out
