@@ -783,6 +783,44 @@ def ensure_metrika_table() -> None:
         conn.commit()
 
 
+def ensure_ml_feature_tables() -> None:
+    """Идемпотентно создаёт feature store и кривую созревания (ML-скоринг EDU)."""
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS edu_lead_features (
+          lead_id TEXT PRIMARY KEY,
+          client_id TEXT,
+          land TEXT NOT NULL,
+          created_date DATE NOT NULL,
+          label_paid BOOLEAN,
+          label_connected BOOLEAN,
+          label_deal BOOLEAN,
+          is_matured BOOLEAN NOT NULL DEFAULT FALSE,
+          amount DOUBLE PRECISION,
+          days_to_pay INTEGER,
+          features JSONB NOT NULL DEFAULT '{}'::jsonb,
+          built_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_elf_created ON edu_lead_features(created_date)",
+        "CREATE INDEX IF NOT EXISTS idx_elf_client ON edu_lead_features(client_id)",
+        """
+        CREATE TABLE IF NOT EXISTS edu_ml_maturation (
+          land TEXT NOT NULL,
+          age_days INTEGER NOT NULL,
+          matured_fraction DOUBLE PRECISION NOT NULL,
+          built_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (land, age_days)
+        )
+        """,
+    ]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        for stmt in statements:
+            cur.execute(stmt)
+        conn.commit()
+
+
 def load_uploaded_conversion_keys() -> set:
     ensure_metrika_table()
     with get_connection() as conn:
@@ -859,3 +897,95 @@ def upsert_edu_visit_behavior(rows: List[Dict[str, Any]]) -> int:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
         conn.commit()
     return len(rows)
+
+
+# ── ML Feature Store: загрузчики и апсерты (ensure_ml_feature_tables — выше, Task 1) ──
+
+def load_vuz_lead_frame() -> List[Dict[str, Any]]:
+    sql = """
+        SELECT lead_id, NULLIF(client_id,'') AS client_id, land,
+               created_date::date AS created_date,
+               0 AS created_hour,  -- created_date = DATE (без времени); час недоступен в Ф1a, оживёт в Ф1b с hit-level Метрикой
+               connection_date::date AS connection_date,
+               payment_date::date AS payment_date,
+               is_paid, is_connected, is_deal, amount,
+               audience, b24_grad_year, b24_edu_level, city_ip_segment,
+               direction, product_group, utm_source, dispatcher, responsible
+        FROM crm_lead_details
+        WHERE land = 'vuz'
+    """
+    with get_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def load_vuz_behavior_frame() -> Dict[str, Dict[str, Any]]:
+    sql = """
+        SELECT client_id,
+               SUM(visits) AS visits,
+               COUNT(DISTINCT visit_date) AS visit_days,
+               CASE WHEN SUM(visits)>0
+                    THEN SUM(avg_duration_sec*visits)/SUM(visits) ELSE 0 END AS avg_duration_sec,
+               CASE WHEN SUM(visits)>0
+                    THEN SUM(bounce_rate*visits)/SUM(visits) ELSE 0 END AS bounce_rate,
+               CASE WHEN SUM(visits)>0
+                    THEN SUM(page_depth*visits)/SUM(visits) ELSE 0 END AS page_depth,
+               (ARRAY_AGG(device_category ORDER BY visits DESC))[1] AS device,
+               (ARRAY_AGG(traffic_source ORDER BY visits DESC))[1] AS source
+        FROM edu_visit_behavior
+        WHERE client_id IS NOT NULL AND client_id <> ''
+        GROUP BY client_id
+    """
+    with get_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql)
+        return {r["client_id"]: dict(r) for r in cur.fetchall()}
+
+
+def upsert_lead_features(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    import json as _json
+    values = [
+        (
+            r["lead_id"], r.get("client_id"), r["land"], r["created_date"],
+            r.get("label_paid"), r.get("label_connected"), r.get("label_deal"),
+            r.get("is_matured", False), r.get("amount"), r.get("days_to_pay"),
+            _json.dumps(r["features"], ensure_ascii=False),
+        )
+        for r in rows
+    ]
+    sql = """
+        INSERT INTO edu_lead_features
+          (lead_id, client_id, land, created_date, label_paid, label_connected,
+           label_deal, is_matured, amount, days_to_pay, features, built_at)
+        VALUES %s
+        ON CONFLICT (lead_id) DO UPDATE SET
+          client_id=EXCLUDED.client_id, land=EXCLUDED.land,
+          created_date=EXCLUDED.created_date, label_paid=EXCLUDED.label_paid,
+          label_connected=EXCLUDED.label_connected, label_deal=EXCLUDED.label_deal,
+          is_matured=EXCLUDED.is_matured, amount=EXCLUDED.amount,
+          days_to_pay=EXCLUDED.days_to_pay, features=EXCLUDED.features,
+          built_at=now()
+    """
+    template = "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,now())"
+    with get_connection() as conn:
+        cur = conn.cursor()
+        psycopg2.extras.execute_values(cur, sql, values, template=template)
+        conn.commit()
+    return len(values)
+
+
+def replace_ml_maturation(land: str, table: List[tuple]) -> int:
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM edu_ml_maturation WHERE land=%s", (land,))
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO edu_ml_maturation (land, age_days, matured_fraction, built_at) VALUES %s",
+            [(land, age, frac) for age, frac in table],
+            template="(%s,%s,%s,now())",
+        )
+        conn.commit()
+    return len(table)
