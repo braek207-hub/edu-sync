@@ -53,7 +53,6 @@ FETCH_JS = """async (path) => {
   return {status: r.status, body: await r.text()};
 }"""
 
-
 def page_fetch_json(page, path: str) -> dict:
     """GET через in-page fetch; возвращает распарсенный JSON или бросает с диагностикой."""
     import json

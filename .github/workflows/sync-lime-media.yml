@@ -56,6 +56,16 @@ jobs:
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_mediametrica
 
+      # Геомедийка (Баннеры/Билборды в Картах) — нет API, ходим по сессии Яндекса.
+      - name: Run Geomedia sync (source=geo.media)
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          YANDEX_STORAGE_STATE: ${{ secrets.YANDEX_STORAGE_STATE }}
+          LIME_GEO_DAYS_BACK: ${{ github.event.inputs.days_back || '14' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_geomedia
+
       - name: Revalidate dashboard cache
         if: success()
         run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
