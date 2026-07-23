@@ -1,0 +1,43 @@
+name: Sync LIME VK Ads → Supabase
+
+on:
+  schedule:
+    - cron: "30 7 * * *"   # 10:30 Moscow, после Директа — свой rate-limit ритм
+  workflow_dispatch:
+    inputs:
+      days_back:
+        description: "Days back to sync (default 14)"
+        required: false
+        default: "14"
+
+concurrency:
+  group: lime-vk-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Apply DB migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/apply_lime_migrations.py
+      - name: Run LIME VK Ads sync
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          VK_CLIENT_ID: ${{ secrets.VK_CLIENT_ID }}
+          VK_CLIENT_SECRET: ${{ secrets.VK_CLIENT_SECRET }}
+          LIME_VK_DAYS_BACK: ${{ github.event.inputs.days_back || '14' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_vk_ads
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
