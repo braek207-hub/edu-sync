@@ -24,8 +24,10 @@ REGISTRY: list[FeatureSpec] = [
     FeatureSpec("b24_edu_level", "at_creation", "cat"),
     FeatureSpec("city_ip_segment", "at_creation", "cat"),
     FeatureSpec("direction", "at_creation", "cat"),
-    FeatureSpec("product_group", "at_creation", "cat"),
-    FeatureSpec("utm_source", "at_creation", "cat"),
+    # product_group / utm_source в crm_lead_details заполняются от привязанного продукта/заказа
+    # НА ЭТАПЕ ОПЛАТЫ (null у 100% неоплативших) → это outcome-утечка, НЕ выбирать в фичи.
+    FeatureSpec("product_group", "outcome", "cat"),
+    FeatureSpec("utm_source", "outcome", "cat"),
     FeatureSpec("created_dow", "at_creation", "num"),
     FeatureSpec("created_hour", "at_creation", "num"),
     FeatureSpec("days_to_deadline", "at_creation", "num"),
