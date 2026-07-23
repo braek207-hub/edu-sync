@@ -13,9 +13,9 @@ from sync.ml.maturation import maturation_table
 _CAL = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "edu_admission_calendar.json")
 
 
-def assemble(leads, behavior, deadlines, today):
+def assemble(leads, behavior_dated, deadlines, today):
     """Чистая часть: строки фич + кривая созревания (по созревшим оплатам)."""
-    rows = build_feature_rows(leads, behavior, deadlines, today)
+    rows = build_feature_rows(leads, behavior_dated, deadlines, today)
     paid_dtp = [r["days_to_pay"] for r in rows
                 if r["is_matured"] and r["label_paid"] and r["days_to_pay"] is not None]
     maturation = maturation_table(paid_dtp, horizon=120)
