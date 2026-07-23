@@ -1103,29 +1103,6 @@ def load_vuz_lead_frame() -> List[Dict[str, Any]]:
         return [dict(r) for r in cur.fetchall()]
 
 
-def load_vuz_behavior_frame() -> Dict[str, Dict[str, Any]]:
-    sql = """
-        SELECT client_id,
-               SUM(visits) AS visits,
-               COUNT(DISTINCT visit_date) AS visit_days,
-               CASE WHEN SUM(visits)>0
-                    THEN SUM(avg_duration_sec*visits)/SUM(visits) ELSE 0 END AS avg_duration_sec,
-               CASE WHEN SUM(visits)>0
-                    THEN SUM(bounce_rate*visits)/SUM(visits) ELSE 0 END AS bounce_rate,
-               CASE WHEN SUM(visits)>0
-                    THEN SUM(page_depth*visits)/SUM(visits) ELSE 0 END AS page_depth,
-               (ARRAY_AGG(device_category ORDER BY visits DESC))[1] AS device,
-               (ARRAY_AGG(traffic_source ORDER BY visits DESC))[1] AS source
-        FROM edu_visit_behavior
-        WHERE client_id IS NOT NULL AND client_id <> ''
-        GROUP BY client_id
-    """
-    with get_connection() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(sql)
-        return {r["client_id"]: dict(r) for r in cur.fetchall()}
-
-
 def load_vuz_behavior_dated() -> Dict[str, List[Dict[str, Any]]]:
     """Поведение по client_id с разбивкой по дате визита (не агрегат за всё время) —
     для per-visit-date фич Ф2 (см. build_feature_rows, behavior_dated)."""
