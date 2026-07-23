@@ -22,6 +22,7 @@ import psycopg2.extras
 
 BASE = "https://ads.vk.com/api/v2"
 TOKEN_URL = f"{BASE}/oauth2/token.json"
+TOKEN_DELETE_URL = f"{BASE}/oauth2/token/delete.json"
 STAT_BATCH = 20
 RETRY_429 = 5
 
@@ -105,14 +106,41 @@ def build_rows(base_map, goals_map, campaigns_meta) -> list:
     return rows
 
 
-def _get_token(client_id: str, secret: str) -> str:
-    body = urllib.parse.urlencode({
+def _token_form(client_id: str, secret: str) -> bytes:
+    return urllib.parse.urlencode({
         "grant_type": "client_credentials", "client_id": client_id, "client_secret": secret,
     }).encode("utf-8")
-    req = urllib.request.Request(TOKEN_URL, data=body,
+
+
+def _issue_token(client_id: str, secret: str) -> str:
+    req = urllib.request.Request(TOKEN_URL, data=_token_form(client_id, secret),
         headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
     with urllib.request.urlopen(req, timeout=40) as r:
         return json.loads(r.read().decode("utf-8"))["access_token"]
+
+
+def _delete_tokens(client_id: str, secret: str) -> None:
+    """Отозвать все активные токены клиента — освободить лимит VK."""
+    req = urllib.request.Request(TOKEN_DELETE_URL, data=_token_form(client_id, secret),
+        headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    urllib.request.urlopen(req, timeout=40).close()
+
+
+def _get_token(client_id: str, secret: str) -> str:
+    """Выпустить access_token; при token_limit_exceeded — отозвать старые и повторить.
+
+    VK Реклама лимитирует число АКТИВНЫХ токенов на клиента: каждый client_credentials даёт
+    новый 24ч-токен, а крон + ручные dispatch + preview накапливают их до лимита → 403
+    token_limit_exceeded. Отзыв всех токенов (token/delete) освобождает лимит; повторный
+    выпуск проходит. Отзыв безопасен: токены короткоживущие и принадлежат только нашему клиенту.
+    """
+    try:
+        return _issue_token(client_id, secret)
+    except urllib.error.HTTPError as e:
+        if e.code == 403 and "token_limit" in e.read().decode("utf-8", "replace"):
+            _delete_tokens(client_id, secret)
+            return _issue_token(client_id, secret)
+        raise
 
 
 def _api_get(token: str, path: str, *, _sleep=time.sleep) -> dict:
@@ -141,8 +169,17 @@ def _campaigns_from_json(js: dict) -> dict:
 
 
 def fetch_active_campaigns(token: str) -> dict:
-    js = _api_get(token, "campaigns.json?limit=500&fields=id,name,status,objective&_status__in=active")
-    return _campaigns_from_json(js)
+    """Активные кампании (id → мета). Пагинация: VK max limit=50 на страницу (limit=500 → 400)."""
+    out: dict = {}
+    offset = 0
+    while True:
+        js = _api_get(token,
+            f"campaigns.json?limit=50&offset={offset}&fields=id,name,status,objective&_status__in=active")
+        out.update(_campaigns_from_json(js))
+        if len(js.get("items", [])) < 50:
+            break
+        offset += 50
+    return out
 
 
 _UPSERT_SQL = """
