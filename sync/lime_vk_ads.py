@@ -7,6 +7,10 @@
 
 ENV: DATABASE_URL, VK_CLIENT_ID, VK_CLIENT_SECRET, LIME_VK_DAYS_BACK (default 14).
 Запуск: python -m sync.lime_vk_ads
+
+ВНИМАНИЕ: VK_CLIENT_ID не шарить с другими потребителями. При token_limit_exceeded
+_get_token отзывает ВСЕ активные токены клиента (token/delete) — это разлогинит любую
+другую систему на том же client_id.
 """
 import json
 import os
