@@ -866,6 +866,129 @@ def ensure_ml_scoring_tables() -> None:
         conn.commit()
 
 
+def load_feature_matrix() -> List[Dict[str, Any]]:
+    sql = """
+        SELECT lead_id, client_id, created_date, is_matured,
+               label_connected, label_deal, label_paid, amount,
+               COALESCE(features->>'f__direction','__na__') AS direction,
+               features
+        FROM edu_lead_features WHERE land='vuz'
+    """
+    with get_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def save_artifact(version: str, kind: str, blob: bytes) -> None:
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO edu_ml_artifacts (version, kind, blob, created_at)
+            VALUES (%s,%s,%s,now())
+            ON CONFLICT (version, kind) DO UPDATE SET blob=EXCLUDED.blob, created_at=now()
+            """,
+            (version, kind, psycopg2.Binary(blob)),
+        )
+        conn.commit()
+
+
+def load_latest_passing_artifacts():
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT version FROM edu_ml_runs WHERE gate_passed=true "
+            "ORDER BY trained_at DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        version = row[0]
+        cur.execute("SELECT kind, blob FROM edu_ml_artifacts WHERE version=%s", (version,))
+        blobs = {k: bytes(b) for k, b in cur.fetchall()}
+    return version, blobs
+
+
+def insert_ml_run(row: Dict[str, Any]) -> None:
+    import json as _json
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO edu_ml_runs
+              (version, trained_at, n_train, n_pos_pay, prauc_pay, brier_pay,
+               lift_final, lift_baseline, lift_pilot, gate_passed, stage_metrics)
+            VALUES (%s,now(),%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+            ON CONFLICT (version) DO UPDATE SET
+              trained_at=now(), n_train=EXCLUDED.n_train, n_pos_pay=EXCLUDED.n_pos_pay,
+              prauc_pay=EXCLUDED.prauc_pay, brier_pay=EXCLUDED.brier_pay,
+              lift_final=EXCLUDED.lift_final, lift_baseline=EXCLUDED.lift_baseline,
+              lift_pilot=EXCLUDED.lift_pilot, gate_passed=EXCLUDED.gate_passed,
+              stage_metrics=EXCLUDED.stage_metrics
+            """,
+            (row["version"], row["n_train"], row["n_pos_pay"], row.get("prauc_pay"),
+             row.get("brier_pay"), row.get("lift_final"), row.get("lift_baseline"),
+             row.get("lift_pilot"), row.get("gate_passed", False),
+             _json.dumps(row.get("stage_metrics", {}), ensure_ascii=False)),
+        )
+        conn.commit()
+
+
+def upsert_lead_scores(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    import json as _json
+    values = [
+        (r["lead_id"], r["scoring_point"], r.get("p_connect"), r.get("p_deal"),
+         r.get("p_pay"), r.get("decile"), _json.dumps(r.get("top_shap", []), ensure_ascii=False),
+         r.get("model_version"))
+        for r in rows
+    ]
+    sql = """
+        INSERT INTO edu_lead_scores
+          (lead_id, scoring_point, p_connect, p_deal, p_pay, decile, top_shap,
+           model_version, scored_at)
+        VALUES %s
+        ON CONFLICT (lead_id, scoring_point) DO UPDATE SET
+          p_connect=EXCLUDED.p_connect, p_deal=EXCLUDED.p_deal, p_pay=EXCLUDED.p_pay,
+          decile=EXCLUDED.decile, top_shap=EXCLUDED.top_shap,
+          model_version=EXCLUDED.model_version, scored_at=now()
+    """
+    template = "(%s,%s,%s,%s,%s,%s,%s::jsonb,%s,now())"
+    with get_connection() as conn:
+        cur = conn.cursor()
+        psycopg2.extras.execute_values(cur, sql, values, template=template)
+        conn.commit()
+    return len(values)
+
+
+def upsert_revenue_forecast(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    values = [
+        (r["as_of_date"], r["segment"], r["pending_leads"], r["exp_payments"],
+         r["exp_revenue"], r["revenue_lo"], r["revenue_hi"], r.get("model_version"))
+        for r in rows
+    ]
+    sql = """
+        INSERT INTO edu_revenue_forecast
+          (as_of_date, segment, pending_leads, exp_payments, exp_revenue,
+           revenue_lo, revenue_hi, model_version, built_at)
+        VALUES %s
+        ON CONFLICT (as_of_date, segment) DO UPDATE SET
+          pending_leads=EXCLUDED.pending_leads, exp_payments=EXCLUDED.exp_payments,
+          exp_revenue=EXCLUDED.exp_revenue, revenue_lo=EXCLUDED.revenue_lo,
+          revenue_hi=EXCLUDED.revenue_hi, model_version=EXCLUDED.model_version, built_at=now()
+    """
+    template = "(%s,%s,%s,%s,%s,%s,%s,%s,now())"
+    with get_connection() as conn:
+        cur = conn.cursor()
+        psycopg2.extras.execute_values(cur, sql, values, template=template)
+        conn.commit()
+    return len(values)
+
+
 def load_uploaded_conversion_keys() -> set:
     ensure_metrika_table()
     with get_connection() as conn:
