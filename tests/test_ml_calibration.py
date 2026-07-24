@@ -6,6 +6,7 @@ import numpy as np
 
 from sync.ml.artifacts import deserialize_pickle, serialize_pickle
 from sync.ml.baseline import fit_logistic, predict_logistic
+from sync.ml_score import to_deciles
 
 
 class _NoopTweedieVec:
@@ -16,8 +17,13 @@ class _NoopTweedieVec:
         return np.zeros(len(X))
 
 
-def test_isotonic_calibration_preserves_rank_order():
-    """Изотоника монотонна → argsort(p_cal) == argsort(p_raw) → дециль/AP не меняются."""
+def test_isotonic_calibration_is_monotonic_but_not_tie_free():
+    """Изотоника (PAV) монотонна, НО не tie-free: она пулит предсказания в плато
+    (много разных p_raw → один p_cal). argsort(p_raw) == argsort(p_cal) НЕ выполняется
+    в общем случае — это была ошибочная гипотеза дизайна (см. ниже
+    test_decile_uses_raw_not_calibrated_probability, где 45% лидов меняют дециль на
+    реалистичной fixture, если дециль считать от p_cal). Здесь фиксируем только то, что
+    ДЕЙСТВИТЕЛЬНО гарантировано: p_cal не убывает по возрастанию p_raw (PAV monotonicity)."""
     from sklearn.isotonic import IsotonicRegression
 
     rows = [{"x": float(i)} for i in range(40)]
@@ -27,10 +33,11 @@ def test_isotonic_calibration_preserves_rank_order():
     calibrator = IsotonicRegression(out_of_bounds="clip").fit(p_raw, y)
     p_cal = calibrator.predict(p_raw)
 
-    assert np.array_equal(np.argsort(p_raw), np.argsort(p_cal))
-    # монотонность и напрямую: по возрастанию p_raw p_cal никогда не убывает
+    # единственная гарантия PAV: по возрастанию p_raw p_cal никогда не убывает
     order = np.argsort(p_raw)
     assert np.all(np.diff(p_cal[order]) >= -1e-12)
+    # НЕ утверждаем np.array_equal(argsort(p_raw), argsort(p_cal)) — с плато это неверно
+    # (isotonic создаёт ties → argsort порядок внутри плато произволен/по индексу).
 
 
 def test_isotonic_calibration_pulls_average_to_base_rate():
@@ -61,6 +68,42 @@ def test_isotonic_calibration_pulls_average_to_base_rate():
     assert avg_p_raw > base_rate * 3              # balanced инфлирует сильно (как в проде: 0.26 vs 0.014)
     assert abs(avg_p_cal - base_rate) < 0.01       # калибровка стягивает почти точно к базе (in-sample)
     assert avg_p_cal < avg_p_raw
+
+
+def test_decile_uses_raw_not_calibrated_probability():
+    """HIGH finding (реальный ревью): изотоника пулит p_raw в несколько плато
+    (много разных сырых скоров → одно p_cal) → to_deciles(p_cal) перетасовывает
+    ранжирование лидов относительно to_deciles(p_raw). На реалистичной fixture
+    (n=2000, редкий позитив, тот же профиль что и в проде) 45% лидов меняют дециль,
+    если дециль считать от калиброванной p — это и есть баг, который сломал бы
+    edu_lead_scores.decile (консюмер-facing поле приоритизации).
+    Фиксируем требуемое поведение: дециль = to_deciles(p_raw), а не to_deciles(p_cal)."""
+    from sklearn.isotonic import IsotonicRegression
+    from sklearn.linear_model import LogisticRegression
+
+    rng = np.random.RandomState(0)
+    n = 2000
+    X = rng.randn(n, 3)
+    logit = 0.8 * X[:, 0] + 0.3 * X[:, 1] - 0.1 * X[:, 2] - 4.0   # редкий позитив, как в проде
+    prob = 1 / (1 + np.exp(-logit))
+    y = (rng.rand(n) < prob).astype(int)
+
+    clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+    clf.fit(X, y)
+    p_raw = clf.predict_proba(X)[:, 1]
+
+    calibrator = IsotonicRegression(out_of_bounds="clip").fit(p_raw, y)
+    p_cal = calibrator.predict(p_raw)
+
+    # плато: изотоника резко сокращает число различимых значений
+    assert len(np.unique(np.round(p_cal, 10))) < len(np.unique(np.round(p_raw, 10))) / 20
+
+    dec_from_raw = to_deciles(p_raw)
+    dec_from_cal = to_deciles(p_cal)
+    changed = sum(1 for a, b in zip(dec_from_raw, dec_from_cal) if a != b)
+    # заявленная в ревью цифра (~45%) — доказывает что раздельные дециль-функции
+    # НЕ взаимозаменяемы; правильный источник дециля — только p_raw.
+    assert changed / n > 0.3
 
 
 def test_calibrator_pickle_roundtrip():
@@ -135,6 +178,16 @@ def test_score_point_applies_calibration_to_p_pay(monkeypatch):
     # отличается от сырой p — здесь balanced-логистика ощутимо инфлирует
     assert abs(got_p_pay[29] - p_raw_expected[29]) > 1e-3
     assert np.allclose(np.asarray(res["p_final"]), p_cal_expected, atol=1e-9)
+
+    # HIGH-регрессия: _score_point должен писать дециль от p_raw, а не от p_cal.
+    # На этой fixture изотоника пулит 40 сырых точек в 2 плато → decile-from-cal
+    # разошёлся бы с decile-from-raw на большинстве строк (проверено: 32/40).
+    got_decile = [r["decile"] for r in captured["rows"]]
+    assert got_decile == to_deciles(p_raw_expected)
+    dec_from_cal_would_be = to_deciles(p_cal_expected)
+    assert got_decile != dec_from_cal_would_be
+    changed = sum(1 for a, b in zip(got_decile, dec_from_cal_would_be) if a != b)
+    assert changed >= 20   # существенное расхождение (не пара точек на границе плато)
 
 
 def test_score_point_falls_back_to_raw_when_calibrator_missing(monkeypatch):

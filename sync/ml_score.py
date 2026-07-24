@@ -4,7 +4,8 @@ edu_lead_scores(scoring_point) → прогноз (только at_creation) →
 Публикует точку ТОЛЬКО если есть её версия с gate_passed=true.
 Ф2.2: p_pay = КАЛИБРОВАННАЯ (изотоника) вероятность — сырая логистика инфлирует
 p_pay (class_weight="balanced"), калибровка чинит абсолют для прогноза выручки;
-децили тождественны сырым (монотонность), фолбэк на сырые p если артефакт старый
+дециль считается от СЫРОЙ p (изотоника схлопывает плато → дециль по калиброванной
+p перетасовывает ранжирование), фолбэк на сырые p если артефакт старый
 (нет ключа "calibrator")."""
 
 from datetime import date, timedelta
@@ -68,8 +69,10 @@ def _score_point(point: str, rows: list) -> Optional[dict[str, Any]]:
     pop = point_subset(rows, point)
     X, _, _ = build_stage_matrix([r["features"] for r in pop], point)
     p_raw = predict_logistic(clf, vec, X)
-    p = calibrator.predict(p_raw) if calibrator is not None else p_raw   # калиброванная p_pay
-    deciles = to_deciles(p)
+    p_cal = calibrator.predict(p_raw) if calibrator is not None else p_raw   # калиброванная p_pay
+    # дециль — от сырой логистики (полное разрешение ранжирования); изотоника схлопывает
+    # плато (много разных p_raw → одно p_cal) → дециль по p_cal перетасовывает ранжирование.
+    deciles = to_deciles(p_raw)
 
     score_rows = []
     for i, r in enumerate(pop):
@@ -77,11 +80,11 @@ def _score_point(point: str, rows: list) -> Optional[dict[str, Any]]:
         top = logistic_top_factors(clf, vec, X[i])
         score_rows.append({
             "lead_id": r["lead_id"], "scoring_point": point,
-            "p_connect": None, "p_deal": None, "p_pay": float(p[i]),
+            "p_connect": None, "p_deal": None, "p_pay": float(p_cal[i]),
             "decile": deciles[i], "top_shap": top, "model_version": version,
         })
     n = db.upsert_lead_scores(score_rows)
-    return {"version": version, "pop": pop, "X": X, "p_final": p, "tw": tw, "n": n}
+    return {"version": version, "pop": pop, "X": X, "p_final": p_cal, "tw": tw, "n": n}
 
 
 def run_scoring(today: Optional[date] = None) -> dict[str, Any]:
