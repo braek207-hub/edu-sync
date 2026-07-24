@@ -79,6 +79,33 @@ def fetch_goal_reaches_by_day(page, campaign_id, date1: str, date2: str, goal_id
     return out
 
 
+def fetch_postview_revenue_by_day(page, campaign_id, date1: str, date2: str) -> dict:
+    """Пост-вью ДОХОД (сумма покупок после показа без клика) → {дата: revenue}.
+    Метрика am:e:postViewRevenue — из клада mediametrika_api.py (док. API AdMetrica);
+    internal table-data принимает те же am:e:-имена. Отдельным запросом и защищённо:
+    если internal API не отдаёт эту метрику — конверсии (Покупка/корзина/оформление)
+    не должны пострадать (вернём пусто, доход просто не появится)."""
+    out: dict[str, float] = {}
+    try:
+        path = (
+            "/api/v1/report/table-data?limit=400&offset=1"
+            f"&ids={campaign_id}&metrics=am:e:postViewRevenue"
+            "&dimensions=am:e:datePeriod<group>&group=day"
+            f"&date1={date1}&date2={date2}&goal_id={PURCHASE_GOAL}"
+            "&filters=&sort=am:e:datePeriodday"
+        )
+        data = page_fetch_json(page, path)
+        for r in data.get("result", {}).get("data", []):
+            dims = r.get("dimensions", [{}])
+            d = (dims[0].get("name") or dims[0].get("id") or "")[:10] if dims else ""
+            if len(d) == 10:
+                m = r.get("metrics", [])
+                out[d] = round(_num(m[0]), 2) if m else 0.0
+    except Exception as e:
+        print(f"[mm] доход post-view у {campaign_id}: {e}")
+    return out
+
+
 def _num(v):
     try:
         return float(v)
@@ -105,6 +132,7 @@ def build_rows(campaigns: list, page, date1: str, date2: str) -> list:
         # за раз). Защищённо: их сбой не роняет «Покупку» (fetch_goal_reaches_by_day → {}).
         cart_by_day = fetch_goal_reaches_by_day(page, cid, date1, date2, CART_GOAL)
         checkout_by_day = fetch_goal_reaches_by_day(page, cid, date1, date2, CHECKOUT_GOAL)
+        revenue_by_day = fetch_postview_revenue_by_day(page, cid, date1, date2)
         mtype = _media_type(name)
         for r in daily:
             dims = r.get("dimensions", [{}])
@@ -127,6 +155,7 @@ def build_rows(campaigns: list, page, date1: str, date2: str) -> list:
                     "pv_purchase": reaches,
                     "pv_cart": cart_by_day.get(d, 0),
                     "pv_checkout": checkout_by_day.get(d, 0),
+                    "pv_revenue": revenue_by_day.get(d, 0.0),
                 }, ensure_ascii=False),
             })
     return rows
