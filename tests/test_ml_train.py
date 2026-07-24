@@ -68,3 +68,35 @@ def test_train_one_point_local_smoke():
     assert run["gate_passed"] is True             # модель бьёт пилота
     assert run["stage_metrics"]["model"] == "logistic_single_stage"
     assert "logistic" in artifacts and "tweedie" in artifacts and "manifest" in artifacts
+
+
+def _all_positive_rows():
+    """Все матурированные train-строки — оплачены (label_paid=True). Реалистично для
+    post_connection: узкий недавний созревший коготь может состоять целиком из платящих."""
+    def _row(cd, cid, lid, paid, connected=True):
+        return {
+            "created_date": cd, "client_id": cid, "lead_id": lid,
+            "is_matured": True, "label_connected": connected, "label_deal": paid,
+            "label_paid": paid, "amount": 1000.0 if paid else 0.0, "direction": "vuz",
+            "features": {
+                "f__beh_page_depth": 5.0,
+                "f__beh_avg_duration_sec": 100.0,
+                "f__beh_visits": 1.0, "f__beh_bounce_rate": 50.0,
+            },
+        }
+    # train (старее окна holdout) — ВСЕ paid=True → single-class
+    rows = [_row(date(2025, 6, 1), f"tr{i}", f"L_tr{i}", True) for i in range(10)]
+    # holdout — произвольные метки, нужен только чтобы train/test оба непустые
+    rows += [_row(date(2026, 3, 1), f"te{i}", f"L_te{i}", i % 2 == 0) for i in range(4)]
+    return rows
+
+
+def test_train_one_point_all_positive_matured_train_is_degenerate():
+    """Finding 1: sum(y) == len(y) (все матурированные train оплачены) должно
+    деградировать чисто, а не падать в LogisticRegression.fit с 'only one class'."""
+    from sync.ml_train import _train_one_point
+    res = _train_one_point(_all_positive_rows(), "post_connection", date(2026, 7, 23))
+    run, artifacts = res["run"], res["artifacts"]
+    assert run["gate_passed"] is False
+    assert run["stage_metrics"]["skipped"] == "empty/single-class matured train"
+    assert artifacts == {}

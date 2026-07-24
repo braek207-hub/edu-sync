@@ -54,6 +54,8 @@ def _score_point(point: str, rows: list) -> Optional[dict[str, Any]]:
         print(f"нет модели {point} — пропуск")
         return None
     version, blobs = loaded
+    man = deserialize_pickle(blobs["manifest"])
+    assert man.get("point") == point, f"artifact point {man.get('point')!r} != {point!r} (version={version})"
     lg = deserialize_pickle(blobs["logistic"])
     clf, vec = lg["clf"], lg["vec"]
     tw = deserialize_pickle(blobs["tweedie"])

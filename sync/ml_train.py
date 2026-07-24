@@ -73,7 +73,7 @@ def _train_one_point(rows, point: str, today: date) -> dict[str, Any]:
     # ── обучение на СОЗРЕВШИХ train (метка pay наблюдаема) ──
     mtr = [r for r in train if r["is_matured"]]
     y = [1 if r["label_paid"] else 0 for r in mtr]
-    if len(mtr) == 0 or sum(y) == 0:
+    if len(mtr) == 0 or sum(y) == 0 or sum(y) == len(y):
         return _degenerate("empty/single-class matured train")
     Xtr, names, cat_names = build_stage_matrix([r["features"] for r in mtr], point)
     clf, vec = fit_logistic(Xtr, y)
