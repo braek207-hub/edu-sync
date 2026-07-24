@@ -1,25 +1,7 @@
-"""Каскад воронки: композиция вероятностей + сборка матрицы фич под точку решения."""
-
-import numpy as np
+"""Сборка матрицы фич под точку решения (после Ф2.1 каскад-композиция удалена —
+прод-модель single-stage логистика, `build_stage_matrix` остаётся общей витриной фич)."""
 
 from sync.ml.registry import REGISTRY, select_features, feature_key
-
-
-def compose_cascade(p_connect, p_deal, p_pay) -> np.ndarray:
-    """Композиция вероятностей каскада: поэлементное произведение с клипом [0,1].
-
-    Args:
-        p_connect: Вероятности дозвона (array-like).
-        p_deal: Вероятности сделки (array-like).
-        p_pay: Вероятности оплаты (array-like).
-
-    Returns:
-        np.ndarray: Произведение с клипом в диапазоне [0, 1].
-    """
-    a = np.asarray(p_connect, dtype=float)
-    b = np.asarray(p_deal, dtype=float)
-    c = np.asarray(p_pay, dtype=float)
-    return np.clip(a * b * c, 0.0, 1.0)
 
 
 def build_stage_matrix(feature_dicts, point):

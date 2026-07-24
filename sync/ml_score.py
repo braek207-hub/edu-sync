@@ -9,8 +9,9 @@ from typing import Any, Optional
 import numpy as np
 
 from sync import db
-from sync.ml.artifacts import deserialize_catboost, deserialize_pickle
-from sync.ml.cascade import build_stage_matrix, compose_cascade
+from sync.ml.artifacts import deserialize_pickle
+from sync.ml.baseline import logistic_top_factors, predict_logistic
+from sync.ml.cascade import build_stage_matrix
 from sync.ml.forecast import aggregate_forecast, expected_revenue
 from sync.ml_train import POINTS, point_subset
 
@@ -53,44 +54,26 @@ def _score_point(point: str, rows: list) -> Optional[dict[str, Any]]:
         print(f"нет модели {point} — пропуск")
         return None
     version, blobs = loaded
-    man = deserialize_pickle(blobs["manifest"])
-    nm, ci = man["names"], man["cat_idx"]
-    m_d = deserialize_catboost(blobs["cb_deal"])
-    m_p = deserialize_catboost(blobs["cb_pay"])
-    cal_d = deserialize_pickle(blobs["cal_deal"])
-    cal_p = deserialize_pickle(blobs["cal_pay"])
+    lg = deserialize_pickle(blobs["logistic"])
+    clf, vec = lg["clf"], lg["vec"]
     tw = deserialize_pickle(blobs["tweedie"])
 
     pop = point_subset(rows, point)
     X, _, _ = build_stage_matrix([r["features"] for r in pop], point)
-    from catboost import Pool
-    Xm = [[r[n] for n in nm] for r in X]
-    if "cb_connect" in blobs:
-        m_c = deserialize_catboost(blobs["cb_connect"])
-        cal_c = deserialize_pickle(blobs["cal_connect"])
-        pc = cal_c.predict(m_c.predict_proba(Pool(Xm, cat_features=ci))[:, 1])
-    else:
-        pc = np.ones(len(pop))
-    pd = cal_d.predict(m_d.predict_proba(Pool(Xm, cat_features=ci))[:, 1])
-    pp = cal_p.predict(m_p.predict_proba(Pool(Xm, cat_features=ci))[:, 1])
-    p_final = compose_cascade(pc, pd, pp)
-    deciles = to_deciles(p_final)
-
-    # SHAP (нативный CatBoost) для стадии pay — топ-3 фактора на лид
-    shap = m_p.get_feature_importance(type="ShapValues", data=Pool(Xm, cat_features=ci))
+    p = predict_logistic(clf, vec, X)
+    deciles = to_deciles(p)
 
     score_rows = []
     for i, r in enumerate(pop):
-        contrib = shap[i][:-1]  # последний столбец — expected value
-        top_idx = np.argsort(-np.abs(contrib))[:3]
-        top = [{"feature": nm[j], "shap": float(contrib[j])} for j in top_idx]
+        # топ-3 фактора: coef[j]*x[j] линейного логита (точная замена SHAP)
+        top = logistic_top_factors(clf, vec, X[i])
         score_rows.append({
             "lead_id": r["lead_id"], "scoring_point": point,
-            "p_connect": float(pc[i]), "p_deal": float(pd[i]), "p_pay": float(p_final[i]),
+            "p_connect": None, "p_deal": None, "p_pay": float(p[i]),
             "decile": deciles[i], "top_shap": top, "model_version": version,
         })
     n = db.upsert_lead_scores(score_rows)
-    return {"version": version, "pop": pop, "X": X, "p_final": p_final, "tw": tw, "n": n}
+    return {"version": version, "pop": pop, "X": X, "p_final": p, "tw": tw, "n": n}
 
 
 def run_scoring(today: Optional[date] = None) -> dict[str, Any]:

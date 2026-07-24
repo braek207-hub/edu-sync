@@ -19,7 +19,7 @@ def test_ensure_ml_scoring_tables_idempotent():
 
 def test_artifact_and_run_roundtrip():
     db.ensure_ml_scoring_tables()
-    db.save_artifact("TEST_V", "manifest_atc", b"\x00\x01\x02")
+    db.save_artifact("TEST_V", "logistic_atc", b"\x00\x01\x02")
     db.insert_ml_run({
         "version": "TEST_V", "scoring_point": "at_creation", "n_train": 100, "n_pos_pay": 5,
         "prauc_pay": 0.1, "brier_pay": 0.2, "lift_final": 3.0,
@@ -28,7 +28,7 @@ def test_artifact_and_run_roundtrip():
     })
     got = db.load_latest_passing_artifacts("at_creation")
     assert got is not None and got[0] == "TEST_V"
-    assert got[1]["manifest"] == b"\x00\x01\x02"          # ключ разсуффиксован
+    assert got[1]["logistic"] == b"\x00\x01\x02"          # ключ разсуффиксован
     assert db.load_latest_passing_artifacts("post_connection") is None  # нет pc-версии
     with db.get_connection() as conn:
         cur = conn.cursor()

@@ -1,4 +1,5 @@
-"""Бейзлайны для гейта: эвристика пилота (время визита) + логистическая регрессия."""
+"""Бейзлайны и продовая модель гейта: эвристика пилота (время визита) +
+сериализуемая логистическая регрессия (прод-модель P(pay) после Ф2.1)."""
 
 import numpy as np
 from sklearn.feature_extraction import DictVectorizer
@@ -21,14 +22,27 @@ def pilot_score(feature_dicts) -> np.ndarray:
     return np.clip(np.asarray(out, dtype=float), 0.0, 1.0)
 
 
-def fit_logistic_baseline(rows, cat_names, y):
+def fit_logistic(rows, y):
+    """Обучает логистическую регрессию на списке dict-строк (из build_stage_matrix).
+    Возвращает `(clf, vec)` — обе части пиклятся (в отличие от замыкания)."""
     vec = DictVectorizer(sparse=False)
     X = vec.fit_transform(rows)
     clf = LogisticRegression(max_iter=1000, class_weight="balanced")
     clf.fit(X, np.asarray(y, dtype=int))
+    return clf, vec
 
-    def predict_proba1(rows2) -> np.ndarray:
-        X2 = vec.transform(rows2)
-        return clf.predict_proba(X2)[:, 1]
 
-    return predict_proba1
+def predict_logistic(clf, vec, rows) -> np.ndarray:
+    """P(pay) для списка dict-строк по обученным (clf, vec)."""
+    X = vec.transform(rows)
+    return clf.predict_proba(X)[:, 1]
+
+
+def logistic_top_factors(clf, vec, row, k: int = 3) -> list[dict]:
+    """Топ-k факторов вклада для одной строки: `coef[j] * x[j]` (точное разложение
+    линейного логита — легитимная замена SHAP для линейной модели). Сортировка по |вкладу|."""
+    x = vec.transform([row])[0]
+    contrib = clf.coef_[0] * np.asarray(x, dtype=float)
+    names = vec.get_feature_names_out()
+    idx = np.argsort(-np.abs(contrib))[:k]
+    return [{"feature": str(names[j]), "shap": float(contrib[j])} for j in idx]
