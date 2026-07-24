@@ -79,31 +79,65 @@ def fetch_goal_reaches_by_day(page, campaign_id, date1: str, date2: str, goal_id
     return out
 
 
+# DISCOVERY: internal table-data отверг am:e:postViewRevenue (код 4002). Внутренний API
+# использует goal<goal_id>Reaches (не документированный postViewGoalReaches) → доход,
+# вероятно, goal<goal_id>ReachesRevenue. Пробуем список кандидатов, первый принятый (200 +
+# ненулевая сумма) — рабочий. MM_REVENUE_PROBE=1 печатает вердикт по каждому кандидату.
+_REVENUE_METRIC_CANDIDATES = [
+    "am:e:goal<goal_id>ReachesRevenue",
+    "am:e:goal<goal_id>Revenue",
+    "am:e:goal<goal_id>ReachesPrice",
+    "am:e:goal<goal_id>Price",
+    "am:e:postViewGoal<goal_id>Revenue",
+    "am:e:ecommerceRevenue",
+    "am:e:revenue",
+]
+# Метрика дохода, подтверждённая discovery-прогоном (заполнить после probe).
+REVENUE_METRIC = os.environ.get("LIME_MM_REVENUE_METRIC", "am:e:goal<goal_id>ReachesRevenue")
+
+
+def _try_revenue_metric(page, campaign_id, date1, date2, metric):
+    """Один запрос дохода по конкретной метрике → {дата: revenue} или None при 400."""
+    path = (
+        "/api/v1/report/table-data?limit=400&offset=1"
+        f"&ids={campaign_id}&metrics={metric}"
+        "&dimensions=am:e:datePeriod<group>&group=day"
+        f"&date1={date1}&date2={date2}&goal_id={PURCHASE_GOAL}"
+        "&filters=&sort=am:e:datePeriodday"
+    )
+    try:
+        data = page_fetch_json(page, path)
+    except Exception:
+        return None  # 400 invalid_parameter — метрика не существует
+    out: dict[str, float] = {}
+    for r in data.get("result", {}).get("data", []):
+        dims = r.get("dimensions", [{}])
+        d = (dims[0].get("name") or dims[0].get("id") or "")[:10] if dims else ""
+        if len(d) == 10:
+            m = r.get("metrics", [])
+            out[d] = round(_num(m[0]), 2) if m else 0.0
+    return out
+
+
+def probe_revenue_metric(page, campaign_id, date1, date2) -> str:
+    """Discovery: перебрать кандидатов, вернуть первую метрику, что даёт ненулевую сумму."""
+    for metric in _REVENUE_METRIC_CANDIDATES:
+        res = _try_revenue_metric(page, campaign_id, date1, date2, metric)
+        total = sum(res.values()) if res else 0.0
+        status = "400" if res is None else f"sum={total:.0f}"
+        print(f"[mm][probe] {metric}: {status}")
+        if res and total > 0:
+            print(f"[mm][probe] ПОБЕДИТЕЛЬ: {metric} (пример {list(res.items())[:2]})")
+            return metric
+    print("[mm][probe] ни один кандидат не дал доход")
+    return ""
+
+
 def fetch_postview_revenue_by_day(page, campaign_id, date1: str, date2: str) -> dict:
     """Пост-вью ДОХОД (сумма покупок после показа без клика) → {дата: revenue}.
-    Метрика am:e:postViewRevenue — из клада mediametrika_api.py (док. API AdMetrica);
-    internal table-data принимает те же am:e:-имена. Отдельным запросом и защищённо:
-    если internal API не отдаёт эту метрику — конверсии (Покупка/корзина/оформление)
-    не должны пострадать (вернём пусто, доход просто не появится)."""
-    out: dict[str, float] = {}
-    try:
-        path = (
-            "/api/v1/report/table-data?limit=400&offset=1"
-            f"&ids={campaign_id}&metrics=am:e:postViewRevenue"
-            "&dimensions=am:e:datePeriod<group>&group=day"
-            f"&date1={date1}&date2={date2}&goal_id={PURCHASE_GOAL}"
-            "&filters=&sort=am:e:datePeriodday"
-        )
-        data = page_fetch_json(page, path)
-        for r in data.get("result", {}).get("data", []):
-            dims = r.get("dimensions", [{}])
-            d = (dims[0].get("name") or dims[0].get("id") or "")[:10] if dims else ""
-            if len(d) == 10:
-                m = r.get("metrics", [])
-                out[d] = round(_num(m[0]), 2) if m else 0.0
-    except Exception as e:
-        print(f"[mm] доход post-view у {campaign_id}: {e}")
-    return out
+    Отдельным запросом и защищённо: сбой метрики дохода не роняет конверсии."""
+    res = _try_revenue_metric(page, campaign_id, date1, date2, REVENUE_METRIC)
+    return res or {}
 
 
 def _num(v):
@@ -167,6 +201,20 @@ def main() -> None:
     date_from = date_to - timedelta(days=days_back - 1)
     d1, d2 = date_from.isoformat(), date_to.isoformat()
     print(f"[mm] период {d1}..{d2}, цель покупки={PURCHASE_GOAL}")
+
+    # DISCOVERY-режим: найти рабочий нейминг метрики дохода (одноразово), без записи.
+    if os.environ.get("MM_REVENUE_PROBE") == "1":
+        with yandex_page(ORIGIN) as page:
+            campaigns = fetch_campaigns(page)
+            for c in campaigns[:8]:
+                cid = c.get("campaignId")
+                print(f"[mm][probe] кампания {cid} '{c.get('name')}'")
+                winner = probe_revenue_metric(page, cid, d1, d2)
+                if winner:
+                    print(f"[mm][probe] ИТОГ: рабочая метрика дохода = {winner}")
+                    return
+        print("[mm][probe] рабочей метрики среди кандидатов нет")
+        return
 
     with yandex_page(ORIGIN) as page:
         campaigns = fetch_campaigns(page)

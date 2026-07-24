@@ -11,6 +11,10 @@ on:
         description: "Days back to sync (default 14)"
         required: false
         default: "14"
+      mm_probe:
+        description: "Discovery дохода Медиаметрики (1 = probe без записи)"
+        required: false
+        default: "0"
 
 concurrency:
   group: lime-media-sync
@@ -53,6 +57,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           YANDEX_STORAGE_STATE: ${{ secrets.YANDEX_STORAGE_STATE }}
           LIME_MM_DAYS_BACK: ${{ github.event.inputs.days_back || '14' }}
+          MM_REVENUE_PROBE: ${{ github.event.inputs.mm_probe || '0' }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_mediametrica
 
