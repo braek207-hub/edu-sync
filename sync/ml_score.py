@@ -1,7 +1,11 @@
 """Оркестратор скоринга+прогноза EDU (land=vuz). Гоняется в CI (score-edu-ml.yml):
 грузит последнюю прошедшую гейт модель ПО КАЖДОЙ точке → скорит субпопуляцию →
 edu_lead_scores(scoring_point) → прогноз (только at_creation) → edu_revenue_forecast.
-Публикует точку ТОЛЬКО если есть её версия с gate_passed=true."""
+Публикует точку ТОЛЬКО если есть её версия с gate_passed=true.
+Ф2.2: p_pay = КАЛИБРОВАННАЯ (изотоника) вероятность — сырая логистика инфлирует
+p_pay (class_weight="balanced"), калибровка чинит абсолют для прогноза выручки;
+децили тождественны сырым (монотонность), фолбэк на сырые p если артефакт старый
+(нет ключа "calibrator")."""
 
 from datetime import date, timedelta
 from typing import Any, Optional
@@ -59,10 +63,12 @@ def _score_point(point: str, rows: list) -> Optional[dict[str, Any]]:
     lg = deserialize_pickle(blobs["logistic"])
     clf, vec = lg["clf"], lg["vec"]
     tw = deserialize_pickle(blobs["tweedie"])
+    calibrator = deserialize_pickle(blobs["calibrator"]) if "calibrator" in blobs else None
 
     pop = point_subset(rows, point)
     X, _, _ = build_stage_matrix([r["features"] for r in pop], point)
-    p = predict_logistic(clf, vec, X)
+    p_raw = predict_logistic(clf, vec, X)
+    p = calibrator.predict(p_raw) if calibrator is not None else p_raw   # калиброванная p_pay
     deciles = to_deciles(p)
 
     score_rows = []

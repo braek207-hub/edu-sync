@@ -58,7 +58,10 @@ def _synthetic_rows():
 
 def test_train_one_point_local_smoke():
     """Локальный smoke прод-пути (sklearn, без catboost/БД): логистика на сепарабельной
-    синтетике → run с prauc_pay, gate_passed bool, артефакт 'logistic'."""
+    синтетике → run с prauc_pay, gate_passed bool, артефакты 'logistic'+'calibrator' (Ф2.2)."""
+    from sklearn.isotonic import IsotonicRegression
+
+    from sync.ml.artifacts import deserialize_pickle
     from sync.ml_train import _train_one_point
     res = _train_one_point(_synthetic_rows(), "at_creation", date(2026, 7, 23))
     run, artifacts = res["run"], res["artifacts"]
@@ -68,6 +71,11 @@ def test_train_one_point_local_smoke():
     assert run["gate_passed"] is True             # модель бьёт пилота
     assert run["stage_metrics"]["model"] == "logistic_single_stage"
     assert "logistic" in artifacts and "tweedie" in artifacts and "manifest" in artifacts
+    # Ф2.2: изотоническая калибровка — артефакт + stage_metrics для наблюдаемости
+    assert "calibrator" in artifacts
+    assert isinstance(deserialize_pickle(artifacts["calibrator"]), IsotonicRegression)
+    sm = run["stage_metrics"]
+    assert isinstance(sm["avg_p_raw"], float) and isinstance(sm["avg_p_cal"], float)
 
 
 def _all_positive_rows():
