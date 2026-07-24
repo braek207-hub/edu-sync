@@ -26,6 +26,9 @@ ORIGIN = "https://media.metrika.yandex.ru/"
 PROMOTER_ID = 17618          # рекламодатель Lime
 ADVERTISER_NAME = "Lime"
 PURCHASE_GOAL = os.environ.get("LIME_MM_PURCHASE_GOAL", "3023504302")  # цель «Покупка» (клад METRIKA_GOALS)
+# Доп. пост-вью цели воронки (клад METRIKA_GOALS): корзина и начало оформления.
+CART_GOAL = os.environ.get("LIME_MM_CART_GOAL", "194380276")
+CHECKOUT_GOAL = os.environ.get("LIME_MM_CHECKOUT_GOAL", "340817822")
 
 
 def _media_type(name: str) -> str:
@@ -45,7 +48,7 @@ def fetch_campaigns(page) -> list:
     return [c for c in camps if str(c.get("advertiserName", "")).strip() == ADVERTISER_NAME]
 
 
-def fetch_daily(page, campaign_id, date1: str, date2: str) -> list:
+def fetch_daily(page, campaign_id, date1: str, date2: str, goal_id: str = PURCHASE_GOAL) -> list:
     # Литеральный <goal_id> — сервер подставляет из параметра goal_id (иначе HTTP 400).
     metrics = ("am:e:renders,am:e:clicks,am:e:ctr,am:e:users,am:e:renderFrequency,"
                "am:e:goal<goal_id>Reaches,am:e:goal<goal_id>Conversion")
@@ -53,11 +56,27 @@ def fetch_daily(page, campaign_id, date1: str, date2: str) -> list:
         "/api/v1/report/table-data?limit=400&offset=1"
         f"&ids={campaign_id}&metrics={metrics}"
         "&dimensions=am:e:datePeriod<group>&group=day"
-        f"&date1={date1}&date2={date2}&goal_id={PURCHASE_GOAL}"
+        f"&date1={date1}&date2={date2}&goal_id={goal_id}"
         "&filters=&sort=am:e:datePeriodday"
     )
     data = page_fetch_json(page, path)
     return data.get("result", {}).get("data", [])
+
+
+def fetch_goal_reaches_by_day(page, campaign_id, date1: str, date2: str, goal_id: str) -> dict:
+    """Пост-вью конверсии по ОДНОЙ доп. цели → {дата: reaches}. Защищённо: сбой корзины/
+    оформления НЕ должен ронять основную «Покупку» — при ошибке возвращаем пусто."""
+    out: dict[str, int] = {}
+    try:
+        for r in fetch_daily(page, campaign_id, date1, date2, goal_id):
+            dims = r.get("dimensions", [{}])
+            d = (dims[0].get("name") or dims[0].get("id") or "")[:10] if dims else ""
+            if len(d) == 10:
+                m = r.get("metrics", [])
+                out[d] = int(_num(m[5])) if len(m) > 5 else 0
+    except Exception as e:
+        print(f"[mm] доп. цель {goal_id} у {campaign_id}: {e}")
+    return out
 
 
 def _num(v):
@@ -82,6 +101,10 @@ def build_rows(campaigns: list, page, date1: str, date2: str) -> list:
         except Exception as e:
             print(f"[mm] кампания {cid} '{name}': {e}")
             continue
+        # Доп. цели воронки (корзина/оформление) — отдельными запросами (API берёт одну цель
+        # за раз). Защищённо: их сбой не роняет «Покупку» (fetch_goal_reaches_by_day → {}).
+        cart_by_day = fetch_goal_reaches_by_day(page, cid, date1, date2, CART_GOAL)
+        checkout_by_day = fetch_goal_reaches_by_day(page, cid, date1, date2, CHECKOUT_GOAL)
         mtype = _media_type(name)
         for r in daily:
             dims = r.get("dimensions", [{}])
@@ -100,7 +123,11 @@ def build_rows(campaigns: list, page, date1: str, date2: str) -> list:
                 "impressions": renders, "reach": users, "clicks": clicks,
                 "cost": 0.0, "currency": "RUB",
                 "video_completes": 0, "vtr": None, "cpv": None,
-                "conversions": json.dumps({"pv_purchase": reaches}, ensure_ascii=False),
+                "conversions": json.dumps({
+                    "pv_purchase": reaches,
+                    "pv_cart": cart_by_day.get(d, 0),
+                    "pv_checkout": checkout_by_day.get(d, 0),
+                }, ensure_ascii=False),
             })
     return rows
 

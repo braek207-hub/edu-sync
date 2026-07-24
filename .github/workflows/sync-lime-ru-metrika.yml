@@ -1,0 +1,59 @@
+# RU-срез Яндекс.Метрики (счётчик 23504302) → витрина lime_metrika_campaign_ru.
+# Поведение + post-click воронка Метрики по каналу/кампании; дашборд обогащает ими строки
+# витрины PROCONTEXT. Отдельно от KZ-среза (тот пишет region='kz_metrika' в lime_stats).
+#
+# Ежедневно скользящим окном; бэкфилл истории — через workflow_dispatch с датами.
+# Синк идемпотентен (delete+insert по дню), повтор безопасен. Токен/счётчик — общие с KZ.
+name: Sync LIME RU Metrika
+
+on:
+  schedule:
+    - cron: "20 7 * * *"   # 10:20 МСК ежедневно
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "Бэкфилл с даты (YYYY-MM-DD); пусто = скользящее окно 30 дней"
+        required: false
+        type: string
+      date_to:
+        description: "Бэкфилл по дату (YYYY-MM-DD), включительно"
+        required: false
+        type: string
+
+concurrency:
+  group: lime-ru-metrika
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Apply DB migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/apply_lime_migrations.py
+
+      - name: Sync RU Metrika
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIME_METRIKA_TOKEN: ${{ secrets.LIME_METRIKA_TOKEN }}
+          LIME_RU_METRIKA_FROM: ${{ github.event.inputs.date_from }}
+          LIME_RU_METRIKA_TO: ${{ github.event.inputs.date_to }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_ru_metrika
+
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
