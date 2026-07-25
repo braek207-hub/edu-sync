@@ -92,8 +92,12 @@ _REVENUE_METRIC_CANDIDATES = [
     "am:e:ecommerceRevenue",
     "am:e:revenue",
 ]
-# Метрика дохода, подтверждённая discovery-прогоном (заполнить после probe).
-REVENUE_METRIC = os.environ.get("LIME_MM_REVENUE_METRIC", "am:e:goal<goal_id>ReachesRevenue")
+# Метрика дохода. Разведка 2026-07-25 (MM_REVENUE_PROBE=1): внутренний API кабинета БЕЗ
+# «Про» отвергает ВСЕ варианты дохода (am:e:postViewRevenue/goal<id>*Revenue/Price → 400
+# код 4002), metadata-каталог не отдаётся (404), UI не шлёт report/table-data. Значит
+# post-view ДОХОД — гейт «Метрика Про». Пусто = запрос не шлём (нет ежедневных 400).
+# Если появится «Про»/найдётся имя — задать LIME_MM_REVENUE_METRIC и доход поедет сам.
+REVENUE_METRIC = os.environ.get("LIME_MM_REVENUE_METRIC", "")
 
 
 def _try_revenue_metric(page, campaign_id, date1, date2, metric):
@@ -216,7 +220,9 @@ def probe_revenue_metric(page, campaign_id, date1, date2) -> str:
 
 def fetch_postview_revenue_by_day(page, campaign_id, date1: str, date2: str) -> dict:
     """Пост-вью ДОХОД (сумма покупок после показа без клика) → {дата: revenue}.
-    Отдельным запросом и защищённо: сбой метрики дохода не роняет конверсии."""
+    REVENUE_METRIC пуст (доход гейтится «Про», см. выше) → запрос не шлём. Защищённо."""
+    if not REVENUE_METRIC:
+        return {}
     res = _try_revenue_metric(page, campaign_id, date1, date2, REVENUE_METRIC)
     return res or {}
 
