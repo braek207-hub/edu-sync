@@ -119,6 +119,80 @@ def _try_revenue_metric(page, campaign_id, date1, date2, metric):
     return out
 
 
+def discover_available_metrics(page) -> None:
+    """Разведка: спросить у внутреннего API каталог доступных метрик и напечатать все,
+    что похожи на доход/цену/выручку (revenue/price/cost/sum). Пробуем известные пути
+    metadata Метрики/AdMetrica — какой отдаст 200, из того вытащим реальные am:e:-имена."""
+    import json as _json
+    endpoints = [
+        "/api/v1/report/available-parameters",
+        "/api/v1/report/parameters",
+        "/api/v1/report/available-metrics",
+        "/api/v1/report/metrics",
+        "/api/v1/metrics",
+        "/api/v1/constructor/available-metrics",
+        "/api/v1/constructor/metadata",
+    ]
+    for ep in endpoints:
+        try:
+            res = page.evaluate(FETCH_JS, ep)
+        except Exception as e:
+            print(f"[mm][meta] {ep}: evaluate err {e}")
+            continue
+        st = res.get("status")
+        body = res.get("body", "")
+        print(f"[mm][meta] {ep}: status={st} len={len(body)}")
+        if st != 200 or not body:
+            continue
+        # Вытащить все am:e:-токены + любые с revenue/price/выручк/доход
+        import re as _re
+        toks = sorted(set(_re.findall(r'am:e:[A-Za-z0-9<>_]+', body)))
+        moneyish = [t for t in toks if _re.search(r'(?i)revenue|price|cost|profit|sum', t)]
+        print(f"[mm][meta] {ep}: всего метрик {len(toks)}; денежные: {moneyish}")
+        # если каталог найден — печатаем и выходим (достаточно одного рабочего)
+        if toks:
+            print(f"[mm][meta] пример каталога (первые 40): {toks[:40]}")
+            return
+    print("[mm][meta] ни один metadata-эндпоинт не отдал каталог")
+
+
+def capture_ui_report_metrics(page) -> None:
+    """Разведка XHR: поймать запрос report/table-data, который шлёт сам UI кабинета при
+    отрисовке отчёта кампании (там метрики видимых колонок, включая доход, если он виден
+    без «Про»). Переходим на страницу статистики и логируем metrics= пойманных запросов."""
+    captured: list[str] = []
+
+    def _on_response(resp):
+        try:
+            url = resp.url
+            if "report/table-data" in url and "metrics=" in url:
+                import urllib.parse as _u
+                q = _u.parse_qs(_u.urlparse(url).query)
+                m = q.get("metrics", [""])[0]
+                if m and m not in captured:
+                    captured.append(m)
+        except Exception:
+            pass
+
+    page.on("response", _on_response)
+    # SPA-маршрут кабинета рекламодателя Lime — статистика кампаний.
+    for route in (
+        f"https://media.metrika.yandex.ru/statistics?advertiser_id={PROMOTER_ID}",
+        f"https://media.metrika.yandex.ru/?advertiser_id={PROMOTER_ID}",
+        "https://media.metrika.yandex.ru/statistics",
+    ):
+        try:
+            print(f"[mm][ui] переход {route}")
+            page.goto(route, wait_until="networkidle", timeout=45000)
+            page.wait_for_timeout(4000)
+        except Exception as e:
+            print(f"[mm][ui] {route}: {e}")
+    for m in captured:
+        print(f"[mm][ui] пойман metrics= {m}")
+    if not captured:
+        print("[mm][ui] запросов report/table-data от UI не поймано")
+
+
 def probe_revenue_metric(page, campaign_id, date1, date2) -> str:
     """Discovery: перебрать кандидатов, вернуть первую метрику, что даёт ненулевую сумму."""
     for metric in _REVENUE_METRIC_CANDIDATES:
@@ -205,6 +279,11 @@ def main() -> None:
     # DISCOVERY-режим: найти рабочий нейминг метрики дохода (одноразово), без записи.
     if os.environ.get("MM_REVENUE_PROBE") == "1":
         with yandex_page(ORIGIN) as page:
+            # 1) каталог метрик внутреннего API (если отдаёт metadata)
+            discover_available_metrics(page)
+            # 2) XHR самого UI при отрисовке отчёта (метрики видимых колонок)
+            capture_ui_report_metrics(page)
+            # 3) перебор кандидатов на реальных кампаниях
             campaigns = fetch_campaigns(page)
             for c in campaigns[:8]:
                 cid = c.get("campaignId")
