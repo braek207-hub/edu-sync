@@ -20,7 +20,7 @@ import json
 import traceback
 from datetime import date, timedelta
 
-from sync.lime_media_session import yandex_page, page_fetch_json
+from sync.lime_media_session import yandex_page, page_fetch_json, FETCH_JS
 
 ORIGIN = "https://media.metrika.yandex.ru/"
 PROMOTER_ID = 17618          # рекламодатель Lime
@@ -124,15 +124,29 @@ def discover_available_metrics(page) -> None:
     что похожи на доход/цену/выручку (revenue/price/cost/sum). Пробуем известные пути
     metadata Метрики/AdMetrica — какой отдаст 200, из того вытащим реальные am:e:-имена."""
     import json as _json
+    import re as _re
     endpoints = [
         "/api/v1/report/available-parameters",
         "/api/v1/report/parameters",
         "/api/v1/report/available-metrics",
         "/api/v1/report/metrics",
+        "/api/v1/report/metadata",
         "/api/v1/metrics",
+        "/api/v1/metadata",
         "/api/v1/constructor/available-metrics",
         "/api/v1/constructor/metadata",
+        f"/api/v1/campaign/{{cid}}",  # заполним первым id ниже
     ]
+    # добавим per-campaign путь с реальным id
+    try:
+        camps = fetch_campaigns(page)
+        if camps:
+            cid = camps[0].get("campaignId")
+            endpoints = [e.replace("{cid}", str(cid)) for e in endpoints]
+            endpoints.append(f"/api/v1/campaign/{cid}/goals")
+            endpoints.append(f"/api/v1/campaign/{cid}/available-metrics")
+    except Exception as e:
+        print(f"[mm][meta] fetch_campaigns для per-camp путей: {e}")
     for ep in endpoints:
         try:
             res = page.evaluate(FETCH_JS, ep)
@@ -141,19 +155,12 @@ def discover_available_metrics(page) -> None:
             continue
         st = res.get("status")
         body = res.get("body", "")
-        print(f"[mm][meta] {ep}: status={st} len={len(body)}")
-        if st != 200 or not body:
-            continue
-        # Вытащить все am:e:-токены + любые с revenue/price/выручк/доход
-        import re as _re
         toks = sorted(set(_re.findall(r'am:e:[A-Za-z0-9<>_]+', body)))
-        moneyish = [t for t in toks if _re.search(r'(?i)revenue|price|cost|profit|sum', t)]
-        print(f"[mm][meta] {ep}: всего метрик {len(toks)}; денежные: {moneyish}")
-        # если каталог найден — печатаем и выходим (достаточно одного рабочего)
-        if toks:
-            print(f"[mm][meta] пример каталога (первые 40): {toks[:40]}")
-            return
-    print("[mm][meta] ни один metadata-эндпоинт не отдал каталог")
+        moneyish = [t for t in toks if _re.search(r'(?i)revenue|price|cost|profit|sum|amount', t)]
+        print(f"[mm][meta] {ep}: status={st} len={len(body)} метрик={len(toks)} денежные={moneyish}")
+        if st == 200 and body and (toks or "revenue" in body.lower() or "amount" in body.lower()):
+            print(f"[mm][meta] {ep}: HEAD {body[:600]}")
+    print("[mm][meta] разведка каталога завершена")
 
 
 def capture_ui_report_metrics(page) -> None:
