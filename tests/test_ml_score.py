@@ -1,6 +1,8 @@
 from datetime import date
 
-from sync.ml_score import to_deciles, is_pending
+import numpy as np
+
+from sync.ml_score import to_deciles, is_pending, expected_amounts
 
 
 def test_deciles_top_is_one():
@@ -16,3 +18,27 @@ def test_is_pending():
     assert is_pending(young_unpaid, today=date(2026, 7, 23)) is True
     assert is_pending(old_unpaid, today=date(2026, 7, 23)) is False   # созрел, не оплатил
     assert is_pending(paid, today=date(2026, 7, 23)) is False
+
+
+class _FakeVec:
+    def transform(self, X):
+        return np.array([[row["a"]] for row in X])
+
+
+class _FakeTweedieModel:
+    def predict(self, Xt):
+        return Xt[:, 0] * 100.0   # E(amount) линейно от фичи "a"
+
+
+def test_expected_amounts_uses_tweedie_over_full_matrix():
+    tw = {"model": _FakeTweedieModel(), "vec": _FakeVec()}
+    X = [{"a": 1.0}, {"a": 2.0}, {"a": 3.0}]
+    out = expected_amounts(tw, X)
+    assert list(out) == [100.0, 200.0, 300.0]   # каждый лид точки, не только pending
+
+
+def test_expected_amounts_zero_when_no_tweedie_model():
+    X = [{"a": 1.0}, {"a": 2.0}]
+    out = expected_amounts({"model": None, "vec": None}, X)
+    assert list(out) == [0.0, 0.0]
+    assert expected_amounts(None, X).tolist() == [0.0, 0.0]

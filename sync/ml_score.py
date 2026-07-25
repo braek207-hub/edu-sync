@@ -43,6 +43,15 @@ def is_pending(row, today: Optional[date] = None, maturity_days: int = MATURITY_
     return age < maturity_days
 
 
+def expected_amounts(tw: Optional[dict], X: list) -> np.ndarray:
+    """E(amount) из Tweedie по всей матрице X точки (Ф1c: на каждый скорящийся лид,
+    не только pending). Нули, если модель tweedie не задана (старый/пустой артефакт)."""
+    tw_model = tw.get("model") if tw else None
+    if tw_model is None:
+        return np.zeros(len(X), dtype=float)
+    return np.asarray(tw_model.predict(tw["vec"].transform(X)), dtype=float)
+
+
 def _maturation_remaining(today: date) -> dict[int, float]:
     """age_days → (1 − matured_fraction): доля ещё-не-наступивших оплат."""
     with db.get_connection() as conn:
@@ -73,6 +82,7 @@ def _score_point(point: str, rows: list) -> Optional[dict[str, Any]]:
     # дециль — от сырой логистики (полное разрешение ранжирования); изотоника схлопывает
     # плато (много разных p_raw → одно p_cal) → дециль по p_cal перетасовывает ранжирование.
     deciles = to_deciles(p_raw)
+    exp_amt_all = expected_amounts(tw, X)   # Ф1c: E(чек) на ВСЕХ скорящихся лидах точки
 
     score_rows = []
     for i, r in enumerate(pop):
@@ -82,9 +92,11 @@ def _score_point(point: str, rows: list) -> Optional[dict[str, Any]]:
             "lead_id": r["lead_id"], "scoring_point": point,
             "p_connect": None, "p_deal": None, "p_pay": float(p_cal[i]),
             "decile": deciles[i], "top_shap": top, "model_version": version,
+            "exp_amount": float(exp_amt_all[i]),
         })
     n = db.upsert_lead_scores(score_rows)
-    return {"version": version, "pop": pop, "X": X, "p_final": p_cal, "tw": tw, "n": n}
+    return {"version": version, "pop": pop, "X": X, "p_final": p_cal, "tw": tw,
+            "exp_amt_all": exp_amt_all, "n": n}
 
 
 def run_scoring(today: Optional[date] = None) -> dict[str, Any]:
@@ -107,16 +119,16 @@ def run_scoring(today: Optional[date] = None) -> dict[str, Any]:
     if atc is None:
         print("нет модели at_creation — прогноз пропущен")
     else:
-        version, pop, X, p_final = atc["version"], atc["pop"], atc["X"], atc["p_final"]
+        version, pop, p_final = atc["version"], atc["pop"], atc["p_final"]
         remaining = _maturation_remaining(today)
-        tw_model, tw_vec = atc["tw"]["model"], atc["tw"]["vec"]
+        exp_amt_all = atc["exp_amt_all"]   # Ф1c: переиспользуем уже посчитанный E(чек), не пересчитывать
         fc_items = []
         for i, r in enumerate(pop):
             if not is_pending(r, today):
                 continue
             age = (today - r["created_date"]).days
             rem = remaining.get(age, remaining.get(min(remaining, key=lambda k: abs(k - age)), 0.0)) if remaining else 0.0
-            exp_amt = float(tw_model.predict(tw_vec.transform([X[i]]))[0]) if tw_model else 0.0
+            exp_amt = float(exp_amt_all[i])
             exp_rev = expected_revenue(p_final[i], exp_amt, rem)
             fc_items.append({"segment": r["direction"] or "__na__", "exp_rev": exp_rev, "p_pay": float(p_final[i])})
 

@@ -862,6 +862,7 @@ def ensure_ml_scoring_tables() -> None:
           lead_id TEXT NOT NULL, scoring_point TEXT NOT NULL,
           p_connect DOUBLE PRECISION, p_deal DOUBLE PRECISION, p_pay DOUBLE PRECISION,
           decile INTEGER, top_shap JSONB NOT NULL DEFAULT '[]'::jsonb,
+          exp_amount NUMERIC,
           model_version TEXT, scored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (lead_id, scoring_point)
         )
@@ -880,6 +881,8 @@ def ensure_ml_scoring_tables() -> None:
     # Добавляем scoring_point и меняем PK (version) → (version, scoring_point).
     migrations = [
         "ALTER TABLE edu_ml_runs ADD COLUMN IF NOT EXISTS scoring_point TEXT NOT NULL DEFAULT 'at_creation'",
+        # Ф1c: per-lead ожидаемый чек (E(amount) из Tweedie) для прогноза выручки/ROMI по кампании.
+        "ALTER TABLE edu_lead_scores ADD COLUMN IF NOT EXISTS exp_amount NUMERIC",
         """
         DO $$
         BEGIN
@@ -984,20 +987,21 @@ def upsert_lead_scores(rows: List[Dict[str, Any]]) -> int:
     values = [
         (r["lead_id"], r["scoring_point"], r.get("p_connect"), r.get("p_deal"),
          r.get("p_pay"), r.get("decile"), _json.dumps(r.get("top_shap", []), ensure_ascii=False),
-         r.get("model_version"))
+         r.get("exp_amount"), r.get("model_version"))
         for r in rows
     ]
     sql = """
         INSERT INTO edu_lead_scores
           (lead_id, scoring_point, p_connect, p_deal, p_pay, decile, top_shap,
-           model_version, scored_at)
+           exp_amount, model_version, scored_at)
         VALUES %s
         ON CONFLICT (lead_id, scoring_point) DO UPDATE SET
           p_connect=EXCLUDED.p_connect, p_deal=EXCLUDED.p_deal, p_pay=EXCLUDED.p_pay,
           decile=EXCLUDED.decile, top_shap=EXCLUDED.top_shap,
+          exp_amount=EXCLUDED.exp_amount,
           model_version=EXCLUDED.model_version, scored_at=now()
     """
-    template = "(%s,%s,%s,%s,%s,%s,%s::jsonb,%s,now())"
+    template = "(%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,now())"
     with get_connection() as conn:
         cur = conn.cursor()
         psycopg2.extras.execute_values(cur, sql, values, template=template)
