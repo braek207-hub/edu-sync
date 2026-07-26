@@ -15,6 +15,10 @@ on:
         description: "Discovery дохода Медиаметрики (1 = probe без записи)"
         required: false
         default: "0"
+      mm_video_probe:
+        description: "Discovery досмотров видео Медиаметрики (1 = probe без записи)"
+        required: false
+        default: "0"
 
 concurrency:
   group: lime-media-sync
@@ -58,6 +62,7 @@ jobs:
           YANDEX_STORAGE_STATE: ${{ secrets.YANDEX_STORAGE_STATE }}
           LIME_MM_DAYS_BACK: ${{ github.event.inputs.days_back || '14' }}
           MM_REVENUE_PROBE: ${{ github.event.inputs.mm_probe || '0' }}
+          MM_VIDEO_PROBE: ${{ github.event.inputs.mm_video_probe || '0' }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_mediametrica
 

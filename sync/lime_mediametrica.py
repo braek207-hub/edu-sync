@@ -227,6 +227,47 @@ def fetch_postview_revenue_by_day(page, campaign_id, date1: str, date2: str) -> 
     return res or {}
 
 
+# Кандидаты метрики ДОСМОТРОВ видео (VTR/CPV в дашборде считаются от video_completes).
+# У Urban поле watchedVideo100; во внутреннем API AdMetrica нейминг иной — перебираем.
+_VIDEO_METRIC_CANDIDATES = [
+    "am:e:watchedVideo100",
+    "am:e:sumWatchedVideo100",
+    "am:e:videoComplete",
+    "am:e:videoCompletions",
+    "am:e:completedVideo",
+    "am:e:videoView100",
+    "am:e:sumVideoComplete",
+    "am:e:renderViewabilityRate",
+    "am:e:vtr",
+    "am:e:videoStarts",
+    "am:e:videoViews",
+]
+# Метрика досмотров, подтверждённая probe (задать после MM_VIDEO_PROBE=1). Пусто → не шлём.
+VIDEO_METRIC = os.environ.get("LIME_MM_VIDEO_METRIC", "")
+
+
+def probe_video_metric(page, campaign_id, date1, date2) -> str:
+    """Discovery досмотров видео: первый кандидат с ненулевой суммой на видео-кампании."""
+    for metric in _VIDEO_METRIC_CANDIDATES:
+        res = _try_revenue_metric(page, campaign_id, date1, date2, metric)  # тот же GET-механизм
+        total = sum(res.values()) if res else 0.0
+        status = "400" if res is None else f"sum={total:.0f}"
+        print(f"[mm][vprobe] {metric}: {status}")
+        if res and total > 0:
+            print(f"[mm][vprobe] ПОБЕДИТЕЛЬ: {metric} (пример {list(res.items())[:2]})")
+            return metric
+    print("[mm][vprobe] ни один кандидат не дал досмотры")
+    return ""
+
+
+def fetch_video_completes_by_day(page, campaign_id, date1: str, date2: str) -> dict:
+    """Досмотры видео по дням. VIDEO_METRIC пуст → запрос не шлём. Защищённо."""
+    if not VIDEO_METRIC:
+        return {}
+    res = _try_revenue_metric(page, campaign_id, date1, date2, VIDEO_METRIC)
+    return res or {}
+
+
 def _num(v):
     try:
         return float(v)
@@ -255,6 +296,8 @@ def build_rows(campaigns: list, page, date1: str, date2: str) -> list:
         checkout_by_day = fetch_goal_reaches_by_day(page, cid, date1, date2, CHECKOUT_GOAL)
         revenue_by_day = fetch_postview_revenue_by_day(page, cid, date1, date2)
         mtype = _media_type(name)
+        # Досмотры видео — только для видео-кампаний (VTR/CPV в дашборде). VIDEO_METRIC пуст → {}.
+        video_by_day = fetch_video_completes_by_day(page, cid, date1, date2) if mtype == "Видео" else {}
         for r in daily:
             dims = r.get("dimensions", [{}])
             d = (dims[0].get("name") or dims[0].get("id") or "")[:10] if dims else ""
@@ -271,7 +314,7 @@ def build_rows(campaigns: list, page, date1: str, date2: str) -> list:
                 "campaign_id": str(cid),
                 "impressions": renders, "reach": users, "clicks": clicks,
                 "cost": 0.0, "currency": "RUB",
-                "video_completes": 0, "vtr": None, "cpv": None,
+                "video_completes": int(_num(video_by_day.get(d, 0))), "vtr": None, "cpv": None,
                 "conversions": json.dumps({
                     "pv_purchase": reaches,
                     "pv_cart": cart_by_day.get(d, 0),
@@ -306,6 +349,22 @@ def main() -> None:
                     print(f"[mm][probe] ИТОГ: рабочая метрика дохода = {winner}")
                     return
         print("[mm][probe] рабочей метрики среди кандидатов нет")
+        return
+
+    # DISCOVERY-режим: нейминг метрики ДОСМОТРОВ видео (на видео-кампаниях), без записи.
+    if os.environ.get("MM_VIDEO_PROBE") == "1":
+        with yandex_page(ORIGIN) as page:
+            campaigns = fetch_campaigns(page)
+            vids = [c for c in campaigns if _media_type(str(c.get("name", ""))) == "Видео"]
+            print(f"[mm][vprobe] видео-кампаний: {len(vids)}")
+            for c in vids[:6]:
+                cid = c.get("campaignId")
+                print(f"[mm][vprobe] кампания {cid} '{c.get('name')}'")
+                winner = probe_video_metric(page, cid, d1, d2)
+                if winner:
+                    print(f"[mm][vprobe] ИТОГ: рабочая метрика досмотров = {winner}")
+                    return
+        print("[mm][vprobe] рабочей метрики досмотров среди кандидатов нет")
         return
 
     with yandex_page(ORIGIN) as page:
