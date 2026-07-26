@@ -484,6 +484,55 @@ def _fetch_report_chunk(
     return rows
 
 
+def _fetch_video_report(date_from: str, date_to: str) -> Dict[tuple, Dict[str, int]]:
+    """Видео-досмотры медийных кампаний → {(date, campaign_id): {video_complete, video_views}}.
+
+    Видео-поля (VideoComplete=досмотры 100%, VideoViews=просмотры) допустимы ТОЛЬКО в отчёте
+    REACH_AND_FREQUENCY_PERFORMANCE_REPORT (CUSTOM_REPORT/CAMPAIGN их отвергают, код 4000) —
+    поэтому отдельным запросом, мержим по (date, campaign_id) в основные строки. Защищённо:
+    сбой (нет медийных кампаний / поле недоступно) → пустая карта, основной синк не страдает."""
+    params = {
+        "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
+        "FieldNames": ["Date", "CampaignId", "VideoComplete", "VideoViews"],
+        "ReportName": f"lime_direct_video_{date_from}_{date_to}",
+        "ReportType": "REACH_AND_FREQUENCY_PERFORMANCE_REPORT",
+        "DateRangeType": "CUSTOM_DATE",
+        "Format": "TSV",
+        "IncludeVAT": "YES",
+        "IncludeDiscount": "NO",
+    }
+    payload = json.dumps({"params": params}).encode("utf-8")
+    out: Dict[tuple, Dict[str, int]] = {}
+    try:
+        r = None
+        for _ in range(8):
+            r = requests.post(REPORTS_URL, data=payload, headers=_report_headers())
+            r.encoding = "utf-8"
+            if r.status_code == 200:
+                break
+            if r.status_code in (201, 202):
+                time.sleep(int(r.headers.get("retryIn", "10")))
+                continue
+            print(f"[lime_direct] видео-отчёт {r.status_code}: {r.text[:200]}")
+            return out
+        else:
+            print("[lime_direct] видео-отчёт: превышено число попыток")
+            return out
+        reader = csv.DictReader(io.StringIO(r.text), delimiter="\t")
+        for row in reader:
+            cid = str(row.get("CampaignId", "")).strip()
+            d = str(row.get("Date", "")).strip()
+            if not cid or cid == "--" or not d:
+                continue
+            vc = _int(row.get("VideoComplete"))
+            vv = _int(row.get("VideoViews"))
+            if vc or vv:
+                out[(d, cid)] = {"video_complete": vc, "video_views": vv}
+    except Exception as e:
+        print(f"[lime_direct] видео-отчёт: {e}")
+    return out
+
+
 def _chunked(seq: List[str], n: int):
     for i in range(0, len(seq), n):
         yield seq[i:i + n]
@@ -1907,6 +1956,7 @@ _UPSERT_SQL = """
        bounce_rate, avg_pageviews,
        weekly_budget, daily_budget, target_cpa,
        conversions,
+       video_complete, video_views,
        state, status, campaign_type, updated_at)
     VALUES
       (%(date)s, %(campaign_id)s, %(campaign_name)s, %(client_login)s,
@@ -1916,6 +1966,7 @@ _UPSERT_SQL = """
        %(bounce_rate)s, %(avg_pageviews)s,
        %(weekly_budget)s, %(daily_budget)s, %(target_cpa)s,
        %(conversions)s::jsonb,
+       %(video_complete)s, %(video_views)s,
        %(state)s, %(status)s, %(campaign_type)s, NOW())
     ON CONFLICT (date, campaign_id) DO UPDATE SET
        campaign_name = EXCLUDED.campaign_name,
@@ -1933,6 +1984,8 @@ _UPSERT_SQL = """
        daily_budget = EXCLUDED.daily_budget,
        target_cpa = EXCLUDED.target_cpa,
        conversions = EXCLUDED.conversions,
+       video_complete = EXCLUDED.video_complete,
+       video_views = EXCLUDED.video_views,
        state = EXCLUDED.state,
        status = EXCLUDED.status,
        campaign_type = EXCLUDED.campaign_type,
@@ -2001,6 +2054,12 @@ def sync_lime_direct(days_back: int = 7) -> int:
     if not report_rows:
         return 0
 
+    # Видео-досмотры медийных кампаний (отдельный R&F-отчёт; см. _fetch_video_report).
+    video_map = _fetch_video_report(date_from, date_to)
+    if video_map:
+        vc_total = sum(v["video_complete"] for v in video_map.values())
+        print(f"[lime_direct] видео-досмотры: {len(video_map)} строк, VideoComplete={vc_total}")
+
     campaign_ids = sorted({r["campaign_id"] for r in report_rows})
     campaign_names = {r["campaign_id"]: r["campaign_name"] for r in report_rows}
     campaigns = _fetch_campaigns(campaign_ids)
@@ -2019,6 +2078,7 @@ def sync_lime_direct(days_back: int = 7) -> int:
     merged: List[Dict[str, Any]] = []
     for r in report_rows:
         c = campaigns.get(r["campaign_id"], {})
+        vid = video_map.get((r["date"], r["campaign_id"]), {})
         merged.append({
             **r,
             "client_login": client_login,
@@ -2028,6 +2088,8 @@ def sync_lime_direct(days_back: int = 7) -> int:
             "state": c.get("state"),
             "status": c.get("status"),
             "campaign_type": c.get("campaign_type"),
+            "video_complete": vid.get("video_complete", 0),
+            "video_views": vid.get("video_views", 0),
             "conversions": json.dumps(r.get("conversions") or {}, ensure_ascii=False),
         })
 
