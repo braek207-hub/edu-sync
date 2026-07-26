@@ -37,19 +37,27 @@ VIDEO_FIELDS = [
 ]
 
 
-def probe(date_from: str, date_to: str) -> None:
+REPORT_TYPES = [
+    "CAMPAIGN_PERFORMANCE_REPORT",
+    "REACH_AND_FREQUENCY_PERFORMANCE_REPORT",
+    "CUSTOM_REPORT",
+]
+
+
+def _try(report_type: str, date_from: str, date_to: str) -> None:
     params = {
         "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
         "FieldNames": VIDEO_FIELDS,
-        "ReportName": f"lime_video_probe_{date_from}_{date_to}",
-        "ReportType": "CUSTOM_REPORT",
+        "ReportName": f"lime_vprobe_{report_type}_{date_from}",
+        "ReportType": report_type,
         "DateRangeType": "CUSTOM_DATE",
         "Format": "TSV",
         "IncludeVAT": "YES",
         "IncludeDiscount": "NO",
     }
     payload = json.dumps({"params": params}).encode("utf-8")
-    print(f"[vprobe] поля: {VIDEO_FIELDS}")
+    print(f"[vprobe] === {report_type} ===")
+    r = None
     for _ in range(10):
         r = requests.post(REPORTS_URL, data=payload, headers=_report_headers())
         r.encoding = "utf-8"
@@ -57,32 +65,39 @@ def probe(date_from: str, date_to: str) -> None:
             break
         if r.status_code in (201, 202):
             wait = int(r.headers.get("retryIn", "10"))
-            print(f"[vprobe] формируется, ждём {wait}с...")
+            print(f"[vprobe] {report_type}: формируется, ждём {wait}с...")
             time.sleep(wait)
             continue
-        print(f"[vprobe] Reports API {r.status_code}: {r.text[:500]}")
+        print(f"[vprobe] {report_type}: HTTP {r.status_code}: {r.text[:400]}")
         return
     else:
-        print("[vprobe] превышено число попыток")
+        print(f"[vprobe] {report_type}: таймаут")
         return
-
     reader = csv.DictReader(io.StringIO(r.text), delimiter="\t")
-    print(f"[vprobe] колонки отчёта: {reader.fieldnames}")
-    total_vc = 0
-    shown = 0
+    print(f"[vprobe] {report_type}: колонки {reader.fieldnames}")
+    total_vc, shown = 0, 0
     for row in reader:
         vc = row.get("VideoComplete", "0")
-        vv = row.get("VideoViews", "0")
         try:
             vci = int(float(vc)) if vc not in ("--", "", None) else 0
         except ValueError:
             vci = 0
         total_vc += vci
-        if vci > 0 and shown < 25:
+        if vci > 0 and shown < 15:
             shown += 1
-            print(f"[vprobe] {row.get('Date')} {row.get('CampaignId')} '{row.get('CampaignName')}': "
-                  f"impr={row.get('Impressions')} views={vv} complete={vc} rate={row.get('VideoCompleteRate')} cpv={row.get('CPV')}")
-    print(f"[vprobe] ИТОГО VideoComplete по отчёту: {total_vc}")
+            print(f"[vprobe]   {row.get('Date')} {row.get('CampaignId')} '{row.get('CampaignName')}': "
+                  f"impr={row.get('Impressions')} views={row.get('VideoViews')} complete={vc} "
+                  f"rate={row.get('VideoCompleteRate')} cpv={row.get('CPV')}")
+    print(f"[vprobe] {report_type}: ИТОГО VideoComplete = {total_vc}")
+
+
+def probe(date_from: str, date_to: str) -> None:
+    print(f"[vprobe] окно {date_from}..{date_to}, поля: {VIDEO_FIELDS}")
+    for rt in REPORT_TYPES:
+        try:
+            _try(rt, date_from, date_to)
+        except Exception as e:
+            print(f"[vprobe] {rt}: исключение {e}")
 
 
 if __name__ == "__main__":
