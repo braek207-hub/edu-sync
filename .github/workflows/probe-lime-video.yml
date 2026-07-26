@@ -1,0 +1,34 @@
+name: Probe LIME Direct video fields
+
+# РАЗОВЫЙ probe: отдаёт ли Reports API Директа досмотры видео (VideoComplete) для LIME.
+on:
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "DateFrom YYYY-MM-DD"
+        required: false
+        default: "2026-04-16"
+      date_to:
+        description: "DateTo YYYY-MM-DD"
+        required: false
+        default: "2026-05-10"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install requests
+      - name: Probe video fields
+        env:
+          LIME_DIRECT_TOKEN: ${{ secrets.LIME_DIRECT_TOKEN }}
+          LIME_DIRECT_CLIENT_LOGIN: ${{ secrets.LIME_DIRECT_CLIENT_LOGIN }}
+          VPROBE_FROM: ${{ github.event.inputs.date_from }}
+          VPROBE_TO: ${{ github.event.inputs.date_to }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.probe_lime_video
