@@ -15,7 +15,21 @@ import time
 
 import requests
 
-from sync.lime_direct import REPORTS_URL, _report_headers
+REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports"
+
+
+def _report_headers():
+    return {
+        "Authorization": f"Bearer {os.environ['LIME_DIRECT_TOKEN'].strip()}",
+        "Client-Login": os.environ["LIME_DIRECT_CLIENT_LOGIN"].strip(),
+        "Accept-Language": "ru",
+        "processingMode": "auto",
+        "returnMoneyInMicros": "false",
+        "skipReportHeader": "true",
+        "skipReportSummary": "true",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
 
 VIDEO_FIELDS = [
     "Date", "CampaignId", "CampaignName", "Impressions", "Clicks",
