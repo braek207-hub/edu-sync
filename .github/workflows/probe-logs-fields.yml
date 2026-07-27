@@ -1,0 +1,19 @@
+name: probe-logs-fields
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Probe Logs API fields (vuz)
+        env:
+          PYTHONUNBUFFERED: "1"
+          YM_TOKEN: ${{ secrets.YM_TOKEN }}
+        run: python -m sync.logs_api_fields_probe
