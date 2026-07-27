@@ -20,7 +20,8 @@ BASE = "https://api-metrika.yandex.net/management/v1/counter/{c}/logrequest"
 EVAL = "https://api-metrika.yandex.net/management/v1/counter/{c}/logrequests/evaluate"
 CREATE = "https://api-metrika.yandex.net/management/v1/counter/{c}/logrequests"
 # Минимум полей для пробы; ym:s:dateTime = точное время визита (ключевое отличие от Reporting).
-FIELDS = "ym:s:dateTime,ym:s:clientID,ym:s:visitDuration,ym:s:bounce,ym:s:pageViews,ym:s:isRobot"
+# isRobot для source=visits Logs API не существует (проба вернула 400) — уточнить бот-поле позже.
+FIELDS = "ym:s:dateTime,ym:s:clientID,ym:s:visitDuration,ym:s:bounce,ym:s:pageViews"
 
 
 def _h():
