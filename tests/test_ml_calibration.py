@@ -222,3 +222,37 @@ def test_score_point_falls_back_to_raw_when_calibrator_missing(monkeypatch):
     assert res is not None
     p_raw_expected = predict_logistic(clf, vec, [{"x": 5.0}])
     assert abs(captured["rows"][0]["p_pay"] - float(p_raw_expected[0])) < 1e-9
+
+
+def test_fit_calibrator_uses_heldout_when_enough_positives():
+    """Ф2: калибратор фитится на held-out (свежий test), НЕ на train, если позитивов ≥ порога.
+    Убирает сезонное занижение (train — старое окно с низкой конверсией)."""
+    from sklearn.isotonic import IsotonicRegression
+
+    from sync.ml_train import CAL_MIN_POS, fit_calibrator
+
+    p_tr = [i / 100 for i in range(100)]
+    y_tr = [1 if i % 10 == 0 else 0 for i in range(100)]          # 10 позитивов (train)
+    p_te = [i / 100 for i in range(100)]
+    y_te = [1 if i >= 50 else 0 for i in range(100)]              # 50 ≥ CAL_MIN_POS → held-out
+    assert sum(y_te) >= CAL_MIN_POS
+
+    cal = fit_calibrator(p_tr, y_tr, p_te, y_te)
+    ref_te = IsotonicRegression(out_of_bounds="clip").fit(p_te, y_te)
+    assert np.allclose(cal.predict(p_te), ref_te.predict(p_te))    # фит на TEST (held-out)
+
+
+def test_fit_calibrator_falls_back_to_train_on_few_positives():
+    """Мало позитивов в test → fallback на train-калибровку (стабильность важнее свежести)."""
+    from sklearn.isotonic import IsotonicRegression
+
+    from sync.ml_train import fit_calibrator
+
+    p_tr = [i / 100 for i in range(100)]
+    y_tr = [1 if i % 5 == 0 else 0 for i in range(100)]          # 20 позитивов (train)
+    p_te = [i / 100 for i in range(100)]
+    y_te = [1 if i == 0 else 0 for i in range(100)]              # 1 позитив < порога → fallback
+
+    cal = fit_calibrator(p_tr, y_tr, p_te, y_te)
+    ref_tr = IsotonicRegression(out_of_bounds="clip").fit(p_tr, y_tr)
+    assert np.allclose(cal.predict(p_tr), ref_tr.predict(p_tr))    # fallback на TRAIN

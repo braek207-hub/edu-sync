@@ -36,6 +36,24 @@ def decide_gate(ap_model: float, ap_pilot: float) -> bool:
     return ap_model > ap_pilot
 
 
+CAL_MIN_POS = 20
+
+
+def fit_calibrator(p_tr, y_tr, p_te, y_te, min_pos: int = CAL_MIN_POS):
+    """Изотоническая калибровка на HELD-OUT свежих созревших (test), НЕ на train (Ф2).
+
+    Калибровку положено фитить на held-out: fit на train переобучает её (запоминает train-скоры).
+    Плюс test-окно [today-180,today-90) СВЕЖЕЕ train (<today-180) → калибровка ближе к текущему
+    сезону (пик приёма) и убирает систематическое ЗАНИЖЕНИЕ прогноза (диагностика 27.07: на
+    созревшем мае прогноз ×0.53 факта, июне ×0.75). Гейт/AP считаются на СЫРЫХ p (изотоника
+    монотонна → ранжирование/AP не меняет). Мало позитивов в test → fallback на train
+    (стабильность калибровки важнее свежести)."""
+    from sklearn.isotonic import IsotonicRegression
+    if sum(y_te) >= min_pos:
+        return IsotonicRegression(out_of_bounds="clip").fit(p_te, y_te)
+    return IsotonicRegression(out_of_bounds="clip").fit(p_tr, y_tr)
+
+
 def time_split(rows, holdout_months=HOLDOUT_MONTHS, maturity_days=MATURITY_DAYS, today=None):
     """Только созревшие когорты (метка pay наблюдаема). test = held-out окно
     [today-(maturity+holdout), today-maturity): все is_matured, не в train.
@@ -55,7 +73,6 @@ def _train_one_point(rows, point: str, today: date) -> dict[str, Any]:
     """Прод-путь Ф2.1: single-stage логистика P(pay) на созревших train, оценка AP
     на созревшем holdout, гейт = AP модели > AP пилота. + Tweedie-прогноз чека."""
     from sklearn.feature_extraction import DictVectorizer
-    from sklearn.isotonic import IsotonicRegression
     from sklearn.linear_model import TweedieRegressor
     from sklearn.metrics import average_precision_score
 
@@ -82,9 +99,7 @@ def _train_one_point(rows, point: str, today: date) -> dict[str, Any]:
     Xtr, names, cat_names = build_stage_matrix([r["features"] for r in mtr], point)
     clf, vec = fit_logistic(Xtr, y)
 
-    # ── изотоническая калибровка поверх логистики (in-sample train, как каскад Ф1b) ──
     p_tr = predict_logistic(clf, vec, Xtr)
-    calibrator = IsotonicRegression(out_of_bounds="clip").fit(p_tr, y)
 
     # ── оценка на СОЗРЕВШЕМ holdout ──
     mte = [r for r in test if r["is_matured"]]
@@ -94,6 +109,9 @@ def _train_one_point(rows, point: str, today: date) -> dict[str, Any]:
     p = predict_logistic(clf, vec, Xte)
     y_te = [1 if r["label_paid"] else 0 for r in mte]
     has_pos = sum(y_te) > 0
+
+    # Калибровка на held-out свежих созревших (test), НЕ на train — см. fit_calibrator (Ф2).
+    calibrator = fit_calibrator(p_tr, y, p, y_te)
 
     ap_model = float(average_precision_score(y_te, p)) if has_pos else 0.0
     pilot = pilot_score([r["features"] for r in mte])
