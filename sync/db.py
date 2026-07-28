@@ -909,7 +909,7 @@ def ensure_ml_scoring_tables() -> None:
 def ensure_edu_visit_sessions() -> None:
     """Идемпотентно создаёт таблицу пер-визитных сессий Метрики (Logs API, Ф2 Logs API).
 
-    Зеркалит supabase/migrations/20260728_edu_visit_sessions.sql. В отличие от
+    Зеркалит migrations/edu/20260728_edu_visit_sessions.sql. В отличие от
     edu_visit_behavior (агрегат за день) — точное время визита (visit_ts) и
     полный набор сырых полей визита для feature building на уровне визита.
     """
@@ -918,7 +918,7 @@ def ensure_edu_visit_sessions() -> None:
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS edu_visit_sessions (
-                  counter_id              INTEGER      NOT NULL,
+                  counter_id              BIGINT       NOT NULL,
                   visit_ts                TIMESTAMPTZ  NOT NULL,
                   client_id               TEXT         NOT NULL,
                   visit_id                TEXT         NOT NULL,

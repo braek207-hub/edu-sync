@@ -4,7 +4,7 @@
 -- Пишет reader (задача 2 плана 2026-07-27-edu-ml-phase-b-logs-api) через Logs API.
 -- Инвариант: visit_ts — timestamptz (UTC), как остальные ts-поля пайплайна.
 CREATE TABLE IF NOT EXISTS edu_visit_sessions (
-  counter_id              INTEGER      NOT NULL,           -- счётчик Метрики
+  counter_id              BIGINT       NOT NULL,           -- счётчик Метрики
   visit_ts                TIMESTAMPTZ  NOT NULL,           -- точное время визита (UTC)
   client_id               TEXT         NOT NULL,           -- ym:s:clientID — джойн-ключ к лиду
   visit_id                TEXT         NOT NULL,           -- ym:s:visitID — уникален в рамках counter_id
