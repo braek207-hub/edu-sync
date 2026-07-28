@@ -1169,6 +1169,68 @@ def upsert_edu_visit_behavior(rows: List[Dict[str, Any]]) -> int:
     return len(rows)
 
 
+def upsert_edu_visit_sessions(rows: List[Dict[str, Any]]) -> int:
+    """Per-visit сессии Метрики (Logs API, Ф2 Task 3) — PK (counter_id, client_id, visit_id).
+    Чистый upsert (паттерн upsert_edu_visit_behavior) — при повторном бэкфилле строка
+    перезаписывается набело, окно не сносим."""
+    if not rows:
+        return 0
+    ensure_edu_visit_sessions()
+    sql = """
+        INSERT INTO edu_visit_sessions (
+            counter_id, visit_ts, client_id, visit_id,
+            visit_duration, bounce, page_views, is_new_user, user_id_hash,
+            utm_source, utm_medium, utm_campaign, utm_content, utm_term,
+            first_traffic_source, lastsign_traffic_source, source_engine, referer,
+            direct_platform_type, direct_condition_type, direct_phrase, direct_order_name,
+            has_gclid, device_category, os, browser, phone_model,
+            screen_w, screen_h, network_type
+        )
+        VALUES (
+            %(counter_id)s, %(visit_ts)s::timestamptz, %(client_id)s, %(visit_id)s,
+            %(visit_duration)s, %(bounce)s, %(page_views)s, %(is_new_user)s, %(user_id_hash)s,
+            %(utm_source)s, %(utm_medium)s, %(utm_campaign)s, %(utm_content)s, %(utm_term)s,
+            %(first_traffic_source)s, %(lastsign_traffic_source)s, %(source_engine)s, %(referer)s,
+            %(direct_platform_type)s, %(direct_condition_type)s, %(direct_phrase)s, %(direct_order_name)s,
+            %(has_gclid)s, %(device_category)s, %(os)s, %(browser)s, %(phone_model)s,
+            %(screen_w)s, %(screen_h)s, %(network_type)s
+        )
+        ON CONFLICT (counter_id, client_id, visit_id) DO UPDATE SET
+            visit_ts                = EXCLUDED.visit_ts,
+            visit_duration          = EXCLUDED.visit_duration,
+            bounce                  = EXCLUDED.bounce,
+            page_views              = EXCLUDED.page_views,
+            is_new_user             = EXCLUDED.is_new_user,
+            user_id_hash            = EXCLUDED.user_id_hash,
+            utm_source              = EXCLUDED.utm_source,
+            utm_medium              = EXCLUDED.utm_medium,
+            utm_campaign            = EXCLUDED.utm_campaign,
+            utm_content             = EXCLUDED.utm_content,
+            utm_term                = EXCLUDED.utm_term,
+            first_traffic_source    = EXCLUDED.first_traffic_source,
+            lastsign_traffic_source = EXCLUDED.lastsign_traffic_source,
+            source_engine           = EXCLUDED.source_engine,
+            referer                 = EXCLUDED.referer,
+            direct_platform_type    = EXCLUDED.direct_platform_type,
+            direct_condition_type   = EXCLUDED.direct_condition_type,
+            direct_phrase           = EXCLUDED.direct_phrase,
+            direct_order_name       = EXCLUDED.direct_order_name,
+            has_gclid               = EXCLUDED.has_gclid,
+            device_category         = EXCLUDED.device_category,
+            os                      = EXCLUDED.os,
+            browser                 = EXCLUDED.browser,
+            phone_model             = EXCLUDED.phone_model,
+            screen_w                = EXCLUDED.screen_w,
+            screen_h                = EXCLUDED.screen_h,
+            network_type            = EXCLUDED.network_type
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+        conn.commit()
+    return len(rows)
+
+
 # ── ML Feature Store: загрузчики и апсерты (ensure_ml_feature_tables — выше, Task 1) ──
 
 def load_vuz_lead_frame() -> List[Dict[str, Any]]:
