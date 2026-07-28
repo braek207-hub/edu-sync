@@ -41,8 +41,8 @@ def main():
         if not fcell:
             continue
         checked += 1
-        ts = to_iso_datetime(fcell)
-        if ts and (ts.hour or ts.minute or ts.second):
+        ts = to_iso_datetime(fcell)  # строка YYYY-MM-DDTHH:MM:SS; без времени → T00:00:00
+        if ts and not ts.endswith("T00:00:00"):
             fmt_time += 1
         if isinstance(ucell, (int, float)) and float(ucell) != int(float(ucell)):
             serial_time += 1
