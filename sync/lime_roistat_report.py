@@ -13,18 +13,27 @@ Supabase: у отчёта своя судьба и свои поломки, их
 ячейки, а не добавляем новую.
 
 Режимы (LIME_REPORT_MODE):
-  probe (default) — только читает и печатает структуру книги + агрегат Роистата,
-                    ничего не пишет. Первый прогон, чтобы снять контракт таблицы.
-  write           — обновляет ячейки за окно дней.
+  refresh (default) — устойчивый инкремент: перезаписывает точечно последние
+                      REFRESH_DAYS дней (default 7), историю не трогает. День без
+                      данных Роистата НЕ затирается нулями — пропускается с ретраем.
+  build             — строит вкладки с нуля и заливает окно [BUILD_FROM; вчера].
+                      Для первичного бэкфилла.
+  probe             — только читает и печатает структуру книги + сверку, не пишет.
+  write             — дате-матч в готовую книгу заказчика (путь B, formula-safe).
+
+Устойчивость: fetch_day уже ретраит транзиентные ошибки API; refresh сверху ретраит
+пустой ответ (данные дня ещё не готовы) и переживает падение одного дня, не роняя
+прогон целиком.
 
 ENV: ROISTAT_API_KEY, ROISTAT_PROJECT_ID (default 235593),
-     LIME_REPORTS_SA_JSON (ключ сервис-аккаунта), LIME_REPORT_SHEET_ID,
-     LIME_REPORT_DAYS_BACK (default 3), LIME_REPORT_FROM/LIME_REPORT_TO (бэкфилл).
+     LIME_REPORTS_SA_JSON / GSC_SA_KEY (ключ сервис-аккаунта), LIME_REPORT_SHEET_ID,
+     LIME_REPORT_REFRESH_DAYS (default 7), LIME_REPORT_FROM/LIME_REPORT_TO (бэкфилл build).
 """
 from __future__ import annotations
 
 import os
 import re
+import time
 from datetime import date, timedelta
 
 from sync.roistat_api import fetch_day
@@ -50,15 +59,58 @@ _TRAFFIC_HEADER = ["Дата", "Трафик органический", "Тра�
 _ORDERS_HEADER = ["Дата", "Продажи платный", "Продажи бесплатный",
                   "Продажи всего", "Год", "Месяц"]
 
-# Старт истории для build (env LIME_REPORT_FROM переопределяет). Крон каждый день
-# перестраивает окно [BUILD_FROM; вчера] целиком — идемпотентно, всегда полное.
+# Старт истории для build (первичный бэкфилл). env LIME_REPORT_FROM переопределяет.
 BUILD_FROM = os.environ.get("LIME_REPORT_FROM") or "2026-07-01"
+
+# refresh перезаписывает последние N дней (данные Роистата дозревают: поздние заказы,
+# доклейка визитов). 7 дней — комфортный запас, окно ограничено (не растёт бесконечно).
+REFRESH_DAYS = int(os.environ.get("LIME_REPORT_REFRESH_DAYS") or "7")
+# Пустой ответ Роистата за день (данные ещё не готовы) — ретраим отдельно от ошибок API.
+EMPTY_RETRIES = int(os.environ.get("LIME_REPORT_EMPTY_RETRIES") or "3")
+EMPTY_RETRY_SLEEP = int(os.environ.get("LIME_REPORT_EMPTY_RETRY_SLEEP") or "20")
 
 
 def _date_label(iso: str) -> str:
     """ISO-дата → «Сб 04.07.2026» как в книге заказчика."""
     d = date.fromisoformat(iso)
     return f"{_RU_WD[d.weekday()]} {d.strftime('%d.%m.%Y')}"
+
+
+def _traffic_row(iso: str, a: dict) -> list:
+    dt = date.fromisoformat(iso)
+    return [_date_label(iso), a["free_visits"], a["paid_visits"],
+            a["total_visits"], a["total_visits"], dt.year, dt.month]
+
+
+def _orders_row(iso: str, a: dict) -> list:
+    dt = date.fromisoformat(iso)
+    return [_date_label(iso), a["paid_orders"], a["free_orders"],
+            a["total_orders"], dt.year, dt.month]
+
+
+def _fetch_agg_guarded(iso: str, key: str) -> tuple[dict, bool]:
+    """Агрегат за день с ретраем ПУСТОГО ответа и защитой от падения дня.
+
+    fetch_day уже ретраит транзиентные ошибки API. Здесь добавляем два слоя:
+      • ошибка Роистата после его ретраев (RuntimeError) — ловим, пробуем ещё;
+      • валидный, но пустой день (данные не готовы) — ретраим до EMPTY_RETRIES.
+
+    Returns:
+        (agg, has_data). has_data=False → день писать НЕ нужно (сохранить прежнее).
+    """
+    agg = aggregate_day([])
+    for attempt in range(1, EMPTY_RETRIES + 1):
+        try:
+            cand = aggregate_day(fetch_day(iso, PROJECT, key))
+        except RuntimeError as e:
+            print(f"refresh: {iso} — ошибка Роистата ({e}), попытка {attempt}/{EMPTY_RETRIES}")
+            cand = None
+        if cand and (cand["total_visits"] > 0 or cand["total_orders"] > 0):
+            return cand, True
+        if attempt < EMPTY_RETRIES:
+            print(f"refresh: {iso} — пусто, ретрай {attempt}/{EMPTY_RETRIES}")
+            time.sleep(EMPTY_RETRY_SLEEP * attempt)
+    return agg, False
 
 PROJECT = os.environ.get("ROISTAT_PROJECT_ID") or "235593"
 SHEET_ID = os.environ.get("LIME_REPORT_SHEET_ID") or "1H6gSLOMDZDvGhvzD7mIvctlOmwPgdCk4WKXM8gtZ7X0"
@@ -272,12 +324,9 @@ def build_book(service, dates: list[str]) -> None:
     traffic = [_TRAFFIC_HEADER]
     orders = [_ORDERS_HEADER]
     for iso in dates:
-        a, dt = aggs[iso], date.fromisoformat(iso)
-        label = _date_label(iso)
-        traffic.append([label, a["free_visits"], a["paid_visits"],
-                        a["total_visits"], a["total_visits"], dt.year, dt.month])
-        orders.append([label, a["paid_orders"], a["free_orders"],
-                       a["total_orders"], dt.year, dt.month])
+        a = aggs[iso]
+        traffic.append(_traffic_row(iso, a))
+        orders.append(_orders_row(iso, a))
         print(f"{iso}: визиты платн={a['paid_visits']} беспл={a['free_visits']} "
               f"всего={a['total_visits']} | продажи платн={a['paid_orders']} "
               f"беспл={a['free_orders']} всего={a['total_orders']}")
@@ -287,14 +336,96 @@ def build_book(service, dates: list[str]) -> None:
     print(f"\nзаписано: {TRAFFIC_TAB} и {ORDERS_TAB} — {len(dates)} дн. ({dates[0]}…{dates[-1]})")
 
 
+def _date_rows(service, tab: str) -> tuple[int, dict[str, int]]:
+    """Разобрать вкладку: (следующая свободная 1-based строка, {ISO-дата: 1-based строка}).
+
+    Ищет строку заголовков с «Дата», ниже по колонке даты строит карту. Нужен для
+    точечной записи refresh — обновляем существующую строку дня, новую дату дописываем.
+    """
+    from sync.sheets_write import read_values
+
+    grid = read_values(service, SHEET_ID, f"{tab}!A1:A400", render="FORMATTED_VALUE")
+    hdr_i = _header_row(grid)
+    if hdr_i is None:
+        raise RuntimeError(f"{tab}: не нашёл строку заголовков с «Дата»")
+    row_of: dict[str, int] = {}
+    last = hdr_i
+    for i in range(hdr_i + 1, len(grid)):
+        cell = grid[i][0] if grid[i] else ""
+        m = _DATE_RE.search(cell)
+        if m:
+            row_of[f"{m[3]}-{m[2]}-{m[1]}"] = i + 1  # 1-based
+            last = i
+    return last + 2, row_of  # +2: 0-based last → 1-based следующая
+
+
+def refresh(service) -> None:
+    """Устойчивый инкремент: точечно перезаписать последние REFRESH_DAYS дней.
+
+    История вне окна не трогается. День без данных Роистата пропускается (прежнее
+    значение сохраняется), а не затирается нулями. Новая дата дописывается строкой.
+    """
+    from sync.sheets_write import add_tab, batch_write, list_tabs
+
+    key = os.environ["ROISTAT_API_KEY"]
+    tabs = set(list_tabs(service, SHEET_ID))
+    for tab in (TRAFFIC_TAB, ORDERS_TAB):
+        if tab not in tabs:
+            add_tab(service, SHEET_ID, tab)
+            print(f"создана вкладка «{tab}» (пустая — сначала прогони build для истории)")
+
+    t_next, t_rows = _date_rows(service, TRAFFIC_TAB)
+    o_next, o_rows = _date_rows(service, ORDERS_TAB)
+
+    to = date.today() - timedelta(days=1)
+    frm = to - timedelta(days=REFRESH_DAYS - 1)
+
+    t_updates: list[tuple[str, list[list]]] = []
+    o_updates: list[tuple[str, list[list]]] = []
+    written, skipped = [], []
+    d = frm
+    while d <= to:
+        iso = d.isoformat()
+        agg, has = _fetch_agg_guarded(iso, key)
+        if not has:
+            skipped.append(iso)
+            d += timedelta(days=1)
+            continue
+
+        tr = t_rows.get(iso)
+        if tr is None:
+            tr, t_next = t_next, t_next + 1
+            t_rows[iso] = tr
+        t_updates.append((f"{TRAFFIC_TAB}!A{tr}", [_traffic_row(iso, agg)]))
+
+        orow = o_rows.get(iso)
+        if orow is None:
+            orow, o_next = o_next, o_next + 1
+            o_rows[iso] = orow
+        o_updates.append((f"{ORDERS_TAB}!A{orow}", [_orders_row(iso, agg)]))
+
+        written.append(iso)
+        print(f"{iso}: визиты платн={agg['paid_visits']} беспл={agg['free_visits']} "
+              f"всего={agg['total_visits']} | продажи={agg['total_orders']}")
+        d += timedelta(days=1)
+
+    batch_write(service, SHEET_ID, t_updates)
+    batch_write(service, SHEET_ID, o_updates)
+    print(f"\nrefresh: окно {frm}…{to}, записано {len(written)} дн.")
+    if skipped:
+        print(f"refresh: без данных (сохранено прежнее): {skipped}")
+
+
 def main() -> None:
     from sync.sheets_write import get_write_service
 
-    mode = os.environ.get("LIME_REPORT_MODE") or "build"
+    mode = os.environ.get("LIME_REPORT_MODE") or "refresh"
     service = get_write_service()
 
     if mode == "probe":
         probe(service)
+    elif mode == "refresh":
+        refresh(service)
     elif mode == "build":
         build_book(service, _build_dates())
     elif mode == "write":

@@ -68,6 +68,20 @@ def write_block(service, spreadsheet_id: str, a1_start: str, values2d: list[list
     ).execute()
 
 
+def batch_write(service, spreadsheet_id: str, data: list[tuple[str, list[list]]]) -> int:
+    """Пакетно записать [(a1_range, values2d), ...] одним запросом. RAW."""
+    if not data:
+        return 0
+    service.spreadsheets().values().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "valueInputOption": "RAW",
+            "data": [{"range": rng, "values": vals} for rng, vals in data],
+        },
+    ).execute()
+    return len(data)
+
+
 def update_cell(service, spreadsheet_id: str, a1_cell: str, value) -> None:
     """Записать одно значение (RAW: число остаётся числом, формула не выполняется)."""
     service.spreadsheets().values().update(
