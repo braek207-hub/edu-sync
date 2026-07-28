@@ -906,6 +906,62 @@ def ensure_ml_scoring_tables() -> None:
         conn.commit()
 
 
+def ensure_edu_visit_sessions() -> None:
+    """Идемпотентно создаёт таблицу пер-визитных сессий Метрики (Logs API, Ф2 Logs API).
+
+    Зеркалит supabase/migrations/20260728_edu_visit_sessions.sql. В отличие от
+    edu_visit_behavior (агрегат за день) — точное время визита (visit_ts) и
+    полный набор сырых полей визита для feature building на уровне визита.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS edu_visit_sessions (
+                  counter_id              INTEGER      NOT NULL,
+                  visit_ts                TIMESTAMPTZ  NOT NULL,
+                  client_id               TEXT         NOT NULL,
+                  visit_id                TEXT         NOT NULL,
+                  visit_duration          INTEGER,
+                  bounce                  INTEGER,
+                  page_views              INTEGER,
+                  is_new_user             INTEGER,
+                  user_id_hash            TEXT,
+                  utm_source              TEXT,
+                  utm_medium              TEXT,
+                  utm_campaign            TEXT,
+                  utm_content             TEXT,
+                  utm_term                TEXT,
+                  first_traffic_source    TEXT,
+                  lastsign_traffic_source TEXT,
+                  source_engine           TEXT,
+                  referer                 TEXT,
+                  direct_platform_type    TEXT,
+                  direct_condition_type   TEXT,
+                  direct_phrase           TEXT,
+                  direct_order_name       TEXT,
+                  has_gclid               INTEGER,
+                  device_category         TEXT,
+                  os                      TEXT,
+                  browser                 TEXT,
+                  phone_model             TEXT,
+                  screen_w                INTEGER,
+                  screen_h                INTEGER,
+                  network_type            TEXT,
+                  PRIMARY KEY (counter_id, client_id, visit_id)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_edu_visit_sessions_client
+                ON edu_visit_sessions (client_id)
+                """
+            )
+            cur.execute("ALTER TABLE edu_visit_sessions ENABLE ROW LEVEL SECURITY")
+        conn.commit()
+
+
 def load_feature_matrix() -> List[Dict[str, Any]]:
     sql = """
         SELECT lead_id, client_id, created_date, is_matured,
