@@ -42,6 +42,24 @@ _TRAFFIC_TARGETS = {
     "Трафик общий": "total_visits",
 }
 
+_RU_WD = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+# Колонки вкладок при построении с нуля (режим build) — как на скрине заказчика.
+_TRAFFIC_HEADER = ["Дата", "Трафик органический", "Трафик платный",
+                   "Трафик сайт", "Трафик общий", "Год", "Месяц"]
+_ORDERS_HEADER = ["Дата", "Продажи платный", "Продажи бесплатный",
+                  "Продажи всего", "Год", "Месяц"]
+
+# Старт истории для build (env LIME_REPORT_FROM переопределяет). Крон каждый день
+# перестраивает окно [BUILD_FROM; вчера] целиком — идемпотентно, всегда полное.
+BUILD_FROM = os.environ.get("LIME_REPORT_FROM") or "2026-07-01"
+
+
+def _date_label(iso: str) -> str:
+    """ISO-дата → «Сб 04.07.2026» как в книге заказчика."""
+    d = date.fromisoformat(iso)
+    return f"{_RU_WD[d.weekday()]} {d.strftime('%d.%m.%Y')}"
+
 PROJECT = os.environ.get("ROISTAT_PROJECT_ID") or "235593"
 SHEET_ID = os.environ.get("LIME_REPORT_SHEET_ID") or "1H6gSLOMDZDvGhvzD7mIvctlOmwPgdCk4WKXM8gtZ7X0"
 DAYS_BACK = int(os.environ.get("LIME_REPORT_DAYS_BACK") or "3")
@@ -222,34 +240,69 @@ def write_traffic(service, day_to_agg: dict[str, dict]) -> int:
     return n
 
 
-def _dump_orders_tab(service) -> None:
-    """Печать структуры Fact Orders — продажи подключим, увидев её контракт."""
-    from sync.sheets_write import read_values
+def _build_dates() -> list[str]:
+    """Окно build: [BUILD_FROM; TO] (TO = LIME_REPORT_TO или вчера)."""
+    to_env = os.environ.get("LIME_REPORT_TO")
+    to = date.fromisoformat(to_env) if to_env else date.today() - timedelta(days=1)
+    d, out = date.fromisoformat(BUILD_FROM), []
+    while d <= to:
+        out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
 
-    try:
-        vals = read_values(service, SHEET_ID, f"{ORDERS_TAB}!A1:N10", render="FORMATTED_VALUE")
-        _dump(vals, f"{ORDERS_TAB} FORMATTED", 10)
-    except Exception as e:  # noqa: BLE001
-        print(f"  !! {ORDERS_TAB}: {type(e).__name__}: {e}")
+
+def build_book(service, dates: list[str]) -> None:
+    """Построить вкладки Fact Traffic / Fact Orders с нуля и залить весь блок.
+
+    Тестовая книга нам принадлежит целиком, поэтому пишем заголовок+строки одним
+    блоком (без дате-матча и защиты формул — их тут нет). Идемпотентно: окно только
+    растёт, поэтому перезапись от BUILD_FROM каждый раз даёт полную актуальную книгу.
+    """
+    from sync.sheets_write import add_tab, list_tabs, write_block
+
+    key = os.environ["ROISTAT_API_KEY"]
+    aggs = {d: aggregate_day(fetch_day(d, PROJECT, key)) for d in dates}
+
+    tabs = set(list_tabs(service, SHEET_ID))
+    for tab in (TRAFFIC_TAB, ORDERS_TAB):
+        if tab not in tabs:
+            add_tab(service, SHEET_ID, tab)
+            print(f"создана вкладка «{tab}»")
+
+    traffic = [_TRAFFIC_HEADER]
+    orders = [_ORDERS_HEADER]
+    for iso in dates:
+        a, dt = aggs[iso], date.fromisoformat(iso)
+        label = _date_label(iso)
+        traffic.append([label, a["free_visits"], a["paid_visits"],
+                        a["total_visits"], a["total_visits"], dt.year, dt.month])
+        orders.append([label, a["paid_orders"], a["free_orders"],
+                       a["total_orders"], dt.year, dt.month])
+        print(f"{iso}: визиты платн={a['paid_visits']} беспл={a['free_visits']} "
+              f"всего={a['total_visits']} | продажи платн={a['paid_orders']} "
+              f"беспл={a['free_orders']} всего={a['total_orders']}")
+
+    write_block(service, SHEET_ID, f"{TRAFFIC_TAB}!A1", traffic)
+    write_block(service, SHEET_ID, f"{ORDERS_TAB}!A1", orders)
+    print(f"\nзаписано: {TRAFFIC_TAB} и {ORDERS_TAB} — {len(dates)} дн. ({dates[0]}…{dates[-1]})")
 
 
 def main() -> None:
     from sync.sheets_write import get_write_service
 
-    mode = os.environ.get("LIME_REPORT_MODE") or "probe"
+    mode = os.environ.get("LIME_REPORT_MODE") or "build"
     service = get_write_service()
 
     if mode == "probe":
         probe(service)
-        return
-
-    key = os.environ["ROISTAT_API_KEY"]
-    day_to_agg = {d: aggregate_day(fetch_day(d, PROJECT, key)) for d in _sync_dates()}
-    for d, agg in day_to_agg.items():
-        print(f"{d}: платн={agg['paid_visits']} беспл={agg['free_visits']} "
-              f"всего={agg['total_visits']} продажи={agg['total_orders']}")
-    write_traffic(service, day_to_agg)
-    _dump_orders_tab(service)  # продажи по дате заказа — следующий шаг
+    elif mode == "build":
+        build_book(service, _build_dates())
+    elif mode == "write":
+        key = os.environ["ROISTAT_API_KEY"]
+        day_to_agg = {d: aggregate_day(fetch_day(d, PROJECT, key)) for d in _sync_dates()}
+        write_traffic(service, day_to_agg)
+    else:
+        raise SystemExit(f"lime_roistat_report: неизвестный режим {mode!r}")
 
 
 if __name__ == "__main__":

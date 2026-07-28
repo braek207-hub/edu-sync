@@ -50,6 +50,24 @@ def list_tabs(service, spreadsheet_id: str) -> list[str]:
     return [s["properties"]["title"] for s in meta.get("sheets", [])]
 
 
+def add_tab(service, spreadsheet_id: str, title: str) -> None:
+    """Создать вкладку с заданным именем."""
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
+    ).execute()
+
+
+def write_block(service, spreadsheet_id: str, a1_start: str, values2d: list[list]) -> None:
+    """Записать двумерный блок начиная с a1_start (например 'Fact Traffic!A1'). RAW."""
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=a1_start,
+        valueInputOption="RAW",
+        body={"values": values2d},
+    ).execute()
+
+
 def update_cell(service, spreadsheet_id: str, a1_cell: str, value) -> None:
     """Записать одно значение (RAW: число остаётся числом, формула не выполняется)."""
     service.spreadsheets().values().update(
