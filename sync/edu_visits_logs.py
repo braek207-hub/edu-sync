@@ -163,6 +163,27 @@ def _build_allowed_buckets(header: List[str], rows: List[List[str]]) -> Dict[str
     return out
 
 
+def _chunk_windows(start: date, end_exclusive_today: date, chunk_days: int) -> List[Tuple[str, str]]:
+    """Список (date1,date2)-окон бэкфилла (ISO-строки), чанк по `chunk_days`.
+
+    Logs API отдаёт визиты только за дни строго ДО сегодня (400 "date2 must be before
+    today" иначе) — верхняя граница каждого окна клампится на
+    `end_exclusive_today - 1 день`. Если после клампа окно пустое (`date1 > date2`,
+    случай когда исходный чанк — это только сегодня) — окно не включается в список
+    вовсе (вызывающий код не создаёт logrequest на пустое окно)."""
+    last_allowed = end_exclusive_today - timedelta(days=1)
+    windows: List[Tuple[str, str]] = []
+    cur = start
+    while cur <= end_exclusive_today:
+        c_from = cur
+        c_to = min(cur + timedelta(days=chunk_days - 1), end_exclusive_today)
+        cur = c_to + timedelta(days=1)
+        c_to_clamped = min(c_to, last_allowed)
+        if c_from <= c_to_clamped:
+            windows.append((c_from.isoformat(), c_to_clamped.isoformat()))
+    return windows
+
+
 def _fetch_chunk(date1: str, date2: str, token: str) -> Tuple[List[str], List[List[str]]]:
     """create → wait_processed → скачать все части → склеить (header одинаков во всех
     частях одного request_id). clean_request — всегда, даже при ошибке скачивания/парсинга."""
@@ -197,20 +218,18 @@ def sync_edu_visit_logs(days_back: int = 90, chunk_days: int = 7) -> int:
 
     today = date.today()
     start = today - timedelta(days=days_back)
+    windows = _chunk_windows(start, today, chunk_days)
     print(
-        f"EDU visits logs (vuz {COUNTER_VUZ}): {start} — {today}, "
-        f"лидов-client_id={len(keep)}, чанк={chunk_days}д"
+        f"EDU visits logs (vuz {COUNTER_VUZ}): {start} — {today - timedelta(days=1)}, "
+        f"лидов-client_id={len(keep)}, чанк={chunk_days}д, окон={len(windows)}"
     )
 
     allowed_buckets: Dict[str, Set[str]] = {k: set() for k in _BUCKET_FIELDS}
     buckets_built = False
 
     total = 0
-    cur = start
-    while cur <= today:
-        c_from = cur
-        c_to = min(cur + timedelta(days=chunk_days - 1), today)
-        header, raw_rows = _fetch_chunk(c_from.isoformat(), c_to.isoformat(), token)
+    for date1, date2 in windows:
+        header, raw_rows = _fetch_chunk(date1, date2, token)
 
         if not buckets_built and raw_rows:
             allowed_buckets = _build_allowed_buckets(header, raw_rows)
@@ -227,9 +246,8 @@ def sync_edu_visit_logs(days_back: int = 90, chunk_days: int = 7) -> int:
                 mapped.append(row)
 
         n = upsert_edu_visit_sessions(mapped) if mapped else 0
-        print(f"  {c_from} — {c_to}: строк всего={len(raw_rows)}, наших={len(mapped)}, upsert={n}")
+        print(f"  {date1} — {date2}: строк всего={len(raw_rows)}, наших={len(mapped)}, upsert={n}")
         total += n
-        cur = c_to + timedelta(days=1)
     return total
 
 
