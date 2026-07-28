@@ -4,7 +4,10 @@ import json
 import os
 
 import sync.lime_roistat_report as rep
-from sync.lime_roistat_report import _fetch_agg_guarded, _orders_row, _traffic_row, aggregate_day
+from sync.lime_roistat_report import (
+    TRAFFIC_TAB, _day_cell_updates, _fetch_agg_guarded, _orders_row, _traffic_row,
+    aggregate_day,
+)
 from sync.roistat_api import parse_analytics
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "roistat_analytics_day.json")
@@ -112,3 +115,44 @@ def test_guarded_recovers_on_late_data(monkeypatch):
     agg, has = _fetch_agg_guarded("2026-07-04", "k")
     assert has is True
     assert agg["free_visits"] == 40
+
+
+# Колонки съехали: заказчик вставил пустой столбец перед «Дата» → данные в B:H.
+_SHIFTED_COLS = {"Дата": 1, "Трафик органический": 2, "Трафик платный": 3,
+                 "Трафик сайт": 4, "Трафик общий": 5, "Год": 6, "Месяц": 7}
+_AGG = {"free_visits": 70, "paid_visits": 100, "total_visits": 170,
+        "paid_orders": 5, "free_orders": 3, "total_orders": 8}
+
+
+def test_updates_go_to_named_columns_not_A():
+    """Баг-регресс: запись идёт в колонки ПО ИМЕНИ (B:H), а не в фиксированную A."""
+    ups = _day_cell_updates(TRAFFIC_TAB, "2026-07-28", _AGG, _SHIFTED_COLS,
+                            formulas=[], ri0=28, is_new=False)
+    cells = dict(ups)
+    # ri0=28 → 1-based строка 29; органический=C, платный=D, сайт=E, общий=F
+    assert cells[f"{TRAFFIC_TAB}!C29"] == [[70]]
+    assert cells[f"{TRAFFIC_TAB}!D29"] == [[100]]
+    assert cells[f"{TRAFFIC_TAB}!E29"] == [[170]]
+    assert cells[f"{TRAFFIC_TAB}!F29"] == [[170]]
+    assert not any(r.endswith("!A29") for r, _ in ups)  # колонку A не трогаем
+
+
+def test_existing_row_skips_formula_cells():
+    """На существующей строке ячейку-формулу не перезаписываем."""
+    formulas = [[""] * 8 for _ in range(30)]
+    formulas[28][4] = "=C29+D29"  # «Трафик сайт» — формула
+    ups = _day_cell_updates(TRAFFIC_TAB, "2026-07-28", _AGG, _SHIFTED_COLS,
+                            formulas=formulas, ri0=28, is_new=False)
+    cells = dict(ups)
+    assert f"{TRAFFIC_TAB}!E29" not in cells      # формула сохранена
+    assert cells[f"{TRAFFIC_TAB}!D29"] == [[100]]  # платный записан
+
+
+def test_new_row_fills_date_year_month():
+    """Новая дата пишется целиком: Дата/Год/Месяц тоже (формул на пустой строке нет)."""
+    ups = _day_cell_updates(TRAFFIC_TAB, "2026-07-28", _AGG, _SHIFTED_COLS,
+                            formulas=[], ri0=28, is_new=True)
+    cells = dict(ups)
+    assert cells[f"{TRAFFIC_TAB}!B29"] == [["Вт 28.07.2026"]]  # Дата в колонке B
+    assert cells[f"{TRAFFIC_TAB}!G29"] == [[2026]]
+    assert cells[f"{TRAFFIC_TAB}!H29"] == [[7]]

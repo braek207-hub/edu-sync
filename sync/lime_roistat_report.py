@@ -310,14 +310,22 @@ def build_book(service, dates: list[str]) -> None:
     блоком (без дате-матча и защиты формул — их тут нет). Идемпотентно: окно только
     растёт, поэтому перезапись от BUILD_FROM каждый раз даёт полную актуальную книгу.
     """
-    from sync.sheets_write import add_tab, list_tabs, write_block
+    from sync.sheets_write import add_tab, list_tabs, read_values, write_block
 
     key = os.environ["ROISTAT_API_KEY"]
     aggs = {d: aggregate_day(fetch_day(d, PROJECT, key)) for d in dates}
 
     tabs = set(list_tabs(service, SHEET_ID))
     for tab in (TRAFFIC_TAB, ORDERS_TAB):
-        if tab not in tabs:
+        if tab in tabs:
+            # build пишет блок от A1; если во вкладке уже есть «Дата» (возможно
+            # сдвинутая вставкой столбца) — перезапись от A1 всё разъедет. Тогда refresh.
+            existing = read_values(service, SHEET_ID, f"{tab}!A1:Z400", render="FORMATTED_VALUE")
+            if _header_row(existing) is not None:
+                raise RuntimeError(
+                    f"{tab}: уже заполнена — build перезаписал бы от A1 и разъехал столбцы. "
+                    f"Используй refresh (он пишет по именам колонок).")
+        else:
             add_tab(service, SHEET_ID, tab)
             print(f"создана вкладка «{tab}»")
 
@@ -336,52 +344,98 @@ def build_book(service, dates: list[str]) -> None:
     print(f"\nзаписано: {TRAFFIC_TAB} и {ORDERS_TAB} — {len(dates)} дн. ({dates[0]}…{dates[-1]})")
 
 
-def _date_rows(service, tab: str) -> tuple[int, dict[str, int]]:
-    """Разобрать вкладку: (следующая свободная 1-based строка, {ISO-дата: 1-based строка}).
+# Заголовок → ключ агрегата ДЛЯ КАЖДОЙ вкладки. Пишем по ИМЕНИ колонки, а не по
+# фиксированной позиции: заказчик может вставить/переставить столбцы (так и вышло —
+# перед «Дата» добавили пустой столбец, данные съехали в B:H).
+_VALUE_MAP = {
+    TRAFFIC_TAB: {
+        "Трафик органический": "free_visits",
+        "Трафик платный": "paid_visits",
+        "Трафик сайт": "total_visits",
+        "Трафик общий": "total_visits",
+    },
+    ORDERS_TAB: {
+        "Продажи платный": "paid_orders",
+        "Продажи бесплатный": "free_orders",
+        "Продажи всего": "total_orders",
+    },
+}
 
-    Ищет строку заголовков с «Дата», ниже по колонке даты строит карту. Нужен для
-    точечной записи refresh — обновляем существующую строку дня, новую дату дописываем.
+
+def _tab_layout(service, tab: str):
+    """(formulas, name_to_col, date_col, row_of, next_row0) вкладки по ИМЕНАМ колонок.
+
+    Читает широкий диапазон и находит строку заголовков + колонку «Дата» — устойчиво к
+    вставке/перестановке столбцов. row_of: ISO-дата → 0-based индекс строки; next_row0 —
+    0-based индекс первой свободной строки под данными (для дописи новой даты).
     """
     from sync.sheets_write import read_values
 
-    grid = read_values(service, SHEET_ID, f"{tab}!A1:A400", render="FORMATTED_VALUE")
+    rng = f"{tab}!A1:Z400"
+    grid = read_values(service, SHEET_ID, rng, render="FORMATTED_VALUE")
+    formulas = read_values(service, SHEET_ID, rng, render="FORMULA")
     hdr_i = _header_row(grid)
     if hdr_i is None:
         raise RuntimeError(f"{tab}: не нашёл строку заголовков с «Дата»")
+    name_to_col = {_norm_header(c): j for j, c in enumerate(grid[hdr_i])}
+    date_col = name_to_col["Дата"]
+
     row_of: dict[str, int] = {}
     last = hdr_i
     for i in range(hdr_i + 1, len(grid)):
-        cell = grid[i][0] if grid[i] else ""
-        m = _DATE_RE.search(cell)
+        row = grid[i]
+        m = _DATE_RE.search(row[date_col] if date_col < len(row) else "")
         if m:
-            row_of[f"{m[3]}-{m[2]}-{m[1]}"] = i + 1  # 1-based
+            row_of[f"{m[3]}-{m[2]}-{m[1]}"] = i
             last = i
-    return last + 2, row_of  # +2: 0-based last → 1-based следующая
+    return formulas, name_to_col, date_col, row_of, last + 1
+
+
+def _day_cell_updates(tab, iso, agg, name_to_col, formulas, ri0, is_new):
+    """Ячейки-обновления одного дня по именам колонок. Формулы не трогаем (кроме новой строки)."""
+    dt = date.fromisoformat(iso)
+    row1 = ri0 + 1  # 1-based
+    values = dict(_VALUE_MAP[tab])
+
+    def is_formula(cj):
+        return (ri0 < len(formulas) and cj < len(formulas[ri0])
+                and str(formulas[ri0][cj]).startswith("="))
+
+    ups = []
+    for hdr, key in values.items():
+        cj = name_to_col.get(hdr)
+        if cj is None or (not is_new and is_formula(cj)):
+            continue
+        ups.append((f"{tab}!{_col_letter(cj)}{row1}", [[agg[key]]]))
+    if is_new:  # новую строку заполняем целиком: Дата/Год/Месяц тоже
+        for hdr, val in (("Дата", _date_label(iso)), ("Год", dt.year), ("Месяц", dt.month)):
+            cj = name_to_col.get(hdr)
+            if cj is not None:
+                ups.append((f"{tab}!{_col_letter(cj)}{row1}", [[val]]))
+    return ups
 
 
 def refresh(service) -> None:
     """Устойчивый инкремент: точечно перезаписать последние REFRESH_DAYS дней.
 
-    История вне окна не трогается. День без данных Роистата пропускается (прежнее
-    значение сохраняется), а не затирается нулями. Новая дата дописывается строкой.
+    Пишем по ИМЕНАМ колонок (устойчиво к вставке столбцов). История вне окна не
+    трогается; формулы не перезаписываем; день без данных Роистата пропускается
+    (прежнее значение сохраняется), а не затирается нулями; новая дата дописывается.
     """
-    from sync.sheets_write import add_tab, batch_write, list_tabs
+    from sync.sheets_write import batch_write, list_tabs
 
     key = os.environ["ROISTAT_API_KEY"]
     tabs = set(list_tabs(service, SHEET_ID))
     for tab in (TRAFFIC_TAB, ORDERS_TAB):
         if tab not in tabs:
-            add_tab(service, SHEET_ID, tab)
-            print(f"создана вкладка «{tab}» (пустая — сначала прогони build для истории)")
+            raise RuntimeError(f"вкладки «{tab}» нет — сначала прогони build для истории")
 
-    t_next, t_rows = _date_rows(service, TRAFFIC_TAB)
-    o_next, o_rows = _date_rows(service, ORDERS_TAB)
+    layouts = {tab: list(_tab_layout(service, tab)) for tab in (TRAFFIC_TAB, ORDERS_TAB)}
 
     to = date.today() - timedelta(days=1)
     frm = to - timedelta(days=REFRESH_DAYS - 1)
 
-    t_updates: list[tuple[str, list[list]]] = []
-    o_updates: list[tuple[str, list[list]]] = []
+    updates: list[tuple[str, list[list]]] = []
     written, skipped = [], []
     d = frm
     while d <= to:
@@ -392,26 +446,23 @@ def refresh(service) -> None:
             d += timedelta(days=1)
             continue
 
-        tr = t_rows.get(iso)
-        if tr is None:
-            tr, t_next = t_next, t_next + 1
-            t_rows[iso] = tr
-        t_updates.append((f"{TRAFFIC_TAB}!A{tr}", [_traffic_row(iso, agg)]))
-
-        orow = o_rows.get(iso)
-        if orow is None:
-            orow, o_next = o_next, o_next + 1
-            o_rows[iso] = orow
-        o_updates.append((f"{ORDERS_TAB}!A{orow}", [_orders_row(iso, agg)]))
+        for tab in (TRAFFIC_TAB, ORDERS_TAB):
+            formulas, name_to_col, _, row_of, next0 = layouts[tab]
+            ri0 = row_of.get(iso)
+            is_new = ri0 is None
+            if is_new:
+                ri0 = next0
+                layouts[tab][4] = next0 + 1  # сдвинуть указатель свободной строки
+                row_of[iso] = ri0
+            updates += _day_cell_updates(tab, iso, agg, name_to_col, formulas, ri0, is_new)
 
         written.append(iso)
         print(f"{iso}: визиты платн={agg['paid_visits']} беспл={agg['free_visits']} "
               f"всего={agg['total_visits']} | продажи={agg['total_orders']}")
         d += timedelta(days=1)
 
-    batch_write(service, SHEET_ID, t_updates)
-    batch_write(service, SHEET_ID, o_updates)
-    print(f"\nrefresh: окно {frm}…{to}, записано {len(written)} дн.")
+    n = batch_write(service, SHEET_ID, updates)
+    print(f"\nrefresh: окно {frm}…{to}, записано {len(written)} дн., {n} ячеек.")
     if skipped:
         print(f"refresh: без данных (сохранено прежнее): {skipped}")
 
