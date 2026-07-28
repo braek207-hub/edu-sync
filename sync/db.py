@@ -1254,8 +1254,8 @@ def load_vuz_lead_frame() -> List[Dict[str, Any]]:
 
 
 def load_vuz_behavior_dated() -> Dict[str, List[Dict[str, Any]]]:
-    """Поведение по client_id с разбивкой по дате визита (не агрегат за всё время) —
-    для per-visit-date фич Ф2 (см. build_feature_rows, behavior_dated)."""
+    """Поведение по client_id с разбивкой по дате визита (дневной агрегат Reporting API).
+    Заменена на load_vuz_sessions_dated (per-visit Logs API) в Ф2; оставлена как rollback path."""
     sql = """
         SELECT client_id, visit_date::date AS visit_date, SUM(visits) AS visits,
                CASE WHEN SUM(visits)>0 THEN SUM(avg_duration_sec*visits)/SUM(visits) ELSE 0 END AS avg_duration_sec,

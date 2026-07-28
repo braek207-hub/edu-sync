@@ -32,7 +32,7 @@ REGISTRY: list[FeatureSpec] = [
     FeatureSpec("created_dow", "at_creation", "num"),
     FeatureSpec("created_hour", "at_creation", "num"),
     FeatureSpec("days_to_deadline", "at_creation", "num"),
-    # L2 (Ф1a — текущий дневной агрегат Метрики; известно ДО заявки)
+    # L2 (Ф1a-Ф2 переход — per-visit сессии из Logs API; известно ДО заявки)
     FeatureSpec("beh_visits", "pre_lead", "num"),
     FeatureSpec("beh_visit_days", "pre_lead", "num"),
     FeatureSpec("beh_avg_duration_sec", "pre_lead", "num"),
