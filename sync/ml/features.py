@@ -77,9 +77,13 @@ def _before_lead_sessions(
 
 
 def _last_session(sessions: list[dict]) -> Optional[dict]:
+    """Детерминированный выбор «последней» pre-lead сессии. Тай-брейк по `visit_id`
+    при равном `visit_ts` (двойная загрузка страницы в ту же секунду) — иначе выбор
+    зависит от порядка строк из Postgres (не гарантирован без ORDER BY), и sess_*
+    могут отличаться между прогонами feature-build над теми же данными."""
     if not sessions:
         return None
-    return max(sessions, key=_session_ts)
+    return max(sessions, key=lambda s: (_session_ts(s), str(s.get("visit_id", ""))))
 
 
 def build_feature_rows(

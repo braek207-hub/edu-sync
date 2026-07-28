@@ -5,7 +5,7 @@
 
 from datetime import date, datetime
 
-from sync.ml.features import _before_lead_sessions, build_feature_rows
+from sync.ml.features import _before_lead_sessions, _last_session, build_feature_rows
 
 
 def test_sessions_include_same_day_before_lead():
@@ -57,3 +57,18 @@ def test_sess_categorical_features_use_last_pre_lead_session():
     assert f["f__sess_phone_model"] == "Samsung"
     assert f["f__sess_is_new_user"] == 1                 # max — было хоть раз
     assert f["f__sess_has_gclid"] == 1                   # max — было хоть раз
+
+
+def test_last_session_deterministic_tiebreak_on_equal_visit_ts():
+    """Без ORDER BY порядок строк из Postgres не гарантирован (двойная загрузка
+    страницы в ту же секунду → одинаковый visit_ts) — тай-брейк по visit_id должен
+    давать один и тот же результат независимо от порядка элементов в списке."""
+    same_ts = datetime(2026, 3, 1, 10, 0, 0)
+    a = {"visit_ts": same_ts, "visit_id": "100", "utm_source": "a_source"}
+    b = {"visit_ts": same_ts, "visit_id": "200", "utm_source": "b_source"}
+
+    forward = _last_session([a, b])
+    reversed_ = _last_session([b, a])
+
+    assert forward == reversed_ == b            # больший visit_id побеждает тай-брейк
+    assert forward["utm_source"] == "b_source"
