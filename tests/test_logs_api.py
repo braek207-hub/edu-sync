@@ -1,4 +1,4 @@
-from sync.logs_api import parse_tsv, bucket_topn
+from sync.logs_api import parse_tsv, bucket_topn, _extract_part_numbers
 
 
 def test_parse_tsv_splits_header_and_rows():
@@ -13,3 +13,13 @@ def test_bucket_topn_keeps_allowed_else_other():
     assert bucket_topn("поиск", allowed) == "поиск"
     assert bucket_topn("редкая_фраза_xyz", allowed) == "other"
     assert bucket_topn("", allowed) == "other"
+
+
+def test_extract_part_numbers_from_dict_parts():
+    status_json = {
+        "log_request": {
+            "status": "processed",
+            "parts": [{"part_number": 0, "size": 123}, {"part_number": 1, "size": 45}],
+        }
+    }
+    assert _extract_part_numbers(status_json) == [0, 1]

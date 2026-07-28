@@ -46,6 +46,20 @@ def create_request(counter: str, date1: str, date2: str, fields: str, token: str
     return int(resp.json()["log_request"]["request_id"])
 
 
+def _extract_part_numbers(status_json: Dict) -> List[int]:
+    """Достаёт номера частей из ответа статуса Logs API.
+
+    log_request.parts реально приходит списком СЛОВАРЕЙ {"part_number": N, "size": M}
+    (не голых int, как можно было бы предположить по имени поля) — на этом упал
+    прод-прогон Task 6: download_part получал dict вместо int и подставлял его как есть
+    в URL (`partNumber={'part_number': 0, ...}`) → HTTP 400 у Метрики. Обрабатываем и
+    dict, и уже-int на случай будущей смены формата API.
+    """
+    parts = (status_json or {}).get("log_request", {}).get("parts", []) or []
+    numbers = [p["part_number"] if isinstance(p, dict) else int(p) for p in parts]
+    return sorted(numbers)
+
+
 def wait_processed(counter: str, req_id: int, token: str, poll_s: int = 10, max_polls: int = 60) -> List[int]:
     """Поллит статус до processed (или другого терминального), возвращает номера частей.
 
@@ -57,9 +71,9 @@ def wait_processed(counter: str, req_id: int, token: str, poll_s: int = 10, max_
     parts: List[int] = []
     for _ in range(max_polls):
         resp = _retry_request("GET", url, token)
-        lr = resp.json().get("log_request", {})
-        status = lr.get("status")
-        parts = lr.get("parts", []) or []
+        status_json = resp.json()
+        status = status_json.get("log_request", {}).get("status")
+        parts = _extract_part_numbers(status_json)
         if status in _TERMINAL_STATUSES:
             break
         time.sleep(poll_s)
