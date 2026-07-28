@@ -55,34 +55,49 @@ def _num(v: Any, default: float = 0.0) -> float:
         return default
 
 
-def _before_lead_visits(visits: list[dict], cutoff: date) -> list[dict]:
-    return [v for v in visits if v["visit_date"] < cutoff]
+def _session_ts(s: dict) -> datetime:
+    """`visit_ts` может прийти как datetime (из БД) или ISO-строка (тесты/сериализация
+    JSON). Python 3.11+ `datetime.fromisoformat` уже понимает пробел вместо `T`
+    (формат Logs API `ym:s:dateTime`, см. sync/edu_visits_logs.py)."""
+    v = s["visit_ts"]
+    return v if isinstance(v, datetime) else datetime.fromisoformat(str(v))
 
 
-def _weighted(visits: list[dict], key: str) -> float:
-    total_visits = sum(_num(v.get("visits")) for v in visits)
-    if total_visits <= 0:
-        return 0.0
-    return sum(_num(v.get(key)) * _num(v.get("visits")) for v in visits) / total_visits
+def _before_lead_sessions(
+    sessions: list[dict], created_ts: Optional[datetime], created_date: date
+) -> list[dict]:
+    """Per-visit сессии СТРОГО ДО момента заявки — без утечки. Если известен точный
+    `created_ts` (timestamptz), сравниваем по времени (`visit_ts < created_ts`) —
+    это и учитывает same-day визиты ДО заявки, отбрасывая same-day визиты ПОСЛЕ.
+    Деградация (нет created_ts) — по дате (`visit_ts.date() < created_date`), как
+    старый дневной cutoff, там same-day визиты неотличимы по порядку."""
+    if created_ts is not None:
+        return [s for s in sessions if _session_ts(s) < created_ts]
+    return [s for s in sessions if _session_ts(s).date() < created_date]
 
 
-def _top_visit_day(visits: list[dict]) -> Optional[dict]:
-    if not visits:
+def _last_session(sessions: list[dict]) -> Optional[dict]:
+    if not sessions:
         return None
-    return max(visits, key=lambda v: _num(v.get("visits")))
+    return max(sessions, key=_session_ts)
 
 
 def build_feature_rows(
     leads: list[dict],
-    behavior_dated: dict[str, list[dict]],
+    sessions: dict[str, list[dict]],
     deadlines: list[date],
     today: date,
 ) -> list[dict]:
-    """Строки под upsert_lead_features. `behavior_dated[client_id]` = список per-date
-    визитов (visit_date, visits, avg_duration_sec, bounce_rate, page_depth, device,
-    source). Все beh_*/timing-фичи time-aware: считаются ТОЛЬКО по визитам ДО заявки
-    (visit_date < created_ts.date() если created_ts есть, иначе < created_date) —
-    защита от post-lead утечки. `repeat_lead` — считаем по частоте client_id."""
+    """Строки под upsert_lead_features. `sessions[client_id]` = список per-visit
+    сессий Метрики Logs API (Task 3, edu_visit_sessions): visit_ts (datetime/ISO),
+    visit_duration, bounce, page_views, is_new_user, utm_*, first_traffic_source,
+    source_engine, direct_*, has_gclid, phone_model, network_type.
+
+    Все beh_*/sess_*/timing-фичи time-aware: считаются ТОЛЬКО по визитам ДО заявки
+    (Ф2 Logs API — `_before_lead_sessions`: `visit_ts < created_ts` если created_ts
+    есть — это учитывает same-day визиты ДО заявки в отличие от старого дневного
+    cutoff'а; деградация на `visit_ts.date() < created_date` для лидов без ts).
+    `repeat_lead` — считаем по частоте client_id."""
     freq: dict[str, int] = {}
     for ld in leads:
         cid = clean_cat(ld.get("client_id"))
@@ -98,10 +113,11 @@ def build_feature_rows(
         conn = ld.get("connection_date")
         ttc = (conn - created).days if conn else None
 
-        all_visits = behavior_dated.get(cid, []) if cid else []
-        before = _before_lead_visits(all_visits, cutoff)
-        before_days = sorted({v["visit_date"] for v in before})
-        top_day = _top_visit_day(before)
+        all_sessions = sessions.get(cid, []) if cid else []
+        before = _before_lead_sessions(all_sessions, created_ts, created)
+        before_days = sorted({_session_ts(s).date() for s in before})
+        last = _last_session(before)
+        n_before = len(before)
 
         connected_ts = ld.get("connected_ts")
         mins_to_connection = (
@@ -124,16 +140,23 @@ def build_feature_rows(
             # Не запускать сборку с PGTZ=Europe/Moscow — сдвинет час на смещение UTC.
             "f__created_hour": created_ts.hour if created_ts else 0,
             "f__days_to_deadline": days_to_deadline(created, deadlines),
-            "f__beh_visits": sum(_num(v.get("visits")) for v in before),
+            # beh_* пересчитаны по per-visit сессиям (было: дневной агрегат Reporting API)
+            "f__beh_visits": n_before,
             "f__beh_visit_days": len(before_days),
-            "f__beh_avg_duration_sec": _weighted(before, "avg_duration_sec"),
-            "f__beh_bounce_rate": _weighted(before, "bounce_rate"),
-            "f__beh_page_depth": _weighted(before, "page_depth"),
-            "f__beh_device": clean_cat(top_day.get("device")) if top_day else None,
-            "f__beh_source": clean_cat(top_day.get("source")) if top_day else None,
+            "f__beh_avg_duration_sec": (
+                sum(_num(s.get("visit_duration")) for s in before) / n_before if n_before else 0.0
+            ),
+            "f__beh_bounce_rate": (
+                sum(_num(s.get("bounce")) for s in before) / n_before * 100 if n_before else 0.0
+            ),
+            "f__beh_page_depth": (
+                sum(_num(s.get("page_views")) for s in before) / n_before if n_before else 0.0
+            ),
+            "f__beh_device": clean_cat(last.get("device_category")) if last else None,
+            "f__beh_source": clean_cat(last.get("source_engine")) if last else None,
             "f__missing_behavior": 0 if before else 1,
             "f__repeat_lead": (freq.get(cid, 0) if cid else 0),
-            "f__visits_before_lead": sum(_num(v.get("visits")) for v in before),
+            "f__visits_before_lead": n_before,
             "f__sessions_before": len(before_days),
             "f__days_since_first_touch": (cutoff - before_days[0]).days if before_days else 0,
             "f__had_repeat_visit": 1 if len(before_days) > 1 else 0,
@@ -141,6 +164,23 @@ def build_feature_rows(
             "f__time_to_connection_days": ttc,
             "f__dispatcher": clean_cat(ld.get("dispatcher")),
             "f__responsible": clean_cat(ld.get("responsible")),
+            # Ф2 (Task 4/5) — per-visit сессии Logs API. Категориальные — значение
+            # ПОСЛЕДНЕЙ pre-lead сессии (ближайший к заявке сигнал); is_new_user/
+            # has_gclid — max (флаг "было хоть раз" за pre-lead окно).
+            "f__sess_is_new_user": max((_num(s.get("is_new_user")) for s in before), default=0.0),
+            "f__sess_utm_source": clean_cat(last.get("utm_source")) if last else None,
+            "f__sess_utm_medium": clean_cat(last.get("utm_medium")) if last else None,
+            "f__sess_utm_campaign": clean_cat(last.get("utm_campaign")) if last else None,
+            "f__sess_utm_content": clean_cat(last.get("utm_content")) if last else None,
+            "f__sess_utm_term": clean_cat(last.get("utm_term")) if last else None,
+            "f__sess_first_traffic_source": clean_cat(last.get("first_traffic_source")) if last else None,
+            "f__sess_source_engine": clean_cat(last.get("source_engine")) if last else None,
+            "f__sess_direct_platform_type": clean_cat(last.get("direct_platform_type")) if last else None,
+            "f__sess_direct_condition_type": clean_cat(last.get("direct_condition_type")) if last else None,
+            "f__sess_direct_phrase_bucket": clean_cat(last.get("direct_phrase")) if last else None,
+            "f__sess_has_gclid": max((_num(s.get("has_gclid")) for s in before), default=0.0),
+            "f__sess_phone_model": clean_cat(last.get("phone_model")) if last else None,
+            "f__sess_network_type": clean_cat(last.get("network_type")) if last else None,
         }
         labels = derive_labels(ld, today=today)
         rows.append({

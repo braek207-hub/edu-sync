@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from sync import ml_features_build as b
 from sync.ml.registry import select_features, feature_key
 from sync.ml.features import build_feature_rows
@@ -13,9 +13,9 @@ def test_assemble_pure(monkeypatch):
         "city_ip_segment": "rf", "direction": "it", "product_group": "vo",
         "utm_source": "yandex", "dispatcher": "Иванова", "responsible": "Петров",
     }]
-    behavior = {"c1": [{"visit_date": date(2024, 12, 31), "visits": 5, "avg_duration_sec": 200.0,
-                        "bounce_rate": 10.0, "page_depth": 3.0, "device": "desktop", "source": "ad"}]}
-    rows, maturation = b.assemble(leads, behavior, deadlines=[date(2025, 8, 20)], today=date(2026, 7, 23))
+    sessions = {"c1": [{"visit_ts": datetime(2024, 12, 31, 10, 0, 0), "visit_duration": 200.0,
+                        "bounce": 0, "page_views": 3.0, "device_category": "desktop", "source_engine": "ad"}]}
+    rows, maturation = b.assemble(leads, sessions, deadlines=[date(2025, 8, 20)], today=date(2026, 7, 23))
     assert rows[0]["label_paid"] is True
     assert rows[0]["features"]["f__missing_behavior"] == 0
     assert rows[0]["features"]["f__time_to_connection_days"] == 1
@@ -64,7 +64,7 @@ def test_registry_feature_keys_present_in_build_feature_rows():
         "lead_id": "L1", "client_id": "c1", "land": "vuz",
         "created_date": date(2025, 1, 1), "created_hour": 10,
     }
-    rows = build_feature_rows([lead], behavior_dated={}, deadlines=[date(2025, 8, 20)],
+    rows = build_feature_rows([lead], sessions={}, deadlines=[date(2025, 8, 20)],
                               today=date(2026, 7, 23))
     features = rows[0]["features"]
     for name in select_features("post_connection"):

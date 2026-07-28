@@ -13,9 +13,11 @@ from sync.ml.maturation import maturation_table
 _CAL = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "edu_admission_calendar.json")
 
 
-def assemble(leads, behavior_dated, deadlines, today):
-    """Чистая часть: строки фич + кривая созревания (по созревшим оплатам)."""
-    rows = build_feature_rows(leads, behavior_dated, deadlines, today)
+def assemble(leads, sessions, deadlines, today):
+    """Чистая часть: строки фич + кривая созревания (по созревшим оплатам).
+    `sessions` — per-visit сессии Метрики Logs API (Task 3/5), а не дневной агрегат:
+    даёт time-aware cutoff по точному visit_ts (same-day визиты ДО заявки учитываются)."""
+    rows = build_feature_rows(leads, sessions, deadlines, today)
     paid_dtp = [r["days_to_pay"] for r in rows
                 if r["is_matured"] and r["label_paid"] and r["days_to_pay"] is not None]
     maturation = maturation_table(paid_dtp, horizon=120)
@@ -26,9 +28,9 @@ def build_edu_features(today: Optional[date] = None) -> dict[str, Any]:
     today = today or date.today()
     db.ensure_ml_feature_tables()
     leads = db.load_vuz_lead_frame()
-    behavior_dated = db.load_vuz_behavior_dated()
+    sessions = db.load_vuz_sessions_dated()
     deadlines = load_admission_deadlines(_CAL)
-    rows, maturation = assemble(leads, behavior_dated, deadlines, today)
+    rows, maturation = assemble(leads, sessions, deadlines, today)
     n = db.upsert_lead_features(rows)
     k = db.replace_ml_maturation("vuz", maturation)
     matured = sum(1 for r in rows if r["is_matured"])

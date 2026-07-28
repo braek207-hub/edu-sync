@@ -23,6 +23,15 @@ def test_load_vuz_behavior_dated_shape():
             assert "visit_date" in r
             assert "visits" in r
 
+def test_load_vuz_sessions_dated_shape():
+    out = db.load_vuz_sessions_dated()
+    assert isinstance(out, dict)
+    for rows in out.values():
+        assert isinstance(rows, list)
+        for r in rows:
+            assert "visit_ts" in r
+            assert "utm_source" in r
+
 def test_upsert_and_maturation_roundtrip():
     db.ensure_ml_feature_tables()
     n = db.upsert_lead_features([{

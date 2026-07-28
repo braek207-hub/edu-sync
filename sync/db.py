@@ -1275,6 +1275,29 @@ def load_vuz_behavior_dated() -> Dict[str, List[Dict[str, Any]]]:
     return out
 
 
+def load_vuz_sessions_dated() -> Dict[str, List[Dict[str, Any]]]:
+    """Per-visit сессии Метрики Logs API (edu_visit_sessions, Task 3) по client_id —
+    для session-aware time-cutoff фич Ф2 (build_feature_rows, Task 5). В отличие от
+    `load_vuz_behavior_dated` (дневной агрегат Reporting API) — точное `visit_ts`,
+    что позволяет учитывать same-day визиты СТРОГО ДО заявки (не только целый день)."""
+    ensure_edu_visit_sessions()
+    sql = """
+        SELECT client_id, visit_ts, visit_duration, bounce, page_views, is_new_user,
+               utm_source, utm_medium, utm_campaign, utm_content, utm_term,
+               first_traffic_source, lastsign_traffic_source, source_engine,
+               direct_platform_type, direct_condition_type, direct_phrase,
+               has_gclid, device_category, phone_model, network_type
+        FROM edu_visit_sessions WHERE client_id IS NOT NULL AND client_id<>''
+    """
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    with get_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql)
+        for r in cur.fetchall():
+            out.setdefault(r["client_id"], []).append(dict(r))
+    return out
+
+
 def upsert_lead_features(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0

@@ -50,7 +50,7 @@ def test_build_rows_missing_behavior_flagged():
         "utm_source": "yandex", "connection_date": None,
         "dispatcher": None, "responsible": None,
     }]
-    rows = build_feature_rows(leads, behavior_dated={}, deadlines=[date(2026, 8, 20)], today=date(2026, 7, 23))
+    rows = build_feature_rows(leads, sessions={}, deadlines=[date(2026, 8, 20)], today=date(2026, 7, 23))
     assert len(rows) == 1
     feats = rows[0]["features"]
     assert feats["f__missing_behavior"] == 1
@@ -60,6 +60,9 @@ def test_build_rows_missing_behavior_flagged():
 
 
 def test_timing_and_time_aware_behavior():
+    """Ф2 (Task 5): behavior_dated (дневной агрегат) → sessions (per-visit, точный
+    visit_ts). Дни 8/9 разложены на отдельные визиты (2+1), день 12 — после created_ts
+    (13:30) → исключён, как раньше исключался день целиком."""
     lead = {
         "lead_id": "L1", "client_id": "c1", "land": "vuz",
         "created_date": date(2026, 6, 10),
@@ -71,12 +74,13 @@ def test_timing_and_time_aware_behavior():
         "city_ip_segment": "rf", "direction": "it", "product_group": None,
         "utm_source": None, "dispatcher": "Иванова", "responsible": "П", "campaign_id": "114",
     }
-    behavior_dated = {"c1": [
-        {"visit_date": date(2026, 6, 8), "visits": 2, "avg_duration_sec": 100, "bounce_rate": 0, "page_depth": 2, "device": "desktop", "source": "ad"},
-        {"visit_date": date(2026, 6, 9), "visits": 1, "avg_duration_sec": 50, "bounce_rate": 0, "page_depth": 1, "device": "desktop", "source": "ad"},
-        {"visit_date": date(2026, 6, 12), "visits": 5, "avg_duration_sec": 300, "bounce_rate": 0, "page_depth": 3, "device": "desktop", "source": "ad"},  # ПОСЛЕ заявки — не учитывать
+    sessions = {"c1": [
+        {"visit_ts": datetime(2026, 6, 8, 9, 0, 0), "visit_duration": 100, "bounce": 0, "page_views": 2, "device_category": "desktop", "source_engine": "ad"},
+        {"visit_ts": datetime(2026, 6, 8, 10, 0, 0), "visit_duration": 100, "bounce": 0, "page_views": 2, "device_category": "desktop", "source_engine": "ad"},
+        {"visit_ts": datetime(2026, 6, 9, 9, 0, 0), "visit_duration": 50, "bounce": 0, "page_views": 1, "device_category": "desktop", "source_engine": "ad"},
+        {"visit_ts": datetime(2026, 6, 12, 9, 0, 0), "visit_duration": 300, "bounce": 0, "page_views": 3, "device_category": "desktop", "source_engine": "ad"},  # ПОСЛЕ заявки — не учитывать
     ]}
-    rows = build_feature_rows([lead], behavior_dated=behavior_dated, deadlines=[date(2026, 8, 20)], today=date(2026, 7, 23))
+    rows = build_feature_rows([lead], sessions=sessions, deadlines=[date(2026, 8, 20)], today=date(2026, 7, 23))
     f = rows[0]["features"]
     assert f["f__visits_before_lead"] == 3          # 2+1 до 10-го, 12-е исключено
     assert f["f__sessions_before"] == 2             # 2 дня с визитами до заявки
