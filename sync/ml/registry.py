@@ -51,6 +51,23 @@ REGISTRY: list[FeatureSpec] = [
     FeatureSpec("dispatcher", "post_connection", "cat"),
     FeatureSpec("responsible", "post_connection", "cat"),
     FeatureSpec("mins_to_connection", "post_connection", "num"),
+    # Ф2 (Task 4) — per-visit сессии из Logs API (edu_visit_sessions, Task 3).
+    # UTM/Директ визита известны на клике ДО заявки, но описывают саму заявку → at_creation.
+    # first_traffic/is_new_user/устройство — история поведения ДО заявки → pre_lead.
+    FeatureSpec("sess_is_new_user", "pre_lead", "num"),
+    FeatureSpec("sess_utm_source", "at_creation", "cat"),
+    FeatureSpec("sess_utm_medium", "at_creation", "cat"),
+    FeatureSpec("sess_utm_campaign", "at_creation", "cat"),
+    FeatureSpec("sess_utm_content", "at_creation", "cat"),
+    FeatureSpec("sess_utm_term", "at_creation", "cat"),
+    FeatureSpec("sess_first_traffic_source", "pre_lead", "cat"),
+    FeatureSpec("sess_source_engine", "pre_lead", "cat"),
+    FeatureSpec("sess_direct_platform_type", "at_creation", "cat"),
+    FeatureSpec("sess_direct_condition_type", "at_creation", "cat"),
+    FeatureSpec("sess_direct_phrase_bucket", "at_creation", "cat"),
+    FeatureSpec("sess_has_gclid", "at_creation", "num"),
+    FeatureSpec("sess_phone_model", "pre_lead", "cat"),
+    FeatureSpec("sess_network_type", "pre_lead", "cat"),
 ]
 
 

@@ -33,3 +33,15 @@ def test_phase2_features_registered():
     assert "visits_before_lead" in atc         # pre_lead виден @creation
     assert "mins_to_connection" not in atc      # post_connection
     assert "mins_to_connection" in pc
+
+def test_phaseb_session_features_registered():
+    atc = set(select_features("at_creation"))
+    pre = set(select_features("pre_lead"))
+    assert "sess_utm_source" in atc
+    assert "sess_direct_platform_type" in atc
+    assert all(
+        spec.availability != "outcome"
+        for spec in REGISTRY
+        if spec.name in atc
+    )
+    assert "sess_is_new_user" in pre
