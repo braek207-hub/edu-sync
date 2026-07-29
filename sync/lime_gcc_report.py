@@ -77,7 +77,7 @@ SELECT date::text AS d, country, traffic_type,
        COALESCE(SUM(sessions), 0)::bigint        AS sessions,
        COALESCE(SUM(purchases_count), 0)::bigint AS orders
 FROM lime_stats
-WHERE region = 'gcc' AND data_source = 'web' AND date = ANY(%s)
+WHERE region = 'gcc' AND data_source = 'web' AND date = ANY(%s::date[])
 GROUP BY date, country, traffic_type
 """
 
