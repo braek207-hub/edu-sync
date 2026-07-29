@@ -143,7 +143,8 @@ def order_country(order: dict) -> str | None:
 
 def aggregate_orders_by_channel(orders: list[dict], date: str,
                                 country_by_order: dict[str, str | None] | None = None,
-                                exclude_orders: set[str] | None = None) -> list[dict]:
+                                exclude_orders: set[str] | None = None,
+                                only_orders: set[str] | None = None) -> list[dict]:
     """Свернуть заказы attribution-эндпоинта в строки заказы/выручка по каналу и стране.
 
     Args:
@@ -162,9 +163,12 @@ def aggregate_orders_by_channel(orders: list[dict], date: str,
     skip = exclude_orders or set()
     agg: dict[tuple[str | None, str | None, str, str, str], dict] = {}
     for order in orders:
-        # App-заказы (чекаут через тот же Shopify) считаются в app из AppMetrica —
-        # из web-счёта их выкидываем, иначе двойной счёт в «Общем».
-        if str(order.get("order_id") or "") in skip:
+        oid0 = str(order.get("order_id") or "")
+        # only_orders — оставить только эти (app-срез); exclude_orders — выкинуть (web-срез,
+        # чтобы app-заказы не задвоились). Канал web/app берём из Shopify (в TW его нет).
+        if only_orders is not None and oid0 not in only_orders:
+            continue
+        if oid0 in skip:
             continue
         touchpoint = order_touchpoint(order)
         src = touchpoint.get("source") or None
@@ -174,8 +178,7 @@ def aggregate_orders_by_channel(orders: list[dict], date: str,
         raw_campaign = (touchpoint.get("campaignId") or "").strip() or None
         is_referrer = (src or "").lower() == "organic_and_social"
         channel, subchannel, traffic_type = map_tw_source(src, raw_campaign)
-        oid = str(order.get("order_id") or "")
-        country = ship[oid] if oid in ship else order_country(order)
+        country = ship[oid0] if oid0 in ship else order_country(order)
         campaign = None if is_referrer else raw_campaign
         key = (country, campaign, channel, subchannel, traffic_type)
         row = agg.setdefault(

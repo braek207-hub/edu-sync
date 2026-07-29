@@ -165,6 +165,24 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
     return out
 
 
+def app_order_rows(app_agg: list[dict], fx_rate: float, date_s: str) -> list[tuple]:
+    """Заказы приложения (Shopify app-канал) → строки lime_stats data_source='app'.
+
+    Только заказы/выручка (трафика тут нет — app-трафик считает AppMetrica). Атрибуция
+    (paid/organic) и страна доставки — те же, что у web (из TW/Shopify), но канал app.
+    """
+    out: list[tuple] = []
+    for o in app_agg:
+        out.append((
+            date_s, "app", "gcc", o.get("country"), o["channel"], o["subchannel"],
+            o.get("traffic_type"), o.get("campaign"), "",
+            0.0, 0, 0, 0, 0, 0,                                    # cost, clicks, impressions, sessions, users, clients
+            int(o["orders"] or 0), round(float(o["revenue"] or 0) * fx_rate, 2), 0,
+            0, 0, 0.0, None, None, 0, 0,
+        ))
+    return out
+
+
 DEADLOCK_RETRIES = 4
 DEADLOCK_BACKOFF_SEC = 3
 
@@ -277,8 +295,13 @@ def _sync_range(frm: date, to: date, conn) -> int:
     while day <= to:
         day_s = day.isoformat()
         metrika = metrika_by_day.get(day_s, [])
-        orders = aggregate_orders_by_channel(fetch_tw_orders(tw_key, shop, day_s, day_s), day_s,
+        tw_orders_raw = fetch_tw_orders(tw_key, shop, day_s, day_s)
+        # web-срез (Online Store, app исключён) и app-срез (только app-канал) — оба с
+        # TW-атрибуцией и Shopify-страной. Канал web/app знает только Shopify.
+        orders = aggregate_orders_by_channel(tw_orders_raw, day_s,
                                              country_by_order=shopify_country, exclude_orders=app_orders)
+        app_ord = aggregate_orders_by_channel(tw_orders_raw, day_s,
+                                              country_by_order=shopify_country, only_orders=app_orders)
         tw_metrics = fetch_tw_spend(tw_key, shop, day_s)
         # Расход Google берём из кабинета (разложен по странам), если Script там уже стоит;
         # тогда ga_adCost из TW выбрасываем — иначе один и тот же расход посчитается дважды.
@@ -296,6 +319,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
         fx_rate = fx_to_rub("AED", day_s)
         rows = merge_rows(metrika, orders, spend, fx_rate, day_s,
                           rub_spend_rows=google_geo, campaign_index=campaign_index)
+        rows += app_order_rows(app_ord, fx_rate, day_s)
 
         if conn is None:
             i_country = COLUMNS.index("country")

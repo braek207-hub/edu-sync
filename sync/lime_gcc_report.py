@@ -100,34 +100,43 @@ def _empty_day() -> dict:
     return {scope: _empty_metrics() for scope in _SCOPES}
 
 
-_WEB_SQL = """
-SELECT date::text AS d, country, traffic_type,
+_STATS_SQL = """
+SELECT date::text AS d, data_source, country, traffic_type,
        COALESCE(SUM(sessions), 0)::bigint        AS sessions,
        COALESCE(SUM(purchases_count), 0)::bigint AS orders
 FROM lime_stats
-WHERE region = 'gcc' AND data_source = 'web' AND date = ANY(%s::date[])
-GROUP BY date, country, traffic_type
+WHERE region = 'gcc' AND data_source IN ('web','app') AND date = ANY(%s::date[])
+GROUP BY date, data_source, country, traffic_type
 """
 
 
 def fetch_web(conn, dates: list[str]) -> tuple[dict, dict]:
-    """(traffic, orders): date → {scope → metrics}. web_org/web_paid из lime_stats.
+    """(traffic, orders): date → {scope → metrics} из lime_stats.
 
-    GCC-срез = весь регион (в т.ч. country=NULL); коды — только 5 узнаваемых стран.
-    App-метрики остаются 0 (ФАЗА 2). traffic = sessions, orders = purchases_count.
+    web-строки: sessions → web-трафик, purchases → web-заказы.
+    app-строки (data_source='app'): purchases → app-ЗАКАЗЫ (у них sessions=0; app-трафик
+    считает AppMetrica отдельно и доливается в _run). GCC-срез = весь регион (в т.ч.
+    country=NULL); коды — только 5 узнаваемых стран.
     """
     traffic = {d: _empty_day() for d in dates}
     orders = {d: _empty_day() for d in dates}
     with conn.cursor() as cur:
-        cur.execute(_WEB_SQL, (dates,))
-        for d, country, ttype, sess, ords in cur.fetchall():
-            field = "web_paid" if ttype == "Платный" else "web_org"
+        cur.execute(_STATS_SQL, (dates,))
+        for d, ds, country, ttype, sess, ords in cur.fetchall():
+            paid = ttype == "Платный"
             code = _COUNTRY_CODE.get((country or "").strip())
-            for metric_map, val in ((traffic, sess), (orders, ords)):
-                day = metric_map[d]
-                day[_GCC][field] += int(val)
+            if ds == "web":
+                field = "web_paid" if paid else "web_org"
+                for metric_map, val in ((traffic, sess), (orders, ords)):
+                    day = metric_map[d]
+                    day[_GCC][field] += int(val)
+                    if code:
+                        day[code][field] += int(val)
+            else:  # app-заказы (TW-атрибуция + Shopify канал/страна)
+                field = "app_paid" if paid else "app_org"
+                orders[d][_GCC][field] += int(ords)
                 if code:
-                    day[code][field] += int(val)
+                    orders[d][code][field] += int(ords)
     return traffic, orders
 
 
@@ -191,10 +200,11 @@ def _run(service, dates: list[str], mode: str) -> None:
 
     if os.environ.get("APPMETRICA_TOKEN"):
         from sync.gcc_app import fetch_app
+        # AppMetrica — ТОЛЬКО app-трафик (sessions): заказы она недосчитывает (~43%),
+        # app-заказы берём из lime_stats (TW-атрибуция + Shopify канал/страна).
         app_dates = dates if len(dates) <= APP_BACKFILL else dates[-APP_BACKFILL:]
-        ta, oa = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
+        ta, _ = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
         _merge_app(traffic, ta)
-        _merge_app(orders, oa)
     else:
         print("gcc_app: APPMETRICA_TOKEN не задан — app-колонки остаются 0")
 

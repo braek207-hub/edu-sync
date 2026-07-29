@@ -208,6 +208,21 @@ def test_exclude_app_orders_from_web():
     assert abs(sum(r["revenue"] for r in rows) - 100) < 0.01
 
 
+def test_only_orders_keeps_app_slice():
+    """only_orders оставляет ТОЛЬКО эти заказы (app-срез) — зеркало exclude_orders."""
+    orders = [
+        {"order_id": 111, "total_price": 100,
+         "attribution": {"lastPlatformClick": [{"source": "google-ads"}]},
+         "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}]},
+        {"order_id": 999, "total_price": 500,
+         "attribution": {"lastPlatformClick": [{"source": "facebook-ads"}]},
+         "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}]},
+    ]
+    rows = aggregate_orders_by_channel(orders, "2026-07-17", only_orders={"999"})
+    assert sum(r["orders"] for r in rows) == 1          # только 999 (app)
+    assert abs(sum(r["revenue"] for r in rows) - 500) < 0.01
+
+
 def test_shopify_none_stays_none_not_domain():
     """Заказ в мапе со значением None (доставка вне Залива) → None, НЕ fallback на домен."""
     orders = [{"order_id": 333, "total_price": 50,

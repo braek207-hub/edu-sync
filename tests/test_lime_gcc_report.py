@@ -51,23 +51,30 @@ def test_scope_cols_order():
 
 def test_fetch_web_splits_scopes_and_paid_organic():
     rows = [
-        ("2026-07-28", "ОАЭ", "Платный", 100, 5),
-        ("2026-07-28", "ОАЭ", "Бесплатный", 40, 2),
-        ("2026-07-28", "Саудовская Аравия", "Платный", 30, 1),
-        ("2026-07-28", None, "Бесплатный", 7, 3),   # без страны → только GCC
+        # date, data_source, country, traffic_type, sessions, orders
+        ("2026-07-28", "web", "ОАЭ", "Платный", 100, 5),
+        ("2026-07-28", "web", "ОАЭ", "Бесплатный", 40, 2),
+        ("2026-07-28", "web", "Саудовская Аравия", "Платный", 30, 1),
+        ("2026-07-28", "web", None, "Бесплатный", 7, 3),   # без страны → только GCC
+        # app-строки: sessions=0, заказы → app_org/app_paid ЗАКАЗОВ (не трафика)
+        ("2026-07-28", "app", "ОАЭ", "Платный", 0, 4),
+        ("2026-07-28", "app", "ОАЭ", "Бесплатный", 0, 6),
     ]
     traffic, orders = fetch_web(FakeConn(rows), ["2026-07-28"])
     t = traffic["2026-07-28"]
     assert t[_GCC]["web_paid"] == 130      # 100 + 30
     assert t[_GCC]["web_org"] == 47        # 40 + 7(null)
     assert t["UAE"]["web_paid"] == 100
-    assert t["UAE"]["web_org"] == 40
-    assert t["KSA"]["web_paid"] == 30
-    assert t["UAE"]["app_org"] == 0        # app — Фаза 2
+    assert t["UAE"]["app_org"] == 0        # app-трафик из lime_stats НЕ берём (только AppMetrica)
     o = orders["2026-07-28"]
     assert o[_GCC]["web_paid"] == 6        # 5 + 1
     assert o[_GCC]["web_org"] == 5         # 2 + 3(null)
     assert o["UAE"]["web_org"] == 2
+    # app-ЗАКАЗЫ из data_source='app'
+    assert o["UAE"]["app_paid"] == 4
+    assert o["UAE"]["app_org"] == 6
+    assert o[_GCC]["app_paid"] == 4
+    assert o[_GCC]["app_org"] == 6
 
 
 def test_row_values_derives_totals():
