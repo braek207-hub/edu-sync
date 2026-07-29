@@ -504,6 +504,23 @@ def attr_compare() -> None:
         print("lastPlatformClick:", json.dumps(a.get("lastPlatformClick"), ensure_ascii=False)[:400])
         print("linearAll:", json.dumps(a.get("linearAll"), ensure_ascii=False)[:800])
 
+    # lastPlatformClick: весь заказ источнику [0]. linearAll: 1/N на касание (поля веса нет).
+    meta_last = meta_linear = total = 0.0
+    for o in tw:
+        total += 1
+        a = o.get("attribution") or {}
+        lpc = a.get("lastPlatformClick") or []
+        if lpc and src(lpc[0]) == "facebook-ads":
+            meta_last += 1
+        la = a.get("linearAll") or []
+        if la:
+            n_meta = sum(1 for tp in la if src(tp) == "facebook-ads")
+            meta_linear += n_meta / len(la)
+    print(f"\nвсего заказов: {int(total)}")
+    print(f"Meta lastPlatformClick (наша): {meta_last:.0f}")
+    print(f"Meta linearAll (TW UI):        {meta_linear:.1f}")
+    print(f"больше при: {'lastPlatformClick' if meta_last > meta_linear else 'linearAll'}")
+
 
 def main() -> None:
     mode = os.environ.get("LIME_GCC_MODE") or "refresh"
