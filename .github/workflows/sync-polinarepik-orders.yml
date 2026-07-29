@@ -1,0 +1,37 @@
+name: Sync Polina Repik Orders → Panda-BI
+
+on:
+  schedule:
+    # 03:00 UTC = 06:00 Moscow — после закрытия их суток, окно «изменённые за вчера»
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: polinarepik-orders-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests==2.31.0
+
+      - name: Run orders sync
+        env:
+          POLINAREPIK_ORDERS_API_KEY: ${{ secrets.POLINAREPIK_ORDERS_API_KEY }}
+          POLINAREPIK_INGEST_TOKEN: ${{ secrets.POLINAREPIK_INGEST_TOKEN }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.polinarepik_orders
+
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate || true
