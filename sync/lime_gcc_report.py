@@ -387,8 +387,33 @@ def app_orders_check() -> None:
         print(f"{d}  {shop_by_day.get(d, 0):>8} {am_d:>11}")
 
 
+def tw_shopify_check() -> None:
+    """Сходятся ли заказы TW и Shopify по order_id, и есть ли app-заказы в TW. Read-only."""
+    from sync.gcc_shopify import fetch_order_sources
+    from sync.gcc_triplewhale import fetch_tw_orders
+
+    frm, to = "2026-07-19", "2026-07-28"
+    tw = fetch_tw_orders(os.environ["GCC_TRIPLEWHALE_API_KEY"], os.environ["GCC_TW_SHOP_DOMAIN"], frm, to)
+    tw_ids = {str(o.get("order_id") or "") for o in tw}
+    src = fetch_order_sources(os.environ["API_LIME_SHOPIFY"], frm, to)
+    shop_ids = {r["order_id"] for r in src}
+    app_ids = {r["order_id"] for r in src if r["app"] != "Online Store"}
+    web_ids = {r["order_id"] for r in src if r["app"] == "Online Store"}
+    print(f"TW заказов: {len(tw_ids)}")
+    print(f"Shopify заказов: {len(shop_ids)} (web {len(web_ids)}, app {len(app_ids)})")
+    print(f"app-заказов Shopify, попавших в TW: {len(app_ids & tw_ids)} из {len(app_ids)}")
+    print(f"web-заказов Shopify в TW: {len(web_ids & tw_ids)} из {len(web_ids)}")
+    print(f"в TW, но нет в Shopify: {len(tw_ids - shop_ids)}")
+    print(f"в Shopify, но нет в TW: {len(shop_ids - tw_ids)}")
+    ex = next(iter(tw_ids), None)
+    print(f"пример order_id из TW: {ex!r} (формат — сверить с Shopify numeric)")
+
+
 def main() -> None:
     mode = os.environ.get("LIME_GCC_MODE") or "refresh"
+    if mode == "tw-shopify-check":  # сверка заказов TW vs Shopify
+        tw_shopify_check()
+        return
     if mode == "app-orders-check":  # сверка app-заказов Shopify vs AppMetrica
         app_orders_check()
         return
