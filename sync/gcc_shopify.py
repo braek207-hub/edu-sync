@@ -93,16 +93,21 @@ def _post(token: str, variables: dict, query: str | None = None) -> dict:
 
 _SOURCE_QUERY = """
 query($q: String!, $after: String) {
-  orders(first: 250, query: $q, after: $after, sortKey: CREATED_AT) {
+  orders(first: 100, query: $q, after: $after, sortKey: CREATED_AT) {
     pageInfo { hasNextPage endCursor }
-    edges { node { id sourceName app { name } shippingAddress { countryCodeV2 } } }
+    edges { node {
+      id name createdAt sourceName
+      app { name }
+      channelInformation { channelDefinition { channelName handle } }
+      shippingAddress { countryCodeV2 }
+    } }
   }
 }
 """
 
 
 def fetch_order_sources(token: str, date_from: str, date_to: str) -> list[dict]:
-    """Диагностика: [{order_id, source, app, country}] — понять, тегируется ли app-канал."""
+    """Диагностика: [{order_id, name, created, source, app, channel, country}]."""
     q = f"created_at:>={date_from} created_at:<={date_to}"
     out, after = [], None
     while True:
@@ -110,10 +115,14 @@ def fetch_order_sources(token: str, date_from: str, date_to: str) -> list[dict]:
         conn = data["orders"]
         for e in conn["edges"]:
             n = e["node"]
+            ch = (((n.get("channelInformation") or {}).get("channelDefinition")) or {})
             out.append({
                 "order_id": _order_id(n["id"]),
+                "name": n.get("name"),
+                "created": (n.get("createdAt") or "")[:10],
                 "source": n.get("sourceName"),
                 "app": (n.get("app") or {}).get("name"),
+                "channel": ch.get("channelName") or ch.get("handle"),
                 "country": ((n.get("shippingAddress") or {}).get("countryCodeV2")),
             })
         if conn["pageInfo"]["hasNextPage"]:

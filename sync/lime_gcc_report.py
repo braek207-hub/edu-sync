@@ -349,7 +349,7 @@ def app_orders_check() -> None:
     from collections import Counter
 
     from sync.gcc_app import _GCC, ISO_CODE, fetch_app
-    from sync.gcc_shopify import fetch_order_meta
+    from sync.gcc_shopify import fetch_order_meta, fetch_order_sources
 
     frm, to = "2026-07-19", "2026-07-28"
     country, app_ids = fetch_order_meta(os.environ["API_LIME_SHOPIFY"], frm, to)
@@ -357,6 +357,15 @@ def app_orders_check() -> None:
     for oid in app_ids:
         shop[_COUNTRY_CODE.get((country.get(oid) or "").strip(), "прочее")] += 1
     print(f"Shopify app-канал: {sum(shop.values())} заказов за {frm}..{to}")
+
+    # что это за заказы: распределение app/channel + примеры номеров для проверки в Shopify
+    src = fetch_order_sources(os.environ["API_LIME_SHOPIFY"], frm, to)
+    print("app:", Counter((r["app"] or "∅") for r in src).most_common())
+    print("channel:", Counter((r["channel"] or "∅") for r in src).most_common())
+    print("sourceName:", Counter((r["source"] or "∅") for r in src).most_common())
+    print("\nпримеры app-заказов (открой в Shopify):")
+    for r in [x for x in src if x["app"] != "Online Store"][:12]:
+        print(f"  {r['name']} | {r['created']} | {r['country']} | app={r['app']} | channel={r['channel']}")
 
     dates = _dates(date.fromisoformat(frm), date.fromisoformat(to))
     _, orders = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, dates)
