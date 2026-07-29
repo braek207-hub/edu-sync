@@ -375,9 +375,16 @@ def app_orders_check() -> None:
             am[code] += orders[d][code]["app_org"] + orders[d][code]["app_paid"]
     am_total = sum(orders[d][_GCC]["app_org"] + orders[d][_GCC]["app_paid"] for d in dates)
     print(f"AppMetrica app-заказы (GCC): {am_total}")
-    print(f"\n{'страна':<8} {'Shopify':>8} {'AppMetrica':>11}")
+    print(f"\nПО СТРАНАМ  {'Shopify':>8} {'AppMetrica':>11}")
     for code in list(ISO_CODE.values()) + ["прочее"]:
-        print(f"{code:<8} {shop.get(code, 0):>8} {am.get(code, 0):>11}")
+        print(f"{code:<10} {shop.get(code, 0):>8} {am.get(code, 0):>11}")
+
+    # ПО ДНЯМ: Shopify app-канал (по createdAt) vs AppMetrica (GCC)
+    shop_by_day = Counter(r["created"] for r in src if r["app"] != "Online Store")
+    print(f"\nПО ДНЯМ     {'Shopify':>8} {'AppMetrica':>11}")
+    for d in dates:
+        am_d = sum(orders[d][c]["app_org"] + orders[d][c]["app_paid"] for c in ISO_CODE.values())
+        print(f"{d}  {shop_by_day.get(d, 0):>8} {am_d:>11}")
 
 
 def main() -> None:
