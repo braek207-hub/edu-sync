@@ -39,19 +39,28 @@ def _export(endpoint: str, params: dict, token: str) -> list[dict]:
     raise TimeoutError(f"Logs API {endpoint}: файл не готов за отведённое время")
 
 
-def fetch_installations(app_id: str, token: str, date_since: str, date_until: str) -> list[dict]:
+# Гео для GCC-разреза (по стране). AppMetrica отдаёт ISO-код страны события/установки.
+_GEO = ",city,country_iso_code"
+
+# Сессии (app-трафик = sessions, не installs). У сессии нет publisher (источник —
+# атрибут установки), поэтому paid/organic сессий берётся джойном device → install.
+SESSION_FIELDS = "appmetrica_device_id,session_start_datetime"
+
+
+def fetch_installations(app_id: str, token: str, date_since: str, date_until: str,
+                        country: bool = False) -> list[dict]:
     params = {
         "application_id": app_id,
         "date_since": f"{date_since} 00:00:00",
         "date_until": f"{date_until} 23:59:59",
         "date_dimension": "default",  # время события установки
-        "fields": INSTALL_FIELDS,
+        "fields": INSTALL_FIELDS + (_GEO if country else ""),
     }
     return _export("installations", params, token)
 
 
 def fetch_purchase_events(app_id: str, token: str, date_since: str, date_until: str,
-                          event_name: str) -> list[dict]:
+                          event_name: str, country: bool = False) -> list[dict]:
     params = {
         "application_id": app_id,
         "date_since": f"{date_since} 00:00:00",
@@ -61,7 +70,20 @@ def fetch_purchase_events(app_id: str, token: str, date_since: str, date_until: 
         # из-за сдвига границы месяца; с 'receive' VK совпадает точно (206), остальные
         # в пределах 0.3-0.4% (остаток — антифрод-фильтрация отчётов, в сыром логе её нет).
         "date_dimension": "receive",
-        "fields": EVENT_FIELDS,
+        "fields": EVENT_FIELDS + (_GEO if country else ""),
         "event_name": event_name,  # серверный фильтр по имени события
     }
     return _export("events", params, token)
+
+
+def fetch_sessions(app_id: str, token: str, date_since: str, date_until: str,
+                   country: bool = False) -> list[dict]:
+    """Старты сессий (app-трафик). date_dimension=default — время старта сессии."""
+    params = {
+        "application_id": app_id,
+        "date_since": f"{date_since} 00:00:00",
+        "date_until": f"{date_until} 23:59:59",
+        "date_dimension": "default",
+        "fields": SESSION_FIELDS + (_GEO if country else ""),
+    }
+    return _export("sessions_starts", params, token)

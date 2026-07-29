@@ -282,6 +282,10 @@ def main() -> None:
     from sync.sheets_write import get_write_service
 
     mode = os.environ.get("LIME_GCC_MODE") or "refresh"
+    if mode == "app-probe":  # разведка AppMetrica GCC (Фаза 2), Sheets не нужен
+        from sync.probe_gcc_app import main as app_probe
+        app_probe()
+        return
     service = get_write_service()
     if mode == "probe":
         probe(service)

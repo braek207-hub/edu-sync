@@ -51,6 +51,7 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          APPMETRICA_TOKEN: ${{ secrets.APPMETRICA_TOKEN }}   # аккаунтовый — видит и app 6299245
           LIME_GCC_MODE: ${{ github.event.inputs.mode || 'refresh' }}
           LIME_GCC_REFRESH_DAYS: ${{ github.event.inputs.refresh_days || '7' }}
           LIME_GCC_FROM: ${{ github.event.inputs.gcc_from }}
