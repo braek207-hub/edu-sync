@@ -36,6 +36,13 @@ ORDERS_TAB = os.environ.get("LIME_GCC_ORDERS_TAB") or "Fact Orders GCC"
 REFRESH_DAYS = int(os.environ.get("LIME_GCC_REFRESH_DAYS") or "7")
 BUILD_FROM = os.environ.get("LIME_GCC_FROM") or "2025-08-01"
 
+# APP (AppMetrica app 6299245, LIME International — мультистрановое, фильтр по Заливу).
+APP_ID = os.environ.get("GCC_APP_ID") or "6299245"
+# Сессии за всю историю тянуть непрактично → app наливаем окном: refresh(7д) целиком,
+# build — последние APP_BACKFILL дней. Web-история при этом полная.
+APP_BACKFILL = int(os.environ.get("LIME_GCC_APP_BACKFILL_DAYS") or "30")
+APP_LOOKBACK = int(os.environ.get("LIME_GCC_APP_LOOKBACK_DAYS") or "90")
+
 # lime_stats хранит страну по-русски; книга — кодами Залива (без BH — Павел подтвердил).
 _COUNTRY_CODE = {
     "ОАЭ": "UAE",
@@ -167,16 +174,34 @@ def _col_letter(idx0: int) -> str:
     return s
 
 
+def _merge_app(dst: dict, app: dict) -> None:
+    """Долить app_org/app_paid из app-агрегата в дневные срезы (web уже заполнен)."""
+    for iso, day in app.items():
+        for scope, m in day.items():
+            dst[iso][scope]["app_org"] += m["app_org"]
+            dst[iso][scope]["app_paid"] += m["app_paid"]
+
+
 def _run(service, dates: list[str], mode: str) -> None:
     conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
     try:
         traffic, orders = fetch_web(conn, dates)
     finally:
         conn.close()
+
+    if os.environ.get("APPMETRICA_TOKEN"):
+        from sync.gcc_app import fetch_app
+        app_dates = dates if len(dates) <= APP_BACKFILL else dates[-APP_BACKFILL:]
+        ta, oa = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
+        _merge_app(traffic, ta)
+        _merge_app(orders, oa)
+    else:
+        print("gcc_app: APPMETRICA_TOKEN не задан — app-колонки остаются 0")
+
     for iso in dates:
-        g = traffic[iso][_GCC]
-        print(f"{iso}: web-трафик org={g['web_org']} paid={g['web_paid']} | "
-              f"заказы org={orders[iso][_GCC]['web_org']} paid={orders[iso][_GCC]['web_paid']}")
+        g, go = traffic[iso][_GCC], orders[iso][_GCC]
+        print(f"{iso}: трафик web {g['web_org']}/{g['web_paid']} app {g['app_org']}/{g['app_paid']} | "
+              f"заказы web {go['web_org']}/{go['web_paid']} app {go['app_org']}/{go['app_paid']}")
     for tab, data in ((TRAFFIC_TAB, traffic), (ORDERS_TAB, orders)):
         if mode == "build":
             _build_tab(service, tab, dates, data)
