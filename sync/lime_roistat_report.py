@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """sync/lime_roistat_report.py — визиты и продажи Роистата (LIME) → Google-таблица.
 
-Отдельная задача с собственным кроном (5:00 МСК), НЕ связана с lime_kz_roistat →
-Supabase: у отчёта своя судьба и свои поломки, их проще чинить в изоляции.
+Отдельная задача с собственным кроном (02:44 МСК — раньше 5:00 с запасом на задержку
+планировщика GitHub), НЕ связана с lime_kz_roistat → Supabase: своя судьба, чинить в изоляции.
 
 Считает по дню:
   • визиты платные / бесплатные / всего — free/paid берём из roistat_channels.map_*;
@@ -34,10 +34,16 @@ from __future__ import annotations
 import os
 import re
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from sync.roistat_api import fetch_day
 from sync.roistat_channels import PAID, map_roistat_channel
+
+# Отчёт живёт в московских датах (крон 02:44 МСK = 23:44 UTC пред. дня — стартуем
+# раньше, компенсируя задержку планировщика GitHub). Раннер в UTC, поэтому «вчера»
+# считаем по Москве, иначе до полуночи UTC окно отставало бы на день. МСК=UTC+3 без DST.
+def _msk_today() -> date:
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).date()
 
 # Дата в книге отформатирована как «Сб 04.07.2026» — тянем из неё DD.MM.YYYY.
 _DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
@@ -226,7 +232,7 @@ def _sync_dates() -> list[str]:
     if frm_env and to_env:
         frm, to = date.fromisoformat(frm_env), date.fromisoformat(to_env)
     else:
-        to = date.today() - timedelta(days=1)
+        to = _msk_today() - timedelta(days=1)
         frm = to - timedelta(days=DAYS_BACK - 1)
     out, d = [], frm
     while d <= to:
@@ -295,7 +301,7 @@ def write_traffic(service, day_to_agg: dict[str, dict]) -> int:
 def _build_dates() -> list[str]:
     """Окно build: [BUILD_FROM; TO] (TO = LIME_REPORT_TO или вчера)."""
     to_env = os.environ.get("LIME_REPORT_TO")
-    to = date.fromisoformat(to_env) if to_env else date.today() - timedelta(days=1)
+    to = date.fromisoformat(to_env) if to_env else _msk_today() - timedelta(days=1)
     d, out = date.fromisoformat(BUILD_FROM), []
     while d <= to:
         out.append(d.isoformat())
@@ -432,7 +438,7 @@ def refresh(service) -> None:
 
     layouts = {tab: list(_tab_layout(service, tab)) for tab in (TRAFFIC_TAB, ORDERS_TAB)}
 
-    to = date.today() - timedelta(days=1)
+    to = _msk_today() - timedelta(days=1)
     frm = to - timedelta(days=REFRESH_DAYS - 1)
 
     updates: list[tuple[str, list[list]]] = []

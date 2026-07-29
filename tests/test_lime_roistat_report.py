@@ -148,6 +148,15 @@ def test_existing_row_skips_formula_cells():
     assert cells[f"{TRAFFIC_TAB}!D29"] == [[100]]  # платный записан
 
 
+def test_msk_today_is_utc_plus_3():
+    """Окно считаем по московской дате (крон 23:44 UTC = 02:44 МСК): раннер в UTC,
+    иначе до полуночи UTC «вчера» отставал бы на день."""
+    from datetime import datetime, timedelta, timezone
+
+    from sync.lime_roistat_report import _msk_today
+    assert _msk_today() == (datetime.now(timezone.utc) + timedelta(hours=3)).date()
+
+
 def test_new_row_fills_date_year_month():
     """Новая дата пишется целиком: Дата/Год/Месяц тоже (формул на пустой строке нет)."""
     ups = _day_cell_updates(TRAFFIC_TAB, "2026-07-28", _AGG, _SHIFTED_COLS,
