@@ -52,10 +52,10 @@ _RETRIES = int(os.environ.get("GCC_SHOPIFY_RETRIES") or "4")
 _BACKOFF = int(os.environ.get("GCC_SHOPIFY_BACKOFF") or "3")
 
 
-def _post(token: str, variables: dict) -> dict:
+def _post(token: str, variables: dict, query: str | None = None) -> dict:
     """POST GraphQL с ретраем 429/5xx (throttling Shopify) и разбором ошибок."""
     url = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
-    body = json.dumps({"query": _QUERY, "variables": variables}).encode("utf-8")
+    body = json.dumps({"query": query or _QUERY, "variables": variables}).encode("utf-8")
     for attempt in range(1, _RETRIES + 1):
         req = urllib.request.Request(
             url, data=body, method="POST",
@@ -84,6 +84,38 @@ def _post(token: str, variables: dict) -> dict:
             raise RuntimeError(f"Shopify GraphQL errors: {str(errs)[:300]}")
         return data["data"]
     raise RuntimeError("Shopify: исчерпаны попытки")
+
+
+_SOURCE_QUERY = """
+query($q: String!, $after: String) {
+  orders(first: 250, query: $q, after: $after, sortKey: CREATED_AT) {
+    pageInfo { hasNextPage endCursor }
+    edges { node { id sourceName app { name } shippingAddress { countryCodeV2 } } }
+  }
+}
+"""
+
+
+def fetch_order_sources(token: str, date_from: str, date_to: str) -> list[dict]:
+    """Диагностика: [{order_id, source, app, country}] — понять, тегируется ли app-канал."""
+    q = f"created_at:>={date_from} created_at:<={date_to}"
+    out, after = [], None
+    while True:
+        data = _post(token, {"q": q, "after": after}, query=_SOURCE_QUERY)
+        conn = data["orders"]
+        for e in conn["edges"]:
+            n = e["node"]
+            out.append({
+                "order_id": _order_id(n["id"]),
+                "source": n.get("sourceName"),
+                "app": (n.get("app") or {}).get("name"),
+                "country": ((n.get("shippingAddress") or {}).get("countryCodeV2")),
+            })
+        if conn["pageInfo"]["hasNextPage"]:
+            after = conn["pageInfo"]["endCursor"]
+        else:
+            break
+    return out
 
 
 def _order_id(gid: str) -> str:

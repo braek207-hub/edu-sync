@@ -307,14 +307,19 @@ def shopify_probe() -> None:
     """Проверка Shopify-токена и страны доставки. Ничего не пишет."""
     from collections import Counter
 
-    from sync.gcc_shopify import SHOP, fetch_order_countries
+    from sync.gcc_shopify import SHOP, fetch_order_countries, fetch_order_sources
 
     frm, to = "2026-07-24", "2026-07-28"
-    m = fetch_order_countries(os.environ["API_LIME_SHOPIFY"], frm, to)
+    tok = os.environ["API_LIME_SHOPIFY"]
+    m = fetch_order_countries(tok, frm, to)
     print(f"shopify: {SHOP}, заказов {len(m)} за {frm}..{to}")
     print("страны доставки:", Counter(v or "— вне Залива/нет адреса —" for v in m.values()).most_common())
-    ex = "7091092619586"  # пример Павла: витрина ae., доставка Doha/Qatar
+    ex = "7091092619586"
     print(f"пример order {ex} → страна доставки: {m.get(ex, 'НЕТ в окне')}")
+    # Двойной счёт app? Тегируется ли канал заказа (sourceName / app)
+    src = fetch_order_sources(tok, frm, to)
+    print("sourceName:", Counter((r["source"] or "∅") for r in src).most_common())
+    print("app:", Counter((r["app"] or "∅") for r in src).most_common())
 
 
 def main() -> None:
