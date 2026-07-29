@@ -1,0 +1,59 @@
+name: LIME GCC → Google Sheet (трафик + заказы)
+
+on:
+  schedule:
+    # 23:50 UTC = 02:50 Moscow. Раньше нужного с запасом на задержку планировщика GitHub;
+    # окно считается по московской дате в коде (запуск до полуночи UTC пишет верный «вчера»).
+    - cron: "50 23 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "refresh = последние 7 дней (устойчиво) | build = бэкфилл с нуля | probe = прочитать"
+        required: false
+        default: "refresh"
+      refresh_days:
+        description: "Сколько дней назад обновлять (refresh). Default 7"
+        required: false
+        default: "7"
+      gcc_from:
+        description: "Бэкфилл build с даты YYYY-MM-DD (default 2025-08-01)"
+        required: false
+        default: ""
+      gcc_to:
+        description: "Бэкфилл build по дату YYYY-MM-DD (default вчера)"
+        required: false
+        default: ""
+
+concurrency:
+  group: lime-gcc-sheet
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Write Google service-account key
+        env:
+          GSC_SA_KEY: ${{ secrets.GSC_SA_KEY }}   # lime-reports SA — расшарен на GCC-книгу
+        run: |
+          if [ -z "$GSC_SA_KEY" ]; then echo "GSC_SA_KEY пуст" && exit 1; fi
+          printf '%s' "$GSC_SA_KEY" > sa.json
+
+      - name: GCC → Sheet
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIME_GCC_MODE: ${{ github.event.inputs.mode || 'refresh' }}
+          LIME_GCC_REFRESH_DAYS: ${{ github.event.inputs.refresh_days || '7' }}
+          LIME_GCC_FROM: ${{ github.event.inputs.gcc_from }}
+          LIME_GCC_TO: ${{ github.event.inputs.gcc_to }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_gcc_report
