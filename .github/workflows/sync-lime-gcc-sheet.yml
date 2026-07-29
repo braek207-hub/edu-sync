@@ -53,6 +53,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           APPMETRICA_TOKEN: ${{ secrets.APPMETRICA_TOKEN }}   # аккаунтовый — видит и app 6299245
           API_LIME_SHOPIFY: ${{ secrets.API_LIME_SHOPIFY }}   # Admin API token GCC-магазина (страна доставки)
+          GCC_METRICA_TOKEN: ${{ secrets.GCC_METRICA_TOKEN }}  # для metrika-probe (regionCountry)
           LIME_GCC_MODE: ${{ github.event.inputs.mode || 'refresh' }}
           LIME_GCC_REFRESH_DAYS: ${{ github.event.inputs.refresh_days || '7' }}
           LIME_GCC_FROM: ${{ github.event.inputs.gcc_from }}

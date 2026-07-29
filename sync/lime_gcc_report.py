@@ -322,8 +322,63 @@ def shopify_probe() -> None:
     print("app:", Counter((r["app"] or "∅") for r in src).most_common())
 
 
+def metrika_probe() -> None:
+    """Сравнить ym:s:regionCountry (гео посетителя) с ym:s:startURLDomain (витрина). Read-only."""
+    import requests
+
+    token = os.environ["GCC_METRICA_TOKEN"]
+    counter = os.environ.get("GCC_METRICA_COUNTER_ID") or "98232701"
+    for dim in ("ym:s:regionCountry", "ym:s:startURLDomain"):
+        r = requests.get(
+            "https://api-metrika.yandex.net/stat/v1/data",
+            headers={"Authorization": f"OAuth {token}"},
+            params={"ids": counter, "date1": "2026-07-20", "date2": "2026-07-26",
+                    "metrics": "ym:s:visits", "dimensions": dim, "accuracy": "full", "limit": 40},
+            timeout=60,
+        )
+        data = r.json()
+        rows = data.get("data") or []
+        print(f"\n=== {dim} (HTTP {r.status_code}, {len(rows)} строк) ===")
+        for item in rows[:25]:
+            d0 = item["dimensions"][0]
+            print(f"  {d0.get('name')!r} (id={d0.get('id')}): {int(item['metrics'][0])}")
+
+
+def app_orders_check() -> None:
+    """Сверить app-заказы: Shopify app-канал vs AppMetrica, по странам. Read-only."""
+    from collections import Counter
+
+    from sync.gcc_app import _GCC, ISO_CODE, fetch_app
+    from sync.gcc_shopify import fetch_order_meta
+
+    frm, to = "2026-07-19", "2026-07-28"
+    country, app_ids = fetch_order_meta(os.environ["API_LIME_SHOPIFY"], frm, to)
+    shop = Counter()
+    for oid in app_ids:
+        shop[_COUNTRY_CODE.get((country.get(oid) or "").strip(), "прочее")] += 1
+    print(f"Shopify app-канал: {sum(shop.values())} заказов за {frm}..{to}")
+
+    dates = _dates(date.fromisoformat(frm), date.fromisoformat(to))
+    _, orders = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, dates)
+    am = Counter()
+    for d in dates:
+        for code in ISO_CODE.values():
+            am[code] += orders[d][code]["app_org"] + orders[d][code]["app_paid"]
+    am_total = sum(orders[d][_GCC]["app_org"] + orders[d][_GCC]["app_paid"] for d in dates)
+    print(f"AppMetrica app-заказы (GCC): {am_total}")
+    print(f"\n{'страна':<8} {'Shopify':>8} {'AppMetrica':>11}")
+    for code in list(ISO_CODE.values()) + ["прочее"]:
+        print(f"{code:<8} {shop.get(code, 0):>8} {am.get(code, 0):>11}")
+
+
 def main() -> None:
     mode = os.environ.get("LIME_GCC_MODE") or "refresh"
+    if mode == "app-orders-check":  # сверка app-заказов Shopify vs AppMetrica
+        app_orders_check()
+        return
+    if mode == "metrika-probe":  # разведка regionCountry, Sheets не нужен
+        metrika_probe()
+        return
     if mode == "shopify-probe":  # проверка Shopify-токена, Sheets не нужен
         shopify_probe()
         return
