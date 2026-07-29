@@ -4,7 +4,18 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from sync.gcc_metrika import parse_metrika_traffic, residual_rows, resolve_engine
+from sync.gcc_metrika import (
+    map_region_country, parse_metrika_traffic, residual_rows, resolve_engine,
+)
+
+
+def test_map_region_country():
+    assert map_region_country(210) == "ОАЭ"
+    assert map_region_country("10540") == "Саудовская Аравия"
+    assert map_region_country(21486) == "Катар"
+    assert map_region_country(84) is None    # США — не Gulf
+    assert map_region_country(None) is None
+    assert map_region_country("") is None
 
 
 def test_parse_metrika_traffic():
@@ -28,23 +39,27 @@ def test_parse_metrika_traffic():
     assert all(r["country"] is None for r in rows)
 
 
-def test_parse_metrika_traffic_with_domain():
-    """Фикстура зонда P1: dimensions = date, startURLDomain, trafficSource, sourceEngine."""
-    p = os.path.join(os.path.dirname(__file__), "fixtures", "metrika_domain_sample.json")
-    with open(p, encoding="utf-8") as f:
-        resp = json.load(f)
-    rows = parse_metrika_traffic(resp)
-    assert len(rows) == len(resp["data"])
-    # порядок полей не съехал: дата/источник/движок читаются по имени dimension, не по позиции
-    first = rows[0]
-    assert first["date"] == "2026-07-17"
-    assert first["traffic_source"] == "ad"
-    assert first["source_engine"] == "Google Ads"   # движок есть в ответе — берём его
-    assert first["country"] == "ОАЭ"
-    # в фикстуре есть несколько стран, все распознаны
-    assert {r["country"] for r in rows} == {
-        "ОАЭ", "Саудовская Аравия", "Кувейт", "Катар", "Оман"
+def test_parse_metrika_traffic_with_region_country():
+    """Страна = гео посетителя (regionCountry по id): англ→рус для Gulf, не-Gulf → None."""
+    resp = {
+        "query": {"dimensions": ["ym:s:date", "ym:s:regionCountry",
+                                  "ym:s:lastsignTrafficSource", "ym:s:lastsignSourceEngine"]},
+        "data": [
+            {"dimensions": [{"name": "2026-07-17"}, {"id": "210", "name": "United Arab Emirates"},
+                            {"id": "ad"}, {"name": "Google Ads"}], "metrics": [100, 80, 20, 10, 2, 5, 3]},
+            {"dimensions": [{"name": "2026-07-17"}, {"id": "10540", "name": "Saudi Arabia"},
+                            {"id": "ad"}, {"name": "Google Ads"}], "metrics": [30, 20, 5, 10, 2, 1, 1]},
+            {"dimensions": [{"name": "2026-07-17"}, {"id": "84", "name": "United States"},
+                            {"id": "organic"}, {"name": None}], "metrics": [10, 8, 2, 50, 1, 0, 0]},
+        ],
     }
+    rows = parse_metrika_traffic(resp)
+    assert rows[0]["date"] == "2026-07-17" and rows[0]["traffic_source"] == "ad"
+    assert rows[0]["source_engine"] == "Google Ads"
+    assert rows[0]["country"] == "ОАЭ"
+    assert rows[1]["country"] == "Саудовская Аравия"
+    assert rows[2]["country"] is None                 # США → вне Gulf → GCC-тотал
+    assert {r["country"] for r in rows} == {"ОАЭ", "Саудовская Аравия", None}
 
 # === Остаток: визиты, не разнесённые по доменам (T5) ===
 #

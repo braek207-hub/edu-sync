@@ -5,9 +5,32 @@ import time
 
 import requests
 
-from sync.gcc_channels import map_domain_country
+from sync.gcc_channels import map_domain_country  # noqa: F401 — оставлен для совместимости
 
-# Измерения канала (эталон тотала: без домена и без разбивок).
+# Страна = ГЕО ПОСЕТИТЕЛЯ (ym:s:regionCountry), а не домен витрины: люди заходят на
+# витрину одной страны из другой (заказ на ae. с доставкой в Qatar — тот же случай в
+# трафике). Ключ по числовому id Метрики (стабильнее имени). Не-Gulf → None (в GCC-тотал).
+_REGION_COUNTRY = {
+    210: "ОАЭ",
+    10540: "Саудовская Аравия",
+    21486: "Катар",
+    10537: "Кувейт",
+    21586: "Оман",
+    10532: "Бахрейн",
+}
+
+
+def map_region_country(country_id) -> str | None:
+    """id страны ym:s:regionCountry → русское имя Залива (или None вне GCC)."""
+    if country_id in (None, ""):
+        return None
+    try:
+        return _REGION_COUNTRY.get(int(country_id))
+    except (TypeError, ValueError):
+        return None
+
+
+# Измерения канала (эталон тотала: без страны и без разбивок).
 CHANNEL_DIMENSIONS = (
     "ym:s:date",
     "ym:s:lastsignTrafficSource",
@@ -19,7 +42,7 @@ CHANNEL_DIMENSIONS = (
 # (зонд 2026-07-18). utm-метки и searchEngine такого не делают: потерь нет.
 COUNTRY_DIMENSIONS = (
     "ym:s:date",
-    "ym:s:startURLDomain",
+    "ym:s:regionCountry",
     "ym:s:lastsignTrafficSource",
     "ym:s:UTMSource",
     "ym:s:UTMCampaign",
@@ -43,7 +66,7 @@ NONAD_FILTER = ("ym:s:lastsignTrafficSource!='ad' "
 # Площадка + кампания: стоит 3.13%, разницу добираем строкой-остатком с известной площадкой.
 AD_DIMENSIONS = (
     "ym:s:date",
-    "ym:s:startURLDomain",
+    "ym:s:regionCountry",
     "ym:s:lastsignTrafficSource",
     "ym:s:lastsignSourceEngine",
     "ym:s:UTMCampaign",
@@ -53,7 +76,7 @@ AD_DIMENSIONS = (
 # Она же используется для соцсетей: кампаний у них нет, нужна только сеть.
 AD_ENGINE_DIMENSIONS = (
     "ym:s:date",
-    "ym:s:startURLDomain",
+    "ym:s:regionCountry",
     "ym:s:lastsignTrafficSource",
     "ym:s:lastsignSourceEngine",
 )
@@ -142,7 +165,7 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
     Returns:
         Список дектов с ключами:
         - date (str): YYYY-MM-DD
-        - country (str|None): страна Залива по домену витрины (None вне GCC)
+        - country (str|None): страна Залива по гео посетителя regionCountry (None вне GCC)
         - campaign (str|None): utm_campaign (у Google Ads это id кампании)
         - traffic_source (str|None): id источника (напр. "ad", "organic")
         - source_engine (str|None): площадка, восстановленная из utm (см. resolve_engine)
@@ -178,7 +201,7 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
         rows.append(
             {
                 "date": dim(dims, "ym:s:date", "name"),
-                "country": map_domain_country(dim(dims, "ym:s:startURLDomain", "name")),
+                "country": map_region_country(dim(dims, "ym:s:regionCountry", "id")),
                 "campaign": campaign,
                 "traffic_source": traffic_source,
                 # Нужен маппингу, чтобы отличить рассылку Mindbox от прочей почты.
