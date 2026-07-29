@@ -433,8 +433,45 @@ def tw_shopify_check() -> None:
     print(f"WEB-заказы paid/organic: {w_pt.most_common()}")
 
 
+def tw_order_dump() -> None:
+    """Полная структура живого заказа TW (app vs web) — есть ли поле канала. Read-only."""
+    import json
+
+    from sync.gcc_shopify import fetch_order_meta
+    from sync.gcc_triplewhale import fetch_tw_orders
+
+    frm, to = "2026-07-19", "2026-07-28"
+    tw = fetch_tw_orders(os.environ["GCC_TRIPLEWHALE_API_KEY"], os.environ["GCC_TW_SHOP_DOMAIN"], frm, to)
+    _, app_ids = fetch_order_meta(os.environ["API_LIME_SHOPIFY"], frm, to)
+    by_id = {str(o.get("order_id") or ""): o for o in tw}
+    app_ex = next((by_id[i] for i in app_ids if i in by_id), None)
+    web_ex = next((o for oid, o in by_id.items() if oid not in app_ids), None)
+
+    def show(o, label):
+        print(f"\n=== {label} order {o.get('order_id')} ===")
+        for k, v in o.items():
+            if k == "journey":
+                j = v or []
+                keys = list(j[0].keys()) if j else []
+                print(f"  journey: {len(j)} тачпоинтов; keys тачпоинта: {keys}")
+                if j:
+                    print(f"    первый тачпоинт: {json.dumps(j[0], ensure_ascii=False)[:400]}")
+            elif k == "attribution":
+                print(f"  attribution keys: {list((v or {}).keys())}")
+            else:
+                print(f"  {k}: {json.dumps(v, ensure_ascii=False)[:200]}")
+
+    if app_ex:
+        show(app_ex, "APP")
+    if web_ex:
+        show(web_ex, "WEB")
+
+
 def main() -> None:
     mode = os.environ.get("LIME_GCC_MODE") or "refresh"
+    if mode == "tw-order-dump":  # полная структура заказа TW
+        tw_order_dump()
+        return
     if mode == "tw-shopify-check":  # сверка заказов TW vs Shopify
         tw_shopify_check()
         return
