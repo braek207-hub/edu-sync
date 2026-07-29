@@ -87,3 +87,16 @@ def fetch_sessions(app_id: str, token: str, date_since: str, date_until: str,
         "fields": SESSION_FIELDS + (_GEO if country else ""),
     }
     return _export("sessions_starts", params, token)
+
+
+def fetch_export(endpoint: str, app_id: str, token: str, date_since: str, date_until: str,
+                 fields: str, date_dimension: str = "default") -> list[dict]:
+    """Сырой вызов произвольного endpoint Logs API — для разведки (deeplinks и пр.)."""
+    params = {
+        "application_id": app_id,
+        "date_since": f"{date_since} 00:00:00",
+        "date_until": f"{date_until} 23:59:59",
+        "date_dimension": date_dimension,
+        "fields": fields,
+    }
+    return _export(endpoint, params, token)

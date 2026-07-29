@@ -114,6 +114,22 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"[events] ОШИБКА {type(e).__name__}: {e}")
 
+    # deeplinks / ре-энгейджмент: есть ли партнёр+устройство+время для last-touch.
+    from sync.appmetrica_logs import fetch_export
+    for fields in ("appmetrica_device_id,deeplink_datetime,publisher_name,tracker_name,city,country_iso_code",
+                   "appmetrica_device_id,event_datetime,publisher_name,tracker_name",
+                   "appmetrica_device_id,session_start_datetime,publisher_name"):
+        try:
+            dl = fetch_export("deeplinks", APP_ID, token, frm, to, fields)
+            print(f"\n[deeplinks fields='{fields[:40]}...'] всего {len(dl)}")
+            if dl:
+                print("  поля:", sorted(dl[0].keys()))
+                print("  publisher:", _top(Counter(r.get("publisher_name") or "∅" for r in dl)))
+                print("  страны:", _top(Counter(r.get("country_iso_code") for r in dl)))
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"[deeplinks fields='{fields[:40]}...'] {type(e).__name__}: {str(e)[:160]}")
+
     print()
     _reporting_probe(token, frm, to)
 
