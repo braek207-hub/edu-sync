@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "refresh = последние 7 дней (устойчиво) | build = бэкфилл с нуля | probe = прочитать"
+        description: "refresh | build | probe | app-probe | shopify-probe"
         required: false
         default: "refresh"
       refresh_days:
@@ -52,6 +52,7 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           APPMETRICA_TOKEN: ${{ secrets.APPMETRICA_TOKEN }}   # аккаунтовый — видит и app 6299245
+          API_LIME_SHOPIFY: ${{ secrets.API_LIME_SHOPIFY }}   # Admin API token GCC-магазина (страна доставки)
           LIME_GCC_MODE: ${{ github.event.inputs.mode || 'refresh' }}
           LIME_GCC_REFRESH_DAYS: ${{ github.event.inputs.refresh_days || '7' }}
           LIME_GCC_FROM: ${{ github.event.inputs.gcc_from }}

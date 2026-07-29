@@ -303,14 +303,31 @@ def probe(service) -> None:
             print(f"  !! {tab}: {type(e).__name__}: {e}")
 
 
-def main() -> None:
-    from sync.sheets_write import get_write_service
+def shopify_probe() -> None:
+    """Проверка Shopify-токена и страны доставки. Ничего не пишет."""
+    from collections import Counter
 
+    from sync.gcc_shopify import SHOP, fetch_order_countries
+
+    frm, to = "2026-07-24", "2026-07-28"
+    m = fetch_order_countries(os.environ["API_LIME_SHOPIFY"], frm, to)
+    print(f"shopify: {SHOP}, заказов {len(m)} за {frm}..{to}")
+    print("страны доставки:", Counter(v or "— вне Залива/нет адреса —" for v in m.values()).most_common())
+    ex = "7091092619586"  # пример Павла: витрина ae., доставка Doha/Qatar
+    print(f"пример order {ex} → страна доставки: {m.get(ex, 'НЕТ в окне')}")
+
+
+def main() -> None:
     mode = os.environ.get("LIME_GCC_MODE") or "refresh"
+    if mode == "shopify-probe":  # проверка Shopify-токена, Sheets не нужен
+        shopify_probe()
+        return
     if mode == "app-probe":  # разведка AppMetrica GCC (Фаза 2), Sheets не нужен
         from sync.probe_gcc_app import main as app_probe
         app_probe()
         return
+
+    from sync.sheets_write import get_write_service
     service = get_write_service()
     if mode == "probe":
         probe(service)
