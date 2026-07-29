@@ -506,23 +506,26 @@ def attr_compare() -> None:
 
     # lastPlatformClick: весь заказ источнику [0]. linearAll: 1/N на касание (поля веса нет).
     from collections import defaultdict
-    last: dict[str, float] = defaultdict(float)
-    linear: dict[str, float] = defaultdict(float)
+    lpc_m: dict[str, float] = defaultdict(float)   # lastPlatformClick (наша)
+    lc_m: dict[str, float] = defaultdict(float)    # lastClick (любой последний)
+    lin_m: dict[str, float] = defaultdict(float)   # linearAll (1/N)
     total = 0
     for o in tw:
         total += 1
         a = o.get("attribution") or {}
         lpc = a.get("lastPlatformClick") or []
         if lpc:
-            last[src(lpc[0]) or "∅(нет)"] += 1
+            lpc_m[src(lpc[0]) or "∅(нет)"] += 1
+        lc = a.get("lastClick") or []
+        if lc:
+            lc_m[src(lc[0]) or "∅(нет)"] += 1
         la = a.get("linearAll") or []
         for tp in la:
-            linear[src(tp) or "∅(нет)"] += 1 / len(la)
+            lin_m[src(tp) or "∅(нет)"] += 1 / len(la)
     print(f"\nвсего заказов: {total}")
-    print(f"{'источник':<22}{'lastPlatformClick':>18}{'linearAll(TW)':>15}{'Δ':>8}")
-    for s in sorted(set(last) | set(linear), key=lambda k: -last.get(k, 0)):
-        lp, li = last.get(s, 0), linear.get(s, 0)
-        print(f"{s:<22}{lp:>18.0f}{li:>15.1f}{lp - li:>+8.1f}")
+    print(f"{'источник':<22}{'lastPlatform(наша)':>19}{'lastClick':>11}{'linearAll':>11}")
+    for s in sorted(set(lpc_m) | set(lc_m) | set(lin_m), key=lambda k: -lpc_m.get(k, 0)):
+        print(f"{s:<22}{lpc_m.get(s, 0):>19.0f}{lc_m.get(s, 0):>11.0f}{lin_m.get(s, 0):>11.1f}")
 
 
 def main() -> None:
