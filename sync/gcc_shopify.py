@@ -39,11 +39,16 @@ COUNTRY_BY_CODE = {
     "BH": "Бахрейн",
 }
 
+# Канал заказа: app.name == 'Online Store' — веб-витрина; 'Lime Mobile BFF' — приложение.
+# App-заказы чекаутятся через тот же Shopify → без исключения считались бы и в web(TW),
+# и в app(AppMetrica). Веб = только Online Store.
+WEB_CHANNEL = "Online Store"
+
 _QUERY = """
 query($q: String!, $after: String) {
   orders(first: 250, query: $q, after: $after, sortKey: CREATED_AT) {
     pageInfo { hasNextPage endCursor }
-    edges { node { id shippingAddress { countryCodeV2 } } }
+    edges { node { id app { name } shippingAddress { countryCodeV2 } } }
   }
 }
 """
@@ -123,26 +128,34 @@ def _order_id(gid: str) -> str:
     return (gid or "").rsplit("/", 1)[-1]
 
 
-def fetch_order_countries(token: str, date_from: str, date_to: str) -> dict[str, str | None]:
-    """{order_id(str): страна доставки(RU) | None} за [date_from; date_to] по дате создания.
+def fetch_order_meta(token: str, date_from: str, date_to: str) -> tuple[dict[str, str | None], set[str]]:
+    """(country_by_order, app_order_ids) за [date_from; date_to] по дате создания.
 
-    None — доставка вне Залива или без адреса (заказ уйдёт в GCC-тотал, не в страну).
-    `to` инклюзивен: используем created_at:<=date_to. token — offline Admin API access
-    token (shpca_/shpat_), получен OAuth-обменом один раз.
+    country_by_order: {order_id: страна доставки(RU)|None} — None = вне Залива/без адреса.
+    app_order_ids: order_id заказов НЕ из веб-витрины (app 'Lime Mobile BFF' и пр.) —
+    их исключаем из web-счёта, чтобы не задвоить с AppMetrica. `to` инклюзивен.
     """
     q = f"created_at:>={date_from} created_at:<={date_to}"
-    out: dict[str, str | None] = {}
+    country: dict[str, str | None] = {}
+    app_ids: set[str] = set()
     after = None
     while True:
         data = _post(token, {"q": q, "after": after})
         conn = data["orders"]
         for edge in conn["edges"]:
             node = edge["node"]
-            addr = node.get("shippingAddress") or {}
-            code = addr.get("countryCodeV2")
-            out[_order_id(node["id"])] = COUNTRY_BY_CODE.get(code)
+            oid = _order_id(node["id"])
+            code = (node.get("shippingAddress") or {}).get("countryCodeV2")
+            country[oid] = COUNTRY_BY_CODE.get(code)
+            if ((node.get("app") or {}).get("name")) != WEB_CHANNEL:
+                app_ids.add(oid)
         if conn["pageInfo"]["hasNextPage"]:
             after = conn["pageInfo"]["endCursor"]
         else:
             break
-    return out
+    return country, app_ids
+
+
+def fetch_order_countries(token: str, date_from: str, date_to: str) -> dict[str, str | None]:
+    """Только страны (обёртка над fetch_order_meta) — для пробы/обратной совместимости."""
+    return fetch_order_meta(token, date_from, date_to)[0]

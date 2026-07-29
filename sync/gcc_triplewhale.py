@@ -142,7 +142,8 @@ def order_country(order: dict) -> str | None:
 
 
 def aggregate_orders_by_channel(orders: list[dict], date: str,
-                                country_by_order: dict[str, str | None] | None = None) -> list[dict]:
+                                country_by_order: dict[str, str | None] | None = None,
+                                exclude_orders: set[str] | None = None) -> list[dict]:
     """Свернуть заказы attribution-эндпоинта в строки заказы/выручка по каналу и стране.
 
     Args:
@@ -158,8 +159,13 @@ def aggregate_orders_by_channel(orders: list[dict], date: str,
         country=None (доставка вне Залива / заказ без journey) — суммируется в GCC-тотал.
     """
     ship = country_by_order or {}
+    skip = exclude_orders or set()
     agg: dict[tuple[str | None, str | None, str, str, str], dict] = {}
     for order in orders:
+        # App-заказы (чекаут через тот же Shopify) считаются в app из AppMetrica —
+        # из web-счёта их выкидываем, иначе двойной счёт в «Общем».
+        if str(order.get("order_id") or "") in skip:
+            continue
         touchpoint = order_touchpoint(order)
         src = touchpoint.get("source") or None
         # У organic_and_social в campaignId лежит домен-реферер, а НЕ id кампании

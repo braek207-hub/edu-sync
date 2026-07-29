@@ -253,14 +253,16 @@ def _sync_range(frm: date, to: date, conn) -> int:
     # витрину одной страны, а доставка в другую. Тянем раз на весь диапазон, джойн по
     # order_id в aggregate_orders_by_channel. Без токена — мапа пустая, fallback на домен.
     shopify_country: dict[str, str | None] = {}
+    app_orders: set[str] = set()
     if os.environ.get("API_LIME_SHOPIFY"):
-        from sync.gcc_shopify import fetch_order_countries
-        shopify_country = fetch_order_countries(
+        from sync.gcc_shopify import fetch_order_meta
+        shopify_country, app_orders = fetch_order_meta(
             os.environ["API_LIME_SHOPIFY"], frm.isoformat(), to.isoformat()
         )
-        print(f"lime_gcc: Shopify страна доставки — {len(shopify_country)} заказов")
+        print(f"lime_gcc: Shopify — {len(shopify_country)} заказов, из них app-канал {len(app_orders)} "
+              f"(исключены из web, они в app из AppMetrica)")
     else:
-        print("lime_gcc: API_LIME_SHOPIFY не задан — страна заказов по домену витрины (fallback)")
+        print("lime_gcc: API_LIME_SHOPIFY не задан — страна заказов по домену витрины, app не исключён")
 
     # Метрику тянем ПОМЕСЯЧНО, а не по дню. `ym:s:date` стоит в измерениях, поэтому
     # диапазон возвращает те же построчные данные. На день уходит пять запросов
@@ -276,7 +278,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
         day_s = day.isoformat()
         metrika = metrika_by_day.get(day_s, [])
         orders = aggregate_orders_by_channel(fetch_tw_orders(tw_key, shop, day_s, day_s), day_s,
-                                             country_by_order=shopify_country)
+                                             country_by_order=shopify_country, exclude_orders=app_orders)
         tw_metrics = fetch_tw_spend(tw_key, shop, day_s)
         # Расход Google берём из кабинета (разложен по странам), если Script там уже стоит;
         # тогда ga_adCost из TW выбрасываем — иначе один и тот же расход посчитается дважды.
