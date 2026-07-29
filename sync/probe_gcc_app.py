@@ -11,10 +11,46 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from sync.appmetrica_logs import fetch_installations, fetch_purchase_events, fetch_sessions
+
+_STAT_URL = "https://api.appmetrica.yandex.ru/stat/v1/data"
+
+
+def _reporting_probe(token: str, frm: str, to: str) -> None:
+    """Проверить Reporting API: sessions по дате×стране×источнику (агрегат, без джойна).
+
+    Пробуем несколько имён метрик/измерений — API в 400 часто перечисляет валидные.
+    """
+    trials = [
+        ("sessions×country×publisher",
+         {"metrics": "ym:s:sessions", "dimensions": "ym:s:date,ym:s:regionCountry,ym:s:publisherName"}),
+        ("sessions×country×trafficSource",
+         {"metrics": "ym:s:sessions", "dimensions": "ym:s:date,ym:s:regionCountry,ym:s:trafficSource"}),
+        ("devices only",
+         {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry"}),
+    ]
+    for label, extra in trials:
+        params = {"id": APP_ID, "date1": frm, "date2": to, "accuracy": "1", "limit": "20", **extra}
+        url = f"{_STAT_URL}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers={"Authorization": f"OAuth {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            rows = data.get("data", [])
+            print(f"[reporting {label}] OK строк={len(rows)}; totals={data.get('totals')}")
+            for row in rows[:6]:
+                dims = [d.get("name") or d.get("id") for d in row.get("dimensions", [])]
+                print(f"    {dims} → {row.get('metrics')}")
+        except urllib.error.HTTPError as e:
+            print(f"[reporting {label}] HTTP {e.code}: {e.read().decode('utf-8')[:300]}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[reporting {label}] ОШИБКА {type(e).__name__}: {e}")
 
 APP_ID = os.environ.get("GCC_APP_ID") or "6299245"
 EVENT = os.environ.get("APPMETRICA_EVENT_NAME") or "purchase"
@@ -62,13 +98,24 @@ def main() -> None:
         if ev:
             print("  поля:", sorted(ev[0].keys()))
             print("  страны:", _top(Counter(r.get("country_iso_code") for r in ev)))
+            src = Counter()
+            for r in ev:
+                try:
+                    src[(json.loads(r.get("event_json") or "{}").get("source") or "∅")] += 1
+                except Exception:  # noqa: BLE001
+                    src["parse_err"] += 1
+            print("  event_json.source:", _top(src))
             ej = ev[0].get("event_json")
             try:
-                print("  event_json ключи:", sorted(json.loads(ej).keys()) if ej else "пусто")
+                print("  event_json пример:", {k: v for k, v in json.loads(ej).items()
+                                               if k in ("value", "currency", "source", "referrer", "transaction_id")})
             except Exception:  # noqa: BLE001
                 print("  event_json (raw):", str(ej)[:200])
     except Exception as e:  # noqa: BLE001
         print(f"[events] ОШИБКА {type(e).__name__}: {e}")
+
+    print()
+    _reporting_probe(token, frm, to)
 
 
 if __name__ == "__main__":
