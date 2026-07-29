@@ -177,6 +177,31 @@ def test_aggregate_orders_splits_by_country():
     assert abs(sum(r["revenue"] for r in sa) - (1737 + 1306)) < 0.01
 
 
+def test_shopify_country_overrides_domain():
+    """Страна из Shopify (доставка) перебивает домен витрины; заказа нет в мапе → домен."""
+    orders = [
+        {"order_id": 111, "total_price": 100,
+         "attribution": {"lastPlatformClick": [{"source": "google-ads"}]},
+         "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}]},
+        {"order_id": 222, "total_price": 200,
+         "attribution": {"lastPlatformClick": [{"source": "google-ads"}]},
+         "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}]},
+    ]
+    rows = aggregate_orders_by_channel(orders, "2026-07-17", country_by_order={"111": "Катар"})
+    got = {r["country"]: sum(x["orders"] for x in rows if x["country"] == r["country"]) for r in rows}
+    assert got.get("Катар") == 1   # 111: домен ОАЭ, но доставка Катар → Катар
+    assert got.get("ОАЭ") == 1     # 222: нет в мапе → fallback на домен ОАЭ
+
+
+def test_shopify_none_stays_none_not_domain():
+    """Заказ в мапе со значением None (доставка вне Залива) → None, НЕ fallback на домен."""
+    orders = [{"order_id": 333, "total_price": 50,
+               "attribution": {"lastPlatformClick": [{"source": "google-ads"}]},
+               "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}]}]
+    rows = aggregate_orders_by_channel(orders, "2026-07-17", country_by_order={"333": None})
+    assert all(r["country"] is None for r in rows)
+
+
 def test_aggregate_orders_same_channel_different_countries_stay_split():
     orders = [
         {"total_price": 100, "attribution": {"lastPlatformClick": [{"source": "google-ads"}]},

@@ -141,18 +141,23 @@ def order_country(order: dict) -> str | None:
     return None
 
 
-def aggregate_orders_by_channel(orders: list[dict], date: str) -> list[dict]:
+def aggregate_orders_by_channel(orders: list[dict], date: str,
+                                country_by_order: dict[str, str | None] | None = None) -> list[dict]:
     """Свернуть заказы attribution-эндпоинта в строки заказы/выручка по каналу и стране.
 
     Args:
         orders: список `ordersWithJourneys`.
         date: дата синка (сутки), проставляется во все строки — НЕ берётся из created_at заказов.
+        country_by_order: {order_id: страна(RU)|None} из Shopify (адрес доставки — правда о
+            стране). Если заказ есть в мапе — берём её (даже None = доставка вне Залива).
+            Если заказа нет в мапе (Shopify не отдал) — fallback на домен витрины.
 
     Returns:
         Список дектов {date, country, campaign, channel, subchannel, traffic_type,
         orders, revenue}.
-        country=None (заказ без journey) — отдельная строка, суммируется в GCC-тотал.
+        country=None (доставка вне Залива / заказ без journey) — суммируется в GCC-тотал.
     """
+    ship = country_by_order or {}
     agg: dict[tuple[str | None, str | None, str, str, str], dict] = {}
     for order in orders:
         touchpoint = order_touchpoint(order)
@@ -163,7 +168,8 @@ def aggregate_orders_by_channel(orders: list[dict], date: str) -> list[dict]:
         raw_campaign = (touchpoint.get("campaignId") or "").strip() or None
         is_referrer = (src or "").lower() == "organic_and_social"
         channel, subchannel, traffic_type = map_tw_source(src, raw_campaign)
-        country = order_country(order)
+        oid = str(order.get("order_id") or "")
+        country = ship[oid] if oid in ship else order_country(order)
         campaign = None if is_referrer else raw_campaign
         key = (country, campaign, channel, subchannel, traffic_type)
         row = agg.setdefault(
