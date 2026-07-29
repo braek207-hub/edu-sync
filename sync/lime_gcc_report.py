@@ -477,8 +477,39 @@ def tw_order_dump() -> None:
         show(web_ex, "WEB")
 
 
+def attr_compare() -> None:
+    """Meta-заказы: lastPlatformClick (весь заказ) vs linearAll (дробно). Read-only.
+
+    Сначала дампим attribution одного Meta-заказа (понять формат весов linearAll),
+    потом считаем сумму по обеим моделям за окно.
+    """
+    import json
+
+    from sync.gcc_triplewhale import fetch_tw_orders
+    frm, to = "2026-07-19", "2026-07-28"
+    tw = fetch_tw_orders(os.environ["GCC_TRIPLEWHALE_API_KEY"], os.environ["GCC_TW_SHOP_DOMAIN"], frm, to)
+
+    def src(tp):
+        return (tp or {}).get("source")
+
+    ex = None
+    for o in tw:
+        lpc = (o.get("attribution") or {}).get("lastPlatformClick") or []
+        if lpc and src(lpc[0]) == "facebook-ads":
+            ex = o
+            break
+    if ex:
+        a = ex.get("attribution") or {}
+        print("=== пример Meta-заказа attribution ===")
+        print("lastPlatformClick:", json.dumps(a.get("lastPlatformClick"), ensure_ascii=False)[:400])
+        print("linearAll:", json.dumps(a.get("linearAll"), ensure_ascii=False)[:800])
+
+
 def main() -> None:
     mode = os.environ.get("LIME_GCC_MODE") or "refresh"
+    if mode == "attr-compare":  # Meta: lastPlatformClick vs linearAll
+        attr_compare()
+        return
     if mode == "tw-order-dump":  # полная структура заказа TW
         tw_order_dump()
         return
