@@ -505,21 +505,24 @@ def attr_compare() -> None:
         print("linearAll:", json.dumps(a.get("linearAll"), ensure_ascii=False)[:800])
 
     # lastPlatformClick: весь заказ источнику [0]. linearAll: 1/N на касание (поля веса нет).
-    meta_last = meta_linear = total = 0.0
+    from collections import defaultdict
+    last: dict[str, float] = defaultdict(float)
+    linear: dict[str, float] = defaultdict(float)
+    total = 0
     for o in tw:
         total += 1
         a = o.get("attribution") or {}
         lpc = a.get("lastPlatformClick") or []
-        if lpc and src(lpc[0]) == "facebook-ads":
-            meta_last += 1
+        if lpc:
+            last[src(lpc[0]) or "∅(нет)"] += 1
         la = a.get("linearAll") or []
-        if la:
-            n_meta = sum(1 for tp in la if src(tp) == "facebook-ads")
-            meta_linear += n_meta / len(la)
-    print(f"\nвсего заказов: {int(total)}")
-    print(f"Meta lastPlatformClick (наша): {meta_last:.0f}")
-    print(f"Meta linearAll (TW UI):        {meta_linear:.1f}")
-    print(f"больше при: {'lastPlatformClick' if meta_last > meta_linear else 'linearAll'}")
+        for tp in la:
+            linear[src(tp) or "∅(нет)"] += 1 / len(la)
+    print(f"\nвсего заказов: {total}")
+    print(f"{'источник':<22}{'lastPlatformClick':>18}{'linearAll(TW)':>15}{'Δ':>8}")
+    for s in sorted(set(last) | set(linear), key=lambda k: -last.get(k, 0)):
+        lp, li = last.get(s, 0), linear.get(s, 0)
+        print(f"{s:<22}{lp:>18.0f}{li:>15.1f}{lp - li:>+8.1f}")
 
 
 def main() -> None:
