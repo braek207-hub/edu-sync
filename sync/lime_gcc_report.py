@@ -405,8 +405,32 @@ def tw_shopify_check() -> None:
     print(f"web-заказов Shopify в TW: {len(web_ids & tw_ids)} из {len(web_ids)}")
     print(f"в TW, но нет в Shopify: {len(tw_ids - shop_ids)}")
     print(f"в Shopify, но нет в TW: {len(shop_ids - tw_ids)}")
-    ex = next(iter(tw_ids), None)
-    print(f"пример order_id из TW: {ex!r} (формат — сверить с Shopify numeric)")
+
+    # Указан ли источник у app-заказов в TW? Распределение source + paid/organic.
+    from collections import Counter
+
+    from sync.gcc_triplewhale import map_tw_source, order_touchpoint
+    tw_by_id = {str(o.get("order_id") or ""): o for o in tw}
+
+    def dist(ids):
+        src, pt = Counter(), Counter()
+        for oid in ids:
+            o = tw_by_id.get(oid)
+            if not o:
+                continue
+            tp = order_touchpoint(o)
+            s = tp.get("source")
+            src[s or "∅(нет источника)"] += 1
+            _, _, tt = map_tw_source(s, (tp.get("campaignId") or "").strip() or None)
+            pt[tt] += 1
+        return src, pt
+
+    a_src, a_pt = dist(app_ids)
+    w_src, w_pt = dist(web_ids)
+    print(f"\nAPP-заказы (90) источник TW: {a_src.most_common()}")
+    print(f"APP-заказы paid/organic: {a_pt.most_common()}")
+    print(f"\nWEB-заказы источник TW: {w_src.most_common()[:8]}")
+    print(f"WEB-заказы paid/organic: {w_pt.most_common()}")
 
 
 def main() -> None:
