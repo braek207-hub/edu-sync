@@ -1,27 +1,25 @@
 # -*- coding: utf-8 -*-
 """sync/lime_gcc_report.py — трафик и заказы GCC → Google-таблица (широкий формат).
 
-Отдельная задача с собственным кроном, аналог lime_roistat_report для KZ, но источники
-другие и формат широкий: ORG/PAID/Total по каждой стране Залива + ORG Total/PAID Total/Total
-по всему GCC.
+Комбинация RU-формата (Web/App × Org/Paid) и GCC-разбивки по странам Залива. По каждому
+срезу (весь GCC + 5 стран UAE/KSA/QA/KW/OM) семь колонок:
+    Web Org · Web Paid · App Org · App Paid · WEB Total · APP Total · Total(«Общий» у GCC).
 
-Источники (ФАЗА 1 — только WEB; APP по app 6299245 добавится ФАЗОЙ 2 в те же ячейки):
-  • WEB трафик = sessions Метрики, WEB заказы = purchases Triple Whale — оба уже собраны
-    в lime_stats (region='gcc', data_source='web') с колонками country + traffic_type.
+Источники:
+  • WEB (трафик = sessions Метрики, заказы = purchases Triple Whale) — уже в lime_stats
+    (region='gcc', data_source='web') с колонками country + traffic_type.
+  • APP (app 6299245, трафик = sessions, заказы = e-commerce) — ФАЗА 2, пока нули.
 
-Ячейка книги = web (+ app в Ф2). Считаем per (дата × страна) словарь {org, paid} и по
-странам, и суммарно по GCC. «Total»-колонки GCC включают остаток country=NULL (заказы/
-визиты без страны), поэтому по странам не сходятся с тоталом — так и задумано в данных.
+«GCC»-срез = весь регион, включая country=NULL (визиты/заказы без страны), поэтому по
+странам он НЕ сходится с суммой пяти — так в данных.
 
-Пишем ПО ИМЕНАМ колонок («ORG UAE», «PAID Total», …) — устойчиво к вставке/перестановке
-столбцов. Формулы (напр. Total=ORG+PAID) на существующих строках не перезаписываем.
+Две вкладки: «Fact Traffic GCC» (sessions) и «Fact Orders GCC» (purchases).
 
-Режимы (LIME_GCC_MODE): refresh (default, последние N дней) | build (бэкфилл с нуля,
-дописывает недостающие строки-даты) | probe (read-only дамп структуры + сверка).
+Режимы (LIME_GCC_MODE): build (создать вкладки + залить окно) | refresh (обновить
+последние N дней, дописать новые даты) | probe (read-only). Пишем по ИМЕНАМ колонок.
 
-ENV: DATABASE_URL, GSC_SA_KEY/GOOGLE_APPLICATION_CREDENTIALS (сервис-аккаунт lime-reports),
-     LIME_GCC_SHEET_ID, LIME_GCC_REFRESH_DAYS (default 7),
-     LIME_GCC_FROM/LIME_GCC_TO (окно build).
+ENV: DATABASE_URL, GSC_SA_KEY/GOOGLE_APPLICATION_CREDENTIALS (SA lime-reports),
+     LIME_GCC_SHEET_ID, LIME_GCC_REFRESH_DAYS (7), LIME_GCC_FROM/LIME_GCC_TO (build).
 """
 from __future__ import annotations
 
@@ -38,38 +36,61 @@ ORDERS_TAB = os.environ.get("LIME_GCC_ORDERS_TAB") or "Fact Orders GCC"
 REFRESH_DAYS = int(os.environ.get("LIME_GCC_REFRESH_DAYS") or "7")
 BUILD_FROM = os.environ.get("LIME_GCC_FROM") or "2025-08-01"
 
-# lime_stats хранит страну по-русски; книга — кодами Залива. Порядок = как в шаблоне.
+# lime_stats хранит страну по-русски; книга — кодами Залива (без BH — Павел подтвердил).
 _COUNTRY_CODE = {
     "ОАЭ": "UAE",
     "Саудовская Аравия": "KSA",
     "Катар": "QA",
     "Кувейт": "KW",
     "Оман": "OM",
-    "Бахрейн": "BH",
 }
-_CODES = ("UAE", "KSA", "QA", "KW", "OM", "BH")
+_CODES = ("UAE", "KSA", "QA", "KW", "OM")
+_GCC = "GCC"  # внутренний ключ среза «весь регион»
+_SCOPES = (_GCC,) + _CODES
 
 _RU_WD = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 _DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
 
+_META_COLS = ("Дата", "Год", "Месяц", "Неделя")
+# Порядок метрик среза. grand — имя итоговой колонки: у GCC «Общий», у стран «{code} Total».
+_METRIC_SUFFIX = ("Web Org", "Web Paid", "App Org", "App Paid", "WEB Total", "APP Total")
+
+
+def _grand_col(scope: str) -> str:
+    return "Общий" if scope == _GCC else f"{scope} Total"
+
+
+def _scope_cols(scope: str) -> list[str]:
+    """Имена 7 колонок среза в порядке шаблона."""
+    prefix = "" if scope == _GCC else f"{scope} "
+    return [f"{prefix}{s}" for s in _METRIC_SUFFIX] + [_grand_col(scope)]
+
+
+def _header() -> list[str]:
+    cols = list(_META_COLS)
+    for scope in _SCOPES:
+        cols += _scope_cols(scope)
+    return cols
+
 
 def _msk_today() -> date:
-    """Московская дата (UTC+3, без DST) — окно считаем по Москве, раннер в UTC."""
+    """Московская дата (UTC+3, без DST) — окно по Москве, раннер в UTC."""
     return (datetime.now(timezone.utc) + timedelta(hours=3)).date()
 
 
 def _date_label(iso: str) -> str:
-    """ISO → «Сб 04.07.2026» как в книге (день недели по-русски + DD.MM.YYYY)."""
     d = date.fromisoformat(iso)
     return f"{_RU_WD[d.weekday()]} {d.strftime('%d.%m.%Y')}"
 
 
-# ─────────────────────────── агрегация данных ───────────────────────────
+# ─────────────────────────── агрегация ───────────────────────────
 
-# Пустой срез дня: org/paid по «Total» (весь GCC) и по каждой стране-коду.
-def _empty_slice() -> dict:
-    keys = ("Total",) + _CODES
-    return {"org": {k: 0 for k in keys}, "paid": {k: 0 for k in keys}}
+def _empty_metrics() -> dict:
+    return {"web_org": 0, "web_paid": 0, "app_org": 0, "app_paid": 0}
+
+
+def _empty_day() -> dict:
+    return {scope: _empty_metrics() for scope in _SCOPES}
 
 
 _WEB_SQL = """
@@ -83,35 +104,57 @@ GROUP BY date, country, traffic_type
 
 
 def fetch_web(conn, dates: list[str]) -> tuple[dict, dict]:
-    """(traffic, orders): date → срез {org/paid × Total/страна} из lime_stats web.
+    """(traffic, orders): date → {scope → metrics}. web_org/web_paid из lime_stats.
 
-    «Total» = весь GCC, включая country=NULL (визиты/заказы без страны); коды —
-    только 6 узнаваемых стран. traffic_type «Платный»→paid, иначе→org.
+    GCC-срез = весь регион (в т.ч. country=NULL); коды — только 5 узнаваемых стран.
+    App-метрики остаются 0 (ФАЗА 2). traffic = sessions, orders = purchases_count.
     """
-    traffic: dict[str, dict] = {d: _empty_slice() for d in dates}
-    orders: dict[str, dict] = {d: _empty_slice() for d in dates}
+    traffic = {d: _empty_day() for d in dates}
+    orders = {d: _empty_day() for d in dates}
     with conn.cursor() as cur:
         cur.execute(_WEB_SQL, (dates,))
         for d, country, ttype, sess, ords in cur.fetchall():
-            bucket = "paid" if ttype == "Платный" else "org"
+            field = "web_paid" if ttype == "Платный" else "web_org"
             code = _COUNTRY_CODE.get((country or "").strip())
             for metric_map, val in ((traffic, sess), (orders, ords)):
-                slc = metric_map[d][bucket]
-                slc["Total"] += int(val)
+                day = metric_map[d]
+                day[_GCC][field] += int(val)
                 if code:
-                    slc[code] += int(val)
+                    day[code][field] += int(val)
     return traffic, orders
 
 
-# ─────────────────────────── запись в книгу ───────────────────────────
+def _row_values(iso: str, day: dict) -> dict:
+    """colname → значение для одной строки (метрики + производные + мета)."""
+    dt = date.fromisoformat(iso)
+    out: dict[str, object] = {
+        "Дата": _date_label(iso), "Год": dt.year, "Месяц": dt.month,
+        "Неделя": dt.isocalendar()[1],
+    }
+    for scope in _SCOPES:
+        m = day[scope]
+        web_total = m["web_org"] + m["web_paid"]
+        app_total = m["app_org"] + m["app_paid"]
+        prefix = "" if scope == _GCC else f"{scope} "
+        out[f"{prefix}Web Org"] = m["web_org"]
+        out[f"{prefix}Web Paid"] = m["web_paid"]
+        out[f"{prefix}App Org"] = m["app_org"]
+        out[f"{prefix}App Paid"] = m["app_paid"]
+        out[f"{prefix}WEB Total"] = web_total
+        out[f"{prefix}APP Total"] = app_total
+        out[_grand_col(scope)] = web_total + app_total
+    return out
 
-def _norm_header(cell) -> str:
+
+# ─────────────────────────── запись ───────────────────────────
+
+def _norm(cell) -> str:
     return re.sub(r"\s+", " ", str(cell or "").replace("\n", " ")).strip()
 
 
 def _header_row(grid: list[list]) -> int | None:
     for i, row in enumerate(grid):
-        if any(_norm_header(c) == "Дата" for c in row):
+        if any(_norm(c) == "Дата" for c in row):
             return i
     return None
 
@@ -124,101 +167,91 @@ def _col_letter(idx0: int) -> str:
     return s
 
 
-def _tab_layout(service, tab: str):
-    """(formulas, name_to_col, date_col, row_of, next_row0) — заголовок и колонки по ИМЕНАМ."""
-    from sync.sheets_write import read_values
-
-    rng = f"{tab}!A1:BZ2000"
-    grid = read_values(service, SHEET_ID, rng, render="FORMATTED_VALUE")
-    formulas = read_values(service, SHEET_ID, rng, render="FORMULA")
-    hdr_i = _header_row(grid)
-    if hdr_i is None:
-        raise RuntimeError(f"{tab}: не нашёл строку заголовков с «Дата»")
-    name_to_col = {_norm_header(c): j for j, c in enumerate(grid[hdr_i])}
-    date_col = name_to_col["Дата"]
-    row_of: dict[str, int] = {}
-    last = hdr_i
-    for i in range(hdr_i + 1, len(grid)):
-        row = grid[i]
-        m = _DATE_RE.search(row[date_col] if date_col < len(row) else "")
-        if m:
-            row_of[f"{m[3]}-{m[2]}-{m[1]}"] = i
-            last = i
-    return formulas, name_to_col, date_col, row_of, last + 1
-
-
-def _slice_cells(tab, iso, slc, name_to_col, formulas, ri0, is_new):
-    """Ячейки одного дня одной вкладки: ORG/PAID по Total и странам + Дата/Год/Месяц (новой)."""
-    row1 = ri0 + 1
-
-    def is_formula(cj):
-        return (ri0 < len(formulas) and cj < len(formulas[ri0])
-                and str(formulas[ri0][cj]).startswith("="))
-
-    ups = []
-    targets = [("ORG Total", slc["org"]["Total"]), ("PAID Total", slc["paid"]["Total"])]
-    for code in _CODES:
-        targets.append((f"ORG {code}", slc["org"][code]))
-        targets.append((f"PAID {code}", slc["paid"][code]))
-    # Total-колонки: пишем только если это НЕ формула (в шаблоне часто =ORG+PAID).
-    total_targets = [("Total", slc["org"]["Total"] + slc["paid"]["Total"])]
-    for code in _CODES:
-        total_targets.append((f"Total {code}", slc["org"][code] + slc["paid"][code]))
-
-    for hdr, val in targets:
-        cj = name_to_col.get(hdr)
-        if cj is None or (not is_new and is_formula(cj)):
-            continue
-        ups.append((f"{tab}!{_col_letter(cj)}{row1}", [[val]]))
-    for hdr, val in total_targets:
-        cj = name_to_col.get(hdr)
-        if cj is None or is_formula(cj):  # Total трогаем только если это литерал
-            continue
-        ups.append((f"{tab}!{_col_letter(cj)}{row1}", [[val]]))
-    if is_new:
-        dt = date.fromisoformat(iso)
-        for hdr, v in (("Дата", _date_label(iso)), ("Год", dt.year), ("Месяц", dt.month)):
-            cj = name_to_col.get(hdr)
-            if cj is not None:
-                ups.append((f"{tab}!{_col_letter(cj)}{row1}", [[v]]))
-    return ups
-
-
-def _write_tab(service, tab, day_to_slice, layout, allow_new):
-    from sync.sheets_write import batch_write
-
-    formulas, name_to_col, _, row_of, next0 = layout
-    updates = []
-    written, missing = [], []
-    for iso, slc in sorted(day_to_slice.items()):
-        ri0 = row_of.get(iso)
-        is_new = ri0 is None
-        if is_new:
-            if not allow_new:
-                missing.append(iso)
-                continue
-            ri0 = next0
-            next0 += 1
-            row_of[iso] = ri0
-        updates += _slice_cells(tab, iso, slc, name_to_col, formulas, ri0, is_new)
-        written.append(iso)
-    n = batch_write(service, SHEET_ID, updates)
-    print(f"{tab}: {len(written)} дн., {n} ячеек" + (f"; нет строк: {missing}" if missing else ""))
-    return n
-
-
-def _run(service, dates, allow_new):
+def _run(service, dates: list[str], mode: str) -> None:
     conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
     try:
         traffic, orders = fetch_web(conn, dates)
     finally:
         conn.close()
     for iso in dates:
-        t, o = traffic[iso], orders[iso]
-        print(f"{iso}: трафик org={t['org']['Total']} paid={t['paid']['Total']} | "
-              f"заказы org={o['org']['Total']} paid={o['paid']['Total']}")
-    _write_tab(service, TRAFFIC_TAB, traffic, _tab_layout(service, TRAFFIC_TAB), allow_new)
-    _write_tab(service, ORDERS_TAB, orders, _tab_layout(service, ORDERS_TAB), allow_new)
+        g = traffic[iso][_GCC]
+        print(f"{iso}: web-трафик org={g['web_org']} paid={g['web_paid']} | "
+              f"заказы org={orders[iso][_GCC]['web_org']} paid={orders[iso][_GCC]['web_paid']}")
+    for tab, data in ((TRAFFIC_TAB, traffic), (ORDERS_TAB, orders)):
+        if mode == "build":
+            _build_tab(service, tab, dates, data)
+        else:
+            _refresh_tab(service, tab, dates, data)
+
+
+def _build_tab(service, tab: str, dates: list[str], data: dict) -> None:
+    """Создать вкладку (если нет) и залить заголовок + все строки одним блоком."""
+    from sync.sheets_write import add_tab, list_tabs, read_values, write_block
+
+    tabs = set(list_tabs(service, SHEET_ID))
+    if tab not in tabs:
+        add_tab(service, SHEET_ID, tab)
+        print(f"создана вкладка «{tab}»")
+    else:
+        existing = read_values(service, SHEET_ID, f"{tab}!A1:BZ5", render="FORMATTED_VALUE")
+        if _header_row(existing) is not None:
+            raise RuntimeError(f"{tab}: уже заполнена — build перезапишет от A1. Используй refresh.")
+
+    header = _header()
+    block = [header]
+    for iso in dates:
+        rv = _row_values(iso, data[iso])
+        block.append([rv.get(c, "") for c in header])
+    write_block(service, SHEET_ID, f"{tab}!A1", block)
+    print(f"{tab}: залито {len(dates)} дн., {len(header)} колонок")
+
+
+def _refresh_tab(service, tab: str, dates: list[str], data: dict) -> None:
+    """Обновить строки последних дней по дате-матчу; новые даты дописать. По ИМЕНАМ колонок."""
+    from sync.sheets_write import batch_write, read_values
+
+    rng = f"{tab}!A1:BZ4000"
+    grid = read_values(service, SHEET_ID, rng, render="FORMATTED_VALUE")
+    formulas = read_values(service, SHEET_ID, rng, render="FORMULA")
+    hdr_i = _header_row(grid)
+    if hdr_i is None:
+        raise RuntimeError(f"{tab}: нет строки заголовков с «Дата» — сначала build")
+    name_to_col = {_norm(c): j for j, c in enumerate(grid[hdr_i])}
+    date_col = name_to_col["Дата"]
+
+    row_of: dict[str, int] = {}
+    next0 = hdr_i + 1
+    for i in range(hdr_i + 1, len(grid)):
+        m = _DATE_RE.search(grid[i][date_col] if date_col < len(grid[i]) else "")
+        if m:
+            row_of[f"{m[3]}-{m[2]}-{m[1]}"] = i
+            next0 = i + 1
+
+    def is_formula(ri, cj):
+        return (ri < len(formulas) and cj < len(formulas[ri])
+                and str(formulas[ri][cj]).startswith("="))
+
+    updates, written = [], []
+    for iso in sorted(dates):
+        ri = row_of.get(iso)
+        is_new = ri is None
+        if is_new:
+            ri = next0
+            next0 += 1
+            row_of[iso] = ri
+        rv = _row_values(iso, data[iso])
+        for col, val in rv.items():
+            cj = name_to_col.get(col)
+            if cj is None:
+                continue
+            if col in ("Дата", "Год", "Месяц", "Неделя") and not is_new:
+                continue  # мету на существующей строке не трогаем
+            if not is_new and is_formula(ri, cj):
+                continue  # формулы (напр. Total) не перезаписываем
+            updates.append((f"{tab}!{_col_letter(cj)}{ri + 1}", [[val]]))
+        written.append(iso)
+    n = batch_write(service, SHEET_ID, updates)
+    print(f"{tab}: refresh {len(written)} дн., {n} ячеек")
 
 
 def _dates(frm: date, to: date) -> list[str]:
@@ -229,43 +262,20 @@ def _dates(frm: date, to: date) -> list[str]:
     return out
 
 
-def refresh(service) -> None:
-    to = _msk_today() - timedelta(days=1)
-    frm = to - timedelta(days=REFRESH_DAYS - 1)
-    _run(service, _dates(frm, to), allow_new=True)
-
-
-def build(service) -> None:
-    to_env = os.environ.get("LIME_GCC_TO")
-    to = date.fromisoformat(to_env) if to_env else _msk_today() - timedelta(days=1)
-    _run(service, _dates(date.fromisoformat(BUILD_FROM), to), allow_new=True)
-
-
 def probe(service) -> None:
     from sync.sheets_write import list_tabs, read_values
 
     print("Вкладки:", list_tabs(service, SHEET_ID))
+    print("Ожидаемый заголовок (%d колонок):" % len(_header()))
+    print("  " + " | ".join(_header()))
     for tab in (TRAFFIC_TAB, ORDERS_TAB):
         try:
-            vals = read_values(service, SHEET_ID, f"{tab}!A1:BZ8", render="FORMATTED_VALUE")
-            print(f"\n=== {tab} (первые строки) ===")
-            for i, row in enumerate(vals[:8]):
+            vals = read_values(service, SHEET_ID, f"{tab}!A1:BZ6", render="FORMATTED_VALUE")
+            print(f"\n=== {tab} ===")
+            for i, row in enumerate(vals[:6]):
                 print(f"  [{i}] {row}")
         except Exception as e:  # noqa: BLE001
             print(f"  !! {tab}: {type(e).__name__}: {e}")
-    # сверка агрегата за вчера
-    to = _msk_today() - timedelta(days=1)
-    dates = _dates(to - timedelta(days=REFRESH_DAYS - 1), to)
-    conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
-    try:
-        traffic, orders = fetch_web(conn, dates)
-    finally:
-        conn.close()
-    print("\n=== web-агрегат (сверка) ===")
-    for iso in dates:
-        t, o = traffic[iso], orders[iso]
-        print(f"  {iso} трафик Total org/paid={t['org']['Total']}/{t['paid']['Total']} "
-              f"UAE={t['org']['UAE']}/{t['paid']['UAE']} | заказы Total={o['org']['Total']}/{o['paid']['Total']}")
 
 
 def main() -> None:
@@ -275,10 +285,14 @@ def main() -> None:
     service = get_write_service()
     if mode == "probe":
         probe(service)
+        return
+    if mode == "build":
+        to_env = os.environ.get("LIME_GCC_TO")
+        to = date.fromisoformat(to_env) if to_env else _msk_today() - timedelta(days=1)
+        _run(service, _dates(date.fromisoformat(BUILD_FROM), to), "build")
     elif mode == "refresh":
-        refresh(service)
-    elif mode == "build":
-        build(service)
+        to = _msk_today() - timedelta(days=1)
+        _run(service, _dates(to - timedelta(days=REFRESH_DAYS - 1), to), "refresh")
     else:
         raise SystemExit(f"lime_gcc_report: неизвестный режим {mode!r}")
 
