@@ -8,12 +8,12 @@ journey. Но люди заходят на витрину одной стран�
 
 Тянем через GraphQL Admin API постранично. Отдаём {order_id(str): страна(RU)}.
 
-Авторизация: grant `client_credentials` (client_id+client_secret → короткоживущий
-Admin API access token shpat_, ~24ч). Токен добываем каждый прогон — не храним.
-API automation token (atkn_) НЕ подходит — он только для Shopify CLI (deploy).
+Авторизация: offline Admin API access token (shpca_/shpat_), полученный OAuth
+authorization-code-grant один раз (client_credentials на этом магазине запрещён:
+shop_not_permitted; atkn_ automation token — только для Shopify CLI). Токен
+бессрочный, лежит в секрете API_LIME_SHOPIFY, шлём в X-Shopify-Access-Token.
 
-ENV: API_LIME_SHOPIFY (CLIENT SECRET приложения, shpss_…),
-     GCC_SHOPIFY_CLIENT_ID (default 0c45cd1d…, публичный),
+ENV: API_LIME_SHOPIFY (offline Admin API access token shpca_/shpat_),
      GCC_SHOPIFY_SHOP (default lime-shop-prod.myshopify.com),
      GCC_SHOPIFY_API_VERSION (default 2025-07).
 """
@@ -23,35 +23,10 @@ import json
 import os
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 SHOP = os.environ.get("GCC_SHOPIFY_SHOP") or "lime-shop-prod.myshopify.com"
-CLIENT_ID = os.environ.get("GCC_SHOPIFY_CLIENT_ID") or "0c45cd1d60b22691368f2cb8ab38fe11"
 API_VERSION = os.environ.get("GCC_SHOPIFY_API_VERSION") or "2025-07"
-
-
-def get_access_token(client_secret: str) -> str:
-    """client_credentials → Admin API access token (shpat_, ~24ч). Не хранится."""
-    url = f"https://{SHOP}/admin/oauth/access_token"
-    body = urllib.parse.urlencode({
-        "grant_type": "client_credentials",
-        "client_id": CLIENT_ID,
-        "client_secret": client_secret,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Shopify token HTTP {e.code}: {e.read().decode('utf-8')[:300]}")
-    tok = data.get("access_token")
-    if not tok:
-        raise RuntimeError(f"Shopify token: нет access_token в ответе ({str(data)[:200]})")
-    return tok
 
 # ISO alpha-2 страны доставки → русское имя как в lime_stats (region='gcc').
 # Только Залив; прочие страны доставки → None (уедут в GCC-тотал, не в колонку страны).
@@ -116,13 +91,13 @@ def _order_id(gid: str) -> str:
     return (gid or "").rsplit("/", 1)[-1]
 
 
-def fetch_order_countries(client_secret: str, date_from: str, date_to: str) -> dict[str, str | None]:
+def fetch_order_countries(token: str, date_from: str, date_to: str) -> dict[str, str | None]:
     """{order_id(str): страна доставки(RU) | None} за [date_from; date_to] по дате создания.
 
     None — доставка вне Залива или без адреса (заказ уйдёт в GCC-тотал, не в страну).
-    `to` инклюзивен: используем created_at:<=date_to. Access token добываем сами.
+    `to` инклюзивен: используем created_at:<=date_to. token — offline Admin API access
+    token (shpca_/shpat_), получен OAuth-обменом один раз.
     """
-    token = get_access_token(client_secret)
     q = f"created_at:>={date_from} created_at:<={date_to}"
     out: dict[str, str | None] = {}
     after = None
