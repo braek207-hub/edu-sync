@@ -55,8 +55,9 @@ _CODES = ("UAE", "KSA", "QA", "KW", "OM")
 _GCC = "GCC"  # внутренний ключ среза «весь регион»
 _SCOPES = (_GCC,) + _CODES
 
-_RU_WD = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-_DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
+_EN_WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+# Дата: «Mon 08/09/2025» (слэши, англ.день) ИЛИ «Сб 04.07.2026» (точки) — оба разделителя.
+_DATE_RE = re.compile(r"(\d{2})[./](\d{2})[./](\d{4})")
 
 _META_COLS = ("Дата", "Год", "Месяц", "Неделя")
 # Порядок метрик среза. grand — имя итоговой колонки: у GCC «Общий», у стран «{code} Total».
@@ -86,8 +87,9 @@ def _msk_today() -> date:
 
 
 def _date_label(iso: str) -> str:
+    """ISO → «Mon 08/09/2025» (англ. день + слэши), как в KZ и в загруженной истории."""
     d = date.fromisoformat(iso)
-    return f"{_RU_WD[d.weekday()]} {d.strftime('%d.%m.%Y')}"
+    return f"{_EN_WD[d.weekday()]} {d.strftime('%d/%m/%Y')}"
 
 
 # ─────────────────────────── агрегация ───────────────────────────

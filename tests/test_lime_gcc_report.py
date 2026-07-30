@@ -112,7 +112,7 @@ def test_row_values_derives_totals():
     assert rv["Общий"] == 189              # 177 + 12
     assert rv["UAE WEB Total"] == 140
     assert rv["UAE Total"] == 145          # 140 + (1+4)
-    assert rv["Дата"] == "Вт 28.07.2026"
+    assert rv["Дата"] == "Tue 28/07/2026"
     assert rv["Неделя"] == 31
 
 
@@ -131,4 +131,4 @@ def test_row_values_covers_every_header_column():
 
 
 def test_date_label():
-    assert _date_label("2026-07-28") == "Вт 28.07.2026"
+    assert _date_label("2026-07-28") == "Tue 28/07/2026"
