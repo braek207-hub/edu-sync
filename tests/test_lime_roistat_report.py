@@ -62,9 +62,9 @@ def test_row_builders_match_headers():
     agg = {"free_visits": 70, "paid_visits": 100, "total_visits": 170,
            "paid_orders": 5, "free_orders": 3, "total_orders": 8}
     tr = _traffic_row("2026-07-04", agg)
-    assert tr == ["Сб 04.07.2026", 70, 100, 170, 170, 2026, 7]
+    assert tr == ["Sat 04/07/2026", 70, 100, 170, 170, 2026, 7]
     orow = _orders_row("2026-07-04", agg)
-    assert orow == ["Сб 04.07.2026", 5, 3, 8, 2026, 7]
+    assert orow == ["Sat 04/07/2026", 5, 3, 8, 2026, 7]
 
 
 def _patch_fetch(monkeypatch, side):
@@ -162,6 +162,24 @@ def test_new_row_fills_date_year_month():
     ups = _day_cell_updates(TRAFFIC_TAB, "2026-07-28", _AGG, _SHIFTED_COLS,
                             formulas=[], ri0=28, is_new=True)
     cells = dict(ups)
-    assert cells[f"{TRAFFIC_TAB}!B29"] == [["Вт 28.07.2026"]]  # Дата в колонке B
+    assert cells[f"{TRAFFIC_TAB}!B29"] == [["Tue 28/07/2026"]]  # Дата в колонке B (слэши, англ.)
     assert cells[f"{TRAFFIC_TAB}!G29"] == [[2026]]
     assert cells[f"{TRAFFIC_TAB}!H29"] == [[7]]
+
+
+def test_date_re_matches_slashes_and_dots():
+    """Регексп даты понимает и слэши (новый формат заказчика), и точки (старый)."""
+    for label, iso in (("Sun 05/07/2026", "2026-07-05"), ("Сб 04.07.2026", "2026-07-04"),
+                       ("05/07/2026", "2026-07-05")):
+        m = rep._DATE_RE.search(label)
+        assert m, label
+        assert f"{m[3]}-{m[2]}-{m[1]}" == iso
+
+
+def test_orders_value_map_has_new_names():
+    """Новые имена колонок заказов маппятся; APP-колонку не трогаем (Роистат KZ без app)."""
+    om = rep._VALUE_MAP[rep.ORDERS_TAB]
+    assert om["Orders (Paid Traffic)"] == "paid_orders"
+    assert om["Orders (Organic Traffic)"] == "free_orders"
+    assert om["Orders (Org + Paid)"] == "total_orders"
+    assert "Orders (APP Traffic)" not in om

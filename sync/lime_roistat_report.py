@@ -45,8 +45,9 @@ from sync.roistat_channels import PAID, map_roistat_channel
 def _msk_today() -> date:
     return (datetime.now(timezone.utc) + timedelta(hours=3)).date()
 
-# Дата в книге отформатирована как «Сб 04.07.2026» — тянем из неё DD.MM.YYYY.
-_DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
+# Дата в книге: «Sun 05/07/2026» (слэши) ИЛИ «Сб 04.07.2026» (точки) — тянем DD/MM/YYYY.
+# Заказчик сменил формат на слэши + англ. день недели; поддерживаем оба разделителя.
+_DATE_RE = re.compile(r"(\d{2})[./](\d{2})[./](\d{4})")
 
 # Заголовок колонки → ключ агрегата. «сайт» и «общий» = итог (органический+платный),
 # пишем в оба; если какой-то из них формула — шаг записи его не тронет.
@@ -57,7 +58,7 @@ _TRAFFIC_TARGETS = {
     "Трафик общий": "total_visits",
 }
 
-_RU_WD = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+_EN_WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # Колонки вкладок при построении с нуля (режим build) — как на скрине заказчика.
 _TRAFFIC_HEADER = ["Дата", "Трафик органический", "Трафик платный",
@@ -77,9 +78,9 @@ EMPTY_RETRY_SLEEP = int(os.environ.get("LIME_REPORT_EMPTY_RETRY_SLEEP") or "20")
 
 
 def _date_label(iso: str) -> str:
-    """ISO-дата → «Сб 04.07.2026» как в книге заказчика."""
+    """ISO-дата → «Sun 05/07/2026» (англ. день + слэши) как в книге заказчика."""
     d = date.fromisoformat(iso)
-    return f"{_RU_WD[d.weekday()]} {d.strftime('%d.%m.%Y')}"
+    return f"{_EN_WD[d.weekday()]} {d.strftime('%d/%m/%Y')}"
 
 
 def _traffic_row(iso: str, a: dict) -> list:
@@ -249,7 +250,7 @@ def _traffic_layout(service):
     """
     from sync.sheets_write import read_values
 
-    rng = f"{TRAFFIC_TAB}!A1:Z400"
+    rng = f"{TRAFFIC_TAB}!A1:Z3000"
     grid = read_values(service, SHEET_ID, rng, render="FORMATTED_VALUE")
     formulas = read_values(service, SHEET_ID, rng, render="FORMULA")
 
@@ -326,7 +327,7 @@ def build_book(service, dates: list[str]) -> None:
         if tab in tabs:
             # build пишет блок от A1; если во вкладке уже есть «Дата» (возможно
             # сдвинутая вставкой столбца) — перезапись от A1 всё разъедет. Тогда refresh.
-            existing = read_values(service, SHEET_ID, f"{tab}!A1:Z400", render="FORMATTED_VALUE")
+            existing = read_values(service, SHEET_ID, f"{tab}!A1:Z3000", render="FORMATTED_VALUE")
             if _header_row(existing) is not None:
                 raise RuntimeError(
                     f"{tab}: уже заполнена — build перезаписал бы от A1 и разъехал столбцы. "
@@ -361,6 +362,12 @@ _VALUE_MAP = {
         "Трафик общий": "total_visits",
     },
     ORDERS_TAB: {
+        # Новые имена заказчика; «Orders (APP Traffic)» не заполняем — у Роистата KZ
+        # приложения нет, колонка остаётся пустой/ручной.
+        "Orders (Paid Traffic)": "paid_orders",
+        "Orders (Organic Traffic)": "free_orders",
+        "Orders (Org + Paid)": "total_orders",
+        # Старые имена — на случай отката формата.
         "Продажи платный": "paid_orders",
         "Продажи бесплатный": "free_orders",
         "Продажи всего": "total_orders",
@@ -377,7 +384,7 @@ def _tab_layout(service, tab: str):
     """
     from sync.sheets_write import read_values
 
-    rng = f"{tab}!A1:Z400"
+    rng = f"{tab}!A1:Z3000"
     grid = read_values(service, SHEET_ID, rng, render="FORMATTED_VALUE")
     formulas = read_values(service, SHEET_ID, rng, render="FORMULA")
     hdr_i = _header_row(grid)
