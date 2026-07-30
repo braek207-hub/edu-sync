@@ -101,43 +101,91 @@ def _empty_day() -> dict:
 
 
 _STATS_SQL = """
-SELECT date::text AS d, data_source, country, traffic_type,
-       COALESCE(SUM(sessions), 0)::bigint        AS sessions,
-       COALESCE(SUM(purchases_count), 0)::bigint AS orders
+SELECT date::text AS d, country, traffic_type,
+       COALESCE(SUM(sessions), 0)::bigint AS sessions
 FROM lime_stats
-WHERE region = 'gcc' AND data_source IN ('web','app') AND date = ANY(%s::date[])
-GROUP BY date, data_source, country, traffic_type
+WHERE region = 'gcc' AND data_source = 'web' AND date = ANY(%s::date[])
+GROUP BY date, country, traffic_type
 """
 
 
-def fetch_web(conn, dates: list[str]) -> tuple[dict, dict]:
-    """(traffic, orders): date → {scope → metrics} из lime_stats.
+def fetch_web(conn, dates: list[str]) -> dict:
+    """traffic: date → {scope → metrics}. web-трафик (sessions) из lime_stats.
 
-    web-строки: sessions → web-трафик, purchases → web-заказы.
-    app-строки (data_source='app'): purchases → app-ЗАКАЗЫ (у них sessions=0; app-трафик
-    считает AppMetrica отдельно и доливается в _run). GCC-срез = весь регион (в т.ч.
-    country=NULL); коды — только 5 узнаваемых стран.
+    Заказы здесь НЕ считаются — они берутся по атрибуции linearAll из TW+Shopify
+    (fetch_orders_linear). app-трафик доливает AppMetrica в _run. GCC-срез = весь регион
+    (в т.ч. country=NULL); коды — только 5 узнаваемых стран.
     """
     traffic = {d: _empty_day() for d in dates}
-    orders = {d: _empty_day() for d in dates}
     with conn.cursor() as cur:
         cur.execute(_STATS_SQL, (dates,))
-        for d, ds, country, ttype, sess, ords in cur.fetchall():
-            paid = ttype == "Платный"
+        for d, country, ttype, sess in cur.fetchall():
+            field = "web_paid" if ttype == "Платный" else "web_org"
             code = _COUNTRY_CODE.get((country or "").strip())
-            if ds == "web":
-                field = "web_paid" if paid else "web_org"
-                for metric_map, val in ((traffic, sess), (orders, ords)):
-                    day = metric_map[d]
-                    day[_GCC][field] += int(val)
-                    if code:
-                        day[code][field] += int(val)
-            else:  # app-заказы (TW-атрибуция + Shopify канал/страна)
-                field = "app_paid" if paid else "app_org"
-                orders[d][_GCC][field] += int(ords)
-                if code:
-                    orders[d][code][field] += int(ords)
-    return traffic, orders
+            traffic[d][_GCC][field] += int(sess)
+            if code:
+                traffic[d][code][field] += int(sess)
+    return traffic
+
+
+def _linear_paid_frac(order: dict) -> float:
+    """Доля заказа, отнесённая к ПЛАТНОМУ трафику по linearAll (1/N на касание).
+
+    Нет касаний → 0 (органика). Классификация касания paid/organic — map_tw_source.
+    """
+    from sync.gcc_triplewhale import map_tw_source
+    la = (order.get("attribution") or {}).get("linearAll") or []
+    if not la:
+        return 0.0
+    paid = sum(1 for tp in la
+               if map_tw_source(tp.get("source"), (tp.get("campaignId") or "").strip() or None)[2] == "Платный")
+    return paid / len(la)
+
+
+def aggregate_orders_linear(orders_by_date: dict, country_map: dict, app_ids: set,
+                            dates: list[str]) -> dict:
+    """Заказы по linearAll, округлённые с ТОЧНЫМ тоталом: date → {scope → metrics}.
+
+    На срез×платформу: paid = round(сумма долей paid), organic = (число заказов − paid).
+    Значит web_org+web_paid = число web-заказов среза, app_org+app_paid = число app —
+    тотал всегда сходится 1-в-1, теряется только точность дележа paid/organic.
+    """
+    # (date, scope, platform) → [paid_frac, n]
+    acc = {d: {s: {"web": [0.0, 0], "app": [0.0, 0]} for s in _SCOPES} for d in dates}
+    for iso in dates:
+        for o in orders_by_date.get(iso, []):
+            oid = str(o.get("order_id") or "")
+            plat = "app" if oid in app_ids else "web"
+            code = _COUNTRY_CODE.get((country_map.get(oid) or "").strip())
+            pf = _linear_paid_frac(o)
+            for scope in (_GCC,) + ((code,) if code else ()):
+                acc[iso][scope][plat][0] += pf
+                acc[iso][scope][plat][1] += 1
+
+    out = {d: _empty_day() for d in dates}
+    for iso in dates:
+        for scope in _SCOPES:
+            for plat in ("web", "app"):
+                paid_frac, n = acc[iso][scope][plat]
+                paid = min(round(paid_frac), n)
+                out[iso][scope][f"{plat}_paid"] = paid
+                out[iso][scope][f"{plat}_org"] = n - paid
+    return out
+
+
+def fetch_orders_linear(dates: list[str]) -> dict:
+    """Заказы GCC по linearAll из TW+Shopify (канал web/app + страна доставки)."""
+    from sync.gcc_shopify import fetch_order_meta
+    from sync.gcc_triplewhale import fetch_tw_orders
+
+    if not os.environ.get("GCC_TRIPLEWHALE_API_KEY"):
+        print("orders: GCC_TRIPLEWHALE_API_KEY не задан — заказы 0")
+        return {d: _empty_day() for d in dates}
+    tw_key = os.environ["GCC_TRIPLEWHALE_API_KEY"]
+    shop = os.environ["GCC_TW_SHOP_DOMAIN"]
+    country_map, app_ids = fetch_order_meta(os.environ["API_LIME_SHOPIFY"], dates[0], dates[-1])
+    by_date = {iso: fetch_tw_orders(tw_key, shop, iso, iso) for iso in dates}
+    return aggregate_orders_linear(by_date, country_map, app_ids, dates)
 
 
 def _row_values(iso: str, day: dict) -> dict:
@@ -194,19 +242,21 @@ def _merge_app(dst: dict, app: dict) -> None:
 def _run(service, dates: list[str], mode: str) -> None:
     conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
     try:
-        traffic, orders = fetch_web(conn, dates)
+        traffic = fetch_web(conn, dates)
     finally:
         conn.close()
 
     if os.environ.get("APPMETRICA_TOKEN"):
         from sync.gcc_app import fetch_app
-        # AppMetrica — ТОЛЬКО app-трафик (sessions): заказы она недосчитывает (~43%),
-        # app-заказы берём из lime_stats (TW-атрибуция + Shopify канал/страна).
+        # AppMetrica — ТОЛЬКО app-трафик (sessions): заказы она недосчитывает (~43%).
         app_dates = dates if len(dates) <= APP_BACKFILL else dates[-APP_BACKFILL:]
         ta, _ = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
         _merge_app(traffic, ta)
     else:
-        print("gcc_app: APPMETRICA_TOKEN не задан — app-колонки остаются 0")
+        print("gcc_app: APPMETRICA_TOKEN не задан — app-трафик 0")
+
+    # Заказы (web+app) — по атрибуции linearAll из TW+Shopify, округлены с точным тоталом.
+    orders = fetch_orders_linear(dates)
 
     for iso in dates:
         g, go = traffic[iso][_GCC], orders[iso][_GCC]
