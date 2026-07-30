@@ -50,6 +50,13 @@ def list_tabs(service, spreadsheet_id: str) -> list[str]:
     return [s["properties"]["title"] for s in meta.get("sheets", [])]
 
 
+def clear_tab(service, spreadsheet_id: str, a1_range: str) -> None:
+    """Очистить значения диапазона (напр. 'Fact Traffic GCC!A1:BZ4000')."""
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id, range=a1_range, body={},
+    ).execute()
+
+
 def add_tab(service, spreadsheet_id: str, title: str) -> None:
     """Создать вкладку с заданным именем."""
     service.spreadsheets().batchUpdate(

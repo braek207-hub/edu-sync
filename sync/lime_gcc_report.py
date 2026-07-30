@@ -580,6 +580,68 @@ def attr_compare() -> None:
         print(f"{s:<22}{lpc_m.get(s, 0):>19.0f}{lc_m.get(s, 0):>11.0f}{lin_m.get(s, 0):>11.1f}")
 
 
+_CSV_TRAFFIC = os.environ.get("LIME_GCC_TRAFFIC_CSV") or "data/gcc_history/traffic.csv"
+_CSV_ORDERS = os.environ.get("LIME_GCC_ORDERS_CSV") or "data/gcc_history/orders.csv"
+
+
+def _parse_history_csv(path: str) -> dict:
+    """CSV заказчика (ORG/PAID/Total по странам) → {iso: day-dict}. app=0 (всё web)."""
+    import csv
+    import io
+
+    rows = list(csv.reader(io.StringIO(open(path, "rb").read().decode("utf-8-sig"))))
+    hi = next(i for i, r in enumerate(rows) if any("ORG Total" in c for c in r))
+    hdr = [c.strip() for c in rows[hi]]
+
+    def col(name):
+        return hdr.index(name) if name in hdr else None
+
+    def num(v):
+        v = str(v or "").replace(",", "").replace("\xa0", "").strip()
+        try:
+            return int(float(v))
+        except ValueError:
+            return 0
+
+    org_t, paid_t, tot = col("ORG Total"), col("PAID Total"), col("Total")
+    out: dict[str, dict] = {}
+    for r in rows[hi + 1:]:
+        if not r:
+            continue
+        m = _DATE_RE.search(r[0])
+        if not m:
+            continue
+        # пустые будущие строки (нет данных) — пропускаем
+        if num(r[org_t] if org_t is not None else 0) == 0 and num(r[paid_t] if paid_t is not None else 0) == 0:
+            continue
+        iso = f"{m[3]}-{m[2]}-{m[1]}"
+        day = {s: {"web_org": 0, "web_paid": 0, "app_org": 0, "app_paid": 0} for s in _SCOPES}
+        day[_GCC]["web_org"] = num(r[org_t])
+        day[_GCC]["web_paid"] = num(r[paid_t])
+        for code in _CODES:
+            co, cp = col(f"ORG {code}"), col(f"PAID {code}")
+            if co is not None and co < len(r):
+                day[code]["web_org"] = num(r[co])
+            if cp is not None and cp < len(r):
+                day[code]["web_paid"] = num(r[cp])
+        out[iso] = day
+    return out
+
+
+def load_history(service) -> None:
+    """РАЗОВЫЙ режим: очистить вкладки GCC и залить историю из CSV (ORG→Web Org, app=0)."""
+    from sync.sheets_write import clear_tab, write_block
+
+    for tab, path in ((TRAFFIC_TAB, _CSV_TRAFFIC), (ORDERS_TAB, _CSV_ORDERS)):
+        data = _parse_history_csv(path)
+        dates = sorted(data)
+        header = _header()
+        block = [header] + [[_row_values(iso, data[iso]).get(c, "") for c in header] for iso in dates]
+        clear_tab(service, SHEET_ID, f"{tab}!A1:BZ4000")
+        write_block(service, SHEET_ID, f"{tab}!A1", block)
+        print(f"{tab}: очищено + залито {len(dates)} дн. ({dates[0]}…{dates[-1]})")
+
+
 def main() -> None:
     mode = os.environ.get("LIME_GCC_MODE") or "refresh"
     if mode == "attr-compare":  # Meta: lastPlatformClick vs linearAll
@@ -607,6 +669,9 @@ def main() -> None:
 
     from sync.sheets_write import get_write_service
     service = get_write_service()
+    if mode == "load-history":  # разовая заливка истории из CSV
+        load_history(service)
+        return
     if mode == "probe":
         probe(service)
         return
