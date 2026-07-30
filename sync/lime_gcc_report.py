@@ -355,12 +355,21 @@ def probe(service) -> None:
     print("Вкладки:", list_tabs(service, SHEET_ID))
     print("Ожидаемый заголовок (%d колонок):" % len(_header()))
     print("  " + " | ".join(_header()))
+    from collections import Counter
     for tab in (TRAFFIC_TAB, ORDERS_TAB):
         try:
-            vals = read_values(service, SHEET_ID, f"{tab}!A1:BZ6", render="FORMATTED_VALUE")
-            print(f"\n=== {tab} ===")
-            for i, row in enumerate(vals[:6]):
-                print(f"  [{i}] {row}")
+            grid = read_values(service, SHEET_ID, f"{tab}!A1:E4000", render="FORMATTED_VALUE")
+            hdr_i = _header_row(grid)
+            dc = next(j for j, c in enumerate(grid[hdr_i]) if _norm(c) == "Дата")
+            isos = []
+            for row in grid[hdr_i + 1:]:
+                m = _DATE_RE.search(row[dc]) if dc < len(row) else None
+                if m:
+                    isos.append(f"{m[3]}-{m[2]}-{m[1]}")
+            dups = [d for d, n in Counter(isos).items() if n > 1]
+            print(f"\n=== {tab}: строк-дат {len(isos)}, уникальных {len(set(isos))} ===")
+            print(f"  диапазон: {min(isos)} … {max(isos)}")
+            print(f"  ДУБЛИ дат: {dups if dups else 'нет'}")
         except Exception as e:  # noqa: BLE001
             print(f"  !! {tab}: {type(e).__name__}: {e}")
 
