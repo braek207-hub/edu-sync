@@ -28,12 +28,30 @@ def _reporting_probe(token: str, frm: str, to: str) -> None:
     Пробуем несколько имён метрик/измерений — API в 400 часто перечисляет валидные.
     """
     trials = [
-        ("sessions×country×publisher",
-         {"metrics": "ym:s:sessions", "dimensions": "ym:s:date,ym:s:regionCountry,ym:s:publisherName"}),
-        ("sessions×country×trafficSource",
-         {"metrics": "ym:s:sessions", "dimensions": "ym:s:date,ym:s:regionCountry,ym:s:trafficSource"}),
-        ("devices only",
+        ("devices × date,country (BASE DAU)",
          {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry"}),
+        # источник в namespace сессий — кандидаты имён
+        ("devices × ...,s:publisher",
+         {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry,ym:s:publisher"}),
+        ("devices × ...,s:advEngineName",
+         {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry,ym:s:advEngineName"}),
+        ("devices × ...,s:trackerName",
+         {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry,ym:s:trackerName"}),
+        # кросс-namespace: DAU по атрибуции установки
+        ("devices × ...,i:publisher",
+         {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry,ym:i:publisher"}),
+        # фильтры organic/paid
+        ("devices filter organic==yes",
+         {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry",
+          "filters": "ym:s:organic=='yes'"}),
+        ("devices filter isOrganic",
+         {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry",
+          "filters": "ym:s:isOrganic=='Yes'"}),
+        # namespace установок: installDevices по publisher (для доли paid, если DAU не делится)
+        ("i:installDevices × date,country,publisher",
+         {"metrics": "ym:i:installDevices", "dimensions": "ym:i:date,ym:i:regionCountry,ym:i:publisher"}),
+        ("i:devices × date,country,publisher",
+         {"metrics": "ym:i:devices", "dimensions": "ym:i:date,ym:i:regionCountry,ym:i:publisher"}),
     ]
     for label, extra in trials:
         params = {"id": APP_ID, "date1": frm, "date2": to, "accuracy": "1", "limit": "20", **extra}
@@ -131,6 +149,14 @@ def main() -> None:
             print(f"[deeplinks fields='{fields[:40]}...'] {type(e).__name__}: {str(e)[:160]}")
 
     print()
+    _reporting_probe(token, frm, to)
+
+
+def reporting_only() -> None:
+    """Только Reporting API (stat/v1/data) — синхронно, мгновенно, не трогает Logs (нет 429)."""
+    token = os.environ["APPMETRICA_TOKEN"]
+    frm, to = _win()
+    print(f"app={APP_ID}, reporting-only окно {frm}..{to}")
     _reporting_probe(token, frm, to)
 
 

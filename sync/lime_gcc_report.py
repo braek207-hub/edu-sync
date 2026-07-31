@@ -831,6 +831,10 @@ def main() -> None:
         from sync.probe_gcc_app import main as app_probe
         app_probe()
         return
+    if mode == "reporting-probe":  # только Reporting API (агрегат DAU/источник), без Logs → без 429
+        from sync.probe_gcc_app import reporting_only
+        reporting_only()
+        return
 
     from sync.sheets_write import get_write_service
     service = get_write_service()
