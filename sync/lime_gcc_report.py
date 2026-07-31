@@ -681,18 +681,27 @@ def traffic_backfill(service) -> None:
         traffic = fetch_web(conn, dates)   # web DAU — весь период из lime_stats
     finally:
         conn.close()
+
+    # Web пишем СРАЗУ — это главное (замена GA4 на Метрику). Быстро, гарантированно ложится,
+    # даже если AppMetrica ниже зависнет/упрётся в таймаут.
+    print(f"traffic-backfill web: {frm}…{to} ({len(dates)} дн.) — только трафик на Метрику, заказы не тронуты")
+    _refresh_tab(service, TRAFFIC_TAB, dates, traffic)
+
+    # App DAU — best-effort вторым проходом: молодые данные (~июнь'26+), тянем последние
+    # APP_BACKFILL дней. AppMetrica async-экспорты медленные — оборачиваем в try, чтобы сбой/
+    # таймаут app не отменял уже записанный web. Перезаписываем ТОЛЬКО app_dates (web+app вместе).
     if os.environ.get("APPMETRICA_TOKEN"):
-        from sync.gcc_app import fetch_app
-        # app-данные молодые (~июнь'26+); тянем последние APP_BACKFILL дней, старее app=0.
         app_dates = dates if len(dates) <= APP_BACKFILL else dates[-APP_BACKFILL:]
-        ta, _ = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
-        _merge_app(traffic, ta)
+        try:
+            from sync.gcc_app import fetch_app
+            ta, _ = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
+            _merge_app(traffic, ta)
+            _refresh_tab(service, TRAFFIC_TAB, app_dates, traffic)
+            print(f"traffic-backfill app: долит DAU за последние {len(app_dates)} дн.")
+        except Exception as e:  # noqa: BLE001
+            print(f"traffic-backfill app: ПРОПУЩЕН (web уже записан): {type(e).__name__}: {e}")
     else:
         print("gcc_app: APPMETRICA_TOKEN не задан — app-трафик 0")
-
-    print(f"traffic-backfill: {frm}…{to} ({len(dates)} дн.) — только трафик на Метрику, "
-          f"заказы не тронуты, app за последние {min(len(dates), APP_BACKFILL)} дн.")
-    _refresh_tab(service, TRAFFIC_TAB, dates, traffic)
 
 
 def verify(service) -> None:
