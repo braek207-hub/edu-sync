@@ -652,6 +652,49 @@ def load_history(service) -> None:
         print(f"{tab}: очищено + залито {len(dates)} дн. ({dates[0]}…{dates[-1]})")
 
 
+def traffic_backfill(service) -> None:
+    """РАЗОВЫЙ режим: заменить ВЕСЬ трафик листа на Метрику (web DAU) + AppMetrica (app DAU).
+
+    Лист трафика раньше был залит из GA4 — переводим на наш Метрика-пайплайн за весь период.
+    Заказы НЕ трогаем (лист «Fact Orders GCC» остаётся как есть, TW не дёргаем).
+    Диапазон: LIME_GCC_FROM..вчера(МСК); FROM по умолчанию — мин. дата текущего листа трафика.
+    Пишем через refresh (по дате-матчу): существующие даты перезаписываются Метрикой,
+    отсутствующие дописываются. Формулы (Total) не трогаем.
+    """
+    from sync.sheets_write import read_values
+
+    frm_env = os.environ.get("LIME_GCC_FROM")
+    if frm_env:
+        frm = date.fromisoformat(frm_env)
+    else:
+        grid = read_values(service, SHEET_ID, f"{TRAFFIC_TAB}!A1:E4000", render="FORMATTED_VALUE")
+        hdr_i = _header_row(grid)
+        dc = next(j for j, c in enumerate(grid[hdr_i]) if _norm(c) == "Дата")
+        isos = [f"{m[3]}-{m[2]}-{m[1]}" for row in grid[hdr_i + 1:]
+                if dc < len(row) and (m := _DATE_RE.search(row[dc]))]
+        frm = date.fromisoformat(min(isos))
+    to = _msk_today() - timedelta(days=1)
+    dates = _dates(frm, to)
+
+    conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
+    try:
+        traffic = fetch_web(conn, dates)   # web DAU — весь период из lime_stats
+    finally:
+        conn.close()
+    if os.environ.get("APPMETRICA_TOKEN"):
+        from sync.gcc_app import fetch_app
+        # app-данные молодые (~июнь'26+); тянем последние APP_BACKFILL дней, старее app=0.
+        app_dates = dates if len(dates) <= APP_BACKFILL else dates[-APP_BACKFILL:]
+        ta, _ = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
+        _merge_app(traffic, ta)
+    else:
+        print("gcc_app: APPMETRICA_TOKEN не задан — app-трафик 0")
+
+    print(f"traffic-backfill: {frm}…{to} ({len(dates)} дн.) — только трафик на Метрику, "
+          f"заказы не тронуты, app за последние {min(len(dates), APP_BACKFILL)} дн.")
+    _refresh_tab(service, TRAFFIC_TAB, dates, traffic)
+
+
 def verify(service) -> None:
     """Самопроверка: в обеих вкладках последняя дата = вчера(МСК). Иначе SystemExit(1)."""
     from sync.sheets_write import read_values
@@ -704,6 +747,9 @@ def main() -> None:
         return
     if mode == "load-history":  # разовая заливка истории из CSV
         load_history(service)
+        return
+    if mode == "traffic-backfill":  # разовый перевод листа трафика GA4 → Метрика (весь период)
+        traffic_backfill(service)
         return
     if mode == "probe":
         probe(service)

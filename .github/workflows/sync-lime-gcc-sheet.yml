@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "refresh | build | probe | app-probe | shopify-probe"
+        description: "refresh | build | traffic-backfill | probe | app-probe | shopify-probe"
         required: false
         default: "refresh"
       refresh_days:
