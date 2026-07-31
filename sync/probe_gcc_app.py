@@ -30,28 +30,17 @@ def _reporting_probe(token: str, frm: str, to: str) -> None:
     trials = [
         ("devices × date,country (BASE DAU)",
          {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry"}),
-        # источник в namespace сессий — кандидаты имён
-        ("devices × ...,s:publisher",
-         {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry,ym:s:publisher"}),
-        ("devices × ...,s:advEngineName",
-         {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry,ym:s:advEngineName"}),
-        ("devices × ...,s:trackerName",
-         {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry,ym:s:trackerName"}),
-        # кросс-namespace: DAU по атрибуции установки
-        ("devices × ...,i:publisher",
-         {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry,ym:i:publisher"}),
-        # фильтры organic/paid
-        ("devices filter organic==yes",
+        # СПЛИТ DAU по атрибуции установки через ФИЛТР (разные префиксы допустимы в filters)
+        ("DAU ORGANIC (filter i:publisher==Органика)",
          {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry",
-          "filters": "ym:s:organic=='yes'"}),
-        ("devices filter isOrganic",
+          "filters": "ym:i:publisher=='Органика'"}),
+        ("DAU PAID (filter i:publisher!=Органика)",
          {"metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry",
-          "filters": "ym:s:isOrganic=='Yes'"}),
-        # namespace установок: installDevices по publisher (для доли paid, если DAU не делится)
+          "filters": "ym:i:publisher!='Органика'"}),
+        # значения publisher (какие платные партнёры есть)
         ("i:installDevices × date,country,publisher",
-         {"metrics": "ym:i:installDevices", "dimensions": "ym:i:date,ym:i:regionCountry,ym:i:publisher"}),
-        ("i:devices × date,country,publisher",
-         {"metrics": "ym:i:devices", "dimensions": "ym:i:date,ym:i:regionCountry,ym:i:publisher"}),
+         {"metrics": "ym:i:installDevices",
+          "dimensions": "ym:i:date,ym:i:regionCountry,ym:i:publisher", "limit": "40"}),
     ]
     for label, extra in trials:
         params = {"id": APP_ID, "date1": frm, "date2": to, "accuracy": "1", "limit": "20", **extra}
