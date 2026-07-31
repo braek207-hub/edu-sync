@@ -142,22 +142,41 @@ def _fetch_touches(token: str, app_id: str, look_from: str, dmax: str) -> dict:
 
 
 def fetch_app_traffic(token: str, app_id: str, dates: list[str],
-                      lookback_days: int = 90) -> dict:
+                      lookback_days: int = 90, chunk_days: int | None = None) -> dict:
     """ТОЛЬКО app-трафик (DAU) GCC за `dates`: installs+deeplinks+sessions, БЕЗ purchases.
 
-    Для добора трафика когда заказы не нужны — 3 лёгких экспорта вместо 4 тяжёлых, надёжнее
-    проходит async-подготовку Logs API. Возвращает traffic (date → scope → app_org/app_paid).
+    Сессии тянем ЧАНКАМИ по chunk_days: приложение мультистрановое (RU/KZ/…+Залив), единый
+    экспорт сессий за большое окно не готовился за отведённое время Logs API. Мелкие окна
+    готовятся быстро; DAU считается по-дневно (дни не пересекают чанки → мержим без дедупа).
+    Касания (installs+deeplinks, лёгкие поля) тянем один раз на всё окно. Заказы не считаем.
     """
-    from sync.appmetrica_logs import fetch_sessions
-
+    chunk_days = chunk_days or int(os.environ.get("LIME_GCC_APP_CHUNK_DAYS") or "7")
     dmin, dmax = min(dates), max(dates)
     look_from = (date.fromisoformat(dmin) - timedelta(days=lookback_days)).isoformat()
     touches = _fetch_touches(token, app_id, look_from, dmax)
-    sessions = fetch_sessions(app_id, token, dmin, dmax, country=True)
-    print(f"gcc_app_traffic: касаний-устройств {len(touches)}, сессий {len(sessions)} "
-          f"(окно {dmin}..{dmax}, lookback {lookback_days}д)")
-    traffic, _ = aggregate(sessions, [], touches, dates)
-    return traffic
+
+    from sync.appmetrica_logs import fetch_sessions
+    combined = _empty(dates)
+    dmin_d, dmax_d = date.fromisoformat(dmin), date.fromisoformat(dmax)
+    d, total_s = dmin_d, 0
+    while d <= dmax_d:
+        c_to = min(d + timedelta(days=chunk_days - 1), dmax_d)
+        cdates = [(d + timedelta(days=k)).isoformat() for k in range((c_to - d).days + 1)]
+        try:
+            s = fetch_sessions(app_id, token, d.isoformat(), c_to.isoformat(), country=True)
+        except Exception as e:  # noqa: BLE001 — сбойный чанк не роняет весь сбор (дни останутся 0)
+            print(f"gcc_app_traffic чанк {d}..{c_to}: ПРОПУЩЕН ({type(e).__name__}: {e})")
+            d = c_to + timedelta(days=1)
+            continue
+        total_s += len(s)
+        t, _ = aggregate(s, [], touches, cdates)
+        for iso in cdates:
+            combined[iso] = t[iso]
+        print(f"gcc_app_traffic чанк {d}..{c_to}: сессий {len(s)}")
+        d = c_to + timedelta(days=1)
+    print(f"gcc_app_traffic: касаний-устройств {len(touches)}, сессий всего {total_s} "
+          f"(окно {dmin}..{dmax}, lookback {lookback_days}д, чанк {chunk_days}д)")
+    return combined
 
 
 def fetch_app(token: str, app_id: str, dates: list[str], lookback_days: int = 90,

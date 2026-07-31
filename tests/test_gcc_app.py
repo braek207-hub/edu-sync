@@ -82,6 +82,39 @@ def test_aggregate_traffic_is_dau_unique_devices():
     assert traffic["2026-07-28"]["GCC"]["app_org"] == 1
 
 
+def test_fetch_app_traffic_chunks_and_merges(monkeypatch):
+    """Сессии тянутся чанками, per-day DAU мержится по дням без дедупа между чанками."""
+    from datetime import date, timedelta
+
+    import sync.appmetrica_logs as logs
+    from sync.gcc_app import fetch_app_traffic
+
+    # касания: одно paid-устройство d1 (installations), диплинков нет
+    monkeypatch.setattr(logs, "fetch_export", lambda ep, *a, **k: (
+        [{"appmetrica_device_id": "d1", "install_datetime": "2026-06-01 00:00:00",
+          "publisher_name": "Google Ads"}] if ep == "installations" else []))
+
+    calls = []
+
+    def fake_sessions(app_id, token, ds, du, country=False):
+        calls.append((ds, du))
+        out, dd = [], date.fromisoformat(ds)
+        while dd <= date.fromisoformat(du):  # d1 активен каждый день окна
+            out.append({"appmetrica_device_id": "d1",
+                        "session_start_datetime": f"{dd} 08:00:00", "country_iso_code": "AE"})
+            dd += timedelta(days=1)
+        return out
+
+    monkeypatch.setattr(logs, "fetch_sessions", fake_sessions)
+
+    dates = ["2026-07-01", "2026-07-02", "2026-07-03"]
+    tr = fetch_app_traffic("t", "app", dates, lookback_days=30, chunk_days=2)
+    assert len(calls) == 2  # [01-02] и [03]
+    for iso in dates:
+        assert tr[iso]["UAE"]["app_paid"] == 1
+        assert tr[iso]["GCC"]["app_paid"] == 1
+
+
 def test_aggregate_empty():
     traffic, orders = aggregate([], [], {}, ["2026-07-28"])
     assert traffic["2026-07-28"]["GCC"]["app_org"] == 0
