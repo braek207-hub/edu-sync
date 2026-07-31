@@ -81,17 +81,28 @@ def aggregate(sessions: list[dict], purchases: list[dict], touches: dict,
     фильтруются по стране Залива и атрибутируются last-touch.
     """
     dset = set(dates)
-    traffic = _empty(dates)
     orders = _empty(dates)
 
+    # Трафик = DAU: уникальные устройства за день (не сессии). Собираем множества device_id
+    # по (дата, срез, paid/organic), затем считаем len. Устройство с сессиями в обоих
+    # сегментах за день попадёт в оба (Total ≥ суммы уникальных) — DAU по сегментам не аддитивен.
+    scopes = (_GCC,) + tuple(ISO_CODE.values())
+    tdev = {d: {s: {"app_org": set(), "app_paid": set()} for s in scopes} for d in dates}
     for r in sessions:
         iso = (r.get("session_start_datetime") or "")[:10]
         code = ISO_CODE.get(r.get("country_iso_code"))
-        if iso not in dset or not code:
+        did = r.get("appmetrica_device_id")
+        if iso not in dset or not code or not did:
             continue
-        field = app_bucket(attribute(r.get("appmetrica_device_id"), r["session_start_datetime"], touches))
-        traffic[iso][_GCC][field] += 1
-        traffic[iso][code][field] += 1
+        field = app_bucket(attribute(did, r["session_start_datetime"], touches))
+        tdev[iso][_GCC][field].add(did)
+        tdev[iso][code][field].add(did)
+
+    traffic = _empty(dates)
+    for iso in dates:
+        for s in scopes:
+            for f in ("app_org", "app_paid"):
+                traffic[iso][s][f] = len(tdev[iso][s][f])
 
     seen: set[str] = set()
     for r in purchases:

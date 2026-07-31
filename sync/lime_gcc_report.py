@@ -104,7 +104,7 @@ def _empty_day() -> dict:
 
 _STATS_SQL = """
 SELECT date::text AS d, country, traffic_type,
-       COALESCE(SUM(sessions), 0)::bigint AS sessions
+       COALESCE(SUM(users), 0)::bigint AS users
 FROM lime_stats
 WHERE region = 'gcc' AND data_source = 'web' AND date = ANY(%s::date[])
 GROUP BY date, country, traffic_type
@@ -112,21 +112,22 @@ GROUP BY date, country, traffic_type
 
 
 def fetch_web(conn, dates: list[str]) -> dict:
-    """traffic: date → {scope → metrics}. web-трафик (sessions) из lime_stats.
+    """traffic: date → {scope → metrics}. web-трафик = DAU (ym:s:users), не визиты.
 
-    Заказы здесь НЕ считаются — они берутся по атрибуции linearAll из TW+Shopify
-    (fetch_orders_linear). app-трафик доливает AppMetrica в _run. GCC-срез = весь регион
-    (в т.ч. country=NULL); коды — только 5 узнаваемых стран.
+    Заказы здесь НЕ считаются (linearAll из TW+Shopify, fetch_orders_linear); app-трафик
+    (DAU) доливает AppMetrica в _run. GCC-срез = весь регион (в т.ч. country=NULL).
+    ⚠️ users по paid/organic не строго аддитивен: юзер, активный в обоих сегментах за день,
+    попадёт в оба (Total чуть больше суммы уникальных) — как в Метрике по сегментам.
     """
     traffic = {d: _empty_day() for d in dates}
     with conn.cursor() as cur:
         cur.execute(_STATS_SQL, (dates,))
-        for d, country, ttype, sess in cur.fetchall():
+        for d, country, ttype, users in cur.fetchall():
             field = "web_paid" if ttype == "Платный" else "web_org"
             code = _COUNTRY_CODE.get((country or "").strip())
-            traffic[d][_GCC][field] += int(sess)
+            traffic[d][_GCC][field] += int(users)
             if code:
-                traffic[d][code][field] += int(sess)
+                traffic[d][code][field] += int(users)
     return traffic
 
 

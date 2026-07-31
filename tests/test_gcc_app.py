@@ -66,6 +66,22 @@ def test_aggregate_filters_gcc_and_dedups_orders():
     assert o["GCC"]["app_paid"] == 1 and o["GCC"]["app_org"] == 1
 
 
+def test_aggregate_traffic_is_dau_unique_devices():
+    """Трафик = DAU: несколько сессий одного устройства за день = 1, не число сессий."""
+    touches = build_touches(
+        installs=[{"appmetrica_device_id": "d1", "install_datetime": "2026-07-01 00:00:00",
+                   "publisher_name": ""}],  # organic
+        deeplinks=[],
+    )
+    sessions = [
+        {"appmetrica_device_id": "d1", "session_start_datetime": f"2026-07-28 0{h}:00:00",
+         "country_iso_code": "AE"} for h in range(1, 6)  # 5 сессий одного устройства
+    ]
+    traffic, _ = aggregate(sessions, [], touches, ["2026-07-28"])
+    assert traffic["2026-07-28"]["UAE"]["app_org"] == 1     # DAU=1, не 5
+    assert traffic["2026-07-28"]["GCC"]["app_org"] == 1
+
+
 def test_aggregate_empty():
     traffic, orders = aggregate([], [], {}, ["2026-07-28"])
     assert traffic["2026-07-28"]["GCC"]["app_org"] == 0
