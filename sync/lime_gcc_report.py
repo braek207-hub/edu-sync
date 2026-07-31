@@ -242,6 +242,53 @@ def _merge_app(dst: dict, app: dict) -> None:
             dst[iso][scope]["app_paid"] += m["app_paid"]
 
 
+# метрика day-dict → имя колонки листа (без префикса среза)
+_FIELD_COL = {"web_org": "Web Org", "web_paid": "Web Paid",
+              "app_org": "App Org", "app_paid": "App Paid"}
+
+
+def _fill_from_sheet(service, traffic: dict, dates: list[str], fields: tuple) -> None:
+    """Заполнить в `traffic` указанные метрики значениями из текущего листа трафика.
+
+    Нужно чтобы _refresh_tab не обнулил колонки источника, который сейчас не собрался
+    (app упал → сохраняем app с листа; app-only режим → сохраняем web с листа). Тем самым
+    производные Total пересчитываются корректно (обновлённая часть + сохранённая часть).
+    """
+    from sync.sheets_write import read_values
+
+    grid = read_values(service, SHEET_ID, f"{TRAFFIC_TAB}!A1:BZ4000", render="FORMATTED_VALUE")
+    hdr_i = _header_row(grid)
+    if hdr_i is None:
+        return
+    name_to_col = {_norm(c): j for j, c in enumerate(grid[hdr_i])}
+    date_col = name_to_col.get("Дата")
+    if date_col is None:
+        return
+
+    def num(ri: int, col: str) -> int:
+        cj = name_to_col.get(col)
+        if cj is None or ri >= len(grid) or cj >= len(grid[ri]):
+            return 0
+        v = str(grid[ri][cj]).replace(",", "").replace("\xa0", "").strip()
+        try:
+            return int(float(v))
+        except ValueError:
+            return 0
+
+    dset = set(dates)
+    for i in range(hdr_i + 1, len(grid)):
+        m = _DATE_RE.search(grid[i][date_col]) if date_col < len(grid[i]) else None
+        if not m:
+            continue
+        iso = f"{m[3]}-{m[2]}-{m[1]}"
+        if iso not in dset or iso not in traffic:
+            continue
+        for scope in _SCOPES:
+            prefix = "" if scope == _GCC else f"{scope} "
+            for f in fields:
+                traffic[iso][scope][f] = num(i, f"{prefix}{_FIELD_COL[f]}")
+
+
 def _run(service, dates: list[str], mode: str) -> None:
     conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
     try:
@@ -249,14 +296,27 @@ def _run(service, dates: list[str], mode: str) -> None:
     finally:
         conn.close()
 
+    app_ok = False
     if os.environ.get("APPMETRICA_TOKEN"):
-        from sync.gcc_app import fetch_app
         # AppMetrica — ТОЛЬКО app-трафик (sessions): заказы она недосчитывает (~43%).
-        app_dates = dates if len(dates) <= APP_BACKFILL else dates[-APP_BACKFILL:]
-        ta, _ = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
-        _merge_app(traffic, ta)
+        # BEST-EFFORT: async-экспорты Logs API иногда не готовятся за 20 мин (TimeoutError).
+        # Раньше это роняло ВЕСЬ _run → ни web, ни заказы не писались, лист застревал
+        # («GCC синк не отработал»). Теперь app-сбой не блокирует запись web+заказов.
+        try:
+            from sync.gcc_app import fetch_app
+            app_dates = dates if len(dates) <= APP_BACKFILL else dates[-APP_BACKFILL:]
+            ta, _ = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
+            _merge_app(traffic, ta)
+            app_ok = True
+        except Exception as e:  # noqa: BLE001
+            print(f"gcc_app: app-трафик ПРОПУЩЕН (пишем web+заказы): {type(e).__name__}: {e}")
     else:
         print("gcc_app: APPMETRICA_TOKEN не задан — app-трафик 0")
+
+    # app не собрался → НЕ обнулять App-колонки: подставляем существующие значения листа,
+    # чтобы _refresh_tab переписал их теми же числами (web обновится, app сохранится, Total верен).
+    if not app_ok and mode != "build":
+        _fill_from_sheet(service, traffic, dates, ("app_org", "app_paid"))
 
     # Заказы (web+app) — по атрибуции linearAll из TW+Shopify, округлены с точным тоталом.
     orders = fetch_orders_linear(dates)
@@ -693,8 +753,8 @@ def traffic_backfill(service) -> None:
     if os.environ.get("APPMETRICA_TOKEN"):
         app_dates = dates if len(dates) <= APP_BACKFILL else dates[-APP_BACKFILL:]
         try:
-            from sync.gcc_app import fetch_app
-            ta, _ = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
+            from sync.gcc_app import fetch_app_traffic
+            ta = fetch_app_traffic(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
             _merge_app(traffic, ta)
             _refresh_tab(service, TRAFFIC_TAB, app_dates, traffic)
             print(f"traffic-backfill app: долит DAU за последние {len(app_dates)} дн.")
@@ -702,6 +762,29 @@ def traffic_backfill(service) -> None:
             print(f"traffic-backfill app: ПРОПУЩЕН (web уже записан): {type(e).__name__}: {e}")
     else:
         print("gcc_app: APPMETRICA_TOKEN не задан — app-трафик 0")
+
+
+def app_traffic_fill(service) -> None:
+    """Добор app-трафика (DAU) в лист: собрать installs+deeplinks+sessions (без purchases) и
+    записать ТОЛЬКО app-колонки (web сохраняется с листа). Для случая, когда web уже залит,
+    а app нужно догнать. Окно: LIME_GCC_FROM..вчера(МСК), по умолчанию последние APP_BACKFILL дн.
+    """
+    from sync.gcc_app import fetch_app_traffic
+
+    to = _msk_today() - timedelta(days=1)
+    frm_env = os.environ.get("LIME_GCC_FROM")
+    frm = date.fromisoformat(frm_env) if frm_env else to - timedelta(days=APP_BACKFILL - 1)
+    dates = _dates(frm, to)
+
+    ta = fetch_app_traffic(os.environ["APPMETRICA_TOKEN"], APP_ID, dates, APP_LOOKBACK)
+    traffic = {d: _empty_day() for d in dates}
+    _merge_app(traffic, ta)                                  # app заполнен, web=0
+    _fill_from_sheet(service, traffic, dates, ("web_org", "web_paid"))  # вернуть web с листа
+    for iso in dates:
+        g = traffic[iso][_GCC]
+        print(f"{iso}: app DAU {g['app_org']}/{g['app_paid']} (org/paid)")
+    print(f"app-traffic-fill: {frm}…{to} ({len(dates)} дн.) — только app-колонки, web сохранён")
+    _refresh_tab(service, TRAFFIC_TAB, dates, traffic)
 
 
 def verify(service) -> None:
@@ -759,6 +842,9 @@ def main() -> None:
         return
     if mode == "traffic-backfill":  # разовый перевод листа трафика GA4 → Метрика (весь период)
         traffic_backfill(service)
+        return
+    if mode == "app-traffic-fill":  # добор app-трафика (DAU) в лист, web сохраняется
+        app_traffic_fill(service)
         return
     if mode == "probe":
         probe(service)

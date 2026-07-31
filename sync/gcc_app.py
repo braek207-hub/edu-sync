@@ -125,21 +125,50 @@ def aggregate(sessions: list[dict], purchases: list[dict], touches: dict,
     return traffic, orders
 
 
+# Лёгкий набор полей установки для атрибуции: только device/время/партнёр. БЕЗ
+# click_url_parameters (тяжёлый JSON ссылки трекера — для paid/organic не нужен, атрибуция
+# идёт по publisher_name) — это резко уменьшает async-экспорт installations и его подготовку
+# (тяжёлое окно упиралось в 20-мин таймаут Logs API).
+_LEAN_INSTALL_FIELDS = "appmetrica_device_id,install_datetime,publisher_name"
+
+
+def _fetch_touches(token: str, app_id: str, look_from: str, dmax: str) -> dict:
+    """Касания устройств (установки + диплинки) за окно [look_from, dmax], лёгкие поля."""
+    from sync.appmetrica_logs import fetch_export
+    installs = fetch_export("installations", app_id, token, look_from, dmax, _LEAN_INSTALL_FIELDS)
+    deeplinks = fetch_export("deeplinks", app_id, token, look_from, dmax,
+                             "appmetrica_device_id,event_datetime,publisher_name")
+    return build_touches(installs, deeplinks)
+
+
+def fetch_app_traffic(token: str, app_id: str, dates: list[str],
+                      lookback_days: int = 90) -> dict:
+    """ТОЛЬКО app-трафик (DAU) GCC за `dates`: installs+deeplinks+sessions, БЕЗ purchases.
+
+    Для добора трафика когда заказы не нужны — 3 лёгких экспорта вместо 4 тяжёлых, надёжнее
+    проходит async-подготовку Logs API. Возвращает traffic (date → scope → app_org/app_paid).
+    """
+    from sync.appmetrica_logs import fetch_sessions
+
+    dmin, dmax = min(dates), max(dates)
+    look_from = (date.fromisoformat(dmin) - timedelta(days=lookback_days)).isoformat()
+    touches = _fetch_touches(token, app_id, look_from, dmax)
+    sessions = fetch_sessions(app_id, token, dmin, dmax, country=True)
+    print(f"gcc_app_traffic: касаний-устройств {len(touches)}, сессий {len(sessions)} "
+          f"(окно {dmin}..{dmax}, lookback {lookback_days}д)")
+    traffic, _ = aggregate(sessions, [], touches, dates)
+    return traffic
+
+
 def fetch_app(token: str, app_id: str, dates: list[str], lookback_days: int = 90,
               event_name: str = "purchase") -> tuple[dict, dict]:
     """Собрать app-трафик и заказы GCC за `dates`. Касания тянем с lookback назад."""
-    from sync.appmetrica_logs import (
-        fetch_export, fetch_installations, fetch_purchase_events, fetch_sessions,
-    )
+    from sync.appmetrica_logs import fetch_purchase_events, fetch_sessions
 
     dmin, dmax = min(dates), max(dates)
     look_from = (date.fromisoformat(dmin) - timedelta(days=lookback_days)).isoformat()
 
-    installs = fetch_installations(app_id, token, look_from, dmax)
-    deeplinks = fetch_export("deeplinks", app_id, token, look_from, dmax,
-                             "appmetrica_device_id,event_datetime,publisher_name")
-    touches = build_touches(installs, deeplinks)
-
+    touches = _fetch_touches(token, app_id, look_from, dmax)  # лёгкие поля (без click_url_parameters)
     sessions = fetch_sessions(app_id, token, dmin, dmax, country=True)
     purchases = fetch_purchase_events(app_id, token, dmin, dmax, event_name, country=True)
     print(f"gcc_app: касаний-устройств {len(touches)}, сессий {len(sessions)}, "

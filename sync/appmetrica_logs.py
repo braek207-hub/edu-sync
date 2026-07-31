@@ -4,13 +4,16 @@ Logs API асинхронный: первый запрос ставит подг
 повторные — поллинг до готовности (HTTP 200 с телом {"data": [...]}).
 Даты — datetime 'YYYY-MM-DD HH:MM:SS'. Авторизация — заголовок OAuth-токеном.
 """
+import os
 import time
 
 import requests
 
 BASE = "https://api.appmetrica.yandex.ru/logs/v1/export"
 POLL_INTERVAL_SEC = 20
-POLL_MAX_ATTEMPTS = 60  # до ~20 минут ожидания подготовки
+# По умолчанию ~20 мин. Настраивается из env: крупные окна (бэкфилл) готовятся дольше —
+# ставим больше (напр. 90 = ~30 мин), но с оглядкой на timeout джобы (несколько экспортов подряд).
+POLL_MAX_ATTEMPTS = int(os.environ.get("APPMETRICA_POLL_MAX") or "60")
 
 INSTALL_FIELDS = (
     "appmetrica_device_id,install_datetime,publisher_name,"
