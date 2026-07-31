@@ -31,7 +31,10 @@ concurrency:
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 60 мин: refresh дёргает медленные async-API (AppMetrica Logs API готовит файл
+    # установок за 90д + сессии/покупки/диплинки, TW по дням, Shopify) — на 20 мин
+    # плановый прогон 31.07 упирался в таймаут и убивался (cancelled), 30.07 не дописывался.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
