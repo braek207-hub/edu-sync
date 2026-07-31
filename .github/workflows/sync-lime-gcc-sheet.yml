@@ -65,7 +65,7 @@ jobs:
           LIME_GCC_REFRESH_DAYS: ${{ github.event.inputs.refresh_days || '7' }}
           LIME_GCC_FROM: ${{ github.event.inputs.gcc_from }}
           LIME_GCC_TO: ${{ github.event.inputs.gcc_to }}
-          APPMETRICA_POLL_MAX: "90"   # ~30 мин на подготовку async-экспорта (крупные окна)
+          APPMETRICA_POLL_MAX: "45"   # ~15 мин/экспорт: сессии тянутся мелкими чанками (7д) — готовятся быстро
           PYTHONIOENCODING: "utf-8"
         # Ретрай: до 3 попыток на транзиентный сбой API (Google/AppMetrica/TW/Shopify),
         # чтобы синк точно дошёл. Между попытками пауза. Падаем только если все 3 легли.
