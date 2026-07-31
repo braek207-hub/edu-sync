@@ -651,6 +651,26 @@ def load_history(service) -> None:
         print(f"{tab}: очищено + залито {len(dates)} дн. ({dates[0]}…{dates[-1]})")
 
 
+def verify(service) -> None:
+    """Самопроверка: в обеих вкладках последняя дата = вчера(МСК). Иначе SystemExit(1)."""
+    from sync.sheets_write import read_values
+    expected = (_msk_today() - timedelta(days=1)).isoformat()
+    stale = []
+    for tab in (TRAFFIC_TAB, ORDERS_TAB):
+        grid = read_values(service, SHEET_ID, f"{tab}!A1:E4000", render="FORMATTED_VALUE")
+        hdr_i = _header_row(grid)
+        dc = next(j for j, c in enumerate(grid[hdr_i]) if _norm(c) == "Дата")
+        isos = [f"{m[3]}-{m[2]}-{m[1]}" for row in grid[hdr_i + 1:]
+                if dc < len(row) and (m := _DATE_RE.search(row[dc]))]
+        mx = max(isos) if isos else "нет"
+        print(f"verify {tab}: последняя дата {mx}, ожидалась ≥ {expected}")
+        if not isos or max(isos) < expected:
+            stale.append(f"{tab}={mx}")
+    if stale:
+        raise SystemExit(f"verify: книга НЕ содержит вчерашней даты ({expected}): {stale} — синк не дошёл")
+    print("verify: OK, книга актуальна")
+
+
 def main() -> None:
     mode = os.environ.get("LIME_GCC_MODE") or "refresh"
     if mode == "attr-compare":  # Meta: lastPlatformClick vs linearAll
@@ -678,6 +698,9 @@ def main() -> None:
 
     from sync.sheets_write import get_write_service
     service = get_write_service()
+    if mode == "verify":  # самопроверка: книга содержит вчерашнюю дату
+        verify(service)
+        return
     if mode == "load-history":  # разовая заливка истории из CSV
         load_history(service)
         return

@@ -2,9 +2,11 @@ name: LIME GCC → Google Sheet (трафик + заказы)
 
 on:
   schedule:
-    # 23:50 UTC = 02:50 Moscow. Раньше нужного с запасом на задержку планировщика GitHub;
-    # окно считается по московской дате в коде (запуск до полуночи UTC пишет верный «вчера»).
+    # Два прогона в день (бэкап): если первый лёг/отменился/задержался планировщиком GitHub —
+    # второй догонит (refresh идемпотентен, пишет последние 7 дней по дате-матчу).
+    # 23:50 UTC = 02:50 МСК (осн.) и 06:00 UTC = 09:00 МСК (страховка).
     - cron: "50 23 * * *"
+    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -63,5 +65,30 @@ jobs:
           LIME_GCC_REFRESH_DAYS: ${{ github.event.inputs.refresh_days || '7' }}
           LIME_GCC_FROM: ${{ github.event.inputs.gcc_from }}
           LIME_GCC_TO: ${{ github.event.inputs.gcc_to }}
+          PYTHONIOENCODING: "utf-8"
+        # Ретрай: до 3 попыток на транзиентный сбой API (Google/AppMetrica/TW/Shopify),
+        # чтобы синк точно дошёл. Между попытками пауза. Падаем только если все 3 легли.
+        run: |
+          for attempt in 1 2 3; do
+            echo "=== попытка $attempt/3 ==="
+            if python -m sync.lime_gcc_report; then
+              echo "=== успех с попытки $attempt ==="
+              exit 0
+            fi
+            echo "=== попытка $attempt упала, пауза 60с ==="
+            sleep 60
+          done
+          echo "=== все 3 попытки легли ==="
+          exit 1
+
+      - name: Самопроверка (последняя дата в книге)
+        if: success()
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          GCC_TRIPLEWHALE_API_KEY: ${{ secrets.GCC_TRIPLEWHALE_API_KEY }}
+          GCC_TW_SHOP_DOMAIN: ${{ secrets.GCC_TW_SHOP_DOMAIN }}
+          API_LIME_SHOPIFY: ${{ secrets.API_LIME_SHOPIFY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIME_GCC_MODE: verify
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_gcc_report
