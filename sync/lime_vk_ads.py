@@ -91,8 +91,9 @@ def parse_goal_stats(api_json: Dict[str, Any]) -> Dict[Tuple[str, str], Dict[str
     return out
 
 
-def build_rows(base_map, goals_map, campaigns_meta) -> list:
-    """Слить базу + конверсии + мету кампании в строки upsert. Ведёт база (только где есть статистика)."""
+def build_rows(base_map, goals_map, campaigns_meta, cabinet: str = "") -> list:
+    """Слить базу + конверсии + мету кампании в строки upsert. Ведёт база (только где есть статистика).
+    cabinet — метка кабинета (login), различает несколько VK-аккаунтов в одной таблице."""
     rows = []
     for (date, cid), base in base_map.items():
         meta = campaigns_meta.get(cid, {})
@@ -100,6 +101,7 @@ def build_rows(base_map, goals_map, campaigns_meta) -> list:
         rows.append({
             "date": date,
             "region": "ru",
+            "cabinet": cabinet,
             "campaign_id": cid,
             "campaign_name": meta.get("name"),
             "objective": meta.get("objective"),
@@ -197,13 +199,13 @@ def fetch_ad_plans(token: str) -> dict:
 
 _UPSERT_SQL = """
     INSERT INTO lime_vk_ads_stats
-      (date, region, campaign_id, campaign_name, objective, status,
+      (date, region, cabinet, campaign_id, campaign_name, objective, status,
        shows, clicks, spent, goals_total, vk_result, conversions, updated_at)
     VALUES
-      (%(date)s, %(region)s, %(campaign_id)s, %(campaign_name)s, %(objective)s, %(status)s,
+      (%(date)s, %(region)s, %(cabinet)s, %(campaign_id)s, %(campaign_name)s, %(objective)s, %(status)s,
        %(shows)s, %(clicks)s, %(spent)s, %(goals_total)s, %(vk_result)s, %(conversions)s::jsonb, NOW())
     ON CONFLICT (date, campaign_id) DO UPDATE SET
-       region = EXCLUDED.region, campaign_name = EXCLUDED.campaign_name,
+       region = EXCLUDED.region, cabinet = EXCLUDED.cabinet, campaign_name = EXCLUDED.campaign_name,
        objective = EXCLUDED.objective, status = EXCLUDED.status,
        shows = EXCLUDED.shows, clicks = EXCLUDED.clicks, spent = EXCLUDED.spent,
        goals_total = EXCLUDED.goals_total, vk_result = EXCLUDED.vk_result,
@@ -236,21 +238,39 @@ def _chunked(seq, n):
         yield seq[i:i + n]
 
 
-def sync_lime_vk_ads(days_back: int = 14) -> int:
-    client_id = os.environ.get("VK_CLIENT_ID", "").strip()
-    secret = os.environ.get("VK_CLIENT_SECRET", "").strip()
-    if not client_id or not secret:
-        raise RuntimeError("VK_CLIENT_ID / VK_CLIENT_SECRET не заданы")
+def _cabinets() -> list:
+    """Пары (client_id, secret) всех VK-кабинетов из env: базовый VK_CLIENT_ID/VK_CLIENT_SECRET +
+    пронумерованные VK_CLIENT_ID_N/VK_CLIENT_SECRET_N (N=2,3,4,...). Каждый кабинет = своя пара
+    (client_id+secret — единица приложения VK, секрет не шарится). Метка кабинета = login аккаунта."""
+    out = []
+    cid = os.environ.get("VK_CLIENT_ID", "").strip()
+    sec = os.environ.get("VK_CLIENT_SECRET", "").strip()
+    if cid and sec:
+        out.append((cid, sec))
+    n = 2
+    while True:
+        cid = os.environ.get(f"VK_CLIENT_ID_{n}", "").strip()
+        sec = os.environ.get(f"VK_CLIENT_SECRET_{n}", "").strip()
+        if not cid or not sec:
+            break
+        out.append((cid, sec))
+        n += 1
+    return out
 
-    token = _get_token(client_id, secret)
+
+def _cabinet_login(token: str) -> str:
+    """Login аккаунта — стабильная метка кабинета в таблице (человекочитаемые имена — в дашборде)."""
+    try:
+        u = _api_get(token, "user.json")
+        return str(u.get("username") or u.get("id") or "").strip()
+    except Exception:
+        return ""
+
+
+def _fetch_cabinet_rows(token: str, cabinet: str, df: str, dt: str) -> list:
     plans = fetch_ad_plans(token)
     ids = list(plans.keys())
-    print(f"[lime_vk_ads] кампаний (ad_plans): {len(ids)}")
-
-    to = date.today()
-    frm = to - timedelta(days=days_back)
-    df, dt = frm.isoformat(), to.isoformat()
-
+    print(f"[lime_vk_ads] {cabinet}: кампаний (ad_plans) {len(ids)}")
     base_map, goals_map = {}, {}
     for batch in _chunked(ids, STAT_BATCH):
         csv = ",".join(batch)
@@ -260,10 +280,27 @@ def sync_lime_vk_ads(days_back: int = 14) -> int:
         goals_map.update(parse_goal_stats(
             _api_get(token, f"statistics/goals/ad_plans/day.json?id={csv}&date_from={df}&date_to={dt}")))
         time.sleep(2)
+    return build_rows(base_map, goals_map, plans, cabinet=cabinet)
 
-    rows = build_rows(base_map, goals_map, plans)
-    n = _upsert(rows, df, dt)
-    print(f"[lime_vk_ads] {n} строк в lime_vk_ads_stats ({df}..{dt})")
+
+def sync_lime_vk_ads(days_back: int = 14) -> int:
+    cabinets = _cabinets()
+    if not cabinets:
+        raise RuntimeError("VK_CLIENT_ID / VK_CLIENT_SECRET не заданы")
+
+    to = date.today()
+    frm = to - timedelta(days=days_back)
+    df, dt = frm.isoformat(), to.isoformat()
+
+    all_rows: list = []
+    for client_id, secret in cabinets:
+        token = _get_token(client_id, secret)
+        cabinet = _cabinet_login(token)
+        all_rows.extend(_fetch_cabinet_rows(token, cabinet, df, dt))
+
+    # ad_plan_id глобально уникальны между кабинетами (0 пересечений) → PK (date,campaign_id) без cabinet.
+    n = _upsert(all_rows, df, dt)
+    print(f"[lime_vk_ads] {n} строк из {len(cabinets)} кабинетов ({df}..{dt})")
     return n
 
 

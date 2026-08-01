@@ -62,3 +62,25 @@ def test_campaigns_from_json():
     out = _campaigns_from_json(js)
     assert out["122821840"] == {"name": "A", "objective": "site_conversions", "status": "active"}
     assert "70911932" in out
+
+
+def test_build_rows_stamps_cabinet():
+    base = {("2026-07-15", "15760469"): {"shows": 10, "clicks": 2, "spent": 50.0,
+                                         "goals_total": 1, "vk_result": 1}}
+    rows = __import__("sync.lime_vk_ads", fromlist=["build_rows"]).build_rows(base, {}, {}, cabinet="vkads_814620282")
+    assert rows[0]["cabinet"] == "vkads_814620282"
+    # дефолт без метки — пустая строка, не падает
+    rows2 = __import__("sync.lime_vk_ads", fromlist=["build_rows"]).build_rows(base, {}, {})
+    assert rows2[0]["cabinet"] == ""
+
+
+def test_cabinets_collects_base_and_numbered(monkeypatch):
+    from sync.lime_vk_ads import _cabinets
+    for k in list(__import__("os").environ):
+        if k.startswith("VK_CLIENT_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("VK_CLIENT_ID", "b_id"); monkeypatch.setenv("VK_CLIENT_SECRET", "b_sec")
+    monkeypatch.setenv("VK_CLIENT_ID_2", "id2"); monkeypatch.setenv("VK_CLIENT_SECRET_2", "sec2")
+    monkeypatch.setenv("VK_CLIENT_ID_3", "id3"); monkeypatch.setenv("VK_CLIENT_SECRET_3", "sec3")
+    # разрыв нумерации останавливает сбор
+    assert _cabinets() == [("b_id", "b_sec"), ("id2", "sec2"), ("id3", "sec3")]

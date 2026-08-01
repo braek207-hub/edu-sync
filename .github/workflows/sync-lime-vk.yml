@@ -33,8 +33,16 @@ jobs:
       - name: Run LIME VK Ads sync
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # 4 кабинета LIME VK (пары client_id+secret, секрет свой на кабинет):
+          # база=Основной(женский) · _2=Kids · _3=Man · _4=APP. Синк гоняет все (_cabinets).
           VK_CLIENT_ID: ${{ secrets.VK_CLIENT_ID }}
           VK_CLIENT_SECRET: ${{ secrets.VK_CLIENT_SECRET }}
+          VK_CLIENT_ID_2: ${{ secrets.VK_CLIENT_ID_2 }}
+          VK_CLIENT_SECRET_2: ${{ secrets.VK_CLIENT_SECRET_2 }}
+          VK_CLIENT_ID_3: ${{ secrets.VK_CLIENT_ID_3 }}
+          VK_CLIENT_SECRET_3: ${{ secrets.VK_CLIENT_SECRET_3 }}
+          VK_CLIENT_ID_4: ${{ secrets.VK_CLIENT_ID_4 }}
+          VK_CLIENT_SECRET_4: ${{ secrets.VK_CLIENT_SECRET_4 }}
           LIME_VK_DAYS_BACK: ${{ github.event.inputs.days_back || '14' }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_vk_ads
