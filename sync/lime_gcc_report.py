@@ -835,6 +835,10 @@ def main() -> None:
         from sync.probe_gcc_app import reporting_only
         reporting_only()
         return
+    if mode == "app-validate":  # сверка app DAU по стране: Logs vs Reporting (=UI Аудитория)
+        from sync.probe_gcc_app import app_validate
+        app_validate()
+        return
 
     from sync.sheets_write import get_write_service
     service = get_write_service()

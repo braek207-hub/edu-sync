@@ -149,5 +149,61 @@ def reporting_only() -> None:
     _reporting_probe(token, frm, to)
 
 
+# имя страны Reporting API (рус.) → код колонки книги
+_REP_COUNTRY = {"Объединённые Арабские Эмираты": "UAE", "Саудовская Аравия": "KSA",
+                "Катар": "QA", "Кувейт": "KW", "Оман": "OM"}
+
+
+def _reporting_dau_by_country(token: str, frm: str, to: str) -> dict:
+    """{(date, code): devices} — DAU по стране из Reporting API (ym:s:devices)."""
+    params = {"id": APP_ID, "date1": frm, "date2": to, "accuracy": "1", "limit": "5000",
+              "metrics": "ym:s:devices", "dimensions": "ym:s:date,ym:s:regionCountry"}
+    url = f"{_STAT_URL}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"Authorization": f"OAuth {token}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    out = {}
+    for row in data.get("data", []):
+        dims = [d.get("name") for d in row.get("dimensions", [])]
+        code = _REP_COUNTRY.get(dims[1]) if len(dims) > 1 else None
+        if code:
+            out[(dims[0], code)] = int(round(row["metrics"][0]))
+    return out
+
+
+def app_validate() -> None:
+    """Сверка app DAU по СТРАНЕ: наш Logs last-touch vs Reporting API (=«Аудитория» UI).
+
+    Окно: LIME_GCC_FROM..вчера(МСК) или последние 14 зрелых дней. Печатает по каждой стране
+    Залива и дню: Logs org/paid/всего и Reporting devices, плюс расхождение по UAE.
+    """
+    from datetime import date, timedelta
+
+    from sync.gcc_app import ISO_CODE, fetch_app_traffic
+
+    token = os.environ["APPMETRICA_TOKEN"]
+    today = (datetime.now(timezone.utc) + timedelta(hours=3)).date()
+    to = today - timedelta(days=1)
+    frm_env = os.environ.get("LIME_GCC_FROM")
+    frm = date.fromisoformat(frm_env) if frm_env else to - timedelta(days=13)
+    dates = [(frm + timedelta(days=k)).isoformat() for k in range((to - frm).days + 1)]
+
+    tr = fetch_app_traffic(token, APP_ID, dates)
+    rep = _reporting_dau_by_country(token, dates[0], dates[-1])
+
+    codes = list(ISO_CODE.values())  # UAE, KSA, QA, KW, OM
+    print(f"\n=== Сверка app DAU по стране: Logs vs Reporting ({dates[0]}..{dates[-1]}) ===")
+    print("дата       стр   Logs(org/paid=всего)   Reporting   Δ(Logs-Rep)")
+    for iso in dates:
+        for code in codes:
+            m = tr[iso][code]
+            logs_tot = m["app_org"] + m["app_paid"]
+            r = rep.get((iso, code))
+            delta = "—" if r is None else str(logs_tot - r)
+            if code == "UAE" or logs_tot or r:  # UAE всегда, прочие если есть данные
+                print(f"{iso} {code:>4}   {m['app_org']:>3}/{m['app_paid']:<3}={logs_tot:<4}      "
+                      f"{('—' if r is None else r):>4}        {delta}")
+
+
 if __name__ == "__main__":
     main()
