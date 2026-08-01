@@ -933,6 +933,12 @@ def ga4_compare_formulas(service) -> None:
     write_formulas(service, SHEET_ID, f"{COMPARE_TAB}!A1", [header, row2])
     print(f"{COMPARE_TAB}: формулы записаны ({len(header)} колонок; авто-обновление из {ga4}/{gcc})")
 
+    from sync.sheets_write import read_values
+    chk = read_values(service, SHEET_ID, f"{COMPARE_TAB}!A1:E6", render="FORMATTED_VALUE")
+    print("проверка (Дата | Метрика DAU GCC | GA4 всего GCC | Δ% GCC):")
+    for r in chk:
+        print("  ", [c for c in r[:5]])
+
 
 def ga4_run(service, dates: list[str], mode: str) -> None:
     """Собрать GA4-трафик по hostName/каналам и записать лист GA4.
