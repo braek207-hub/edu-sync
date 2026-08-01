@@ -1,9 +1,36 @@
 # -*- coding: utf-8 -*-
 """GCC-отчёт: агрегация web по срезам (GCC+страны) и построение строки широкого формата."""
 from sync.lime_gcc_report import (
-    _CODES, _GCC, _date_label, _header, _row_values, _scope_cols,
-    aggregate_orders_linear, fetch_web,
+    _CODES, _GCC, _apply_app_total, _date_label, _header, _row_values, _scope_cols,
+    _split_app_by_logs, aggregate_orders_linear, fetch_web,
 )
+
+
+def _empty_traffic(dates):
+    from sync.lime_gcc_report import _SCOPES, _empty_day
+    return {d: _empty_day() for d in dates}
+
+
+def test_apply_app_total_no_split():
+    """Reporting total кладётся весь в app_org, paid=0 (полный день без разбивки)."""
+    tr = _empty_traffic(["2026-07-28"])
+    _apply_app_total(tr, {"2026-07-28": {_GCC: 219, "UAE": 200}}, ["2026-07-28"])
+    assert tr["2026-07-28"][_GCC]["app_org"] == 219
+    assert tr["2026-07-28"][_GCC]["app_paid"] == 0
+    assert tr["2026-07-28"]["UAE"]["app_org"] == 200
+
+
+def test_split_app_by_logs_preserves_reporting_total():
+    """Сплит: paid = round(total × доля_Logs), тотал остаётся Reporting-точным."""
+    tr = _empty_traffic(["2026-07-28"])
+    app_total = {"2026-07-28": {_GCC: 200}}
+    _apply_app_total(tr, app_total, ["2026-07-28"])
+    # Logs: 150 org / 50 paid → доля paid = 25% → от Reporting total 200: paid=50, org=150
+    logs = {"2026-07-28": {_GCC: {"app_org": 150, "app_paid": 50}}}
+    _split_app_by_logs(tr, app_total, logs, ["2026-07-28"])
+    m = tr["2026-07-28"][_GCC]
+    assert m["app_paid"] == 50 and m["app_org"] == 150
+    assert m["app_org"] + m["app_paid"] == 200   # тотал = Reporting, не Logs
 
 
 class FakeCur:

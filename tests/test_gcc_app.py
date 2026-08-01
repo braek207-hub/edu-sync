@@ -115,6 +115,35 @@ def test_fetch_app_traffic_chunks_and_merges(monkeypatch):
         assert tr[iso]["GCC"]["app_paid"] == 1
 
 
+def test_fetch_app_dau_total_parses_and_sums_gcc(monkeypatch):
+    """Reporting total: маппинг стран (рус.→код), GCC = сумма 5, чужие страны отброшены."""
+    import json as _json
+    from contextlib import contextmanager
+
+    import sync.gcc_app as ga
+
+    payload = {"data": [
+        {"dimensions": [{"name": "2026-07-28"}, {"name": "Объединённые Арабские Эмираты"}],
+         "metrics": [179.0]},
+        {"dimensions": [{"name": "2026-07-28"}, {"name": "Саудовская Аравия"}], "metrics": [40.0]},
+        {"dimensions": [{"name": "2026-07-28"}, {"name": "Россия"}], "metrics": [196.0]},  # не Залив
+    ]}
+
+    @contextmanager
+    def fake_urlopen(req, timeout=90):
+        class R:
+            def read(self):
+                return _json.dumps(payload).encode("utf-8")
+        yield R()
+
+    monkeypatch.setattr(ga.urllib.request, "urlopen", fake_urlopen)
+    out = ga.fetch_app_dau_total("t", "app", ["2026-07-28"])
+    assert out["2026-07-28"]["UAE"] == 179
+    assert out["2026-07-28"]["KSA"] == 40
+    assert out["2026-07-28"]["GCC"] == 219   # 179+40, Россия не в счёте
+    assert "QA" in out["2026-07-28"] and out["2026-07-28"]["QA"] == 0
+
+
 def test_aggregate_empty():
     traffic, orders = aggregate([], [], {}, ["2026-07-28"])
     assert traffic["2026-07-28"]["GCC"]["app_org"] == 0

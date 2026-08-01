@@ -289,6 +289,39 @@ def _fill_from_sheet(service, traffic: dict, dates: list[str], fields: tuple) ->
                 traffic[iso][scope][f] = num(i, f"{prefix}{_FIELD_COL[f]}")
 
 
+def _apply_app_total(traffic: dict, app_total: dict, dates: list[str]) -> None:
+    """Положить app DAU total (Reporting) в срезы БЕЗ деления: весь total в app_org, paid=0.
+
+    Это «полный день без разбивки» — гарантированное утреннее состояние. Logs-фаза ниже
+    (best-effort) потом перепишет app_org/app_paid реальным сплитом. GCC-срез Reporting уже
+    сумма 5 стран, поэтому кладём как есть.
+    """
+    for iso in dates:
+        for scope, total in app_total.get(iso, {}).items():
+            traffic[iso][scope]["app_org"] = total
+            traffic[iso][scope]["app_paid"] = 0
+
+
+def _split_app_by_logs(traffic: dict, app_total: dict, logs: dict, dates: list[str]) -> None:
+    """Разложить app total (Reporting) на org/paid по ДОЛЕ из Logs last-touch.
+
+    Total берём точный из Reporting (=UI), а долю paid — из Logs (org/paid данного среза).
+    app_paid = round(total × paid_доля), app_org = total − paid. Тотал остаётся Reporting-точным,
+    делится только пропорция. Нет данных Logs по срезу → остаётся как есть (весь organic).
+    """
+    for iso in dates:
+        for scope, total in app_total.get(iso, {}).items():
+            lm = logs.get(iso, {}).get(scope)
+            if not lm:
+                continue
+            lt = lm["app_org"] + lm["app_paid"]
+            if lt <= 0:
+                continue
+            paid = min(round(total * lm["app_paid"] / lt), total)
+            traffic[iso][scope]["app_paid"] = paid
+            traffic[iso][scope]["app_org"] = total - paid
+
+
 def _run(service, dates: list[str], mode: str) -> None:
     conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
     try:
@@ -296,40 +329,46 @@ def _run(service, dates: list[str], mode: str) -> None:
     finally:
         conn.close()
 
-    app_ok = False
-    if os.environ.get("APPMETRICA_TOKEN"):
-        # AppMetrica — ТОЛЬКО app-трафик (sessions): заказы она недосчитывает (~43%).
-        # BEST-EFFORT: async-экспорты Logs API иногда не готовятся за 20 мин (TimeoutError).
-        # Раньше это роняло ВЕСЬ _run → ни web, ни заказы не писались, лист застревал
-        # («GCC синк не отработал»). Теперь app-сбой не блокирует запись web+заказов.
+    token = os.environ.get("APPMETRICA_TOKEN")
+    # ── Фаза 1: app DAU TOTAL из Reporting API (синхронно, надёжно = полный день без разбивки).
+    app_total = {}
+    if token:
         try:
-            from sync.gcc_app import fetch_app
-            app_dates = dates if len(dates) <= APP_BACKFILL else dates[-APP_BACKFILL:]
-            ta, _ = fetch_app(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
-            _merge_app(traffic, ta)
-            app_ok = True
+            from sync.gcc_app import fetch_app_dau_total
+            app_total = fetch_app_dau_total(token, APP_ID, dates)
+            _apply_app_total(traffic, app_total, dates)
         except Exception as e:  # noqa: BLE001
-            print(f"gcc_app: app-трафик ПРОПУЩЕН (пишем web+заказы): {type(e).__name__}: {e}")
+            print(f"gcc_app: Reporting total ПРОПУЩЕН: {type(e).__name__}: {e}")
+            if mode != "build":  # Reporting лёг → не обнулять app, сохранить значения листа
+                _fill_from_sheet(service, traffic, dates, ("app_org", "app_paid"))
     else:
         print("gcc_app: APPMETRICA_TOKEN не задан — app-трафик 0")
 
-    # app не собрался → НЕ обнулять App-колонки: подставляем существующие значения листа,
-    # чтобы _refresh_tab переписал их теми же числами (web обновится, app сохранится, Total верен).
-    if not app_ok and mode != "build":
-        _fill_from_sheet(service, traffic, dates, ("app_org", "app_paid"))
+    orders = fetch_orders_linear(dates)  # web+app по linearAll из TW+Shopify
 
-    # Заказы (web+app) — по атрибуции linearAll из TW+Shopify, округлены с точным тоталом.
-    orders = fetch_orders_linear(dates)
-
-    for iso in dates:
-        g, go = traffic[iso][_GCC], orders[iso][_GCC]
-        print(f"{iso}: трафик web {g['web_org']}/{g['web_paid']} app {g['app_org']}/{g['app_paid']} | "
-              f"заказы web {go['web_org']}/{go['web_paid']} app {go['app_org']}/{go['app_paid']}")
+    # ЗАПИСЬ A — полный день гарантированно: web(Метрика) + app total(Reporting, без разбивки) + заказы.
     for tab, data in ((TRAFFIC_TAB, traffic), (ORDERS_TAB, orders)):
         if mode == "build":
             _build_tab(service, tab, dates, data)
         else:
             _refresh_tab(service, tab, dates, data)
+    for iso in dates:
+        g = traffic[iso][_GCC]
+        print(f"{iso}: web {g['web_org']}/{g['web_paid']} app total {g['app_org'] + g['app_paid']}")
+
+    # ── Фаза 2: уточнить app-сплит paid/organic из Logs last-touch (BEST-EFFORT).
+    # Logs упал/таймаут → фаза 1 (total без разбивки) уже записана, утренние данные целы.
+    if token and app_total and mode != "build":
+        try:
+            from sync.gcc_app import fetch_app_traffic
+            app_dates = dates if len(dates) <= APP_BACKFILL else dates[-APP_BACKFILL:]
+            logs = fetch_app_traffic(token, APP_ID, app_dates, APP_LOOKBACK)
+            _split_app_by_logs(traffic, app_total, logs, app_dates)
+            _refresh_tab(service, TRAFFIC_TAB, app_dates, traffic)  # перезапись app-сплита
+            print(f"gcc_app: app-сплит из Logs записан за {len(app_dates)} дн.")
+        except Exception as e:  # noqa: BLE001
+            print(f"gcc_app: Logs-сплит ПРОПУЩЕН (app total без разбивки уже записан): "
+                  f"{type(e).__name__}: {e}")
 
 
 def _build_tab(service, tab: str, dates: list[str], data: dict) -> None:

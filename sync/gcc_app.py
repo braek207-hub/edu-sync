@@ -14,11 +14,49 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.parse
+import urllib.request
 from datetime import date, timedelta
 
 # ISO страны события → код колонки книги. Только Залив; прочие страны (RU/KZ/…) отброшены.
 ISO_CODE = {"AE": "UAE", "SA": "KSA", "QA": "QA", "KW": "KW", "OM": "OM"}
 _GCC = "GCC"
+
+# Reporting API (агрегат, синхронно). Имя страны (рус.) → код колонки.
+_STAT_URL = "https://api.appmetrica.yandex.ru/stat/v1/data"
+_REP_COUNTRY = {"Объединённые Арабские Эмираты": "UAE", "Саудовская Аравия": "KSA",
+                "Катар": "QA", "Кувейт": "KW", "Оман": "OM"}
+
+
+def fetch_app_dau_total(token: str, app_id: str, dates: list[str]) -> dict:
+    """DAU total по стране из Reporting API (`ym:s:devices`) — синхронно, надёжно, полный день.
+
+    Возвращает {date: {scope: total}}, scope ∈ {GCC, UAE, KSA, QA, KW, OM}; GCC = сумма 5 стран
+    Залива (device в двух странах за день считается в обеих — минорный двойной счёт, как per-country).
+    Reporting = «Аудитория» в UI, поэтому total точный; сплит paid/organic Reporting не даёт
+    (только Logs last-touch). Заказы здесь не считаются.
+    """
+    params = {"id": app_id, "date1": min(dates), "date2": max(dates), "accuracy": "1",
+              "limit": "10000", "metrics": "ym:s:devices",
+              "dimensions": "ym:s:date,ym:s:regionCountry"}
+    url = f"{_STAT_URL}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"Authorization": f"OAuth {token}"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        data = json.loads(r.read().decode("utf-8"))
+
+    dset = set(dates)
+    out = {d: {s: 0 for s in (_GCC,) + tuple(ISO_CODE.values())} for d in dates}
+    for row in data.get("data", []):
+        dims = [d.get("name") for d in row.get("dimensions", [])]
+        if len(dims) < 2:
+            continue
+        iso, code = dims[0], _REP_COUNTRY.get(dims[1])
+        if iso not in dset or not code:
+            continue
+        dev = int(round(row["metrics"][0]))
+        out[iso][code] += dev
+        out[iso][_GCC] += dev
+    return out
 
 # Партнёр платного привлечения/ремаркетинга. Матчим по подстроке (Yandex.Direct и
 # Yandex.Direct Auto-Tracking, VK Ads / vkads и т.п.). Всё остальное — органика.
