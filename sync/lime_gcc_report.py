@@ -937,6 +937,10 @@ def main() -> None:
         from sync.gcc_ga4 import validate as ga4_validate
         ga4_validate()
         return
+    if mode == "ga4-hosts":  # диагностика: все hostName за день (что не замаплено в страну)
+        from sync.gcc_ga4 import hosts_probe
+        hosts_probe()
+        return
 
     from sync.sheets_write import get_write_service
     service = get_write_service()

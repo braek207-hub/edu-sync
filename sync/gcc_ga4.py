@@ -125,6 +125,30 @@ def validate() -> None:
             print(f"{iso}: GCC ORG {g['org']} PAID {g['paid']} Total {g['org'] + g['paid']}  ||  {parts}")
 
 
+def hosts_probe() -> None:
+    """Диагностика расхождения: ВСЕ hostName за день + грандтотал vs сумма замапленных 5 стран."""
+    import os as _os
+    day = _os.environ.get("LIME_GCC_FROM") or "2026-07-26"
+
+    grand = run_report(GA4_PROPERTY, day, day, ["date"], ("activeUsers",))
+    grand_v = int(grand[0]["metrics"][0]) if grand else 0
+
+    rows = run_report(GA4_PROPERTY, day, day, ["hostName"], ("activeUsers",))
+    rows.sort(key=lambda r: -int(r["metrics"][0]))
+    mapped = 0
+    print(f"GA4 hosts за {day}: грандтотал activeUsers(no dim) = {grand_v}")
+    print("hostName → activeUsers  [код или НЕ ЗАМАПЛЕН]:")
+    for r in rows:
+        host = (r["dims"][0] or "").lower()
+        v = int(r["metrics"][0])
+        code = HOST_COUNTRY.get(host)
+        if code:
+            mapped += v
+        tag = code or "НЕ ЗАМАПЛЕН"
+        print(f"  {r['dims'][0]}: {v}  [{tag}]")
+    print(f"\nСумма замапленных 5 стран: {mapped} | грандтотал: {grand_v} | вне мапы: {grand_v - mapped}")
+
+
 def probe() -> None:
     """Разведка: одно ли property покрывает все 5 стран Залива + какие каналы (paid/organic)."""
     from collections import Counter
