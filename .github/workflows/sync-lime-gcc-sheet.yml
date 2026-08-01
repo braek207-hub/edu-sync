@@ -1,11 +1,14 @@
 name: LIME GCC → Google Sheet (трафик + заказы)
 
 on:
+  # ОСНОВНОЙ триггер: сразу после успешного ингеста Метрики в Supabase — тогда web за вчера
+  # уже полный (ингест DELETE+INSERT последних 7 дней). Гарантирует полный WEB к утру.
+  workflow_run:
+    workflows: ["Sync LIME GCC → Supabase"]
+    types: [completed]
   schedule:
-    # Два прогона в день (бэкап): если первый лёг/отменился/задержался планировщиком GitHub —
-    # второй догонит (refresh идемпотентен, пишет последние 7 дней по дате-матчу).
-    # 23:50 UTC = 02:50 МСК (осн.) и 06:00 UTC = 09:00 МСК (страховка).
-    - cron: "50 23 * * *"
+    # Страховка, если workflow_run не сработал: 06:00 UTC = 09:00 МСК (после ингеста 05:30 UTC).
+    # Раньше был ещё 02:50 МСК — убран: он читал ещё неполный вчерашний день (web ~⅓).
     - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
@@ -33,6 +36,9 @@ concurrency:
 jobs:
   report:
     runs-on: ubuntu-latest
+    # После workflow_run — только если ингест успешен (иначе web за вчера мог не докачаться).
+    # Для schedule/dispatch — всегда.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     # 60 мин: refresh дёргает медленные async-API (AppMetrica Logs API готовит файл
     # установок за 90д + сессии/покупки/диплинки, TW по дням, Shopify) — на 20 мин
     # плановый прогон 31.07 упирался в таймаут и убивался (cancelled), 30.07 не дописывался.
