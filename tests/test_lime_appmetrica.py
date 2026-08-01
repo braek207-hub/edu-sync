@@ -300,3 +300,117 @@ def test_daily_cohort_sums_lifetime_revenue_per_install_day():
     assert (pub, camp, n) == ("Yandex.Direct", "704121835", 2)
     assert orders == 3
     assert revenue == 6000.0
+
+
+VK_PUB = "VK Ads (ex. myTarget)"
+ENTITY_MAP = {"140704359": "22293644", "22293644": "22293644"}
+
+
+def _inst_vk(dev, dt, c=None, pub=VK_PUB):
+    """Установка VK: в ссылке трекера лежит макрос c — id ГРУППЫ объявлений."""
+    r = {"appmetrica_device_id": dev, "install_datetime": dt, "publisher_name": pub,
+         "is_reinstallation": "0", "is_reattribution": "0"}
+    if c:
+        r["click_url_parameters"] = f"c={c}&banner_id=221583236"
+    return r
+
+
+def test_install_campaign_direct_keeps_own_campaign_id():
+    assert m.install_campaign("Yandex.Direct", "campaign_id=704121835", ENTITY_MAP) == "704121835"
+
+
+def test_install_campaign_vk_group_resolves_to_ad_plan():
+    """Главное правило: id группы из макроса c превращается в id кампании (ad_plan)."""
+    assert m.install_campaign(VK_PUB, "c=140704359&banner_id=1", ENTITY_MAP) == "22293644"
+
+
+def test_install_campaign_vk_unknown_group_is_empty():
+    """Группы нет в справочнике → пусто, а не сырой id: он 9-значный, как кампания Директа,
+    и мог бы приклеить установку VK к чужой строке."""
+    assert m.install_campaign(VK_PUB, "c=999999999", ENTITY_MAP) == ""
+
+
+def test_install_campaign_vk_without_macro_is_empty():
+    assert m.install_campaign(VK_PUB, "utm_source=vk_ads", ENTITY_MAP) == ""
+
+
+def test_install_campaign_vk_macro_carrying_ad_plan_resolves_to_itself():
+    assert m.install_campaign(VK_PUB, "c=22293644", ENTITY_MAP) == "22293644"
+
+
+def test_install_campaign_non_vk_publisher_ignores_macro():
+    """Макрос c у чужого партнёра — не VK-группа, справочник к нему не применяем."""
+    assert m.install_campaign("Website", "c=140704359", ENTITY_MAP) == ""
+
+
+def test_is_vk_publisher_covers_both_vk_names():
+    assert m.is_vk_publisher(VK_PUB)
+    assert m.is_vk_publisher("VKAds_custom")
+    assert not m.is_vk_publisher("Yandex.Direct")
+    assert not m.is_vk_publisher("")
+
+
+def test_build_installs_daily_puts_vk_installs_on_ad_plan():
+    installs = [
+        _inst_vk("d1", "2026-07-06 10:00:00", c="140704359"),
+        _inst_vk("d2", "2026-07-06 11:00:00", c="140704359"),
+        _inst_vk("d3", "2026-07-06 12:00:00", c="999999999"),   # группы нет в справочнике
+    ]
+    rows = {(p, camp): n for (_d, p, _det, camp, n)
+            in m.build_installs_daily(installs, False, False, entity_map=ENTITY_MAP)}
+    assert rows[(VK_PUB, "22293644")] == 2
+    assert rows[(VK_PUB, "")] == 1
+
+
+def test_build_installs_daily_total_is_invariant_to_entity_map():
+    """Справочник ПЕРЕКЛАДЫВАЕТ установки на кампании, но не теряет и не двоит их."""
+    installs = [
+        _inst_vk("d1", "2026-07-06 10:00:00", c="140704359"),
+        _inst_vk("d2", "2026-07-06 11:00:00", c="999999999"),
+        _inst_vk("d3", "2026-07-06 12:00:00"),
+        _inst("d4", "2026-07-06 12:00:00", "Yandex.Direct", camp="704121835"),
+    ]
+    with_map = sum(n for (_d, _p, _det, _c, n)
+                   in m.build_installs_daily(installs, False, False, entity_map=ENTITY_MAP))
+    without = sum(n for (_d, _p, _det, _c, n) in m.build_installs_daily(installs, False, False))
+    assert with_map == without == 4
+
+
+def test_build_installs_daily_without_entity_map_keeps_vk_empty():
+    """Обратная совместимость: без справочника поведение ровно прежнее."""
+    rows = {(p, camp): n for (_d, p, _det, camp, n)
+            in m.build_installs_daily([_inst_vk("d1", "2026-07-06 10:00:00", c="140704359")],
+                                      False, False)}
+    assert rows[(VK_PUB, "")] == 1
+
+
+def test_daily_cohort_money_follows_resolved_ad_plan():
+    """Выручка когорты должна лечь на ту же грань, что и установки, — иначе ROAS не сойдётся."""
+    installs = [_inst_vk("d1", "2026-07-06 10:00:00", c="140704359")]
+    purchases = [_buy("d1", (2026, 8), 5000.0, "t1")]
+    rows = m.build_installs_daily_with_cohort(installs, purchases, False, False,
+                                              entity_map=ENTITY_MAP)
+    assert len(rows) == 1
+    (_d, pub, _det, camp, n, orders, revenue) = rows[0]
+    assert (pub, camp, n, orders, revenue) == (VK_PUB, "22293644", 1, 1, 5000.0)
+
+
+def test_vk_resolve_stats_counts_coverage():
+    installs = [
+        _inst_vk("d1", "2026-07-06 10:00:00", c="140704359"),   # резолвится
+        _inst_vk("d2", "2026-07-06 10:00:00", c="999999999"),   # есть c, не резолвится
+        _inst_vk("d3", "2026-07-06 10:00:00"),                  # без c
+        _inst("d4", "2026-07-06 10:00:00", "Yandex.Direct", camp="704121835"),  # не VK
+    ]
+    assert m.vk_resolve_stats(installs, ENTITY_MAP) == (3, 2, 1)
+
+
+def test_warn_if_vk_entities_stale():
+    from datetime import timezone
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    assert m.warn_if_vk_entities_stale(0, None, now) is True            # пустой справочник
+    assert m.warn_if_vk_entities_stale(10, None, now) is True           # строки без updated_at
+    stale = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)           # 12 дней
+    assert m.warn_if_vk_entities_stale(10, stale, now) is True
+    fresh = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)           # сутки
+    assert m.warn_if_vk_entities_stale(10, fresh, now) is False

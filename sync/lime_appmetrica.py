@@ -7,7 +7,7 @@ cohorts  → устройства-покупатели по когорте (ме
 import json
 import os
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qs
 
 import psycopg2
@@ -74,8 +74,103 @@ def param_of(raw: str, key: str) -> str:
     return (vals[0] if vals else "")[:64]
 
 
+# Порог протухания справочника VK-сущностей. Его наполняет sync-lime-vk.yml (ежедневно,
+# 10:30 MSK); неделя переживает разовый сбой и ручную паузу, но ловит настоящую остановку
+# до того, как новые группы начнут массово оседать на уровне канала.
+VK_ENTITY_MAX_AGE_DAYS = 7
+
+
+def is_vk_publisher(publisher: str) -> bool:
+    """Партнёр AppMetrica относится к VK Рекламе ('VK Ads (ex. myTarget)', 'VKAds_custom')."""
+    return "vk" in (publisher or "").lower()
+
+
+def install_campaign(publisher: str, params: str, entity_map: dict) -> str:
+    """Грань расхода кабинета для установки: campaign_id Директа либо ad_plan VK.
+
+    У Директа трекер несёт готовый campaign_id (~96% его установок). У VK в ссылке лежит
+    макрос `c` — id ГРУППЫ объявлений; кампанией (ad_plan, грань расхода lime_vk_ads_stats)
+    он становится через справочник lime_vk_entities. Сырой id группы в витрину не пишем:
+    он 9-значный, как campaign_id Директа, и мог бы приклеить установку VK к чужой строке.
+    Не резолвится — пусто: установка ляжет на подканал, как раньше.
+    """
+    cid = param_of(params, "campaign_id")
+    if cid:
+        return cid
+    if is_vk_publisher(publisher):
+        return entity_map.get(param_of(params, "c"), "")
+    return ""
+
+
+def vk_resolve_stats(installs: list[dict], entity_map: dict) -> tuple[int, int, int]:
+    """(VK-установок, из них с макросом `c`, резолвнулось в ad_plan) — покрытие для лога.
+
+    Считается по СЫРЫМ строкам Logs API (до дедупа по устройству) — это оценка качества
+    справочника, а не витринная метрика.
+    """
+    total = with_c = resolved = 0
+    for r in installs:
+        if not is_vk_publisher(r.get("publisher_name") or ""):
+            continue
+        total += 1
+        c = param_of(r.get("click_url_parameters") or "", "c")
+        if not c:
+            continue
+        with_c += 1
+        if entity_map.get(c):
+            resolved += 1
+    return total, with_c, resolved
+
+
+def warn_if_vk_entities_stale(row_count: int, newest, now: datetime | None = None) -> bool:
+    """Предупредить, если справочник VK пуст или протух. True — предупреждение напечатано.
+
+    Пустой/протухший справочник не роняет синк, но тихо возвращает VK-установки на уровень
+    канала: CPI и ROAS по VK-кампаниям исчезают при живых установках и расходе.
+    """
+    if row_count == 0:
+        print("[lime-appmetrica] WARN справочник lime_vk_entities ПУСТ → установки VK лягут "
+              "на уровень канала, CPI/ROAS по VK-кампаниям не посчитаются. "
+              "Прогони sync-lime-vk.yml")
+        return True
+    if newest is None:
+        print("[lime-appmetrica] WARN справочник lime_vk_entities без updated_at — проверь "
+              "схему (migrations/lime/021_vk_entities.sql)")
+        return True
+    now = now or datetime.now(timezone.utc)
+    if newest.tzinfo is None:
+        newest = newest.replace(tzinfo=timezone.utc)
+    age = now - newest
+    if age > timedelta(days=VK_ENTITY_MAX_AGE_DAYS):
+        print(f"[lime-appmetrica] WARN справочник lime_vk_entities не обновлялся {age.days} дн. "
+              f"(порог {VK_ENTITY_MAX_AGE_DAYS}) → новые группы VK не резолвятся. "
+              f"Проверь sync-lime-vk.yml")
+        return True
+    return False
+
+
+def load_vk_entity_map() -> dict:
+    """entity_id (группа или ad_plan) → ad_plan_id. Недоступный справочник синк не роняет."""
+    try:
+        conn = psycopg2.connect(_pg_url(), connect_timeout=30)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*)::int, MAX(updated_at) FROM lime_vk_entities")
+                row_count, newest = cur.fetchone()
+                cur.execute("SELECT entity_id, ad_plan_id FROM lime_vk_entities")
+                out = {str(eid): str(plan) for eid, plan in cur.fetchall()}
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[lime-appmetrica] WARN справочник lime_vk_entities не прочитан ({e}) — "
+              f"установки VK лягут на уровень канала")
+        return {}
+    warn_if_vk_entities_stale(int(row_count or 0), newest)
+    return out
+
+
 def build_installs_daily(installs: list[dict], keep_reattribution: bool,
-                         keep_reinstall: bool) -> list[tuple]:
+                         keep_reinstall: bool, entity_map: dict | None = None) -> list[tuple]:
     """Установки дня = уникальные устройства, установившие ИМЕННО в этот день.
 
     Грань дневная, потому что главная таблица дашборда суммирует дневные строки по
@@ -92,11 +187,13 @@ def build_installs_daily(installs: list[dict], keep_reattribution: bool,
     установки в этом дне у этого партнёра — иначе устройство с двумя установками под
     разными метками попало бы в две строки, и детали не сложились бы в родителя.
 
-    campaign_id есть только у Директа (~96%); у VK в трекере лежит группа объявлений,
-    а не кампания, поэтому там пусто — метрика ляжет на грань канала.
+    campaign_id — грань расхода кабинета: у Директа он лежит прямо в трекере (~96%), у VK
+    получается из макроса `c` (id группы) через справочник lime_vk_entities (см.
+    install_campaign). Не резолвится — пусто, метрика ложится на грань канала.
 
     Возвращает (date, publisher, detail, campaign_id, installs).
     """
+    entity_map = entity_map or {}
     # (date, publisher, device) → (самая ранняя дата, utm_source, campaign_id)
     first_in_day: dict[tuple, tuple] = {}
     for r in installs:
@@ -108,12 +205,13 @@ def build_installs_daily(installs: list[dict], keep_reattribution: bool,
         if not dev:
             continue
         dt = parse_dt(r["install_datetime"])
-        key = (dt.date(), r.get("publisher_name") or "unknown", dev)
+        pub = r.get("publisher_name") or "unknown"
+        key = (dt.date(), pub, dev)
         cur = first_in_day.get(key)
         if cur is None or dt < cur[0]:
             params = r.get("click_url_parameters") or ""
             first_in_day[key] = (dt, param_of(params, "utm_source"),
-                                 param_of(params, "campaign_id"))
+                                 install_campaign(pub, params, entity_map))
 
     agg: dict[tuple, int] = defaultdict(int)
     for (day, pub, _dev), (_dt, detail, campaign) in first_in_day.items():
@@ -122,8 +220,8 @@ def build_installs_daily(installs: list[dict], keep_reattribution: bool,
 
 
 def build_installs_daily_with_cohort(installs: list[dict], purchases: list[tuple],
-                                     keep_reattribution: bool,
-                                     keep_reinstall: bool) -> list[tuple]:
+                                     keep_reattribution: bool, keep_reinstall: bool,
+                                     entity_map: dict | None = None) -> list[tuple]:
     """Дневные установки + пожизненные заказы/выручка устройств, установившихся в этот день.
 
     Зачем: главная таблица дашборда суммирует дневные строки по выбранному диапазону.
@@ -140,7 +238,8 @@ def build_installs_daily_with_cohort(installs: list[dict], purchases: list[tuple
 
     Возвращает (date, publisher, detail, campaign_id, installs, cohort_orders, cohort_revenue).
     """
-    base = build_installs_daily(installs, keep_reattribution, keep_reinstall)
+    entity_map = entity_map or {}
+    base = build_installs_daily(installs, keep_reattribution, keep_reinstall, entity_map)
 
     # Первая установка устройства → её день/партнёр/метки (когортная привязка).
     first: dict[str, tuple] = {}
@@ -156,8 +255,9 @@ def build_installs_daily_with_cohort(installs: list[dict], purchases: list[tuple
         cur = first.get(dev)
         if cur is None or dt < cur[0]:
             params = r.get("click_url_parameters") or ""
-            first[dev] = (dt, r.get("publisher_name") or "unknown",
-                          param_of(params, "utm_source"), param_of(params, "campaign_id"))
+            pub = r.get("publisher_name") or "unknown"
+            first[dev] = (dt, pub, param_of(params, "utm_source"),
+                          install_campaign(pub, params, entity_map))
 
     orders: dict[tuple, int] = defaultdict(int)
     revenue: dict[tuple, float] = defaultdict(float)
@@ -346,11 +446,17 @@ def sync_lime_appmetrica() -> None:
     if not purchases_raw:
         print("[lime-appmetrica] WARNING: purchases_raw пуст — покупки не найдены за окно")
 
+    entity_map = load_vk_entity_map()
+    vk_total, vk_with_c, vk_resolved = vk_resolve_stats(installs_raw, entity_map)
+    pct = (100.0 * vk_resolved / vk_total) if vk_total else 0.0
+    print(f"[lime-appmetrica] VK: установок {vk_total}, с макросом c {vk_with_c}, "
+          f"резолвнулось в ad_plan {vk_resolved} ({pct:.1f}%)")
+
     first = first_install_per_device(installs_raw, keep_reattr, keep_reinstall)
     # Недельные установки — по сырым строкам (дедуп внутри недели); когорты — по первой
     # установке устройства. Это два разных вопроса и две разные агрегации.
     installs_rows = build_installs_daily_with_cohort(
-        installs_raw, purchases_raw, keep_reattr, keep_reinstall)
+        installs_raw, purchases_raw, keep_reattr, keep_reinstall, entity_map)
     cohort_rows = build_cohorts(first, purchases_raw, max_life)
 
     if not installs_rows:
