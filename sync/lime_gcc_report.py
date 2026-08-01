@@ -882,6 +882,10 @@ def main() -> None:
         from sync.gcc_ga4 import probe as ga4_probe
         ga4_probe()
         return
+    if mode == "ga4-validate":  # сверка GA4-сбора с ручным файлом (per-country ORG/PAID/Total)
+        from sync.gcc_ga4 import validate as ga4_validate
+        ga4_validate()
+        return
 
     from sync.sheets_write import get_write_service
     service = get_write_service()
