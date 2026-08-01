@@ -116,7 +116,7 @@ def validate() -> None:
     while d <= _date.fromisoformat(to):
         dates.append(d.isoformat()); d += _td(days=1)
 
-    for metric in ("activeUsers", "sessions"):
+    for metric in ("activeUsers", "totalUsers", "sessions"):
         data = fetch_ga4_traffic(GA4_PROPERTY, dates, metric)
         print(f"\n=== GA4 {metric} property={GA4_PROPERTY} ({frm}..{to}) ===")
         for iso in dates:
