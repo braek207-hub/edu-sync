@@ -29,7 +29,7 @@ def _client():
 
 
 def run_report(property_id: str, frm: str, to: str, dimensions: list[str],
-               metrics: tuple = ("activeUsers",)) -> list[dict]:
+               metrics: tuple = ("activeUsers",), dimension_filter: dict | None = None) -> list[dict]:
     """runReport → список строк [{dims: [...], metrics: [...]}]. Даты 'YYYY-MM-DD'."""
     svc = _client()
     body = {
@@ -38,6 +38,8 @@ def run_report(property_id: str, frm: str, to: str, dimensions: list[str],
         "metrics": [{"name": m} for m in metrics],
         "limit": 250000,
     }
+    if dimension_filter:
+        body["dimensionFilter"] = dimension_filter
     resp = svc.properties().runReport(property=f"properties/{property_id}", body=body).execute()
     out = []
     for row in resp.get("rows", []):
@@ -59,40 +61,46 @@ HOST_COUNTRY = {
 }
 GA4_CODES = ["UAE", "KSA", "QA", "KW", "OM"]
 
-# Группы каналов GA4 → paid/org (ровно как сравнения «Платный»/«Бесплатный трафик» в UI Павла).
-# Прочие (Direct/Referral/Email/Unassigned) НЕ входят ни в одну → Total = ORG+PAID.
+# Платные каналы GA4 = сравнение «Платный трафик» в UI Павла. ORG = Total−PAID (всё остальное).
 _PAID_CH = {"Paid Shopping", "Paid Search", "Paid Social", "Paid Other", "Paid Video",
             "Display", "Cross-network", "Audio"}
-_ORG_CH = {"Organic Search", "Organic Video", "Organic Social", "Organic Shopping"}
 
 
-def ga4_bucket(channel: str) -> str | None:
-    if channel in _PAID_CH:
-        return "paid"
-    if channel in _ORG_CH:
-        return "org"
-    return None
+def _by_host(property_id: str, dates: list[str], metric: str, paid_only: bool) -> dict:
+    """{(iso, code): activeUsers} по стране (hostName→код). paid_only → фильтр платных каналов."""
+    dim_filter = None
+    if paid_only:
+        dim_filter = {"filter": {"fieldName": "sessionDefaultChannelGroup",
+                                 "inListFilter": {"values": sorted(_PAID_CH)}}}
+    rows = run_report(property_id, min(dates), max(dates), ["date", "hostName"], (metric,), dim_filter)
+    dset, out = set(dates), {}
+    for r in rows:
+        d_raw, host = r["dims"][0], r["dims"][1]
+        iso = f"{d_raw[:4]}-{d_raw[4:6]}-{d_raw[6:8]}"  # GA4 отдаёт 'YYYYMMDD'
+        code = HOST_COUNTRY.get((host or "").lower())
+        if iso in dset and code:
+            out[(iso, code)] = out.get((iso, code), 0) + int(r["metrics"][0])
+    return out
 
 
 def fetch_ga4_traffic(property_id: str, dates: list[str], metric: str = "activeUsers") -> dict:
-    """{date: {scope: {org, paid}}} по 5 странам Залива + GCC(сумма 5). Разрез по hostName×каналу.
+    """{date: {scope: {org, paid}}} по 5 странам Залива + GCC(сумма 5).
 
-    Total среза = org+paid (Direct/Referral/прочее не входят — как в ручном GA4-файле).
+    Логика ручного файла Павла: PAID = платные каналы (Paid*+Display+Cross-network+Audio);
+    Total = ВСЕ пользователи хоста (без фильтра каналов); **ORG = Total − PAID** (всё неплатное:
+    organic+direct+referral+email+unassigned). Два запроса activeUsers: total и paid-фильтр.
     """
-    rows = run_report(property_id, min(dates), max(dates),
-                      ["date", "hostName", "sessionDefaultChannelGroup"], (metric,))
-    dset = set(dates)
+    total = _by_host(property_id, dates, metric, paid_only=False)
+    paid = _by_host(property_id, dates, metric, paid_only=True)
     out = {d: {s: {"org": 0, "paid": 0} for s in ["GCC"] + GA4_CODES} for d in dates}
-    for r in rows:
-        d_raw, host, channel = r["dims"][0], r["dims"][1], r["dims"][2]
-        iso = f"{d_raw[:4]}-{d_raw[4:6]}-{d_raw[6:8]}"  # GA4 отдаёт 'YYYYMMDD'
-        code = HOST_COUNTRY.get((host or "").lower())
-        bucket = ga4_bucket(channel)
-        if iso not in dset or not code or not bucket:
-            continue
-        val = int(r["metrics"][0])
-        out[iso][code][bucket] += val
-        out[iso]["GCC"][bucket] += val
+    for iso in dates:
+        for code in GA4_CODES:
+            t, p = total.get((iso, code), 0), paid.get((iso, code), 0)
+            org = max(t - p, 0)
+            out[iso][code]["paid"] = p
+            out[iso][code]["org"] = org
+            out[iso]["GCC"]["paid"] += p
+            out[iso]["GCC"]["org"] += org
     return out
 
 
