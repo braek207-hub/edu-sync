@@ -32,6 +32,7 @@ import psycopg2
 SHEET_ID = os.environ.get("LIME_GCC_SHEET_ID") or "1JSM7wcZlNnKX6uB4kk7UwkQzv7QEgPyyYUiOD-77WiE"
 TRAFFIC_TAB = os.environ.get("LIME_GCC_TRAFFIC_TAB") or "Fact Traffic GCC"
 ORDERS_TAB = os.environ.get("LIME_GCC_ORDERS_TAB") or "Fact Orders GCC"
+GA4_TAB = os.environ.get("LIME_GCC_GA4_TAB") or "Fact Traffic GA4"
 
 REFRESH_DAYS = int(os.environ.get("LIME_GCC_REFRESH_DAYS") or "7")
 BUILD_FROM = os.environ.get("LIME_GCC_FROM") or "2025-08-01"
@@ -371,10 +372,16 @@ def _run(service, dates: list[str], mode: str) -> None:
                   f"{type(e).__name__}: {e}")
 
 
-def _build_tab(service, tab: str, dates: list[str], data: dict) -> None:
-    """Создать вкладку (если нет) и залить заголовок + все строки одним блоком."""
+def _build_tab(service, tab: str, dates: list[str], data: dict,
+               header: list | None = None, row_fn=None) -> None:
+    """Создать вкладку (если нет) и залить заголовок + все строки одним блоком.
+
+    header/row_fn по умолчанию — формат Метрики (_header/_row_values); GA4 передаёт свои.
+    """
     from sync.sheets_write import add_tab, list_tabs, read_values, write_block
 
+    header = header or _header()
+    row_fn = row_fn or _row_values
     tabs = set(list_tabs(service, SHEET_ID))
     if tab not in tabs:
         add_tab(service, SHEET_ID, tab)
@@ -384,18 +391,22 @@ def _build_tab(service, tab: str, dates: list[str], data: dict) -> None:
         if _header_row(existing) is not None:
             raise RuntimeError(f"{tab}: уже заполнена — build перезапишет от A1. Используй refresh.")
 
-    header = _header()
     block = [header]
     for iso in dates:
-        rv = _row_values(iso, data[iso])
+        rv = row_fn(iso, data[iso])
         block.append([rv.get(c, "") for c in header])
     write_block(service, SHEET_ID, f"{tab}!A1", block)
     print(f"{tab}: залито {len(dates)} дн., {len(header)} колонок")
 
 
-def _refresh_tab(service, tab: str, dates: list[str], data: dict) -> None:
-    """Обновить строки последних дней по дате-матчу; новые даты дописать. По ИМЕНАМ колонок."""
+def _refresh_tab(service, tab: str, dates: list[str], data: dict, row_fn=None) -> None:
+    """Обновить строки последних дней по дате-матчу; новые даты дописать. По ИМЕНАМ колонок.
+
+    row_fn(iso, day) → {colname: value}; по умолчанию формат Метрики (_row_values), GA4 — свой.
+    """
     from sync.sheets_write import batch_write, read_values
+
+    row_fn = row_fn or _row_values
 
     rng = f"{tab}!A1:BZ4000"
     grid = read_values(service, SHEET_ID, rng, render="FORMATTED_VALUE")
@@ -426,7 +437,7 @@ def _refresh_tab(service, tab: str, dates: list[str], data: dict) -> None:
             ri = next0
             next0 += 1
             row_of[iso] = ri
-        rv = _row_values(iso, data[iso])
+        rv = row_fn(iso, data[iso])
         for col, val in rv.items():
             cj = name_to_col.get(col)
             if cj is None:
@@ -846,6 +857,46 @@ def verify(service) -> None:
     print("verify: OK, книга актуальна")
 
 
+def _ga4_header() -> list[str]:
+    """Заголовок GA4-листа: мета + GCC(ORG/PAID/Total) + по 5 странам (ORG/PAID/Total)."""
+    from sync.gcc_ga4 import GA4_CODES
+    h = ["Дата", "Год", "Месяц", "Неделя", "ORG Total", "PAID Total", "Total"]
+    for code in GA4_CODES:
+        h += [f"ORG {code}", f"PAID {code}", f"Total {code}"]
+    return h
+
+
+def _ga4_row(iso: str, day: dict) -> dict:
+    """colname → значение строки GA4. day = {scope: {org, paid}}; Total = org+paid."""
+    from sync.gcc_ga4 import GA4_CODES
+    dt = date.fromisoformat(iso)
+    g = day["GCC"]
+    out: dict[str, object] = {
+        "Дата": _date_label(iso), "Год": dt.year, "Месяц": dt.month, "Неделя": dt.isocalendar()[1],
+        "ORG Total": g["org"], "PAID Total": g["paid"], "Total": g["org"] + g["paid"],
+    }
+    for code in GA4_CODES:
+        m = day[code]
+        out[f"ORG {code}"] = m["org"]
+        out[f"PAID {code}"] = m["paid"]
+        out[f"Total {code}"] = m["org"] + m["paid"]
+    return out
+
+
+def ga4_run(service, dates: list[str], mode: str) -> None:
+    """Собрать GA4 DAU (activeUsers) по hostName/каналам и записать лист GA4."""
+    from sync.gcc_ga4 import GA4_PROPERTY, fetch_ga4_traffic
+
+    data = fetch_ga4_traffic(GA4_PROPERTY, dates)
+    for iso in dates:
+        g = data[iso]["GCC"]
+        print(f"{iso}: GA4 ORG {g['org']} PAID {g['paid']} Total {g['org'] + g['paid']}")
+    if mode == "ga4-build":
+        _build_tab(service, GA4_TAB, dates, data, header=_ga4_header(), row_fn=_ga4_row)
+    else:
+        _refresh_tab(service, GA4_TAB, dates, data, row_fn=_ga4_row)
+
+
 def main() -> None:
     mode = os.environ.get("LIME_GCC_MODE") or "refresh"
     if mode == "attr-compare":  # Meta: lastPlatformClick vs linearAll
@@ -904,13 +955,28 @@ def main() -> None:
     if mode == "probe":
         probe(service)
         return
+    if mode == "ga4-build":  # создать GA4-лист + бэкфилл (LIME_GCC_FROM..вчера)
+        to_env = os.environ.get("LIME_GCC_TO")
+        to = date.fromisoformat(to_env) if to_env else _msk_today() - timedelta(days=1)
+        ga4_run(service, _dates(date.fromisoformat(BUILD_FROM), to), "ga4-build")
+        return
+    if mode == "ga4-refresh":  # обновить последние N дней GA4-листа
+        to = _msk_today() - timedelta(days=1)
+        ga4_run(service, _dates(to - timedelta(days=REFRESH_DAYS - 1), to), "ga4-refresh")
+        return
     if mode == "build":
         to_env = os.environ.get("LIME_GCC_TO")
         to = date.fromisoformat(to_env) if to_env else _msk_today() - timedelta(days=1)
         _run(service, _dates(date.fromisoformat(BUILD_FROM), to), "build")
     elif mode == "refresh":
         to = _msk_today() - timedelta(days=1)
-        _run(service, _dates(to - timedelta(days=REFRESH_DAYS - 1), to), "refresh")
+        dates = _dates(to - timedelta(days=REFRESH_DAYS - 1), to)
+        _run(service, dates, "refresh")
+        # GA4-лист — best-effort в той же связке (независимый источник; сбой не рушит основной синк).
+        try:
+            ga4_run(service, dates, "ga4-refresh")
+        except Exception as e:  # noqa: BLE001
+            print(f"GA4 refresh ПРОПУЩЕН: {type(e).__name__}: {e}")
     else:
         raise SystemExit(f"lime_gcc_report: неизвестный режим {mode!r}")
 

@@ -11,6 +11,20 @@ def _empty_traffic(dates):
     return {d: _empty_day() for d in dates}
 
 
+def test_ga4_row_and_header():
+    from sync.lime_gcc_report import _ga4_header, _ga4_row
+    h = _ga4_header()
+    assert h[:7] == ["Дата", "Год", "Месяц", "Неделя", "ORG Total", "PAID Total", "Total"]
+    assert "ORG UAE" in h and "Total OM" in h
+    day = {"GCC": {"org": 3387, "paid": 5170}, "UAE": {"org": 1646, "paid": 1478},
+           "KSA": {"org": 0, "paid": 0}, "QA": {"org": 0, "paid": 0},
+           "KW": {"org": 0, "paid": 0}, "OM": {"org": 0, "paid": 0}}
+    rv = _ga4_row("2025-09-01", day)
+    assert rv["ORG Total"] == 3387 and rv["PAID Total"] == 5170 and rv["Total"] == 8557
+    assert rv["Total UAE"] == 3124  # 1646+1478
+    assert rv["Год"] == 2025 and rv["Месяц"] == 9
+
+
 def test_apply_app_total_no_split():
     """Reporting total кладётся весь в app_org, paid=0 (полный день без разбивки)."""
     tr = _empty_traffic(["2026-07-28"])
