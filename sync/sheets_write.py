@@ -65,6 +65,28 @@ def add_tab(service, spreadsheet_id: str, title: str) -> None:
     ).execute()
 
 
+def sheet_gid(service, spreadsheet_id: str, title: str) -> int:
+    """gridId (sheetId) вкладки по имени — нужен для операций со строками/столбцами."""
+    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id,
+                                      fields="sheets.properties").execute()
+    for s in meta.get("sheets", []):
+        if s["properties"]["title"] == title:
+            return s["properties"]["sheetId"]
+    raise RuntimeError(f"вкладка {title!r} не найдена")
+
+
+def delete_rows(service, spreadsheet_id: str, title: str, rows_0based: list[int]) -> int:
+    """Удалить строки по 0-based индексам. Удаляем по убыванию, чтобы индексы не сдвигались."""
+    gid = sheet_gid(service, spreadsheet_id, title)
+    reqs = [{"deleteDimension": {"range": {"sheetId": gid, "dimension": "ROWS",
+             "startIndex": r, "endIndex": r + 1}}}
+            for r in sorted(set(rows_0based), reverse=True)]
+    if reqs:
+        service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id,
+                                           body={"requests": reqs}).execute()
+    return len(reqs)
+
+
 def write_block(service, spreadsheet_id: str, a1_start: str, values2d: list[list]) -> None:
     """Записать двумерный блок начиная с a1_start (например 'Fact Traffic!A1'). RAW."""
     service.spreadsheets().values().update(

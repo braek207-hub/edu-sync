@@ -429,10 +429,17 @@ def _refresh_tab(service, tab: str, dates: list[str], data: dict, row_fn=None) -
         return (ri < len(formulas) and cj < len(formulas[ri])
                 and str(formulas[ri][cj]).startswith("="))
 
-    updates, written = [], []
+    # Даты старее последней в листе НЕ дописываем в конец (иначе строки уезжают не по порядку —
+    # так случилось при refresh с широким окном). Их место — build/бэкфилл, не refresh.
+    existing_max = max(row_of) if row_of else None
+
+    updates, written, skipped_old = [], [], 0
     for iso in sorted(dates):
         ri = row_of.get(iso)
         is_new = ri is None
+        if is_new and existing_max and iso < existing_max:
+            skipped_old += 1
+            continue
         if is_new:
             ri = next0
             next0 += 1
@@ -449,7 +456,8 @@ def _refresh_tab(service, tab: str, dates: list[str], data: dict, row_fn=None) -
             updates.append((f"{tab}!{_col_letter(cj)}{ri + 1}", [[val]]))
         written.append(iso)
     n = batch_write(service, SHEET_ID, updates)
-    print(f"{tab}: refresh {len(written)} дн., {n} ячеек")
+    extra = f", пропущено старых дат {skipped_old}" if skipped_old else ""
+    print(f"{tab}: refresh {len(written)} дн., {n} ячеек{extra}")
 
 
 def _dates(frm: date, to: date) -> list[str]:
@@ -903,6 +911,25 @@ def ga4_run(service, dates: list[str], mode: str) -> None:
         _refresh_tab(service, GA4_TAB, dates, data, row_fn=_ga4_row)
 
 
+def ga4_cleanup(service) -> None:
+    """Удалить из GA4-листа строки с датой < 2025-09-01 (мусор от слишком широкого refresh)."""
+    from sync.sheets_write import delete_rows, read_values
+
+    grid = read_values(service, SHEET_ID, f"{GA4_TAB}!A1:A4000", render="FORMATTED_VALUE")
+    hdr_i = next((i for i, row in enumerate(grid) if row and _norm(row[0]) == "Дата"), 0)
+    bad = []
+    for i in range(hdr_i + 1, len(grid)):
+        cell = grid[i][0] if grid[i] else ""
+        m = _DATE_RE.search(cell)
+        if m and f"{m[3]}-{m[2]}-{m[1]}" < "2025-09-01":
+            bad.append(i)  # 0-based индекс строки = индекс в grid
+    if bad:
+        n = delete_rows(service, SHEET_ID, GA4_TAB, bad)
+        print(f"ga4-cleanup: удалено строк с датой < 2025-09-01: {n}")
+    else:
+        print("ga4-cleanup: мусорных строк нет")
+
+
 def main() -> None:
     mode = os.environ.get("LIME_GCC_MODE") or "refresh"
     if mode == "attr-compare":  # Meta: lastPlatformClick vs linearAll
@@ -950,6 +977,9 @@ def main() -> None:
 
     from sync.sheets_write import get_write_service
     service = get_write_service()
+    if mode == "ga4-cleanup":  # удалить мусорные строки < 2025-09-01 из GA4-листа
+        ga4_cleanup(service)
+        return
     if mode == "verify":  # самопроверка: книга содержит вчерашнюю дату
         verify(service)
         return
