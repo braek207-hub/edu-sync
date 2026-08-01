@@ -7,9 +7,10 @@ on:
     workflows: ["Sync LIME GCC → Supabase"]
     types: [completed]
   schedule:
-    # Страховка, если workflow_run не сработал: 06:00 UTC = 09:00 МСК (после ингеста 05:30 UTC).
+    # Страховка, если workflow_run не сработал: 03:00 UTC = 06:00 МСК (после ингеста-страховки
+    # 02:30 UTC = 05:30 МСК → lime_stats уже полный). Все прогоны укладываются ДО 08:00 МСК.
     # Раньше был ещё 02:50 МСК — убран: он читал ещё неполный вчерашний день (web ~⅓).
-    - cron: "0 6 * * *"
+    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       mode:
