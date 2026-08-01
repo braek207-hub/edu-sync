@@ -884,10 +884,16 @@ def _ga4_row(iso: str, day: dict) -> dict:
 
 
 def ga4_run(service, dates: list[str], mode: str) -> None:
-    """Собрать GA4 DAU (activeUsers) по hostName/каналам и записать лист GA4."""
+    """Собрать GA4-трафик по hostName/каналам и записать лист GA4.
+
+    Метрика по умолчанию `totalUsers` («Всего пользователей» в UI) — ровно то, чем Павел
+    заполняет ручной файл (сверено: мой totalUsers по 5 странам за 24.07 = 4365 ≈ «Всего»
+    4380 в отчёте «Привлечение трафика»). Меняется через GCC_GA4_METRIC.
+    """
     from sync.gcc_ga4 import GA4_PROPERTY, fetch_ga4_traffic
 
-    data = fetch_ga4_traffic(GA4_PROPERTY, dates)
+    metric = os.environ.get("GCC_GA4_METRIC") or "totalUsers"
+    data = fetch_ga4_traffic(GA4_PROPERTY, dates, metric)
     for iso in dates:
         g = data[iso]["GCC"]
         print(f"{iso}: GA4 ORG {g['org']} PAID {g['paid']} Total {g['org'] + g['paid']}")
