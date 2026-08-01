@@ -2,7 +2,10 @@
 """Парсинг статистики VK Реклама (ads.vk.com API v2) в строки lime_vk_ads_stats.
 Фикстуры — обрезанные реальные ответы probe 2026-07-22."""
 import json, os
+from unittest.mock import patch
+
 from sync.lime_vk_ads import parse_base_stats, parse_goal_stats, _campaigns_from_json
+from sync.lime_vk_ads import _ad_groups_from_json, fetch_ad_groups, self_plan_rows
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -84,3 +87,53 @@ def test_cabinets_collects_base_and_numbered(monkeypatch):
     monkeypatch.setenv("VK_CLIENT_ID_3", "id3"); monkeypatch.setenv("VK_CLIENT_SECRET_3", "sec3")
     # разрыв нумерации останавливает сбор
     assert _cabinets() == [("b_id", "b_sec"), ("id2", "sec2"), ("id3", "sec3")]
+
+
+def test_ad_groups_from_json_maps_group_to_ad_plan():
+    """id группы (макрос `c` в ссылке трекера AppMetrica) → id кампании (ad_plan)."""
+    js = {"items": [
+        {"id": 140704359, "name": "Группа Ж", "ad_plan_id": 22293644},
+        {"id": 140704360, "name": "Группа М", "ad_plan_id": 22293644},
+    ]}
+    rows = _ad_groups_from_json(js, "vkads_809330054@vk")
+    assert rows[0] == {"entity_id": "140704359", "kind": "ad_group",
+                       "ad_plan_id": "22293644", "cabinet": "vkads_809330054@vk",
+                       "name": "Группа Ж"}
+    assert [r["ad_plan_id"] for r in rows] == ["22293644", "22293644"]
+
+
+def test_ad_groups_from_json_skips_rows_without_plan():
+    """Группа без ad_plan_id бесполезна для резолва — в справочник не попадает."""
+    js = {"items": [{"id": 1, "name": "битая"}, {"id": 2, "ad_plan_id": None},
+                    {"id": 3, "name": "ок", "ad_plan_id": 99}]}
+    rows = _ad_groups_from_json(js, "cab")
+    assert [r["entity_id"] for r in rows] == ["3"]
+
+
+def test_self_plan_rows_point_ad_plan_to_itself():
+    """Макрос `c` иногда несёт id кампании, а не группы — резолв должен работать и так."""
+    rows = self_plan_rows(["22293644", 22293645], "cab")
+    assert rows[0] == {"entity_id": "22293644", "kind": "ad_plan",
+                       "ad_plan_id": "22293644", "cabinet": "cab", "name": None}
+    assert rows[1]["entity_id"] == "22293645"
+
+
+def test_fetch_ad_groups_paginates_until_short_page():
+    """VK отдаёт максимум 50 на страницу: короткая страница = последняя."""
+    pages = [
+        {"items": [{"id": i, "ad_plan_id": 100} for i in range(50)]},
+        {"items": [{"id": 900, "ad_plan_id": 101}]},
+    ]
+    calls = []
+
+    def fake_get(token, path, **kw):
+        calls.append(path)
+        return pages[len(calls) - 1]
+
+    with patch("sync.lime_vk_ads._api_get", side_effect=fake_get), \
+         patch("sync.lime_vk_ads.time.sleep"):
+        rows = fetch_ad_groups("tok", "cab")
+
+    assert len(rows) == 51
+    assert "offset=0" in calls[0] and "offset=50" in calls[1]
+    assert "fields=id,name,ad_plan_id" in calls[0]

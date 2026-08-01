@@ -197,6 +197,47 @@ def fetch_ad_plans(token: str) -> dict:
     return out
 
 
+def _ad_groups_from_json(js: dict, cabinet: str) -> list:
+    """Группы объявлений VK → строки справочника. entity_id = id группы (макрос `c`).
+
+    id=0 — валидное значение (встречается в пагинации), поэтому проверяем на None, а не на
+    falsy: `it.get("id", "") or ""` затирало бы id=0 пустой строкой и роняло страницу."""
+    out = []
+    for it in js.get("items", []):
+        raw_id, raw_plan = it.get("id"), it.get("ad_plan_id")
+        gid = str(raw_id).strip() if raw_id is not None else ""
+        plan = str(raw_plan).strip() if raw_plan is not None else ""
+        if not gid or not plan:
+            continue
+        out.append({"entity_id": gid, "kind": "ad_group", "ad_plan_id": plan,
+                    "cabinet": cabinet, "name": it.get("name")})
+    return out
+
+
+def fetch_ad_groups(token: str, cabinet: str) -> list:
+    """Все группы объявлений кабинета (в API v2 «campaigns»), включая неактивные.
+
+    Без фильтра статуса: установка могла прийти по группе, которую с тех пор остановили или
+    удалили — она всё равно должна резолвиться в свою кампанию. Пагинация по 50 (максимум VK).
+    """
+    out: list = []
+    offset = 0
+    while True:
+        js = _api_get(token, f"campaigns.json?limit=50&offset={offset}&fields=id,name,ad_plan_id")
+        out.extend(_ad_groups_from_json(js, cabinet))
+        if len(js.get("items", [])) < 50:
+            break
+        offset += 50
+        time.sleep(1)  # rate-limit
+    return out
+
+
+def self_plan_rows(plan_ids, cabinet: str) -> list:
+    """Строки-ссылки кампании на себя: макрос `c` иногда несёт id кампании, а не группы."""
+    return [{"entity_id": str(p), "kind": "ad_plan", "ad_plan_id": str(p),
+             "cabinet": cabinet, "name": None} for p in plan_ids]
+
+
 _UPSERT_SQL = """
     INSERT INTO lime_vk_ads_stats
       (date, region, cabinet, campaign_id, campaign_name, objective, status,
@@ -211,6 +252,27 @@ _UPSERT_SQL = """
        goals_total = EXCLUDED.goals_total, vk_result = EXCLUDED.vk_result,
        conversions = EXCLUDED.conversions, updated_at = NOW()
 """
+
+
+# Справочник накопительный: без delete-окна. Пропавшая из выдачи группа остаётся —
+# по ней есть исторические установки, которые обязаны резолвиться и завтра.
+_ENTITY_UPSERT_SQL = """
+    INSERT INTO lime_vk_entities (entity_id, kind, ad_plan_id, cabinet, name, updated_at)
+    VALUES (%(entity_id)s, %(kind)s, %(ad_plan_id)s, %(cabinet)s, %(name)s, NOW())
+    ON CONFLICT (entity_id) DO UPDATE SET
+       kind = EXCLUDED.kind, ad_plan_id = EXCLUDED.ad_plan_id,
+       cabinet = EXCLUDED.cabinet, name = EXCLUDED.name, updated_at = NOW()
+"""
+
+
+def _upsert_entities(rows: list) -> int:
+    if not rows:
+        return 0
+    with psycopg2.connect(_pg_url(), connect_timeout=30) as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, _ENTITY_UPSERT_SQL, rows, page_size=500)
+        conn.commit()
+    return len(rows)
 
 
 def _pg_url() -> str:
@@ -267,8 +329,7 @@ def _cabinet_login(token: str) -> str:
         return ""
 
 
-def _fetch_cabinet_rows(token: str, cabinet: str, df: str, dt: str) -> list:
-    plans = fetch_ad_plans(token)
+def _fetch_cabinet_rows(token: str, cabinet: str, df: str, dt: str, plans: dict) -> list:
     ids = list(plans.keys())
     print(f"[lime_vk_ads] {cabinet}: кампаний (ad_plans) {len(ids)}")
     base_map, goals_map = {}, {}
@@ -293,14 +354,22 @@ def sync_lime_vk_ads(days_back: int = 14) -> int:
     df, dt = frm.isoformat(), to.isoformat()
 
     all_rows: list = []
+    entity_rows: list = []
     for client_id, secret in cabinets:
         token = _get_token(client_id, secret)
         cabinet = _cabinet_login(token)
-        all_rows.extend(_fetch_cabinet_rows(token, cabinet, df, dt))
+        plans = fetch_ad_plans(token)
+        all_rows.extend(_fetch_cabinet_rows(token, cabinet, df, dt, plans))
+        # Справочник группа→кампания собираем на ТОМ ЖЕ токене: VK лимитирует число активных
+        # токенов на client_id, а при token_limit_exceeded код отзывает все токены клиента.
+        entity_rows.extend(fetch_ad_groups(token, cabinet))
+        entity_rows.extend(self_plan_rows(plans.keys(), cabinet))
 
     # ad_plan_id глобально уникальны между кабинетами (0 пересечений) → PK (date,campaign_id) без cabinet.
     n = _upsert(all_rows, df, dt)
-    print(f"[lime_vk_ads] {n} строк из {len(cabinets)} кабинетов ({df}..{dt})")
+    e = _upsert_entities(entity_rows)
+    print(f"[lime_vk_ads] {n} строк из {len(cabinets)} кабинетов ({df}..{dt}); "
+          f"справочник lime_vk_entities: {e} строк")
     return n
 
 
