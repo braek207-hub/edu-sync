@@ -33,6 +33,7 @@ SHEET_ID = os.environ.get("LIME_GCC_SHEET_ID") or "1JSM7wcZlNnKX6uB4kk7UwkQzv7QE
 TRAFFIC_TAB = os.environ.get("LIME_GCC_TRAFFIC_TAB") or "Fact Traffic GCC"
 ORDERS_TAB = os.environ.get("LIME_GCC_ORDERS_TAB") or "Fact Orders GCC"
 GA4_TAB = os.environ.get("LIME_GCC_GA4_TAB") or "Fact Traffic GA4"
+COMPARE_TAB = os.environ.get("LIME_GCC_COMPARE_TAB") or "Сверка web DAU"
 
 REFRESH_DAYS = int(os.environ.get("LIME_GCC_REFRESH_DAYS") or "7")
 BUILD_FROM = os.environ.get("LIME_GCC_FROM") or "2025-08-01"
@@ -891,6 +892,48 @@ def _ga4_row(iso: str, day: dict) -> dict:
     return out
 
 
+def ga4_compare_formulas(service) -> None:
+    """Лист сверки на ФОРМУЛАХ (без синка): GA4 «всего» (totalUsers) vs Метрика DAU по web.
+
+    Тянет из готовых листов Fact Traffic GA4 (столбец «Total» = totalUsers) и Fact Traffic GCC
+    («WEB Total» = Метрика DAU) по дате и имени колонки (ARRAYFORMULA+VLOOKUP+MATCH). Авто-
+    обновляется, когда обновляются эти листы — ничего не считаем в питоне, отдельного синка нет.
+    Δ% = (GA4 всего − Метрика DAU)/Метрика DAU·100. По GCC и 5 странам.
+    """
+    from sync.gcc_ga4 import GA4_CODES
+    from sync.sheets_write import add_tab, get_locale, list_tabs, write_formulas
+
+    # Разделитель аргументов формул зависит от локали книги: comma-decimal (ru/eu) → ';', иначе ','.
+    loc = get_locale(service, SHEET_ID)
+    s = ";" if loc.split("_")[0] in ("ru", "de", "fr", "es", "it", "pt", "nl", "pl", "tr", "uk") else ","
+
+    ga4, gcc = GA4_TAB, TRAFFIC_TAB  # 'Fact Traffic GA4', 'Fact Traffic GCC'
+    # (метка, имя «всего»-колонки в GA4-листе, имя WEB-колонки в Метрика-листе)
+    scopes = [("GCC", "Total", "WEB Total")] + [(c, f"Total {c}", f"{c} WEB Total") for c in GA4_CODES]
+
+    # A2 — даты, разлитые из GA4-листа (драйвер); диапазон растёт сам.
+    header = ["Дата"]
+    row2 = [f"=ARRAYFORMULA(IF('{ga4}'!$A$2:$A=\"\"{s}\"\"{s}'{ga4}'!$A$2:$A))"]
+    for k, (label, ga4_h, metr_h) in enumerate(scopes):
+        metr_L, ga4_L = _col_letter(1 + 3 * k), _col_letter(2 + 3 * k)
+        header += [f"Метрика DAU {label}", f"GA4 всего {label}", f"Δ% {label}"]
+        row2 += [
+            (f"=ARRAYFORMULA(IF($A$2:$A=\"\"{s}\"\"{s}IFERROR(VLOOKUP($A$2:$A{s}'{gcc}'!$A:$BZ{s}"
+             f"MATCH(\"{metr_h}\"{s}'{gcc}'!$1:$1{s}0){s}FALSE))))"),
+            (f"=ARRAYFORMULA(IF($A$2:$A=\"\"{s}\"\"{s}IFERROR(VLOOKUP($A$2:$A{s}'{ga4}'!$A:$Z{s}"
+             f"MATCH(\"{ga4_h}\"{s}'{ga4}'!$1:$1{s}0){s}FALSE))))"),
+            (f"=ARRAYFORMULA(IF(${metr_L}$2:${metr_L}=\"\"{s}\"\"{s}IFERROR(ROUND("
+             f"({ga4_L}2:{ga4_L}-{metr_L}2:{metr_L})/{metr_L}2:{metr_L}*100{s}1){s}\"\")))"),
+        ]
+
+    print(f"локаль книги {loc}, разделитель '{s}'")
+    if COMPARE_TAB not in set(list_tabs(service, SHEET_ID)):
+        add_tab(service, SHEET_ID, COMPARE_TAB)
+        print(f"создана вкладка «{COMPARE_TAB}»")
+    write_formulas(service, SHEET_ID, f"{COMPARE_TAB}!A1", [header, row2])
+    print(f"{COMPARE_TAB}: формулы записаны ({len(header)} колонок; авто-обновление из {ga4}/{gcc})")
+
+
 def ga4_run(service, dates: list[str], mode: str) -> None:
     """Собрать GA4-трафик по hostName/каналам и записать лист GA4.
 
@@ -1003,6 +1046,9 @@ def main() -> None:
     if mode == "ga4-refresh":  # обновить последние N дней GA4-листа
         to = _msk_today() - timedelta(days=1)
         ga4_run(service, _dates(to - timedelta(days=REFRESH_DAYS - 1), to), "ga4-refresh")
+        return
+    if mode == "compare-formulas":  # создать лист сверки на формулах (GA4 всего vs Метрика DAU)
+        ga4_compare_formulas(service)
         return
     if mode == "build":
         to_env = os.environ.get("LIME_GCC_TO")

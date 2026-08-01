@@ -65,6 +65,13 @@ def add_tab(service, spreadsheet_id: str, title: str) -> None:
     ).execute()
 
 
+def get_locale(service, spreadsheet_id: str) -> str:
+    """Локаль книги (напр. 'ru_RU'|'en_US') — определяет разделитель аргументов в формулах."""
+    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id,
+                                      fields="properties.locale").execute()
+    return meta.get("properties", {}).get("locale", "en_US")
+
+
 def sheet_gid(service, spreadsheet_id: str, title: str) -> int:
     """gridId (sheetId) вкладки по имени — нужен для операций со строками/столбцами."""
     meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id,
@@ -93,6 +100,16 @@ def write_block(service, spreadsheet_id: str, a1_start: str, values2d: list[list
         spreadsheetId=spreadsheet_id,
         range=a1_start,
         valueInputOption="RAW",
+        body={"values": values2d},
+    ).execute()
+
+
+def write_formulas(service, spreadsheet_id: str, a1_start: str, values2d: list[list]) -> None:
+    """Записать блок с USER_ENTERED — формулы вычисляются (в отличие от RAW write_block)."""
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=a1_start,
+        valueInputOption="USER_ENTERED",
         body={"values": values2d},
     ).execute()
 

@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "refresh | build | ga4-build | ga4-refresh | traffic-backfill | app-traffic-fill | ga4-probe | ga4-validate | probe"
+        description: "refresh | build | ga4-build | ga4-refresh | compare-formulas | traffic-backfill | app-traffic-fill | ga4-probe | ga4-validate | ga4-cleanup"
         required: false
         default: "refresh"
       refresh_days:
