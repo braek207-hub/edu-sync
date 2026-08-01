@@ -878,6 +878,10 @@ def main() -> None:
         from sync.probe_gcc_app import app_validate
         app_validate()
         return
+    if mode == "ga4-probe":  # разведка GA4: одно ли property на все страны + каналы
+        from sync.gcc_ga4 import probe as ga4_probe
+        ga4_probe()
+        return
 
     from sync.sheets_write import get_write_service
     service = get_write_service()
