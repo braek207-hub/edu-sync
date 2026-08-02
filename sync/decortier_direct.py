@@ -117,7 +117,8 @@ def _fetch_report(date_from: str, date_to: str) -> List[Dict[str, Any]]:
 def _upsert(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
-    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    # psycopg2 не понимает query-параметр pgbouncer= в DSN — срезаем query (см. sync/lime_vk_ads.py:_pg_url)
+    conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0])
     try:
         with conn.cursor() as cur:
             psycopg2.extras.execute_values(
