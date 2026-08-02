@@ -89,7 +89,7 @@ jobs:
         run: python main.py
 
       # Сброс серверного кэша Panda-BI (unstable_cache 24ч): иначе правки плана/CRM/директа
-      # в дашборде видны лишь через сутки. Как в sync-lime/decortier/edu-direct-settings.
+      # в дашборде видны лишь через сутки. Как в sync-lime/edu-direct-settings.
       - name: Revalidate dashboard cache
         if: success()
         run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate

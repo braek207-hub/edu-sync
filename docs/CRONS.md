@@ -27,7 +27,6 @@
 | МСК | UTC | workflow | что делает | типовая длительность |
 |---|---|---|---|---|
 | 03:10 | 10 0 | `sync-lime-direct.yml` | Кабинеты Директа LIME → Supabase (первыми — от них зависит витрина) | 914 с |
-| 03:15 | 15 0 | `sync-decortier-direct.yml` | Кабинет Директа Decortier → Supabase | — (нет данных о длительности) |
 | 03:30 | 30 0 | `sync-polinarepik-orders.yml` | Заказы Polina Repik → Panda-BI | 31 с |
 | 03:40 | 40 0 | `sync-lime-vk.yml` | VK Реклама LIME → Supabase; наполняет справочник `lime_vk_entities` | 238 с |
 | 03:50 | 50 0 | `sync-lime-ru-metrika.yml` | RU-срез Яндекс.Метрики LIME → `lime_metrika_campaign_ru` | 277 с |
