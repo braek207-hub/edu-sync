@@ -1,0 +1,47 @@
+name: Data Watchdog
+
+# Сторож свежести витрин. Смотрит РЕЗУЛЬТАТ в базе, а не код возврата синков:
+# 2026-08-02 выяснилось, что лиды EDU стоят с 29 июля, при этом каждый утренний
+# прогон был зелёным и честно записывал 37 тысяч строк — ровно то, что лежало
+# в Google-таблице, а таблица перестала пополняться выше по течению.
+#
+# Падение здесь и есть уведомление: GitHub присылает письмо на упавший workflow.
+# Строка WARN в логе успешного прогона не доходит ни до кого — это уже проверено.
+on:
+  schedule:
+    # 07:00 UTC = 10:00 МСК. Все синки обязаны закончиться до 09:00 МСК (docs/CRONS.md),
+    # плюс запас на опоздание планировщика GitHub. Письмо приходит к тому моменту,
+    # когда Павел открывает дашборды, а не вечером.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      dash:
+        description: "Проверить один дашборд (lime / edunetwork / bjorn / polinarepik). Пусто = все."
+        required: false
+        default: ""
+      dry:
+        description: "Только показать состояние, не ронять прогон"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Check data freshness
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.dash }}" ]; then ARGS="$ARGS --dash ${{ github.event.inputs.dash }}"; fi
+          if [ "${{ github.event.inputs.dry }}" = "true" ]; then ARGS="$ARGS --dry"; fi
+          python -m scripts.data_watchdog $ARGS
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
