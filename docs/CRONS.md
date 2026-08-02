@@ -47,11 +47,11 @@
 
 | МСК | UTC | workflow | что делает | типовая длительность |
 |---|---|---|---|---|
-| 02:00 (пн) | 0 2 (пн) | `build-edu-features.yml` | Фичи для ML EDU (перед `train-edu-ml`) | 378 с |
-| 00:00 | 0 0 | `sync-lime-gcc.yml` (основной) | Ингест GCC (Triple Whale) | 86 с |
-| 02:30 | 30 2 | `sync-lime-gcc.yml` (страховка) | Повтор ингеста GCC — на случай, если к 3 ночи источник не финализировал день | 86 с |
-| 03:00 | 0 3 | `sync-lime-gcc-sheet.yml` | Лист GCC в Google Sheets, триггерится через `workflow_run` после ингеста GCC | 65 с (аналог roistat-sheet) |
-| 23:44 (пред. сутки) | 44 23 | `sync-lime-roistat-sheet.yml` | Лист Roistat KZ в Google Sheets | 65 с |
+| 02:44 | 44 23 (пред. сутки UTC) | `sync-lime-roistat-sheet.yml` | Лист Roistat KZ в Google Sheets (окно считается по московской дате в коде) | 65 с |
+| 03:00 | 0 0 | `sync-lime-gcc.yml` (основной) | Ингест GCC (Triple Whale) | 86 с |
+| 05:00 (пн) | 0 2 (пн) | `build-edu-features.yml` | Фичи для ML EDU (перед `train-edu-ml` 05:20 МСК) | 378 с |
+| 05:30 | 30 2 | `sync-lime-gcc.yml` (страховка) | Повтор ингеста GCC — на случай, если к 3 ночи источник не финализировал день | 86 с |
+| 06:00 | 0 3 | `sync-lime-gcc-sheet.yml` | Лист GCC в Google Sheets, страховка; основной путь — `workflow_run` после ингеста GCC | 65 с (аналог roistat-sheet) |
 
 ## Цепочки зависимостей
 
