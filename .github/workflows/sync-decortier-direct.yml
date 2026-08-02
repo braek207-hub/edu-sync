@@ -2,8 +2,8 @@ name: Sync Decortier Direct → Supabase
 
 on:
   schedule:
-    # 07:00 UTC = 10:00 Moscow
-    - cron: "0 7 * * *"
+    # 00:15 UTC = 03:15 Moscow
+    - cron: "15 0 * * *"
   workflow_dispatch:
     inputs:
       days_back:

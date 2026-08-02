@@ -1,7 +1,7 @@
 name: score-edu-ml
 on:
   schedule:
-    - cron: "0 4 * * *"   # ежедневно 04:00 UTC (после обучения по понедельникам)
+    - cron: "40 2 * * *"   # ежедневно 05:40 MSK — ПОСЛЕ sync.yml (свежие данные) и после train по понедельникам
   workflow_dispatch:
 jobs:
   score:

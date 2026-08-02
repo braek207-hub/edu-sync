@@ -8,7 +8,7 @@ name: Sync LIME RU Metrika
 
 on:
   schedule:
-    - cron: "20 7 * * *"   # 10:20 МСК ежедневно
+    - cron: "50 0 * * *"   # 03:50 МСК ежедневно
   workflow_dispatch:
     inputs:
       date_from:

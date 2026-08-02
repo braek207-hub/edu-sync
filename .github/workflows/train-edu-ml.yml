@@ -1,7 +1,7 @@
 name: train-edu-ml
 on:
   schedule:
-    - cron: "0 3 * * 1"   # понедельник 03:00 UTC (после build-edu-features 02:00)
+    - cron: "20 2 * * 1"   # понедельник 05:20 MSK (после build-edu-features 02:00 UTC), до скоринга
   workflow_dispatch:
 jobs:
   train:

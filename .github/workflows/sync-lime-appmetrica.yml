@@ -2,7 +2,7 @@ name: Sync LIME AppMetrica
 
 on:
   schedule:
-    - cron: "30 4 * * *"   # ежедневно 07:30 MSK — когорты пересобираются целиком
+    - cron: "10 1 * * *"   # ежедневно 04:10 MSK — ПОСЛЕ sync-lime-vk (справочник группа→кампания свежий); когорты пересобираются целиком
   workflow_dispatch:
     inputs:
       cohort_months:

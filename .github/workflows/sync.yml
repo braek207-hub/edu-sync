@@ -2,8 +2,8 @@ name: EDU Daily Sync
 
 on:
   schedule:
-    # 04:00 UTC = 07:00 Moscow
-    - cron: "0 4 * * *"
+    # 01:50 UTC = 04:50 Moscow — EDU Daily, до скоринга
+    - cron: "50 1 * * *"
   workflow_dispatch:
     inputs:
       direct_sync_mode:

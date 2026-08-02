@@ -2,8 +2,8 @@ name: Sync EDU Direct Campaign Settings
 
 on:
   schedule:
-    # 07:20 UTC = 10:20 Moscow (after main Direct stats sync which runs at 07:00 UTC)
-    - cron: "20 7 * * *"
+    # 02:00 UTC = 05:00 Moscow (after main Direct stats sync which runs at 03:10 MSK)
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
 concurrency:

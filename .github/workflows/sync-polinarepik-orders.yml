@@ -2,8 +2,8 @@ name: Sync Polina Repik Orders → Panda-BI
 
 on:
   schedule:
-    # 03:00 UTC = 06:00 Moscow — после закрытия их суток, окно «изменённые за вчера»
-    - cron: "0 3 * * *"
+    # 00:30 UTC = 03:30 Moscow — после закрытия их суток, окно «изменённые за вчера»
+    - cron: "30 0 * * *"
   workflow_dispatch:
 
 concurrency:

@@ -2,7 +2,7 @@ name: Sync LIME → Supabase
 
 on:
   schedule:
-    - cron: "30 8 * * *"  # 11:30 Moscow (UTC+3)
+    - cron: "30 1 * * *"  # 04:30 Moscow (UTC+3) — витрина, после кабинетов и Метрики
   workflow_dispatch:
     inputs:
       sync_from:

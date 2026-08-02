@@ -2,7 +2,7 @@ name: Sync LIME VK Ads → Supabase
 
 on:
   schedule:
-    - cron: "30 7 * * *"   # 10:30 Moscow, после Директа — свой rate-limit ритм
+    - cron: "40 0 * * *"   # 03:40 Moscow — ДО AppMetrica: наполняет справочник lime_vk_entities
   workflow_dispatch:
     inputs:
       days_back:
