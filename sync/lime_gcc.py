@@ -353,6 +353,114 @@ def _sync_range(frm: date, to: date, conn) -> int:
     return total
 
 
+def _read_preserved(conn, day_s: str) -> tuple[list[dict], list[tuple]]:
+    """Существующие строки region=gcc за день: web-заказы/расход (без трафика) + app целиком.
+
+    Для режима regeo: заказы/расход НЕ перезапрашиваем у TW/Shopify (Павел: «заказы не трогаем»,
+    Shopify отдаёт страну только за ~60 дней) — берём как есть. Трафик (sessions/users/…) из
+    web-строк отбрасываем, его даёт свежая Метрика. app-строки (там Метрики нет) — целиком.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM lime_stats WHERE region='gcc' AND date=%s", (day_s,))
+        existing = cur.fetchall()
+    web, app_rows = [], []
+    for r in existing:
+        if r["data_source"] == "app":
+            app_rows.append(tuple(r[c] for c in COLUMNS))
+        else:
+            web.append({
+                "country": r["country"], "campaign": r["campaign_id"],
+                "channel": r["channel"], "subchannel": r["subchannel"],
+                "traffic_type": r["traffic_type"], "campaign_name": r["campaign_name"] or "",
+                "orders": int(r["purchases_count"] or 0),
+                "revenue_rub": float(r["purchases_revenue"] or 0),
+                "cost_rub": float(r["cost"] or 0),
+            })
+    return web, app_rows
+
+
+def _merge_regeo(metrika_rows, preserved_web, day_s, campaign_index) -> list[tuple]:
+    """Свежий трафик (Метрика гео) + СОХРАНЁННЫЕ заказы/расход (из lime_stats, уже в рублях)."""
+    agg: dict[tuple, dict] = {}
+
+    def bucket(country, campaign, channel, subchannel, tt):
+        key = (country, campaign or "", channel, subchannel)
+        row = agg.get(key)
+        if row is None:
+            row = {"traffic_type": tt, "campaign_name": "", "sessions": 0, "users": 0,
+                   "new_users": 0, "bounce_w": 0.0, "depth_w": 0.0, "cart": 0, "checkout": 0,
+                   "orders": 0, "revenue_rub": 0.0, "cost_rub": 0.0}
+            agg[key] = row
+        elif not row["traffic_type"]:
+            row["traffic_type"] = tt
+        return row
+
+    for m in metrika_rows:
+        channel, subchannel, tt = map_metrika_channel(
+            m["traffic_source"], m["source_engine"], m.get("utm_source"))
+        campaign = bridge_metrika_campaign(m.get("campaign"), campaign_index or {})
+        row = bucket(m.get("country"), campaign, channel, subchannel, tt)
+        row["sessions"] += int(m["visits"] or 0)
+        row["users"] += int(m["users"] or 0)
+        row["new_users"] += int(m.get("new_users") or 0)
+        row["bounce_w"] += float(m.get("bounce_w") or 0)
+        row["depth_w"] += float(m.get("depth_w") or 0)
+        row["cart"] += int(m.get("cart_reaches") or 0)
+        row["checkout"] += int(m.get("checkout_reaches") or 0)
+
+    for p in preserved_web:
+        row = bucket(p["country"], p["campaign"], p["channel"], p["subchannel"], p["traffic_type"])
+        row["orders"] += p["orders"]
+        row["revenue_rub"] += p["revenue_rub"]
+        row["cost_rub"] += p["cost_rub"]
+        if p["campaign_name"] and not row["campaign_name"]:
+            row["campaign_name"] = p["campaign_name"]
+
+    out = []
+    for (country, campaign, channel, subchannel), row in agg.items():
+        sessions = row["sessions"]
+        out.append((
+            day_s, "web", "gcc", country, channel, subchannel, row["traffic_type"],
+            campaign, row["campaign_name"],
+            round(row["cost_rub"], 2), 0, 0, row["sessions"], row["users"], 0,
+            row["orders"], round(row["revenue_rub"], 2), 0,
+            row["new_users"], 0, 0.0,
+            round(row["bounce_w"] / sessions * 100, 4) if sessions else None,
+            round(row["depth_w"] / sessions, 4) if sessions else None,
+            row["cart"], row["checkout"],
+        ))
+    return out
+
+
+def _regeo_range(frm: date, to: date, conn, dry: bool = False) -> int:
+    """Ре-ингест ТОЛЬКО web-трафика на гео за период. Заказы/расход/app — из lime_stats как есть."""
+    token = os.environ["GCC_METRICA_TOKEN"]
+    tw_key = os.environ["GCC_TRIPLEWHALE_API_KEY"]
+    shop = os.environ["GCC_TW_SHOP_DOMAIN"]
+    campaign_index = fetch_campaign_index(
+        tw_key, shop, (frm - timedelta(days=90)).isoformat(), to.isoformat())
+    print(f"regeo: справочник кампаний — {len(campaign_index)} имён")
+    metrika_by_day = _fetch_metrika_by_month(token, frm, to)
+
+    total, day = 0, frm
+    while day <= to:
+        day_s = day.isoformat()
+        metrika = metrika_by_day.get(day_s, [])
+        web_pres, app_rows = _read_preserved(conn, day_s)
+        rows = _merge_regeo(metrika, web_pres, day_s, campaign_index) + app_rows
+        if dry:
+            m_users = sum(int(m["users"] or 0) for m in metrika)
+            o_sum = sum(p["orders"] for p in web_pres)
+            print(f"regeo [DRY] {day_s}: трафик users {m_users}, сохр. заказов {o_sum} "
+                  f"({len(web_pres)} web-строк), app {len(app_rows)} → {len(rows)} строк")
+        else:
+            _write_day(conn, day_s, rows)
+            print(f"regeo {day_s} → {len(rows)} строк")
+        total += len(rows)
+        day += timedelta(days=1)
+    return total
+
+
 def sync_lime_gcc() -> int:
     frm_env = os.environ.get("LIME_GCC_SYNC_FROM")
     to_env = os.environ.get("LIME_GCC_SYNC_TO")
@@ -363,8 +471,18 @@ def sync_lime_gcc() -> int:
         to = date.today()
         frm = to - timedelta(days=SYNC_DAYS - 1)
 
-    dry_run = bool(os.environ.get("LIME_GCC_DRY_RUN")) or not os.environ.get("DATABASE_URL")
-    if dry_run:
+    dry_run = bool(os.environ.get("LIME_GCC_DRY_RUN"))
+
+    # regeo: ре-ингест только web-трафика на гео (нужен DB даже для dry — читаем заказы).
+    if os.environ.get("LIME_GCC_MODE") == "regeo":
+        url = os.environ["DATABASE_URL"].split("?")[0]
+        conn = psycopg2.connect(url, connect_timeout=30)
+        try:
+            return _regeo_range(frm, to, conn, dry=dry_run)
+        finally:
+            conn.close()
+
+    if dry_run or not os.environ.get("DATABASE_URL"):
         return _sync_range(frm, to, None)
 
     url = os.environ["DATABASE_URL"].split("?")[0]

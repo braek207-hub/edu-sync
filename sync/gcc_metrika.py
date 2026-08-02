@@ -9,19 +9,21 @@ from sync.gcc_channels import map_domain_country  # noqa: F401 — оставл�
 
 # Страна = ГЕО ПОСЕТИТЕЛЯ (ym:s:regionCountry), а не домен витрины: люди заходят на
 # витрину одной страны из другой (заказ на ae. с доставкой в Qatar — тот же случай в
-# трафике). Ключ по числовому id Метрики (стабильнее имени). Не-Gulf → None (в GCC-тотал).
+# трафике). Ключ по числовому id Метрики (стабильнее имени).
+# ТОЛЬКО 5 стран продукта GCC (Бахрейн не выделяют). Всё вне этих 5 (США/Индия/РФ/боты/
+# Бахрейн/неопределённое гео) → None и ОТБРАСЫВАЕТСЯ из трафика (parse_metrika_traffic):
+# GCC-тотал трафика = сумма 5 стран (2026-08, по решению Павла — раньше не-Залив сидел в тотале).
 _REGION_COUNTRY = {
     210: "ОАЭ",
     10540: "Саудовская Аравия",
     21486: "Катар",
     10537: "Кувейт",
     21586: "Оман",
-    10532: "Бахрейн",
 }
 
 
 def map_region_country(country_id) -> str | None:
-    """id страны ym:s:regionCountry → русское имя Залива (или None вне GCC)."""
+    """id страны ym:s:regionCountry → русское имя страны GCC (или None вне 5 стран продукта)."""
     if country_id in (None, ""):
         return None
     try:
@@ -198,10 +200,16 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
             traffic_source, utm_source, campaign, search_engine
         )
 
+        country = map_region_country(dim(dims, "ym:s:regionCountry", "id"))
+        # Фильтр только когда страна в запросе ЕСТЬ: трафик вне 5 стран GCC (не-Залив/Бахрейн/
+        # неопр. гео) в region=gcc не пишем. Запрос без regionCountry (тотал-эталон) не трогаем.
+        if "ym:s:regionCountry" in pos and country is None:
+            continue
+
         rows.append(
             {
                 "date": dim(dims, "ym:s:date", "name"),
-                "country": map_region_country(dim(dims, "ym:s:regionCountry", "id")),
+                "country": country,
                 "campaign": campaign,
                 "traffic_source": traffic_source,
                 # Нужен маппингу, чтобы отличить рассылку Mindbox от прочей почты.
@@ -384,13 +392,12 @@ def fetch_metrika_traffic(
     ad = ad_detail + ad_engine_residual(ad_engine, ad_detail)
 
     # Соцсети — тем же приёмом: сеть нужна, чтобы визиты встретились с заказами TW.
-    # Эталон здесь без домена: обрезка (−7.43%) съедает именно страновой разрез.
     social_detail = _fetch(counter_id, token, date_from, date_to,
                            AD_ENGINE_DIMENSIONS, SOCIAL_FILTER)
-    social_total = _fetch(counter_id, token, date_from, date_to,
-                          CHANNEL_DIMENSIONS, SOCIAL_FILTER)
-    social = social_detail + residual_rows(social_total, social_detail)
 
-    by_country = nonad + ad + social
-    totals = _fetch(counter_id, token, date_from, date_to, CHANNEL_DIMENSIONS)
-    return by_country + residual_rows(totals, by_country)
+    # GCC-тотал = СУММА 5 стран (решение Павла 2026-08). Раньше добирали остаток «тотал −
+    # страны» строкой country=None (не-Залив + потеря кросса Метрики) — теперь НЕ добираем:
+    # трафик вне 5 стран и неатрибутированный к стране в region=gcc не пишем. Ценой ~кросс-лосс
+    # страны чуть занижены против «полного тотала», зато сходятся. ad_engine_residual оставлен —
+    # он держит страну (компенсирует потерю кампании ВНУТРИ страны, не создаёт country=None).
+    return nonad + ad + social_detail

@@ -58,8 +58,9 @@ def test_parse_metrika_traffic_with_region_country():
     assert rows[0]["source_engine"] == "Google Ads"
     assert rows[0]["country"] == "ОАЭ"
     assert rows[1]["country"] == "Саудовская Аравия"
-    assert rows[2]["country"] is None                 # США → вне Gulf → GCC-тотал
-    assert {r["country"] for r in rows} == {"ОАЭ", "Саудовская Аравия", None}
+    # США → вне 5 стран GCC → строка ОТФИЛЬТРОВАНА (не пишем в region=gcc; GCC-тотал = сумма стран)
+    assert len(rows) == 2
+    assert {r["country"] for r in rows} == {"ОАЭ", "Саудовская Аравия"}
 
 # === Остаток: визиты, не разнесённые по доменам (T5) ===
 #

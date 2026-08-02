@@ -22,6 +22,14 @@ on:
       sync_to:
         description: "Бэкфилл: дата конца YYYY-MM-DD"
         required: false
+      mode:
+        description: "sync | regeo (ре-ингест только web-трафика на гео, заказы из lime_stats)"
+        required: false
+        default: "sync"
+      dry_run:
+        description: "1 = только печать, без записи (для regeo)"
+        required: false
+        default: ""
 
 concurrency:
   group: lime-gcc-sync
@@ -55,5 +63,7 @@ jobs:
           # Пусто на кроне → синк уходит в режим SYNC_DAYS (в коде `if frm and to`)
           LIME_GCC_SYNC_FROM: ${{ github.event.inputs.sync_from }}
           LIME_GCC_SYNC_TO: ${{ github.event.inputs.sync_to }}
+          LIME_GCC_MODE: ${{ github.event.inputs.mode || 'sync' }}
+          LIME_GCC_DRY_RUN: ${{ github.event.inputs.dry_run }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_gcc
