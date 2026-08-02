@@ -362,8 +362,15 @@ def sync_lime_vk_ads(days_back: int = 14) -> int:
         all_rows.extend(_fetch_cabinet_rows(token, cabinet, df, dt, plans))
         # Справочник группа→кампания собираем на ТОМ ЖЕ токене: VK лимитирует число активных
         # токенов на client_id, а при token_limit_exceeded код отзывает все токены клиента.
-        entity_rows.extend(fetch_ad_groups(token, cabinet))
-        entity_rows.extend(self_plan_rows(plans.keys(), cabinet))
+        # Справочник — вспомогательный слой (накопительный, без delete-окна): отказ здесь
+        # (5xx/таймаут — _api_get ретраит только 429) не должен ронять уже собранный расход
+        # кабинета, который пишется ниже. Что не собралось сейчас — подтянется в след. прогоне.
+        try:
+            entity_rows.extend(fetch_ad_groups(token, cabinet))
+            entity_rows.extend(self_plan_rows(plans.keys(), cabinet))
+        except Exception as e:
+            print(f"[lime_vk_ads] WARN {cabinet}: сбор справочника сущностей упал ({e}) — "
+                  f"пропускаю, расход кабинета не затронут")
 
     # ad_plan_id глобально уникальны между кабинетами (0 пересечений) → PK (date,campaign_id) без cabinet.
     n = _upsert(all_rows, df, dt)

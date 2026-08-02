@@ -348,6 +348,22 @@ def test_is_vk_publisher_covers_both_vk_names():
     assert m.is_vk_publisher("VKAds_custom")
     assert not m.is_vk_publisher("Yandex.Direct")
     assert not m.is_vk_publisher("")
+    # Находка ревью: голая подстрока "vk" матчила бы любого будущего партнёра со случайным
+    # "vk" внутри имени — сузили до "vk ads"/"vkads"/"mytarget".
+    assert not m.is_vk_publisher("NovKrug Media")
+
+
+def test_install_campaign_vk_raw_campaign_id_wins_when_known():
+    """Легитимный VK-трекер иногда кладёт campaign_id=<ad_plan> напрямую — принимаем,
+    если id реально есть в справочнике (self_plan_rows регистрирует ad_plan сам на себя)."""
+    assert m.install_campaign(VK_PUB, "campaign_id=22293644&c=140704359", ENTITY_MAP) == "22293644"
+
+
+def test_install_campaign_vk_unknown_raw_campaign_id_falls_back_to_macro():
+    """Находка ревью: кастомный трекер (VKAds_custom заводится руками) может положить чужой
+    9-значный campaign_id (коллизия с id Директа) — его нет в справочнике, поэтому игнорируем
+    и резолвим по c, как для любой другой VK-установки."""
+    assert m.install_campaign(VK_PUB, "campaign_id=704121835&c=140704359", ENTITY_MAP) == "22293644"
 
 
 def test_build_installs_daily_puts_vk_installs_on_ad_plan():
@@ -403,6 +419,51 @@ def test_vk_resolve_stats_counts_coverage():
         _inst("d4", "2026-07-06 10:00:00", "Yandex.Direct", camp="704121835"),  # не VK
     ]
     assert m.vk_resolve_stats(installs, ENTITY_MAP) == (3, 2, 1)
+
+
+def test_vk_entity_map_unusable_predicate():
+    # Есть установки с макросом c, ни одна не резолвилась — справочник непригоден.
+    assert m.vk_entity_map_unusable(vk_with_c=5, vk_resolved=0) is True
+    # Частичный резолв — не отказ, синк продолжается.
+    assert m.vk_entity_map_unusable(vk_with_c=5, vk_resolved=1) is False
+    assert m.vk_entity_map_unusable(vk_with_c=5, vk_resolved=5) is False
+    # VK-установок с макросом c вообще нет — справочник ни при чём, не отказ.
+    assert m.vk_entity_map_unusable(vk_with_c=0, vk_resolved=0) is False
+
+
+def test_sync_refuses_to_wipe_when_vk_entity_map_unusable():
+    """Находка ревью: load_vk_entity_map глотает любое исключение и возвращает {}, а _write
+    делает DELETE без окна — недоступный/пустой справочник молча стирал бы CPI/ROAS по VK
+    на всей витрине установок. Есть VK-установки с c, резолвнулось 0 → отказ до _write."""
+    installs = [
+        {"appmetrica_device_id": "d1", "install_datetime": "2026-07-06 10:00:00",
+         "publisher_name": VK_PUB, "click_url_parameters": "c=140704359",
+         "is_reinstallation": "0", "is_reattribution": "0"},
+    ]
+    with patch.dict(os.environ, {"APPMETRICA_TOKEN": "test-token"}, clear=False), \
+         patch("sync.lime_appmetrica.fetch_installations", return_value=installs), \
+         patch("sync.lime_appmetrica.fetch_purchase_events", return_value=[]), \
+         patch("sync.lime_appmetrica.load_vk_entity_map", return_value={}), \
+         patch("sync.lime_appmetrica._write") as mock_write:
+        with pytest.raises(RuntimeError, match="lime_vk_entities"):
+            m.sync_lime_appmetrica()
+    mock_write.assert_not_called()
+
+
+def test_sync_proceeds_when_no_vk_installs_have_macro_c():
+    """VK-установок с макросом c вообще нет (vk_with_c==0) — не повод отказывать: справочник
+    ни при чём, синк должен спокойно дойти до записи."""
+    installs = [
+        {"appmetrica_device_id": "d1", "install_datetime": "2026-07-06 10:00:00",
+         "publisher_name": "Organic", "is_reinstallation": "0", "is_reattribution": "0"},
+    ]
+    with patch.dict(os.environ, {"APPMETRICA_TOKEN": "test-token"}, clear=False), \
+         patch("sync.lime_appmetrica.fetch_installations", return_value=installs), \
+         patch("sync.lime_appmetrica.fetch_purchase_events", return_value=[]), \
+         patch("sync.lime_appmetrica.load_vk_entity_map", return_value={}), \
+         patch("sync.lime_appmetrica._write") as mock_write:
+        m.sync_lime_appmetrica()
+    mock_write.assert_called_once()
 
 
 def test_warn_if_vk_entities_stale():

@@ -80,26 +80,38 @@ def param_of(raw: str, key: str) -> str:
 VK_ENTITY_MAX_AGE_DAYS = 7
 
 
+# Маркеры паблишера VK Рекламы в AppMetrica ('VK Ads (ex. myTarget)', 'VKAds_custom').
+# Не голая подстрока 'vk': она матчила бы любого будущего партнёра со случайным 'vk' внутри
+# имени (например «NovKrug Media») и подсунула бы ему чужой справочник к его собственному `c`.
+_VK_PUBLISHER_MARKERS = ("vk ads", "vkads", "mytarget")
+
+
 def is_vk_publisher(publisher: str) -> bool:
     """Партнёр AppMetrica относится к VK Рекламе ('VK Ads (ex. myTarget)', 'VKAds_custom')."""
-    return "vk" in (publisher or "").lower()
+    p = (publisher or "").lower()
+    return any(marker in p for marker in _VK_PUBLISHER_MARKERS)
 
 
 def install_campaign(publisher: str, params: str, entity_map: dict) -> str:
     """Грань расхода кабинета для установки: campaign_id Директа либо ad_plan VK.
 
-    У Директа трекер несёт готовый campaign_id (~96% его установок). У VK в ссылке лежит
-    макрос `c` — id ГРУППЫ объявлений; кампанией (ad_plan, грань расхода lime_vk_ads_stats)
-    он становится через справочник lime_vk_entities. Сырой id группы в витрину не пишем:
-    он 9-значный, как campaign_id Директа, и мог бы приклеить установку VK к чужой строке.
-    Не резолвится — пусто: установка ляжет на подканал, как раньше.
+    У Директа трекер несёт готовый campaign_id (~96% его установок) — принимаем как есть.
+
+    У VK в ссылке обычно лежит макрос `c` — id ГРУППЫ объявлений; кампанией (ad_plan, грань
+    расхода lime_vk_ads_stats) он становится через справочник lime_vk_entities. Сырой
+    campaign_id из ссылки у VK-паблишера принимаем ТОЛЬКО если он сам есть в справочнике
+    (self_plan_rows регистрирует каждый ad_plan_id как ключ, указывающий сам на себя) —
+    иначе кастомный трекер (VKAds_custom заводится руками) со своим 9-значным campaign_id
+    в URL мог бы приклеить установку VK к чужой строке (коллизия с campaign_id Директа),
+    от которой и защищает резолв через `c`. Не резолвится — пусто: установка ляжет на
+    подканал, как раньше.
     """
     cid = param_of(params, "campaign_id")
-    if cid:
-        return cid
     if is_vk_publisher(publisher):
+        if cid and cid in entity_map:
+            return entity_map[cid]
         return entity_map.get(param_of(params, "c"), "")
-    return ""
+    return cid
 
 
 def vk_resolve_stats(installs: list[dict], entity_map: dict) -> tuple[int, int, int]:
@@ -120,6 +132,16 @@ def vk_resolve_stats(installs: list[dict], entity_map: dict) -> tuple[int, int, 
         if entity_map.get(c):
             resolved += 1
     return total, with_c, resolved
+
+
+def vk_entity_map_unusable(vk_with_c: int, vk_resolved: int) -> bool:
+    """True — справочник lime_vk_entities непригоден в этом прогоне: есть VK-установки
+    с макросом `c` (значит резолвить есть что), но НИ ОДНА не резолвилась. Частичный
+    резолв (vk_resolved > 0) не считается отказом — синк продолжается: справочник
+    накопительный, недостающие группы подтянутся следующим прогоном sync-lime-vk.yml.
+    Если VK-установок с макросом `c` вообще нет (vk_with_c == 0) — тоже не отказ: нечего
+    было резолвить, справочник ни при чём."""
+    return vk_with_c > 0 and vk_resolved == 0
 
 
 def warn_if_vk_entities_stale(row_count: int, newest, now: datetime | None = None) -> bool:
@@ -451,6 +473,13 @@ def sync_lime_appmetrica() -> None:
     pct = (100.0 * vk_resolved / vk_total) if vk_total else 0.0
     print(f"[lime-appmetrica] VK: установок {vk_total}, с макросом c {vk_with_c}, "
           f"резолвнулось в ad_plan {vk_resolved} ({pct:.1f}%)")
+    if vk_entity_map_unusable(vk_with_c, vk_resolved):
+        raise RuntimeError(
+            f"[lime-appmetrica] справочник lime_vk_entities пуст/недоступен/протух: "
+            f"{vk_with_c} VK-установок с макросом `c`, резолвнулось 0 — отказ от записи, "
+            f"чтобы не затереть грань кампаний VK данными на уровне канала. "
+            f"Проверь sync-lime-vk.yml (крон 10:30 MSK)."
+        )
 
     first = first_install_per_device(installs_raw, keep_reattr, keep_reinstall)
     # Недельные установки — по сырым строкам (дедуп внутри недели); когорты — по первой

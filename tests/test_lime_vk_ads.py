@@ -118,6 +118,36 @@ def test_self_plan_rows_point_ad_plan_to_itself():
     assert rows[1]["entity_id"] == "22293645"
 
 
+def test_sync_survives_entity_collection_failure_and_still_writes_spend():
+    """Находка ревью: справочник — вспомогательный слой. Отказ на сборе сущностей ОДНОГО
+    кабинета (5xx/таймаут — _api_get ретраит только 429) не должен ронять запись расхода —
+    критичный путь. Мокаем сеть/БД, реальной БД не касаемся."""
+    from sync import lime_vk_ads as m
+
+    with patch.dict(os.environ, {"VK_CLIENT_ID": "cid", "VK_CLIENT_SECRET": "sec"}, clear=False), \
+         patch.object(m, "_get_token", return_value="tok"), \
+         patch.object(m, "_cabinet_login", return_value="cab1"), \
+         patch.object(m, "fetch_ad_plans", return_value={"100": {"name": "A", "objective": "o", "status": "active"}}), \
+         patch.object(m, "_fetch_cabinet_rows", return_value=[{"date": "2026-07-01", "region": "ru",
+             "cabinet": "cab1", "campaign_id": "100", "campaign_name": "A", "objective": "o",
+             "status": "active", "shows": 1, "clicks": 1, "spent": 10.0, "goals_total": 0,
+             "vk_result": 0, "conversions": "{}"}]), \
+         patch.object(m, "fetch_ad_groups", side_effect=RuntimeError("HTTP 503")), \
+         patch.object(m, "_upsert") as mock_upsert, \
+         patch.object(m, "_upsert_entities") as mock_upsert_entities:
+        mock_upsert.return_value = 1
+        mock_upsert_entities.return_value = 0
+        n = m.sync_lime_vk_ads(days_back=1)
+
+    assert n == 1
+    # Расход дошёл до записи несмотря на упавший сбор справочника.
+    spend_rows = mock_upsert.call_args[0][0]
+    assert len(spend_rows) == 1 and spend_rows[0]["campaign_id"] == "100"
+    # self_plan_rows (не сетевой вызов) для этого кабинета тоже пропущен — весь try-блок
+    # прерван исключением из fetch_ad_groups до self_plan_rows.
+    mock_upsert_entities.assert_called_once_with([])
+
+
 def test_fetch_ad_groups_paginates_until_short_page():
     """VK отдаёт максимум 50 на страницу: короткая страница = последняя."""
     pages = [
