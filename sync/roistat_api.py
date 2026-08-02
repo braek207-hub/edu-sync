@@ -43,6 +43,12 @@ METRICS = (
     "visitsCost",
     "paidClientCount",
     "canceledLeadCount",
+    # Новизна клиента по дате ОПЛАТЫ. Зонд 2026-08-02: new_sales + repeatedSales ровно
+    # равны paidLeadCount (26 + 103 = 129 на 15.07). Денег в разрезе новизны у Роистата
+    # нет вовсе — в списке из 48 метрик ни одной; поэтому только счётчики.
+    "new_sales",
+    "repeatedSales",
+    "repeatedLeadCount",
 )
 
 FIELD_BY_METRIC = {
@@ -55,6 +61,9 @@ FIELD_BY_METRIC = {
     "visitsCost": "cost",
     "paidClientCount": "paid_clients",
     "canceledLeadCount": "canceled_leads",
+    "new_sales": "new_sales",
+    "repeatedSales": "repeat_sales",
+    "repeatedLeadCount": "repeat_leads",
 }
 
 # Кампания лежит на РАЗНЫХ уровнях: у Google/Директа — level_3 (level_2 это код типа:

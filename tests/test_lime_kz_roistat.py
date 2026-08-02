@@ -11,7 +11,8 @@ def api_row(channel, **kw):
     row = {"channel": channel, "level2_id": "", "level2": "", "level3_id": "", "level3": "",
            "visits": 0.0, "leads": 0.0, "paid_leads": 0.0,
            "paid_revenue": 0.0, "progress_revenue": 0.0, "canceled_revenue": 0.0,
-           "cost": 0.0, "paid_clients": 0.0, "canceled_leads": 0.0}
+           "cost": 0.0, "paid_clients": 0.0, "canceled_leads": 0.0,
+           "new_sales": 0.0, "repeat_sales": 0.0, "repeat_leads": 0.0}
     row.update(kw)
     return row
 
@@ -197,3 +198,26 @@ def test_merge_cohort_rows_accumulates_across_chunks():
     _merge_cohort_rows(cmap, [cr(10, 4, 6, 1000.0, 12, 8)])   # чанк оплаты 1
     _merge_cohort_rows(cmap, [cr(5, 2, 3, 500.0, 6, 4)])      # чанк оплаты 2, та же грань визита
     assert cmap[("2026-06-08", "", "SEO", "SEO Others")] == (15.0, 6.0, 9.0, 1500.0, 18.0, 12.0)
+
+
+def test_newness_by_pay_date_written():
+    """Новизна по дате ОПЛАТЫ идёт отдельными полями, параллельно когортной по дате визита.
+
+    Роистат отдаёт её только счётчиками (new_sales / repeatedSales / repeatedLeadCount);
+    выручки в разрезе новизны в API нет — поэтому денежных полей здесь не появляется.
+    """
+    rows = build_rows([api_row("SEO", paid_leads=129, new_sales=26, repeat_sales=103,
+                               repeat_leads=40)], FX, {}, "2026-07-15", {})
+    assert col(rows[0], "new_sales") == 26
+    assert col(rows[0], "repeat_sales") == 103
+    assert col(rows[0], "repeat_leads") == 40
+    # Зонд 2026-08-02: сумма новизны равна оплаченным продажам того же дня.
+    assert col(rows[0], "new_sales") + col(rows[0], "repeat_sales") == col(rows[0], "net_purchases_count")
+
+
+def test_newness_missing_metric_does_not_crash():
+    """Метрику могут отключить в проекте — синк обязан записать 0, а не упасть."""
+    row = api_row("SEO", paid_leads=5)
+    del row["new_sales"]
+    rows = build_rows([row], FX, {}, "2026-07-15", {})
+    assert col(rows[0], "new_sales") == 0

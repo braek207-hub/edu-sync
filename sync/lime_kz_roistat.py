@@ -59,6 +59,9 @@ COLUMNS = (
     "net_purchases_count", "net_revenue",
     "cohort_orders", "cohort_revenue", "cohort_new_sales", "cohort_repeat_sales",
     "cohort_leads", "cohort_clients",
+    # Новизна по дате ОПЛАТЫ — параллельно когортной (по дате визита). Складывать нельзя:
+    # это одни и те же продажи, разложенные по разным датам.
+    "new_sales", "repeat_sales", "repeat_leads",
 )
 
 INSERT_SQL = f"INSERT INTO lime_stats ({', '.join(COLUMNS)}) VALUES %s"
@@ -143,6 +146,9 @@ def build_rows(api_rows, fx_rate: float, cabinet_cost: dict, date_s: str, cohort
             0, 0, 0.0,
             int(r["paid_leads"]), round(float(r["paid_revenue"]) * fx_rate, 2),
             c_orders, c_rev, c_new, c_repeat, c_leads, c_clients,
+            # .get: метрику могут отключить в проекте Роистата — тогда пишем 0, а не падаем.
+            int(r.get("new_sales") or 0), int(r.get("repeat_sales") or 0),
+            int(r.get("repeat_leads") or 0),
         ))
     return out
 
