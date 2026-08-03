@@ -7,14 +7,18 @@
 
 Паритет с Директом: расход/клики/показы + конверсии по типам (jsonb). Валюта RUB —
 конверсии валюты нет; spent как в кабинете (без НДС). Rate-limit строгий: батчи id,
-паузы, ретрай 429, токен кэшируется на прогон.
+паузы, ретрай 429, токен кэшируется в БД между прогонами синка (lime_vk_tokens).
 
 ENV: DATABASE_URL, VK_CLIENT_ID, VK_CLIENT_SECRET, LIME_VK_DAYS_BACK (default 14).
 Запуск: python -m sync.lime_vk_ads
 
-ВНИМАНИЕ: VK_CLIENT_ID не шарить с другими потребителями. При token_limit_exceeded
-_get_token отзывает ВСЕ активные токены клиента (token/delete) — это разлогинит любую
-другую систему на том же client_id.
+ПРАВИЛО: токены не отзываем НИКОГДА. Тем же приложением (client_id) может пользоваться
+подрядчик (агентство ПРОКОНТЕКСТ) — на тех же рекламных кабинетах, но своим токеном.
+Отзыв через эндпоинт oauth2 revoke снимает ВСЕ токены пользователя в рамках client_id,
+не только наш, — разлогинил бы и его. Инцидент 2026-08-03: старый код на 403
+token_limit_exceeded звал этот эндпоинт revoke — это и было причиной чужих обрывов сессии.
+Вместо отзыва — кэш токена в БД (lime_vk_tokens), переиспользуем живой токен между
+прогонами синка, новый выпускаем только когда кэш пуст/протух.
 """
 import json
 import os
@@ -22,17 +26,18 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
-from datetime import date, timedelta
-from typing import Any, Dict, Tuple
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
 
 import psycopg2
 import psycopg2.extras
 
 BASE = "https://ads.vk.com/api/v2"
 TOKEN_URL = f"{BASE}/oauth2/token.json"
-TOKEN_DELETE_URL = f"{BASE}/oauth2/token/delete.json"
 STAT_BATCH = 20
 RETRY_429 = 5
+TOKEN_TTL_MARGIN = timedelta(minutes=10)  # запас перед истечением — не отдавать токен впритык
+TOKEN_TTL_DEFAULT = timedelta(hours=24)   # VK: токен живёт ~24ч; берём из expires_in, если есть
 
 
 def _num(v: Any) -> float:
@@ -122,35 +127,83 @@ def _token_form(client_id: str, secret: str) -> bytes:
     }).encode("utf-8")
 
 
-def _issue_token(client_id: str, secret: str) -> str:
+def _issue_token(client_id: str, secret: str) -> Dict[str, Any]:
+    """Выпустить новый access_token. Возвращает сырой ответ VK (access_token, expires_in)."""
     req = urllib.request.Request(TOKEN_URL, data=_token_form(client_id, secret),
         headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
     with urllib.request.urlopen(req, timeout=40) as r:
-        return json.loads(r.read().decode("utf-8"))["access_token"]
+        return json.loads(r.read().decode("utf-8"))
 
 
-def _delete_tokens(client_id: str, secret: str) -> None:
-    """Отозвать все активные токены клиента — освободить лимит VK."""
-    req = urllib.request.Request(TOKEN_DELETE_URL, data=_token_form(client_id, secret),
-        headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
-    urllib.request.urlopen(req, timeout=40).close()
+_TOKEN_SELECT_SQL = "SELECT access_token, expires_at FROM lime_vk_tokens WHERE client_id = %s"
+_TOKEN_UPSERT_SQL = """
+    INSERT INTO lime_vk_tokens (client_id, access_token, expires_at, updated_at)
+    VALUES (%s, %s, %s, NOW())
+    ON CONFLICT (client_id) DO UPDATE SET
+       access_token = EXCLUDED.access_token, expires_at = EXCLUDED.expires_at, updated_at = NOW()
+"""
+
+
+def _load_cached_token(client_id: str) -> Optional[Tuple[str, datetime]]:
+    """(access_token, expires_at) из кэша или None (нет строки). Недоступность кэша (нет
+    таблицы, сбой SELECT) НЕ должна ронять синк — WARN, вызывающий код выпускает токен как раньше."""
+    try:
+        with psycopg2.connect(_pg_url(), connect_timeout=15) as conn:
+            with conn.cursor() as cur:
+                cur.execute(_TOKEN_SELECT_SQL, (client_id,))
+                row = cur.fetchone()
+        return (row[0], row[1]) if row else None
+    except Exception as e:  # noqa: BLE001 — кэш вспомогательный, недоступность не критична
+        print(f"[lime_vk_ads] WARN кэш токена недоступен на чтении ({client_id}): {e} — выпускаю новый")
+        return None
+
+
+def _store_token(client_id: str, token: str, expires_at) -> None:
+    """Записать токен в кэш. Ошибка записи — тоже только WARN, синк продолжается с уже
+    выпущенным токеном (просто следующий прогон выпустит новый вместо переиспользования)."""
+    try:
+        with psycopg2.connect(_pg_url(), connect_timeout=15) as conn:
+            with conn.cursor() as cur:
+                cur.execute(_TOKEN_UPSERT_SQL, (client_id, token, expires_at))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        print(f"[lime_vk_ads] WARN не удалось сохранить токен в кэш ({client_id}): {e}")
 
 
 def _get_token(client_id: str, secret: str) -> str:
-    """Выпустить access_token; при token_limit_exceeded — отозвать старые и повторить.
+    """Токен из кэша (lime_vk_tokens), если живой (запас TOKEN_TTL_MARGIN до истечения) —
+    сеть не дёргаем. Иначе выпускаем новый и кэшируем.
 
-    VK Реклама лимитирует число АКТИВНЫХ токенов на клиента: каждый client_credentials даёт
-    новый 24ч-токен, а крон + ручные dispatch + preview накапливают их до лимита → 403
-    token_limit_exceeded. Отзыв всех токенов (token/delete) освобождает лимит; повторный
-    выпуск проходит. Отзыв безопасен: токены короткоживущие и принадлежат только нашему клиенту.
+    VK Реклама лимитирует число АКТИВНЫХ токенов на клиента (5 на пару client_id+пользователь,
+    по документации VK Ads). Раньше при упоре в лимит код звал эндпоинт revoke — отзывал ВСЕ
+    токены пользователя в рамках client_id, включая токены других потребителей того же
+    приложения (подрядчик работает на тех же кабинетах). Это и было причиной чужих обрывов
+    сессии — отзыв убран НАВСЕГДА. Теперь на 403 token_limit_exceeded — понятная ошибка,
+    без обращения к эндпоинту отзыва: см. докстринг модуля.
     """
+    cached = _load_cached_token(client_id)
+    now = datetime.now(timezone.utc)
+    if cached is not None and cached[1] > now + TOKEN_TTL_MARGIN:
+        return cached[0]
+
     try:
-        return _issue_token(client_id, secret)
+        data = _issue_token(client_id, secret)
     except urllib.error.HTTPError as e:
         if e.code == 403 and "token_limit" in e.read().decode("utf-8", "replace"):
-            _delete_tokens(client_id, secret)
-            return _issue_token(client_id, secret)
+            raise RuntimeError(
+                "VK Реклама: лимит 5 активных токенов на приложение+аккаунт исчерпан. "
+                "Токены НЕ отзываем — тем же приложением (client_id) может пользоваться "
+                "подрядчик на тех же рекламных кабинетах. Дождитесь истечения суточного TTL "
+                "старых токенов, либо отзовите свой токен вручную в кабинете VK."
+            ) from e
         raise
+
+    token = data["access_token"]
+    expires_in = data.get("expires_in")
+    ttl = timedelta(seconds=expires_in) if expires_in else TOKEN_TTL_DEFAULT
+    expires_at = now + ttl
+    _store_token(client_id, token, expires_at)
+    return token
 
 
 def _api_get(token: str, path: str, *, _sleep=time.sleep) -> dict:
@@ -360,8 +413,8 @@ def sync_lime_vk_ads(days_back: int = 14) -> int:
         cabinet = _cabinet_login(token)
         plans = fetch_ad_plans(token)
         all_rows.extend(_fetch_cabinet_rows(token, cabinet, df, dt, plans))
-        # Справочник группа→кампания собираем на ТОМ ЖЕ токене: VK лимитирует число активных
-        # токенов на client_id, а при token_limit_exceeded код отзывает все токены клиента.
+        # Справочник группа→кампания собираем на ТОМ ЖЕ токене: экономит сетевой выпуск
+        # (кэш живёт ~24ч — каждый лишний выпуск приближает к лимиту 5 активных на client_id).
         # Справочник — вспомогательный слой (накопительный, без delete-окна): отказ здесь
         # (5xx/таймаут — _api_get ретраит только 429) не должен ронять уже собранный расход
         # кабинета, который пишется ниже. Что не собралось сейчас — подтянется в след. прогоне.

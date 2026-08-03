@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """Парсинг статистики VK Реклама (ads.vk.com API v2) в строки lime_vk_ads_stats.
 Фикстуры — обрезанные реальные ответы probe 2026-07-22."""
+import io
 import json, os
+import urllib.error
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from sync.lime_vk_ads import parse_base_stats, parse_goal_stats, _campaigns_from_json
@@ -167,3 +170,110 @@ def test_fetch_ad_groups_paginates_until_short_page():
     assert len(rows) == 51
     assert "offset=0" in calls[0] and "offset=50" in calls[1]
     assert "fields=id,name,ad_plan_id" in calls[0]
+
+
+# ── Кэш токена (lime_vk_tokens): убрано удаление токенов, добавлен кэш между прогонами ──
+# Инцидент: старый _get_token на 403 token_limit_exceeded звал token/delete (отзывает ВСЕ
+# токены пользователя в рамках client_id) — рвал токен подрядчика (агентство ПРОКОНТЕКСТ)
+# на тех же кабинетах. Отзыв убран навсегда; вместо него — переиспользование живого токена.
+
+def test_get_token_uses_live_cache_without_network_call():
+    """Живой кэш (запас больше TOKEN_TTL_MARGIN) → токен из БД, сетевой выпуск НЕ вызывается."""
+    from sync import lime_vk_ads as m
+    future = datetime.now(timezone.utc) + timedelta(hours=5)
+    with patch.object(m, "_load_cached_token", return_value=("cached-tok", future)), \
+         patch.object(m, "_issue_token") as mock_issue, \
+         patch.object(m, "_store_token") as mock_store:
+        tok = m._get_token("cid", "sec")
+    assert tok == "cached-tok"
+    mock_issue.assert_not_called()
+    mock_store.assert_not_called()
+
+
+def test_get_token_refreshes_expired_cache_and_stores():
+    """Кэш протух (запас меньше TOKEN_TTL_MARGIN) → выпущен новый токен и записан в кэш."""
+    from sync import lime_vk_ads as m
+    near_expiry = datetime.now(timezone.utc) + timedelta(minutes=5)  # < TOKEN_TTL_MARGIN=10 мин
+    with patch.object(m, "_load_cached_token", return_value=("stale-tok", near_expiry)), \
+         patch.object(m, "_issue_token", return_value={"access_token": "fresh-tok", "expires_in": 3600}), \
+         patch.object(m, "_store_token") as mock_store:
+        tok = m._get_token("cid", "sec")
+    assert tok == "fresh-tok"
+    mock_store.assert_called_once()
+    stored_client_id, stored_token, stored_expires_at = mock_store.call_args[0]
+    assert stored_client_id == "cid" and stored_token == "fresh-tok"
+    # expires_in=3600с из ответа VK — expires_at должен быть ~сейчас+1ч (не дефолтные 24ч)
+    assert stored_expires_at < datetime.now(timezone.utc) + timedelta(minutes=61)
+    assert stored_expires_at > datetime.now(timezone.utc) + timedelta(minutes=59)
+
+
+def test_get_token_defaults_ttl_when_expires_in_missing():
+    """Ответ VK без expires_in → срок кэша по умолчанию 24ч (TOKEN_TTL_DEFAULT)."""
+    from sync import lime_vk_ads as m
+    with patch.object(m, "_load_cached_token", return_value=None), \
+         patch.object(m, "_issue_token", return_value={"access_token": "tok2"}), \
+         patch.object(m, "_store_token") as mock_store:
+        tok = m._get_token("cid", "sec")
+    assert tok == "tok2"
+    stored_expires_at = mock_store.call_args[0][2]
+    assert stored_expires_at > datetime.now(timezone.utc) + timedelta(hours=23)
+
+
+def test_get_token_issues_when_cache_empty():
+    """Кэш пуст (нет строки в БД) → синк не падает, токен выпускается сетью."""
+    from sync import lime_vk_ads as m
+    with patch.object(m, "_load_cached_token", return_value=None), \
+         patch.object(m, "_issue_token", return_value={"access_token": "issued", "expires_in": 3600}), \
+         patch.object(m, "_store_token"):
+        tok = m._get_token("cid", "sec")
+    assert tok == "issued"
+
+
+def test_load_cached_token_survives_db_error():
+    """SELECT падает (нет таблицы / сбой соединения) → None, без исключения наружу."""
+    from sync import lime_vk_ads as m
+    with patch.object(m.psycopg2, "connect", side_effect=RuntimeError("relation does not exist")):
+        assert m._load_cached_token("cid") is None
+
+
+def test_store_token_failure_does_not_raise():
+    """Ошибка ЗАПИСИ кэша тоже не должна ронять синк — только WARN в лог."""
+    from sync import lime_vk_ads as m
+    with patch.object(m.psycopg2, "connect", side_effect=RuntimeError("db down")):
+        m._store_token("cid", "tok", datetime.now(timezone.utc) + timedelta(hours=24))  # не бросает
+
+
+def test_get_token_issues_when_db_fully_unavailable():
+    """И чтение, и запись кэша падают (БД недоступна целиком) → синк всё равно выпускает токен."""
+    from sync import lime_vk_ads as m
+    with patch.object(m.psycopg2, "connect", side_effect=RuntimeError("db down")), \
+         patch.object(m, "_issue_token", return_value={"access_token": "issued2", "expires_in": 3600}):
+        tok = m._get_token("cid", "sec")
+    assert tok == "issued2"
+
+
+def test_get_token_403_token_limit_raises_clear_error_without_delete():
+    """403 token_limit_exceeded → внятная русская ошибка; НИКАКОГО обращения к token/delete."""
+    from sync import lime_vk_ads as m
+    body = io.BytesIO(b'{"error":"token_limit_exceeded"}')
+    err = urllib.error.HTTPError(
+        "https://ads.vk.com/api/v2/oauth2/token.json", 403, "Forbidden", {}, body,
+    )
+    assert not hasattr(m, "_delete_tokens")  # функция отзыва удалена целиком
+    with patch.object(m, "_load_cached_token", return_value=None), \
+         patch.object(m, "_issue_token", side_effect=err):
+        try:
+            m._get_token("cid", "sec")
+            assert False, "ожидалась RuntimeError"
+        except RuntimeError as e:
+            msg = str(e)
+            assert "лимит" in msg.lower()
+            assert "не отзываем" in msg.lower()
+
+
+def test_no_token_delete_reference_in_source():
+    """Страховочный тест: строка token/delete не должна вернуться в исходник синка."""
+    src_path = os.path.join(os.path.dirname(__file__), "..", "sync", "lime_vk_ads.py")
+    with open(src_path, encoding="utf-8") as f:
+        src = f.read()
+    assert "token/delete" not in src
