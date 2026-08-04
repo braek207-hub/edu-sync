@@ -11,6 +11,22 @@ def _empty_traffic(dates):
     return {d: _empty_day() for d in dates}
 
 
+def test_write_traffic_partial_preserves_other_side(monkeypatch):
+    """owns='web' → сохраняем app с листа; owns='app' → сохраняем web (не обнуляем)."""
+    import sync.lime_gcc_report as rep
+    calls = {}
+    monkeypatch.setattr(rep, "_fill_from_sheet",
+                        lambda svc, data, dates, fields: calls.__setitem__("keep", tuple(fields)))
+    monkeypatch.setattr(rep, "_refresh_tab", lambda *a, **k: calls.__setitem__("wrote", True))
+
+    rep._write_traffic_partial(None, ["2026-07-01"], {}, "web")
+    assert calls["keep"] == ("app_org", "app_paid") and calls["wrote"]
+
+    calls.clear()
+    rep._write_traffic_partial(None, ["2026-07-01"], {}, "app")
+    assert calls["keep"] == ("web_org", "web_paid")
+
+
 def test_ga4_row_and_header():
     from sync.lime_gcc_report import _ga4_header, _ga4_row
     h = _ga4_header()

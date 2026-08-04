@@ -771,6 +771,19 @@ def load_history(service) -> None:
         print(f"{tab}: очищено + залито {len(dates)} дн. ({dates[0]}…{dates[-1]})")
 
 
+def _write_traffic_partial(service, dates: list[str], data: dict, owns: str) -> None:
+    """Записать трафик-лист, владея ТОЛЬКО одной стороной (owns='web'|'app').
+
+    Другую сторону подтягиваем с листа (_fill_from_sheet), чтобы _refresh_tab её НЕ обнулил.
+    ЕДИНСТВЕННАЯ точка частичной записи трафика — иначе легко забыть preserve (обнулит app/web)
+    или задвоить через _merge_app (инцидент 2026-08-04: backfill обнулил app). `data` содержит
+    свежими только колонки `owns`; противоположные должны быть 0 (не смерженными) на входе.
+    """
+    keep = ("app_org", "app_paid") if owns == "web" else ("web_org", "web_paid")
+    _fill_from_sheet(service, data, dates, keep)
+    _refresh_tab(service, TRAFFIC_TAB, dates, data)
+
+
 def traffic_backfill(service) -> None:
     """РАЗОВЫЙ режим: заменить ВЕСЬ трафик листа на Метрику (web DAU) + AppMetrica (app DAU).
 
@@ -797,29 +810,24 @@ def traffic_backfill(service) -> None:
 
     conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
     try:
-        traffic = fetch_web(conn, dates)   # web DAU — весь период из lime_stats
+        traffic = fetch_web(conn, dates)   # web DAU — весь период из lime_stats (app=0)
     finally:
         conn.close()
 
-    # App-колонки НЕ обнулять: подставляем существующие значения листа (Павел: «app не трогаем»).
-    # Если AppMetrica-проход ниже успеет — перезапишет свежими; если упадёт — app останется как был.
-    _fill_from_sheet(service, traffic, dates, ("app_org", "app_paid"))
+    # Web пишем СРАЗУ (главное — замена GA4 на Метрику). Владеем web, app сохраняем с листа
+    # (Павел: «app не трогаем»). Гарантированно ложится, даже если AppMetrica ниже упрётся в таймаут.
+    print(f"traffic-backfill web: {frm}…{to} ({len(dates)} дн.) — только web, app и заказы не тронуты")
+    _write_traffic_partial(service, dates, traffic, "web")
 
-    # Web пишем СРАЗУ — это главное (замена GA4 на Метрику). Быстро, гарантированно ложится,
-    # даже если AppMetrica ниже зависнет/упрётся в таймаут.
-    print(f"traffic-backfill web: {frm}…{to} ({len(dates)} дн.) — только трафик на Метрику, заказы не тронуты")
-    _refresh_tab(service, TRAFFIC_TAB, dates, traffic)
-
-    # App DAU — best-effort вторым проходом: молодые данные (~июнь'26+), тянем последние
-    # APP_BACKFILL дней. AppMetrica async-экспорты медленные — оборачиваем в try, чтобы сбой/
-    # таймаут app не отменял уже записанный web. Перезаписываем ТОЛЬКО app_dates (web+app вместе).
+    # App DAU — best-effort вторым проходом (свежий dict, владеем app, web сохраняем с листа).
     if os.environ.get("APPMETRICA_TOKEN"):
         app_dates = dates if len(dates) <= APP_BACKFILL else dates[-APP_BACKFILL:]
         try:
             from sync.gcc_app import fetch_app_traffic
             ta = fetch_app_traffic(os.environ["APPMETRICA_TOKEN"], APP_ID, app_dates, APP_LOOKBACK)
-            _merge_app(traffic, ta)
-            _refresh_tab(service, TRAFFIC_TAB, app_dates, traffic)
+            appdata = {d: _empty_day() for d in app_dates}
+            _merge_app(appdata, ta)
+            _write_traffic_partial(service, app_dates, appdata, "app")
             print(f"traffic-backfill app: долит DAU за последние {len(app_dates)} дн.")
         except Exception as e:  # noqa: BLE001
             print(f"traffic-backfill app: ПРОПУЩЕН (web уже записан): {type(e).__name__}: {e}")
@@ -842,12 +850,11 @@ def app_traffic_fill(service) -> None:
     ta = fetch_app_traffic(os.environ["APPMETRICA_TOKEN"], APP_ID, dates, APP_LOOKBACK)
     traffic = {d: _empty_day() for d in dates}
     _merge_app(traffic, ta)                                  # app заполнен, web=0
-    _fill_from_sheet(service, traffic, dates, ("web_org", "web_paid"))  # вернуть web с листа
     for iso in dates:
         g = traffic[iso][_GCC]
         print(f"{iso}: app DAU {g['app_org']}/{g['app_paid']} (org/paid)")
     print(f"app-traffic-fill: {frm}…{to} ({len(dates)} дн.) — только app-колонки, web сохранён")
-    _refresh_tab(service, TRAFFIC_TAB, dates, traffic)
+    _write_traffic_partial(service, dates, traffic, "app")  # владеем app, web сохраняем с листа
 
 
 def verify(service) -> None:
