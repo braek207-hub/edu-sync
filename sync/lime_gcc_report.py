@@ -801,6 +801,10 @@ def traffic_backfill(service) -> None:
     finally:
         conn.close()
 
+    # App-колонки НЕ обнулять: подставляем существующие значения листа (Павел: «app не трогаем»).
+    # Если AppMetrica-проход ниже успеет — перезапишет свежими; если упадёт — app останется как был.
+    _fill_from_sheet(service, traffic, dates, ("app_org", "app_paid"))
+
     # Web пишем СРАЗУ — это главное (замена GA4 на Метрику). Быстро, гарантированно ложится,
     # даже если AppMetrica ниже зависнет/упрётся в таймаут.
     print(f"traffic-backfill web: {frm}…{to} ({len(dates)} дн.) — только трафик на Метрику, заказы не тронуты")
