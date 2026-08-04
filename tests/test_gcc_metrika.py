@@ -5,17 +5,17 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from sync.gcc_metrika import (
-    map_region_country, parse_metrika_traffic, residual_rows, resolve_engine,
+    domain_country_gcc5, parse_metrika_traffic, residual_rows, resolve_engine,
 )
 
 
-def test_map_region_country():
-    assert map_region_country(210) == "ОАЭ"
-    assert map_region_country("10540") == "Саудовская Аравия"
-    assert map_region_country(21486) == "Катар"
-    assert map_region_country(84) is None    # США — не Gulf
-    assert map_region_country(None) is None
-    assert map_region_country("") is None
+def test_domain_country_gcc5():
+    assert domain_country_gcc5("ae.lime-shop.com") == "ОАЭ"
+    assert domain_country_gcc5("sa.limestore.com") == "Саудовская Аравия"
+    assert domain_country_gcc5("qa.lime-shop.com") == "Катар"
+    assert domain_country_gcc5("bh.lime-shop.com") is None   # Бахрейн — вне 5 стран продукта
+    assert domain_country_gcc5("example.com") is None        # чужой домен
+    assert domain_country_gcc5(None) is None
 
 
 def test_parse_metrika_traffic():
@@ -39,17 +39,17 @@ def test_parse_metrika_traffic():
     assert all(r["country"] is None for r in rows)
 
 
-def test_parse_metrika_traffic_with_region_country():
-    """Страна = гео посетителя (regionCountry по id): англ→рус для Gulf, не-Gulf → None."""
+def test_parse_metrika_traffic_with_domain():
+    """Страна = домен витрины (startURLDomain): 5 витрин → страна, bh/чужие → отфильтровано."""
     resp = {
-        "query": {"dimensions": ["ym:s:date", "ym:s:regionCountry",
+        "query": {"dimensions": ["ym:s:date", "ym:s:startURLDomain",
                                   "ym:s:lastsignTrafficSource", "ym:s:lastsignSourceEngine"]},
         "data": [
-            {"dimensions": [{"name": "2026-07-17"}, {"id": "210", "name": "United Arab Emirates"},
+            {"dimensions": [{"name": "2026-07-17"}, {"name": "ae.lime-shop.com"},
                             {"id": "ad"}, {"name": "Google Ads"}], "metrics": [100, 80, 20, 10, 2, 5, 3]},
-            {"dimensions": [{"name": "2026-07-17"}, {"id": "10540", "name": "Saudi Arabia"},
+            {"dimensions": [{"name": "2026-07-17"}, {"name": "sa.limestore.com"},
                             {"id": "ad"}, {"name": "Google Ads"}], "metrics": [30, 20, 5, 10, 2, 1, 1]},
-            {"dimensions": [{"name": "2026-07-17"}, {"id": "84", "name": "United States"},
+            {"dimensions": [{"name": "2026-07-17"}, {"name": "bh.lime-shop.com"},
                             {"id": "organic"}, {"name": None}], "metrics": [10, 8, 2, 50, 1, 0, 0]},
         ],
     }
@@ -58,7 +58,7 @@ def test_parse_metrika_traffic_with_region_country():
     assert rows[0]["source_engine"] == "Google Ads"
     assert rows[0]["country"] == "ОАЭ"
     assert rows[1]["country"] == "Саудовская Аравия"
-    # США → вне 5 стран GCC → строка ОТФИЛЬТРОВАНА (не пишем в region=gcc; GCC-тотал = сумма стран)
+    # Бахрейн → вне 5 стран продукта → строка ОТФИЛЬТРОВАНА (GCC-тотал = сумма 5 стран)
     assert len(rows) == 2
     assert {r["country"] for r in rows} == {"ОАЭ", "Саудовская Аравия"}
 

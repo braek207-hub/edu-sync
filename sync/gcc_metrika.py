@@ -5,31 +5,19 @@ import time
 
 import requests
 
-from sync.gcc_channels import map_domain_country  # noqa: F401 — оставлен для совместимости
+from sync.gcc_channels import map_domain_country
 
-# Страна = ГЕО ПОСЕТИТЕЛЯ (ym:s:regionCountry), а не домен витрины: люди заходят на
-# витрину одной страны из другой (заказ на ae. с доставкой в Qatar — тот же случай в
-# трафике). Ключ по числовому id Метрики (стабильнее имени).
-# ТОЛЬКО 5 стран продукта GCC (Бахрейн не выделяют). Всё вне этих 5 (США/Индия/РФ/боты/
-# Бахрейн/неопределённое гео) → None и ОТБРАСЫВАЕТСЯ из трафика (parse_metrika_traffic):
-# GCC-тотал трафика = сумма 5 стран (2026-08, по решению Павла — раньше не-Залив сидел в тотале).
-_REGION_COUNTRY = {
-    210: "ОАЭ",
-    10540: "Саудовская Аравия",
-    21486: "Катар",
-    10537: "Кувейт",
-    21586: "Оман",
-}
+# Страна ТРАФИКА = ДОМЕН витрины (ym:s:startURLDomain), как GA4 (hostName-магазин) и логика RU.
+# Сумма стран = GCC-тотал (нет не-Заливного «без страны», которое было при гео). Разрез
+# совпадает с GA4 (магазин↔магазин), поэтому Метрика и GA4 сопоставимы.
+# ТОЛЬКО 5 стран продукта GCC (Бахрейн не выделяют) — bh-домен и прочее → None, отбрасывается.
+_GCC5 = {"ОАЭ", "Саудовская Аравия", "Катар", "Кувейт", "Оман"}
 
 
-def map_region_country(country_id) -> str | None:
-    """id страны ym:s:regionCountry → русское имя страны GCC (или None вне 5 стран продукта)."""
-    if country_id in (None, ""):
-        return None
-    try:
-        return _REGION_COUNTRY.get(int(country_id))
-    except (TypeError, ValueError):
-        return None
+def domain_country_gcc5(domain) -> str | None:
+    """Домен витрины (ym:s:startURLDomain) → страна GCC. Только 5 продуктовых; Бахрейн/прочее → None."""
+    c = map_domain_country(domain)
+    return c if c in _GCC5 else None
 
 
 # Измерения канала (эталон тотала: без страны и без разбивок).
@@ -44,7 +32,7 @@ CHANNEL_DIMENSIONS = (
 # (зонд 2026-07-18). utm-метки и searchEngine такого не делают: потерь нет.
 COUNTRY_DIMENSIONS = (
     "ym:s:date",
-    "ym:s:regionCountry",
+    "ym:s:startURLDomain",
     "ym:s:lastsignTrafficSource",
     "ym:s:UTMSource",
     "ym:s:UTMCampaign",
@@ -68,7 +56,7 @@ NONAD_FILTER = ("ym:s:lastsignTrafficSource!='ad' "
 # Площадка + кампания: стоит 3.13%, разницу добираем строкой-остатком с известной площадкой.
 AD_DIMENSIONS = (
     "ym:s:date",
-    "ym:s:regionCountry",
+    "ym:s:startURLDomain",
     "ym:s:lastsignTrafficSource",
     "ym:s:lastsignSourceEngine",
     "ym:s:UTMCampaign",
@@ -78,7 +66,7 @@ AD_DIMENSIONS = (
 # Она же используется для соцсетей: кампаний у них нет, нужна только сеть.
 AD_ENGINE_DIMENSIONS = (
     "ym:s:date",
-    "ym:s:regionCountry",
+    "ym:s:startURLDomain",
     "ym:s:lastsignTrafficSource",
     "ym:s:lastsignSourceEngine",
 )
@@ -167,7 +155,7 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
     Returns:
         Список дектов с ключами:
         - date (str): YYYY-MM-DD
-        - country (str|None): страна Залива по гео посетителя regionCountry (None вне GCC)
+        - country (str|None): страна GCC по домену витрины startURLDomain (None вне 5 витрин)
         - campaign (str|None): utm_campaign (у Google Ads это id кампании)
         - traffic_source (str|None): id источника (напр. "ad", "organic")
         - source_engine (str|None): площадка, восстановленная из utm (см. resolve_engine)
@@ -200,10 +188,10 @@ def parse_metrika_traffic(resp: dict) -> list[dict]:
             traffic_source, utm_source, campaign, search_engine
         )
 
-        country = map_region_country(dim(dims, "ym:s:regionCountry", "id"))
-        # Фильтр только когда страна в запросе ЕСТЬ: трафик вне 5 стран GCC (не-Залив/Бахрейн/
-        # неопр. гео) в region=gcc не пишем. Запрос без regionCountry (тотал-эталон) не трогаем.
-        if "ym:s:regionCountry" in pos and country is None:
+        country = domain_country_gcc5(dim(dims, "ym:s:startURLDomain", "name"))
+        # Фильтр только когда домен в запросе ЕСТЬ: трафик вне 5 витрин GCC (bh/прочее)
+        # в region=gcc не пишем. Запрос без startURLDomain (тотал-эталон) не трогаем.
+        if "ym:s:startURLDomain" in pos and country is None:
             continue
 
         rows.append(
@@ -368,10 +356,11 @@ def _fetch(counter_id, token: str, date_from: str, date_to: str, dimensions,
 def fetch_metrika_traffic(
     counter_id: int, token: str, date_from: str, date_to: str
 ) -> list[dict]:
-    """Получить трафик из Яндекс.Метрики: строки по странам + остаток до полного тотала.
+    """Получить трафик из Яндекс.Метрики по 5 витринам GCC (страна = домен startURLDomain).
 
-    Два запроса: с доменом (страны) и без (эталонный тотал по каналам). Разница по каналу
-    добирается строкой country=None — см. residual_rows.
+    Запросы разбиты по типам трафика (прочий/реклама/соцсети), каждый с доменом → строки
+    по 5 странам. Остаток «тотал − страны» (country=None) НЕ добираем: GCC-тотал = сумма 5
+    стран (решение Павла 2026-08). ad_engine_residual держит страну внутри рекламы.
 
     Args:
         counter_id: ID счётчика (напр. 98232701)
@@ -380,7 +369,7 @@ def fetch_metrika_traffic(
         date_to: дата до в формате YYYY-MM-DD
 
     Returns:
-        Строки parse_metrika_traffic: по странам + остатки (country=None).
+        Строки parse_metrika_traffic по 5 странам GCC (без country=None).
     """
     # Прочий трафик — прежним набором (движок бы его порезал).
     nonad = _fetch(counter_id, token, date_from, date_to, COUNTRY_DIMENSIONS, NONAD_FILTER)
