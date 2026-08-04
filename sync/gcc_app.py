@@ -193,7 +193,7 @@ def fetch_app_traffic(token: str, app_id: str, dates: list[str],
     look_from = (date.fromisoformat(dmin) - timedelta(days=lookback_days)).isoformat()
     # Пол окна касаний: не сканировать installs раньше запуска приложения — пустой диапазон
     # раздувает и замедляет async-экспорт AppMetrica (installations упирался в таймаут).
-    floor = os.environ.get("LIME_GCC_APP_LOOK_FLOOR") or "2026-05-01"
+    floor = os.environ.get("LIME_GCC_APP_LOOK_FLOOR") or "2026-06-01"  # app запущен ~2 июня'26
     if look_from < floor:
         look_from = floor
     touches = _fetch_touches(token, app_id, look_from, dmax)
