@@ -842,7 +842,8 @@ def app_traffic_fill(service) -> None:
     """
     from sync.gcc_app import fetch_app_traffic
 
-    to = _msk_today() - timedelta(days=1)
+    to_env = os.environ.get("LIME_GCC_TO")
+    to = date.fromisoformat(to_env) if to_env else _msk_today() - timedelta(days=1)
     frm_env = os.environ.get("LIME_GCC_FROM")
     frm = date.fromisoformat(frm_env) if frm_env else to - timedelta(days=APP_BACKFILL - 1)
     dates = _dates(frm, to)

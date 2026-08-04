@@ -191,6 +191,11 @@ def fetch_app_traffic(token: str, app_id: str, dates: list[str],
     chunk_days = chunk_days or int(os.environ.get("LIME_GCC_APP_CHUNK_DAYS") or "7")
     dmin, dmax = min(dates), max(dates)
     look_from = (date.fromisoformat(dmin) - timedelta(days=lookback_days)).isoformat()
+    # Пол окна касаний: не сканировать installs раньше запуска приложения — пустой диапазон
+    # раздувает и замедляет async-экспорт AppMetrica (installations упирался в таймаут).
+    floor = os.environ.get("LIME_GCC_APP_LOOK_FLOOR") or "2026-05-01"
+    if look_from < floor:
+        look_from = floor
     touches = _fetch_touches(token, app_id, look_from, dmax)
 
     from sync.appmetrica_logs import fetch_sessions
