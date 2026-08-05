@@ -990,6 +990,40 @@ def save_artifact(version: str, kind: str, blob: bytes) -> None:
         conn.commit()
 
 
+def ensure_ml_weights_table() -> None:
+    """Веса логистики для реалтайм-скоринга (Vercel /api/edu/lead-quality).
+    RLS без политик: публичный API Supabase не читает, postgres-роль — свободно."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS edu_ml_weights (
+              point      TEXT PRIMARY KEY,
+              version    TEXT NOT NULL,
+              payload    JSONB NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute("ALTER TABLE edu_ml_weights ENABLE ROW LEVEL SECURITY")
+        conn.commit()
+
+
+def upsert_ml_weights(point: str, version: str, payload: dict) -> None:
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO edu_ml_weights (point, version, payload, updated_at)
+            VALUES (%s,%s,%s::jsonb,now())
+            ON CONFLICT (point) DO UPDATE
+              SET version=EXCLUDED.version, payload=EXCLUDED.payload, updated_at=now()
+            """,
+            (point, version, _json.dumps(payload, ensure_ascii=False)),
+        )
+        conn.commit()
+
+
 def load_latest_passing_artifacts(point):
     """Последняя прошедшая гейт версия ДЛЯ ТОЧКИ point; артефакты с суффиксом точки,
     ключи возвращаются каноническими (без суффикса). None если такой версии нет."""

@@ -18,10 +18,14 @@ class FeatureSpec:
 
 
 REGISTRY: list[FeatureSpec] = [
+    # audience/b24_* заполняет МЕНЕДЖЕР ПРИ ЗВОНКЕ, не форма: SQL-проба 2026-08-05 —
+    # b24_grad_year заполнен у 96.5% дозвонившихся vs 3.7% недозвонившихся (90д, vuz).
+    # На at_creation это утечка дозвона (та же грабля, что product_group в Ф1b) →
+    # переклассифицированы в post_connection, где анкета честно существует.
+    FeatureSpec("audience", "post_connection", "cat"),
+    FeatureSpec("b24_grad_year", "post_connection", "cat"),
+    FeatureSpec("b24_edu_level", "post_connection", "cat"),
     # L0 — известны на создании лида
-    FeatureSpec("audience", "at_creation", "cat"),
-    FeatureSpec("b24_grad_year", "at_creation", "cat"),
-    FeatureSpec("b24_edu_level", "at_creation", "cat"),
     FeatureSpec("city_ip_segment", "at_creation", "cat"),
     FeatureSpec("direction", "at_creation", "cat"),
     FeatureSpec("campaign_id", "at_creation", "cat"),

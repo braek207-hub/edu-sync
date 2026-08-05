@@ -18,3 +18,9 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m sync.ml_train
+      # Веса свежей (или последней прошедшей гейт) модели — для реалтайм-скоринга
+      # на Vercel (/api/edu/lead-quality). Экспортёр сам берёт latest passing.
+      - name: Export logistic weights (at_creation)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m sync.ml_export_weights
