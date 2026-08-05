@@ -87,6 +87,23 @@ def test_residual_adds_unattributed_visits():
     assert r["users"] == 900 - 850 - 30
 
 
+def test_country_residual_within_country():
+    """Остаток кросса садится В СТРАНУ (не country=None), органикой, только где недобор."""
+    from sync.gcc_channels import map_metrika_channel
+    from sync.gcc_metrika import country_residual_rows
+
+    clean = [{"date": "2026-07-17", "country": "ОАЭ", "visits": 1000, "users": 800},
+             {"date": "2026-07-17", "country": "Катар", "visits": 100, "users": 80}]
+    channels = [{"date": "2026-07-17", "country": "ОАЭ", "visits": 900, "users": 730},   # недобор
+                {"date": "2026-07-17", "country": "Катар", "visits": 100, "users": 80}]   # покрыт
+    res = country_residual_rows(clean, channels)
+    assert len(res) == 1                       # только ОАЭ (у Катара остатка нет)
+    r = res[0]
+    assert r["country"] == "ОАЭ" and r["visits"] == 100 and r["users"] == 70
+    ch, sub, ttype = map_metrika_channel(r["traffic_source"], r["source_engine"], r["utm_source"])
+    assert ttype == "Бесплатный" and ch == "Others"   # остаток = органика (как GA4 ORG=Total−PAID)
+
+
 def test_residual_skips_fully_attributed_channels():
     totals = [{"date": "2026-07-17", "country": None, "traffic_source": "direct",
                "source_engine": None, "visits": 100, "users": 90}]

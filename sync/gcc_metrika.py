@@ -71,6 +71,14 @@ AD_ENGINE_DIMENSIONS = (
     "ym:s:lastsignSourceEngine",
 )
 
+# ЧИСТЫЙ тотал страны — только (дата, домен), БЕЗ канала. 5 доменов × даты = мало комбинаций,
+# Stat API ничего не режет → кресту неоткуда взяться (аналогия GA4: тотал по хосту без каналов).
+# Разницу «чистый тотал − сумма каналов» (кросс) добираем остатком ВНУТРИ страны, не country=None.
+DOMAIN_TOTAL_DIMENSIONS = (
+    "ym:s:date",
+    "ym:s:startURLDomain",
+)
+
 # Цели счётчика GCC (проверено 2026-07-18 на живых данных за неделю):
 #   344184922 «Ecommerce: добавление в корзину» — 7955 достижений, работает;
 #   344184921 «Автоцель: просмотр корзины» — 2446, взята как шаг «оформление»:
@@ -263,6 +271,41 @@ def residual_rows(total_rows: list[dict], country_rows: list[dict]) -> list[dict
     return out
 
 
+def country_residual_rows(clean_rows: list[dict], country_rows: list[dict]) -> list[dict]:
+    """Остаток кросса ВНУТРИ страны: чистый тотал страны (запрос только по домену, без канала —
+    кресту неоткуда взяться) − сумма её каналов. Одна строка на (дата, страна): канал
+    Others/«Прочее (не разнесено)», органика (Бесплатный).
+
+    Так тотал страны = сумма её каналов (кросс не теряется), и остаётся В СТРАНЕ (не country=None).
+    Это аналогия GA4: тотал по хосту чистый, ORG=Total−PAID (недобор садится в органику страны).
+
+    Args:
+        clean_rows: разбор запроса по DOMAIN_TOTAL_DIMENSIONS (страна из домена, канала нет).
+        country_rows: разбор запроса по каналам (nonad+ad+social) — сумма недобирает крест.
+    """
+    from collections import defaultdict
+    seen: dict[tuple, list[int]] = defaultdict(lambda: [0, 0])  # (date,country) -> [visits, users]
+    for r in country_rows:
+        acc = seen[(r["date"], r["country"])]
+        acc[0] += int(r.get("visits") or 0)
+        acc[1] += int(r.get("users") or 0)
+
+    out = []
+    for r in clean_rows:
+        v = int(r.get("visits") or 0) - seen[(r["date"], r["country"])][0]
+        u = int(r.get("users") or 0) - seen[(r["date"], r["country"])][1]
+        if v <= 0 and u <= 0:  # каналы уже покрыли тотал (креста нет/перекрытие) — остаток не нужен
+            continue
+        out.append({
+            "date": r["date"], "country": r["country"], "campaign": None,
+            "traffic_source": None, "utm_source": None,
+            "source_engine": "Прочее (не разнесено)",   # → Others/…/Бесплатный (map_metrika_channel)
+            "visits": max(v, 0), "users": max(u, 0), "new_users": 0,
+            "bounce_w": 0, "depth_w": 0, "cart_reaches": 0, "checkout_reaches": 0,
+        })
+    return out
+
+
 def ad_engine_residual(engine_rows: list[dict], detail_rows: list[dict]) -> list[dict]:
     """Платные визиты, не попавшие в разрез с кампанией → строки с площадкой, без кампании.
 
@@ -358,9 +401,10 @@ def fetch_metrika_traffic(
 ) -> list[dict]:
     """Получить трафик из Яндекс.Метрики по 5 витринам GCC (страна = домен startURLDomain).
 
-    Запросы разбиты по типам трафика (прочий/реклама/соцсети), каждый с доменом → строки
-    по 5 странам. Остаток «тотал − страны» (country=None) НЕ добираем: GCC-тотал = сумма 5
-    стран (решение Павла 2026-08). ad_engine_residual держит страну внутри рекламы.
+    Запросы по типам трафика (прочий/реклама/соцсети) с доменом → каналы по 5 странам (недобирают
+    крест Stat API). Плюс ЧИСТЫЙ тотал страны по домену без канала (креста нет) — разницу добираем
+    остатком ВНУТРИ страны (Others/Прочее, органика, country_residual_rows). Итог как GA4:
+    тотал страны полный, сумма её каналов = тотал, сумма 5 стран = GCC-тотал, нет country=None.
 
     Args:
         counter_id: ID счётчика (напр. 98232701)
@@ -369,7 +413,7 @@ def fetch_metrika_traffic(
         date_to: дата до в формате YYYY-MM-DD
 
     Returns:
-        Строки parse_metrika_traffic по 5 странам GCC (без country=None).
+        Строки parse_metrika_traffic по 5 странам GCC (каналы + остаток; без country=None).
     """
     # Прочий трафик — прежним набором (движок бы его порезал).
     nonad = _fetch(counter_id, token, date_from, date_to, COUNTRY_DIMENSIONS, NONAD_FILTER)
@@ -384,9 +428,10 @@ def fetch_metrika_traffic(
     social_detail = _fetch(counter_id, token, date_from, date_to,
                            AD_ENGINE_DIMENSIONS, SOCIAL_FILTER)
 
-    # GCC-тотал = СУММА 5 стран (решение Павла 2026-08). Раньше добирали остаток «тотал −
-    # страны» строкой country=None (не-Залив + потеря кросса Метрики) — теперь НЕ добираем:
-    # трафик вне 5 стран и неатрибутированный к стране в region=gcc не пишем. Ценой ~кросс-лосс
-    # страны чуть занижены против «полного тотала», зато сходятся. ad_engine_residual оставлен —
-    # он держит страну (компенсирует потерю кампании ВНУТРИ страны, не создаёт country=None).
-    return nonad + ad + social_detail
+    channel = nonad + ad + social_detail
+
+    # ЧИСТЫЙ тотал страны — запрос только по домену (без канала → без креста). Разницу
+    # «чистый − сумма каналов» добираем остатком ВНУТРИ страны (Others/Прочее, органика).
+    # Итог как GA4: тотал страны полный (крест не теряется), сумма 5 = GCC-тотал, нет country=None.
+    clean = _fetch(counter_id, token, date_from, date_to, DOMAIN_TOTAL_DIMENSIONS)
+    return channel + country_residual_rows(clean, channel)
