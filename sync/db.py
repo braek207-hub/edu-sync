@@ -1010,6 +1010,7 @@ def ensure_ml_weights_table() -> None:
 
 
 def upsert_ml_weights(point: str, version: str, payload: dict) -> None:
+    import json as _json
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(
