@@ -132,4 +132,84 @@ def audit():
     for s, u in sorted(sagg.items(), key=lambda x: -x[1]):
         print(f"MCH {s} | {u}")
 
+    hf = {"filter": {"fieldName": "hostName",
+                     "inListFilter": {"values": list(HOST_COUNTRY.keys())}}}
+
+    # ── 5. ИСТОЧНИК/МЕДИУМ детально — ГДЕ именно перевес (Google Ads vs Meta)
+    print("\n### SRC GA4 sessionSource/sessionMedium (totalUsers, GCC-хосты, топ 25):")
+    gsm = run_report(GA4_PROPERTY, frm_s, to_s, ["sessionSource", "sessionMedium"],
+                     ("totalUsers",), hf)
+    for r in sorted(gsm, key=lambda x: -int(x["metrics"][0]))[:25]:
+        print(f"GSRC {r['dims'][0]} / {r['dims'][1]} | {int(r['metrics'][0])}")
+    print("\n### SRC Метрика площадка платного lastsignSourceEngine (users, GCC5 ad, топ 25):")
+    men = _m(["ym:s:lastsignSourceEngine", "ym:s:startURLDomain"], ["ym:s:users"], frm_s, to_s,
+             filters="ym:s:lastsignTrafficSource=='ad'")
+    eagg = {}
+    for r in men:
+        if domain_country_gcc5(r["dimensions"][1]["name"]):
+            e = r["dimensions"][0]["name"]
+            eagg[e] = eagg.get(e, 0) + int(r["metrics"][0])
+    for e, u in sorted(eagg.items(), key=lambda x: -x[1])[:25]:
+        print(f"MSRC {e} | {u}")
+
+    # ── 6. ПЛАТФОРМА ПО ДНЯМ: Google Ads vs Meta — где разрыв и как скачет
+    def _g_plat(src, med):
+        s, m = (src or "").lower(), (med or "").lower()
+        if "google" in s and any(x in m for x in ("cpc", "paid", "ppc")):
+            return "google"
+        if "cross" in m:  # PMax cross-network
+            return "google"
+        if any(x in s for x in ("facebook", "instagram", "fb", "ig", "meta")) and \
+           any(x in m for x in ("cpc", "paid", "ppc", "social")):
+            return "meta"
+        return None
+    gpd = run_report(GA4_PROPERTY, frm_s, to_s, ["date", "sessionSource", "sessionMedium"],
+                     ("totalUsers",), hf)
+    g_goog, g_meta = {}, {}
+    for r in gpd:
+        p = _g_plat(r["dims"][1], r["dims"][2])
+        d0 = r["dims"][0]
+        if p == "google":
+            g_goog[d0] = g_goog.get(d0, 0) + int(r["metrics"][0])
+        elif p == "meta":
+            g_meta[d0] = g_meta.get(d0, 0) + int(r["metrics"][0])
+    mpd = _m(["ym:s:date", "ym:s:lastsignSourceEngine", "ym:s:startURLDomain"], ["ym:s:users"],
+             frm_s, to_s, filters="ym:s:lastsignTrafficSource=='ad'")
+    m_goog, m_meta = {}, {}
+    for r in mpd:
+        if not domain_country_gcc5(r["dimensions"][2]["name"]):
+            continue
+        e = (r["dimensions"][1]["name"] or "").lower()
+        iso = r["dimensions"][0]["name"]
+        if "google" in e:
+            m_goog[iso] = m_goog.get(iso, 0) + int(r["metrics"][0])
+        elif any(x in e for x in ("instagram", "facebook", "meta")):
+            m_meta[iso] = m_meta.get(iso, 0) + int(r["metrics"][0])
+    print("\n### PLATFORM date | M_google GA_google d%g | M_meta GA_meta d%m")
+    for iso in dates:
+        mg, gg = m_goog.get(iso, 0), g_goog.get(iso, 0)
+        mm, gm = m_meta.get(iso, 0), g_meta.get(iso, 0)
+        dg = round((gg - mg) / mg * 100, 1) if mg else 0
+        dm = round((gm - mm) / mm * 100, 1) if mm else 0
+        print(f"PLAT {iso} | {mg} {gg} {dg} | {mm} {gm} {dm}")
+
+    # ── 7. ПОКРЫТИЕ ЛЕНДИНГОВ: не ловит ли GA4 входы на страницах, где тега Метрики нет
+    print("\n### LANDING GA4 (sessions по landingPage, GCC-хосты):")
+    gl = run_report(GA4_PROPERTY, frm_s, to_s, ["landingPage"], ("sessions", "totalUsers"), hf)
+    print(f"GLND_STAT distinct={len(gl)} sessions={sum(int(r['metrics'][0]) for r in gl)}")
+    for r in sorted(gl, key=lambda x: -int(x["metrics"][0]))[:20]:
+        print(f"GLND {r['dims'][0][:70]} | s={int(r['metrics'][0])} u={int(r['metrics'][1])}")
+    print("\n### LANDING Метрика (visits по startURLPath, GCC5):")
+    ml = _m(["ym:s:startURLPath", "ym:s:startURLDomain"], ["ym:s:visits", "ym:s:users"], frm_s, to_s)
+    mlagg = {}
+    for r in ml:
+        if domain_country_gcc5(r["dimensions"][1]["name"]):
+            path = r["dimensions"][0]["name"]
+            a = mlagg.setdefault(path, [0, 0])
+            a[0] += int(r["metrics"][0])
+            a[1] += int(r["metrics"][1])
+    print(f"MLND_STAT distinct={len(mlagg)} visits={sum(v[0] for v in mlagg.values())}")
+    for path, v in sorted(mlagg.items(), key=lambda x: -x[1][0])[:20]:
+        print(f"MLND {path[:70]} | v={v[0]} u={v[1]}")
+
     print("\n### AUDIT DONE")
