@@ -1035,6 +1035,10 @@ def main() -> None:
         from sync.gcc_ga4 import hosts_probe
         hosts_probe()
         return
+    if mode == "audit":  # аудит расхождений Метрика↔GA4 (покрытие + дневная динамика), Sheets не нужен
+        from sync.gcc_audit import audit
+        audit()
+        return
 
     from sync.sheets_write import get_write_service
     service = get_write_service()
