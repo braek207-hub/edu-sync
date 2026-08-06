@@ -163,15 +163,15 @@ def audit():
            any(x in m for x in ("cpc", "paid", "ppc", "social")):
             return "meta"
         return None
-    gpd = run_report(GA4_PROPERTY, frm_s, to_s, ["date", "sessionSource", "sessionMedium"],
+    # По группе каналов надёжнее, чем парсить source/medium: Google=Paid Search+Cross-network(PMax), Meta=Paid Social
+    gpd = run_report(GA4_PROPERTY, frm_s, to_s, ["date", "sessionDefaultChannelGroup"],
                      ("totalUsers",), hf)
     g_goog, g_meta = {}, {}
     for r in gpd:
-        p = _g_plat(r["dims"][1], r["dims"][2])
-        d0 = r["dims"][0]
-        if p == "google":
+        ch, d0 = r["dims"][1], r["dims"][0]
+        if ch in ("Paid Search", "Cross-network"):
             g_goog[d0] = g_goog.get(d0, 0) + int(r["metrics"][0])
-        elif p == "meta":
+        elif ch == "Paid Social":
             g_meta[d0] = g_meta.get(d0, 0) + int(r["metrics"][0])
     mpd = _m(["ym:s:date", "ym:s:lastsignSourceEngine", "ym:s:startURLDomain"], ["ym:s:users"],
              frm_s, to_s, filters="ym:s:lastsignTrafficSource=='ad'")
