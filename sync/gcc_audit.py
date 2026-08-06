@@ -58,15 +58,25 @@ def audit():
             m_day.setdefault(iso, [0, 0])
             m_day[iso][0] += int(r["metrics"][0])
             m_day[iso][1] += int(r["metrics"][1])
-    print("\n### DAILY: date | M_users M_visits | GA_total GA_active GA_sessions | d%tot d%act")
+    # Метрика платный по дням (Ad traffic, GCC5) — проверить, что разрыв идёт за долей платного
+    mp_rows = _m(["ym:s:date", "ym:s:startURLDomain"], ["ym:s:users"], frm_s, to_s,
+                 filters="ym:s:lastsignTrafficSource=='ad'")
+    m_paid = {}
+    for r in mp_rows:
+        iso = r["dimensions"][0]["name"]
+        if domain_country_gcc5(r["dimensions"][1]["name"]):
+            m_paid[iso] = m_paid.get(iso, 0) + int(r["metrics"][0])
+    print("\n### DAILY: date | M_users | GA_total GA_active | d%tot d%act | M_paid GA_paid paid%GA")
     for iso in dates:
         mu, mv = m_day.get(iso, [0, 0])
         gt = ga_tot[iso]["GCC"]["org"] + ga_tot[iso]["GCC"]["paid"]
         gac = ga_act[iso]["GCC"]["org"] + ga_act[iso]["GCC"]["paid"]
-        gs = ga_ses[iso]["GCC"]["org"] + ga_ses[iso]["GCC"]["paid"]
+        gp = ga_tot[iso]["GCC"]["paid"]
+        mp = m_paid.get(iso, 0)
         dt = round((gt - mu) / mu * 100, 1) if mu else 0
         da = round((gac - mu) / mu * 100, 1) if mu else 0
-        print(f"DAILY {iso} | {mu} {mv} | {gt} {gac} {gs} | {dt} {da}")
+        psh = round(gp / gt * 100, 1) if gt else 0
+        print(f"DAILY {iso} | {mu} | {gt} {gac} | {dt} {da} | {mp} {gp} {psh}")
 
     # ── 2. ПОКРЫТИЕ ДОМЕНОВ: где стоят счётчики
     print("\n### COVERAGE Метрика по startURLDomain (users, всё окно, топ):")
