@@ -163,11 +163,14 @@ def audit():
            any(x in m for x in ("cpc", "paid", "ppc", "social")):
             return "meta"
         return None
-    # По группе каналов надёжнее, чем парсить source/medium: Google=Paid Search+Cross-network(PMax), Meta=Paid Social
-    gpd = run_report(GA4_PROPERTY, frm_s, to_s, ["date", "sessionDefaultChannelGroup"],
-                     ("totalUsers",), hf)
+    # БЕЗ dimension_filter (с date+фильтром API давал 0) — фильтруем hostName в коде, как в v1.
+    # Google=Paid Search+Cross-network(PMax), Meta=Paid Social.
+    gpd = run_report(GA4_PROPERTY, frm_s, to_s,
+                     ["date", "sessionDefaultChannelGroup", "hostName"], ("totalUsers",))
     g_goog, g_meta = {}, {}
     for r in gpd:
+        if (r["dims"][2] or "").lower() not in HOST_COUNTRY:
+            continue
         ch, d0 = r["dims"][1], r["dims"][0]
         if ch in ("Paid Search", "Cross-network"):
             g_goog[d0] = g_goog.get(d0, 0) + int(r["metrics"][0])
