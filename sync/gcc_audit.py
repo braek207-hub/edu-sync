@@ -171,7 +171,9 @@ def audit():
     for r in gpd:
         if (r["dims"][2] or "").lower() not in HOST_COUNTRY:
             continue
-        ch, d0 = r["dims"][1], r["dims"][0]
+        dr = r["dims"][0]
+        d0 = f"{dr[:4]}-{dr[4:6]}-{dr[6:8]}"  # GA4 отдаёт YYYYMMDD → ISO (иначе ключи не сходятся)
+        ch = r["dims"][1]
         if ch in ("Paid Search", "Cross-network"):
             g_goog[d0] = g_goog.get(d0, 0) + int(r["metrics"][0])
         elif ch == "Paid Social":
