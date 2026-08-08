@@ -40,6 +40,28 @@ def main() -> None:
         except Exception as e:
             print(f"ОШИБКА wordstat: {e}")
             errors.append(f"wordstat: {e}")
+
+        # Дневной срез спроса (глубина Wordstat — 60 дней) — отдельный try:
+        # ошибка дневного не мешает уже записанному недельному (и наоборот).
+        try:
+            from sync.wordstat import (
+                daily_demand_up_to_date,
+                daily_floor,
+                sync_wordstat_demand_daily,
+            )
+
+            # Лаг дневного Wordstat 1-3 дня: пока «вчера-1» нет — дёргаем API, появился — отдыхаем.
+            if daily_demand_up_to_date("lime_wordstat_demand_daily"):
+                print("wordstat-daily: свежие дни уже есть — пропуск (до нового отставания)")
+            else:
+                # Всё доступное окно (60 дней): upsert идемпотентен, поэтому первый запуск —
+                # это же и бэкфилл, отдельная команда не нужна.
+                frm = daily_floor()
+                n = sync_wordstat_demand_daily(frm, dt.date.today().isoformat())
+                print(f"wordstat-daily: {n} дней (с {frm})")
+        except Exception as e:
+            print(f"ОШИБКА wordstat-daily: {e}")
+            errors.append(f"wordstat-daily: {e}")
     else:
         print("wordstat: пропуск (нет YANDEX_SEARCHAPI_KEY)")
 

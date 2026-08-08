@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from sync.wordstat import BRAND_PHRASES, _monday, _sunday, aggregate_weekly
+from sync.wordstat import BRAND_PHRASES, _monday, _sunday, aggregate_daily, aggregate_weekly
 
 
 def test_brand_phrases_are_the_five():
@@ -35,3 +35,22 @@ def test_aggregate_weekly_sums_phrases_and_parses_string_count():
 
 def test_aggregate_weekly_empty():
     assert aggregate_weekly([{"results": []}]) == {}
+
+
+def test_aggregate_daily_sums_phrases_and_parses_string_count():
+    # PERIOD_DAILY: точка = день, суммируем фразы по одинаковой дате
+    responses = [
+        {"results": [{"date": "2026-08-01", "count": "100"}, {"date": "2026-08-02", "count": "200"}]},
+        {"results": [{"date": "2026-08-01", "count": "10"}]},
+    ]
+    assert aggregate_daily(responses) == {"2026-08-01": 110, "2026-08-02": 200}
+
+
+def test_aggregate_daily_truncates_rfc3339_to_day():
+    # date может прийти RFC3339-таймстампом — ключ дня всё равно YYYY-MM-DD
+    responses = [{"results": [{"date": "2026-08-01T00:00:00Z", "count": "5"}]}]
+    assert aggregate_daily(responses) == {"2026-08-01": 5}
+
+
+def test_aggregate_daily_empty():
+    assert aggregate_daily([{"results": []}]) == {}
