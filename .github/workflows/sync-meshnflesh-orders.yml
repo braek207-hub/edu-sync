@@ -1,0 +1,41 @@
+name: Sync Mesh-n-Flesh Orders → Panda-BI
+
+on:
+  schedule:
+    # 01:00 UTC = 04:00 Moscow — дневное окно «изменённые за 7 дней» добирает поздние оплаты
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      sync_days:
+        description: "Окно updated_since в днях (бэкфилл: 3650)"
+        required: false
+        default: "7"
+
+concurrency:
+  group: meshnflesh-orders-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests==2.31.0
+
+      - name: Run orders sync
+        env:
+          MESHNFLESH_INSALES_HOST: ${{ secrets.MESHNFLESH_INSALES_HOST }}
+          MESHNFLESH_INSALES_API_KEY: ${{ secrets.MESHNFLESH_INSALES_API_KEY }}
+          MESHNFLESH_INSALES_PASSWORD: ${{ secrets.MESHNFLESH_INSALES_PASSWORD }}
+          MESHNFLESH_INGEST_TOKEN: ${{ secrets.MESHNFLESH_INGEST_TOKEN }}
+          MESHNFLESH_SYNC_DAYS: ${{ github.event.inputs.sync_days || '7' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.meshnflesh_orders
