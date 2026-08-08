@@ -1,0 +1,43 @@
+name: Sync Mesh-n-Flesh Metrika → Supabase
+
+on:
+  schedule:
+    # 05:10 UTC = 08:10 Moscow — вчерашний день Метрики готов утром
+    - cron: "10 5 * * *"
+  workflow_dispatch:
+    inputs:
+      sync_days:
+        description: "Окно в днях (бэкфилл с запуска ecommerce: 530)"
+        required: false
+        default: "60"
+
+concurrency:
+  group: meshnflesh-metrika-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Metrika sync
+        env:
+          MESHNFLESH_YANDEX_TOKEN: ${{ secrets.MESHNFLESH_YANDEX_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MESHNFLESH_METRIKA_SYNC_DAYS: ${{ github.event.inputs.sync_days || '60' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.meshnflesh_metrika
+
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate || true
