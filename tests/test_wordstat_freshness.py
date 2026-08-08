@@ -18,9 +18,10 @@ def test_last_closed_week_monday_on_sunday():
     assert last_closed_week_monday(dt.date(2026, 7, 19)) == "2026-07-06"
 
 
-def test_daily_floor_is_60_days_back():
-    # Глубина дневной детализации Wordstat — 60 дней.
-    assert daily_floor(dt.date(2026, 8, 8)) == "2026-06-09"
+def test_daily_floor_is_59_days_back():
+    # Глубина дневной детализации Wordstat — 60 дней, но граница у API строгая:
+    # from ровно 60 дней назад отвергается 400 → пол 59 дней (probe 2026-08-08).
+    assert daily_floor(dt.date(2026, 8, 8)) == "2026-06-10"
 
 
 def test_daily_fresh_target_is_two_days_back():

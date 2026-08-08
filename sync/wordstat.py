@@ -17,8 +17,10 @@ WORDSTAT_URL = "https://searchapi.api.cloud.yandex.net/v2/wordstat/dynamics"
 RUSSIA_REGION = "225"  # регион Wordstat «Россия»
 BRAND_PHRASES = ["lime", "лайм интернет", "лайм купить", "лайм магазин", "лайм одежда"]
 # Глубина дневной детализации Wordstat: «в дневном отображении данные показываются
-# за последние 60 дней» (справка Wordstat) — запрашивать старше бессмысленно.
-WORDSTAT_DAILY_DEPTH_DAYS = 60
+# за последние 60 дней» (справка Wordstat). Граница у API СТРОГАЯ: from ровно 60 дней
+# назад отвергается 400 «The from field value is older than 60 days» (проверено probe
+# 2026-08-08), поэтому пол — 59 дней.
+WORDSTAT_DAILY_DEPTH_DAYS = 59
 
 
 def _monday(date_str: str) -> str:
