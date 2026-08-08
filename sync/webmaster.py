@@ -1,6 +1,10 @@
-"""Яндекс Вебмастер API → lime_brand_seo.
+"""Яндекс Вебмастер API → lime_brand_seo (+ _daily).
 
-Недельные брендовые SEO-клики (Σ бренд-запросов по обоим хостам).
+Брендовые SEO-клики (Σ бренд-запросов по обоим хостам) в двух зернах: недельном
+(вся история — накоплена кроном + импортом Павла) и дневном (query-analytics
+отдаёт статистику только за последние 2 недели с лагом ~2 дня — дока
+«Данные доступны за последние две недели» + фикстура probe 2026-07: окно ровно
+14 дней. Глубже дневной ряд не забэкфиллить — история копится upsert'ами крона).
 Контракт query-analytics/list: text_indicator_to_statistics[].{text_indicator.value,
 statistics[].{date, field(CLICKS/IMPRESSIONS/CTR/POSITION/DEMAND), value}}.
 Серверный бренд-фильтр: filters.text_filters TEXT_CONTAINS по написаниям из brand_terms.
@@ -59,6 +63,25 @@ def aggregate_seo_weekly(rows: list[dict], region: str = "ru") -> dict[str, dict
     return out
 
 
+def aggregate_seo_daily(rows: list[dict], region: str = "ru") -> dict[str, dict]:
+    """[{query,date,clicks,impressions}] → {day: {clicks, impressions}} (только бренд).
+
+    Тот же бренд-фильтр, что у недельной свёртки, но без приведения к понедельнику:
+    query-analytics отдаёт статистику уже по дням — для дневного ряда достаточно
+    просуммировать по дате (запросы × хосты). Ключ дня режем до 10 символов, чтобы
+    быть стабильным и к YYYY-MM-DD, и к возможному таймстампу (как aggregate_daily
+    у Wordstat)."""
+    out: dict[str, dict] = {}
+    for r in rows:
+        if not is_brand_query(r.get("query", ""), region):
+            continue
+        day = r["date"][:10]
+        acc = out.setdefault(day, {"clicks": 0, "impressions": 0})
+        acc["clicks"] += int(r.get("clicks", 0) or 0)
+        acc["impressions"] += int(r.get("impressions", 0) or 0)
+    return out
+
+
 def _post(path: str, body: dict) -> dict:
     token = os.environ["WORDSTAT_WEBMASTER_TOKEN"]
     r = requests.post(f"{WM_BASE}{path}", json=body, timeout=60,
@@ -99,6 +122,31 @@ def fetch_host_brand(host_id: str) -> list[dict]:
     return rows
 
 
+def seo_daily_fresh_target(today: dt.date | None = None) -> str:
+    """Дата, наличие которой в дневной таблице означает «SEO свеж» — вчера-2.
+
+    Вебмастер отдаёт статистику с лагом ~2 дня (max(date) в ответе отстаёт от
+    сегодня на 2-3 дня — фикстура probe), поэтому ждать «вчера» каждый прогон —
+    дёргать API впустую; ориентир — today-3 (по образцу daily_fresh_target
+    у Wordstat, у того лаг на день меньше)."""
+    d = today or dt.date.today()
+    return (d - dt.timedelta(days=3)).isoformat()
+
+
+def seo_daily_up_to_date(today: dt.date | None = None) -> bool:
+    """True, если в lime_brand_seo_daily уже есть день за вчера-2 → синк можно пропустить.
+    Как появился свежий день — крон отдыхает до следующего отставания."""
+    from sync.db import get_connection
+
+    target = seo_daily_fresh_target(today)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT max(day) FROM lime_brand_seo_daily")
+            row = cur.fetchone()
+    mx = row[0] if row and row[0] else None
+    return mx is not None and mx.isoformat() >= target
+
+
 def sync_brand_seo() -> int:
     """Синк недельных брендовых SEO-кликов (оба хоста суммируются). Число недель."""
     all_rows: list[dict] = []
@@ -123,3 +171,37 @@ def sync_brand_seo() -> int:
             )
         conn.commit()
     return len(weekly)
+
+
+def sync_brand_seo_daily() -> int:
+    """Синк ДНЕВНЫХ брендовых SEO-кликов → lime_brand_seo_daily. Возвращает число дней.
+
+    Повторный fetch тех же данных, что у sync_brand_seo: чтобы делить один проход
+    на weekly+daily, пришлось бы менять сигнатуру/связывать два upsert'а — простота
+    дороже второго запроса по тому же 14-дневному окну (данных мало, лимит API
+    10k req/час не задевается). Окно — всё, что отдал API (последние 2 недели);
+    идемпотентный upsert по day: каждый прогон крона дописывает свежие дни,
+    так дневная история накапливается — бэкфилла глубже у API нет.
+    """
+    all_rows: list[dict] = []
+    for host in HOSTS:
+        all_rows += fetch_host_brand(host)
+    daily = aggregate_seo_daily(all_rows)
+    if not daily:
+        return 0
+    from sync.db import get_connection  # ленивый импорт psycopg2
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO lime_brand_seo_daily (day, clicks, impressions, source, updated_at)
+                VALUES (%s, %s, %s, 'webmaster', now())
+                ON CONFLICT (day)
+                DO UPDATE SET clicks = EXCLUDED.clicks, impressions = EXCLUDED.impressions,
+                              source = 'webmaster', updated_at = now()
+                """,
+                [(d, v["clicks"], v["impressions"]) for d, v in sorted(daily.items())],
+            )
+        conn.commit()
+    return len(daily)

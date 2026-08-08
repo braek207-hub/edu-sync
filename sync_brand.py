@@ -75,6 +75,21 @@ def main() -> None:
         except Exception as e:
             print(f"ОШИБКА webmaster: {e}")
             errors.append(f"webmaster: {e}")
+
+        # Дневной SEO-срез — отдельный try (по образцу wordstat-daily): ошибка
+        # дневного не мешает уже записанному недельному (и наоборот).
+        try:
+            from sync.webmaster import seo_daily_up_to_date, sync_brand_seo_daily
+
+            # Лаг Вебмастера ~2 дня: пока «вчера-2» нет — дёргаем API, появился — отдыхаем.
+            if seo_daily_up_to_date():
+                print("webmaster-daily: свежие дни уже есть — пропуск (до нового отставания)")
+            else:
+                n = sync_brand_seo_daily()
+                print(f"webmaster-daily: {n} дней")
+        except Exception as e:
+            print(f"ОШИБКА webmaster-daily: {e}")
+            errors.append(f"webmaster-daily: {e}")
     else:
         print("webmaster: пропуск (нет WORDSTAT_WEBMASTER_TOKEN)")
 
