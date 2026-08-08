@@ -127,83 +127,132 @@ def _token_form(client_id: str, secret: str) -> bytes:
     }).encode("utf-8")
 
 
-def _issue_token(client_id: str, secret: str) -> Dict[str, Any]:
-    """Выпустить новый access_token. Возвращает сырой ответ VK (access_token, expires_in)."""
-    req = urllib.request.Request(TOKEN_URL, data=_token_form(client_id, secret),
+def _refresh_form(client_id: str, secret: str, refresh: str) -> bytes:
+    return urllib.parse.urlencode({
+        "grant_type": "refresh_token", "refresh_token": refresh,
+        "client_id": client_id, "client_secret": secret,
+    }).encode("utf-8")
+
+
+def _post_token(data: bytes) -> Dict[str, Any]:
+    req = urllib.request.Request(TOKEN_URL, data=data,
         headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
     with urllib.request.urlopen(req, timeout=40) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
-_TOKEN_SELECT_SQL = "SELECT access_token, expires_at FROM lime_vk_tokens WHERE client_id = %s"
+def _issue_token(client_id: str, secret: str) -> Dict[str, Any]:
+    """ВЫПУСТИТЬ новый токен — занимает один из пяти слотов на пару client_id+пользователь."""
+    return _post_token(_token_form(client_id, secret))
+
+
+def _refresh_access(client_id: str, secret: str, refresh: str) -> Dict[str, Any]:
+    """ОБНОВИТЬ существующий токен. Слот НЕ занимается: по документации VK обновление
+    не создаёт новый экземпляр, а меняет значение access_token у текущего. Это и есть
+    способ жить вечно на одном слоте, не отзывая ничего и не мешая агентству."""
+    return _post_token(_refresh_form(client_id, secret, refresh))
+
+
+_TOKEN_SELECT_SQL = "SELECT access_token, expires_at, refresh_token FROM lime_vk_tokens WHERE client_id = %s"
 _TOKEN_UPSERT_SQL = """
-    INSERT INTO lime_vk_tokens (client_id, access_token, expires_at, updated_at)
-    VALUES (%s, %s, %s, NOW())
+    INSERT INTO lime_vk_tokens (client_id, access_token, expires_at, refresh_token, updated_at)
+    VALUES (%s, %s, %s, %s, NOW())
     ON CONFLICT (client_id) DO UPDATE SET
-       access_token = EXCLUDED.access_token, expires_at = EXCLUDED.expires_at, updated_at = NOW()
+       access_token = EXCLUDED.access_token, expires_at = EXCLUDED.expires_at,
+       -- refresh приходит не в каждом ответе: пустым не затираем, иначе следующий прогон
+       -- снова пойдёт выпускать новый токен и сожжёт слот.
+       refresh_token = COALESCE(EXCLUDED.refresh_token, lime_vk_tokens.refresh_token),
+       updated_at = NOW()
 """
 
 
-def _load_cached_token(client_id: str) -> Optional[Tuple[str, datetime]]:
-    """(access_token, expires_at) из кэша или None (нет строки). Недоступность кэша (нет
-    таблицы, сбой SELECT) НЕ должна ронять синк — WARN, вызывающий код выпускает токен как раньше."""
+def _load_cached_token(client_id: str) -> Optional[Tuple[str, datetime, Optional[str]]]:
+    """(access_token, expires_at, refresh_token) из кэша или None (нет строки). Недоступность
+    кэша (нет таблицы, сбой SELECT) НЕ должна ронять синк — WARN, вызывающий код выпустит токен."""
     try:
         with psycopg2.connect(_pg_url(), connect_timeout=15) as conn:
             with conn.cursor() as cur:
                 cur.execute(_TOKEN_SELECT_SQL, (client_id,))
                 row = cur.fetchone()
-        return (row[0], row[1]) if row else None
+        return (row[0], row[1], row[2]) if row else None
     except Exception as e:  # noqa: BLE001 — кэш вспомогательный, недоступность не критична
         print(f"[lime_vk_ads] WARN кэш токена недоступен на чтении ({client_id}): {e} — выпускаю новый")
         return None
 
 
-def _store_token(client_id: str, token: str, expires_at) -> None:
+def _store_token(client_id: str, token: str, expires_at, refresh: Optional[str]) -> None:
     """Записать токен в кэш. Ошибка записи — тоже только WARN, синк продолжается с уже
     выпущенным токеном (просто следующий прогон выпустит новый вместо переиспользования)."""
     try:
         with psycopg2.connect(_pg_url(), connect_timeout=15) as conn:
             with conn.cursor() as cur:
-                cur.execute(_TOKEN_UPSERT_SQL, (client_id, token, expires_at))
+                cur.execute(_TOKEN_UPSERT_SQL, (client_id, token, expires_at, refresh))
             conn.commit()
     except Exception as e:  # noqa: BLE001
         print(f"[lime_vk_ads] WARN не удалось сохранить токен в кэш ({client_id}): {e}")
 
 
-def _get_token(client_id: str, secret: str) -> str:
-    """Токен из кэша (lime_vk_tokens), если живой (запас TOKEN_TTL_MARGIN до истечения) —
-    сеть не дёргаем. Иначе выпускаем новый и кэшируем.
+def _save_from_response(client_id: str, data: Dict[str, Any]) -> str:
+    """Разобрать ответ VK, положить в кэш и вернуть access_token."""
+    token = data["access_token"]
+    expires_in = data.get("expires_in")
+    ttl = timedelta(seconds=int(expires_in)) if expires_in else TOKEN_TTL_DEFAULT
+    _store_token(client_id, token, datetime.now(timezone.utc) + ttl, data.get("refresh_token"))
+    return token
 
-    VK Реклама лимитирует число АКТИВНЫХ токенов на клиента (5 на пару client_id+пользователь,
-    по документации VK Ads). Раньше при упоре в лимит код звал эндпоинт revoke — отзывал ВСЕ
-    токены пользователя в рамках client_id, включая токены других потребителей того же
-    приложения (подрядчик работает на тех же кабинетах). Это и было причиной чужих обрывов
-    сессии — отзыв убран НАВСЕГДА. Теперь на 403 token_limit_exceeded — понятная ошибка,
-    без обращения к эндпоинту отзыва: см. докстринг модуля.
+
+def _http_error_body(e: urllib.error.HTTPError) -> str:
+    """Тело ответа об ошибке. Читается ОДИН раз — поэтому возвращаем строку, а не поток."""
+    try:
+        return e.read().decode("utf-8", "replace")[:300]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _get_token(client_id: str, secret: str) -> str:
+    """Порядок: живой токен из кэша → обновление по refresh_token → выпуск нового.
+
+    VK лимитирует ОДНОВРЕМЕННО АКТИВНЫЕ токены: 5 на пару client_id + пользователь. Тем же
+    приложением пользуется агентство ПРОКОНТЕКСТ, и лимит у нас с ним общий. Отсюда два правила.
+
+    1. Токены не отзываем НИКОГДА: эндпоинт delete снимает ВСЕ токены пользователя в рамках
+       client_id, включая агентские (инцидент 2026-08-03 — так и оборвали им интеграцию).
+       Выборочного отзыва VK не предусматривает.
+    2. Новый токен выпускаем только когда обновить нечего. Обновление по refresh_token, по
+       документации VK, не создаёт новый экземпляр — меняется значение существующего, слот
+       НЕ занимается. Прежний код звал client_credentials на каждый протухший кэш: пять
+       прогонов — пять слотов, и лимит выбирался нашими же токенами за неделю.
     """
     cached = _load_cached_token(client_id)
     now = datetime.now(timezone.utc)
-    if cached is not None and cached[1] > now + TOKEN_TTL_MARGIN:
-        return cached[0]
+
+    if cached is not None:
+        access, expires_at, refresh = cached
+        if expires_at > now + TOKEN_TTL_MARGIN:
+            return access
+        if refresh:
+            try:
+                return _save_from_response(client_id, _refresh_access(client_id, secret, refresh))
+            except urllib.error.HTTPError as e:
+                # Refresh мог протухнуть или быть отозван — это не тупик, ниже выпустим новый.
+                print(f"[lime_vk_ads] WARN обновление по refresh не прошло ({client_id}): "
+                      f"HTTP {e.code} {_http_error_body(e)} — выпускаю новый токен")
 
     try:
-        data = _issue_token(client_id, secret)
+        return _save_from_response(client_id, _issue_token(client_id, secret))
     except urllib.error.HTTPError as e:
-        if e.code == 403 and "token_limit" in e.read().decode("utf-8", "replace"):
+        body = _http_error_body(e)
+        if e.code == 403 and "token_limit" in body:
             raise RuntimeError(
-                "VK Реклама: лимит 5 активных токенов на приложение+аккаунт исчерпан. "
-                "Токены НЕ отзываем — тем же приложением (client_id) может пользоваться "
-                "подрядчик на тех же рекламных кабинетах. Дождитесь истечения суточного TTL "
-                "старых токенов, либо отзовите свой токен вручную в кабинете VK."
+                "VK Реклама: лимит 5 активных токенов на приложение+аккаунт исчерпан, а обновить "
+                "нечего (в кэше нет живого refresh_token). Токены НЕ отзываем — тем же "
+                "приложением (client_id) пользуется агентство на тех же кабинетах, а delete "
+                "снимает ВСЕ токены пользователя сразу. Варианты: дождаться истечения суточного "
+                "TTL чужих токенов, отозвать свой токен вручную в кабинете VK либо завести "
+                "ОТДЕЛЬНОЕ приложение под синк — у каждого client_id свой лимит в пять токенов."
             ) from e
-        raise
-
-    token = data["access_token"]
-    expires_in = data.get("expires_in")
-    ttl = timedelta(seconds=expires_in) if expires_in else TOKEN_TTL_DEFAULT
-    expires_at = now + ttl
-    _store_token(client_id, token, expires_at)
-    return token
+        # Любой другой 403 — не про лимит: в лог уходит тело ответа, иначе причина неизвестна.
+        raise RuntimeError(f"VK Реклама: выпуск токена отклонён, HTTP {e.code}: {body}") from e
 
 
 def _api_get(token: str, path: str, *, _sleep=time.sleep) -> dict:
