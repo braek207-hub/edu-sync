@@ -33,6 +33,7 @@ jobs:
       - name: Run Metrika sync
         env:
           MESHNFLESH_YANDEX_TOKEN: ${{ secrets.MESHNFLESH_YANDEX_TOKEN }}
+          MESHNFLESH_DIRECT_TOKEN: ${{ secrets.MESHNFLESH_DIRECT_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MESHNFLESH_METRIKA_SYNC_DAYS: ${{ github.event.inputs.sync_days || '60' }}
           PYTHONIOENCODING: "utf-8"

@@ -1,21 +1,26 @@
-"""Mesh-n-Flesh: Yandex Metrika (счётчик 82116769) → Supabase.
+"""Mesh-n-Flesh: Yandex Metrika (счётчик 82116769) + Direct (кабинет meshnflesh) → Supabase.
 
-Зеркало метричных блоков sync/polinarepik.py, без Direct (кабинет подключим,
-когда одобрят заявку API) и без clientID-блока (атрибуция заказов идёт по
+Зеркало блоков sync/polinarepik.py, без clientID-блока (атрибуция заказов идёт по
 utm-полям самого заказа InSales + каскаду purchases, lookback по визитам не нужен):
   • sources: source-level визиты + отказы/глубина + цели корзина/оформление
     → meshnflesh_metrica_sources (delete-from + upsert);
   • purchases: ecommerce по-заказно (purchaseID = номер заказа InSales, проверено)
-    → meshnflesh_metrica_purchases (PK order_id).
+    → meshnflesh_metrica_purchases (PK order_id);
+  • direct: CAMPAIGN_PERFORMANCE_REPORT кабинета meshnflesh (расход С НДС, IncludeVAT=YES)
+    → meshnflesh_direct_stats (upsert по date+campaign_id). ВАЖНО: «МК. МСК» (Мастер
+    кампаний, id 712769413) в campaigns.get не отдаётся, но в отчётах есть — норма.
 
-Токен — общий OAuth аккаунта approve.digital (доступ к счётчику выдан 2026-08-08).
-Секреты не заведены → мягкий выход 0 (не красить cron).
+Токены РАЗНЫЕ (в отличие от polina): Метрика — аккаунт approve.digital
+(MESHNFLESH_YANDEX_TOKEN, доступ к счётчику выдан 08.08), Директ — логин-владелец
+кабинета meshnflesh (MESHNFLESH_DIRECT_TOKEN). Нет секрета → блок мягко пропускается.
 
 GitHub Actions: .github/workflows/sync-meshnflesh-metrika.yml
 Local: python -m sync.meshnflesh_metrika  (env: MESHNFLESH_METRIKA_SYNC_DAYS)
 """
 from __future__ import annotations
 
+import csv
+import io
 import os
 import re
 import sys
@@ -31,6 +36,10 @@ from sync.db import get_connection
 METRICA_COUNTER_ID = "82116769"
 METRICA_ATTRIBUTION = "lastsign"
 DEFAULT_SYNC_DAYS = 60
+
+DIRECT_CLIENT_LOGIN = "meshnflesh"
+DIRECT_API_URL = "https://api.direct.yandex.com/json/v5/reports"
+DIRECT_MAX_POLL_ATTEMPTS = 30
 
 # Цели воронки счётчика 82116769 (management API, 2026-08-08)
 METRICA_GOAL_CART = "194805961"      # Ecommerce: добавление в корзину (e_cart)
@@ -58,6 +67,103 @@ def _metrica_text(value: str) -> str:
     if not text or text in {"(not set)", "not_set", "--", "None", "none"}:
         return ""
     return text
+
+
+def campaign_platform(name: str) -> str:
+    """Тип площадки из имени кампании. Порядок важен: «МСК» в имени содержит «мк» —
+    сначала однозначные маркеры, «мк» только как отдельный префикс/слово."""
+    t = (name or "").lower()
+    if "поиск" in t or "search" in t:
+        return "search"
+    if "рся" in t or "смарт" in t or "ретаргет" in t:
+        return "rsya"
+    if "товарн" in t or t.startswith("мк.") or t.startswith("мк ") or "мастер" in t:
+        return "mc"
+    return "other"
+
+
+def fetch_direct_report(token: str, date_from: str, date_to: str) -> list[dict[str, Any]]:
+    body = {
+        "params": {
+            "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
+            "FieldNames": ["Date", "CampaignId", "CampaignName", "Impressions", "Clicks", "Cost"],
+            "ReportName": f"meshnflesh_{date_from}_{date_to}",
+            "ReportType": "CAMPAIGN_PERFORMANCE_REPORT",
+            "DateRangeType": "CUSTOM_DATE",
+            "Format": "TSV",
+            "IncludeVAT": "YES",
+            "IncludeDiscount": "NO",
+        }
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Client-Login": DIRECT_CLIENT_LOGIN,
+        "Accept-Language": "ru",
+        "processingMode": "auto",
+        "returnMoneyInMicros": "false",
+        "skipReportHeader": "true",
+        "skipColumnHeader": "true",
+        "skipReportSummary": "true",
+    }
+    resp = None
+    for _ in range(DIRECT_MAX_POLL_ATTEMPTS):
+        resp = requests.post(DIRECT_API_URL, json=body, headers=headers, timeout=(30, 600))
+        if resp.status_code == 200:
+            break
+        if resp.status_code in (201, 202):
+            time.sleep(max(30, min(int(resp.headers.get("retryIn", 60)), 120)))
+            continue
+        raise RuntimeError(f"Direct API {resp.status_code}: {resp.text[:400]}")
+    else:
+        raise RuntimeError("Direct API: max retries")
+
+    rows: list[dict[str, Any]] = []
+    reader = csv.reader(io.StringIO(resp.text.lstrip("﻿")), delimiter="\t")
+    for parts in reader:
+        if len(parts) < 6:
+            continue
+        campaign_id = str(parts[1]).strip()
+        if not campaign_id or campaign_id == "--":
+            continue
+        campaign_name = str(parts[2]).strip()
+        rows.append(
+            {
+                "date": str(parts[0]).strip(),
+                "campaign_id": campaign_id,
+                "campaign_name": campaign_name,
+                "source_type": campaign_platform(campaign_name),
+                "cost": float(parts[5] or 0),
+                "clicks": int(float(parts[4] or 0)),
+                "impressions": int(float(parts[3] or 0)),
+            }
+        )
+    return rows
+
+
+def upsert_direct(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    sql = """
+        INSERT INTO meshnflesh_direct_stats (
+            date, campaign_id, campaign_name, source_type, cost, clicks, impressions, updated_at
+        )
+        VALUES (
+            %(date)s, %(campaign_id)s, %(campaign_name)s, %(source_type)s,
+            %(cost)s, %(clicks)s, %(impressions)s, NOW()
+        )
+        ON CONFLICT (date, campaign_id) DO UPDATE SET
+            campaign_name = COALESCE(NULLIF(EXCLUDED.campaign_name, ''), meshnflesh_direct_stats.campaign_name),
+            source_type   = EXCLUDED.source_type,
+            cost          = EXCLUDED.cost,
+            clicks        = EXCLUDED.clicks,
+            impressions   = EXCLUDED.impressions,
+            updated_at    = NOW()
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+        conn.commit()
+    return len(rows)
 
 
 def _metrica_get(params: dict[str, Any], token: str) -> dict[str, Any]:
@@ -331,6 +437,20 @@ def main() -> int:
     date_from = (today - timedelta(days=days)).isoformat()
     date_to = today.isoformat()
     errors: list[str] = []
+
+    direct_token = _env("MESHNFLESH_DIRECT_TOKEN")
+    if not direct_token:
+        print("Direct: MESHNFLESH_DIRECT_TOKEN не задан, блок пропущен")
+    else:
+        try:
+            print(f"Direct: {date_from} — {date_to} [{DIRECT_CLIENT_LOGIN}]")
+            rows = fetch_direct_report(direct_token, date_from, date_to)
+            print(f"  rows: {len(rows)}")
+            if rows:
+                print(f"  upserted: {upsert_direct(rows)}")
+        except Exception as e:
+            print(f"ERROR direct: {e}")
+            errors.append(f"direct: {e}")
 
     try:
         print(f"Metrica sources: {date_from} — {date_to}")
