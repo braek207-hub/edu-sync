@@ -402,6 +402,11 @@ def _chunked(seq, n):
         yield seq[i:i + n]
 
 
+def _mask(client_id: str) -> str:
+    """client_id в логи целиком не пишем: он половина пары доступа к кабинету."""
+    return f"{client_id[:4]}…{client_id[-2:]}" if len(client_id) > 6 else "client_id"
+
+
 def _cabinets() -> list:
     """Пары (client_id, secret) всех VK-кабинетов из env: базовый VK_CLIENT_ID/VK_CLIENT_SECRET +
     пронумерованные VK_CLIENT_ID_N/VK_CLIENT_SECRET_N (N=2,3,4,...). Каждый кабинет = своя пара
@@ -457,8 +462,18 @@ def sync_lime_vk_ads(days_back: int = 14) -> int:
 
     all_rows: list = []
     entity_rows: list = []
+    failed: list = []
     for client_id, secret in cabinets:
-        token = _get_token(client_id, secret)
+        # Токен одного кабинета не должен ронять остальные: лимит активных токенов
+        # считается на КАЖДУЮ пару client_id+пользователь отдельно, поэтому упёршийся
+        # кабинет — это не «VK недоступен». Раньше падение на первом же оставляло без
+        # данных все четыре, хотя у остальных с токеном всё в порядке.
+        try:
+            token = _get_token(client_id, secret)
+        except Exception as e:  # noqa: BLE001
+            print(f"[lime_vk_ads] ОШИБКА кабинета {_mask(client_id)}: {e}")
+            failed.append(_mask(client_id))
+            continue
         cabinet = _cabinet_login(token)
         plans = fetch_ad_plans(token)
         all_rows.extend(_fetch_cabinet_rows(token, cabinet, df, dt, plans))
@@ -477,10 +492,46 @@ def sync_lime_vk_ads(days_back: int = 14) -> int:
     # ad_plan_id глобально уникальны между кабинетами (0 пересечений) → PK (date,campaign_id) без cabinet.
     n = _upsert(all_rows, df, dt)
     e = _upsert_entities(entity_rows)
-    print(f"[lime_vk_ads] {n} строк из {len(cabinets)} кабинетов ({df}..{dt}); "
-          f"справочник lime_vk_entities: {e} строк")
+    print(f"[lime_vk_ads] {n} строк из {len(cabinets) - len(failed)} кабинетов "
+          f"({df}..{dt}); справочник lime_vk_entities: {e} строк")
+    if failed:
+        # Ненулевой код возврата: молча недособранный расход — это тихая дыра в данных.
+        raise RuntimeError(f"кабинеты без токена: {', '.join(failed)} — расход по ним не собран")
     return n
 
 
+def ensure_tokens() -> int:
+    """Только токены: обновить по refresh или выпустить, и сохранить refresh в кэш.
+
+    Зачем отдельный режим. Слоты активных токенов (5 на пару client_id+пользователь) выбраны,
+    а refresh в кэше нет — его начали сохранять только сейчас. Значит нужен ОДИН свободный
+    слот: как только чей-то токен истекает, мы занимаем слот, получаем вместе с ним refresh
+    и дальше живём на обновлениях, слотов больше не тратя. Ловить момент удобнее коротким
+    прогоном раз в N минут, чем суточным синком.
+
+    Неудачная попытка выпуска слот НЕ занимает (VK отвечает 403 и токена не создаёт),
+    поэтому частые повторы безопасны и агентству ничего не портят.
+    """
+    cabinets = _cabinets()
+    if not cabinets:
+        raise RuntimeError("VK_CLIENT_ID / VK_CLIENT_SECRET не заданы")
+    ready = 0
+    for client_id, secret in cabinets:
+        try:
+            _get_token(client_id, secret)
+            ready += 1
+            print(f"[lime_vk_ads] {_mask(client_id)}: токен готов")
+        except Exception as e:  # noqa: BLE001
+            print(f"[lime_vk_ads] {_mask(client_id)}: {e}")
+    print(f"[lime_vk_ads] кабинетов с рабочим токеном: {ready} из {len(cabinets)}")
+    return ready
+
+
 if __name__ == "__main__":
+    import sys
+    if "--tokens-only" in sys.argv:
+        # Ненулевой код, пока хоть один кабинет без токена: воркфлоу-ловец должен быть
+        # красным, пока ловить ещё есть что, — иначе «поймали» и «не поймали» неразличимы.
+        got = ensure_tokens()
+        sys.exit(0 if got == len(_cabinets()) else 1)
     sync_lime_vk_ads(days_back=int(os.environ.get("LIME_VK_DAYS_BACK", "14")))

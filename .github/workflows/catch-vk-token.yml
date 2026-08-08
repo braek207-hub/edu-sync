@@ -1,0 +1,53 @@
+name: Поймать слот токена VK
+
+# ВРЕМЕННЫЙ воркфлоу. Выключить, когда все четыре кабинета получат refresh_token
+# (прогон станет зелёным и в логе будет «кабинетов с рабочим токеном: 4 из 4»).
+#
+# Зачем. VK держит не более 5 ОДНОВРЕМЕННО активных токенов на пару client_id+пользователь.
+# Приложения общие с агентством ПРОКОНТЕКСТ, а отзыв токенов запрещён навсегда: эндпоинт
+# delete снимает ВСЕ токены пользователя сразу, включая агентские (так им и оборвали доступ
+# 03.08). Выборочного отзыва VK не даёт.
+#
+# Слоты сейчас заняты, а refresh_token в кэше нет — сохранять его начали только что. Нужен
+# ОДИН свободный слот на кабинет: как только чужой токен истекает, мы занимаем слот, получаем
+# вместе с ним refresh и дальше живём на обновлениях (обновление слот не занимает).
+# Отсюда частые короткие попытки: кто первым увидел свободный слот, тот его и занял.
+#
+# Безопасность для агентства: неудачная попытка выпуска токена слот НЕ занимает — VK отвечает
+# 403 и токена не создаёт. То есть ловец никого не вытесняет и ничего не отзывает.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: vk-token-catch
+  cancel-in-progress: false
+
+jobs:
+  catch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Попытаться получить токены всех кабинетов
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          VK_CLIENT_ID: ${{ secrets.VK_CLIENT_ID }}
+          VK_CLIENT_SECRET: ${{ secrets.VK_CLIENT_SECRET }}
+          VK_CLIENT_ID_2: ${{ secrets.VK_CLIENT_ID_2 }}
+          VK_CLIENT_SECRET_2: ${{ secrets.VK_CLIENT_SECRET_2 }}
+          VK_CLIENT_ID_3: ${{ secrets.VK_CLIENT_ID_3 }}
+          VK_CLIENT_SECRET_3: ${{ secrets.VK_CLIENT_SECRET_3 }}
+          VK_CLIENT_ID_4: ${{ secrets.VK_CLIENT_ID_4 }}
+          VK_CLIENT_SECRET_4: ${{ secrets.VK_CLIENT_SECRET_4 }}
+          PYTHONIOENCODING: "utf-8"
+        # Красный прогон = ещё не все кабинеты пойманы. Это не поломка, а состояние ожидания:
+        # зелёным он станет ровно тогда, когда ловить больше нечего.
+        run: python -m sync.lime_vk_ads --tokens-only
