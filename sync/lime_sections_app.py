@@ -25,7 +25,7 @@ import os
 import re
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import requests
 
@@ -35,6 +35,10 @@ from sync.lime_sections_common import (
 
 BASE = "https://api.appmetrica.yandex.ru/logs/v1/export"
 ART = re.compile(r'"item_article"\s*:\s*"([^"]+)"')
+# Установки тянутся с запуска приложения: last-touch падает на установку, когда
+# диплинков в lookback-окне нет, а установка может быть сколь угодно старой.
+# Диплинки — только за lookback (90 дней) от начала окна.
+INSTALL_HISTORY_START = date(2024, 8, 1)
 
 csv.field_size_limit(10 ** 8)
 
@@ -78,7 +82,7 @@ class Attribution:
     def __init__(self, token: str, date_from, date_to):
         self.inst = {}
         dl = defaultdict(list)
-        for a, b in _months(date_from - timedelta(days=DEEPLINK_LOOKBACK_DAYS), date_to):
+        for a, b in _months(INSTALL_HISTORY_START, date_to):
             data = _export_json("installations", {
                 "application_id": APPMETRICA_APP,
                 "date_since": f"{a} 00:00:00", "date_until": f"{b} 23:59:59",
@@ -88,6 +92,8 @@ class Attribution:
                 dev = r.get("appmetrica_device_id")
                 if dev:
                     self.inst[dev] = (_ts(r["install_datetime"]), pub_norm(r.get("publisher_name")))
+            print(f"  установки {a:%Y-%m}: +{len(data):,}")
+        for a, b in _months(date_from - timedelta(days=DEEPLINK_LOOKBACK_DAYS), date_to):
             data2 = _export_json("deeplinks", {
                 "application_id": APPMETRICA_APP,
                 "date_since": f"{a} 00:00:00", "date_until": f"{b} 23:59:59",
@@ -97,7 +103,7 @@ class Attribution:
                 dev = r.get("appmetrica_device_id")
                 if dev:
                     dl[dev].append((_ts(r["event_datetime"]), pub_norm(r.get("publisher_name"))))
-            print(f"  атрибуция {a:%Y-%m}: установок +{len(data):,}, диплинков +{len(data2):,}")
+            print(f"  диплинки {a:%Y-%m}: +{len(data2):,}")
         for v in dl.values():
             v.sort()
         self.dl = dict(dl)
