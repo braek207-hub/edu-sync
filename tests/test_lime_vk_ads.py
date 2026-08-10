@@ -181,7 +181,7 @@ def test_get_token_uses_live_cache_without_network_call():
     """Живой кэш (запас больше TOKEN_TTL_MARGIN) → токен из БД, сетевой выпуск НЕ вызывается."""
     from sync import lime_vk_ads as m
     future = datetime.now(timezone.utc) + timedelta(hours=5)
-    with patch.object(m, "_load_cached_token", return_value=("cached-tok", future)), \
+    with patch.object(m, "_load_cached_token", return_value=("cached-tok", future, None)), \
          patch.object(m, "_issue_token") as mock_issue, \
          patch.object(m, "_store_token") as mock_store:
         tok = m._get_token("cid", "sec")
@@ -191,20 +191,36 @@ def test_get_token_uses_live_cache_without_network_call():
 
 
 def test_get_token_refreshes_expired_cache_and_stores():
-    """Кэш протух (запас меньше TOKEN_TTL_MARGIN) → выпущен новый токен и записан в кэш."""
+    """Кэш протух, refresh нет → выпущен новый токен и записан в кэш."""
     from sync import lime_vk_ads as m
     near_expiry = datetime.now(timezone.utc) + timedelta(minutes=5)  # < TOKEN_TTL_MARGIN=10 мин
-    with patch.object(m, "_load_cached_token", return_value=("stale-tok", near_expiry)), \
+    with patch.object(m, "_load_cached_token", return_value=("stale-tok", near_expiry, None)), \
          patch.object(m, "_issue_token", return_value={"access_token": "fresh-tok", "expires_in": 3600}), \
          patch.object(m, "_store_token") as mock_store:
         tok = m._get_token("cid", "sec")
     assert tok == "fresh-tok"
     mock_store.assert_called_once()
-    stored_client_id, stored_token, stored_expires_at = mock_store.call_args[0]
+    stored_client_id, stored_token, stored_expires_at, stored_refresh = mock_store.call_args[0]
     assert stored_client_id == "cid" and stored_token == "fresh-tok"
+    assert stored_refresh is None
     # expires_in=3600с из ответа VK — expires_at должен быть ~сейчас+1ч (не дефолтные 24ч)
     assert stored_expires_at < datetime.now(timezone.utc) + timedelta(minutes=61)
     assert stored_expires_at > datetime.now(timezone.utc) + timedelta(minutes=59)
+
+
+def test_get_token_prefers_refresh_over_issue():
+    """Кэш протух, но refresh есть → обновление по refresh_token, БЕЗ выпуска нового
+    (client_credentials на каждый протухший кэш жёг слоты — инцидент 2026-08-03)."""
+    from sync import lime_vk_ads as m
+    near_expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+    with patch.object(m, "_load_cached_token", return_value=("stale-tok", near_expiry, "ref-1")), \
+         patch.object(m, "_refresh_access", return_value={"access_token": "refreshed", "expires_in": 3600}) as mock_ref, \
+         patch.object(m, "_issue_token") as mock_issue, \
+         patch.object(m, "_store_token"):
+        tok = m._get_token("cid", "sec")
+    assert tok == "refreshed"
+    mock_ref.assert_called_once_with("cid", "sec", "ref-1")
+    mock_issue.assert_not_called()
 
 
 def test_get_token_defaults_ttl_when_expires_in_missing():
@@ -240,7 +256,7 @@ def test_store_token_failure_does_not_raise():
     """Ошибка ЗАПИСИ кэша тоже не должна ронять синк — только WARN в лог."""
     from sync import lime_vk_ads as m
     with patch.object(m.psycopg2, "connect", side_effect=RuntimeError("db down")):
-        m._store_token("cid", "tok", datetime.now(timezone.utc) + timedelta(hours=24))  # не бросает
+        m._store_token("cid", "tok", datetime.now(timezone.utc) + timedelta(hours=24), None)  # не бросает
 
 
 def test_get_token_issues_when_db_fully_unavailable():
