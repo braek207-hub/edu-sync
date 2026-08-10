@@ -44,7 +44,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     # Хиты дня — сотни МБ стримом; атрибуция приложения — установки+диплинки за 90 дней.
-    timeout-minutes: 120
+    timeout-minutes: 300
 
     steps:
       - uses: actions/checkout@v4
