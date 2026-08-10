@@ -12,5 +12,6 @@ secrets-local/
 *.json
 !package.json
 !config/lime_direct_goals.json
+!config/lime_sections/*.json
 !config/edu_admission_calendar.json
 !tests/fixtures/*.json

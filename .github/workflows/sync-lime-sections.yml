@@ -1,0 +1,64 @@
+# Витрины вкладки «Категории» LIME: lime_section_daily(+v2), product, cross_channel,
+# campaign. Веб — два запроса Logs API Метрики на день (хиты стримом, визиты),
+# приложение — события AppMetrica + атрибуция паблишера (90 дней lookback,
+# карта строится в памяти запуска, в базу не пишется). Хранятся только агрегаты.
+#
+# Ежедневно окно из 3 последних полных дней (поздние данные доезжают), перезапись
+# идемпотентна (delete+insert по дню и платформе). Бэкфилл — workflow_dispatch.
+name: Sync LIME sections
+
+on:
+  schedule:
+    - cron: "0 4 * * *"   # 07:00 МСК — логи за вчера уже готовы
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "Бэкфилл с даты (YYYY-MM-DD); пусто = окно 3 дня"
+        required: false
+        type: string
+      date_to:
+        description: "Бэкфилл по дату (YYYY-MM-DD), включительно"
+        required: false
+        type: string
+      platforms:
+        description: "Площадки (web,app)"
+        required: false
+        default: "web,app"
+        type: string
+      check:
+        description: "1 = сверка с базой без записи"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: lime-sections
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # Хиты дня — сотни МБ стримом; атрибуция приложения — установки+диплинки за 90 дней.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync LIME sections
+        run: python sync_lime_sections.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIME_METRIKA_TOKEN: ${{ secrets.LIME_METRIKA_TOKEN }}
+          APPMETRICA_TOKEN: ${{ secrets.APPMETRICA_TOKEN }}
+          LIME_SECTIONS_FROM: ${{ github.event.inputs.date_from }}
+          LIME_SECTIONS_TO: ${{ github.event.inputs.date_to }}
+          LIME_SECTIONS_PLATFORMS: ${{ github.event.inputs.platforms || 'web,app' }}
+          LIME_SECTIONS_CHECK: ${{ github.event.inputs.check }}

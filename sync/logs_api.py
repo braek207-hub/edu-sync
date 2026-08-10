@@ -38,10 +38,13 @@ def _retry_request(method: str, url: str, token: str, *, params: Dict = None, ti
     raise RuntimeError(f"Logs API {method} {url}: max retries")
 
 
-def create_request(counter: str, date1: str, date2: str, fields: str, token: str) -> int:
-    """POST logrequests — создаёт асинхронный запрос выгрузки визитов, возвращает request_id."""
+def create_request(counter: str, date1: str, date2: str, fields: str, token: str, source: str = "visits") -> int:
+    """POST logrequests — создаёт асинхронный запрос выгрузки, возвращает request_id.
+
+    source="hits" — просмотры страниц (нужны витринам разделов LIME); по умолчанию
+    визиты, как у всех существующих вызовов."""
     url = CREATE.format(c=counter)
-    params = {"date1": date1, "date2": date2, "source": "visits", "fields": fields}
+    params = {"date1": date1, "date2": date2, "source": source, "fields": fields}
     resp = _retry_request("POST", url, token, params=params)
     return int(resp.json()["log_request"]["request_id"])
 
@@ -87,6 +90,34 @@ def download_part(counter: str, req_id: int, part: int, token: str) -> str:
     url = f"{BASE.format(c=counter)}/{req_id}/part/{part}/download"
     resp = _retry_request("GET", url, token, timeout=180)
     return resp.text
+
+
+def iter_part_lines(counter: str, req_id: int, part: int, token: str):
+    """Стримит строки части выгрузки, не собирая её в память.
+
+    Хиты за день — сотни мегабайт; download_part() с resp.text здесь не годится.
+    Стрим может оборваться на середине — вызывающий код обязан пересчитывать
+    ВЕСЬ день заново (частично прочитанный день = заниженные множества).
+    """
+    url = f"{BASE.format(c=counter)}/{req_id}/part/{part}/download"
+    backoff = 2
+    for attempt in range(6):
+        resp = requests.get(url, headers=_headers(token), timeout=1800, stream=True)
+        if resp.status_code == 200:
+            try:
+                for raw in resp.iter_lines():
+                    if raw:
+                        yield raw.decode("utf-8", "replace")
+                return
+            finally:
+                resp.close()
+        resp.close()
+        if resp.status_code in _TRANSIENT_STATUSES and attempt < 5:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+        raise RuntimeError(f"Logs API download part {part} -> {resp.status_code}")
+    raise RuntimeError(f"Logs API download part {part}: max retries")
 
 
 def clean_request(counter: str, req_id: int, token: str) -> None:
