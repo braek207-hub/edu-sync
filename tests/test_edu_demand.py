@@ -39,3 +39,20 @@ def test_entry_module_imports():
     import importlib
     mod = importlib.import_module("sync_edu_demand")
     assert hasattr(mod, "main")
+
+
+def test_aggregate_daily_by_phrase_sums_by_day_and_trims_timestamp():
+    from sync.edu_demand import aggregate_daily_by_phrase
+    resp = {"results": [
+        {"date": "2026-08-01T00:00:00Z", "count": "10"},
+        {"date": "2026-08-01", "count": "5"},
+        {"date": "2026-08-02", "count": "7"},
+    ]}
+    # RFC3339-таймстамп и голая дата дают один ключ дня; count-строки суммируются.
+    assert aggregate_daily_by_phrase(resp) == {"2026-08-01": 15, "2026-08-02": 7}
+
+
+def test_daily_sync_exported():
+    # Дневной синк объявлен рядом с недельным (окно 60 дней, per-phrase × ru/msk).
+    from sync.edu_demand import sync_edu_wordstat_demand_daily
+    assert callable(sync_edu_wordstat_demand_daily)

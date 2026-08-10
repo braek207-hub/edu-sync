@@ -17,3 +17,9 @@ def test_entry_module_imports():
     import importlib
     mod = importlib.import_module("sync_bjorn_demand")
     assert hasattr(mod, "main")
+
+
+def test_daily_sync_exported():
+    # Дневной синк объявлен рядом с недельным (окно 60 дней, per-phrase, регион ru).
+    from sync.bjorn_demand import sync_bjorn_wordstat_demand_daily
+    assert callable(sync_bjorn_wordstat_demand_daily)

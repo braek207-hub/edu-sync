@@ -6,8 +6,10 @@
 
 Env: YANDEX_SEARCHAPI_KEY, DATABASE_URL.
 """
-from sync.edu_demand import aggregate_weekly_by_phrase
-from sync.wordstat import fetch_phrase
+import datetime as dt
+
+from sync.edu_demand import aggregate_daily_by_phrase, aggregate_weekly_by_phrase
+from sync.wordstat import daily_floor, fetch_phrase, fetch_phrase_daily
 
 # Крупные корни по категориям (без бренда/моделей и без вложенности): бомбер/пуховик/косуха —
 # непересекающиеся типы; «куртка мужская/женская/зимняя/демисезонная/парка/аляска» — срезы «куртки».
@@ -48,6 +50,41 @@ def sync_bjorn_wordstat_demand(from_date: str, to_date: str) -> int:
                 DO UPDATE SET frequency = EXCLUDED.frequency, updated_at = now()
                 """,
                 [(wk, phrase, freq) for wk, phrase, freq in sorted(rows)],
+            )
+        conn.commit()
+    return len(rows)
+
+
+def sync_bjorn_wordstat_demand_daily(from_date: str, to_date: str) -> int:
+    """Синк ДНЕВНОГО спроса по всем BJORN-фразам → bjorn_wordstat_demand_daily.
+
+    from клампится к daily_floor() (60-дневная глубина Wordstat), to — к сегодня.
+    Идемпотентно (upsert по (day, region, phrase)) — бэкфилл и инкремент один вызов.
+    """
+    today = dt.date.today()
+    frm = max(from_date[:10], daily_floor(today))
+    to = min(to_date[:10], today.isoformat())
+    if frm > to:
+        return 0
+    rows: list[tuple[str, str, int]] = []  # (day, phrase, frequency)
+    for phrase in BJORN_DEMAND_PHRASES:
+        daily = aggregate_daily_by_phrase(fetch_phrase_daily(phrase, frm, to))
+        rows.extend((d, phrase, freq) for d, freq in daily.items())
+    if not rows:
+        return 0
+
+    from sync.db import get_connection  # ленивый импорт (psycopg2) — тесты чистых функций без БД
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO bjorn_wordstat_demand_daily (day, region, phrase, frequency, updated_at)
+                VALUES (%s, 'ru', %s, %s, now())
+                ON CONFLICT (day, region, phrase)
+                DO UPDATE SET frequency = EXCLUDED.frequency, updated_at = now()
+                """,
+                sorted(rows),
             )
         conn.commit()
     return len(rows)

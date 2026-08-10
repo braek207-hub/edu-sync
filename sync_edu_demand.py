@@ -23,19 +23,36 @@ def main() -> None:
         print("edu-demand: пропуск (нет YANDEX_SEARCHAPI_KEY)")
         return
 
-    from sync.edu_demand import sync_edu_wordstat_demand
-    from sync.wordstat import demand_up_to_date
+    from sync.edu_demand import sync_edu_wordstat_demand, sync_edu_wordstat_demand_daily
+    from sync.wordstat import daily_demand_up_to_date, daily_floor, demand_up_to_date
 
-    # Крон ежедневный: пока прошлой закрытой недели нет — дёргаем API; как появилась — пропуск.
-    if not os.environ.get("WORDSTAT_FROM") and demand_up_to_date("edu_wordstat_demand"):
-        print("edu-demand: последняя закрытая неделя уже есть — пропуск (до закрытия новой)")
-        return
+    today = dt.date.today().isoformat()
 
-    frm = os.environ.get("WORDSTAT_FROM") or (
-        dt.date.today() - dt.timedelta(weeks=INCREMENTAL_WEEKS)
-    ).isoformat()
-    n = sync_edu_wordstat_demand(frm, dt.date.today().isoformat())
-    print(f"edu-demand: {n} строк week×phrase (с {frm})")
+    # Недельный спрос. Крон ежедневный: пока прошлой закрытой недели нет — дёргаем API;
+    # как появилась — пропуск. Отдельный try: ошибка недельного не роняет дневной блок.
+    try:
+        if not os.environ.get("WORDSTAT_FROM") and demand_up_to_date("edu_wordstat_demand"):
+            print("edu-demand: последняя закрытая неделя уже есть — пропуск (до закрытия новой)")
+        else:
+            frm = os.environ.get("WORDSTAT_FROM") or (
+                dt.date.today() - dt.timedelta(weeks=INCREMENTAL_WEEKS)
+            ).isoformat()
+            n = sync_edu_wordstat_demand(frm, today)
+            print(f"edu-demand: {n} строк week×phrase (с {frm})")
+    except Exception as e:  # noqa: BLE001 — блоки независимы, падение одного не роняет другой
+        print(f"edu-demand: ОШИБКА недельного синка: {e}")
+
+    # Дневной спрос (скользящее окно 60 дней Wordstat). WORDSTAT_FROM не нужен:
+    # окно всегда синкается целиком (идемпотентный upsert), глубже floor API не отдаёт.
+    try:
+        if daily_demand_up_to_date("edu_wordstat_demand_daily"):
+            print("edu-demand-daily: свежий день уже есть — пропуск (до нового отставания)")
+        else:
+            nd = sync_edu_wordstat_demand_daily(daily_floor(), today)
+            print(f"edu-demand-daily: {nd} строк day×region×phrase")
+    except Exception as e:  # noqa: BLE001
+        print(f"edu-demand-daily: ОШИБКА дневного синка: {e}")
+
     print("=== edu demand sync DONE ===")
 
 
