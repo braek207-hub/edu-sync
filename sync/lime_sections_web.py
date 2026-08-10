@@ -234,6 +234,8 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
     product = defaultdict(lambda: [set(), set(), 0.0, 0.0])     # (ch, sec, type)
     cross = defaultdict(lambda: [set(), set(), 0.0, 0.0, 0.0])  # (ch, visited, bought)
     camp_buy = defaultdict(lambda: [set(), set(), 0.0, 0.0])    # (camp, sec)
+    camp_type = defaultdict(lambda: [set(), set(), 0.0, 0.0])   # (camp, sec, type)
+    camp_cross = defaultdict(lambda: [set(), set(), 0.0, 0.0, 0.0])  # (camp, visited, bought)
     cohort_orders = []      # (cid, {sec: [items, revenue]}) на заказ — вход когорты
     for oid, (cid, positions) in order_seen.items():
         ch = ch_of.get(cid, "Others")
@@ -269,6 +271,19 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
                 k[1].add(oid)
                 k[2] += sec_items
                 k[3] += sec_rev
+                for tp, (its, rev) in types.items():
+                    kt = camp_type[(cmp_, b, tp)]
+                    kt[0].add(cid)
+                    kt[1].add(oid)
+                    kt[2] += its
+                    kt[3] += rev
+                for v in visited:
+                    kc = camp_cross[(cmp_, v, b)]
+                    kc[0].add(cid)
+                    kc[1].add(oid)
+                    kc[2] += sec_items
+                    kc[3] += sec_rev
+                    kc[4] += sec_rev / len(visited)
 
     # ── строки таблиц ──────────────────────────────────────────────────────
     r3 = lambda x: round(x, 3)  # noqa: E731
@@ -290,14 +305,23 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
         for (ch, v, b), (bu, o, its, rev, sp) in sorted(cross.items())
     ]
     rows_campaign = [
-        (day, "web", c, s, len(camp_aud.get((c, s), ())), len(b), len(o),
+        (day, "web", c, s, len(camp_aud.get((c, s), ())),
+         len(camp_aud.get((c, s), set()) & cart), len(b), len(o),
          round(its, 2), round(rev, 2))
         for (c, s), (b, o, its, rev) in sorted(camp_buy.items())
     ]
     # кампании с аудиторией без покупок тоже нужны (dau без строк покупок)
     for (c, s), ids in sorted(camp_aud.items()):
         if (c, s) not in camp_buy:
-            rows_campaign.append((day, "web", c, s, len(ids), 0, 0, 0.0, 0.0))
+            rows_campaign.append((day, "web", c, s, len(ids), len(ids & cart), 0, 0, 0.0, 0.0))
+    rows_camp_type = [
+        (day, "web", c, sec, tp, len(b), len(o), round(its, 2), round(rev, 2))
+        for (c, sec, tp), (b, o, its, rev) in sorted(camp_type.items())
+    ]
+    rows_camp_cross = [
+        (day, "web", c, v, b, len(bu), len(o), round(its, 2), round(rev, 2), round(sp, 2))
+        for (c, v, b), (bu, o, its, rev, sp) in sorted(camp_cross.items())
+    ]
 
     print(f"  web {day}: аудитория {len(all_ids):,}, заказов {len(order_seen):,}, "
           f"строк v1/{len(rows_v1)} v2/{len(rows_daily_v2)} prod/{len(rows_product)} "
@@ -315,5 +339,7 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
         "product": rows_product,
         "cross_channel": rows_cross,
         "campaign": rows_campaign,
+        "campaign_type": rows_camp_type,
+        "campaign_cross": rows_camp_cross,
         "cohort_input": {"clicks": paid_clicks, "orders": cohort_orders},
     }

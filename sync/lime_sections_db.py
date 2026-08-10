@@ -23,8 +23,14 @@ TABLES = {
                       ["day", "platform", "channel", "visited", "bought", "buyers",
                        "orders", "items", "revenue", "revenue_split"]),
     "campaign": ("lime_section_campaign_daily",
-                 ["day", "platform", "campaign", "section", "dau", "buyers", "orders",
-                  "items", "revenue"]),
+                 ["day", "platform", "campaign", "section", "dau", "cart_users",
+                  "buyers", "orders", "items", "revenue"]),
+    "campaign_type": ("lime_section_campaign_type_daily",
+                      ["day", "platform", "campaign", "section", "product_type",
+                       "buyers", "orders", "items", "revenue"]),
+    "campaign_cross": ("lime_section_campaign_cross_daily",
+                       ["day", "platform", "campaign", "visited", "bought",
+                        "buyers", "orders", "items", "revenue", "revenue_split"]),
 }
 
 
@@ -52,7 +58,8 @@ def write_day(platform: str, day: str, sets: dict) -> None:
 
 def compare_day(platform: str, day: str, sets: dict) -> None:
     """Check-режим: суммы посчитанного дня против сумм в базе, без записи."""
-    num_from = {"daily": 4, "daily_v2": 5, "product": 5, "cross_channel": 5, "campaign": 4}
+    num_from = {"daily": 4, "daily_v2": 5, "product": 5, "cross_channel": 5, "campaign": 4,
+                "campaign_type": 5, "campaign_cross": 5}
     with get_connection() as conn:
         with conn.cursor() as cur:
             for key, rows in sets.items():

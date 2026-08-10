@@ -97,6 +97,15 @@ def pub_norm(pub: str) -> str:
     return (pub or "").strip() or "Без атрибуции"
 
 
+def app_campaign_of(pub: str, tracker: str):
+    """Кампания приложения из трекера AppMetrica. Автотрекинг Директа создаёт
+    трекер с именем = ID кампании — единственный надёжный случай; остальные
+    трекеры (ручные, Mindbox, SMM) кампаний не несут → None."""
+    if (pub or "").strip() == "Yandex.Direct Auto-Tracking" and (tracker or "").strip().isdigit():
+        return "direct:" + tracker.strip()
+    return None
+
+
 # ── раздел товара: фид → карта артикулов → поведенческая карта ─────────────
 _CFG_DIR = os.path.join(os.path.dirname(__file__), "..", "config", "lime_sections")
 

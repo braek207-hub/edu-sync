@@ -5,7 +5,8 @@
 check-режим синка (LIME_SECTIONS_CHECK=1) против уже залитой истории.
 """
 from sync.lime_sections_common import (
-    CH_IDX, CHANNEL_PRIORITY, SRC_PRIORITY, WEB_BUCKET, bucket, channel_of, pub_norm,
+    CH_IDX, CHANNEL_PRIORITY, SRC_PRIORITY, WEB_BUCKET, app_campaign_of, bucket,
+    channel_of, pub_norm,
 )
 
 
@@ -72,3 +73,13 @@ def test_app_bucket():
 def test_pub_norm():
     assert pub_norm("") == "Без атрибуции"
     assert pub_norm("  VK Ads (ex. myTarget) ") == "VK Ads (ex. myTarget)"
+
+
+def test_app_campaign_of():
+    # Автотрекинг Директа: имя трекера = ID кампании.
+    assert app_campaign_of("Yandex.Direct Auto-Tracking", "118498117") == "direct:118498117"
+    # Ручные трекеры и другие паблишеры кампаний не несут.
+    assert app_campaign_of("Yandex.Direct", "118498117") is None
+    assert app_campaign_of("Yandex.Direct Auto-Tracking", "Тест роута") is None
+    assert app_campaign_of("Mindbox", "Mindbox_catalog") is None
+    assert app_campaign_of("", "") is None

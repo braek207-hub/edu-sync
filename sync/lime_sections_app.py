@@ -30,7 +30,8 @@ from datetime import date, datetime, timedelta
 import requests
 
 from sync.lime_sections_common import (
-    APPMETRICA_APP, DEEPLINK_LOOKBACK_DAYS, SECTIONS_V2, TABMAP, bucket, pub_norm,
+    APPMETRICA_APP, DEEPLINK_LOOKBACK_DAYS, SECTIONS_V2, TABMAP, app_campaign_of,
+    bucket, pub_norm,
 )
 
 BASE = "https://api.appmetrica.yandex.ru/logs/v1/export"
@@ -87,11 +88,15 @@ class Attribution:
                 "application_id": APPMETRICA_APP,
                 "date_since": f"{a} 00:00:00", "date_until": f"{b} 23:59:59",
                 "date_dimension": "default",
-                "fields": "appmetrica_device_id,install_datetime,publisher_name"}, token)
+                "fields": "appmetrica_device_id,install_datetime,publisher_name,tracker_name"}, token)
             for r in data:
                 dev = r.get("appmetrica_device_id")
                 if dev:
-                    self.inst[dev] = (_ts(r["install_datetime"]), pub_norm(r.get("publisher_name")))
+                    self.inst[dev] = (
+                        _ts(r["install_datetime"]),
+                        pub_norm(r.get("publisher_name")),
+                        app_campaign_of(r.get("publisher_name"), r.get("tracker_name")),
+                    )
             print(f"  установки {a:%Y-%m}: +{len(data):,}")
         for a, b in _months(date_from - timedelta(days=DEEPLINK_LOOKBACK_DAYS), date_to):
             data2 = _export_json("deeplinks", {
@@ -102,7 +107,11 @@ class Attribution:
             for r in data2:
                 dev = r.get("appmetrica_device_id")
                 if dev:
-                    dl[dev].append((_ts(r["event_datetime"]), pub_norm(r.get("publisher_name"))))
+                    dl[dev].append((
+                        _ts(r["event_datetime"]),
+                        pub_norm(r.get("publisher_name")),
+                        app_campaign_of(r.get("publisher_name"), r.get("tracker_name")),
+                    ))
             print(f"  диплинки {a:%Y-%m}: +{len(data2):,}")
         for v in dl.values():
             v.sort()
@@ -110,16 +119,25 @@ class Attribution:
         self.dl_keys = {d: [t for t, _ in v] for d, v in self.dl.items()}
         print(f"  атрибуция готова: установок {len(self.inst):,}, устройств с диплинком {len(self.dl):,}")
 
-    def publisher(self, dev: str, when: datetime) -> str:
+    def _last_touch(self, dev: str, when: datetime):
         v = self.dl.get(dev)
         if v:
             i = bisect.bisect_right(self.dl_keys[dev], when) - 1
             if i >= 0 and (when - v[i][0]).days <= DEEPLINK_LOOKBACK_DAYS:
-                return v[i][1]
+                return v[i]
         r = self.inst.get(dev)
         if r and r[0] <= when:
-            return r[1]
-        return "Без атрибуции"
+            return r
+        return None
+
+    def publisher(self, dev: str, when: datetime) -> str:
+        t = self._last_touch(dev, when)
+        return t[1] if t else "Без атрибуции"
+
+    def campaign(self, dev: str, when: datetime):
+        """Кампания last-touch (пока только автотрекинг Директа) или None."""
+        t = self._last_touch(dev, when)
+        return t[2] if t else None
 
     def source(self, dev: str, when: datetime) -> str:
         pub = self.publisher(dev, when)
@@ -228,6 +246,7 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
     def read_cart(rows):
         cart_items = defaultdict(float)     # (sec-fold, src) -> штук
         cart_users = defaultdict(set)       # (sec women/men/kids, src) -> devices
+        camp_cart = defaultdict(set)        # (camp, sec) -> devices
         for row in rows:
             if len(row) < 3:
                 continue
@@ -236,15 +255,19 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
                 j = json.loads(row[2] or "{}")
             except ValueError:
                 continue
-            src = attr.source(dev, _ts(when_s))
+            when = _ts(when_s)
+            src = attr.source(dev, when)
+            camp = attr.campaign(dev, when)
             for it in (j.get("items") or [j]):
                 g = resolver.gender_of_item(it)
                 cart_items[(fold(g), src)] += float(it.get("quantity") or 1)
                 if g in SECTIONS_V2:
                     cart_users[(g, src)].add(dev)
-        return cart_items, cart_users
+                    if camp:
+                        camp_cart[(camp, g)].add(dev)
+        return cart_items, cart_users, camp_cart
 
-    cart_items, cart_users = _day_attempts(day, "add_to_cart", token, read_cart)
+    cart_items, cart_users, camp_cart = _day_attempts(day, "add_to_cart", token, read_cart)
 
     # ── purchase ───────────────────────────────────────────────────────────
     def read_purchases(rows):
@@ -265,6 +288,9 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
     buy_users = defaultdict(set)
     prod = defaultdict(lambda: [set(), set(), 0.0, 0.0])    # (ch, sec, type)
     cross = defaultdict(lambda: [set(), set(), 0.0, 0.0, 0.0])  # (ch, visited, bought)
+    camp_buy = defaultdict(lambda: [set(), set(), 0.0, 0.0])        # (camp, sec)
+    camp_type = defaultdict(lambda: [set(), set(), 0.0, 0.0])       # (camp, sec, type)
+    camp_cross = defaultdict(lambda: [set(), set(), 0.0, 0.0, 0.0]) # (camp, visited, bought)
     for dev, when_s, j in purchases:
         tx = j.get("transaction_id")
         if tx is not None:
@@ -274,6 +300,7 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
         when = _ts(when_s)
         src = attr.source(dev, when)
         ch = attr.publisher(dev, when)
+        camp = attr.campaign(dev, when)
         vis = sorted(g for g in SECTIONS_V2 if devviews.get(dev, {}).get(g)) or ["none"]
         touched = set()
         by_sec = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))
@@ -313,6 +340,25 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
                 cell[2] += sec_items
                 cell[3] += sec_rev
                 cell[4] += sec_rev / len(vis)
+            if camp:
+                cell = camp_buy[(camp, b)]
+                cell[0].add(dev)
+                cell[1].add(tx_id)
+                cell[2] += sec_items
+                cell[3] += sec_rev
+                for tp, (its, rev) in types.items():
+                    ct = camp_type[(camp, b, tp)]
+                    ct[0].add(dev)
+                    ct[1].add(tx_id)
+                    ct[2] += its
+                    ct[3] += rev
+                for v in vis:
+                    cc = camp_cross[(camp, v, b)]
+                    cc[0].add(dev)
+                    cc[1].add(tx_id)
+                    cc[2] += sec_items
+                    cc[3] += sec_rev
+                    cc[4] += sec_rev / len(vis)
 
     # ── сведение v1 ────────────────────────────────────────────────────────
     # DAU раздела = устройства с карточкой ∪ вкладкой; источник — на момент
@@ -335,11 +381,15 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
     # ── v2 daily: канал = паблишер на полдень дня ──────────────────────────
     noon = datetime.fromisoformat(day + "T12:00:00")
     daily_v2 = defaultdict(lambda: [set(), 0.0])   # (ch, sec) -> devices, просмотров
+    camp_aud = defaultdict(set)                     # (camp, sec) -> devices
     for dev, secviews in devviews.items():
         ch = attr.publisher(dev, noon)
+        camp = attr.campaign(dev, noon)
         for g, n in secviews.items():
             daily_v2[(ch, g)][0].add(dev)
             daily_v2[(ch, g)][1] += n
+            if camp:
+                camp_aud[(camp, g)].add(dev)
 
     rows_v1 = [
         (day, "app", s, src, int(m["dau"]), int(m["views"]), int(m["cart_users"]), 0,
@@ -359,11 +409,32 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
         (day, "app", ch, v, b, len(bu), len(o), round(its, 2), round(rev, 2), round(sp, 2))
         for (ch, v, b), (bu, o, its, rev, sp) in sorted(cross.items())
     ]
+    rows_campaign = [
+        (day, "app", c, sec, len(camp_aud.get((c, sec), ())),
+         len(camp_cart.get((c, sec), ())), len(b), len(o), round(its, 2), round(rev, 2))
+        for (c, sec), (b, o, its, rev) in sorted(camp_buy.items())
+    ]
+    for (c, sec), ids in sorted(camp_aud.items()):
+        if (c, sec) not in camp_buy:
+            rows_campaign.append(
+                (day, "app", c, sec, len(ids), len(camp_cart.get((c, sec), ())), 0, 0, 0.0, 0.0))
+    rows_camp_type = [
+        (day, "app", c, sec, tp, len(b), len(o), round(its, 2), round(rev, 2))
+        for (c, sec, tp), (b, o, its, rev) in sorted(camp_type.items())
+    ]
+    rows_camp_cross = [
+        (day, "app", c, v, b, len(bu), len(o), round(its, 2), round(rev, 2), round(sp, 2))
+        for (c, v, b), (bu, o, its, rev, sp) in sorted(camp_cross.items())
+    ]
     print(f"  app {day}: устройств с карточками {len(devviews):,}, "
-          f"строк v1/{len(rows_v1)} v2/{len(rows_daily_v2)} prod/{len(rows_product)} cross/{len(rows_cross)}")
+          f"строк v1/{len(rows_v1)} v2/{len(rows_daily_v2)} prod/{len(rows_product)} "
+          f"cross/{len(rows_cross)} camp/{len(rows_campaign)}")
     return {
         "daily": rows_v1,
         "daily_v2": rows_daily_v2,
         "product": rows_product,
         "cross_channel": rows_cross,
+        "campaign": rows_campaign,
+        "campaign_type": rows_camp_type,
+        "campaign_cross": rows_camp_cross,
     }
