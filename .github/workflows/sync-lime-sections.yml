@@ -30,6 +30,11 @@ on:
         required: false
         default: ""
         type: string
+      cohort_only:
+        description: "1 = только когорта (стейт+матрица), витрины не трогать"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: lime-sections
@@ -62,3 +67,4 @@ jobs:
           LIME_SECTIONS_TO: ${{ github.event.inputs.date_to }}
           LIME_SECTIONS_PLATFORMS: ${{ github.event.inputs.platforms || 'web,app' }}
           LIME_SECTIONS_CHECK: ${{ github.event.inputs.check }}
+          LIME_SECTIONS_COHORT_ONLY: ${{ github.event.inputs.cohort_only }}

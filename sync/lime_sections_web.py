@@ -84,10 +84,14 @@ def _audience(day: str, token: str, resolver):
     return dict(sets)
 
 
-def build_web_day(day: str, token: str, resolver):
+def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
     """Считает все веб-агрегаты одного дня. Возвращает словарь списков строк
-    в порядке колонок целевых таблиц (см. lime_sections_db.TABLES)."""
-    aud_raw = _audience(day, token, resolver)
+    в порядке колонок целевых таблиц (см. lime_sections_db.TABLES).
+
+    with_hits=False — без аудитории (хиты не качаются): дешёвый режим для
+    бэкфилла когорты, где нужны только визиты (клики+покупки). Витринные
+    строки в этом режиме неполны и писаться в базу НЕ должны."""
+    aud_raw = _audience(day, token, resolver) if with_hits else {}
     aud = defaultdict(set)          # v1: perfume остаётся, unknown_product → other
     for s, ids in aud_raw.items():
         aud[SEC_ALIAS.get(s, s)] |= ids
@@ -230,6 +234,7 @@ def build_web_day(day: str, token: str, resolver):
     product = defaultdict(lambda: [set(), set(), 0.0, 0.0])     # (ch, sec, type)
     cross = defaultdict(lambda: [set(), set(), 0.0, 0.0, 0.0])  # (ch, visited, bought)
     camp_buy = defaultdict(lambda: [set(), set(), 0.0, 0.0])    # (camp, sec)
+    cohort_orders = []      # (cid, {sec: [items, revenue]}) на заказ — вход когорты
     for oid, (cid, positions) in order_seen.items():
         ch = ch_of.get(cid, "Others")
         visited = sorted(g for g in SECTIONS_V2 if cid in aud_raw.get(g, ())) or ["none"]
@@ -238,6 +243,10 @@ def build_web_day(day: str, token: str, resolver):
             cell = by_sec[resolver.label_v2(nm)][resolver.fm.type_of_name(nm)]
             cell[0] += float(q or 0)
             cell[1] += float(q or 0) * float(pr or 0) / 1e6
+        cohort_orders.append((cid, {
+            b: [sum(t[0] for t in types.values()), sum(t[1] for t in types.values())]
+            for b, types in by_sec.items()
+        }))
         for b, types in by_sec.items():
             sec_items = sum(t[0] for t in types.values())
             sec_rev = sum(t[1] for t in types.values())
@@ -293,10 +302,18 @@ def build_web_day(day: str, token: str, resolver):
     print(f"  web {day}: аудитория {len(all_ids):,}, заказов {len(order_seen):,}, "
           f"строк v1/{len(rows_v1)} v2/{len(rows_daily_v2)} prod/{len(rows_product)} "
           f"cross/{len(rows_cross)} camp/{len(rows_campaign)}")
+    # Вход когорты (фаза 2): платный клик дня клиента — одна кампания с
+    # приоритетом Директ > VK (стабильный выбор ради идемпотентности стейта).
+    paid_clicks = {}
+    for cid, camps in camp_of.items():
+        best = sorted(camps, key=lambda c: (0 if c.startswith("direct:") else 1, c))[0]
+        paid_clicks[cid] = (best, "SEM" if best.startswith("direct:") else "SMM paid")
+
     return {
         "daily": rows_v1,
         "daily_v2": rows_daily_v2,
         "product": rows_product,
         "cross_channel": rows_cross,
         "campaign": rows_campaign,
+        "cohort_input": {"clicks": paid_clicks, "orders": cohort_orders},
     }

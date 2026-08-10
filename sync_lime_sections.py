@@ -13,6 +13,8 @@ Env:
   LIME_SECTIONS_DUMP=dir — не трогать базу вовсе, сложить посчитанные строки в
                            JSON (отладка/сверка там, где Postgres недоступен)
   LIME_SECTIONS_PLATFORMS=web,app — какие площадки гнать
+  LIME_SECTIONS_COHORT_ONLY=1 — писать только когорту (стейт+матрица), витрины
+                           не трогать: бэкфилл когорты по сверенной истории
 
 Запуск: python sync_lime_sections.py
 """
@@ -59,14 +61,22 @@ def main() -> None:
     from sync.lime_sections_common import SectionResolver
     from sync.lime_sections_db import compare_day, write_day
 
+    cohort_only = os.environ.get("LIME_SECTIONS_COHORT_ONLY") == "1"
+
     def emit(platform: str, day: str, sets: dict) -> None:
-        if dump_dir:
-            import json
-            os.makedirs(dump_dir, exist_ok=True)
-            with open(os.path.join(dump_dir, f"{platform}_{day}.json"), "w", encoding="utf-8") as f:
-                json.dump(sets, f, ensure_ascii=False)
-            return
-        (compare_day if check else write_day)(platform, day, sets)
+        # Когорта живёт отдельным шагом: свой стейт в БД, дни строго по порядку.
+        cohort_input = sets.pop("cohort_input", None)
+        if not cohort_only:
+            if dump_dir:
+                import json
+                os.makedirs(dump_dir, exist_ok=True)
+                with open(os.path.join(dump_dir, f"{platform}_{day}.json"), "w", encoding="utf-8") as f:
+                    json.dump(sets, f, ensure_ascii=False)
+            else:
+                (compare_day if check else write_day)(platform, day, sets)
+        if platform == "web" and cohort_input and not check and not dump_dir:
+            from sync.lime_sections_cohort import sync_cohort_web
+            sync_cohort_web(day, cohort_input)
 
     feed_path = fetch_feed(os.path.join(tempfile.gettempdir(), "lime_feed.xml"))
     resolver = SectionResolver(FeedMap(feed_path))
@@ -77,11 +87,13 @@ def main() -> None:
     if "web" in platforms and web_token:
         from sync.lime_sections_web import build_web_day
         for day in _days(frm, to):
-            emit("web", day, build_web_day(day, web_token, resolver))
+            emit("web", day, build_web_day(day, web_token, resolver, with_hits=not cohort_only))
     elif "web" in platforms:
         print("web: пропуск (нет LIME_METRIKA_TOKEN)")
 
     app_token = os.environ.get("APPMETRICA_TOKEN")
+    if cohort_only:
+        app_token = None    # когорта пока только web — приложение не гоняем зря
     if "app" in platforms and app_token:
         from sync.lime_sections_app import Attribution, build_app_day
         attr = Attribution(app_token, date.fromisoformat(frm), date.fromisoformat(to))
