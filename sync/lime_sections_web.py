@@ -214,7 +214,7 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
         for cid in aud_raw.get(g, ()):
             per_cid_secs[cid].add(g)
     daily_v2 = defaultdict(lambda: defaultdict(float))  # (ch, dev, sec)
-    camp_aud = defaultdict(set)                          # (camp, sec) -> клиенты
+    camp_aud = defaultdict(set)                          # (ch, camp, sec) -> клиенты
     for cid, gs in per_cid_secs.items():
         ch = ch_of.get(cid, "Others")
         dev = device_of.get(cid, "all")
@@ -226,9 +226,11 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
                 a["cart"] += 1
             if in_checkout:
                 a["checkout"] += 1
-        for cmp_ in camp_of.get(cid, ()):
+        # campaign='' — остаток канала без кампании: единая грань канал × кампания,
+        # по каналам сходится без задвоения (клиент ровно в одной строке грани).
+        for cmp_ in (camp_of.get(cid) or ("",)):
             for g in gs:
-                camp_aud[(cmp_, g)].add(cid)
+                camp_aud[(ch, cmp_, g)].add(cid)
 
     # ── v2: покупки → тип товара, кросс, кампании ─────────────────────────
     product = defaultdict(lambda: [set(), set(), 0.0, 0.0])     # (ch, sec, type)
@@ -265,20 +267,20 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
                 k[2] += sec_items
                 k[3] += sec_rev
                 k[4] += sec_rev / len(visited)
-            for cmp_ in camp_of.get(cid, ()):
-                k = camp_buy[(cmp_, b)]
+            for cmp_ in (camp_of.get(cid) or ("",)):
+                k = camp_buy[(ch, cmp_, b)]
                 k[0].add(cid)
                 k[1].add(oid)
                 k[2] += sec_items
                 k[3] += sec_rev
                 for tp, (its, rev) in types.items():
-                    kt = camp_type[(cmp_, b, tp)]
+                    kt = camp_type[(ch, cmp_, b, tp)]
                     kt[0].add(cid)
                     kt[1].add(oid)
                     kt[2] += its
                     kt[3] += rev
                 for v in visited:
-                    kc = camp_cross[(cmp_, v, b)]
+                    kc = camp_cross[(ch, cmp_, v, b)]
                     kc[0].add(cid)
                     kc[1].add(oid)
                     kc[2] += sec_items
@@ -305,22 +307,23 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
         for (ch, v, b), (bu, o, its, rev, sp) in sorted(cross.items())
     ]
     rows_campaign = [
-        (day, "web", c, s, len(camp_aud.get((c, s), ())),
-         len(camp_aud.get((c, s), set()) & cart), len(b), len(o),
+        (day, "web", ch, c, s, len(camp_aud.get((ch, c, s), ())),
+         len(camp_aud.get((ch, c, s), set()) & cart), len(b), len(o),
          round(its, 2), round(rev, 2))
-        for (c, s), (b, o, its, rev) in sorted(camp_buy.items())
+        for (ch, c, s), (b, o, its, rev) in sorted(camp_buy.items())
     ]
     # кампании с аудиторией без покупок тоже нужны (dau без строк покупок)
-    for (c, s), ids in sorted(camp_aud.items()):
-        if (c, s) not in camp_buy:
-            rows_campaign.append((day, "web", c, s, len(ids), len(ids & cart), 0, 0, 0.0, 0.0))
+    for (ch, c, s), ids in sorted(camp_aud.items()):
+        if (ch, c, s) not in camp_buy:
+            rows_campaign.append(
+                (day, "web", ch, c, s, len(ids), len(ids & cart), 0, 0, 0.0, 0.0))
     rows_camp_type = [
-        (day, "web", c, sec, tp, len(b), len(o), round(its, 2), round(rev, 2))
-        for (c, sec, tp), (b, o, its, rev) in sorted(camp_type.items())
+        (day, "web", ch, c, sec, tp, len(b), len(o), round(its, 2), round(rev, 2))
+        for (ch, c, sec, tp), (b, o, its, rev) in sorted(camp_type.items())
     ]
     rows_camp_cross = [
-        (day, "web", c, v, b, len(bu), len(o), round(its, 2), round(rev, 2), round(sp, 2))
-        for (c, v, b), (bu, o, its, rev, sp) in sorted(camp_cross.items())
+        (day, "web", ch, c, v, b, len(bu), len(o), round(its, 2), round(rev, 2), round(sp, 2))
+        for (ch, c, v, b), (bu, o, its, rev, sp) in sorted(camp_cross.items())
     ]
 
     print(f"  web {day}: аудитория {len(all_ids):,}, заказов {len(order_seen):,}, "

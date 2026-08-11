@@ -409,21 +409,22 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
         (day, "app", ch, v, b, len(bu), len(o), round(its, 2), round(rev, 2), round(sp, 2))
         for (ch, v, b), (bu, o, its, rev, sp) in sorted(cross.items())
     ]
+    # Канал app-кампаний: автотрекинг = Директ → SEM (единая номенклатура с web).
     rows_campaign = [
-        (day, "app", c, sec, len(camp_aud.get((c, sec), ())),
+        (day, "app", "SEM", c, sec, len(camp_aud.get((c, sec), ())),
          len(camp_cart.get((c, sec), ())), len(b), len(o), round(its, 2), round(rev, 2))
         for (c, sec), (b, o, its, rev) in sorted(camp_buy.items())
     ]
     for (c, sec), ids in sorted(camp_aud.items()):
         if (c, sec) not in camp_buy:
             rows_campaign.append(
-                (day, "app", c, sec, len(ids), len(camp_cart.get((c, sec), ())), 0, 0, 0.0, 0.0))
+                (day, "app", "SEM", c, sec, len(ids), len(camp_cart.get((c, sec), ())), 0, 0, 0.0, 0.0))
     rows_camp_type = [
-        (day, "app", c, sec, tp, len(b), len(o), round(its, 2), round(rev, 2))
+        (day, "app", "SEM", c, sec, tp, len(b), len(o), round(its, 2), round(rev, 2))
         for (c, sec, tp), (b, o, its, rev) in sorted(camp_type.items())
     ]
     rows_camp_cross = [
-        (day, "app", c, v, b, len(bu), len(o), round(its, 2), round(rev, 2), round(sp, 2))
+        (day, "app", "SEM", c, v, b, len(bu), len(o), round(its, 2), round(rev, 2), round(sp, 2))
         for (c, v, b), (bu, o, its, rev, sp) in sorted(camp_cross.items())
     ]
     print(f"  app {day}: устройств с карточками {len(devviews):,}, "
