@@ -149,6 +149,50 @@ def sync_cohort_web(day: str, cohort_input: dict) -> None:
             # 5. Retention стейта: окно закрыто + зазор — строка больше не нужна.
             horizon = (date.fromisoformat(day) - timedelta(days=STATE_RETENTION_DAYS)).isoformat()
             cur.execute("delete from lime_cohort_state where click_date < %s", (horizon,))
+
+            # 6. Новые покупатели: первая покупка с начала наблюдений (25.05.2026,
+            # левая цензура — глоссарий предупреждает). Идемпотентно: «новый» =
+            # клиента нет в стейте ИЛИ его first_day == D (повтор дня не занижает).
+            new_cnt = 0
+            buyer_attr = cohort_input.get("buyer_attr") or {}
+            if buyer_ids:
+                cur.execute(
+                    "select client_id, first_day from lime_client_first_buy "
+                    "where platform = 'web' and client_id = any(%s)",
+                    (buyer_ids,),
+                )
+                first_map = {int(cid): fd.isoformat() for cid, fd in cur.fetchall()}
+                new_cids = [int(c) for c in buyer_ids if first_map.get(int(c), day) == day]
+                if new_cids:
+                    psycopg2.extras.execute_batch(
+                        cur,
+                        "insert into lime_client_first_buy (platform, client_id, first_day) "
+                        "values ('web', %s, %s) on conflict do nothing",
+                        [(str(c), day) for c in new_cids], page_size=500,
+                    )
+                # Разделы покупок клиента за день — раскладка новых по грани кампаний.
+                secs_of = defaultdict(set)
+                for cid, by_sec in orders:
+                    secs_of[cid].update(by_sec.keys())
+                counts = defaultdict(int)
+                for cid in new_cids:
+                    ch, camps = buyer_attr.get(cid) or ("Others", [""])
+                    for camp in camps:
+                        for sec in secs_of.get(cid, ()):
+                            counts[(ch, camp, sec)] += 1
+                cur.execute(
+                    "update lime_section_campaign_daily set new_buyers = 0 "
+                    "where platform = 'web' and day = %s", (day,))
+                if counts:
+                    psycopg2.extras.execute_batch(
+                        cur,
+                        "update lime_section_campaign_daily set new_buyers = %s "
+                        "where day = %s and platform = 'web' and channel = %s "
+                        "and campaign = %s and section = %s",
+                        [(n, day, ch, camp, sec) for (ch, camp, sec), n in sorted(counts.items())],
+                        page_size=500,
+                    )
+                new_cnt = len(new_cids)
         conn.commit()
     print(f"  когорта {day}: кликов {sum(click_rows.values()):,}, ячеек {len(cells)}, "
-          f"первых покупок {len(first_buy)}")
+          f"первых покупок {len(first_buy)}, новых покупателей {new_cnt}")

@@ -336,6 +336,12 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
         best = sorted(camps, key=lambda c: (0 if c.startswith("direct:") else 1, c))[0]
         paid_clicks[cid] = (best, "SEM" if best.startswith("direct:") else "SMM paid")
 
+    # Атрибуция покупателей дня (канал + кампании|'' ) — для new_buyers.
+    buyer_attr = {}
+    for _oid, (cid, _positions) in order_seen.items():
+        if cid not in buyer_attr:
+            buyer_attr[cid] = (ch_of.get(cid, "Others"), sorted(camp_of.get(cid) or ("",)))
+
     return {
         "daily": rows_v1,
         "daily_v2": rows_daily_v2,
@@ -344,5 +350,5 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
         "campaign": rows_campaign,
         "campaign_type": rows_camp_type,
         "campaign_cross": rows_camp_cross,
-        "cohort_input": {"clicks": paid_clicks, "orders": cohort_orders},
+        "cohort_input": {"clicks": paid_clicks, "orders": cohort_orders, "buyer_attr": buyer_attr},
     }
