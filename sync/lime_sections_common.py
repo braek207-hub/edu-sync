@@ -97,13 +97,31 @@ def pub_norm(pub: str) -> str:
     return (pub or "").strip() or "Без атрибуции"
 
 
-def app_campaign_of(pub: str, tracker: str):
-    """Кампания приложения из трекера AppMetrica. Автотрекинг Директа создаёт
-    трекер с именем = ID кампании — единственный надёжный случай; остальные
-    трекеры (ручные, Mindbox, SMM) кампаний не несут → None."""
-    if (pub or "").strip() == "Yandex.Direct Auto-Tracking" and (tracker or "").strip().isdigit():
+_VK_PUB_MARKERS = ("vk ads", "mytarget", "vkads")
+_PARAM_RE = re.compile(r"(?:^|[?&])(campaign_id|c)=([^&#]+)")
+
+
+def app_campaign_of(pub: str, tracker: str, click_params: str = ""):
+    """Кампания приложения из трекера AppMetrica.
+
+    Директ: автотрекинг создаёт трекер с именем = ID кампании — надёжно.
+    VK: в кликовой ссылке лежит макрос `c` (id группы объявлений) — ключ
+    'vk:<группа>' в той же номенклатуре, что и веб (Обзор резолвит группу
+    в план через lime_vk_entities). Остальные трекеры кампаний не несут."""
+    p = (pub or "").strip()
+    if p == "Yandex.Direct Auto-Tracking" and (tracker or "").strip().isdigit():
         return "direct:" + tracker.strip()
+    if any(m in p.lower() for m in _VK_PUB_MARKERS):
+        params = dict(_PARAM_RE.findall(click_params or ""))
+        gid = (params.get("c") or params.get("campaign_id") or "").strip()
+        if gid:
+            return "vk:" + gid[:64]
     return None
+
+
+def app_campaign_channel(camp: str) -> str:
+    """Канал app-кампании в номенклатуре PROCONTEXT."""
+    return "SMM paid" if camp.startswith("vk:") else "SEM"
 
 
 # ── раздел товара: фид → карта артикулов → поведенческая карта ─────────────

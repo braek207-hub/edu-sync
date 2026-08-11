@@ -83,3 +83,13 @@ def test_app_campaign_of():
     assert app_campaign_of("Yandex.Direct Auto-Tracking", "Тест роута") is None
     assert app_campaign_of("Mindbox", "Mindbox_catalog") is None
     assert app_campaign_of("", "") is None
+    # VK: макрос `c` в кликовой ссылке = id группы — та же номенклатура, что веб.
+    assert app_campaign_of("VK Ads (ex. myTarget)", "Трекер VK", "a=1&c=79412&x=2") == "vk:79412"
+    assert app_campaign_of("VKAds_custom", "", "campaign_id=555001") == "vk:555001"
+    assert app_campaign_of("VK Ads (ex. myTarget)", "", "") is None
+
+
+def test_app_campaign_channel():
+    from sync.lime_sections_common import app_campaign_channel
+    assert app_campaign_channel("direct:118498117") == "SEM"
+    assert app_campaign_channel("vk:79412") == "SMM paid"

@@ -30,7 +30,7 @@ from datetime import date, datetime, timedelta
 import requests
 
 from sync.lime_sections_common import (
-    APPMETRICA_APP, DEEPLINK_LOOKBACK_DAYS, SECTIONS_V2, TABMAP, app_campaign_of,
+    APPMETRICA_APP, DEEPLINK_LOOKBACK_DAYS, SECTIONS_V2, TABMAP, app_campaign_channel, app_campaign_of,
     bucket, pub_norm,
 )
 
@@ -88,14 +88,14 @@ class Attribution:
                 "application_id": APPMETRICA_APP,
                 "date_since": f"{a} 00:00:00", "date_until": f"{b} 23:59:59",
                 "date_dimension": "default",
-                "fields": "appmetrica_device_id,install_datetime,publisher_name,tracker_name"}, token)
+                "fields": "appmetrica_device_id,install_datetime,publisher_name,tracker_name,click_url_parameters"}, token)
             for r in data:
                 dev = r.get("appmetrica_device_id")
                 if dev:
                     self.inst[dev] = (
                         _ts(r["install_datetime"]),
                         pub_norm(r.get("publisher_name")),
-                        app_campaign_of(r.get("publisher_name"), r.get("tracker_name")),
+                        app_campaign_of(r.get("publisher_name"), r.get("tracker_name"), r.get("click_url_parameters")),
                     )
             print(f"  установки {a:%Y-%m}: +{len(data):,}")
         for a, b in _months(date_from - timedelta(days=DEEPLINK_LOOKBACK_DAYS), date_to):
@@ -103,20 +103,20 @@ class Attribution:
                 "application_id": APPMETRICA_APP,
                 "date_since": f"{a} 00:00:00", "date_until": f"{b} 23:59:59",
                 "date_dimension": "default",
-                "fields": "appmetrica_device_id,event_datetime,publisher_name,tracker_name"}, token)
+                "fields": "appmetrica_device_id,event_datetime,publisher_name,tracker_name,click_url_parameters"}, token)
             for r in data2:
                 dev = r.get("appmetrica_device_id")
                 if dev:
                     dl[dev].append((
                         _ts(r["event_datetime"]),
                         pub_norm(r.get("publisher_name")),
-                        app_campaign_of(r.get("publisher_name"), r.get("tracker_name")),
+                        app_campaign_of(r.get("publisher_name"), r.get("tracker_name"), r.get("click_url_parameters")),
                     ))
             print(f"  диплинки {a:%Y-%m}: +{len(data2):,}")
         for v in dl.values():
             v.sort()
         self.dl = dict(dl)
-        self.dl_keys = {d: [t for t, _ in v] for d, v in self.dl.items()}
+        self.dl_keys = {d: [t for t, *_ in v] for d, v in self.dl.items()}
         print(f"  атрибуция готова: установок {len(self.inst):,}, устройств с диплинком {len(self.dl):,}")
 
     def _last_touch(self, dev: str, when: datetime):
@@ -135,7 +135,7 @@ class Attribution:
         return t[1] if t else "Без атрибуции"
 
     def campaign(self, dev: str, when: datetime):
-        """Кампания last-touch (пока только автотрекинг Директа) или None."""
+        """Кампания last-touch: Директ (автотрекинг) или VK-группа ('vk:<c>') — либо None."""
         t = self._last_touch(dev, when)
         return t[2] if t else None
 
@@ -409,22 +409,24 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
         (day, "app", ch, v, b, len(bu), len(o), round(its, 2), round(rev, 2), round(sp, 2))
         for (ch, v, b), (bu, o, its, rev, sp) in sorted(cross.items())
     ]
-    # Канал app-кампаний: автотрекинг = Директ → SEM (единая номенклатура с web).
+    # Канал app-кампании — по ключу: Директ → SEM, VK-группы → SMM paid.
     rows_campaign = [
-        (day, "app", "SEM", c, sec, len(camp_aud.get((c, sec), ())),
+        (day, "app", app_campaign_channel(c), c, sec, len(camp_aud.get((c, sec), ())),
          len(camp_cart.get((c, sec), ())), len(b), len(o), round(its, 2), round(rev, 2))
         for (c, sec), (b, o, its, rev) in sorted(camp_buy.items())
     ]
     for (c, sec), ids in sorted(camp_aud.items()):
         if (c, sec) not in camp_buy:
             rows_campaign.append(
-                (day, "app", "SEM", c, sec, len(ids), len(camp_cart.get((c, sec), ())), 0, 0, 0.0, 0.0))
+                (day, "app", app_campaign_channel(c), c, sec, len(ids),
+                 len(camp_cart.get((c, sec), ())), 0, 0, 0.0, 0.0))
     rows_camp_type = [
-        (day, "app", "SEM", c, sec, tp, len(b), len(o), round(its, 2), round(rev, 2))
+        (day, "app", app_campaign_channel(c), c, sec, tp, len(b), len(o), round(its, 2), round(rev, 2))
         for (c, sec, tp), (b, o, its, rev) in sorted(camp_type.items())
     ]
     rows_camp_cross = [
-        (day, "app", "SEM", c, v, b, len(bu), len(o), round(its, 2), round(rev, 2), round(sp, 2))
+        (day, "app", app_campaign_channel(c), c, v, b, len(bu), len(o),
+         round(its, 2), round(rev, 2), round(sp, 2))
         for (c, v, b), (bu, o, its, rev, sp) in sorted(camp_cross.items())
     ]
     print(f"  app {day}: устройств с карточками {len(devviews):,}, "

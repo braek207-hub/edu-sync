@@ -91,6 +91,13 @@ def main() -> None:
     elif "web" in platforms:
         print("web: пропуск (нет LIME_METRIKA_TOKEN)")
 
+    # Страж методики: после записи web-дней сверяем gross с витриной PROCONTEXT.
+    # Валит джобу ПОСЛЕ записи всех площадок — данные не теряются, сигнал громкий.
+    verify_failed = False
+    if "web" in platforms and web_token and not check and not dump_dir and not cohort_only:
+        from sync.lime_sections_verify import verify_web_window
+        verify_failed = not verify_web_window(frm, to)
+
     app_token = os.environ.get("APPMETRICA_TOKEN")
     if cohort_only:
         app_token = None    # когорта пока только web — приложение не гоняем зря
@@ -104,6 +111,8 @@ def main() -> None:
         print("app: пропуск (нет APPMETRICA_TOKEN)")
 
     print("=== lime sections sync DONE ===")
+    if verify_failed:
+        sys.exit(2)
 
 
 if __name__ == "__main__":
