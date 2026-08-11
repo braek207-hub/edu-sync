@@ -66,6 +66,14 @@ def main() -> None:
     def emit(platform: str, day: str, sets: dict) -> None:
         # Когорта живёт отдельным шагом: свой стейт в БД, дни строго по порядку.
         cohort_input = sets.pop("cohort_input", None)
+        nb_orders = sets.pop("nb_orders", None)
+        if not cohort_only and nb_orders is not None:
+            # Новые/повторные: стейт первой покупки в БД; без базы — нули той же формы.
+            if dump_dir or check:
+                sets["campaign"] = [row + (0, 0.0) for row in sets["campaign"]]
+            else:
+                from sync.lime_sections_newbuyers import apply_new_measures
+                sets["campaign"] = apply_new_measures(day, platform, nb_orders, sets["campaign"])
         if not cohort_only:
             if dump_dir:
                 import json

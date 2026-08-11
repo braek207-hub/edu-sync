@@ -239,6 +239,7 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
     camp_type = defaultdict(lambda: [set(), set(), 0.0, 0.0])   # (camp, sec, type)
     camp_cross = defaultdict(lambda: [set(), set(), 0.0, 0.0, 0.0])  # (camp, visited, bought)
     cohort_orders = []      # (cid, {sec: [items, revenue]}) на заказ — вход когорты
+    nb_orders = []          # (cid, канал, кампании, {sec: [шт, деньги]}) — вход новых/повторных
     for oid, (cid, positions) in order_seen.items():
         ch = ch_of.get(cid, "Others")
         visited = sorted(g for g in SECTIONS_V2 if cid in aud_raw.get(g, ())) or ["none"]
@@ -247,10 +248,12 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
             cell = by_sec[resolver.label_v2(nm)][resolver.fm.type_of_name(nm)]
             cell[0] += float(q or 0)
             cell[1] += float(q or 0) * float(pr or 0) / 1e6
-        cohort_orders.append((cid, {
+        sec_totals = {
             b: [sum(t[0] for t in types.values()), sum(t[1] for t in types.values())]
             for b, types in by_sec.items()
-        }))
+        }
+        cohort_orders.append((cid, sec_totals))
+        nb_orders.append((cid, ch, tuple(camp_of.get(cid) or ("",)), sec_totals))
         for b, types in by_sec.items():
             sec_items = sum(t[0] for t in types.values())
             sec_rev = sum(t[1] for t in types.values())
@@ -351,4 +354,5 @@ def build_web_day(day: str, token: str, resolver, with_hits: bool = True):
         "campaign_type": rows_camp_type,
         "campaign_cross": rows_camp_cross,
         "cohort_input": {"clicks": paid_clicks, "orders": cohort_orders, "buyer_attr": buyer_attr},
+        "nb_orders": nb_orders,
     }

@@ -285,6 +285,7 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
     purchases = _day_attempts(day, "purchase", token, read_purchases)
 
     v1 = defaultdict(lambda: defaultdict(float))            # (sec-fold, src) -> меры
+    nb_orders = []          # (dev, канал, кампании, {sec: [шт, деньги]}) — новые/повторные
     buy_users = defaultdict(set)
     prod = defaultdict(lambda: [set(), set(), 0.0, 0.0])    # (ch, sec, type)
     cross = defaultdict(lambda: [set(), set(), 0.0, 0.0, 0.0])  # (ch, visited, bought)
@@ -323,6 +324,9 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
             cell[1] += rv
         for k in touched:
             v1[k]["orders"] += 1
+        nb_orders.append((dev, "SEM", camps or ("",),
+                          {b: [sum(t[0] for t in ts.values()), sum(t[1] for t in ts.values())]
+                           for b, ts in by_sec.items()}))
         tx_id = str(tx) if tx is not None else f"{dev}:{when_s}"
         for b, types in by_sec.items():
             sec_items = sum(t[0] for t in types.values())
@@ -440,4 +444,5 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
         "campaign": rows_campaign,
         "campaign_type": rows_camp_type,
         "campaign_cross": rows_camp_cross,
+        "nb_orders": nb_orders,
     }

@@ -24,7 +24,7 @@ TABLES = {
                        "orders", "items", "revenue", "revenue_split"]),
     "campaign": ("lime_section_campaign_daily",
                  ["day", "platform", "channel", "campaign", "section", "dau", "cart_users",
-                  "buyers", "orders", "items", "revenue"]),
+                  "buyers", "orders", "items", "revenue", "new_buyers", "new_revenue"]),
     "campaign_type": ("lime_section_campaign_type_daily",
                       ["day", "platform", "channel", "campaign", "section", "product_type",
                        "buyers", "orders", "items", "revenue"]),
