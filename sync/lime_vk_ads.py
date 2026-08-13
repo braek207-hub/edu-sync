@@ -10,6 +10,8 @@
 паузы, ретрай 429, токен кэшируется в БД между прогонами синка (lime_vk_tokens).
 
 ENV: DATABASE_URL, VK_CLIENT_ID, VK_CLIENT_SECRET, LIME_VK_DAYS_BACK (default 14).
+Разовый ручной ввод токена в кэш (не тратит слот выпуска): VK_SEED_CLIENT_ID +
+VK_SEED_ACCESS_TOKEN и/или VK_SEED_REFRESH_TOKEN (+опционально VK_SEED_EXPIRES_IN, сек).
 Запуск: python -m sync.lime_vk_ads
 
 ПРАВИЛО: токены не отзываем НИКОГДА. Тем же приложением (client_id) может пользоваться
@@ -253,6 +255,31 @@ def _get_token(client_id: str, secret: str) -> str:
             ) from e
         # Любой другой 403 — не про лимит: в лог уходит тело ответа, иначе причина неизвестна.
         raise RuntimeError(f"VK Реклама: выпуск токена отклонён, HTTP {e.code}: {body}") from e
+
+
+def _seed_token_from_env() -> None:
+    """Ручной ввод уже существующего токена (прислал подрядчик, либо остался от прошлого
+    выпуска) в кэш — БЕЗ траты слота на новый выпуск. Активируется, только если заданы
+    VK_SEED_CLIENT_ID и хотя бы одна из VK_SEED_ACCESS_TOKEN / VK_SEED_REFRESH_TOKEN; иначе
+    no-op. Значения токенов в лог не идут — только факт занесения.
+
+    Дан только refresh (access неизвестен/невалиден) — кэш кладём СРАЗУ протухшим: первый
+    же _get_token не станет отдавать пустой access, а пойдёт обновляться по refresh — тоже
+    без траты слота. VK_SEED_EXPIRES_IN тут не при чём: он про срок жизни ДАННОГО access."""
+    client_id = os.environ.get("VK_SEED_CLIENT_ID", "").strip()
+    access = os.environ.get("VK_SEED_ACCESS_TOKEN", "").strip()
+    refresh = os.environ.get("VK_SEED_REFRESH_TOKEN", "").strip()
+    if not client_id or not (access or refresh):
+        return
+    now = datetime.now(timezone.utc)
+    if access:
+        expires_in = os.environ.get("VK_SEED_EXPIRES_IN", "").strip()
+        ttl = timedelta(seconds=int(expires_in)) if expires_in else TOKEN_TTL_DEFAULT
+        expires_at = now + ttl
+    else:
+        expires_at = now - timedelta(seconds=1)
+    _store_token(client_id, access, expires_at, refresh or None)
+    print(f"[lime_vk_ads] стартовый токен для кабинета {_mask(client_id)} занесён в кэш")
 
 
 def _api_get(token: str, path: str, *, _sleep=time.sleep) -> dict:
@@ -529,6 +556,7 @@ def ensure_tokens() -> int:
 
 if __name__ == "__main__":
     import sys
+    _seed_token_from_env()
     if "--tokens-only" in sys.argv:
         # Ненулевой код, пока хоть один кабинет без токена: воркфлоу-ловец должен быть
         # красным, пока ловить ещё есть что, — иначе «поймали» и «не поймали» неразличимы.

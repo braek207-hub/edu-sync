@@ -223,6 +223,26 @@ def test_get_token_prefers_refresh_over_issue():
     mock_issue.assert_not_called()
 
 
+def test_get_token_refresh_failure_falls_back_to_issue():
+    """Обновление по refresh упало (HTTP-ошибка — просрочен/отозван) → не тупик: синк не
+    падает, фолбэк на обычный выпуск нового токена."""
+    from sync import lime_vk_ads as m
+    near_expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+    body = io.BytesIO(b'{"error":"invalid_grant"}')
+    err = urllib.error.HTTPError(
+        "https://ads.vk.com/api/v2/oauth2/token.json", 400, "Bad Request", {}, body,
+    )
+    with patch.object(m, "_load_cached_token", return_value=("stale-tok", near_expiry, "dead-ref")), \
+         patch.object(m, "_refresh_access", side_effect=err) as mock_ref, \
+         patch.object(m, "_issue_token", return_value={"access_token": "issued-after-fail", "expires_in": 3600}) as mock_issue, \
+         patch.object(m, "_store_token") as mock_store:
+        tok = m._get_token("cid", "sec")
+    assert tok == "issued-after-fail"
+    mock_ref.assert_called_once()
+    mock_issue.assert_called_once()
+    mock_store.assert_called_once()
+
+
 def test_get_token_defaults_ttl_when_expires_in_missing():
     """Ответ VK без expires_in → срок кэша по умолчанию 24ч (TOKEN_TTL_DEFAULT)."""
     from sync import lime_vk_ads as m
@@ -293,3 +313,62 @@ def test_no_token_delete_reference_in_source():
     with open(src_path, encoding="utf-8") as f:
         src = f.read()
     assert "token/delete" not in src
+
+
+# ── Стартовый seed токена из env (VK_SEED_*) — ручной ввод без траты слота ──
+
+def test_seed_token_from_env_stores_access_and_refresh_without_network(monkeypatch):
+    """Заданы client_id + access + refresh → занесены в кэш, сеть не дёргалась."""
+    from sync import lime_vk_ads as m
+    monkeypatch.setenv("VK_SEED_CLIENT_ID", "cid-seed")
+    monkeypatch.setenv("VK_SEED_ACCESS_TOKEN", "seed-access")
+    monkeypatch.setenv("VK_SEED_REFRESH_TOKEN", "seed-refresh")
+    monkeypatch.setenv("VK_SEED_EXPIRES_IN", "3600")
+    with patch.object(m, "_store_token") as mock_store, \
+         patch.object(m, "_issue_token") as mock_issue, \
+         patch.object(m, "_refresh_access") as mock_refresh:
+        m._seed_token_from_env()
+    mock_issue.assert_not_called()
+    mock_refresh.assert_not_called()
+    mock_store.assert_called_once()
+    client_id, access, expires_at, refresh = mock_store.call_args[0]
+    assert client_id == "cid-seed" and access == "seed-access" and refresh == "seed-refresh"
+    # expires_in=3600с из env — expires_at ~сейчас+1ч, а не дефолтные 24ч
+    assert expires_at < datetime.now(timezone.utc) + timedelta(minutes=61)
+    assert expires_at > datetime.now(timezone.utc) + timedelta(minutes=59)
+
+
+def test_seed_token_from_env_refresh_only_marks_cache_expired(monkeypatch):
+    """Дан только refresh (access неизвестен) → кэш кладётся сразу протухшим: первый же
+    _get_token обновится по refresh, а не отдаст пустой access как рабочий."""
+    from sync import lime_vk_ads as m
+    monkeypatch.delenv("VK_SEED_ACCESS_TOKEN", raising=False)
+    monkeypatch.setenv("VK_SEED_CLIENT_ID", "cid-seed")
+    monkeypatch.setenv("VK_SEED_REFRESH_TOKEN", "seed-refresh-only")
+    monkeypatch.delenv("VK_SEED_EXPIRES_IN", raising=False)
+    with patch.object(m, "_store_token") as mock_store:
+        m._seed_token_from_env()
+    client_id, access, expires_at, refresh = mock_store.call_args[0]
+    assert client_id == "cid-seed" and refresh == "seed-refresh-only"
+    assert expires_at < datetime.now(timezone.utc)  # уже протух
+
+
+def test_seed_token_from_env_noop_without_vars(monkeypatch):
+    """Ни одна переменная не задана → no-op, кэш не трогаем, сеть не дёргаем."""
+    from sync import lime_vk_ads as m
+    for k in ("VK_SEED_CLIENT_ID", "VK_SEED_ACCESS_TOKEN", "VK_SEED_REFRESH_TOKEN", "VK_SEED_EXPIRES_IN"):
+        monkeypatch.delenv(k, raising=False)
+    with patch.object(m, "_store_token") as mock_store:
+        m._seed_token_from_env()
+    mock_store.assert_not_called()
+
+
+def test_seed_token_from_env_requires_client_id(monkeypatch):
+    """Токены заданы, но VK_SEED_CLIENT_ID нет — не знаем, какому кабинету это принадлежит,
+    поэтому no-op, а не запись в кэш под пустым client_id."""
+    from sync import lime_vk_ads as m
+    monkeypatch.delenv("VK_SEED_CLIENT_ID", raising=False)
+    monkeypatch.setenv("VK_SEED_ACCESS_TOKEN", "seed-access")
+    with patch.object(m, "_store_token") as mock_store:
+        m._seed_token_from_env()
+    mock_store.assert_not_called()
