@@ -103,14 +103,17 @@ class Attribution:
                 "application_id": APPMETRICA_APP,
                 "date_since": f"{a} 00:00:00", "date_until": f"{b} 23:59:59",
                 "date_dimension": "default",
-                "fields": "appmetrica_device_id,event_datetime,publisher_name,tracker_name,click_url_parameters"}, token)
+                # click_url_parameters есть только у установок: у диплинков экспорт
+                # его не знает (HTTP 400). VK-кампания достаётся из установки,
+                # Директ — из tracker_name, он у диплинков есть.
+                "fields": "appmetrica_device_id,event_datetime,publisher_name,tracker_name"}, token)
             for r in data2:
                 dev = r.get("appmetrica_device_id")
                 if dev:
                     dl[dev].append((
                         _ts(r["event_datetime"]),
                         pub_norm(r.get("publisher_name")),
-                        app_campaign_of(r.get("publisher_name"), r.get("tracker_name"), r.get("click_url_parameters")),
+                        app_campaign_of(r.get("publisher_name"), r.get("tracker_name")),
                     ))
             print(f"  диплинки {a:%Y-%m}: +{len(data2):,}")
         for v in dl.values():
