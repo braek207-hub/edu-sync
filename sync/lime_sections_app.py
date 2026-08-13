@@ -327,7 +327,11 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
             cell[1] += rv
         for k in touched:
             v1[k]["orders"] += 1
-        nb_orders.append((dev, "SEM", camps or ("",),
+        # Вход new/repeat: канал по ключу кампании (SEM/SMM paid), без кампании —
+        # остаток '' (new-меры лягут только на существующие строки грани).
+        nb_orders.append((dev,
+                          app_campaign_channel(camp) if camp else "SEM",
+                          (camp,) if camp else ("",),
                           {b: [sum(t[0] for t in ts.values()), sum(t[1] for t in ts.values())]
                            for b, ts in by_sec.items()}))
         tx_id = str(tx) if tx is not None else f"{dev}:{when_s}"
