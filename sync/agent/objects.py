@@ -33,9 +33,12 @@ def build_object_rows(
 ) -> List[Dict[str, Any]]:
     """Строки снимка структуры для одного уровня."""
     id_field, campaign_field, parent_field = _ID_FIELDS[object_level]
+    # Идентификаторы уже лежат отдельными колонками — в payload они только дублируют
+    # данные и раздувают JSONB: 198 тыс. объектов заняли 123 МБ (прогон 31788997736).
+    dropped = {f for f in (id_field, campaign_field, parent_field) if f}
     out: List[Dict[str, Any]] = []
     for item in items:
-        payload = {k: v for k, v in item.items() if k != id_field}
+        payload = {k: v for k, v in item.items() if k not in dropped}
         out.append({
             "object_level": object_level,
             "object_id": str(item[id_field]),

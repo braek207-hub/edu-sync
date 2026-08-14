@@ -71,3 +71,14 @@ def test_top_queries_applies_limit_per_campaign():
     out = top_queries_by_cost(queries, per_campaign=3)
     assert len(out) == 6
     assert {q["campaign_id"] for q in out} == {"1", "2"}
+
+
+def test_payload_has_no_duplicate_identifiers():
+    # Id/CampaignId/AdGroupId лежат отдельными колонками — в JSONB они лишний вес.
+    items = [{"Id": 10, "CampaignId": 1, "AdGroupId": 5, "Keyword": "вуз", "State": "ON"}]
+    payload = build_object_rows(items, "keyword", seen_on="2026-08-14")[0]["payload"]
+    assert "Id" not in payload
+    assert "CampaignId" not in payload
+    assert "AdGroupId" not in payload
+    assert payload["Keyword"] == "вуз"
+    assert payload["State"] == "ON"
