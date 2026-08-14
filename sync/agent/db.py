@@ -182,3 +182,346 @@ def ensure_agent_tables() -> None:
             for statement in AGENT_DDL:
                 cur.execute(statement)
         conn.commit()
+
+
+# ---------------------------------------------------------------- загрузчики
+
+
+def _fetch_dicts(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+
+def load_direct_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    return _fetch_dicts(
+        """
+        SELECT date, campaign_id, campaign_name, project, direction,
+               cost, clicks, impressions, w_avg_impr_pos, w_auction_win_share
+        FROM direct_stats
+        WHERE date BETWEEN %s AND %s
+        """,
+        (date_from, date_to),
+    )
+
+
+def load_lead_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    # revenue в crm_lead_details нет — суммы лежат в amount.
+    return _fetch_dicts(
+        """
+        SELECT lead_id, campaign_id, created_date, is_eff, is_paid,
+               is_connected, is_deal, created_ts, connected_ts, payment_date,
+               amount AS revenue, direction, project, audience
+        FROM crm_lead_details
+        WHERE created_date BETWEEN %s AND %s
+        """,
+        (date_from, date_to),
+    )
+
+
+def load_score_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    return _fetch_dicts(
+        """
+        SELECT s.lead_id, s.scoring_point, s.p_pay
+        FROM edu_lead_scores s
+        JOIN crm_lead_details d ON d.lead_id = s.lead_id
+        WHERE d.created_date BETWEEN %s AND %s
+        """,
+        (date_from, date_to),
+    )
+
+
+def load_campaign_settings_raw() -> Dict[str, Dict[str, Any]]:
+    """Текущие настройки из витрины edu_campaign_settings (колонка settings, JSONB)."""
+    rows = _fetch_dicts("SELECT campaign_id, settings FROM edu_campaign_settings")
+    return {str(r["campaign_id"]): (r["settings"] or {}) for r in rows}
+
+
+def load_campaign_features(date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    """Признаки кампаний для профиля успеха.
+
+    Структурные признаки считаем из собственной таблицы edu_agent_objects, а не из
+    JSONB настроек: там их формат не гарантирован, а объекты мы сняли сами.
+    Берётся последняя версия каждого объекта (last_seen).
+    """
+    return _fetch_dicts(
+        """
+        WITH latest AS (
+            SELECT DISTINCT ON (object_level, object_id)
+                   object_level, object_id, campaign_id, payload
+            FROM edu_agent_objects
+            ORDER BY object_level, object_id, last_seen DESC
+        ),
+        structure AS (
+            SELECT campaign_id,
+                   COUNT(*) FILTER (WHERE object_level = 'adgroup')  AS groups_count,
+                   COUNT(*) FILTER (WHERE object_level = 'keyword')  AS keywords_count,
+                   COUNT(*) FILTER (WHERE object_level = 'ad')       AS ads_count,
+                   COUNT(*) FILTER (
+                       WHERE object_level = 'ad'
+                         AND COALESCE(payload->'TextAd'->>'Title2', '') <> ''
+                   ) AS ads_with_title2
+            FROM latest
+            GROUP BY campaign_id
+        ),
+        perf AS (
+            SELECT campaign_id, SUM(cost) AS cost, SUM(sum_p_pay) AS sum_p_pay
+            FROM edu_agent_facts
+            WHERE fact_date BETWEEN %s AND %s
+            GROUP BY campaign_id
+        )
+        SELECT p.campaign_id,
+               p.cost,
+               p.sum_p_pay,
+               COALESCE(s.groups_count, 0) AS groups_count,
+               CASE WHEN COALESCE(s.groups_count, 0) > 0
+                    THEN s.keywords_count::float / s.groups_count
+                    ELSE 0 END AS phrases_per_group,
+               CASE WHEN COALESCE(s.ads_count, 0) > 0
+                    THEN s.ads_with_title2::float / s.ads_count
+                    ELSE 0 END AS title2_fill_share
+        FROM perf p
+        LEFT JOIN structure s ON s.campaign_id = p.campaign_id
+        """,
+        (date_from, date_to),
+    )
+
+
+# ---------------------------------------------------------------- запись
+
+
+def _batch(sql: str, rows: List[Dict[str, Any]], page_size: int = 500) -> int:
+    if not rows:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, rows, page_size=page_size)
+        conn.commit()
+    return len(rows)
+
+
+def upsert_facts(rows: List[Dict[str, Any]]) -> int:
+    return _batch(
+        """
+        INSERT INTO edu_agent_facts (
+            fact_date, campaign_id, campaign_name, project, direction,
+            cost, clicks, impressions, leads, eff_leads, sum_p_pay,
+            payments_fact, avg_impr_pos, auction_win_share,
+            connected_leads, deals, mins_to_connection_sum, mins_to_connection_count,
+            days_to_pay_sum, days_to_pay_count, revenue
+        ) VALUES (
+            %(fact_date)s, %(campaign_id)s, %(campaign_name)s, %(project)s, %(direction)s,
+            %(cost)s, %(clicks)s, %(impressions)s, %(leads)s, %(eff_leads)s, %(sum_p_pay)s,
+            %(payments_fact)s, %(avg_impr_pos)s, %(auction_win_share)s,
+            %(connected_leads)s, %(deals)s, %(mins_to_connection_sum)s,
+            %(mins_to_connection_count)s, %(days_to_pay_sum)s, %(days_to_pay_count)s,
+            %(revenue)s
+        )
+        ON CONFLICT (fact_date, campaign_id) DO UPDATE SET
+            campaign_name = EXCLUDED.campaign_name,
+            project = EXCLUDED.project,
+            direction = EXCLUDED.direction,
+            cost = EXCLUDED.cost,
+            clicks = EXCLUDED.clicks,
+            impressions = EXCLUDED.impressions,
+            leads = EXCLUDED.leads,
+            eff_leads = EXCLUDED.eff_leads,
+            sum_p_pay = EXCLUDED.sum_p_pay,
+            payments_fact = EXCLUDED.payments_fact,
+            avg_impr_pos = EXCLUDED.avg_impr_pos,
+            auction_win_share = EXCLUDED.auction_win_share,
+            connected_leads = EXCLUDED.connected_leads,
+            deals = EXCLUDED.deals,
+            mins_to_connection_sum = EXCLUDED.mins_to_connection_sum,
+            mins_to_connection_count = EXCLUDED.mins_to_connection_count,
+            days_to_pay_sum = EXCLUDED.days_to_pay_sum,
+            days_to_pay_count = EXCLUDED.days_to_pay_count,
+            revenue = EXCLUDED.revenue,
+            collected_at = now()
+        """,
+        rows,
+        page_size=1000,
+    )
+
+
+def upsert_sliced_facts(rows: List[Dict[str, Any]]) -> int:
+    return _batch(
+        """
+        INSERT INTO edu_agent_facts_sliced (
+            week_start, campaign_id, slice_kind, slice_key,
+            cost, clicks, impressions, conversions
+        ) VALUES (
+            %(week_start)s, %(campaign_id)s, %(slice_kind)s, %(slice_key)s,
+            %(cost)s, %(clicks)s, %(impressions)s, %(conversions)s
+        )
+        ON CONFLICT (week_start, campaign_id, slice_kind, slice_key) DO UPDATE SET
+            cost = EXCLUDED.cost,
+            clicks = EXCLUDED.clicks,
+            impressions = EXCLUDED.impressions,
+            conversions = EXCLUDED.conversions
+        """,
+        rows,
+        page_size=1000,
+    )
+
+
+def upsert_objects(rows: List[Dict[str, Any]]) -> int:
+    """Новая версия только при смене content_hash; иначе двигаем last_seen."""
+    payload = [{**r, "payload": json.dumps(r.get("payload", {}), ensure_ascii=False)} for r in rows]
+    return _batch(
+        """
+        INSERT INTO edu_agent_objects (
+            object_level, object_id, parent_id, campaign_id, content_hash,
+            payload, first_seen, last_seen
+        ) VALUES (
+            %(object_level)s, %(object_id)s, %(parent_id)s, %(campaign_id)s,
+            %(content_hash)s, %(payload)s, %(first_seen)s, %(last_seen)s
+        )
+        ON CONFLICT (object_level, object_id, content_hash)
+        DO UPDATE SET last_seen = EXCLUDED.last_seen
+        """,
+        payload,
+        page_size=1000,
+    )
+
+
+def upsert_search_queries(rows: List[Dict[str, Any]]) -> int:
+    return _batch(
+        """
+        INSERT INTO edu_agent_search_queries (
+            window_from, window_to, campaign_id, query, matched_key,
+            cost, clicks, conversions
+        ) VALUES (
+            %(window_from)s, %(window_to)s, %(campaign_id)s, %(query)s, %(matched_key)s,
+            %(cost)s, %(clicks)s, %(conversions)s
+        )
+        ON CONFLICT (window_from, campaign_id, query) DO UPDATE SET
+            cost = EXCLUDED.cost,
+            clicks = EXCLUDED.clicks,
+            conversions = EXCLUDED.conversions
+        """,
+        rows,
+        page_size=1000,
+    )
+
+
+def upsert_settings_snapshot(rows: List[Dict[str, Any]]) -> int:
+    payload = [{**r, "settings": json.dumps(r.get("settings", {}), ensure_ascii=False)} for r in rows]
+    return _batch(
+        """
+        INSERT INTO edu_agent_settings_snapshot (
+            campaign_id, content_hash, settings, first_seen, last_seen
+        ) VALUES (
+            %(campaign_id)s, %(content_hash)s, %(settings)s, %(first_seen)s, %(last_seen)s
+        )
+        ON CONFLICT (campaign_id, content_hash)
+        DO UPDATE SET last_seen = EXCLUDED.last_seen
+        """,
+        payload,
+    )
+
+
+def upsert_holdout(rows: List[Dict[str, Any]], included_on: str) -> int:
+    payload = [{**r, "included_at": included_on} for r in rows]
+    return _batch(
+        """
+        INSERT INTO edu_agent_holdout (campaign_id, direction, stratum, included_at, reason)
+        VALUES (%(campaign_id)s, %(direction)s, %(stratum)s, %(included_at)s, %(reason)s)
+        ON CONFLICT (campaign_id) DO NOTHING
+        """,
+        payload,
+    )
+
+
+def upsert_experiments(rows: List[Dict[str, Any]]) -> int:
+    payload = [{**r, "params": json.dumps(r.get("params", {}), ensure_ascii=False)} for r in rows]
+    return _batch(
+        """
+        INSERT INTO edu_agent_experiments (
+            experiment_id, hypothesis_type, object_level, object_id, params, mechanism,
+            started_on, measured_on, effect, effect_lo, effect_hi, metric, verdict,
+            reliability_class, source
+        ) VALUES (
+            %(experiment_id)s, %(hypothesis_type)s, %(object_level)s, %(object_id)s,
+            %(params)s, %(mechanism)s, %(started_on)s, %(measured_on)s, %(effect)s,
+            %(effect_lo)s, %(effect_hi)s, %(metric)s, %(verdict)s,
+            %(reliability_class)s, %(source)s
+        )
+        ON CONFLICT (experiment_id) DO UPDATE SET
+            effect = EXCLUDED.effect,
+            effect_lo = EXCLUDED.effect_lo,
+            effect_hi = EXCLUDED.effect_hi,
+            verdict = EXCLUDED.verdict
+        """,
+        payload,
+    )
+
+
+def upsert_computed_settings(
+    rows: List[Dict[str, Any]], calc_date: str,
+    object_level: str = "account", object_id: str = "vuz",
+) -> int:
+    payload = [{**r, "calc_date": calc_date, "object_level": object_level, "object_id": object_id}
+               for r in rows]
+    return _batch(
+        """
+        INSERT INTO edu_agent_computed_settings (
+            calc_date, object_level, object_id, setting_kind, setting_key,
+            value, support_n, raw_value
+        ) VALUES (
+            %(calc_date)s, %(object_level)s, %(object_id)s, %(setting_kind)s,
+            %(setting_key)s, %(value)s, %(support_n)s, %(raw_value)s
+        )
+        ON CONFLICT (calc_date, object_level, object_id, setting_kind, setting_key)
+        DO UPDATE SET value = EXCLUDED.value,
+                      support_n = EXCLUDED.support_n,
+                      raw_value = EXCLUDED.raw_value
+        """,
+        payload,
+    )
+
+
+def upsert_profile(rows: List[Dict[str, Any]], calc_date: str) -> int:
+    payload = [{**r, "calc_date": calc_date, "gaps": json.dumps(r.get("gaps", []), ensure_ascii=False)}
+               for r in rows]
+    return _batch(
+        """
+        INSERT INTO edu_agent_profile (calc_date, campaign_id, distance, gaps, quartile)
+        VALUES (%(calc_date)s, %(campaign_id)s, %(distance)s, %(gaps)s, %(quartile)s)
+        ON CONFLICT (calc_date, campaign_id) DO UPDATE SET
+            distance = EXCLUDED.distance,
+            gaps = EXCLUDED.gaps,
+            quartile = EXCLUDED.quartile
+        """,
+        payload,
+    )
+
+
+def insert_guard_checks(checks: List[Dict[str, Any]]) -> int:
+    payload = [{**c, "detail": json.dumps(c.get("detail", {}), ensure_ascii=False)} for c in checks]
+    return _batch(
+        """
+        INSERT INTO edu_agent_guard (check_name, status, detail)
+        VALUES (%(check_name)s, %(status)s, %(detail)s)
+        ON CONFLICT DO NOTHING
+        """,
+        payload,
+    )
+
+
+def table_sizes() -> List[Dict[str, Any]]:
+    """Фактический объём таблиц агента — сверка с бюджетом ~40 МБ."""
+    return _fetch_dicts(
+        """
+        SELECT relname AS table_name,
+               pg_size_pretty(pg_total_relation_size(c.oid)) AS size,
+               pg_total_relation_size(c.oid) AS size_bytes,
+               n_live_tup AS approx_rows
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+        WHERE relname LIKE 'edu_agent_%%' AND c.relkind = 'r'
+        ORDER BY pg_total_relation_size(c.oid) DESC
+        """
+    )

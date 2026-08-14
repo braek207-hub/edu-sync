@@ -1,0 +1,34 @@
+name: agent-e0
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Окно истории в днях"
+        required: false
+        default: "180"
+      skip_direct:
+        description: "Пропустить обращения к API Директа (только БД)"
+        required: false
+        type: boolean
+        default: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run E0
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+          DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
+        run: |
+          ARGS="--days ${{ github.event.inputs.days || '180' }}"
+          if [ "${{ github.event.inputs.skip_direct }}" = "true" ]; then
+            ARGS="$ARGS --skip-direct"
+          fi
+          python -m sync.agent_e0 $ARGS
