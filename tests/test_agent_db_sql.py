@@ -6,6 +6,7 @@ REQUIRED_TABLES = [
     "edu_agent_objects",
     "edu_agent_search_queries",
     "edu_agent_settings_snapshot",
+    "edu_agent_behavior",
     "edu_agent_guard",
     "edu_agent_holdout",
     "edu_agent_experiments",

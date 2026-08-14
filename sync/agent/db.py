@@ -106,6 +106,20 @@ AGENT_DDL: List[str] = [
       PRIMARY KEY (campaign_id, content_hash)
     )
     """,
+    # Поведение из Метрики по кампаниям: ранний сигнал качества трафика.
+    # Суммы и счётчики, не проценты — среднее по среднему не складывается.
+    """
+    CREATE TABLE IF NOT EXISTS edu_agent_behavior (
+      window_from   DATE NOT NULL,
+      window_to     DATE NOT NULL,
+      campaign_id   TEXT NOT NULL,
+      visits        INTEGER NOT NULL DEFAULT 0,
+      bounces       INTEGER NOT NULL DEFAULT 0,
+      pageviews     INTEGER NOT NULL DEFAULT 0,
+      visit_seconds BIGINT  NOT NULL DEFAULT 0,
+      PRIMARY KEY (window_from, campaign_id)
+    )
+    """,
     # Журнал гейта качества данных: почему агент работал или спал.
     """
     CREATE TABLE IF NOT EXISTS edu_agent_guard (
@@ -504,6 +518,26 @@ def upsert_profile(rows: List[Dict[str, Any]], calc_date: str) -> int:
             distance = EXCLUDED.distance,
             gaps = EXCLUDED.gaps,
             quartile = EXCLUDED.quartile
+        """,
+        payload,
+    )
+
+
+def upsert_behavior(rows: List[Dict[str, Any]], window_from: str, window_to: str) -> int:
+    payload = [{**r, "window_from": window_from, "window_to": window_to} for r in rows]
+    return _batch(
+        """
+        INSERT INTO edu_agent_behavior (
+            window_from, window_to, campaign_id, visits, bounces, pageviews, visit_seconds
+        ) VALUES (
+            %(window_from)s, %(window_to)s, %(campaign_id)s, %(visits)s,
+            %(bounces)s, %(pageviews)s, %(visit_seconds)s
+        )
+        ON CONFLICT (window_from, campaign_id) DO UPDATE SET
+            visits = EXCLUDED.visits,
+            bounces = EXCLUDED.bounces,
+            pageviews = EXCLUDED.pageviews,
+            visit_seconds = EXCLUDED.visit_seconds
         """,
         payload,
     )

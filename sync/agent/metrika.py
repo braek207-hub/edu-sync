@@ -1,0 +1,138 @@
+# -*- coding: utf-8 -*-
+"""
+sync/agent/metrika.py — обогащение витрин автопилота данными Яндекс Метрики.
+
+Закрывает две дыры, которые Директ не закрывает:
+
+  1. ПОЧАСОВОЙ ПРОФИЛЬ. Reports API отвергает HourOfDay (probe 31781715471) —
+     почасовой детализации расхода Директ не отдаёт вовсе. Метрика отдаёт визиты
+     и цели по часам, и корректировка расписания считается по ним.
+
+  2. РАННИЙ СИГНАЛ КАЧЕСТВА. Отказы, глубина и время на сайте видны в тот же день,
+     а оплата созревает 30–90 дней. Для агента это единственная метрика качества
+     трафика с суточной задержкой — прокси p_pay опирается на поведение, но сам
+     по себе поведенческий срез нужен и как независимый детектор: рост отказов
+     при неизменном CPA означает, что изменение испортило релевантность.
+
+Идём через Reporting API (/stat/v1/data) с тем же OAuth YM_TOKEN и той же атрибуцией
+lastsign, что и sync/edu_visits.py — иначе цифры разойдутся с существующими витринами.
+
+Хранение: поведенческие показатели — суммами и счётчиками (visits, bounces, pageviews,
+visit_seconds), а не готовыми процентами: среднее по среднему не складывается при
+перегруппировке по неделям и направлениям.
+"""
+
+import os
+import time
+from typing import Any, Dict, List
+
+import requests
+
+METRICA_API_URL = "https://api-metrika.yandex.net/stat/v1/data"
+ATTRIBUTION = "lastsign"
+ROW_LIMIT = 10_000
+# Счётчики EDU по проектам (vuz/vse/provuz) — те же, что в sync/edu_direct_settings.py.
+EDU_COUNTERS = [98627983, 96526110, 95348914]
+
+
+def _metrica_get(params: Dict[str, Any], token: str) -> Dict[str, Any]:
+    """GET Reporting API с ретраями. Тот же путь, что sync/edu_visits.py::_metrica_get."""
+    headers = {"Authorization": f"OAuth {token}"}
+    backoff = 2
+    for attempt in range(6):
+        resp = requests.get(METRICA_API_URL, params=params, headers=headers, timeout=120)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code in {429, 500, 502, 503, 504} and attempt < 5:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+        raise RuntimeError(f"Metrica API {resp.status_code}: {resp.text[:400]}")
+    raise RuntimeError("Metrica API: max retries")
+
+
+def parse_hourly(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Ответ Метрики → почасовой профиль в формате среза slice_kind='hour'.
+
+    Час извлекается из измерения ym:s:hour (значение вида '13' или '13:00').
+    """
+    out: List[Dict[str, Any]] = []
+    for row in data.get("data") or []:
+        dims = row.get("dimensions") or []
+        metrics = row.get("metrics") or []
+        if not dims or not metrics:
+            continue
+        raw_hour = str(dims[0].get("name") or dims[0].get("id") or "").strip()
+        hour = raw_hour.split(":")[0].lstrip("0") or "0"
+        visits = float(metrics[0] or 0.0)
+        goals = float(metrics[1] or 0.0) if len(metrics) > 1 else 0.0
+        out.append({
+            "segment_kind": "hour",
+            "segment_key": hour,
+            # Для corrections важна конверсионность: визиты играют роль кликов,
+            # достижения цели — роль ожидаемых оплат.
+            "clicks": int(visits),
+            "leads": int(goals),
+            "sum_p_pay": goals,
+        })
+    return sorted(out, key=lambda r: int(r["segment_key"]))
+
+
+def parse_campaign_behavior(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Ответ Метрики → поведение по кампаниям Директа.
+
+    Отдаём суммы и счётчики: visits, bounces, pageviews, visit_seconds.
+    Проценты и средние считает потребитель — иначе перегруппировка врёт.
+    """
+    out: List[Dict[str, Any]] = []
+    for row in data.get("data") or []:
+        dims = row.get("dimensions") or []
+        metrics = row.get("metrics") or []
+        if not dims or len(metrics) < 4:
+            continue
+        campaign_id = str(dims[0].get("name") or dims[0].get("id") or "").strip()
+        if not campaign_id or not campaign_id.isdigit():
+            continue
+        visits = float(metrics[0] or 0.0)
+        bounce_rate = float(metrics[1] or 0.0)      # проценты
+        page_depth = float(metrics[2] or 0.0)       # страниц за визит
+        avg_seconds = float(metrics[3] or 0.0)      # секунд за визит
+        out.append({
+            "campaign_id": campaign_id,
+            "visits": int(visits),
+            "bounces": int(round(visits * bounce_rate / 100.0)),
+            "pageviews": int(round(visits * page_depth)),
+            "visit_seconds": int(round(visits * avg_seconds)),
+        })
+    return sorted(out, key=lambda r: r["campaign_id"])
+
+
+def fetch_hourly_profile(counter_id: int, date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    """Визиты и достижения целей по часам суток."""
+    params = {
+        "ids": counter_id,
+        "metrics": "ym:s:visits,ym:s:goalDimensionVisits",
+        "dimensions": "ym:s:hour",
+        "date1": date_from,
+        "date2": date_to,
+        "attribution": ATTRIBUTION,
+        "limit": ROW_LIMIT,
+        "accuracy": "full",
+    }
+    return parse_hourly(_metrica_get(params, os.environ["YM_TOKEN"]))
+
+
+def fetch_campaign_behavior(counter_id: int, date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    """Поведение по кампаниям Директа: отказы, глубина, время."""
+    params = {
+        "ids": counter_id,
+        "metrics": "ym:s:visits,ym:s:bounceRate,ym:s:pageDepth,ym:s:avgVisitDurationSeconds",
+        "dimensions": "ym:s:lastsignDirectClickOrder",
+        "filters": "ym:s:lastsignTrafficSource=='ad'",
+        "date1": date_from,
+        "date2": date_to,
+        "attribution": ATTRIBUTION,
+        "limit": ROW_LIMIT,
+        "accuracy": "full",
+    }
+    return parse_campaign_behavior(_metrica_get(params, os.environ["YM_TOKEN"]))

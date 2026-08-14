@@ -72,6 +72,17 @@ CREATE TABLE IF NOT EXISTS edu_agent_settings_snapshot (
       PRIMARY KEY (campaign_id, content_hash)
     );
 
+CREATE TABLE IF NOT EXISTS edu_agent_behavior (
+      window_from   DATE NOT NULL,
+      window_to     DATE NOT NULL,
+      campaign_id   TEXT NOT NULL,
+      visits        INTEGER NOT NULL DEFAULT 0,
+      bounces       INTEGER NOT NULL DEFAULT 0,
+      pageviews     INTEGER NOT NULL DEFAULT 0,
+      visit_seconds BIGINT  NOT NULL DEFAULT 0,
+      PRIMARY KEY (window_from, campaign_id)
+    );
+
 CREATE TABLE IF NOT EXISTS edu_agent_guard (
       run_ts       TIMESTAMPTZ NOT NULL DEFAULT now(),
       check_name   TEXT NOT NULL,

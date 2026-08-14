@@ -16,14 +16,16 @@ ENV:     DATABASE_URL, DIRECT_TOKEN, DIRECT_CLIENTS_JSON
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from sync.agent import db as agent_db
-from sync.agent.computed import compute_segment_modifiers
+from sync.agent.computed import compute_schedule, compute_segment_modifiers
 from sync.agent.facts import assemble_facts
 from sync.agent.guard import check_continuity, check_freshness, verdict
 from sync.agent.holdout import select_holdout
+from sync.agent.metrika import EDU_COUNTERS, fetch_campaign_behavior, fetch_hourly_profile
 from sync.agent.mining import mine_quasi_experiments
 from sync.agent.objects import build_object_rows
 from sync.agent.power import power_report
@@ -39,6 +41,8 @@ SLICE_WINDOW_DAYS = 90
 PROFILE_FEATURES = ["groups_count", "phrases_per_group", "title2_fill_share"]
 # Окно истории, а не оперативный контур: дневной лаг синков допустим.
 HISTORY_MAX_AGE_HOURS = 72
+# Директ ограничивает число одновременно формируемых отчётов на кабинет.
+REPORT_WORKERS = 4
 
 
 def _window(days: int) -> tuple:
@@ -162,30 +166,47 @@ def main() -> int:
     slice_from = (date.today() - timedelta(days=SLICE_WINDOW_DAYS)).isoformat()
     clients = [] if skip_direct else _direct_clients()
 
-    # 6. Вычисляемые настройки. Считаем и складываем — применение на Э1.
+    # 6-7. Отчёты Директа. ПАРАЛЛЕЛЬНО: каждый отчёт формируется до 10 минут, а их
+    # десятки — последовательный обход делал прогон многочасовым (run 31781846178
+    # висел 25+ минут и был отменён). Воркеров немного: Директ ограничивает число
+    # одновременно формируемых отчётов на кабинет.
     base_clicks = sum(f["clicks"] for f in recent)
     base_expected = sum(f["sum_p_pay"] for f in recent)
     base_conv = (base_expected / base_clicks) if base_clicks else 0.0
-    computed_rows: List[Dict[str, Any]] = []
-    if base_conv > 0:
-        for client in clients:
-            login, goals = client["login"], client["goal_ids"]
-            # Расписания здесь нет: HourOfDay отвергается Reports API (probe 31781715471),
-            # почасовой расход придёт из Метрики на Э1.
-            for kind in ("device", "gender", "age"):
-                segment_rows = fetch_segment_report(login, kind, cutoff, date_to, goals=goals)
-                enriched = _attach_expected_payments(segment_rows, base_expected)
-                computed_rows += compute_segment_modifiers(enriched, base_conv)
-    agent_db.upsert_computed_settings(computed_rows, calc_date=today_iso)
 
-    # 7. Срезы по кампаниям — окно 90 дней, недельная грань, хвост в other.
-    sliced_rows: List[Dict[str, Any]] = []
+    jobs: List[Dict[str, Any]] = []
     for client in clients:
         login, goals = client["login"], client["goal_ids"]
+        if base_conv > 0:
+            # Расписания здесь нет: HourOfDay отвергается Reports API (probe 31781715471),
+            # почасовой профиль приходит из Метрики (шаг 9).
+            for kind in ("device", "gender", "age"):
+                jobs.append({"purpose": "computed", "login": login, "goals": goals,
+                             "kind": kind, "date_from": cutoff, "by_campaign": False})
         for kind in ("region", "network", "device"):
-            report_rows = fetch_segment_report(
-                login, kind, slice_from, date_to, by_campaign=True, goals=goals)
-            sliced_rows += collapse_tail(build_sliced_facts(report_rows, kind))
+            jobs.append({"purpose": "sliced", "login": login, "goals": goals,
+                         "kind": kind, "date_from": slice_from, "by_campaign": True})
+
+    def _run_job(job: Dict[str, Any]) -> Dict[str, Any]:
+        rows = fetch_segment_report(
+            job["login"], job["kind"], job["date_from"], date_to,
+            by_campaign=job["by_campaign"], goals=job["goals"],
+        )
+        return {**job, "rows": rows}
+
+    computed_rows: List[Dict[str, Any]] = []
+    sliced_rows: List[Dict[str, Any]] = []
+    if jobs:
+        with ThreadPoolExecutor(max_workers=REPORT_WORKERS) as pool:
+            for done in as_completed([pool.submit(_run_job, j) for j in jobs]):
+                job = done.result()
+                if job["purpose"] == "computed":
+                    enriched = _attach_expected_payments(job["rows"], base_expected)
+                    computed_rows += compute_segment_modifiers(enriched, base_conv)
+                else:
+                    sliced_rows += collapse_tail(build_sliced_facts(job["rows"], job["kind"]))
+
+    agent_db.upsert_computed_settings(computed_rows, calc_date=today_iso)
     agent_db.upsert_sliced_facts(sliced_rows)
 
     # 8. Структура кабинета и поисковые запросы.
@@ -226,6 +247,32 @@ def main() -> int:
             })
     agent_db.upsert_profile(profile_rows, calc_date=today_iso)
 
+    # 9. Обогащение Метрикой: почасовой профиль (Директ HourOfDay не отдаёт) и
+    # поведение по кампаниям — ранний сигнал качества до созревания оплат.
+    hourly_rows: List[Dict[str, Any]] = []
+    behavior_rows: List[Dict[str, Any]] = []
+    if not skip_direct and os.environ.get("YM_TOKEN"):
+        for counter in EDU_COUNTERS:
+            try:
+                hourly_rows += fetch_hourly_profile(counter, cutoff, date_to)
+                behavior_rows += fetch_campaign_behavior(counter, slice_from, date_to)
+            except Exception as exc:  # счётчик может быть недоступен токену
+                agent_db.insert_guard_checks([{
+                    "check_name": f"metrika:{counter}", "status": "FAIL",
+                    "detail": {"error": f"{type(exc).__name__}: {exc}"[:300]},
+                }])
+
+    if hourly_rows:
+        hourly_clicks = sum(r["clicks"] for r in hourly_rows)
+        hourly_goals = sum(r["sum_p_pay"] for r in hourly_rows)
+        hourly_base = (hourly_goals / hourly_clicks) if hourly_clicks else 0.0
+        if hourly_base > 0:
+            schedule_rows = compute_schedule(hourly_rows, hourly_base)
+            agent_db.upsert_computed_settings(schedule_rows, calc_date=today_iso)
+            computed_rows += schedule_rows
+
+    agent_db.upsert_behavior(behavior_rows, window_from=slice_from, window_to=date_to)
+
     # 11. Отчёт мощности и фактический объём таблиц.
     report = power_report(list(aggregates.values()))
     sizes = agent_db.table_sizes()
@@ -242,6 +289,8 @@ def main() -> int:
         "quasi_experiments": len(quasi),
         "computed_settings": len(computed_rows),
         "profile_rows": len(profile_rows),
+        "metrika_hourly": len(hourly_rows),
+        "metrika_behavior": len(behavior_rows),
         "power": report,
         "db_total_mb": total_mb,
         "db_tables": [{"t": s["table_name"], "size": s["size"]} for s in sizes],
