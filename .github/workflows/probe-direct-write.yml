@@ -27,3 +27,9 @@ jobs:
           else
             python probe_direct_write_access.py
           fi
+      - name: Probe report fields
+        env:
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+          DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
+        run: python probe_report_fields.py
