@@ -11,6 +11,11 @@ on:
         required: false
         type: boolean
         default: false
+      rebuild_bulk:
+        description: "Пересобрать объёмные витрины (объекты, поисковые запросы) с нуля"
+        required: false
+        type: boolean
+        default: false
       rebuild_holdout:
         description: "Пересобрать заповедник (состав держится весь сезон — только осознанно)"
         required: false
@@ -39,5 +44,8 @@ jobs:
           fi
           if [ "${{ github.event.inputs.rebuild_holdout }}" = "true" ]; then
             ARGS="$ARGS --rebuild-holdout"
+          fi
+          if [ "${{ github.event.inputs.rebuild_bulk }}" = "true" ]; then
+            ARGS="$ARGS --rebuild-bulk"
           fi
           python -m sync.agent_e0 $ARGS

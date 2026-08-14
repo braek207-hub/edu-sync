@@ -50,3 +50,24 @@ def test_minus_candidates_flags_spend_without_conversions():
 def test_minus_candidates_empty_when_nothing_qualifies():
     queries = [{"campaign_id": "1", "query": "вуз", "cost": 10.0, "clicks": 1, "conversions": 0}]
     assert minus_word_candidates(queries, cpa_limit=1000.0) == []
+
+
+def test_top_queries_keeps_expensive_and_drops_tail():
+    # Миллион запросов с одним кликом решений не даёт, но занял 450 МБ.
+    from sync.agent.objects import top_queries_by_cost
+
+    queries = [{"campaign_id": "1", "query": f"q{i}", "cost": float(i), "clicks": 1}
+               for i in range(100)]
+    out = top_queries_by_cost(queries, per_campaign=10)
+    assert len(out) == 10
+    assert min(float(q["cost"]) for q in out) == 90.0
+
+
+def test_top_queries_applies_limit_per_campaign():
+    from sync.agent.objects import top_queries_by_cost
+
+    queries = ([{"campaign_id": "1", "query": f"a{i}", "cost": 10.0, "clicks": 1} for i in range(5)]
+               + [{"campaign_id": "2", "query": f"b{i}", "cost": 10.0, "clicks": 1} for i in range(5)])
+    out = top_queries_by_cost(queries, per_campaign=3)
+    assert len(out) == 6
+    assert {q["campaign_id"] for q in out} == {"1", "2"}

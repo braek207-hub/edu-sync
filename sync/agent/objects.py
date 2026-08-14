@@ -49,6 +49,25 @@ def build_object_rows(
     return out
 
 
+def top_queries_by_cost(
+    queries: List[Dict[str, Any]], per_campaign: int = 500
+) -> List[Dict[str, Any]]:
+    """Верх по расходу внутри каждой кампании.
+
+    Кандидаты в минус-слова — это запросы, которые ЖГУТ бюджет; миллион запросов
+    с одним кликом не несёт решений, но занял 450 МБ на прогоне 31785888375.
+    Отсекаем хвост, сохраняя всё, что реально стоит денег.
+    """
+    by_campaign: Dict[str, List[Dict[str, Any]]] = {}
+    for q in queries:
+        by_campaign.setdefault(str(q.get("campaign_id", "")), []).append(q)
+    out: List[Dict[str, Any]] = []
+    for campaign_id, rows in by_campaign.items():
+        rows.sort(key=lambda r: float(r.get("cost") or 0.0), reverse=True)
+        out += rows[:per_campaign]
+    return out
+
+
 def minus_word_candidates(
     queries: List[Dict[str, Any]], cpa_limit: float, multiplier: float = 3.0
 ) -> List[Dict[str, Any]]:

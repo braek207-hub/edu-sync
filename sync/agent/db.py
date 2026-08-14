@@ -543,6 +543,24 @@ def upsert_behavior(rows: List[Dict[str, Any]], window_from: str, window_to: str
     )
 
 
+def clear_bulk_tables() -> Dict[str, int]:
+    """Сброс объёмных витрин перед пересбором.
+
+    Нужен, когда меняются правила отбора: старые строки не перезаписываются
+    upsert-ом и остаются мёртвым грузом. На прогоне 31785888375 объекты и
+    поисковые запросы заняли 828 МБ из 838 — при квоте Supabase это риск,
+    а история проекта уже знает инцидент с исчерпанием диска.
+    """
+    removed: Dict[str, int] = {}
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for table in ("edu_agent_search_queries", "edu_agent_objects"):
+                cur.execute(f"DELETE FROM {table} WHERE true")
+                removed[table] = cur.rowcount
+        conn.commit()
+    return removed
+
+
 def insert_guard_checks(checks: List[Dict[str, Any]]) -> int:
     payload = [{**c, "detail": json.dumps(c.get("detail", {}), ensure_ascii=False)} for c in checks]
     return _batch(

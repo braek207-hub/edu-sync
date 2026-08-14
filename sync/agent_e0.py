@@ -27,7 +27,7 @@ from sync.agent.guard import check_continuity, check_freshness, verdict
 from sync.agent.holdout import select_holdout
 from sync.agent.metrika import EDU_COUNTERS, fetch_campaign_behavior, fetch_hourly_profile
 from sync.agent.mining import mine_quasi_experiments
-from sync.agent.objects import build_object_rows
+from sync.agent.objects import build_object_rows, top_queries_by_cost
 from sync.agent.power import power_report
 from sync.agent.profile import build_profile, campaign_quality, distance_to_profile
 from sync.agent.segments import (
@@ -43,6 +43,9 @@ DEFAULT_DAYS = 180
 # Срезы, структура и поисковые запросы — только за квартал: 90 дней покрывают все
 # сезонные фазы, кроме прошлогодней приёмки, а объём таблиц держат в десятках МБ.
 SLICE_WINDOW_DAYS = 90
+# Поисковые запросы — самая объёмная витрина (450 МБ за 90 дней на 4 кабинета).
+# Кандидаты в минус-слова считаются по свежим данным, глубокая история не нужна.
+QUERY_WINDOW_DAYS = 30
 PROFILE_FEATURES = ["groups_count", "phrases_per_group", "title2_fill_share"]
 # Окно истории, а не оперативный контур: дневной лаг синков допустим.
 HISTORY_MAX_AGE_HOURS = 72
@@ -169,6 +172,7 @@ def main() -> int:
     agent_db.upsert_experiments(quasi)
 
     slice_from = (date.today() - timedelta(days=SLICE_WINDOW_DAYS)).isoformat()
+    queries_from = (date.today() - timedelta(days=QUERY_WINDOW_DAYS)).isoformat()
     clients = [] if skip_direct else _direct_clients()
 
     # 6-7. Отчёты Директа. ПАРАЛЛЕЛЬНО: каждый отчёт формируется до 10 минут, а их
@@ -214,17 +218,25 @@ def main() -> int:
     agent_db.upsert_computed_settings(computed_rows, calc_date=today_iso)
     agent_db.upsert_sliced_facts(sliced_rows)
 
-    # 8. Структура кабинета и поисковые запросы.
+    # 8. Структура кабинета и поисковые запросы. Только по живым кампаниям окна.
+    if "--rebuild-bulk" in sys.argv:
+        agent_db.clear_bulk_tables()
+    live_campaigns = {str(f["campaign_id"]) for f in facts
+                      if f["fact_date"] >= slice_from and (f["cost"] > 0 or f["leads"] > 0)}
     object_rows: List[Dict[str, Any]] = []
     query_rows: List[Dict[str, Any]] = []
     for client in clients:
         login, goals = client["login"], client["goal_ids"]
-        campaign_ids = fetch_campaign_ids(login)
+        # Только ЖИВЫЕ кампании окна, а не весь кабинет за всю историю:
+        # fetch_campaign_ids отдавал все 163+ кампании включая архивные, и снимок
+        # структуры раздувался до 367k строк / 378 МБ (прогон 31785888375).
+        campaign_ids = [cid for cid in fetch_campaign_ids(login) if str(cid) in live_campaigns]
         for level in ("adgroup", "keyword", "ad"):
             object_rows += build_object_rows(
                 fetch_objects(login, level, campaign_ids), level, seen_on=today_iso)
-        query_rows += fetch_search_queries(login, slice_from, date_to, goals=goals)
+        query_rows += fetch_search_queries(login, queries_from, date_to, goals=goals)
     agent_db.upsert_objects(object_rows)
+    query_rows = top_queries_by_cost(query_rows)
     agent_db.upsert_search_queries(query_rows)
 
     # 9. Снимок настроек.
