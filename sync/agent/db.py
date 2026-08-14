@@ -514,14 +514,14 @@ def table_sizes() -> List[Dict[str, Any]]:
     """Фактический объём таблиц агента — сверка с бюджетом ~40 МБ."""
     return _fetch_dicts(
         """
-        SELECT relname AS table_name,
+        SELECT c.relname AS table_name,
                pg_size_pretty(pg_total_relation_size(c.oid)) AS size,
                pg_total_relation_size(c.oid) AS size_bytes,
-               n_live_tup AS approx_rows
+               COALESCE(s.n_live_tup, 0) AS approx_rows
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
-        WHERE relname LIKE 'edu_agent_%%' AND c.relkind = 'r'
+        WHERE c.relname LIKE 'edu_agent_%%' AND c.relkind = 'r'
         ORDER BY pg_total_relation_size(c.oid) DESC
         """
     )
