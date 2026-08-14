@@ -16,6 +16,7 @@ import io
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List
 
 import requests
@@ -33,6 +34,9 @@ POLL_SECONDS = 10
 PAGE_LIMIT = 1000
 CAMPAIGN_CHUNK = 10
 MAX_OFFSET = 10_000
+# Параллелизм снимка объектов: у API Директа есть суточный лимит баллов,
+# поэтому воркеров немного.
+OBJECT_WORKERS = 4
 
 # Срез → поле Reports API. Состав проверен probe-прогоном 31781715471:
 # Device / Gender / Age / AdNetworkType / TargetingLocationName принимаются,
@@ -237,9 +241,11 @@ def fetch_objects(login: str, object_level: str, campaign_ids: List[int]) -> Lis
     ограничена 10000 — форма проверена рабочим sync/edu_direct_settings.py.
     """
     url, collection, fields, extra = _OBJECT_ENDPOINTS[object_level]
-    out: List[Dict[str, Any]] = []
-    for start in range(0, len(campaign_ids), CAMPAIGN_CHUNK):
-        chunk = campaign_ids[start:start + CAMPAIGN_CHUNK]
+    chunks = [campaign_ids[i:i + CAMPAIGN_CHUNK]
+              for i in range(0, len(campaign_ids), CAMPAIGN_CHUNK)]
+
+    def _fetch_chunk(chunk: List[int]) -> List[Dict[str, Any]]:
+        items_all: List[Dict[str, Any]] = []
         offset = 0
         while True:
             result = _api_post(
@@ -257,12 +263,22 @@ def fetch_objects(login: str, object_level: str, campaign_ids: List[int]) -> Lis
                 f"{object_level}.get",
             )
             items = result.get(collection) or []
-            out += items
+            items_all += items
             if len(items) < PAGE_LIMIT:
                 break
             offset += PAGE_LIMIT
             if offset >= MAX_OFFSET:
                 break
+        return items_all
+
+    # Чанки кампаний параллельно: 163 кампании × 3 уровня × 4 кабинета — это ~200
+    # последовательных запросов, из-за которых прогон 31783879686 шёл 35+ минут.
+    out: List[Dict[str, Any]] = []
+    if not chunks:
+        return out
+    with ThreadPoolExecutor(max_workers=OBJECT_WORKERS) as pool:
+        for done in as_completed([pool.submit(_fetch_chunk, c) for c in chunks]):
+            out += done.result()
     return out
 
 
