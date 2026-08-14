@@ -46,20 +46,28 @@ def _window(days: int) -> tuple:
     return (today - timedelta(days=days)).isoformat(), today.isoformat()
 
 
-def _direct_logins() -> List[str]:
-    """Логины кабинетов. DIRECT_CLIENTS_JSON — список словарей {login, ...},
-    формат задан sync/direct.py::_direct_clients."""
+def _direct_clients() -> List[Dict[str, Any]]:
+    """Кабинеты с целями. DIRECT_CLIENTS_JSON — список словарей
+    {login, goal_ids, sheet_name}, формат задан sync/direct.py::_direct_clients.
+
+    Цели нужны не для красоты: без Goals в запросе Reports API не отдаёт колонку
+    Conversions и отвергает FieldNames с ошибкой 8000.
+    """
     raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
+    out: List[Dict[str, Any]] = []
     if raw:
-        out = []
         for item in json.loads(raw):
-            login = str(item.get("login", "")).strip() if isinstance(item, dict) else str(item).strip()
+            if isinstance(item, dict):
+                login = str(item.get("login", "")).strip()
+                goals = item.get("goal_ids") or item.get("goals") or []
+            else:
+                login, goals = str(item).strip(), []
             if login:
-                out.append(login)
+                out.append({"login": login, "goal_ids": [str(g) for g in goals]})
         if out:
             return out
     login = (os.environ.get("DIRECT_CLIENT_LOGIN") or "").strip()
-    return [login] if login else []
+    return [{"login": login, "goal_ids": []}] if login else []
 
 
 def _attach_expected_payments(
@@ -152,7 +160,7 @@ def main() -> int:
     agent_db.upsert_experiments(quasi)
 
     slice_from = (date.today() - timedelta(days=SLICE_WINDOW_DAYS)).isoformat()
-    logins = [] if skip_direct else _direct_logins()
+    clients = [] if skip_direct else _direct_clients()
 
     # 6. Вычисляемые настройки. Считаем и складываем — применение на Э1.
     base_clicks = sum(f["clicks"] for f in recent)
@@ -160,9 +168,10 @@ def main() -> int:
     base_conv = (base_expected / base_clicks) if base_clicks else 0.0
     computed_rows: List[Dict[str, Any]] = []
     if base_conv > 0:
-        for login in logins:
+        for client in clients:
+            login, goals = client["login"], client["goal_ids"]
             for kind in ("device", "gender", "age", "hour"):
-                segment_rows = fetch_segment_report(login, kind, cutoff, date_to)
+                segment_rows = fetch_segment_report(login, kind, cutoff, date_to, goals=goals)
                 enriched = _attach_expected_payments(segment_rows, base_expected)
                 if kind == "hour":
                     computed_rows += compute_schedule(enriched, base_conv)
@@ -172,19 +181,22 @@ def main() -> int:
 
     # 7. Срезы по кампаниям — окно 90 дней, недельная грань, хвост в other.
     sliced_rows: List[Dict[str, Any]] = []
-    for login in logins:
+    for client in clients:
+        login, goals = client["login"], client["goal_ids"]
         for kind in ("region", "network", "device"):
-            report_rows = fetch_segment_report(login, kind, slice_from, date_to, by_campaign=True)
+            report_rows = fetch_segment_report(
+                login, kind, slice_from, date_to, by_campaign=True, goals=goals)
             sliced_rows += collapse_tail(build_sliced_facts(report_rows, kind))
     agent_db.upsert_sliced_facts(sliced_rows)
 
     # 8. Структура кабинета и поисковые запросы.
     object_rows: List[Dict[str, Any]] = []
     query_rows: List[Dict[str, Any]] = []
-    for login in logins:
+    for client in clients:
+        login, goals = client["login"], client["goal_ids"]
         for level in ("adgroup", "keyword", "ad"):
             object_rows += build_object_rows(fetch_objects(login, level), level, seen_on=today_iso)
-        query_rows += fetch_search_queries(login, slice_from, date_to)
+        query_rows += fetch_search_queries(login, slice_from, date_to, goals=goals)
     agent_db.upsert_objects(object_rows)
     agent_db.upsert_search_queries(query_rows)
 

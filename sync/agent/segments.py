@@ -75,14 +75,26 @@ def _run_report(login: str, payload: Dict[str, Any]) -> str:
             headers=_report_headers(login),
             timeout=120,
         )
+        # Директ отдаёт UTF-8, но без charset в заголовке — requests угадывает latin-1
+        # и русский текст ошибки превращается в мусор.
+        resp.encoding = "utf-8"
         if resp.status_code == 200:
             return resp.text
         if resp.status_code in (201, 202):
             time.sleep(POLL_SECONDS)
             waited += POLL_SECONDS
             continue
-        raise RuntimeError(f"Reports API {resp.status_code}: {resp.text[:300]}")
+        raise RuntimeError(f"Reports API {resp.status_code}: {resp.text[:400]}")
     raise TimeoutError(f"Отчёт не готов за {MAX_WAIT_SECONDS} с")
+
+
+def _with_goals(params: Dict[str, Any], goals: List[str]) -> Dict[str, Any]:
+    """Conversions — метрика, доступная только вместе с Goals: без них Reports API
+    отвергает FieldNames с ошибкой 8000 (проверено на прогоне 31781031949)."""
+    if goals:
+        params["Goals"] = [str(g) for g in goals]
+        params["AttributionModels"] = ["LSC"]
+    return params
 
 
 def _parse_tsv(text: str) -> List[Dict[str, str]]:
@@ -101,17 +113,20 @@ def _parse_tsv(text: str) -> List[Dict[str, str]]:
 
 
 def fetch_segment_report(
-    login: str, segment_kind: str, date_from: str, date_to: str, by_campaign: bool = False
+    login: str, segment_kind: str, date_from: str, date_to: str,
+    by_campaign: bool = False, goals: List[str] = (),
 ) -> List[Dict[str, Any]]:
     """Срез за окно. by_campaign=True добавляет разрез по кампаниям и датам —
     для edu_agent_facts_sliced; без него агрегат по аккаунту для корректировок."""
     field = SEGMENT_FIELDS[segment_kind]
-    fields = [field, "Clicks", "Cost", "Impressions", "Conversions"]
+    fields = [field, "Clicks", "Cost", "Impressions"]
+    if goals:
+        fields.append("Conversions")
     if by_campaign:
         fields = ["CampaignId", "Date"] + fields
 
     payload = {
-        "params": {
+        "params": _with_goals({
             "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
             "FieldNames": fields,
             "ReportName": f"agent-{segment_kind}-{'bycamp-' if by_campaign else ''}{date_from}-{date_to}",
@@ -120,7 +135,7 @@ def fetch_segment_report(
             "Format": "TSV",
             "IncludeVAT": "YES",
             "IncludeDiscount": "NO",
-        }
+        }, list(goals))
     }
 
     rows: List[Dict[str, Any]] = []
@@ -175,24 +190,32 @@ def fetch_objects(login: str, object_level: str) -> List[Dict[str, Any]]:
     return out
 
 
-def fetch_search_queries(login: str, date_from: str, date_to: str) -> List[Dict[str, Any]]:
+def fetch_search_queries(
+    login: str, date_from: str, date_to: str, goals: List[str] = ()
+) -> List[Dict[str, Any]]:
     """Поисковые запросы за окно, агрегат без дат. Только строки с кликами:
-    показы без кликов дают миллионы строк и ничего не решают."""
+    показы без кликов дают миллионы строк и ничего не решают.
+
+    Без goals колонка Conversions недоступна, и правило «расход без конверсий»
+    вырождается — кандидаты в минус-слова считать будет нечем."""
+    fields = ["CampaignId", "Query", "Criteria", "Cost", "Clicks"]
+    if goals:
+        fields.append("Conversions")
     payload = {
-        "params": {
+        "params": _with_goals({
             "SelectionCriteria": {
                 "DateFrom": date_from,
                 "DateTo": date_to,
                 "Filter": [{"Field": "Clicks", "Operator": "GREATER_THAN", "Values": ["0"]}],
             },
-            "FieldNames": ["CampaignId", "Query", "Criteria", "Cost", "Clicks", "Conversions"],
+            "FieldNames": fields,
             "ReportName": f"agent-queries-{date_from}-{date_to}",
             "ReportType": "SEARCH_QUERY_PERFORMANCE_REPORT",
             "DateRangeType": "CUSTOM_DATE",
             "Format": "TSV",
             "IncludeVAT": "YES",
             "IncludeDiscount": "NO",
-        }
+        }, list(goals))
     }
     return [
         {
