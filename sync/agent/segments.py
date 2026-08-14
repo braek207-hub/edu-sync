@@ -11,6 +11,7 @@ sync/agent/segments.py — загрузчики Директа для автоп
 Reports API асинхронный: 201/202 значат «отчёт готовится», нужен цикл ожидания.
 """
 
+import hashlib
 import io
 import json
 import os
@@ -65,8 +66,26 @@ def _report_headers(login: str) -> Dict[str, str]:
     return headers
 
 
+def _stamp_report_name(payload: Dict[str, Any]) -> None:
+    """Имя отчёта = префикс + хеш параметров.
+
+    Директ помнит связку имя↔параметры: повторный запрос с тем же именем, но
+    изменившимися параметрами отвергается с ошибкой 4000. Хеш делает имя
+    детерминированным по содержимому — те же параметры переиспользуют отчёт,
+    любое изменение даёт новое имя.
+    """
+    params = payload["params"]
+    prefix = str(params.get("ReportName") or "agent")
+    body = {k: v for k, v in params.items() if k != "ReportName"}
+    digest = hashlib.sha256(
+        json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:10]
+    params["ReportName"] = f"{prefix}-{digest}"
+
+
 def _run_report(login: str, payload: Dict[str, Any]) -> str:
     """Reports API асинхронный: 201/202 значит «готовится», нужен цикл ожидания."""
+    _stamp_report_name(payload)
     waited = 0
     while waited <= MAX_WAIT_SECONDS:
         resp = requests.post(
