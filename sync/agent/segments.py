@@ -46,10 +46,16 @@ SEGMENT_FIELDS = {
     "network": "AdNetworkType",
 }
 
+# Тексты объявлений живут НЕ в FieldNames, а в отдельном TextAdFieldNames — ads.get
+# отвергает "TextAd" в FieldNames ошибкой 8000 с перечнем допустимых значений.
 _OBJECT_ENDPOINTS = {
-    "adgroup": (ADGROUPS_URL, "AdGroups", ["Id", "CampaignId", "Name", "RegionIds", "NegativeKeywords"]),
-    "keyword": (KEYWORDS_URL, "Keywords", ["Id", "CampaignId", "AdGroupId", "Keyword", "State", "Status"]),
-    "ad": (ADS_URL, "Ads", ["Id", "CampaignId", "AdGroupId", "State", "Status", "Type", "TextAd"]),
+    "adgroup": (ADGROUPS_URL, "AdGroups",
+                ["Id", "CampaignId", "Name", "RegionIds", "NegativeKeywords"], {}),
+    "keyword": (KEYWORDS_URL, "Keywords",
+                ["Id", "CampaignId", "AdGroupId", "Keyword", "State", "Status"], {}),
+    "ad": (ADS_URL, "Ads",
+           ["Id", "CampaignId", "AdGroupId", "State", "Status", "Type", "Subtype"],
+           {"TextAdFieldNames": ["Title", "Title2", "Text", "Href", "DisplayUrlPath"]}),
 }
 
 
@@ -230,7 +236,7 @@ def fetch_objects(login: str, object_level: str, campaign_ids: List[int]) -> Lis
     подаются чанками по 10 (лимит API), страницы по 1000, глубина offset
     ограничена 10000 — форма проверена рабочим sync/edu_direct_settings.py.
     """
-    url, collection, fields = _OBJECT_ENDPOINTS[object_level]
+    url, collection, fields, extra = _OBJECT_ENDPOINTS[object_level]
     out: List[Dict[str, Any]] = []
     for start in range(0, len(campaign_ids), CAMPAIGN_CHUNK):
         chunk = campaign_ids[start:start + CAMPAIGN_CHUNK]
@@ -245,6 +251,7 @@ def fetch_objects(login: str, object_level: str, campaign_ids: List[int]) -> Lis
                         "SelectionCriteria": {"CampaignIds": chunk},
                         "FieldNames": fields,
                         "Page": {"Limit": PAGE_LIMIT, "Offset": offset},
+                        **extra,
                     },
                 },
                 f"{object_level}.get",
