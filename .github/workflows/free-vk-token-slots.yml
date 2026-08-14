@@ -1,0 +1,60 @@
+name: Освободить слоты токенов VK (разовая операция)
+
+# ТОЛЬКО РУЧНОЙ ЗАПУСК и только по договорённости с подрядчиком.
+#
+# Операция снимает ВСЕ токены указанного кабинета — включая рабочий токен агентства,
+# которое ходит тем же приложением (client_id). Выборочного удаления VK не даёт.
+# Сразу после чистки скрипт занимает ОДИН слот нашим токеном и сохраняет refresh_token,
+# чтобы дальше жить на обновлениях (обновление слот не занимает).
+#
+# Почему это вообще нужно: слот НЕ освобождается по истечении токена — «no more than
+# 5 tokens may exist simultaneously, regardless of token status». Протухшие токены наших
+# прошлых прогонов держали 4 слота из 5 и не отпускали бы их ещё месяц.
+#
+# После прогона: сказать подрядчику, что можно выпускать свой токен.
+on:
+  workflow_dispatch:
+    inputs:
+      client_id:
+        description: "client_id кабинета, чьи слоты чистим (полностью)"
+        required: true
+      confirm:
+        description: "Подтверждение: DELETE-ALL-TOKENS"
+        required: true
+        default: ""
+
+concurrency:
+  group: vk-token-free-slots
+  cancel-in-progress: false
+
+jobs:
+  free:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Apply DB migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/apply_lime_migrations.py
+      - name: Освободить слоты и занять один
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          VK_CLIENT_ID: ${{ secrets.VK_CLIENT_ID }}
+          VK_CLIENT_SECRET: ${{ secrets.VK_CLIENT_SECRET }}
+          VK_CLIENT_ID_2: ${{ secrets.VK_CLIENT_ID_2 }}
+          VK_CLIENT_SECRET_2: ${{ secrets.VK_CLIENT_SECRET_2 }}
+          VK_CLIENT_ID_3: ${{ secrets.VK_CLIENT_ID_3 }}
+          VK_CLIENT_SECRET_3: ${{ secrets.VK_CLIENT_SECRET_3 }}
+          VK_CLIENT_ID_4: ${{ secrets.VK_CLIENT_ID_4 }}
+          VK_CLIENT_SECRET_4: ${{ secrets.VK_CLIENT_SECRET_4 }}
+          FREE_VK_CLIENT_ID: ${{ github.event.inputs.client_id }}
+          FREE_VK_CONFIRM: ${{ github.event.inputs.confirm }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m scripts.free_vk_token_slots
