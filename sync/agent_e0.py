@@ -290,7 +290,24 @@ def main() -> int:
             agent_db.upsert_computed_settings(schedule_rows, calc_date=today_iso)
             computed_rows += schedule_rows
 
-    agent_db.upsert_behavior(behavior_rows, window_from=slice_from, window_to=date_to)
+    # Метрика отдаёт имя кампании, а не Id (probe 31788247020) — резолвим по фактам.
+    id_by_name = {str(f.get("campaign_name") or "").strip(): f["campaign_id"]
+                  for f in facts if f.get("campaign_name")}
+    resolved_behavior = []
+    unresolved = 0
+    for row in behavior_rows:
+        campaign_id = id_by_name.get(row["campaign_name"])
+        if not campaign_id:
+            unresolved += 1
+            continue
+        resolved_behavior.append({k: v for k, v in row.items() if k != "campaign_name"}
+                                 | {"campaign_id": campaign_id})
+    if unresolved:
+        agent_db.insert_guard_checks([{
+            "check_name": "metrika:name_resolution", "status": "OK",
+            "detail": {"unresolved_campaigns": unresolved, "resolved": len(resolved_behavior)},
+        }])
+    agent_db.upsert_behavior(resolved_behavior, window_from=slice_from, window_to=date_to)
 
     # 11. Отчёт мощности и фактический объём таблиц.
     report = power_report(list(aggregates.values()))
@@ -309,7 +326,7 @@ def main() -> int:
         "computed_settings": len(computed_rows),
         "profile_rows": len(profile_rows),
         "metrika_hourly": len(hourly_rows),
-        "metrika_behavior": len(behavior_rows),
+        "metrika_behavior": len(resolved_behavior),
         "power": report,
         "db_total_mb": total_mb,
         "db_tables": [{"t": s["table_name"], "size": s["size"]} for s in sizes],

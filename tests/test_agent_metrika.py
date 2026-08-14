@@ -39,28 +39,29 @@ def test_behavior_converts_rates_to_counts():
     # Храним суммы и счётчики: среднее по среднему не складывается
     # при перегруппировке по неделям и направлениям.
     data = {"data": [
-        {"dimensions": [{"name": "12345"}], "metrics": [200.0, 25.0, 3.5, 120.0]},
+        {"dimensions": [{"name": "vuz / ВПО / Поиск"}], "metrics": [200.0, 25.0, 3.5, 120.0]},
     ]}
     out = parse_campaign_behavior(data)
     assert len(out) == 1
     row = out[0]
-    assert row["campaign_id"] == "12345"
+    # Метрика отдаёт ИМЯ кампании, не Id — привязка к Id делается снаружи.
+    assert row["campaign_name"] == "vuz / ВПО / Поиск"
     assert row["visits"] == 200
     assert row["bounces"] == 50          # 25% от 200
     assert row["pageviews"] == 700       # 3.5 × 200
     assert row["visit_seconds"] == 24000  # 120 × 200
 
 
-def test_behavior_skips_non_numeric_campaign():
+def test_behavior_skips_placeholder_campaign():
     data = {"data": [
         {"dimensions": [{"name": "не задано"}], "metrics": [10.0, 0.0, 1.0, 5.0]},
-        {"dimensions": [{"name": "777"}], "metrics": [10.0, 0.0, 1.0, 5.0]},
+        {"dimensions": [{"name": "vuz / СПО"}], "metrics": [10.0, 0.0, 1.0, 5.0]},
     ]}
-    assert [r["campaign_id"] for r in parse_campaign_behavior(data)] == ["777"]
+    assert [r["campaign_name"] for r in parse_campaign_behavior(data)] == ["vuz / СПО"]
 
 
 def test_behavior_skips_incomplete_rows():
-    data = {"data": [{"dimensions": [{"name": "777"}], "metrics": [10.0, 0.0]}]}
+    data = {"data": [{"dimensions": [{"name": "vuz / СПО"}], "metrics": [10.0, 0.0]}]}
     assert parse_campaign_behavior(data) == []
 
 

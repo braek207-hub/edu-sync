@@ -81,6 +81,11 @@ def parse_hourly(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 def parse_campaign_behavior(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Ответ Метрики → поведение по кампаниям Директа.
 
+    ВАЖНО: Метрика отдаёт ИМЯ кампании, а не её Id — и ym:s:lastDirectClickOrder,
+    и ...OrderName возвращают одну и ту же строку с названием (probe 31788247020).
+    Поэтому здесь возвращается campaign_name, а привязка к Id делается снаружи
+    по справочнику имён из фактов.
+
     Отдаём суммы и счётчики: visits, bounces, pageviews, visit_seconds.
     Проценты и средние считает потребитель — иначе перегруппировка врёт.
     """
@@ -90,28 +95,28 @@ def parse_campaign_behavior(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         metrics = row.get("metrics") or []
         if not dims or len(metrics) < 4:
             continue
-        campaign_id = str(dims[0].get("name") or dims[0].get("id") or "").strip()
-        if not campaign_id or not campaign_id.isdigit():
+        campaign_name = str(dims[0].get("name") or "").strip()
+        if not campaign_name or campaign_name.lower() in {"не задано", "(not set)"}:
             continue
         visits = float(metrics[0] or 0.0)
         bounce_rate = float(metrics[1] or 0.0)      # проценты
         page_depth = float(metrics[2] or 0.0)       # страниц за визит
         avg_seconds = float(metrics[3] or 0.0)      # секунд за визит
         out.append({
-            "campaign_id": campaign_id,
+            "campaign_name": campaign_name,
             "visits": int(visits),
             "bounces": int(round(visits * bounce_rate / 100.0)),
             "pageviews": int(round(visits * page_depth)),
             "visit_seconds": int(round(visits * avg_seconds)),
         })
-    return sorted(out, key=lambda r: r["campaign_id"])
+    return sorted(out, key=lambda r: r["campaign_name"])
 
 
 def fetch_hourly_profile(counter_id: int, date_from: str, date_to: str) -> List[Dict[str, Any]]:
     """Визиты и достижения целей по часам суток."""
     params = {
         "ids": counter_id,
-        "metrics": "ym:s:visits,ym:s:goalDimensionVisits",
+        "metrics": "ym:s:visits,ym:s:sumGoalReachesAny",
         "dimensions": "ym:s:hour",
         "date1": date_from,
         "date2": date_to,
@@ -127,8 +132,8 @@ def fetch_campaign_behavior(counter_id: int, date_from: str, date_to: str) -> Li
     params = {
         "ids": counter_id,
         "metrics": "ym:s:visits,ym:s:bounceRate,ym:s:pageDepth,ym:s:avgVisitDurationSeconds",
-        "dimensions": "ym:s:lastsignDirectClickOrder",
-        "filters": "ym:s:lastsignTrafficSource=='ad'",
+        "dimensions": "ym:s:lastDirectClickOrderName",
+        "filters": "ym:s:lastTrafficSource=='ad'",
         "date1": date_from,
         "date2": date_to,
         "attribution": ATTRIBUTION,

@@ -552,12 +552,23 @@ def clear_bulk_tables() -> Dict[str, int]:
     а история проекта уже знает инцидент с исчерпанием диска.
     """
     removed: Dict[str, int] = {}
+    tables = ("edu_agent_search_queries", "edu_agent_objects")
     with get_connection() as conn:
         with conn.cursor() as cur:
-            for table in ("edu_agent_search_queries", "edu_agent_objects"):
+            for table in tables:
                 cur.execute(f"DELETE FROM {table} WHERE true")
                 removed[table] = cur.rowcount
         conn.commit()
+
+    # DELETE не возвращает место на диск: мёртвые строки лежат в файлах до VACUUM FULL.
+    # Без этого после чистки 1,2 млн строк таблица продолжала занимать сотни мегабайт.
+    # VACUUM нельзя выполнять внутри транзакции — нужен autocommit.
+    with get_connection() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            for table in tables:
+                cur.execute(f"VACUUM FULL {table}")
+        conn.autocommit = False
     return removed
 
 
