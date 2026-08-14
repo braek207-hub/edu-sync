@@ -30,7 +30,12 @@ from sync.agent.mining import mine_quasi_experiments
 from sync.agent.objects import build_object_rows
 from sync.agent.power import power_report
 from sync.agent.profile import build_profile, campaign_quality, distance_to_profile
-from sync.agent.segments import fetch_objects, fetch_search_queries, fetch_segment_report
+from sync.agent.segments import (
+    fetch_campaign_ids,
+    fetch_objects,
+    fetch_search_queries,
+    fetch_segment_report,
+)
 from sync.agent.settings_snapshot import build_snapshot_rows
 from sync.agent.slices import build_sliced_facts, collapse_tail
 
@@ -214,8 +219,10 @@ def main() -> int:
     query_rows: List[Dict[str, Any]] = []
     for client in clients:
         login, goals = client["login"], client["goal_ids"]
+        campaign_ids = fetch_campaign_ids(login)
         for level in ("adgroup", "keyword", "ad"):
-            object_rows += build_object_rows(fetch_objects(login, level), level, seen_on=today_iso)
+            object_rows += build_object_rows(
+                fetch_objects(login, level, campaign_ids), level, seen_on=today_iso)
         query_rows += fetch_search_queries(login, slice_from, date_to, goals=goals)
     agent_db.upsert_objects(object_rows)
     agent_db.upsert_search_queries(query_rows)

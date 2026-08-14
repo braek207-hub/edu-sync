@@ -21,13 +21,18 @@ from typing import Any, Dict, List
 import requests
 
 REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports"
+CAMPAIGNS_URL = "https://api.direct.yandex.com/json/v5/campaigns"
 ADGROUPS_URL = "https://api.direct.yandex.com/json/v5/adgroups"
 KEYWORDS_URL = "https://api.direct.yandex.com/json/v5/keywords"
 ADS_URL = "https://api.direct.yandex.com/json/v5/ads"
 
 MAX_WAIT_SECONDS = 600
 POLL_SECONDS = 10
-PAGE_LIMIT = 10_000
+# Формы, проверенные рабочим sync/edu_direct_settings.py: страница 1000,
+# кампании чанками по 10, глубина offset ограничена 10000.
+PAGE_LIMIT = 1000
+CAMPAIGN_CHUNK = 10
+MAX_OFFSET = 10_000
 
 # Срез → поле Reports API. Состав проверен probe-прогоном 31781715471:
 # Device / Gender / Age / AdNetworkType / TargetingLocationName принимаются,
@@ -177,37 +182,80 @@ def fetch_segment_report(
     return rows
 
 
-def fetch_objects(login: str, object_level: str) -> List[Dict[str, Any]]:
-    """Постранично тянет объекты уровня. SelectionCriteria обязан быть непустым:
-    у ads.get пустой критерий отклоняется с ошибкой."""
-    url, collection, fields = _OBJECT_ENDPOINTS[object_level]
-    out: List[Dict[str, Any]] = []
+def _api_post(url: str, login: str, payload: Dict[str, Any], what: str) -> Dict[str, Any]:
+    resp = requests.post(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=_api_headers(login),
+        timeout=120,
+    )
+    resp.encoding = "utf-8"
+    body = resp.json()
+    if body.get("error"):
+        raise RuntimeError(f"{what}: {body['error']}")
+    return body.get("result") or {}
+
+
+def fetch_campaign_ids(login: str) -> List[int]:
+    """Id всех кампаний кабинета — по ним отбираются объекты нижних уровней."""
+    out: List[int] = []
     offset = 0
     while True:
-        payload = {
-            "method": "get",
-            "params": {
-                "SelectionCriteria": {"States": ["ON", "OFF", "SUSPENDED"]},
-                "FieldNames": fields,
-                "Page": {"Limit": PAGE_LIMIT, "Offset": offset},
+        result = _api_post(
+            CAMPAIGNS_URL,
+            login,
+            {
+                "method": "get",
+                "params": {
+                    "SelectionCriteria": {},
+                    "FieldNames": ["Id"],
+                    "Page": {"Limit": PAGE_LIMIT, "Offset": offset},
+                },
             },
-        }
-        resp = requests.post(
-            url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=_api_headers(login),
-            timeout=120,
+            "campaigns.get",
         )
-        body = resp.json()
-        if body.get("error"):
-            raise RuntimeError(f"{object_level}.get: {body['error']}")
-        result = body.get("result") or {}
-        items = result.get(collection) or []
-        out += items
-        limited_by = result.get("LimitedBy") or 0
-        if not limited_by or not items:
+        items = result.get("Campaigns") or []
+        out += [int(c["Id"]) for c in items]
+        if len(items) < PAGE_LIMIT:
             break
-        offset = limited_by
+        offset += PAGE_LIMIT
+    return out
+
+
+def fetch_objects(login: str, object_level: str, campaign_ids: List[int]) -> List[Dict[str, Any]]:
+    """Объекты уровня по кампаниям.
+
+    SelectionCriteria для adgroups/keywords/ads — это CampaignIds, НЕ States:
+    States отвергается ошибкой 8000 «Указан неизвестный параметр». Кампании
+    подаются чанками по 10 (лимит API), страницы по 1000, глубина offset
+    ограничена 10000 — форма проверена рабочим sync/edu_direct_settings.py.
+    """
+    url, collection, fields = _OBJECT_ENDPOINTS[object_level]
+    out: List[Dict[str, Any]] = []
+    for start in range(0, len(campaign_ids), CAMPAIGN_CHUNK):
+        chunk = campaign_ids[start:start + CAMPAIGN_CHUNK]
+        offset = 0
+        while True:
+            result = _api_post(
+                url,
+                login,
+                {
+                    "method": "get",
+                    "params": {
+                        "SelectionCriteria": {"CampaignIds": chunk},
+                        "FieldNames": fields,
+                        "Page": {"Limit": PAGE_LIMIT, "Offset": offset},
+                    },
+                },
+                f"{object_level}.get",
+            )
+            items = result.get(collection) or []
+            out += items
+            if len(items) < PAGE_LIMIT:
+                break
+            offset += PAGE_LIMIT
+            if offset >= MAX_OFFSET:
+                break
     return out
 
 
