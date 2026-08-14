@@ -44,7 +44,14 @@ def select_holdout(
     for c in alive:
         by_direction.setdefault(c.get("direction") or "unknown", []).append(c)
 
-    picked: List[Dict[str, Any]] = []
+    # Целевой размер считается от ВСЕГО кабинета, а не по каждой страте отдельно:
+    # «минимум одна на страту» при 3 стратах × N направлений раздувает заповедник
+    # в разы (замер на 26% кабинета вместо 6%).
+    global_target = max(round(len(alive) * share), 1)
+
+    # Очередь кандидатов внутри направления: сначала средняя страта (не край
+    # распределения), затем крупные и мелкие; внутри страты — детерминированно по хешу.
+    queues: Dict[str, List[Dict[str, Any]]] = {}
     for direction, items in sorted(by_direction.items()):
         costs = sorted(float(i.get("cost_30d") or 0.0) for i in items)
         third = max(len(costs) // 3, 1)
@@ -55,17 +62,30 @@ def select_holdout(
             key = _stratum(direction, float(item.get("cost_30d") or 0.0), thresholds)
             by_stratum.setdefault(key, []).append(item)
 
-        target = max(round(len(items) * share), 1)
-        per_stratum = max(target // max(len(by_stratum), 1), 1)
+        queue: List[Dict[str, Any]] = []
+        for suffix in ("mid", "large", "small"):
+            group = by_stratum.get(f"{direction}:{suffix}", [])
+            for item in sorted(group, key=lambda c: _rank(c["campaign_id"], seed)):
+                queue.append({**item, "stratum": f"{direction}:{suffix}"})
+        queues[direction] = queue
 
-        for stratum, group in sorted(by_stratum.items()):
-            ordered = sorted(group, key=lambda c: _rank(c["campaign_id"], seed))
-            for item in ordered[:per_stratum]:
+    # Обход направлений по кругу: каждое получает представителя раньше, чем любое
+    # направление получит второго — репрезентативность важнее точной пропорции.
+    picked: List[Dict[str, Any]] = []
+    round_index = 0
+    while len(picked) < global_target and any(len(q) > round_index for q in queues.values()):
+        for direction in sorted(queues):
+            if len(picked) >= global_target:
+                break
+            queue = queues[direction]
+            if len(queue) > round_index:
+                item = queue[round_index]
                 picked.append({
                     "campaign_id": item["campaign_id"],
                     "direction": direction,
-                    "stratum": stratum,
+                    "stratum": item["stratum"],
                     "reason": "стратифицированный отбор, детерминированный по хешу id",
                 })
+        round_index += 1
 
     return sorted(picked, key=lambda c: c["campaign_id"])

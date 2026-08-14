@@ -15,8 +15,15 @@ def _campaigns(n_per_dir=10):
 
 
 def test_selects_about_target_share():
+    # Доля считается от всего кабинета: 30 кампаний × 10% = 3, а не «по одной на страту».
     picked = select_holdout(_campaigns(), share=0.1)
-    assert 2 <= len(picked) <= 12  # 3 направления × страты, по одной кампании минимум
+    assert len(picked) == 3
+
+
+def test_share_six_percent_stays_small():
+    # Регрессия: заповедник разрастался до 26% кабинета из-за минимума на каждую страту.
+    picked = select_holdout(_campaigns(n_per_dir=28), share=0.06)
+    assert len(picked) == 5  # 84 кампании × 6%
 
 
 def test_is_deterministic_across_runs():

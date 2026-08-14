@@ -422,6 +422,17 @@ def upsert_settings_snapshot(rows: List[Dict[str, Any]]) -> int:
     )
 
 
+def clear_holdout() -> int:
+    """Сброс заповедника. Только по явному флагу: состав держится весь сезон,
+    случайная пересборка ломает базу сравнения для всех замеров."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM edu_agent_holdout WHERE excluded_at IS NULL")
+            removed = cur.rowcount
+        conn.commit()
+    return removed
+
+
 def upsert_holdout(rows: List[Dict[str, Any]], included_on: str) -> int:
     payload = [{**r, "included_at": included_on} for r in rows]
     return _batch(

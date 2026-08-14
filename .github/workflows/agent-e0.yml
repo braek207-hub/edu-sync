@@ -11,6 +11,11 @@ on:
         required: false
         type: boolean
         default: false
+      rebuild_holdout:
+        description: "Пересобрать заповедник (состав держится весь сезон — только осознанно)"
+        required: false
+        type: boolean
+        default: false
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -30,5 +35,8 @@ jobs:
           ARGS="--days ${{ github.event.inputs.days || '180' }}"
           if [ "${{ github.event.inputs.skip_direct }}" = "true" ]; then
             ARGS="$ARGS --skip-direct"
+          fi
+          if [ "${{ github.event.inputs.rebuild_holdout }}" = "true" ]; then
+            ARGS="$ARGS --rebuild-holdout"
           fi
           python -m sync.agent_e0 $ARGS

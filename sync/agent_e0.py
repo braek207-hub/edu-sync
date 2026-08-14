@@ -141,7 +141,9 @@ def main() -> int:
         agg["eff_leads_30d"] += f["eff_leads"]
         agg["sum_p_pay_30d"] += f["sum_p_pay"]
 
-    # 4. Заповедник.
+    # 4. Заповедник. Состав держится весь сезон — пересборка только по явному флагу.
+    if "--rebuild-holdout" in sys.argv:
+        agent_db.clear_holdout()
     holdout = select_holdout(list(aggregates.values()))
     agent_db.upsert_holdout(holdout, included_on=today_iso)
 
