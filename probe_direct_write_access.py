@@ -100,13 +100,22 @@ def _post(url: str, login: str, payload: Dict[str, Any]) -> tuple:
 
 
 def _logins() -> List[str]:
-    raw = os.environ.get("DIRECT_CLIENTS_JSON")
+    """Логины кабинетов. DIRECT_CLIENTS_JSON — список словарей вида
+    {"login": ..., "goal_ids": [...], "sheet_name": ...}, а не список строк:
+    формат задан sync/direct.py::_direct_clients, отступать от него нельзя."""
+    raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
     if raw:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return list(parsed.values())
-        return [str(x) for x in parsed]
-    return [os.environ["DIRECT_CLIENT_LOGIN"]]
+        out: List[str] = []
+        for item in json.loads(raw):
+            login = str(item.get("login", "")).strip() if isinstance(item, dict) else str(item).strip()
+            if login:
+                out.append(login)
+        if out:
+            return out
+    login = (os.environ.get("DIRECT_CLIENT_LOGIN") or "").strip()
+    if login:
+        return [login]
+    raise RuntimeError("Нужен DIRECT_CLIENTS_JSON или DIRECT_CLIENT_LOGIN")
 
 
 def probe(login: str, real_write: bool = False) -> Dict[str, Any]:

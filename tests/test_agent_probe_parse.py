@@ -47,3 +47,34 @@ def test_experiments_available_when_result_returned():
 def test_experiments_no_access_on_error_58():
     body = {"error": {"error_code": 58, "error_string": "Нет доступа к сервису"}}
     assert experiments_endpoint_verdict(200, body) == "NO_ACCESS"
+
+
+def test_logins_parsed_from_dict_list(monkeypatch):
+    # DIRECT_CLIENTS_JSON — список словарей (формат sync/direct.py), не список строк.
+    # Строковое представление словаря в Client-Login даёт ошибку 8800.
+    import json as _json
+
+    from probe_direct_write_access import _logins
+
+    monkeypatch.setenv(
+        "DIRECT_CLIENTS_JSON",
+        _json.dumps([{"login": "account3-506455-yo8h", "goal_ids": [1], "sheet_name": "Vuz"}]),
+    )
+    assert _logins() == ["account3-506455-yo8h"]
+
+
+def test_logins_skip_entries_without_login(monkeypatch):
+    import json as _json
+
+    from probe_direct_write_access import _logins
+
+    monkeypatch.setenv("DIRECT_CLIENTS_JSON", _json.dumps([{"login": ""}, {"login": "acc-1"}]))
+    assert _logins() == ["acc-1"]
+
+
+def test_logins_fallback_to_single_login(monkeypatch):
+    from probe_direct_write_access import _logins
+
+    monkeypatch.delenv("DIRECT_CLIENTS_JSON", raising=False)
+    monkeypatch.setenv("DIRECT_CLIENT_LOGIN", "solo-login")
+    assert _logins() == ["solo-login"]
