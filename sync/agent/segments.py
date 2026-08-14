@@ -29,12 +29,14 @@ MAX_WAIT_SECONDS = 600
 POLL_SECONDS = 10
 PAGE_LIMIT = 10_000
 
-# Срез → поле Reports API.
+# Срез → поле Reports API. Состав проверен probe-прогоном 31781715471:
+# Device / Gender / Age / AdNetworkType / TargetingLocationName принимаются,
+# а HourOfDay отвергается ошибкой 8000 — почасовой детализации расхода
+# CUSTOM_REPORT не отдаёт вообще. Расписание считается на Э1 из Метрики.
 SEGMENT_FIELDS = {
     "device": "Device",
     "gender": "Gender",
     "age": "Age",
-    "hour": "HourOfDay",
     "region": "TargetingLocationName",
     "network": "AdNetworkType",
 }

@@ -20,7 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from sync.agent import db as agent_db
-from sync.agent.computed import compute_schedule, compute_segment_modifiers
+from sync.agent.computed import compute_segment_modifiers
 from sync.agent.facts import assemble_facts
 from sync.agent.guard import check_continuity, check_freshness, verdict
 from sync.agent.holdout import select_holdout
@@ -170,13 +170,12 @@ def main() -> int:
     if base_conv > 0:
         for client in clients:
             login, goals = client["login"], client["goal_ids"]
-            for kind in ("device", "gender", "age", "hour"):
+            # Расписания здесь нет: HourOfDay отвергается Reports API (probe 31781715471),
+            # почасовой расход придёт из Метрики на Э1.
+            for kind in ("device", "gender", "age"):
                 segment_rows = fetch_segment_report(login, kind, cutoff, date_to, goals=goals)
                 enriched = _attach_expected_payments(segment_rows, base_expected)
-                if kind == "hour":
-                    computed_rows += compute_schedule(enriched, base_conv)
-                else:
-                    computed_rows += compute_segment_modifiers(enriched, base_conv)
+                computed_rows += compute_segment_modifiers(enriched, base_conv)
     agent_db.upsert_computed_settings(computed_rows, calc_date=today_iso)
 
     # 7. Срезы по кампаниям — окно 90 дней, недельная грань, хвост в other.
