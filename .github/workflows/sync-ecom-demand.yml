@@ -19,6 +19,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
       - run: pip install -r requirements.txt
       - name: Run ecom demand sync
         run: python sync_ecom_demand.py
@@ -26,3 +27,6 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           YANDEX_SEARCHAPI_KEY: ${{ secrets.YANDEX_SEARCHAPI_KEY }}
           WORDSTAT_FROM: ${{ github.event.inputs.wordstat_from }}
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
