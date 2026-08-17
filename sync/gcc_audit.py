@@ -231,6 +231,30 @@ def audit():
     except Exception as e:  # noqa: BLE001
         print(f"TWCL ERR {type(e).__name__}: {e}")
 
+    # Клик ≈ СЕССИЯ, не DAU. Сверяем клики с сессиями GA4 и визитами Метрики (не с users!).
+    gses = run_report(GA4_PROPERTY, frm_s, to_s, ["sessionSource", "sessionMedium"],
+                      ("sessions",), hf)
+    gg_s, gm_s = 0, 0
+    for r in gses:
+        p = _g_plat(r["dims"][0], r["dims"][1])
+        if p == "google":
+            gg_s += int(r["metrics"][0])
+        elif p == "meta":
+            gm_s += int(r["metrics"][0])
+    mvis = _m(["ym:s:lastsignSourceEngine", "ym:s:startURLDomain"], ["ym:s:visits"], frm_s, to_s,
+              filters="ym:s:lastsignTrafficSource=='ad'")
+    mg_v, mm_v = 0, 0
+    for r in mvis:
+        if not domain_country_gcc5(r["dimensions"][1]["name"]):
+            continue
+        e = (r["dimensions"][0]["name"] or "").lower()
+        if "google" in e:
+            mg_v += int(r["metrics"][0])
+        elif any(x in e for x in ("instagram", "facebook", "meta")):
+            mm_v += int(r["metrics"][0])
+    print(f"SESS Google | GA4_sessions={gg_s} Metrika_visits={mg_v}")
+    print(f"SESS Meta   | GA4_sessions={gm_s} Metrika_visits={mm_v}")
+
     # ── 9. КОНВЕРСИЯ по каналу: заказы (TW в lime_stats) / Метрика DAU
     print("\n### CONV lime_stats платный: channel/subchannel | users orders CR% | clicks(лид)")
     import psycopg2
