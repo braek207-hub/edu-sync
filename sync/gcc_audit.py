@@ -254,6 +254,8 @@ def audit():
             mm_v += int(r["metrics"][0])
     print(f"SESS Google | GA4_sessions={gg_s} Metrika_visits={mg_v}")
     print(f"SESS Meta   | GA4_sessions={gm_s} Metrika_visits={mm_v}")
+    for r in sorted(gses, key=lambda x: -int(x["metrics"][0]))[:10]:
+        print(f"GSESS_SRC {r['dims'][0]}/{r['dims'][1]} | {int(r['metrics'][0])}")
 
     # ── 9. КОНВЕРСИЯ по каналу: заказы (TW в lime_stats) / Метрика DAU
     print("\n### CONV lime_stats платный: channel/subchannel | users orders CR% | clicks(лид)")
