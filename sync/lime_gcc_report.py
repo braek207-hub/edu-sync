@@ -1043,6 +1043,10 @@ def main() -> None:
         from sync.gcc_audit import ru_direct_check
         ru_direct_check()
         return
+    if mode == "page-data":  # данные для страницы «старый vs новый подход» (одно окно, обе методики)
+        from sync.gcc_audit import page_data
+        page_data()
+        return
 
     from sync.sheets_write import get_write_service
     service = get_write_service()

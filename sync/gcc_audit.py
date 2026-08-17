@@ -278,6 +278,144 @@ def audit():
     print("\n### AUDIT DONE")
 
 
+def page_data():
+    """Данные для страницы «старый vs новый подход» — одно окно, обе методики.
+
+    Считает на ОДНОМ 30-дн окне и одних данных, чтобы разница была на 100% из-за метода:
+      • Трафик-знаменатель: GA4 users по группам каналов (старый) vs Метрика DAU (новый).
+      • Заказы-числитель: linearAll (старый, дробно 1/N) vs lastPlatformClick (новый, весь заказ)
+        — оба из ОДНОГО TW-ответа, чтобы тотал совпал, а разошлось лишь распределение.
+      • Конверсия платного: заказы/DAU в обеих связках.
+    Печатает parseable-секции PD_*, страницу строим по логу.
+    """
+    from collections import defaultdict
+
+    from sync.gcc_channels import map_tw_source
+    from sync.gcc_triplewhale import fetch_tw_orders, order_touchpoint
+
+    to = date.fromisoformat(os.environ["LIME_GCC_TO"]) if os.environ.get("LIME_GCC_TO") \
+        else date.today() - timedelta(days=1)
+    frm = date.fromisoformat(os.environ["LIME_GCC_FROM"]) if os.environ.get("LIME_GCC_FROM") \
+        else to - timedelta(days=29)
+    frm_s, to_s = frm.isoformat(), to.isoformat()
+    print(f"### PAGE-DATA окно {frm_s}..{to_s}")
+
+    hosts = set(HOST_COUNTRY.keys())
+
+    # ── ТРАФИК GA4 по группам каналов (GCC-хосты, всё окно) ──
+    def _paid_group(g):
+        return g in ("Paid Search", "Paid Social", "Cross-network", "Display",
+                     "Paid Shopping", "Paid Other")
+    gch = run_report(GA4_PROPERTY, frm_s, to_s,
+                     ["sessionDefaultChannelGroup", "hostName"], ("totalUsers", "activeUsers"))
+    ga_grp_tot, ga_grp_act = defaultdict(int), defaultdict(int)
+    for r in gch:
+        if (r["dims"][1] or "").lower() not in hosts:
+            continue
+        g = r["dims"][0]
+        ga_grp_tot[g] += int(r["metrics"][0])
+        ga_grp_act[g] += int(r["metrics"][1])
+    ga_total = sum(ga_grp_tot.values())
+    ga_act_total = sum(ga_grp_act.values())
+    ga_paid = sum(v for g, v in ga_grp_tot.items() if _paid_group(g))
+    ga_goog = ga_grp_tot.get("Paid Search", 0) + ga_grp_tot.get("Cross-network", 0)
+    ga_meta = ga_grp_tot.get("Paid Social", 0)
+    print("\n### PD_GA4 group | totalUsers | activeUsers")
+    for g, v in sorted(ga_grp_tot.items(), key=lambda x: -x[1]):
+        print(f"PD_GA4 {g} | {v} | {ga_grp_act.get(g, 0)}")
+    print(f"PD_GA4TOT total={ga_total} active={ga_act_total} paid={ga_paid} "
+          f"google={ga_goog} meta={ga_meta}")
+
+    # ── ТРАФИК Метрика DAU (GCC5, всё окно) ──
+    mall = _m(["ym:s:startURLDomain"], ["ym:s:users"], frm_s, to_s, limit=200)
+    m_total = sum(int(r["metrics"][0]) for r in mall
+                  if domain_country_gcc5(r["dimensions"][0]["name"]))
+    mpaid = _m(["ym:s:lastsignSourceEngine", "ym:s:startURLDomain"], ["ym:s:users"], frm_s, to_s,
+               filters="ym:s:lastsignTrafficSource=='ad'")
+    m_paid = m_goog = m_meta = 0
+    m_paid_eng = defaultdict(int)
+    for r in mpaid:
+        if not domain_country_gcc5(r["dimensions"][1]["name"]):
+            continue
+        e = (r["dimensions"][0]["name"] or "").lower()
+        u = int(r["metrics"][0])
+        m_paid += u
+        m_paid_eng[e or "∅"] += u
+        if "google" in e:
+            m_goog += u
+        elif any(x in e for x in ("instagram", "facebook", "meta")):
+            m_meta += u
+    print(f"\n### PD_M total={m_total} paid={m_paid} google={m_goog} meta={m_meta} "
+          f"organic={m_total - m_paid}")
+    for e, u in sorted(m_paid_eng.items(), key=lambda x: -x[1])[:12]:
+        print(f"PD_MENG {e} | {u}")
+
+    # ── ЗАКАЗЫ: linearAll vs lastPlatformClick из одного TW-ответа ──
+    tw = fetch_tw_orders(os.environ["GCC_TRIPLEWHALE_API_KEY"],
+                         os.environ["GCC_TW_SHOP_DOMAIN"], frm_s, to_s)
+    lpc_o, lpc_r = defaultdict(float), defaultdict(float)   # lastPlatformClick (новый)
+    lin_o, lin_r = defaultdict(float), defaultdict(float)   # linearAll (старый)
+    tt_lpc_o, tt_lin_o = defaultdict(float), defaultdict(float)  # по traffic_type
+    tt_lpc_r, tt_lin_r = defaultdict(float), defaultdict(float)
+    total_orders = 0
+    total_rev = 0.0
+    for o in tw:
+        total_orders += 1
+        rev = float(o.get("total_price") or 0)
+        total_rev += rev
+        # НОВЫЙ: весь заказ последнему платформенному клику
+        tp = order_touchpoint(o)
+        ch, sc, tt = map_tw_source(tp.get("source") or None, (tp.get("campaignId") or "").strip() or None)
+        key = f"{ch}/{sc}"
+        lpc_o[key] += 1
+        lpc_r[key] += rev
+        tt_lpc_o[tt] += 1
+        tt_lpc_r[tt] += rev
+        # СТАРЫЙ: linearAll — 1/N на касание
+        la = (o.get("attribution") or {}).get("linearAll") or []
+        if la:
+            w = 1.0 / len(la)
+            for t in la:
+                ch2, sc2, tt2 = map_tw_source(t.get("source") or None,
+                                              (t.get("campaignId") or "").strip() or None)
+                k2 = f"{ch2}/{sc2}"
+                lin_o[k2] += w
+                lin_r[k2] += rev * w
+                tt_lin_o[tt2] += w
+                tt_lin_r[tt2] += rev * w
+        else:  # нет журнала — оба метода кладут в тот же lpc-бакет
+            lin_o[key] += 1
+            lin_r[key] += rev
+            tt_lin_o[tt] += 1
+            tt_lin_r[tt] += rev
+    print(f"\n### PD_ORDTOT orders={total_orders} revenue={total_rev:.0f}")
+    print("### PD_ORD channel | last_orders last_rev | linear_orders linear_rev")
+    for k in sorted(set(lpc_o) | set(lin_o), key=lambda x: -(lpc_o.get(x, 0) + lin_o.get(x, 0))):
+        print(f"PD_ORD {k} | {lpc_o.get(k,0):.1f} {lpc_r.get(k,0):.0f} | "
+              f"{lin_o.get(k,0):.1f} {lin_r.get(k,0):.0f}")
+    print("### PD_TT traffic_type | last_orders last_rev | linear_orders linear_rev")
+    for tt in sorted(set(tt_lpc_o) | set(tt_lin_o)):
+        print(f"PD_TT {tt} | {tt_lpc_o.get(tt,0):.1f} {tt_lpc_r.get(tt,0):.0f} | "
+              f"{tt_lin_o.get(tt,0):.1f} {tt_lin_r.get(tt,0):.0f}")
+
+    # ── КОНВЕРСИЯ платного: заказы платные / DAU платные, обе связки ──
+    lpc_paid_o = tt_lpc_o.get("Платный", 0)
+    lin_paid_o = tt_lin_o.get("Платный", 0)
+    print("\n### PD_CONV method | paid_orders | paid_DAU | CR%")
+    if m_paid:
+        print(f"PD_CONV НОВЫЙ(last/Метрика) | {lpc_paid_o:.0f} | {m_paid} | "
+              f"{lpc_paid_o / m_paid * 100:.2f}")
+    if ga_paid:
+        print(f"PD_CONV СТАРЫЙ(linear/GA4) | {lin_paid_o:.0f} | {ga_paid} | "
+              f"{lin_paid_o / ga_paid * 100:.2f}")
+    # промежуточные комбинации — изолировать вклад каждого сдвига
+    if ga_paid:
+        print(f"PD_CONV last/GA4 | {lpc_paid_o:.0f} | {ga_paid} | {lpc_paid_o / ga_paid * 100:.2f}")
+    if m_paid:
+        print(f"PD_CONV linear/Метрика | {lin_paid_o:.0f} | {m_paid} | {lin_paid_o / m_paid * 100:.2f}")
+    print("\n### PAGE-DATA DONE")
+
+
 def ru_direct_check():
     """RU: клики Яндекс.Директа (lime_direct_stats) vs Метрика DAU/визиты (lime_metrika_campaign_ru).
 
