@@ -1039,6 +1039,10 @@ def main() -> None:
         from sync.gcc_audit import audit
         audit()
         return
+    if mode == "ru-direct-check":  # RU: клики Директа vs Метрика DAU (родная пара), только БД
+        from sync.gcc_audit import ru_direct_check
+        ru_direct_check()
+        return
 
     from sync.sheets_write import get_write_service
     service = get_write_service()

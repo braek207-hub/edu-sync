@@ -276,3 +276,46 @@ def audit():
         conn.close()
 
     print("\n### AUDIT DONE")
+
+
+def ru_direct_check():
+    """RU: клики Яндекс.Директа (lime_direct_stats) vs Метрика DAU/визиты (lime_metrika_campaign_ru).
+
+    Проверка родной пары Метрика↔Директ (аналог GA4↔Google Ads): насколько Метрика ловит
+    свою рекламу. Всё из БД, без API.
+    """
+    import psycopg2
+    to = date.fromisoformat(os.environ["LIME_GCC_TO"]) if os.environ.get("LIME_GCC_TO") \
+        else date.today() - timedelta(days=1)
+    frm = date.fromisoformat(os.environ["LIME_GCC_FROM"]) if os.environ.get("LIME_GCC_FROM") \
+        else to - timedelta(days=29)
+    conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
+    with conn.cursor() as cur:
+        cur.execute("SELECT date::text, SUM(clicks)::int FROM lime_direct_stats "
+                    "WHERE date BETWEEN %s AND %s GROUP BY date", (frm, to))
+        clk = dict(cur.fetchall())
+        cur.execute("SELECT date::text, SUM(users)::int, SUM(visits)::int "
+                    "FROM lime_metrika_campaign_ru WHERE traffic_type='Платный' "
+                    "AND subchannel ILIKE '%Директ%' AND date BETWEEN %s AND %s GROUP BY date",
+                    (frm, to))
+        mu = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+        cur.execute("SELECT subchannel, SUM(users)::int FROM lime_metrika_campaign_ru "
+                    "WHERE traffic_type='Платный' AND date BETWEEN %s AND %s "
+                    "GROUP BY subchannel ORDER BY 2 DESC", (frm, to))
+        brk = cur.fetchall()
+    conn.close()
+    print(f"### RU платные подканалы Метрики: {brk}")
+    print(f"### RU date | direct_clicks | metrika_visits | metrika_DAU | visits/clicks% | DAU/clicks%")
+    tc = tv = tu = 0
+    d = frm
+    while d <= to:
+        iso = d.isoformat()
+        c = clk.get(iso, 0)
+        u, v = mu.get(iso, (0, 0))
+        tc += c; tv += v; tu += u
+        vc = round(v / c * 100, 1) if c else 0
+        uc = round(u / c * 100, 1) if c else 0
+        print(f"RU {iso} | {c} | {v} | {u} | {vc} | {uc}")
+        d += timedelta(days=1)
+    print(f"RU TOTAL | clicks={tc} visits={tv} DAU={tu} | visits/clicks={round(tv/tc*100,1) if tc else 0}% "
+          f"DAU/clicks={round(tu/tc*100,1) if tc else 0}%")
