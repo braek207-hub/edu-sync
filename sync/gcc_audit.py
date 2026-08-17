@@ -217,4 +217,36 @@ def audit():
     for path, v in sorted(mlagg.items(), key=lambda x: -x[1][0])[:20]:
         print(f"MLND {path[:70]} | v={v[0]} u={v[1]}")
 
+    # ── 8. КЛИКИ Google Ads/Meta (из TW ads_table) vs Метрика DAU
+    print("\n### CLICKS TW ads_table по каналу:")
+    try:
+        from sync.gcc_tw_ads import tw_sql
+        tk, shop = os.environ.get("GCC_TRIPLEWHALE_API_KEY"), os.environ.get("GCC_TW_SHOP_DOMAIN")
+        q = ("SELECT channel, SUM(clicks) AS clicks, SUM(impressions) AS impressions, "
+             "SUM(spend) AS spend FROM ads_table "
+             "WHERE event_date BETWEEN @startDate AND @endDate GROUP BY channel")
+        for r in tw_sql(tk, shop, q, frm_s, to_s):
+            print(f"TWCL {r.get('channel')} | clicks={r.get('clicks')} "
+                  f"impr={r.get('impressions')} spend={r.get('spend')}")
+    except Exception as e:  # noqa: BLE001
+        print(f"TWCL ERR {type(e).__name__}: {e}")
+
+    # ── 9. КОНВЕРСИЯ по каналу: заказы (TW в lime_stats) / Метрика DAU
+    print("\n### CONV lime_stats платный: channel/subchannel | users orders CR% | clicks(лид)")
+    import psycopg2
+    conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT channel, subchannel, SUM(users)::int, SUM(purchases_count)::int, "
+                "ROUND(SUM(purchases_revenue)::numeric,0) "
+                "FROM lime_stats WHERE region='gcc' AND data_source='web' "
+                "AND traffic_type='Платный' AND date BETWEEN %s AND %s "
+                "GROUP BY channel, subchannel ORDER BY 3 DESC", (frm_s, to_s))
+            for ch, sc, u, o, rev in cur.fetchall():
+                cr = round(o / u * 100, 2) if u else 0
+                print(f"CONV {ch}/{sc} | u={u} o={o} cr={cr}% rev={rev}")
+    finally:
+        conn.close()
+
     print("\n### AUDIT DONE")
