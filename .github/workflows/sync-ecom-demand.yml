@@ -1,0 +1,28 @@
+name: E-com Demand Sync
+
+on:
+  schedule:
+    - cron: "20 2 * * *"   # 05:20 Moscow, после основного синка
+  workflow_dispatch:
+    inputs:
+      wordstat_from:
+        description: "Бэкфилл недель с даты (YYYY-MM-DD); пусто = инкремент"
+        required: false
+        default: ""
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run ecom demand sync
+        run: python sync_ecom_demand.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          YANDEX_SEARCHAPI_KEY: ${{ secrets.YANDEX_SEARCHAPI_KEY }}
+          WORDSTAT_FROM: ${{ github.event.inputs.wordstat_from }}
