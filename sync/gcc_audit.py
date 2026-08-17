@@ -296,8 +296,8 @@ def ru_direct_check():
         clk = dict(cur.fetchall())
         cur.execute("SELECT date::text, SUM(users)::int, SUM(visits)::int "
                     "FROM lime_metrika_campaign_ru WHERE traffic_type='Платный' "
-                    "AND subchannel ILIKE '%Директ%' AND date BETWEEN %s AND %s GROUP BY date",
-                    (frm, to))
+                    "AND subchannel ILIKE %s AND date BETWEEN %s AND %s GROUP BY date",
+                    ("%Директ%", frm, to))
         mu = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
         cur.execute("SELECT subchannel, SUM(users)::int FROM lime_metrika_campaign_ru "
                     "WHERE traffic_type='Платный' AND date BETWEEN %s AND %s "
