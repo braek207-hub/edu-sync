@@ -357,12 +357,24 @@ def page_data():
     lin_o, lin_r = defaultdict(float), defaultdict(float)   # linearAll (старый)
     tt_lpc_o, tt_lin_o = defaultdict(float), defaultdict(float)  # по traffic_type
     tt_lpc_r, tt_lin_r = defaultdict(float), defaultdict(float)
+    # дневные платные заказы обеих моделей — для таблицы-приложения и дневной CR
+    day_lpc_paid, day_lin_paid = defaultdict(float), defaultdict(float)
+    dkey = None
+    if tw:
+        for cand in ("created_at", "createdAt", "date", "order_date", "orderDate",
+                     "processed_at", "createdAtShopTz"):
+            v = tw[0].get(cand)
+            if isinstance(v, str) and v[:3] == "202":
+                dkey = cand
+                break
+        print(f"PD_ORDKEYS dkey={dkey} keys={sorted(tw[0].keys())}")
     total_orders = 0
     total_rev = 0.0
     for o in tw:
         total_orders += 1
         rev = float(o.get("total_price") or 0)
         total_rev += rev
+        iso_o = (o.get(dkey) or "")[:10] if dkey else None
         # НОВЫЙ: весь заказ последнему платформенному клику
         tp = order_touchpoint(o)
         ch, sc, tt = map_tw_source(tp.get("source") or None, (tp.get("campaignId") or "").strip() or None)
@@ -371,6 +383,8 @@ def page_data():
         lpc_r[key] += rev
         tt_lpc_o[tt] += 1
         tt_lpc_r[tt] += rev
+        if tt == "Платный" and iso_o:
+            day_lpc_paid[iso_o] += 1
         # СТАРЫЙ: linearAll — 1/N на касание
         la = (o.get("attribution") or {}).get("linearAll") or []
         if la:
@@ -383,11 +397,15 @@ def page_data():
                 lin_r[k2] += rev * w
                 tt_lin_o[tt2] += w
                 tt_lin_r[tt2] += rev * w
+                if tt2 == "Платный" and iso_o:
+                    day_lin_paid[iso_o] += w
         else:  # нет журнала — оба метода кладут в тот же lpc-бакет
             lin_o[key] += 1
             lin_r[key] += rev
             tt_lin_o[tt] += 1
             tt_lin_r[tt] += rev
+            if tt == "Платный" and iso_o:
+                day_lin_paid[iso_o] += 1
     print(f"\n### PD_ORDTOT orders={total_orders} revenue={total_rev:.0f}")
     print("### PD_ORD channel | last_orders last_rev | linear_orders linear_rev")
     for k in sorted(set(lpc_o) | set(lin_o), key=lambda x: -(lpc_o.get(x, 0) + lin_o.get(x, 0))):
@@ -413,6 +431,120 @@ def page_data():
         print(f"PD_CONV last/GA4 | {lpc_paid_o:.0f} | {ga_paid} | {lpc_paid_o / ga_paid * 100:.2f}")
     if m_paid:
         print(f"PD_CONV linear/Метрика | {lin_paid_o:.0f} | {m_paid} | {lin_paid_o / m_paid * 100:.2f}")
+
+    dates = _dates(frm, to)
+
+    # ── ДНЕВНЫЕ РЯДЫ ТРАФИКА: обе системы, тотал и платный ──
+    ga_day = fetch_ga4_traffic(GA4_PROPERTY, dates, "totalUsers")
+    md_rows = _m(["ym:s:date", "ym:s:startURLDomain"], ["ym:s:users"], frm_s, to_s)
+    md_tot = defaultdict(int)
+    for r in md_rows:
+        if domain_country_gcc5(r["dimensions"][1]["name"]):
+            md_tot[r["dimensions"][0]["name"]] += int(r["metrics"][0])
+    mdp_rows = _m(["ym:s:date", "ym:s:startURLDomain"], ["ym:s:users"], frm_s, to_s,
+                  filters="ym:s:lastsignTrafficSource=='ad'")
+    md_paid = defaultdict(int)
+    for r in mdp_rows:
+        if domain_country_gcc5(r["dimensions"][1]["name"]):
+            md_paid[r["dimensions"][0]["name"]] += int(r["metrics"][0])
+    print("\n### PD_DAY iso | m_total m_paid | ga_total ga_paid | lin_paid_ord lpc_paid_ord")
+    for iso in dates:
+        g = ga_day.get(iso, {}).get("GCC", {"org": 0, "paid": 0})
+        print(f"PD_DAY {iso} | {md_tot.get(iso, 0)} {md_paid.get(iso, 0)} | "
+              f"{g['org'] + g['paid']} {g['paid']} | "
+              f"{day_lin_paid.get(iso, 0):.1f} {day_lpc_paid.get(iso, 0):.0f}")
+
+    # ── ПЛАТФОРМЫ ПО ДНЯМ: Google/Meta в обеих системах (как audit §6) ──
+    gpd = run_report(GA4_PROPERTY, frm_s, to_s,
+                     ["date", "sessionDefaultChannelGroup", "hostName"], ("totalUsers",))
+    g_goog_d, g_meta_d = defaultdict(int), defaultdict(int)
+    for r in gpd:
+        if (r["dims"][2] or "").lower() not in hosts:
+            continue
+        dr = r["dims"][0]
+        d0 = f"{dr[:4]}-{dr[4:6]}-{dr[6:8]}"
+        chg = r["dims"][1]
+        if chg in ("Paid Search", "Cross-network"):
+            g_goog_d[d0] += int(r["metrics"][0])
+        elif chg == "Paid Social":
+            g_meta_d[d0] += int(r["metrics"][0])
+    mpd = _m(["ym:s:date", "ym:s:lastsignSourceEngine", "ym:s:startURLDomain"], ["ym:s:users"],
+             frm_s, to_s, filters="ym:s:lastsignTrafficSource=='ad'")
+    m_goog_d, m_meta_d = defaultdict(int), defaultdict(int)
+    for r in mpd:
+        if not domain_country_gcc5(r["dimensions"][2]["name"]):
+            continue
+        e = (r["dimensions"][1]["name"] or "").lower()
+        iso = r["dimensions"][0]["name"]
+        if "google" in e:
+            m_goog_d[iso] += int(r["metrics"][0])
+        elif any(x in e for x in ("instagram", "facebook", "meta")):
+            m_meta_d[iso] += int(r["metrics"][0])
+    print("\n### PD_PLATD iso | m_google ga_google | m_meta ga_meta")
+    for iso in dates:
+        print(f"PD_PLATD {iso} | {m_goog_d.get(iso, 0)} {g_goog_d.get(iso, 0)} | "
+              f"{m_meta_d.get(iso, 0)} {g_meta_d.get(iso, 0)}")
+
+    # ── КЛИКИ КАБИНЕТОВ (TW ads_table) — внешний якорь, тоталы и по дням ──
+    try:
+        from sync.gcc_tw_ads import tw_sql
+        tk, shop = os.environ["GCC_TRIPLEWHALE_API_KEY"], os.environ["GCC_TW_SHOP_DOMAIN"]
+        rows = tw_sql(tk, shop,
+                      "SELECT event_date, channel, SUM(clicks) AS clicks, SUM(spend) AS spend "
+                      "FROM ads_table WHERE event_date BETWEEN @startDate AND @endDate "
+                      "GROUP BY event_date, channel", frm_s, to_s)
+        clk_tot, clk_g_d, clk_m_d = defaultdict(float), defaultdict(float), defaultdict(float)
+        spend_tot = defaultdict(float)
+        for r in rows:
+            chn = (r.get("channel") or "?").lower()
+            iso = str(r.get("event_date") or "")[:10]
+            c = float(r.get("clicks") or 0)
+            clk_tot[chn] += c
+            spend_tot[chn] += float(r.get("spend") or 0)
+            if "google" in chn:
+                clk_g_d[iso] += c
+            elif "facebook" in chn or "meta" in chn:
+                clk_m_d[iso] += c
+        print("\n### PD_CLK channel | clicks | spend")
+        for chn, c in sorted(clk_tot.items(), key=lambda x: -x[1]):
+            print(f"PD_CLK {chn} | {c:.0f} | {spend_tot[chn]:.0f}")
+        print("### PD_CLKD iso | google_clicks | meta_clicks")
+        for iso in dates:
+            print(f"PD_CLKD {iso} | {clk_g_d.get(iso, 0):.0f} | {clk_m_d.get(iso, 0):.0f}")
+    except Exception as e:  # noqa: BLE001
+        print(f"PD_CLK ERR {type(e).__name__}: {e}")
+
+    # ── СЕССИИ/ВИЗИТЫ vs КЛИКИ (то же окно): проверка на уровне посещений ──
+    def _g_plat2(src, med):
+        s, m2 = (src or "").lower(), (med or "").lower()
+        if "google" in s and any(x in m2 for x in ("cpc", "paid", "ppc")):
+            return "google"
+        if "cross" in m2:
+            return "google"
+        if any(x in s for x in ("facebook", "instagram", "fb", "ig", "meta")) and \
+           any(x in m2 for x in ("cpc", "paid", "ppc", "social")):
+            return "meta"
+        return None
+    hf = {"filter": {"fieldName": "hostName",
+                     "inListFilter": {"values": list(HOST_COUNTRY.keys())}}}
+    gses = run_report(GA4_PROPERTY, frm_s, to_s, ["sessionSource", "sessionMedium"],
+                      ("sessions",), hf)
+    gg_s = sum(int(r["metrics"][0]) for r in gses if _g_plat2(r["dims"][0], r["dims"][1]) == "google")
+    gm_s = sum(int(r["metrics"][0]) for r in gses if _g_plat2(r["dims"][0], r["dims"][1]) == "meta")
+    mvis = _m(["ym:s:lastsignSourceEngine", "ym:s:startURLDomain"], ["ym:s:visits"], frm_s, to_s,
+              filters="ym:s:lastsignTrafficSource=='ad'")
+    mg_v = mm_v = 0
+    for r in mvis:
+        if not domain_country_gcc5(r["dimensions"][1]["name"]):
+            continue
+        e = (r["dimensions"][0]["name"] or "").lower()
+        if "google" in e:
+            mg_v += int(r["metrics"][0])
+        elif any(x in e for x in ("instagram", "facebook", "meta")):
+            mm_v += int(r["metrics"][0])
+    print(f"\nPD_SESS google | ga4_sessions={gg_s} m_visits={mg_v}")
+    print(f"PD_SESS meta | ga4_sessions={gm_s} m_visits={mm_v}")
+
     print("\n### PAGE-DATA DONE")
 
 
