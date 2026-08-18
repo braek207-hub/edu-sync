@@ -76,31 +76,55 @@ def report(name: str, rows) -> None:
     print(f"  топ трекеров Директа: {trackers.most_common(10)}")
 
 
+def params_report(name: str, rows) -> None:
+    """Какие ключи лежат в click_url_parameters у Директа и есть ли там кампания.
+    Печатаются только имена параметров и пример числового значения-кампании —
+    не сырые ссылки (там yclid и прочие идентификаторы кликов)."""
+    if rows is None:
+        return
+    import re
+    from urllib.parse import parse_qsl
+    direct = [r for r in rows if (r.get("publisher_name") or "").startswith("Yandex.Direct")]
+    print(f"\n== {name}: Директ-строк {len(direct):,} из {len(rows):,} ==")
+    keys = Counter()
+    camp_vals = Counter()
+    with_params = 0
+    for r in direct:
+        raw = (r.get("click_url_parameters") or "").strip()
+        if not raw:
+            continue
+        with_params += 1
+        pairs = dict(parse_qsl(raw)) if "=" in raw else {}
+        for k in pairs:
+            keys[k] += 1
+        for key in ("campaign_id", "campaignid", "cid", "campaign"):
+            v = (pairs.get(key) or "").strip()
+            if re.fullmatch(r"\d{6,12}", v):
+                camp_vals[key] += 1
+    print(f"  строк с click_url_parameters: {with_params:,}/{len(direct):,}")
+    print(f"  ключи параметров: {keys.most_common(20)}")
+    print(f"  числовая кампания по ключам: {dict(camp_vals)}")
+
+
 def main() -> None:
     to = date.today() - timedelta(days=1)
-    frm = to - timedelta(days=6)
-    day = to.isoformat()
-    print(f"окно {frm}..{to}, день кликов {day}")
+    frm = to - timedelta(days=2)
+    print(f"окно {frm}..{to}")
 
-    report("installations 7д",
-           export_json("installations", frm.isoformat(), to.isoformat(),
-                       "appmetrica_device_id,publisher_name,tracker_name"))
-    report("deeplinks 7д",
-           export_json("deeplinks", frm.isoformat(), to.isoformat(),
-                       "appmetrica_device_id,publisher_name,tracker_name"))
+    inst = export_json("installations", frm.isoformat(), to.isoformat(),
+                       "appmetrica_device_id,publisher_name,tracker_name,click_url_parameters")
+    report("installations 3д", inst)
+    params_report("installations 3д, click_url_parameters", inst)
 
-    # Клики: сначала пробуем с device id — если Logs API поле не знает (400),
-    # повторяем без него, чтобы хотя бы увидеть объём и паблишеров.
-    clicks = export_json("clicks", day, day,
-                         "appmetrica_device_id,publisher_name,tracker_name,click_datetime")
-    if clicks is None:
-        clicks = export_json("clicks", day, day,
-                             "publisher_name,tracker_name,click_datetime")
-    report(f"clicks {day}", clicks)
-    if clicks:
-        with_dev = sum(1 for r in clicks if (r.get("appmetrica_device_id") or "").strip())
-        print(f"  clicks с appmetrica_device_id: {with_dev:,}/{len(clicks):,}"
-              f" ({with_dev / len(clicks):.1%})")
+    # По коду диплинки click_url_parameters не отдают (HTTP 400) — перепроверяем:
+    # если API поменялся, кампанию можно доставать и из них.
+    dl = export_json("deeplinks", frm.isoformat(), to.isoformat(),
+                     "appmetrica_device_id,publisher_name,tracker_name,click_url_parameters")
+    if dl is None:
+        print("deeplinks: click_url_parameters всё ещё не отдаётся (см. HTTP выше)")
+    else:
+        report("deeplinks 3д", dl)
+        params_report("deeplinks 3д, click_url_parameters", dl)
 
 
 if __name__ == "__main__":
