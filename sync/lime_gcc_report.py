@@ -34,6 +34,12 @@ TRAFFIC_TAB = os.environ.get("LIME_GCC_TRAFFIC_TAB") or "Fact Traffic GCC"
 ORDERS_TAB = os.environ.get("LIME_GCC_ORDERS_TAB") or "Fact Orders GCC"
 GA4_TAB = os.environ.get("LIME_GCC_GA4_TAB") or "Fact Traffic GA4"
 COMPARE_TAB = os.environ.get("LIME_GCC_COMPARE_TAB") or "Сверка web DAU"
+# Заказы по НОВОЙ методике (весь заказ последней платной площадке, lastPlatformClick) —
+# отдельный лист рядом с linear-листом, структура колонок та же.
+ORDERS_LPC_TAB = os.environ.get("LIME_GCC_ORDERS_LPC_TAB") or "Fact Orders LPC"
+# Сверка конверсий было/стало на формулах (web): числители из двух листов заказов,
+# знаменатели из GA4-листа (было) и Метрика-листа (стало).
+CR_TAB = os.environ.get("LIME_GCC_CR_TAB") or "Сверка CR web"
 
 REFRESH_DAYS = int(os.environ.get("LIME_GCC_REFRESH_DAYS") or "7")
 BUILD_FROM = os.environ.get("LIME_GCC_FROM") or "2025-08-01"
@@ -147,6 +153,40 @@ def _linear_paid_frac(order: dict) -> float:
     return paid / len(la)
 
 
+def _order_paid_lpc(order: dict) -> bool:
+    """Платный ли заказ по НОВОЙ методике: последняя платная площадка пути.
+
+    order_touchpoint отдаёт первый непустой тачпоинт lastPlatformClick→lastClick→fullLastClick;
+    классификация — тем же map_tw_source, что и у linear (одна таксономия каналов).
+    Нет атрибуции → бесплатный.
+    """
+    from sync.gcc_triplewhale import map_tw_source, order_touchpoint
+    tp = order_touchpoint(order)
+    if not tp:
+        return False
+    referrer = (tp.get("campaignId") or "").strip() or None
+    return map_tw_source(tp.get("source"), referrer)[2] == "Платный"
+
+
+def aggregate_orders_lpc(orders_by_date: dict, country_map: dict, app_ids: set,
+                         dates: list[str]) -> dict:
+    """Заказы по lastPlatformClick (весь заказ платной площадке): date → {scope → metrics}.
+
+    В отличие от linear здесь нет дробей: каждый заказ целиком либо paid, либо organic —
+    web_paid+web_org = число web-заказов среза, тотал совпадает с linear-листом по построению.
+    """
+    out = {d: _empty_day() for d in dates}
+    for iso in dates:
+        for o in orders_by_date.get(iso, []):
+            oid = str(o.get("order_id") or "")
+            plat = "app" if oid in app_ids else "web"
+            code = _COUNTRY_CODE.get((country_map.get(oid) or "").strip())
+            field = f"{plat}_paid" if _order_paid_lpc(o) else f"{plat}_org"
+            for scope in (_GCC,) + ((code,) if code else ()):
+                out[iso][scope][field] += 1
+    return out
+
+
 def aggregate_orders_linear(orders_by_date: dict, country_map: dict, app_ids: set,
                             dates: list[str]) -> dict:
     """Заказы по linearAll, округлённые с ТОЧНЫМ тоталом: date → {scope → metrics}.
@@ -178,19 +218,32 @@ def aggregate_orders_linear(orders_by_date: dict, country_map: dict, app_ids: se
     return out
 
 
-def fetch_orders_linear(dates: list[str]) -> dict:
-    """Заказы GCC по linearAll из TW+Shopify (канал web/app + страна доставки)."""
+def _fetch_orders_raw(dates: list[str]) -> tuple[dict, dict, set] | None:
+    """Сырьё заказов за окно: (orders_by_date, country_map, app_ids) из TW+Shopify.
+
+    Один тяжёлый фетч (TW с journeys по дням) — на него садятся ОБЕ агрегации
+    (linear и lastPlatformClick), чтобы листы считались из одного среза данных.
+    Нет ключа TW → None (заказы 0).
+    """
     from sync.gcc_shopify import fetch_order_meta
     from sync.gcc_triplewhale import fetch_tw_orders
 
     if not os.environ.get("GCC_TRIPLEWHALE_API_KEY"):
         print("orders: GCC_TRIPLEWHALE_API_KEY не задан — заказы 0")
-        return {d: _empty_day() for d in dates}
+        return None
     tw_key = os.environ["GCC_TRIPLEWHALE_API_KEY"]
     shop = os.environ["GCC_TW_SHOP_DOMAIN"]
     country_map, app_ids = fetch_order_meta(os.environ["API_LIME_SHOPIFY"], dates[0], dates[-1])
     by_date = {iso: fetch_tw_orders(tw_key, shop, iso, iso) for iso in dates}
-    return aggregate_orders_linear(by_date, country_map, app_ids, dates)
+    return by_date, country_map, app_ids
+
+
+def fetch_orders_linear(dates: list[str]) -> dict:
+    """Заказы GCC по linearAll из TW+Shopify (канал web/app + страна доставки)."""
+    raw = _fetch_orders_raw(dates)
+    if raw is None:
+        return {d: _empty_day() for d in dates}
+    return aggregate_orders_linear(*raw, dates)
 
 
 def _row_values(iso: str, day: dict) -> dict:
@@ -346,7 +399,12 @@ def _run(service, dates: list[str], mode: str) -> None:
     else:
         print("gcc_app: APPMETRICA_TOKEN не задан — app-трафик 0")
 
-    orders = fetch_orders_linear(dates)  # web+app по linearAll из TW+Shopify
+    raw = _fetch_orders_raw(dates)  # один TW-фетч → обе модели атрибуции
+    if raw is None:
+        orders = orders_lpc = {d: _empty_day() for d in dates}
+    else:
+        orders = aggregate_orders_linear(*raw, dates)      # старая методика (linear)
+        orders_lpc = aggregate_orders_lpc(*raw, dates)     # новая (последняя платная)
 
     # ЗАПИСЬ A — полный день гарантированно: web(Метрика) + app total(Reporting, без разбивки) + заказы.
     for tab, data in ((TRAFFIC_TAB, traffic), (ORDERS_TAB, orders)):
@@ -354,6 +412,11 @@ def _run(service, dates: list[str], mode: str) -> None:
             _build_tab(service, tab, dates, data)
         else:
             _refresh_tab(service, tab, dates, data)
+    # LPC-лист — best-effort: до первого orders-lpc-build вкладки нет, синк не рушим.
+    try:
+        _refresh_tab(service, ORDERS_LPC_TAB, dates, orders_lpc)
+    except RuntimeError as e:
+        print(f"{ORDERS_LPC_TAB}: пропуск ({e}) — создать разово режимом orders-lpc-build")
     for iso in dates:
         g = traffic[iso][_GCC]
         print(f"{iso}: web {g['web_org']}/{g['web_paid']} app total {g['app_org'] + g['app_paid']}")
@@ -952,6 +1015,76 @@ def ga4_compare_formulas(service) -> None:
         print("  ", [c for c in r[:5]])
 
 
+def orders_lpc_build(service) -> None:
+    """Разовый бэкфилл листа заказов по новой методике (lastPlatformClick) за всю историю.
+
+    Окно: LIME_GCC_FROM (default BUILD_FROM) .. LIME_GCC_TO (default вчера МСК). Дальше лист
+    ведёт ежедневный refresh в _run.
+    """
+    to_env = os.environ.get("LIME_GCC_TO")
+    to = date.fromisoformat(to_env) if to_env else _msk_today() - timedelta(days=1)
+    dates = _dates(date.fromisoformat(BUILD_FROM), to)
+    print(f"orders-lpc-build: окно {dates[0]}..{dates[-1]} ({len(dates)} дн.)")
+    raw = _fetch_orders_raw(dates)
+    if raw is None:
+        raise SystemExit("orders-lpc-build: нет GCC_TRIPLEWHALE_API_KEY")
+    data = aggregate_orders_lpc(*raw, dates)
+    _build_tab(service, ORDERS_LPC_TAB, dates, data)
+    tot_paid = sum(data[d][_GCC]["web_paid"] + data[d][_GCC]["app_paid"] for d in dates)
+    tot = sum(sum(data[d][_GCC][f] for f in ("web_paid", "web_org", "app_paid", "app_org"))
+              for d in dates)
+    print(f"orders-lpc-build: заказов {tot}, из них платных {tot_paid}")
+
+
+def cr_compare_formulas(service) -> None:
+    """Лист «Сверка CR web» на ФОРМУЛАХ: конверсия было/стало по дням, платный/бесплатный, страны.
+
+    CR было = заказы linear ('Fact Orders GCC') / трафик GA4 ('Fact Traffic GA4');
+    CR стало = заказы LPC ('Fact Orders LPC') / трафик Метрики ('Fact Traffic GCC').
+    Только web: у app источник трафика в обеих методиках один (AppMetrica), сравнивать нечего.
+    Автообновление: формулы тянут значения из четырёх листов по дате и имени колонки.
+    """
+    from sync.sheets_write import add_tab, get_locale, list_tabs, read_values, write_formulas
+
+    loc = get_locale(service, SHEET_ID)
+    s = ";" if loc.split("_")[0] in ("ru", "de", "fr", "es", "it", "pt", "nl", "pl", "tr", "uk") else ","
+
+    def vlook(tab: str, col: str) -> str:
+        return (f"VLOOKUP($A$2:$A{s}'{tab}'!$A:$BZ{s}"
+                f"MATCH(\"{col}\"{s}'{tab}'!$1:$1{s}0){s}FALSE)")
+
+    def cr(num_tab: str, num_col: str, den_tab: str, den_col: str) -> str:
+        return (f"=ARRAYFORMULA(IF($A$2:$A=\"\"{s}\"\"{s}IFERROR(ROUND("
+                f"{vlook(num_tab, num_col)}/{vlook(den_tab, den_col)}*100{s}2){s}\"\")))")
+
+    # (метка, префикс колонок Метрика/заказы, ORG/PAID-колонки GA4-листа)
+    scopes = [("GCC", "", "ORG Total", "PAID Total")] + \
+             [(c, f"{c} ", f"ORG {c}", f"PAID {c}") for c in _CODES]
+
+    header = ["Дата"]
+    row2 = [f"=ARRAYFORMULA(IF('{TRAFFIC_TAB}'!$A$2:$A=\"\"{s}\"\"{s}'{TRAFFIC_TAB}'!$A$2:$A))"]
+    for label, p, ga_org, ga_paid in scopes:
+        header += [f"{label} Paid CR было", f"{label} Paid CR стало",
+                   f"{label} Org CR было", f"{label} Org CR стало"]
+        row2 += [
+            cr(ORDERS_TAB, f"{p}Web Paid", GA4_TAB, ga_paid),
+            cr(ORDERS_LPC_TAB, f"{p}Web Paid", TRAFFIC_TAB, f"{p}Web Paid"),
+            cr(ORDERS_TAB, f"{p}Web Org", GA4_TAB, ga_org),
+            cr(ORDERS_LPC_TAB, f"{p}Web Org", TRAFFIC_TAB, f"{p}Web Org"),
+        ]
+
+    print(f"локаль книги {loc}, разделитель '{s}'")
+    if CR_TAB not in set(list_tabs(service, SHEET_ID)):
+        add_tab(service, SHEET_ID, CR_TAB)
+        print(f"создана вкладка «{CR_TAB}»")
+    write_formulas(service, SHEET_ID, f"{CR_TAB}!A1", [header, row2])
+    print(f"{CR_TAB}: формулы записаны ({len(header)} колонок)")
+    chk = read_values(service, SHEET_ID, f"{CR_TAB}!A1:E6", render="FORMATTED_VALUE")
+    print("проверка (Дата | GCC Paid CR было | GCC Paid CR стало | GCC Org CR было | GCC Org CR стало):")
+    for r in chk:
+        print("  ", [c for c in r[:5]])
+
+
 def ga4_run(service, dates: list[str], mode: str) -> None:
     """Собрать GA4-трафик по hostName/каналам и записать лист GA4.
 
@@ -1079,6 +1212,12 @@ def main() -> None:
         return
     if mode == "compare-formulas":  # создать лист сверки на формулах (GA4 всего vs Метрика DAU)
         ga4_compare_formulas(service)
+        return
+    if mode == "orders-lpc-build":  # разовый бэкфилл листа заказов по новой методике (LPC)
+        orders_lpc_build(service)
+        return
+    if mode == "cr-compare-formulas":  # лист «Сверка CR web» было/стало на формулах
+        cr_compare_formulas(service)
         return
     if mode == "build":
         to_env = os.environ.get("LIME_GCC_TO")

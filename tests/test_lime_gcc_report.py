@@ -189,3 +189,30 @@ def test_row_values_covers_every_header_column():
 
 def test_date_label():
     assert _date_label("2026-07-28") == "Tue 28/07/2026"
+
+
+def test_aggregate_orders_lpc_whole_order_to_paid_or_org():
+    """LPC: заказ целиком paid (последняя платная площадка) либо целиком org; без дробей."""
+    from sync.lime_gcc_report import aggregate_orders_lpc
+
+    def order(oid, source, referrer=None):
+        tp = {"source": source}
+        if referrer:
+            tp["campaignId"] = referrer
+        return {"order_id": oid, "attribution": {"lastPlatformClick": [tp] if source else []}}
+
+    by_date = {"2026-07-01": [
+        order("1", "google-ads"),            # платный → web_paid (страна UAE)
+        order("2", "facebook-ads"),          # платный, app-заказ
+        order("3", "organic_and_social", "google"),  # SEO → org
+        order("4", None),                    # без атрибуции → org, страна не опознана
+    ]}
+    country = {"1": "ОАЭ", "2": "Саудовская Аравия", "3": "ОАЭ"}
+    out = aggregate_orders_lpc(by_date, country, app_ids={"2"}, dates=["2026-07-01"])
+
+    g = out["2026-07-01"]["GCC"]
+    assert g == {"web_org": 2, "web_paid": 1, "app_org": 0, "app_paid": 1}
+    assert out["2026-07-01"]["UAE"] == {"web_org": 1, "web_paid": 1, "app_org": 0, "app_paid": 0}
+    assert out["2026-07-01"]["KSA"] == {"web_org": 0, "web_paid": 0, "app_org": 0, "app_paid": 1}
+    # тотал заказов сходится: сумма всех полей GCC = 4
+    assert sum(g.values()) == 4
