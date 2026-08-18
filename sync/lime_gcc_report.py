@@ -1049,9 +1049,27 @@ def cr_compare_formulas(service) -> None:
     loc = get_locale(service, SHEET_ID)
     s = ";" if loc.split("_")[0] in ("ru", "de", "fr", "es", "it", "pt", "nl", "pl", "tr", "uk") else ","
 
+    # У исторических листов шапка НЕ обязана быть в строке 1 (сверху примечания) — читаем
+    # реальную строку заголовка и колонку «Дата» каждого листа, формулы строим по факту.
+    meta: dict[str, dict] = {}
+    for tab in (TRAFFIC_TAB, ORDERS_TAB, ORDERS_LPC_TAB, GA4_TAB):
+        grid = read_values(service, SHEET_ID, f"{tab}!A1:BZ12", render="FORMATTED_VALUE")
+        hdr_i = _header_row(grid)
+        if hdr_i is None:
+            raise SystemExit(f"cr-compare: в «{tab}» нет строки заголовков с «Дата»")
+        cols = {_norm(c): j for j, c in enumerate(grid[hdr_i])}
+        meta[tab] = {"row1": hdr_i + 2, "date_j": cols["Дата"], "cols": cols}
+        print(f"{tab}: заголовок в строке {hdr_i + 1}, колонок {len(cols)}")
+
     def vlook(tab: str, col: str) -> str:
-        return (f"VLOOKUP($A$2:$A{s}'{tab}'!$A:$BZ{s}"
-                f"MATCH(\"{col}\"{s}'{tab}'!$1:$1{s}0){s}FALSE)")
+        m = meta[tab]
+        cj = m["cols"].get(_norm(col))
+        if cj is None:
+            raise SystemExit(f"cr-compare: в «{tab}» нет колонки «{col}»")
+        d_letter = _col_letter(m["date_j"])
+        idx = cj - m["date_j"] + 1
+        assert idx >= 1, (tab, col)
+        return (f"VLOOKUP($A$2:$A{s}'{tab}'!${d_letter}${m['row1']}:$BZ{s}{idx}{s}FALSE)")
 
     def cr(num_tab: str, num_col: str, den_tab: str, den_col: str) -> str:
         return (f"=ARRAYFORMULA(IF($A$2:$A=\"\"{s}\"\"{s}IFERROR(ROUND("
@@ -1061,8 +1079,10 @@ def cr_compare_formulas(service) -> None:
     scopes = [("GCC", "", "ORG Total", "PAID Total")] + \
              [(c, f"{c} ", f"ORG {c}", f"PAID {c}") for c in _CODES]
 
+    t_m = meta[TRAFFIC_TAB]
+    drv = f"'{TRAFFIC_TAB}'!${_col_letter(t_m['date_j'])}${t_m['row1']}:${_col_letter(t_m['date_j'])}"
     header = ["Дата"]
-    row2 = [f"=ARRAYFORMULA(IF('{TRAFFIC_TAB}'!$A$2:$A=\"\"{s}\"\"{s}'{TRAFFIC_TAB}'!$A$2:$A))"]
+    row2 = [f"=ARRAYFORMULA(IF({drv}=\"\"{s}\"\"{s}{drv}))"]
     for label, p, ga_org, ga_paid in scopes:
         header += [f"{label} Paid CR было", f"{label} Paid CR стало",
                    f"{label} Org CR было", f"{label} Org CR стало"]
