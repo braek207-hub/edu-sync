@@ -78,10 +78,17 @@ def test_pub_norm():
 def test_app_campaign_of():
     # Автотрекинг Директа: имя трекера = ID кампании.
     assert app_campaign_of("Yandex.Direct Auto-Tracking", "118498117") == "direct:118498117"
-    # Ручные трекеры и другие паблишеры кампаний не несут.
-    assert app_campaign_of("Yandex.Direct", "118498117") is None
+    # Числовой трекер надёжен у любого Директ-паблишера.
+    assert app_campaign_of("Yandex.Direct", "118498117") == "direct:118498117"
+    # Установки через общие трекеры: кампания в click_url_parameters (campaign_id).
+    assert app_campaign_of("Yandex.Direct", "Трекер для Директа (iOS)",
+                           "device_type=phone&campaign_id=703451076&yclid=1") == "direct:703451076"
+    # Без параметров или с нечисловой кампанией — не выдумываем.
     assert app_campaign_of("Yandex.Direct Auto-Tracking", "Тест роута") is None
+    assert app_campaign_of("Yandex.Direct", "Трекер для Директа (iOS)", "campaign_id=brand") is None
+    # Не-Директ и не-VK паблишеры кампаний не несут, даже с campaign_id в ссылке.
     assert app_campaign_of("Mindbox", "Mindbox_catalog") is None
+    assert app_campaign_of("Website", "", "campaign_id=703451076") is None
     assert app_campaign_of("", "") is None
     # VK: макрос `c` в кликовой ссылке = id группы — та же номенклатура, что веб.
     assert app_campaign_of("VK Ads (ex. myTarget)", "Трекер VK", "a=1&c=79412&x=2") == "vk:79412"
