@@ -1239,6 +1239,18 @@ def main() -> None:
     if mode == "cr-compare-formulas":  # лист «Сверка CR web» было/стало на формулах
         cr_compare_formulas(service)
         return
+    if mode == "cr-check":  # диагностика листа сверки CR: значения + формулы
+        from sync.sheets_write import read_values
+        vals = read_values(service, SHEET_ID, f"{CR_TAB}!A1:F10", render="FORMATTED_VALUE")
+        print(f"«{CR_TAB}» значения (A1:F10), строк: {len(vals)}")
+        for r in vals:
+            print("  ", r[:6])
+        fml = read_values(service, SHEET_ID, f"{CR_TAB}!A2:C2", render="FORMULA")
+        print("формулы A2:C2:")
+        for r in fml:
+            for c in r:
+                print("  ", str(c)[:220])
+        return
     if mode == "build":
         to_env = os.environ.get("LIME_GCC_TO")
         to = date.fromisoformat(to_env) if to_env else _msk_today() - timedelta(days=1)
