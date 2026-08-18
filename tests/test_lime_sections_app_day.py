@@ -76,3 +76,35 @@ def test_build_app_day_full_pass():
     # DAU v1: устройство с карточкой + устройство со вкладкой.
     v1 = sets["daily"]
     assert any(r[2] == "men" and r[4] == 2 for r in v1), "dau men должен быть 2 (карточка+вкладка)"
+
+
+class FakeAttrNone:
+    """Устройство без атрибуции: last-touch не найден (прямой запуск)."""
+
+    def publisher(self, dev, when):
+        return "Без атрибуции"
+
+    def campaign(self, dev, when):
+        return None
+
+    def source(self, dev, when):
+        return "organic"
+
+
+def test_build_app_day_unattributed_remainder():
+    """Неатрибутированные устройства ложатся остатком campaign='' (канал Direct),
+    а не выпадают из кампанийной грани — иначе бОльшая часть app-разделов
+    не доезжает до Обзора вовсе."""
+    with patch.object(A, "_stream_event", fake_stream):
+        sets = A.build_app_day("2026-08-03", "tok", FakeResolver(), FakeAttrNone(), set())
+
+    camp_rows = sets["campaign"]
+    remainder = [r for r in camp_rows if r[3] == ""]
+    assert remainder, "остаток campaign='' должен существовать"
+    # Аудитория раздела (view_item d1) и покупка d1 — в остатке канала Direct.
+    assert any(r[2] == "Direct" and r[4] == "men" and r[5] == 1 and r[8] == 1 for r in remainder), remainder
+    # Тип-грань: покупка тоже в остатке.
+    assert any(r[2] == "Direct" and r[3] == "" and r[4] == "men" for r in sets["campaign_type"])
+    # nb_orders: канал остатка совпадает с каналом строки грани (иначе new-меры не лягут).
+    dev, ch, camps, _by_sec = sets["nb_orders"][0]
+    assert ch == "Direct" and camps == ("",)

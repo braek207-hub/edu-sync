@@ -2,6 +2,10 @@
 """Витрины разделов LIME, приложение: события AppMetrica за день + атрибуция.
 
 Атрибуция last-touch: диплинк не старше 90 дней → установка → «Без атрибуции».
+Кампанийная грань: атрибутированные устройства — под своей кампанией, остальные —
+остатком campaign='' с каналом паблишера (app_channel_of_publisher), как остаток
+канала на вебе: иначе неатрибутированная часть app-разделов (подавляющая) вообще
+не доезжала до Обзора.
 Карта устройств строится заново на каждый запуск из выгрузок installations и
 deeplinks за lookback-окно — в базе она НЕ хранится (только готовые агрегаты).
 
@@ -30,8 +34,8 @@ from datetime import date, datetime, timedelta
 import requests
 
 from sync.lime_sections_common import (
-    APPMETRICA_APP, DEEPLINK_LOOKBACK_DAYS, SECTIONS_V2, TABMAP, app_campaign_channel, app_campaign_of,
-    bucket, pub_norm,
+    APPMETRICA_APP, DEEPLINK_LOOKBACK_DAYS, SECTIONS_V2, TABMAP, app_campaign_channel,
+    app_campaign_of, app_channel_of_publisher, bucket, pub_norm,
 )
 
 BASE = "https://api.appmetrica.yandex.ru/logs/v1/export"
@@ -249,7 +253,7 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
     def read_cart(rows):
         cart_items = defaultdict(float)     # (sec-fold, src) -> штук
         cart_users = defaultdict(set)       # (sec women/men/kids, src) -> devices
-        camp_cart = defaultdict(set)        # (camp, sec) -> devices
+        camp_cart = defaultdict(set)        # (ch, camp, sec) -> devices; camp='' — остаток
         for row in rows:
             if len(row) < 3:
                 continue
@@ -261,13 +265,14 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
             when = _ts(when_s)
             src = attr.source(dev, when)
             camp = attr.campaign(dev, when)
+            ch_key = (app_campaign_channel(camp) if camp
+                      else app_channel_of_publisher(attr.publisher(dev, when)))
             for it in (j.get("items") or [j]):
                 g = resolver.gender_of_item(it)
                 cart_items[(fold(g), src)] += float(it.get("quantity") or 1)
                 if g in SECTIONS_V2:
                     cart_users[(g, src)].add(dev)
-                    if camp:
-                        camp_cart[(camp, g)].add(dev)
+                    camp_cart[(ch_key, camp or "", g)].add(dev)
         return cart_items, cart_users, camp_cart
 
     cart_items, cart_users, camp_cart = _day_attempts(day, "add_to_cart", token, read_cart)
@@ -292,9 +297,9 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
     buy_users = defaultdict(set)
     prod = defaultdict(lambda: [set(), set(), 0.0, 0.0])    # (ch, sec, type)
     cross = defaultdict(lambda: [set(), set(), 0.0, 0.0, 0.0])  # (ch, visited, bought)
-    camp_buy = defaultdict(lambda: [set(), set(), 0.0, 0.0])        # (camp, sec)
-    camp_type = defaultdict(lambda: [set(), set(), 0.0, 0.0])       # (camp, sec, type)
-    camp_cross = defaultdict(lambda: [set(), set(), 0.0, 0.0, 0.0]) # (camp, visited, bought)
+    camp_buy = defaultdict(lambda: [set(), set(), 0.0, 0.0])        # (ch, camp, sec); camp='' — остаток
+    camp_type = defaultdict(lambda: [set(), set(), 0.0, 0.0])       # (ch, camp, sec, type)
+    camp_cross = defaultdict(lambda: [set(), set(), 0.0, 0.0, 0.0]) # (ch, camp, visited, bought)
     for dev, when_s, j in purchases:
         tx = j.get("transaction_id")
         if tx is not None:
@@ -305,6 +310,10 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
         src = attr.source(dev, when)
         ch = attr.publisher(dev, when)
         camp = attr.campaign(dev, when)
+        # Кампанийная грань: атрибутированные — своим каналом по ключу кампании,
+        # остаток (camp='') — каналом паблишера, как остаток канала на вебе.
+        chk = app_campaign_channel(camp) if camp else app_channel_of_publisher(ch)
+        ckey = camp or ""
         vis = sorted(g for g in SECTIONS_V2 if devviews.get(dev, {}).get(g)) or ["none"]
         touched = set()
         by_sec = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))
@@ -327,11 +336,9 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
             cell[1] += rv
         for k in touched:
             v1[k]["orders"] += 1
-        # Вход new/repeat: канал по ключу кампании (SEM/SMM paid), без кампании —
-        # остаток '' (new-меры лягут только на существующие строки грани).
-        nb_orders.append((dev,
-                          app_campaign_channel(camp) if camp else "SEM",
-                          (camp,) if camp else ("",),
+        # Вход new/repeat: канал тот же, что у строки кампанийной грани (chk) —
+        # apply_new_measures матчит по (канал, кампания, раздел).
+        nb_orders.append((dev, chk, (ckey,),
                           {b: [sum(t[0] for t in ts.values()), sum(t[1] for t in ts.values())]
                            for b, ts in by_sec.items()}))
         tx_id = str(tx) if tx is not None else f"{dev}:{when_s}"
@@ -351,25 +358,24 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
                 cell[2] += sec_items
                 cell[3] += sec_rev
                 cell[4] += sec_rev / len(vis)
-            if camp:
-                cell = camp_buy[(camp, b)]
-                cell[0].add(dev)
-                cell[1].add(tx_id)
-                cell[2] += sec_items
-                cell[3] += sec_rev
-                for tp, (its, rev) in types.items():
-                    ct = camp_type[(camp, b, tp)]
-                    ct[0].add(dev)
-                    ct[1].add(tx_id)
-                    ct[2] += its
-                    ct[3] += rev
-                for v in vis:
-                    cc = camp_cross[(camp, v, b)]
-                    cc[0].add(dev)
-                    cc[1].add(tx_id)
-                    cc[2] += sec_items
-                    cc[3] += sec_rev
-                    cc[4] += sec_rev / len(vis)
+            cell = camp_buy[(chk, ckey, b)]
+            cell[0].add(dev)
+            cell[1].add(tx_id)
+            cell[2] += sec_items
+            cell[3] += sec_rev
+            for tp, (its, rev) in types.items():
+                ct = camp_type[(chk, ckey, b, tp)]
+                ct[0].add(dev)
+                ct[1].add(tx_id)
+                ct[2] += its
+                ct[3] += rev
+            for v in vis:
+                cc = camp_cross[(chk, ckey, v, b)]
+                cc[0].add(dev)
+                cc[1].add(tx_id)
+                cc[2] += sec_items
+                cc[3] += sec_rev
+                cc[4] += sec_rev / len(vis)
 
     # ── сведение v1 ────────────────────────────────────────────────────────
     # DAU раздела = устройства с карточкой ∪ вкладкой; источник — на момент
@@ -392,15 +398,15 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
     # ── v2 daily: канал = паблишер на полдень дня ──────────────────────────
     noon = datetime.fromisoformat(day + "T12:00:00")
     daily_v2 = defaultdict(lambda: [set(), 0.0])   # (ch, sec) -> devices, просмотров
-    camp_aud = defaultdict(set)                     # (camp, sec) -> devices
+    camp_aud = defaultdict(set)                     # (ch, camp, sec) -> devices; camp='' — остаток
     for dev, secviews in devviews.items():
         ch = attr.publisher(dev, noon)
         camp = attr.campaign(dev, noon)
+        chk = app_campaign_channel(camp) if camp else app_channel_of_publisher(ch)
         for g, n in secviews.items():
             daily_v2[(ch, g)][0].add(dev)
             daily_v2[(ch, g)][1] += n
-            if camp:
-                camp_aud[(camp, g)].add(dev)
+            camp_aud[(chk, camp or "", g)].add(dev)
 
     rows_v1 = [
         (day, "app", s, src, int(m["dau"]), int(m["views"]), int(m["cart_users"]), 0,
@@ -420,25 +426,26 @@ def build_app_day(day: str, token: str, resolver, attr: Attribution, seen_tx: se
         (day, "app", ch, v, b, len(bu), len(o), round(its, 2), round(rev, 2), round(sp, 2))
         for (ch, v, b), (bu, o, its, rev, sp) in sorted(cross.items())
     ]
-    # Канал app-кампании — по ключу: Директ → SEM, VK-группы → SMM paid.
+    # Канал в ключе грани: у кампаний — по ключу (Директ → SEM, VK → SMM paid),
+    # у остатка campaign='' — канал паблишера last-touch (как остаток на вебе).
     rows_campaign = [
-        (day, "app", app_campaign_channel(c), c, sec, len(camp_aud.get((c, sec), ())),
-         len(camp_cart.get((c, sec), ())), len(b), len(o), round(its, 2), round(rev, 2))
-        for (c, sec), (b, o, its, rev) in sorted(camp_buy.items())
+        (day, "app", ch, c, sec, len(camp_aud.get((ch, c, sec), ())),
+         len(camp_cart.get((ch, c, sec), ())), len(b), len(o), round(its, 2), round(rev, 2))
+        for (ch, c, sec), (b, o, its, rev) in sorted(camp_buy.items())
     ]
-    for (c, sec), ids in sorted(camp_aud.items()):
-        if (c, sec) not in camp_buy:
+    for (ch, c, sec), ids in sorted(camp_aud.items()):
+        if (ch, c, sec) not in camp_buy:
             rows_campaign.append(
-                (day, "app", app_campaign_channel(c), c, sec, len(ids),
-                 len(camp_cart.get((c, sec), ())), 0, 0, 0.0, 0.0))
+                (day, "app", ch, c, sec, len(ids),
+                 len(camp_cart.get((ch, c, sec), ())), 0, 0, 0.0, 0.0))
     rows_camp_type = [
-        (day, "app", app_campaign_channel(c), c, sec, tp, len(b), len(o), round(its, 2), round(rev, 2))
-        for (c, sec, tp), (b, o, its, rev) in sorted(camp_type.items())
+        (day, "app", ch, c, sec, tp, len(b), len(o), round(its, 2), round(rev, 2))
+        for (ch, c, sec, tp), (b, o, its, rev) in sorted(camp_type.items())
     ]
     rows_camp_cross = [
-        (day, "app", app_campaign_channel(c), c, v, b, len(bu), len(o),
+        (day, "app", ch, c, v, b, len(bu), len(o),
          round(its, 2), round(rev, 2), round(sp, 2))
-        for (c, v, b), (bu, o, its, rev, sp) in sorted(camp_cross.items())
+        for (ch, c, v, b), (bu, o, its, rev, sp) in sorted(camp_cross.items())
     ]
     print(f"  app {day}: устройств с карточками {len(devviews):,}, "
           f"строк v1/{len(rows_v1)} v2/{len(rows_daily_v2)} prod/{len(rows_product)} "

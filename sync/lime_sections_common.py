@@ -124,6 +124,29 @@ def app_campaign_channel(camp: str) -> str:
     return "SMM paid" if camp.startswith("vk:") else "SEM"
 
 
+# Паблишер приложения → канал номенклатуры PROCONTEXT (зеркало classify() в
+# sync/lime.py): остаток кампанийной грани app (campaign='') ложится в Обзор
+# каналом, который сливается с каналами lime_stats, а не плодит имена
+# паблишеров в фильтре каналов дашборда.
+APP_PUB_CHANNEL = {
+    "Yandex.Direct": "SEM", "Yandex.Direct Auto-Tracking": "SEM",
+    "Google Ads": "SEM", "Turbotarget": "SEM",
+    "VK Ads (ex. myTarget)": "SMM paid", "myTarget": "SMM paid",
+    "VKAds_custom": "SMM paid", "Facebook": "SMM paid",
+    "Yandex Search": "SEO", "Google Search": "SEO",
+    "Mindbox": "CRM", "Email": "CRM", "Push": "CRM", "CS bot": "CRM",
+    "SMM": "SMM (organic)",
+}
+
+
+def app_channel_of_publisher(pub: str) -> str:
+    """Канал остатка app-грани по паблишеру last-touch; прямой запуск — Direct."""
+    p = (pub or "").strip()
+    if not p or p == "Без атрибуции":
+        return "Direct"
+    return APP_PUB_CHANNEL.get(p, "Others")
+
+
 # ── раздел товара: фид → карта артикулов → поведенческая карта ─────────────
 _CFG_DIR = os.path.join(os.path.dirname(__file__), "..", "config", "lime_sections")
 
