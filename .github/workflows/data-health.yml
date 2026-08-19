@@ -1,0 +1,120 @@
+name: Сторож свежести данных
+
+# Перенесён из EduDash 19.08.2026: тот репозиторий приватный, и CI съедает месячную
+# квоту Actions (2000 мин Free) — сторож падал не по делу, «job was not started».
+# Здесь репозиторий публичный, минуты бесплатны без лимита.
+#
+# Проверка смотрит на результат, а не на «прошёл ли синк»: докуда доехала дата факта,
+# есть ли строки за неделю, не обнулились ли суммы. Пороги — в EduDash
+# lib/dashboard/data-freshness.ts. Тикеты заводятся ЗДЕСЬ (в edu-sync): токен
+# воркфлоу не имеет прав на приватный EduDash, а письмо от GitHub приходит одинаково.
+#
+# Утром по Москве: к 8:00 ночные синки уже отработали, и лаг в сутки — ещё норма.
+on:
+  schedule:
+    - cron: "0 5 * * *" # 08:00 МСК
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Проверить свежесть данных
+        id: probe
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          # Витрина отдаёт суммы расхода и выручки, поэтому закрыта. Секрета в репозитории
+          # может не быть — тогда честно говорим, что проверки НЕ БЫЛО, и валим шаг.
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::Секрет CRON_SECRET не заведён — проверка НЕ ВЫПОЛНЕНА."
+            echo "Включить: одинаковое значение в переменных Vercel и в секретах репозитория."
+            exit 1
+          fi
+
+          code=$(curl -s -o response.json -w "%{http_code}" --max-time 60 \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            "https://panda-bi.vercel.app/api/health/data?strict=1")
+          cat response.json
+          echo ""
+
+          if [ "$code" = "200" ]; then
+            echo "Все источники свежие."
+            echo "state=ok" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Тело витрины — разбираем в человеческий список «источник — что не так».
+          # Ответ может быть и не JSON (502 от платформы), поэтому jq не должен ронять шаг.
+          summary=$(jq -r '
+            if .probes then
+              .probes[] | select(.status != "ok")
+              | "- **\(.dashboard) / \(.source)** — \(.note // .status)"
+            else empty end' response.json 2>/dev/null || true)
+          [ -z "$summary" ] && summary="Витрина ответила HTTP $code без разбираемого тела."
+
+          {
+            echo "state=stale"
+            echo "summary<<EOF"
+            echo "$summary"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "::error::Данные протухли (HTTP $code)."
+          echo "$summary"
+          exit 1
+
+      # Тикет вместо молчания: GitHub пришлёт письмо, и видно, когда началось.
+      # Один тикет на всю поломку — новые проверки дописывают комментарий, а не плодят
+      # по штуке в день: ежедневный дубль читают один раз, потом перестают.
+      - name: Завести или обновить тикет
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Чекаута здесь нет (проверке нужен только curl), а gh без него определяет
+          # репозиторий по git remote и падает с «not a git repository». Поэтому явно.
+          GH_REPO: ${{ github.repository }}
+          SUMMARY: ${{ steps.probe.outputs.summary }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="Сторож свежести данных не прошёл.
+
+          ${SUMMARY:-Проверка не выполнена — смотри лог прогона.}
+
+          Прогон: $RUN_URL
+
+          Что это значит: у перечисленных источников либо отстала дата факта, либо за неделю
+          нет строк, либо суммы обнулились при живых строках. Последнее — самый дорогой случай:
+          дашборд при этом выглядит рабочим и показывает нули.
+
+          Тикет закроется сам, когда следующая проверка пройдёт."
+
+          existing=$(gh issue list --label data-health --state open --limit 1 --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            echo "дописал комментарий в #$existing"
+          else
+            gh label create data-health --color B60205 --description "Сторож свежести данных" 2>/dev/null || true
+            gh issue create --title "Данные протухли" --label data-health --body "$body"
+          fi
+
+      # Самозакрытие: тикет, который надо закрывать руками, рано или поздно остаётся
+      # висеть — и следующая настоящая поломка припишется к нему комментарием.
+      - name: Закрыть тикет, если данные снова свежие
+        if: success() && steps.probe.outputs.state == 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Метки может ещё не быть (ни одной поломки не случалось) — это не ошибка.
+          existing=$(gh issue list --label data-health --state open --limit 1 --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --comment "Проверка снова прошла: все источники свежие. Прогон: $RUN_URL"
+            echo "закрыл #$existing"
+          fi
