@@ -24,26 +24,33 @@ ENV: DATABASE_URL, DIRECT_TOKEN, DIRECT_CLIENTS_JSON
    bidmodifiers.get по чужим Id — гарантированная ошибка "объект не найден"
    и лишние Units на чужой кабинет.
 
-2. Демографические корректировки нормализуются построчно: одна запись
-   DemographicsAdjustment в ответе API может нести Gender И Age ОДНОВРЕМЕННО
-   (ставка на пересечение сегментов). Diff сопоставляет план с фактом по паре
-   (Type, key) — если такую запись свернуть в один ключ, вторая половина
-   потеряется и diff предложит add там, где нужен set, создав дубль
-   корректировки в кабинете.
+2. Одна запись bidmodifiers.get → максимум одна нормализованная actual-запись.
+   Запись DemographicsAdjustment может нести Gender И Age ОДНОВРЕМЕННО (ставка
+   на пересечение сегментов). Это ОДИН объект Директа с одним Id и одним
+   коэффициентом, и он не эквивалентен паре одномерных: «мужчины 25–34» — не
+   «мужчины». Такая запись сворачивается в одну actual-запись с составным
+   ключом, который заведомо не сойдётся с одномерным планом (подробности — в
+   _normalize_actual). Прежняя раскладка на две записи с одним Id выпускала из
+   diff два изменения на один физический объект.
 """
 
 import json
 import os
 import sys
 from datetime import date, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set, Tuple
 
 from sync.agent import db as agent_db
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import apply_actions
 from sync.agent.writer.client import WriteClient
 from sync.agent.writer.diff import diff_modifiers
-from sync.agent.writer.guardrails import cap_actions, check_action, check_holdout
+from sync.agent.writer.guardrails import (
+    MAX_ACTIONS_PER_RUN,
+    cap_actions,
+    check_action,
+    check_holdout,
+)
 from sync.agent.writer.plan import plan_bid_modifiers
 from sync.agent.writer.risk import action_risk, fit_into_budget, median, week_start
 from sync.agent.writer.rollback import red_line_for
@@ -65,6 +72,29 @@ ABSOLUTE_MAX_CPA_MULTIPLIER = 2.0
 # посчитать не из чего вообще (справочник базовых CPA пуст целиком).
 NO_RED_LINE_REASON = "нет базового CPA ни у одной кампании — красная линия недостижима"
 
+# Настройки читаются строго по кабинету (agent_db.load_latest_computed_settings).
+# Пустой ответ — не «нечего делать»: он значит либо что Э0 по этому кабинету не
+# проходил, либо что в таблице лежат строки СТАРОГО формата, записанные под общим
+# идентификатором на все кабинеты сразу. Старые строки читать нельзя — в них
+# выжили числа одного кабинета, перетершие остальные; прогон честно ничего не
+# применит, но это обязано быть видно в отчёте, а не выглядеть как тишина.
+NO_COMPUTED_REASON = (
+    "нет вычисленных настроек кабинета {login} (object_level='account', "
+    "object_id='{login}'): либо расчёт Э0 по этому кабинету не проходил, либо в "
+    "таблице лежат строки старого формата под общим object_id — они не читаются "
+    "намеренно, потому что схлопывали кабинеты в один набор"
+)
+
+# Сколько минут строка может простоять в статусе planned, прежде чем считаться
+# зависшей. Прогон живёт минуты; всё, что старше, — след обрыва прошлого прогона
+# ПОСЛЕ отправки запроса (см. writer/db.py::STALE_PLANNED_SQL).
+STALE_PLANNED_MINUTES = 60
+
+# Сколько действий показать поимённо в отчёте. Остальное — агрегатом по видам
+# настроек: полный список из полусотни строк превращает отчёт в стену текста,
+# а он читается глазами перед решением включать боевую запись.
+PREVIEW_SAMPLE_LIMIT = 5
+
 # Поле ответа bidmodifiers.get → (тип корректировки, ключ в форме плана).
 # Устройство у Директа — три РАЗНЫХ типа корректировки, а не один мобильный;
 # ключи в верхнем регистре, как в plan.DEVICE_TYPE_MAP, иначе diff не сойдётся.
@@ -73,6 +103,14 @@ _DEVICE_ADJUSTMENTS = (
     ("DesktopAdjustment", "DESKTOP_ADJUSTMENT", "DESKTOP"),
     ("TabletAdjustment", "TABLET_ADJUSTMENT", "TABLET"),
 )
+
+# Корректировка, несущая сразу несколько измерений (пол И возраст), — это НЕ
+# сумма одномерных: «мужчины 25–34» и «мужчины» в Директе разные объекты с
+# разными ставками. Такой факт нормализуется составным ключом, который заведомо
+# не совпадает ни с одним ключом плана (в плане ключ всегда одномерный), и
+# разнотипной меткой — чтобы план не сопоставился с ним по случайности.
+COMPOSITE_KEY_SEPARATOR = "+"
+COMPOSITE_TYPE = "COMPOSITE_ADJUSTMENT"
 
 
 def _clients() -> List[Dict[str, Any]]:
@@ -117,9 +155,9 @@ def own_campaign_ids(client: WriteClient, daily_cost_by_campaign: Dict[str, floa
 
 
 def _normalize_actual(item: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Одна запись bidmodifiers.get → 0..N нормализованных actual-записей.
+    """Одна запись bidmodifiers.get → 0 или 1 нормализованная actual-запись.
 
-    Две обязанности, обе — про совпадение факта с планом:
+    Три обязанности, все — про совпадение факта с планом:
 
     1. Единицы. API отдаёт 100-базный коэффициент (100 = нейтраль), план
        живёт в дельтах — здесь стоит обратная граница конверсии
@@ -130,36 +168,59 @@ def _normalize_actual(item: Dict[str, Any]) -> List[Dict[str, Any]]:
        верхний регистр): устройство — это ТРИ разных типа корректировки, и
        ключ "mobile" строчными не сойдётся с "MOBILE" из плана никогда,
        из-за чего diff вечно предлагал бы add там, где нужен set.
+    3. Один объект — одна запись. Запись bidmodifiers.get это ОДИН физический
+       объект в Директе с одним Id и одним коэффициентом. Раскладка её на
+       несколько normalized-записей с ОДНИМ И ТЕМ ЖЕ Id выпускала из diff два
+       изменения на один объект: второе затирало первое, оба списывали
+       риск-бюджет, оба сохраняли прошлое состояние, снятое ДО первого, —
+       откат вернул бы объект не туда, откуда агент его вывел.
 
-    Демографическая корректировка может нести Gender И Age одновременно —
-    такая запись раскладывается в ДВЕ отдельные normalized-записи с разными
-    ключами (но одним Id: обе указывают на один физический объект в Директе).
-    Без этого diff терял бы вторую половину и предлагал add вместо set.
+    Многомерная корректировка («мужчины 25–34» — Gender И Age одновременно)
+    сворачивается в ОДНУ запись с составным ключом (GENDER_MALE+AGE_25_34).
+    Составной ключ не совпадает ни с одним одномерным ключом плана — и это
+    правильно: коэффициент, посчитанный для всего мужского сегмента, к
+    пересечению «мужчины 25–34» не относится, ставить его туда значит править
+    не тот объект. Diff увидит, что одномерной корректировки в кабинете нет, и
+    предложит добавить её отдельным объектом, не трогая многомерную —
+    в Директе это разные объекты, и они сосуществуют штатно.
     """
-    out: List[Dict[str, Any]] = []
-    demo = item.get("DemographicsAdjustment") or {}
-    regional = item.get("RegionalAdjustment") or {}
+    dimensions: List[Tuple[str, str, int]] = []  # (тип, ключ, дельта)
 
     for api_field, direct_type, key in _DEVICE_ADJUSTMENTS:
         adjustment = item.get(api_field) or {}
         if adjustment:
-            out.append({"Id": item["Id"], "Type": direct_type, "key": key,
-                        "percent": api_to_delta(adjustment.get("BidModifier") or 0)})
+            dimensions.append(
+                (direct_type, key, api_to_delta(adjustment.get("BidModifier") or 0)))
+
+    demo = item.get("DemographicsAdjustment") or {}
     if demo:
         percent = api_to_delta(demo.get("BidModifier") or 0)
-        gender = demo.get("Gender")
-        age = demo.get("Age")
-        if gender:
-            out.append({"Id": item["Id"], "Type": "DEMOGRAPHICS_ADJUSTMENT",
-                        "key": gender, "percent": percent})
-        if age:
-            out.append({"Id": item["Id"], "Type": "DEMOGRAPHICS_ADJUSTMENT",
-                        "key": age, "percent": percent})
+        for value in (demo.get("Gender"), demo.get("Age")):
+            if value:
+                dimensions.append(("DEMOGRAPHICS_ADJUSTMENT", str(value), percent))
+
+    regional = item.get("RegionalAdjustment") or {}
     if regional:
-        out.append({"Id": item["Id"], "Type": "REGIONAL_ADJUSTMENT",
-                    "key": str(regional.get("RegionId") or ""),
-                    "percent": api_to_delta(regional.get("BidModifier") or 0)})
-    return out
+        dimensions.append(("REGIONAL_ADJUSTMENT", str(regional.get("RegionId") or ""),
+                           api_to_delta(regional.get("BidModifier") or 0)))
+
+    if not dimensions:
+        return []
+    if len(dimensions) == 1:
+        direct_type, key, percent = dimensions[0]
+        return [{"Id": item["Id"], "Type": direct_type, "key": key, "percent": percent}]
+
+    types = {t for t, _, _ in dimensions}
+    return [{
+        "Id": item["Id"],
+        # Измерения одного типа (пол+возраст) сохраняют свой тип; разнотипная
+        # комбинация типу не принадлежит вообще — своя метка, чтобы она не
+        # сошлась с планом по чистой случайности.
+        "Type": dimensions[0][0] if len(types) == 1 else COMPOSITE_TYPE,
+        "key": COMPOSITE_KEY_SEPARATOR.join(k for _, k, _ in dimensions),
+        "percent": dimensions[0][2],
+        "composite": True,
+    }]
 
 
 def _unsupported_report(unsupported: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -172,6 +233,54 @@ def _unsupported_report(unsupported: List[Dict[str, Any]]) -> Dict[str, Any]:
     for row in unsupported:
         by_reason[row["reason"]] = by_reason.get(row["reason"], 0) + 1
     return {"count": len(unsupported), "by_reason": by_reason}
+
+
+def action_label(action: Dict[str, Any]) -> str:
+    """Короткая подпись действия: что и на сколько правится."""
+    payload = action.get("payload") or {}
+    percent = int(payload.get("BidModifier") or 0)
+    kind = str(action.get("action_kind") or "").split(".")[-1]
+    return f"{action.get('direct_type')}:{action.get('key')} {percent:+d}% ({kind})"
+
+
+def actions_preview(
+    actions: List[Dict[str, Any]], limit: int = PREVIEW_SAMPLE_LIMIT
+) -> Dict[str, Any]:
+    """Состав действий для отчёта прогона: сколько и какие именно.
+
+    Без этого блока репетиция (--prod без --apply) показывала ровные нули и не
+    содержала ни числа готовых действий, ни их состава — то есть главный
+    артефакт для решения «включать ли боевую запись» не показывал, что именно
+    было бы записано.
+
+    Форма компактная и не растёт со числом действий: агрегат по видам настроек
+    (их единицы) плюс несколько примеров с кампаниями. Полный список — в
+    журнале действий, отчёт его не дублирует.
+    """
+    by_setting: Dict[str, int] = {}
+    for action in actions:
+        label = action_label(action)
+        by_setting[label] = by_setting.get(label, 0) + 1
+    return {
+        "count": len(actions),
+        "by_setting": dict(sorted(by_setting.items())),
+        "sample": [f"кампания {a.get('object_id')}: {action_label(a)}"
+                   for a in actions[:limit]],
+        "sample_truncated": len(actions) > limit,
+    }
+
+
+def _stale_report(rows: List[Dict[str, Any]], limit: int = PREVIEW_SAMPLE_LIMIT) -> Dict[str, Any]:
+    """Зависшие planned-строки для отчёта: сколько, какие, с какого времени."""
+    return {
+        "count": len(rows),
+        "older_than_minutes": STALE_PLANNED_MINUTES,
+        "sample": [
+            {"action_id": r.get("action_id"), "object_id": r.get("object_id"),
+             "action_kind": r.get("action_kind"), "created_at": str(r.get("created_at"))}
+            for r in rows[:limit]
+        ],
+    }
 
 
 def absolute_max_cpa_from_baseline(baseline_cpa: Dict[str, float]) -> Any:
@@ -240,20 +349,6 @@ def main() -> int:
 
     writer_db.ensure_writer_tables()
 
-    computed = agent_db.load_latest_computed_settings()
-    plan = plan_bid_modifiers(computed)
-    desired = plan["desired"]
-    # Значимые настройки, которые агент применить не умеет (нечисловой ключ
-    # региона, устройство вне DESKTOP/MOBILE/TABLET). Они не подставляются в
-    # чужой тип корректировки и не роняют применение — но и не пропадают
-    # молча: причина видна в отчёте прогона.
-    unsupported = _unsupported_report(plan["unsupported"])
-    if not desired:
-        print(json.dumps({"verdict": "NOTHING_TO_DO", "reason": "нет значимых корректировок",
-                          "unsupported": unsupported},
-                         ensure_ascii=False, indent=2))
-        return 0
-
     clients = _clients()
     if not clients:
         print(json.dumps({"verdict": "NOTHING_TO_DO", "reason": "нет кабинетов в DIRECT_CLIENTS_JSON"},
@@ -274,8 +369,41 @@ def main() -> int:
     # дефолт-плейсхолдер, никак не связанный с экономикой кабинета.
     absolute_max_cpa = absolute_max_cpa_from_baseline(baseline_cpa)
 
+    # Лимит действий — на ПРОГОН, а не на кабинет: рельса ограничивает объём
+    # изменений, которые человек способен проверить и осмысленно откатить, а
+    # он не зависит от того, на сколько кабинетов эти изменения разложены.
+    # Внутри цикла по четырём кабинетам потолок был вчетверо выше заявленного.
+    remaining_cap = MAX_ACTIONS_PER_RUN
+    # Объекты, риск которых прогон уже оплатил (см. risk.fit_into_budget).
+    charged_objects: Set[str] = set()
+
     for client_info in clients:
-        client = WriteClient(client_info["login"], sandbox=sandbox, dry_run=dry_run)
+        login = client_info["login"]
+
+        # Настройки — этого кабинета, а не общий набор на всех: числа посчитаны
+        # по его аудитории и применимы только к его кампаниям.
+        computed = agent_db.load_latest_computed_settings(login)
+        plan = plan_bid_modifiers(computed)
+        desired = plan["desired"]
+        # Значимые настройки, которые агент применить не умеет (нечисловой ключ
+        # региона, устройство вне DESKTOP/MOBILE/TABLET). Они не подставляются в
+        # чужой тип корректировки и не роняют применение — но и не пропадают
+        # молча: причина видна в отчёте прогона.
+        unsupported = _unsupported_report(plan["unsupported"])
+        if not desired:
+            print(json.dumps({
+                "account": login,
+                "verdict": "NO_COMPUTED_SETTINGS" if not computed else "NOTHING_TO_DO",
+                "reason": (NO_COMPUTED_REASON.format(login=login) if not computed
+                           else "нет значимых корректировок"),
+                "computed_settings": len(computed),
+                "unsupported": unsupported,
+                "stale_planned": _stale_report(
+                    writer_db.stale_planned(STALE_PLANNED_MINUTES, account=login)),
+            }, ensure_ascii=False, indent=2))
+            continue
+
+        client = WriteClient(login, sandbox=sandbox, dry_run=dry_run)
 
         # Рулинг 1: кампании только этого кабинета, не всего справочника расходов.
         campaign_ids = own_campaign_ids(client, daily_cost)
@@ -290,56 +418,68 @@ def main() -> int:
                 if not ok:
                     blocked.append({**action, "blocked_reason": reason})
                     continue
-                planned.append({**action, "account": client_info["login"]})
+                planned.append({**action, "account": login})
 
         allowed, in_holdout = check_holdout(planned, holdout_ids)
         blocked += [{**a, "blocked_reason": "заповедник"} for a in in_holdout]
 
-        risks = {a["idempotency_key"]: action_risk(a, daily_cost) for a in allowed}
-        # Бюджет читается заново для каждого кабинета: он общий на весь прогон,
-        # а не на кабинет, и предыдущий клиент этого же прогона мог его уже
-        # частично занять (spent_risk читает applied_at из журнала, куда
-        # apply_actions уже успел записать применённые действия).
-        remaining = writer_db.risk_limit(wk, DEFAULT_WEEKLY_RISK_RUB) - writer_db.spent_risk(wk)
-        fits, deferred = fit_into_budget(allowed, risks, remaining)
-        fits, over_cap = cap_actions(fits)
+        # Порядок рельс: сначала отсекается всё, что применять нельзя или
+        # незачем (лимит прогона, отсутствие красной линии), и только потом
+        # считается бюджет. Обратный порядок списывал бы риск за действия,
+        # которые дальше отваливаются, — объект помечался бы оплаченным, а
+        # изменение по нему так и не уходило бы в кабинет.
+        allowed, over_cap = cap_actions(allowed, max_per_run=max(remaining_cap, 0))
 
         # Красная линия ставится ВМЕСТЕ с действием: у каждого применённого
         # изменения заранее известно, при каком исходе оно считается провалом.
         # build_red_line возвращает None, если её посчитать не из чего — такое
         # действие не применяется, причина уходит в no_red_line, а не в тихий
         # дефолт-плейсхолдер.
-        prepared = []
+        with_red_line: List[Dict[str, Any]] = []
         no_red_line: List[Dict[str, Any]] = []
-        for a in fits:
+        for a in allowed:
             red_line = build_red_line(a, baseline_cpa, absolute_max_cpa)
             if red_line is None:
                 no_red_line.append({**a, "blocked_reason": NO_RED_LINE_REASON})
                 continue
-            prepared.append({
-                **a,
-                "risk_rub": risks[a["idempotency_key"]],
-                "red_line": red_line,
-            })
+            with_red_line.append({**a, "red_line": red_line})
+
+        risks = {a["idempotency_key"]: action_risk(a, daily_cost) for a in with_red_line}
+        # Бюджет читается заново для каждого кабинета: он общий на весь прогон,
+        # а не на кабинет, и предыдущий клиент этого же прогона мог его уже
+        # частично занять (spent_risk читает applied_at из журнала, куда
+        # apply_actions уже успел записать применённые действия).
+        remaining = writer_db.risk_limit(wk, DEFAULT_WEEKLY_RISK_RUB) - writer_db.spent_risk(wk)
+        prepared, deferred = fit_into_budget(with_red_line, risks, remaining, charged_objects)
+        remaining_cap -= len(prepared)
+
+        stale = writer_db.stale_planned(STALE_PLANNED_MINUTES, account=login)
         report = apply_actions(client, prepared, writer_db)
 
         print(json.dumps({
-            "account": client_info["login"],
+            "account": login,
             "sandbox": sandbox,
             "dry_run": dry_run,
             "own_campaigns": len(campaign_ids),
+            "computed_settings": len(computed),
             "desired": len(desired),
             "unsupported": unsupported,
             "planned": len(planned),
             "blocked": len(blocked),
             "deferred_by_risk": len(deferred),
             "deferred_by_cap": len(over_cap),
+            "actions_left_in_run": max(remaining_cap, 0),
             "no_red_line": {
                 "count": len(no_red_line),
                 "reason": NO_RED_LINE_REASON if no_red_line else None,
             },
             "remaining_risk_rub": round(remaining, 2),
+            "risk_charged_rub": round(sum(a["risk_rub"] for a in prepared), 2),
             "absolute_max_cpa": absolute_max_cpa,
+            # Состав того, что уходит (или ушло бы) в кабинет. В режиме
+            # репетиции это единственное место, где он вообще виден.
+            "prepared": actions_preview(prepared),
+            "stale_planned": _stale_report(stale),
             "result": {k: v for k, v in report.items() if k != "details"},
             "units_left": client.units_left,
         }, ensure_ascii=False, indent=2))

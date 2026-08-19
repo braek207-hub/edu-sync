@@ -1,3 +1,6 @@
+import pytest
+
+import sync.agent.db as agent_db
 from sync.agent.db import AGENT_DDL
 
 REQUIRED_TABLES = [
@@ -57,3 +60,52 @@ def test_objects_snapshot_versioned_by_hash():
     # ежедневная копия 55k объектов дала бы 5 млн строк за квартал.
     ddl = "\n".join(AGENT_DDL)
     assert "content_hash" in ddl
+
+
+# ------------------------------- вычисленные настройки живут ПО КАБИНЕТАМ
+# Дефект 1: расчёт шёл в цикле по кабинетам, а писался с захардкоженным
+# идентификатором объекта — одним на всех. Первичный ключ совпадал, запись
+# построчная, поэтому дубликаты не падали, а тихо перетирали друг друга:
+# выживали числа последнего успевшего кабинета. Загрузчик движка записи не
+# фильтровал по кабинету вообще и раскатывал схлопнутый набор на все.
+
+
+def test_upsert_computed_settings_requires_account(monkeypatch):
+    # object_id без значения по умолчанию: забытый кабинет обязан уронить
+    # вызов, а не подставить общий идентификатор и склеить кабинеты.
+    monkeypatch.setattr(agent_db, "_batch", lambda sql, rows, **kw: len(rows))
+    with pytest.raises(TypeError):
+        agent_db.upsert_computed_settings([], calc_date="2026-08-19")
+
+
+def test_upsert_computed_settings_stamps_account_on_every_row(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        agent_db, "_batch",
+        lambda sql, rows, **kw: captured.update(rows=rows) or len(rows),
+    )
+    rows = [{"setting_kind": "bid_modifier:device", "setting_key": "MOBILE",
+             "value": 10.0, "support_n": 500, "raw_value": 1.1},
+            {"setting_kind": "bid_modifier:gender", "setting_key": "GENDER_MALE",
+             "value": -10.0, "support_n": 500, "raw_value": 0.9}]
+
+    agent_db.upsert_computed_settings(rows, calc_date="2026-08-19", object_id="acc-1")
+
+    assert {r["object_id"] for r in captured["rows"]} == {"acc-1"}
+    assert {r["object_level"] for r in captured["rows"]} == {"account"}
+
+
+def test_load_latest_computed_settings_filters_by_account(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        agent_db, "_fetch_dicts",
+        lambda sql, params=(): captured.update(sql=sql, params=params) or [],
+    )
+
+    agent_db.load_latest_computed_settings("acc-1")
+
+    # Фильтр обязан стоять И в основной выборке, И в подзапросе MAX(calc_date):
+    # без второго свежий расчёт одного кабинета прятал бы вчерашний расчёт
+    # другого — выборка по MAX по всей таблице просто не находила бы строк.
+    assert captured["sql"].count("object_id = %s") == 2
+    assert captured["params"] == ("account", "acc-1", "account", "acc-1")

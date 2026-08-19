@@ -106,6 +106,19 @@ def _attach_expected_payments(
     return out
 
 
+def computed_rows_for_job(
+    job: Dict[str, Any], base_conv: float, base_expected: float
+) -> tuple:
+    """Результат одного отчёта → (кабинет, строки вычисленных настроек).
+
+    Кабинет едет ВМЕСТЕ с числами и дальше становится object_id записи. Без
+    него строки четырёх кабинетов ложились в один ключ таблицы и перетирали
+    друг друга, а движок записи раскатывал выживший набор на всех.
+    """
+    enriched = _attach_expected_payments(job["rows"], base_expected)
+    return job["login"], compute_segment_modifiers(enriched, base_conv)
+
+
 def main() -> int:
     days = DEFAULT_DAYS
     if "--days" in sys.argv:
@@ -203,19 +216,26 @@ def main() -> int:
         )
         return {**job, "rows": rows}
 
-    computed_rows: List[Dict[str, Any]] = []
+    # Вычисленные настройки копятся ПО КАБИНЕТАМ: числа посчитаны по аудитории
+    # конкретного кабинета и записываются под его логином (object_id). Общий
+    # идентификатор на всех схлопывал четыре набора в один — ключ таблицы
+    # совпадал, и в базе оставались числа последнего успевшего кабинета.
+    computed_by_account: Dict[str, List[Dict[str, Any]]] = {}
     sliced_rows: List[Dict[str, Any]] = []
     if jobs:
         with ThreadPoolExecutor(max_workers=REPORT_WORKERS) as pool:
             for done in as_completed([pool.submit(_run_job, j) for j in jobs]):
                 job = done.result()
                 if job["purpose"] == "computed":
-                    enriched = _attach_expected_payments(job["rows"], base_expected)
-                    computed_rows += compute_segment_modifiers(enriched, base_conv)
+                    login, rows = computed_rows_for_job(job, base_conv, base_expected)
+                    computed_by_account.setdefault(login, []).extend(rows)
                 else:
                     sliced_rows += collapse_tail(build_sliced_facts(job["rows"], job["kind"]))
 
-    agent_db.upsert_computed_settings(computed_rows, calc_date=today_iso)
+    computed_count = 0
+    for login, rows in computed_by_account.items():
+        agent_db.upsert_computed_settings(rows, calc_date=today_iso, object_id=login)
+        computed_count += len(rows)
     agent_db.upsert_sliced_facts(sliced_rows)
 
     # 8. Структура кабинета и поисковые запросы. Только по живым кампаниям окна.
@@ -287,8 +307,15 @@ def main() -> int:
         hourly_base = (hourly_goals / hourly_clicks) if hourly_clicks else 0.0
         if hourly_base > 0:
             schedule_rows = compute_schedule(hourly_rows, hourly_base)
-            agent_db.upsert_computed_settings(schedule_rows, calc_date=today_iso)
-            computed_rows += schedule_rows
+            # Почасовой профиль посчитан по счётчикам Метрики всего EDU, а не
+            # по одному кабинету, но применяется в каждом — пишем его под
+            # каждым логином. Хранить его под общим «ничьим» идентификатором
+            # нельзя: тогда загрузчик, который читает настройки строго по
+            # кабинету, не найдёт расписание ни для одного из них.
+            for client in clients:
+                agent_db.upsert_computed_settings(
+                    schedule_rows, calc_date=today_iso, object_id=client["login"])
+                computed_count += len(schedule_rows)
 
     # Метрика отдаёт имя кампании, а не Id (probe 31788247020) — резолвим по фактам.
     id_by_name = {str(f.get("campaign_name") or "").strip(): f["campaign_id"]
@@ -323,7 +350,8 @@ def main() -> int:
         "settings_snapshots": len(snapshot_rows),
         "holdout": len(holdout),
         "quasi_experiments": len(quasi),
-        "computed_settings": len(computed_rows),
+        "computed_settings": computed_count,
+        "computed_settings_by_account": {k: len(v) for k, v in computed_by_account.items()},
         "profile_rows": len(profile_rows),
         "metrika_hourly": len(hourly_rows),
         "metrika_behavior": len(resolved_behavior),

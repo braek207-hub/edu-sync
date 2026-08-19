@@ -302,14 +302,32 @@ def load_campaign_features(date_from: str, date_to: str) -> List[Dict[str, Any]]
     )
 
 
-def load_latest_computed_settings() -> List[Dict[str, Any]]:
-    """Последний расчёт вычисляемых настроек."""
+def load_latest_computed_settings(
+    object_id: str, object_level: str = "account",
+) -> List[Dict[str, Any]]:
+    """Последний расчёт вычисляемых настроек ОДНОГО кабинета.
+
+    Фильтр по кабинету обязателен и не имеет значения по умолчанию: таблица
+    копит расчёты всех кабинетов сразу, и выборка без фильтра раскатывала бы
+    набор одного кабинета на кампании всех остальных — корректировка,
+    посчитанная по аудитории одного клиента, уезжала бы чужому.
+
+    MAX(calc_date) тоже считается ВНУТРИ кабинета: кабинеты считаются
+    независимо, и один отставший на день кабинет не должен обнулять выборку
+    остальных (и наоборот — свежий расчёт одного кабинета не должен прятать
+    вчерашний расчёт другого).
+    """
     return _fetch_dicts(
         """
         SELECT setting_kind, setting_key, value, support_n, raw_value
         FROM edu_agent_computed_settings
-        WHERE calc_date = (SELECT MAX(calc_date) FROM edu_agent_computed_settings)
-        """
+        WHERE object_level = %s AND object_id = %s
+          AND calc_date = (
+              SELECT MAX(calc_date) FROM edu_agent_computed_settings
+              WHERE object_level = %s AND object_id = %s
+          )
+        """,
+        (object_level, object_id, object_level, object_id),
     )
 
 
@@ -537,9 +555,18 @@ def upsert_experiments(rows: List[Dict[str, Any]]) -> int:
 
 
 def upsert_computed_settings(
-    rows: List[Dict[str, Any]], calc_date: str,
-    object_level: str = "account", object_id: str = "vuz",
+    rows: List[Dict[str, Any]], calc_date: str, object_id: str,
+    object_level: str = "account",
 ) -> int:
+    """Вычисленные настройки ОДНОГО кабинета.
+
+    object_id обязателен и без значения по умолчанию: первичный ключ включает
+    (object_level, object_id), а расчёт идёт в цикле по кабинетам. С общим
+    захардкоженным идентификатором строки четырёх кабинетов ложились в один и
+    тот же ключ и тихо перетирали друг друга — в таблице выживали числа того
+    кабинета, который дописался последним. Ошибки при этом не было: запись
+    построчная, ON CONFLICT DO UPDATE отрабатывал штатно.
+    """
     payload = [{**r, "calc_date": calc_date, "object_level": object_level, "object_id": object_id}
                for r in rows]
     return _batch(

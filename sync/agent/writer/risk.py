@@ -22,7 +22,7 @@ sync/agent/writer/risk.py — риск-бюджет движка записи (�
 """
 
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 DEFAULT_DAYS_TO_MEASURE = 7
 
@@ -87,18 +87,51 @@ def action_risk(
     return round(daily * days_to_measure, 2)
 
 
+def risk_object(action: Dict[str, Any]) -> str:
+    """Единица риска — ОБЪЕКТ, на который действие влияет, а не само действие."""
+    return f"{action.get('object_level')}:{action.get('object_id')}"
+
+
 def fit_into_budget(
-    actions: List[Dict[str, Any]], risks: Dict[str, float], remaining_rub: float
+    actions: List[Dict[str, Any]],
+    risks: Dict[str, float],
+    remaining_rub: float,
+    charged_objects: Optional[Set[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Берёт действия по порядку, пока хватает бюджета. Остальное откладывает."""
+    """Берёт действия по порядку, пока хватает бюджета. Остальное откладывает.
+
+    Риск считается ПО ОБЪЕКТУ, а не по действию. Цена ошибки — дневной расход
+    кампании × горизонт наблюдения; этот расход у кампании один, сколько бы
+    корректировок ей ни ставили за прогон. Начисление каждому действию давало
+    четырёхкратный расход на четыре корректировки одной кампании: модель
+    расходилась с реальностью, бюджет выгорал на второй-третьей кампании, и
+    посчитанные корректировки капали по паре в неделю.
+
+    charged_objects — объекты, риск которых в этом прогоне уже списан.
+    Множество ДОПОЛНЯЕТСЯ по ходу: вызывающий код передаёт одно и то же
+    множество на все кабинеты прогона, поэтому «первое действие по объекту»
+    определено на весь прогон, а не на один вызов.
+
+    Списание происходит только при фактическом попадании в бюджет: действие,
+    ушедшее в отложенные, объект не помечает — иначе следующее действие по
+    тому же объекту прошло бы бесплатно за счёт так и не применённого первого.
+
+    Каждому действию в fits проставлен risk_rub — ровно та сумма, которую
+    прогон за него заплатил (полная цена объекта первому действию, 0 —
+    остальным). Она же уходит в журнал: без этого spent_risk суммировал бы
+    расход кампании столько раз, сколько по ней прошло действий.
+    """
+    charged: Set[str] = charged_objects if charged_objects is not None else set()
     fits: List[Dict[str, Any]] = []
     deferred: List[Dict[str, Any]] = []
     budget = float(remaining_rub)
     for action in actions:
-        cost = float(risks.get(action["idempotency_key"], 0.0))
+        obj = risk_object(action)
+        cost = 0.0 if obj in charged else float(risks.get(action["idempotency_key"], 0.0))
         if cost <= budget:
-            fits.append(action)
+            fits.append({**action, "risk_rub": cost})
             budget -= cost
+            charged.add(obj)
         else:
             deferred.append(action)
     return fits, deferred

@@ -93,8 +93,9 @@ def _action(key: str = "k1") -> Dict[str, Any]:
 class _FakeDB:
     """Минимальная замена sync.agent.writer.db по протоколу apply_actions.
 
-    insert_action повторяет ON CONFLICT (idempotency_key) DO NOTHING реального
-    кода: вторая вставка того же ключа не трогает уже существующую строку.
+    insert_action повторяет ON CONFLICT (idempotency_key) DO UPDATE реального
+    кода: повторная вставка ещё не применённого действия обновляет строку
+    свежими данными, применённую (или откатанную) — не трогает.
     """
 
     def __init__(self, seed: Optional[Dict[str, Dict[str, Any]]] = None):
@@ -107,8 +108,10 @@ class _FakeDB:
     def insert_action(self, row: Dict[str, Any]) -> str:
         self.events.append(f"insert:{row['idempotency_key']}")
         key = row["idempotency_key"]
-        if key not in self.rows:
-            self.rows[key] = {"status": "planned"}
+        existing = self.rows.get(key)
+        if existing and existing.get("status") in {"applied", "rolled_back"}:
+            return key
+        self.rows[key] = {**row, "status": "planned"}
         return key  # action_id — в тестах достаточно самого ключа
 
     def mark_action(self, action_id: str, status: str, response: Dict[str, Any]) -> None:
@@ -138,7 +141,7 @@ def test_apply_actions_marks_applied_on_clean_success():
     report = apply_actions(client, [_action()], db)
 
     assert report == {"applied": 1, "skipped": 0, "failed": 0, "rejected": 0,
-                       "details": [{"key": "k1", "result": "applied"}]}
+                       "dry_run": 0, "details": [{"key": "k1", "result": "applied"}]}
     assert db.rows["k1"]["status"] == "applied"
     assert len(client.calls) == 1
 
@@ -183,7 +186,7 @@ def test_apply_actions_repeat_run_skips_already_applied():
     report = apply_actions(client, [_action()], db)
 
     assert report == {"applied": 0, "skipped": 1, "failed": 0, "rejected": 0,
-                       "details": [{"key": "k1", "result": "skipped"}]}
+                       "dry_run": 0, "details": [{"key": "k1", "result": "skipped"}]}
     assert client.calls == []  # запрос не ушёл второй раз
 
 
@@ -272,3 +275,59 @@ def test_apply_actions_journal_write_happens_before_api_call():
     apply_actions(client, [_action()], db)
 
     assert order == ["insert", "mutate"]
+
+
+# ------------------------------------- репетиция считается, а не показывает нули
+# Дефект 6: в режиме без записи каждое действие получает статус dry_run, но
+# счётчики его не считали — главный артефакт, по которому принимается решение
+# включать боевую запись, показывал ровные нули по всем счётчикам.
+
+
+def test_apply_actions_counts_dry_run_actions():
+    db = _FakeDB()
+    client = _FakeClient(response={"dry_run": True})
+
+    report = apply_actions(client, [_action("k1"), _action("k2")], db)
+
+    assert report["dry_run"] == 2
+    assert report["applied"] == 0
+    assert report["failed"] == 0
+
+
+def test_apply_actions_dry_run_counter_present_even_when_zero():
+    db = _FakeDB()
+    client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["dry_run"] == 0
+
+
+# ------------------- повтор непринятого действия несёт свежее прошлое состояние
+# Дефект 5, поведенческая половина: apply_actions обязан переписать журнал
+# заново для действия, которое ещё не применилось успешно.
+
+
+def test_replanned_action_overwrites_previous_state_of_failed_attempt():
+    db = _FakeDB()
+    first = {**_action("k1"), "previous_state": {"Id": 7, "percent": 10}}
+    apply_actions(_FakeClient(raises=RuntimeError("сеть недоступна")), [first], db)
+    assert db.rows["k1"]["status"] == "failed"
+
+    # Человек поправил корректировку руками — свежий факт другой.
+    second = {**_action("k1"), "previous_state": {"Id": 7, "percent": 25}}
+    apply_actions(_FakeClient(response={"SetResults": [{"Id": 7}]}), [second], db)
+
+    assert db.rows["k1"]["previous_state"] == {"Id": 7, "percent": 25}
+
+
+def test_applied_action_is_not_replanned():
+    db = _FakeDB()
+    apply_actions(_FakeClient(response={"SetResults": [{"Id": 7}]}),
+                  [{**_action("k1"), "previous_state": {"Id": 7, "percent": 10}}], db)
+
+    report = apply_actions(_FakeClient(response={"SetResults": [{"Id": 7}]}),
+                           [{**_action("k1"), "previous_state": {"Id": 7, "percent": 99}}], db)
+
+    assert report["skipped"] == 1
+    assert db.rows["k1"]["previous_state"] == {"Id": 7, "percent": 10}

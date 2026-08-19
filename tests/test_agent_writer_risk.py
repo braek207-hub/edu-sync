@@ -1,5 +1,16 @@
 # -*- coding: utf-8 -*-
+import sync.agent.writer.risk as risk_module
 from sync.agent.writer.risk import action_risk, fit_into_budget, median_daily_cost, week_start
+
+# Единица риска — ОБЪЕКТ, на который действие влияет. В фикстурах ниже у
+# каждого действия свой object_id: они изображают разные кампании, поэтому
+# бюджет платит за каждое. Случай нескольких действий по ОДНОЙ кампании —
+# отдельными тестами в конце файла.
+
+
+def _act(key, object_id=None):
+    return {"idempotency_key": key, "object_level": "campaign",
+            "object_id": object_id or key}
 
 
 def test_week_start_is_monday():
@@ -51,7 +62,7 @@ def test_median_daily_cost_empty_is_none():
 
 
 def test_fit_stops_at_budget():
-    actions = [{"idempotency_key": "a"}, {"idempotency_key": "b"}, {"idempotency_key": "c"}]
+    actions = [_act("a"), _act("b"), _act("c")]
     risks = {"a": 4000.0, "b": 4000.0, "c": 4000.0}
     fits, deferred = fit_into_budget(actions, risks, remaining_rub=9000.0)
     assert [a["idempotency_key"] for a in fits] == ["a", "b"]
@@ -59,14 +70,14 @@ def test_fit_stops_at_budget():
 
 
 def test_fit_takes_nothing_when_budget_exhausted():
-    actions = [{"idempotency_key": "a"}]
+    actions = [_act("a")]
     fits, deferred = fit_into_budget(actions, {"a": 100.0}, remaining_rub=0.0)
     assert fits == []
     assert len(deferred) == 1
 
 
 def test_fit_allows_all_when_budget_large():
-    actions = [{"idempotency_key": "a"}, {"idempotency_key": "b"}]
+    actions = [_act("a"), _act("b")]
     fits, deferred = fit_into_budget(actions, {"a": 1.0, "b": 1.0}, remaining_rub=1_000_000.0)
     assert len(fits) == 2
     assert deferred == []
@@ -75,8 +86,74 @@ def test_fit_allows_all_when_budget_large():
 def test_fit_defers_action_with_undetermined_risk():
     # Действие с неопределённым риском (+inf) не проходит бюджет ни при каком
     # конечном остатке — уходит в отложенные, а не пропускается бесплатно.
-    actions = [{"idempotency_key": "unknown"}, {"idempotency_key": "known"}]
+    actions = [_act("unknown"), _act("known")]
     risks = {"unknown": float("inf"), "known": 100.0}
     fits, deferred = fit_into_budget(actions, risks, remaining_rub=1_000_000.0)
     assert [a["idempotency_key"] for a in fits] == ["known"]
     assert [a["idempotency_key"] for a in deferred] == ["unknown"]
+
+
+# ------------------------------- риск списывается ПО ОБЪЕКТУ, а не по действию
+# Дефект 4: оценка риска (дневной расход кампании × горизонт наблюдения)
+# начислялась КАЖДОМУ действию. Четыре корректировки одной кампании списывали
+# четырёхкратный расход — бюджет выгорал на второй-третьей кампании, и
+# посчитанные корректировки капали по паре в неделю.
+
+
+def test_risk_object_is_the_object_not_the_action():
+    a = _act("k1", object_id="111")
+    b = _act("k2", object_id="111")
+    risk_object = risk_module.risk_object
+    assert risk_object(a) == risk_object(b)
+    assert risk_object(_act("k3", object_id="222")) != risk_object(a)
+
+
+def test_same_campaign_is_charged_once_per_run():
+    # Две корректировки одной кампании: расход кампании один, сколько бы
+    # корректировок ей ни ставили. Полная цена — первому действию, 0 — второму.
+    actions = [_act("a", object_id="111"), _act("b", object_id="111")]
+    risks = {"a": 7000.0, "b": 7000.0}
+
+    fits, deferred = fit_into_budget(actions, risks, remaining_rub=10_000.0)
+
+    assert [a["idempotency_key"] for a in fits] == ["a", "b"]
+    assert deferred == []
+    assert [a["risk_rub"] for a in fits] == [7000.0, 0.0]
+    # Сумма, уходящая в журнал, равна цене ОДНОЙ кампании, а не двух.
+    assert sum(a["risk_rub"] for a in fits) == 7000.0
+
+
+def test_different_campaigns_are_charged_separately():
+    actions = [_act("a", object_id="111"), _act("b", object_id="222")]
+    risks = {"a": 7000.0, "b": 7000.0}
+
+    fits, deferred = fit_into_budget(actions, risks, remaining_rub=10_000.0)
+
+    assert [a["idempotency_key"] for a in fits] == ["a"]
+    assert [a["idempotency_key"] for a in deferred] == ["b"]
+
+
+def test_charged_objects_carry_across_calls_within_one_run():
+    # Множество оплаченных объектов общее на прогон: кабинеты обрабатываются
+    # по очереди, и второй вызов не должен снова платить за уже оплаченное.
+    charged = set()
+    fit_into_budget([_act("a", object_id="111")], {"a": 7000.0}, 10_000.0, charged)
+
+    fits, _ = fit_into_budget([_act("b", object_id="111")], {"b": 7000.0}, 10_000.0, charged)
+
+    assert fits[0]["risk_rub"] == 0.0
+
+
+def test_deferred_action_does_not_mark_object_as_paid():
+    # Действие, не влезшее в бюджет, объект не помечает — иначе следующее
+    # действие по той же кампании прошло бы бесплатно за счёт так и не
+    # применённого первого.
+    charged = set()
+    actions = [_act("a", object_id="111"), _act("b", object_id="111")]
+    risks = {"a": 7000.0, "b": 7000.0}
+
+    fits, deferred = fit_into_budget(actions, risks, remaining_rub=100.0, charged_objects=charged)
+
+    assert fits == []
+    assert len(deferred) == 2
+    assert charged == set()

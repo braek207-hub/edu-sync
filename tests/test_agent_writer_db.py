@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+import sync.agent.writer.db as writer_db
 from sync.agent.writer.db import WRITER_DDL, ensure_writer_tables, spent_risk
 from sync.db import get_connection
 
@@ -100,3 +101,76 @@ def test_spent_risk_counts_by_applied_week_not_created_week():
                     (key_counted, key_excluded),
                 )
             conn.commit()
+
+
+# --------------------- повтор несёт свежие данные, а не прошлое первого прогона
+# Дефект 5: ON CONFLICT DO NOTHING оставлял в журнале previous_state ПЕРВОГО
+# прогона навсегда. Сценарий: первый прогон сохранил прошлое состояние и упал на
+# отправке; человек поправил значение руками; второй прогон прочитал свежий факт,
+# но ключ идемпотентности тот же — и откат вернул бы кабинет не туда, откуда
+# агент его вывел. То же с оценкой риска и красной линией.
+
+
+def test_insert_action_updates_unapplied_row_instead_of_ignoring_it():
+    sql = " ".join(writer_db.INSERT_ACTION_SQL.split())
+    assert "ON CONFLICT (idempotency_key) DO UPDATE SET" in sql
+    assert "DO NOTHING" not in sql
+    for column in ("previous_state = EXCLUDED.previous_state",
+                   "red_line = EXCLUDED.red_line",
+                   "risk_rub = EXCLUDED.risk_rub",
+                   "payload = EXCLUDED.payload"):
+        assert column in sql, column
+
+
+def test_insert_action_never_touches_applied_row():
+    # Уже применённая (или откатанная) строка неприкосновенна: её
+    # previous_state описывает реально совершённое изменение и является
+    # единственным основанием для отката.
+    sql = " ".join(writer_db.INSERT_ACTION_SQL.split())
+    assert "WHERE edu_agent_actions.status NOT IN ('applied', 'rolled_back')" in sql
+
+
+def test_insert_action_resets_stale_response_and_status():
+    sql = " ".join(writer_db.INSERT_ACTION_SQL.split())
+    assert "status = 'planned'" in sql
+    assert "response = '{}'::jsonb" in sql
+    assert "created_at = now()" in sql
+
+
+# ------------------------------------- обрыв ПОСЛЕ отправки виден в отчёте
+# Дефект 7: порядок «журнал → отправка» соблюдён, но смерть процесса ПОСЛЕ
+# ухода запроса оставляла строку в статусе planned — без ответа и без Id
+# созданного объекта. Такую строку не видит ни сторож применённых действий,
+# ни откат; риск не списан; diff следующего прогона новых действий не
+# предложит, потому что факт в кабинете уже совпал с планом.
+
+
+def test_stale_planned_finds_rows_stuck_in_intermediate_status():
+    sql = " ".join(writer_db.STALE_PLANNED_SQL.split())
+    assert "status = 'planned'" in sql
+    assert "created_at < now() - make_interval(mins => %s)" in sql
+
+
+def test_stale_planned_passes_threshold_and_account(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        writer_db, "_fetch",
+        lambda sql, params=(): captured.update(sql=sql, params=params) or [],
+    )
+
+    writer_db.stale_planned(60, account="acc-1")
+
+    assert captured["params"] == (60, "acc-1", "acc-1")
+    # Без кабинета — все зависшие строки, фильтр отключается значением NULL.
+    writer_db.stale_planned(30)
+    assert captured["params"] == (30, None, None)
+
+
+def test_open_actions_does_not_see_stuck_planned_rows():
+    # Причина, по которой зависшую строку нужно искать отдельным запросом:
+    # сторож применённых действий смотрит только на статус applied.
+    import inspect
+
+    source = inspect.getsource(writer_db.open_actions)
+    assert "status = 'applied'" in source
+    assert "planned" not in source

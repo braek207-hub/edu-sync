@@ -50,6 +50,12 @@ def diff_modifiers(
             "action_kind": action_kind,
             "object_level": "campaign",
             "object_id": str(campaign_id),
+            # Вид и ключ корректировки — на верхнем уровне действия, а не
+            # только внутри payload: у bidmodifier.set payload несёт лишь Id,
+            # и без этих полей отчёт прогона не мог бы сказать, ЧТО именно
+            # правится, — только «одно изменение в кампании 111».
+            "direct_type": item["direct_type"],
+            "key": item["key"],
             "payload": payload,
             "previous_state": previous_state,
             "idempotency_key": _idempotency_key(

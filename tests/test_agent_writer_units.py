@@ -173,12 +173,15 @@ def test_actual_device_keys_match_plan_keys():
     # Reports API отдаёт устройства заглавными; план канонизирует ключ в
     # верхний регистр. Строчный "mobile" в нормализации факта не сходился с
     # планом никогда — diff вечно предлагал add вместо set.
-    normalized = _normalize_actual({
-        "Id": 9,
-        "MobileAdjustment": {"BidModifier": 130},
-        "DesktopAdjustment": {"BidModifier": 120},
-        "TabletAdjustment": {"BidModifier": 90},
-    })
+    # По одной записи на устройство — так их и отдаёт bidmodifiers.get: у
+    # Директа это три РАЗНЫХ объекта с разными Id, а не одна запись с тремя
+    # полями (одна запись = один объект = одна нормализованная строка,
+    # см. sync/agent_e1.py::_normalize_actual).
+    normalized = []
+    for id_, field, coefficient in ((9, "MobileAdjustment", 130),
+                                    (10, "DesktopAdjustment", 120),
+                                    (11, "TabletAdjustment", 90)):
+        normalized += _normalize_actual({"Id": id_, field: {"BidModifier": coefficient}})
     by_type = {r["Type"]: r for r in normalized}
     assert by_type["MOBILE_ADJUSTMENT"]["key"] == "MOBILE"
     assert by_type["DESKTOP_ADJUSTMENT"]["key"] == "DESKTOP"

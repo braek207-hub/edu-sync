@@ -129,7 +129,7 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module) -> Dict[str,
                      переприменяются на следующем прогоне по той же причине:
                      неразобранный ответ — отказ по умолчанию, а не 'applied'.
     """
-    applied = skipped = failed = rejected = 0
+    applied = skipped = failed = rejected = dry_run = 0
     details: List[Dict[str, Any]] = []
 
     for action in actions:
@@ -151,6 +151,7 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module) -> Dict[str,
             db_module.mark_action(action_id, status, response)
             applied += 1 if status == "applied" else 0
             rejected += 1 if status == "rejected" else 0
+            dry_run += 1 if status == "dry_run" else 0
             details.append({"key": action["idempotency_key"], "result": status})
         except Exception as exc:
             db_module.mark_action(action_id, "failed", {"error": f"{type(exc).__name__}: {exc}"[:400]})
@@ -158,5 +159,9 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module) -> Dict[str,
             details.append({"key": action["idempotency_key"], "result": "failed",
                             "error": str(exc)[:200]})
 
+    # dry_run — полноправный счётчик, а не «ничего не произошло»: в режиме
+    # репетиции ВСЕ действия получают этот статус, и отчёт без него показывал
+    # ровные нули по всем счётчикам. Ровно по этому отчёту принимается решение
+    # включать боевую запись, и он обязан показывать объём репетиции.
     return {"applied": applied, "skipped": skipped, "failed": failed, "rejected": rejected,
-            "details": details}
+            "dry_run": dry_run, "details": details}

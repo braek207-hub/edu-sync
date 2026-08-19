@@ -74,10 +74,12 @@ def test_own_campaign_ids_drops_campaigns_without_cost_data():
     assert result == ["111"]
 
 
-def test_normalize_actual_splits_combined_gender_and_age():
-    # Одна запись DemographicsAdjustment может нести Gender И Age одновременно
-    # (ставка на пересечение сегментов) — без раскладки diff потерял бы
-    # вторую половину и предложил add там, где нужен set.
+def test_normalize_actual_collapses_combined_gender_and_age_to_one_record():
+    # Дефект 2. Запись DemographicsAdjustment может нести Gender И Age
+    # одновременно — это ОДИН объект Директа с одним Id. Раскладка её на две
+    # normalized-записи с ОДНИМ И ТЕМ ЖЕ Id выпускала из diff два изменения на
+    # один физический объект: второе затирало первое, оба списывали риск и оба
+    # сохраняли прошлое состояние, снятое до первого.
     # BidModifier здесь — то, что реально отдаёт API: 100-базный коэффициент
     # (120 = «+20 %»). Нормализация переводит его в дельту плана.
     item = {"Id": 55, "DemographicsAdjustment": {
@@ -85,13 +87,48 @@ def test_normalize_actual_splits_combined_gender_and_age():
 
     out = agent_e1._normalize_actual(item)
 
-    assert len(out) == 2
-    keys = {(r["Type"], r["key"]) for r in out}
-    assert keys == {
-        ("DEMOGRAPHICS_ADJUSTMENT", "GENDER_MALE"),
-        ("DEMOGRAPHICS_ADJUSTMENT", "AGE_25_34"),
-    }
-    assert all(r["Id"] == 55 and r["percent"] == 20 for r in out)
+    assert len(out) == 1
+    assert out[0]["Id"] == 55
+    assert out[0]["percent"] == 20
+    assert out[0]["key"] == "GENDER_MALE+AGE_25_34"
+    assert out[0]["composite"] is True
+
+
+def test_normalize_actual_never_returns_two_records_with_same_id():
+    # Инвариант нормализации: сколько бы измерений ни несла запись API, на один
+    # Id приходится максимум одна actual-запись — иначе diff может выпустить
+    # два изменения на один объект.
+    items = [
+        {"Id": 1, "DemographicsAdjustment": {
+            "BidModifier": 120, "Gender": "GENDER_MALE", "Age": "AGE_25_34"}},
+        {"Id": 2, "MobileAdjustment": {"BidModifier": 110},
+         "DesktopAdjustment": {"BidModifier": 110}},
+        {"Id": 3, "RegionalAdjustment": {"BidModifier": 90, "RegionId": 213}},
+    ]
+
+    out = [r for item in items for r in agent_e1._normalize_actual(item)]
+
+    ids = [r["Id"] for r in out]
+    assert len(ids) == len(set(ids)), out
+
+
+def test_combined_demographic_does_not_match_one_dimensional_plan():
+    # Семантика: коэффициент, посчитанный для всего мужского сегмента, к
+    # пересечению «мужчины 25–34» не относится. Составной ключ не сходится с
+    # одномерным планом, поэтому diff не выпустит set на чужой объект.
+    from sync.agent.writer.diff import diff_modifiers
+
+    desired = [{"kind": "bid_modifier:gender", "direct_type": "DEMOGRAPHICS_ADJUSTMENT",
+                "key": "GENDER_MALE", "percent": 30}]
+    actual = agent_e1._normalize_actual({"Id": 55, "DemographicsAdjustment": {
+        "BidModifier": 120, "Gender": "GENDER_MALE", "Age": "AGE_25_34"}})
+
+    actions = diff_modifiers(desired, actual, campaign_id="111")
+
+    assert len(actions) == 1
+    # Добавление отдельного одномерного объекта, а не правка многомерного.
+    assert actions[0]["action_kind"] == "bidmodifier.add"
+    assert "Id" not in actions[0]["payload"]
 
 
 def test_normalize_actual_keeps_single_demographic_field_as_one_record():
@@ -202,7 +239,7 @@ def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeyp
     monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables", lambda: None)
     monkeypatch.setattr(
         agent_e1.agent_db, "load_latest_computed_settings",
-        lambda: [{"setting_kind": "bid_modifier:device", "setting_key": "mobile",
+        lambda *_: [{"setting_kind": "bid_modifier:device", "setting_key": "mobile",
                   "value": 30.0, "support_n": 1000, "raw_value": 30.0}],
     )
     monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", lambda: [])
@@ -211,6 +248,7 @@ def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeyp
     monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa", lambda *_: {})
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
+    monkeypatch.setattr(agent_e1.writer_db, "stale_planned", lambda *a, **k: [])
     monkeypatch.setattr(agent_e1, "WriteClient", _FakeWriteClient)
 
     exit_code = agent_e1.main()
@@ -261,7 +299,7 @@ def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatc
     monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables", lambda: None)
     monkeypatch.setattr(
         agent_e1.agent_db, "load_latest_computed_settings",
-        lambda: [
+        lambda *_: [
             {"setting_kind": "bid_modifier:region", "setting_key": "Москва",
              "value": 30.0, "support_n": 1000, "raw_value": 1.3},
             {"setting_kind": "bid_modifier:device", "setting_key": "DESKTOP",
@@ -277,6 +315,7 @@ def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatc
     monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
     monkeypatch.setattr(agent_e1.writer_db, "insert_action", lambda action: 1)
     monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: None)
+    monkeypatch.setattr(agent_e1.writer_db, "stale_planned", lambda *a, **k: [])
     monkeypatch.setattr(agent_e1, "WriteClient", _RecordingWriteClient)
 
     assert agent_e1.main() == 0
@@ -292,3 +331,319 @@ def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatc
     item = sent[0][2]["BidModifiers"][0]
     assert item["DesktopAdjustment"]["BidModifier"] == 130   # дельта +30 → 100-база
     assert "MobileAdjustment" not in item
+
+
+# =========================================================================
+# Оркестратор прогона: настройки по кабинетам, лимит и риск на прогон,
+# состав репетиции и зависшие записи журнала.
+# =========================================================================
+
+
+class _MultiCabinetClient:
+    """Кабинет с заданным набором кампаний и пустыми корректировками.
+
+    campaigns_by_login задаётся тестом; mutate только записывает вызовы.
+    """
+
+    instances = []
+    campaigns_by_login = {}
+
+    def __init__(self, login, sandbox=True, dry_run=True):
+        self.login = login
+        self.sandbox = sandbox
+        self.dry_run = dry_run
+        self.units_left = None
+        self.sent = []
+        _MultiCabinetClient.instances.append(self)
+
+    def get(self, service, params):
+        if service == "campaigns":
+            ids = self.campaigns_by_login.get(self.login, [])
+            return {"Campaigns": [{"Id": i} for i in ids]}
+        if service == "bidmodifiers":
+            return {"BidModifiers": []}
+        raise AssertionError(f"неожиданный сервис: {service}")
+
+    def mutate(self, service, method, params):
+        self.sent.append((service, method, params))
+        return {"dry_run": True}
+
+
+def _setting(kind, key, value, support=1000):
+    return {"setting_kind": kind, "setting_key": key, "value": float(value),
+            "support_n": support, "raw_value": 1.0 + value / 100.0}
+
+
+def _reports(capsys):
+    """Отчёты прогона: main() печатает по одному JSON на кабинет подряд."""
+    out = capsys.readouterr().out
+    decoder = json.JSONDecoder()
+    reports = []
+    idx = 0
+    while idx < len(out):
+        while idx < len(out) and out[idx].isspace():
+            idx += 1
+        if idx >= len(out):
+            break
+        obj, idx = decoder.raw_decode(out, idx)
+        reports.append(obj)
+    return reports
+
+
+def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
+               baseline_cpa=None, stale=(), journal=None):
+    _MultiCabinetClient.instances = []
+    _MultiCabinetClient.campaigns_by_login = campaigns_by_login
+    logins = list(computed_by_login.keys())
+    monkeypatch.setattr(agent_e1, "_clients", lambda: [{"login": x} for x in logins])
+    monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables", lambda: None)
+    # Загрузчик вызывается С кабинетом. Значение по умолчанию оставлено
+    # намеренно: на коде ДО правки вызов идёт без аргументов, и тест падает на
+    # утверждениях о поведении, а не на TypeError.
+    monkeypatch.setattr(
+        agent_e1.agent_db, "load_latest_computed_settings",
+        lambda login=None, *a, **k: list(computed_by_login.get(login, [])),
+    )
+    monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", lambda: [])
+    monkeypatch.setattr(agent_e1.agent_db, "load_daily_cost_by_campaign", lambda *_: daily_cost)
+    monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa",
+                        lambda *_: dict(baseline_cpa or {c: 1000.0 for c in daily_cost}))
+    monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
+    monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
+    monkeypatch.setattr(agent_e1.writer_db, "stale_planned", lambda *a, **k: list(stale))
+    monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
+    rows = journal if journal is not None else []
+    monkeypatch.setattr(agent_e1.writer_db, "insert_action",
+                        lambda row: (rows.append(row), row["idempotency_key"])[1])
+    monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: None)
+    monkeypatch.setattr(agent_e1, "WriteClient", _MultiCabinetClient)
+    return rows
+
+
+# --------------------------------- дефект 1: настройки каждого кабинета — свои
+
+
+def test_each_cabinet_gets_its_own_computed_settings(monkeypatch, capsys):
+    # Расчёт Э0 идёт по кабинетам, и числа одного кабинета неприменимы к
+    # другому. Загрузчик обязан взять настройки именно того кабинета, в
+    # который сейчас пишет, а не общий схлопнутый набор.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={
+            "acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)],
+            "acc-2": [_setting("bid_modifier:device", "MOBILE", -20)],
+        },
+        campaigns_by_login={"acc-1": [111], "acc-2": [222]},
+        daily_cost={"111": 100.0, "222": 100.0},
+    )
+
+    assert agent_e1.main() == 0
+
+    sent_by_login = {c.login: c.sent for c in _MultiCabinetClient.instances}
+    first = sent_by_login["acc-1"][0][2]["BidModifiers"][0]
+    second = sent_by_login["acc-2"][0][2]["BidModifiers"][0]
+    assert first["DesktopAdjustment"]["BidModifier"] == 130   # дельта +30
+    assert "MobileAdjustment" not in first
+    assert second["MobileAdjustment"]["BidModifier"] == 80    # дельта -20
+    assert "DesktopAdjustment" not in second
+
+
+def test_cabinet_without_computed_settings_is_visible_in_report(monkeypatch, capsys):
+    # В таблице уже лежат данные, записанные по-старому: при чтении по-новому
+    # они не находятся, и прогон честно ничего не применяет. Это правильное
+    # поведение, но оно обязано быть видно в отчёте с причиной, а не выглядеть
+    # как «нечего делать».
+    _patch_run(
+        monkeypatch,
+        computed_by_login={
+            "acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)],
+            "acc-2": [],
+        },
+        campaigns_by_login={"acc-1": [111], "acc-2": [222]},
+        daily_cost={"111": 100.0, "222": 100.0},
+    )
+
+    assert agent_e1.main() == 0
+
+    reports = {r["account"]: r for r in _reports(capsys)}
+    silent = reports["acc-2"]
+    assert silent["verdict"] == "NO_COMPUTED_SETTINGS"
+    assert silent["computed_settings"] == 0
+    assert "object_id" in silent["reason"]
+    assert "acc-2" in silent["reason"]
+    # Кабинет с настройками при этом отработал как обычно.
+    assert reports["acc-1"]["desired"] == 1
+
+
+# ------------------------------------- дефект 3: лимит действий — на прогон
+
+
+def test_action_cap_is_shared_across_cabinets(monkeypatch, capsys):
+    # cap_actions вызывался внутри цикла по кабинетам: при четырёх кабинетах
+    # потолок был вчетверо выше заявленного. Смысл рельсы — ограничить объём
+    # изменений, которые можно проверить и осмысленно откатить, а он не
+    # зависит от числа кабинетов.
+    monkeypatch.setattr(agent_e1, "MAX_ACTIONS_PER_RUN", 2)
+    settings = [_setting("bid_modifier:device", "DESKTOP", 30)]
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": settings, "acc-2": settings},
+        campaigns_by_login={"acc-1": [111, 112], "acc-2": [221, 222]},
+        daily_cost={"111": 10.0, "112": 10.0, "221": 10.0, "222": 10.0},
+    )
+
+    assert agent_e1.main() == 0
+
+    sent = sum(len(c.sent) for c in _MultiCabinetClient.instances)
+    assert sent == 2, "потолок прогона обязан считаться на все кабинеты сразу"
+    reports = {r["account"]: r for r in _reports(capsys)}
+    assert reports["acc-1"]["actions_left_in_run"] == 0
+    assert reports["acc-2"]["deferred_by_cap"] == 2
+
+
+# --------------------------- дефект 4: риск кампании списывается один раз
+
+
+def test_campaign_risk_is_charged_once_per_run(monkeypatch, capsys):
+    # Четыре действия по одной кампании списывали четырёхкратный расход:
+    # бюджет исчерпывался на второй-третьей кампании, и посчитанные
+    # корректировки капали по паре в неделю.
+    journal = []
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [
+            _setting("bid_modifier:device", "DESKTOP", 30),
+            _setting("bid_modifier:device", "MOBILE", 20),
+            _setting("bid_modifier:gender", "GENDER_MALE", 15),
+        ]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 1000.0},   # риск кампании = 1000 × 7 = 7000
+        journal=journal,
+    )
+
+    assert agent_e1.main() == 0
+
+    report = _reports(capsys)[0]
+    assert report["prepared"]["count"] == 3
+    assert report["deferred_by_risk"] == 0
+    # Кампания одна — платим за неё один раз, а не трижды.
+    assert report["risk_charged_rub"] == 7000.0
+    assert sum(row["risk_rub"] for row in journal) == 7000.0
+
+
+def test_budget_is_not_exhausted_by_repeated_actions_on_same_campaign(monkeypatch, capsys):
+    # Тот же расчёт «в лоб»: три действия по кампании с расходом 1000 ₽/день
+    # стоили бы 21 000 ₽ при остатке 10 000 ₽ — два из трёх ушли бы в
+    # отложенные, хотя реальная цена ошибки по этой кампании 7000 ₽.
+    journal = []
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [
+            _setting("bid_modifier:device", "DESKTOP", 30),
+            _setting("bid_modifier:device", "MOBILE", 20),
+            _setting("bid_modifier:gender", "GENDER_MALE", 15),
+        ]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 1000.0},
+        journal=journal,
+    )
+    monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 10_000.0)
+
+    assert agent_e1.main() == 0
+
+    report = _reports(capsys)[0]
+    assert report["deferred_by_risk"] == 0
+    assert report["result"]["dry_run"] == 3
+
+
+# ------------------------- дефект 6: репетиция показывает, что было бы записано
+
+
+def test_dry_run_report_shows_what_would_be_written(monkeypatch, capsys):
+    # Главный артефакт для решения «включать боевую запись» показывал нули и
+    # не содержал ни числа готовых действий, ни их состава.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [
+            _setting("bid_modifier:device", "DESKTOP", 30),
+            _setting("bid_modifier:gender", "GENDER_MALE", -15),
+        ]},
+        campaigns_by_login={"acc-1": [111, 112]},
+        daily_cost={"111": 10.0, "112": 10.0},
+    )
+
+    assert agent_e1.main() == 0
+
+    report = _reports(capsys)[0]
+    assert report["dry_run"] is True
+    assert report["result"]["dry_run"] == 4          # 2 кампании × 2 корректировки
+    assert report["prepared"]["count"] == 4
+    assert report["prepared"]["by_setting"] == {
+        "DEMOGRAPHICS_ADJUSTMENT:GENDER_MALE -15% (add)": 2,
+        "DESKTOP_ADJUSTMENT:DESKTOP +30% (add)": 2,
+    }
+    assert report["prepared"]["sample"]
+    assert report["prepared"]["sample_truncated"] is False
+
+
+def test_dry_run_preview_stays_compact_on_many_actions():
+    # Состав показывается агрегатом плюс несколько примеров: полный список из
+    # полусотни строк превратил бы отчёт в стену текста.
+    actions = [{"object_id": str(i), "action_kind": "bidmodifier.add",
+                "direct_type": "MOBILE_ADJUSTMENT", "key": "MOBILE",
+                "payload": {"BidModifier": 20}} for i in range(50)]
+
+    preview = agent_e1.actions_preview(actions)
+
+    assert preview["count"] == 50
+    assert preview["by_setting"] == {"MOBILE_ADJUSTMENT:MOBILE +20% (add)": 50}
+    assert len(preview["sample"]) == agent_e1.PREVIEW_SAMPLE_LIMIT
+    assert preview["sample_truncated"] is True
+
+
+# --------------------- дефект 7: зависшие после обрыва записи видны в отчёте
+
+
+def test_stuck_planned_rows_are_reported(monkeypatch, capsys):
+    # Обрыв ПОСЛЕ отправки: изменение в кабинете состоялось, строка осталась
+    # planned. Её не видит ни сторож применённых действий, ни откат; риск не
+    # списан; diff следующего прогона новых действий не предложит, потому что
+    # факт уже совпал. Расхождение обязано всплыть в отчёте прогона.
+    stuck = [{"action_id": "abc123", "idempotency_key": "k-stuck",
+              "account": "acc-1", "object_level": "campaign", "object_id": "111",
+              "action_kind": "bidmodifier.add", "created_at": "2026-08-18T10:00:00+00:00"}]
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+        stale=stuck,
+    )
+
+    assert agent_e1.main() == 0
+
+    report = _reports(capsys)[0]
+    assert report["stale_planned"]["count"] == 1
+    assert report["stale_planned"]["older_than_minutes"] == agent_e1.STALE_PLANNED_MINUTES
+    assert report["stale_planned"]["sample"][0]["action_id"] == "abc123"
+    assert report["stale_planned"]["sample"][0]["object_id"] == "111"
+
+
+def test_stuck_rows_are_asked_per_cabinet(monkeypatch, capsys):
+    # Запрос идёт с кабинетом и порогом: чужие зависшие строки в отчёте
+    # кабинета не нужны.
+    calls = []
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)],
+                           "acc-2": []},
+        campaigns_by_login={"acc-1": [111], "acc-2": [222]},
+        daily_cost={"111": 10.0, "222": 10.0},
+    )
+    monkeypatch.setattr(agent_e1.writer_db, "stale_planned",
+                        lambda minutes, account=None: calls.append((minutes, account)) or [])
+
+    assert agent_e1.main() == 0
+
+    assert calls == [(agent_e1.STALE_PLANNED_MINUTES, "acc-1"),
+                     (agent_e1.STALE_PLANNED_MINUTES, "acc-2")]

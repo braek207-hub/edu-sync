@@ -73,21 +73,54 @@ def find_action_by_key(idempotency_key: str) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
+# Повторная планировка ещё не применённого действия обязана НЕСТИ СВЕЖИЕ ДАННЫЕ.
+# Со старым ON CONFLICT DO NOTHING сценарий был такой: первый прогон сохранил
+# прошлое состояние и упал на отправке; человек поправил значение руками; второй
+# прогон прочитал свежий факт из API, но идемпотентный ключ тот же — и в журнале
+# НАВСЕГДА оставалось прошлое состояние первого прогона. Откат вернул бы кабинет
+# не туда, откуда агент его вывел. То же с оценкой риска и красной линией.
+#
+# Условие в DO UPDATE — граница между «ещё не сделано» и «сделано»: строку в
+# статусе applied/rolled_back не трогаем никогда, её previous_state описывает
+# реально совершённое изменение и является единственным основанием для отката.
+# status/response сбрасываются: прошлая ошибка не должна выглядеть ответом на
+# новую попытку, а created_at обновляется, чтобы «зависшая» строка считалась от
+# последней попытки (stale_planned ниже).
+INSERT_ACTION_SQL = """
+    INSERT INTO edu_agent_actions (
+        action_id, idempotency_key, account, object_level, object_id,
+        action_kind, payload, previous_state, red_line, risk_rub, status
+    ) VALUES (
+        %(action_id)s, %(idempotency_key)s, %(account)s, %(object_level)s,
+        %(object_id)s, %(action_kind)s, %(payload)s, %(previous_state)s,
+        %(red_line)s, %(risk_rub)s, 'planned'
+    )
+    ON CONFLICT (idempotency_key) DO UPDATE SET
+        account        = EXCLUDED.account,
+        object_level   = EXCLUDED.object_level,
+        object_id      = EXCLUDED.object_id,
+        action_kind    = EXCLUDED.action_kind,
+        payload        = EXCLUDED.payload,
+        previous_state = EXCLUDED.previous_state,
+        red_line       = EXCLUDED.red_line,
+        risk_rub       = EXCLUDED.risk_rub,
+        status         = 'planned',
+        response       = '{}'::jsonb,
+        created_at     = now()
+    WHERE edu_agent_actions.status NOT IN ('applied', 'rolled_back')
+"""
+
+
 def insert_action(row: Dict[str, Any]) -> str:
-    """Пишет действие в статусе planned. Повторный вызов с тем же ключом
-    возвращает уже существующий action_id и ничего не меняет."""
-    action_id = make_action_id(row["idempotency_key"])
-    sql = """
-        INSERT INTO edu_agent_actions (
-            action_id, idempotency_key, account, object_level, object_id,
-            action_kind, payload, previous_state, red_line, risk_rub, status
-        ) VALUES (
-            %(action_id)s, %(idempotency_key)s, %(account)s, %(object_level)s,
-            %(object_id)s, %(action_kind)s, %(payload)s, %(previous_state)s,
-            %(red_line)s, %(risk_rub)s, 'planned'
-        )
-        ON CONFLICT (idempotency_key) DO NOTHING
+    """Пишет действие в статусе planned.
+
+    Повторный вызов с тем же ключом обновляет ещё не применённую строку
+    свежими данными (previous_state, red_line, risk_rub) и возвращает тот же
+    action_id. Уже применённую или откатанную строку не трогает — см.
+    INSERT_ACTION_SQL.
     """
+    action_id = make_action_id(row["idempotency_key"])
+    sql = INSERT_ACTION_SQL
     params = {
         **row,
         "action_id": action_id,
@@ -123,6 +156,38 @@ def open_actions() -> List[Dict[str, Any]]:
     return _fetch(
         "SELECT * FROM edu_agent_actions WHERE status = 'applied' AND rolled_back_at IS NULL"
     )
+
+
+# Строка, застрявшая в промежуточном статусе, — след обрыва ПОСЛЕ отправки
+# запроса. Порядок «журнал → отправка» защищает от потери следа, но не от
+# смерти процесса между уходом запроса и отметкой результата: изменение в
+# кабинете состоялось, а строка осталась planned — без ответа и без Id
+# созданного объекта. Такую строку не видит ни сторож применённых действий
+# (open_actions смотрит только applied), ни откат; риск-бюджет не списан;
+# diff следующего прогона новых действий не предложит, потому что факт в
+# кабинете уже совпал с планом. Расхождение не всплывает нигде — поэтому
+# ищем его явно и показываем в отчёте прогона.
+STALE_PLANNED_SQL = """
+    SELECT action_id, idempotency_key, account, object_level, object_id,
+           action_kind, created_at
+    FROM edu_agent_actions
+    WHERE status = 'planned'
+      AND created_at < now() - make_interval(mins => %s)
+      AND (%s IS NULL OR account = %s)
+    ORDER BY created_at
+"""
+
+
+def stale_planned(older_than_minutes: int, account: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Действия, застрявшие в статусе planned дольше разумного времени.
+
+    Порог в минутах, а не в днях: прогон живёт минуты, и всё, что старше
+    порога, к текущему прогону отношения не имеет — это след прошлого обрыва,
+    который надо разобрать руками (сверить кабинет с журналом), а не автоматом:
+    достоверно отличить «запрос ушёл и применился» от «запрос не ушёл» по
+    самой строке невозможно.
+    """
+    return _fetch(STALE_PLANNED_SQL, (int(older_than_minutes), account, account))
 
 
 def mark_rolled_back(action_id: str) -> None:
