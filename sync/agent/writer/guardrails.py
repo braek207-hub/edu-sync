@@ -19,12 +19,26 @@ from typing import Any, Dict, List, Set, Tuple
 MODIFIER_CAP = 50          # потолок и пол корректировки, проценты
 MAX_ACTIONS_PER_RUN = 50
 
+# Allow-лист: разрешено ровно это, всё остальное отклоняется. Не блок-лист по
+# словам — тот пропускает любой ещё не придуманный вид действия (purge,
+# campaign.archive, adgroups.suspend, ...) молча, а рельса обязана держать
+# "никогда", а не эвристику по подстроке.
+ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set"}
+
 
 def check_action(action: Dict[str, Any]) -> Tuple[bool, str]:
     """Проверка одного действия. Возвращает (можно ли, причина отказа)."""
     kind = str(action.get("action_kind") or "")
-    if "delete" in kind or "remove" in kind:
+    kind_lower = kind.lower()
+
+    # Отдельная явная проверка поверх allow-листа — не для защиты (её уже
+    # даёт allow-лист), а чтобы в журнале была понятная причина отказа
+    # именно "удаление", а не общая "вне allow-листа".
+    if "delete" in kind_lower or "remove" in kind_lower:
         return False, "удаление объектов запрещено: агент только паузит"
+
+    if kind not in ALLOWED_ACTION_KINDS:
+        return False, f"вид действия вне allow-листа: {kind}"
 
     percent = action.get("payload", {}).get("BidModifier")
     if percent is not None:
@@ -34,9 +48,10 @@ def check_action(action: Dict[str, Any]) -> Tuple[bool, str]:
 
 
 def check_holdout(
-    actions: List[Dict[str, Any]], holdout_ids: Set[str]
+    actions: List[Dict[str, Any]], holdout_ids: Set[Any]
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Разделяет действия на разрешённые и заблокированные заповедником."""
+    holdout_ids = {str(h) for h in holdout_ids}
     allowed = [a for a in actions if str(a.get("object_id")) not in holdout_ids]
     blocked = [a for a in actions if str(a.get("object_id")) in holdout_ids]
     return allowed, blocked

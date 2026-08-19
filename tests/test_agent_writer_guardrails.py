@@ -19,6 +19,28 @@ def test_forbids_any_delete():
     assert "удал" in reason.lower()
 
 
+def test_forbids_delete_uppercase():
+    ok, reason = check_action(_action(kind="bidmodifier.DELETE"))
+    assert ok is False
+    assert "удал" in reason.lower()
+
+
+def test_forbids_delete_mixed_case():
+    ok, reason = check_action(_action(kind="BidModifier.Delete"))
+    assert ok is False
+    assert "удал" in reason.lower()
+
+
+def test_forbids_action_kind_outside_allowlist():
+    ok, reason = check_action(_action(kind="purge"))
+    assert ok is False
+    assert "allow" in reason.lower()
+
+    ok, reason = check_action(_action(kind="campaign.archive"))
+    assert ok is False
+    assert "allow" in reason.lower()
+
+
 def test_forbids_modifier_beyond_cap():
     ok, reason = check_action(_action(percent=250))
     assert ok is False
@@ -33,6 +55,13 @@ def test_forbids_modifier_below_floor():
 def test_holdout_campaigns_are_untouched():
     actions = [_action(object_id="111"), _action(object_id="222")]
     allowed, blocked = check_holdout(actions, holdout_ids={"222"})
+    assert [a["object_id"] for a in allowed] == ["111"]
+    assert [a["object_id"] for a in blocked] == ["222"]
+
+
+def test_holdout_protects_with_numeric_ids():
+    actions = [_action(object_id="111"), _action(object_id="222")]
+    allowed, blocked = check_holdout(actions, holdout_ids={222})
     assert [a["object_id"] for a in allowed] == ["111"]
     assert [a["object_id"] for a in blocked] == ["222"]
 
