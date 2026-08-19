@@ -1,0 +1,33 @@
+name: agent-e1
+on:
+  workflow_dispatch:
+    inputs:
+      prod:
+        description: "Боевой кабинет вместо песочницы"
+        required: false
+        type: boolean
+        default: false
+      apply:
+        description: "РЕАЛЬНАЯ ЗАПИСЬ (без неё — dry-run)"
+        required: false
+        type: boolean
+        default: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run E1a
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.prod }}" = "true" ]; then ARGS="$ARGS --prod"; fi
+          if [ "${{ github.event.inputs.apply }}" = "true" ]; then ARGS="$ARGS --apply"; fi
+          python -m sync.agent_e1 $ARGS

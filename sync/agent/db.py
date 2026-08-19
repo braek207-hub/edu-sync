@@ -302,6 +302,59 @@ def load_campaign_features(date_from: str, date_to: str) -> List[Dict[str, Any]]
     )
 
 
+def load_latest_computed_settings() -> List[Dict[str, Any]]:
+    """Последний расчёт вычисляемых настроек."""
+    return _fetch_dicts(
+        """
+        SELECT setting_kind, setting_key, value, support_n, raw_value
+        FROM edu_agent_computed_settings
+        WHERE calc_date = (SELECT MAX(calc_date) FROM edu_agent_computed_settings)
+        """
+    )
+
+
+def load_holdout_ids() -> List[str]:
+    rows = _fetch_dicts(
+        "SELECT campaign_id FROM edu_agent_holdout WHERE excluded_at IS NULL"
+    )
+    return [str(r["campaign_id"]) for r in rows]
+
+
+def load_baseline_cpa(date_from: str, date_to: str) -> Dict[str, float]:
+    """Базовый CPA кампании за окно — точка отсчёта для красной линии.
+
+    Знаменатель — эффективные лиды: по ним ставится порог отката, потому что
+    оплаты созревают дольше, чем длится наблюдение за изменением.
+    """
+    rows = _fetch_dicts(
+        """
+        SELECT campaign_id,
+               SUM(cost) / NULLIF(SUM(eff_leads), 0) AS cpa
+        FROM edu_agent_facts
+        WHERE fact_date BETWEEN %s AND %s
+        GROUP BY campaign_id
+        HAVING SUM(eff_leads) > 0
+        """,
+        (date_from, date_to),
+    )
+    return {str(r["campaign_id"]): float(r["cpa"]) for r in rows}
+
+
+def load_daily_cost_by_campaign(date_from: str, date_to: str) -> Dict[str, float]:
+    """Средний дневной расход кампании за окно — множитель цены ошибки."""
+    rows = _fetch_dicts(
+        """
+        SELECT campaign_id, AVG(cost) AS daily_cost
+        FROM edu_agent_facts
+        WHERE fact_date BETWEEN %s AND %s
+        GROUP BY campaign_id
+        HAVING AVG(cost) > 0
+        """,
+        (date_from, date_to),
+    )
+    return {str(r["campaign_id"]): float(r["daily_cost"]) for r in rows}
+
+
 # ---------------------------------------------------------------- запись
 
 
