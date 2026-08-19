@@ -107,8 +107,20 @@ def main() -> int:
         "MobileAdjustmentFieldNames": ["BidModifier", "OperatingSystemType"],
         "DemographicsAdjustmentFieldNames": ["BidModifier", "Gender", "Age"],
     })
-    cases.append({"case": "get + FieldNames", "verdict": classify(s, b),
+    cases.append({"case": "get без Levels", "verdict": classify(s, b),
                   "raw": json.dumps(b, ensure_ascii=False)[:300]})
+
+    # Levels — обязательный параметр get (error 8000 без него). Проверяем значения.
+    for levels in (["CAMPAIGN"], ["CAMPAIGN", "AD_GROUP"]):
+        s, b = _call(base, login, "bidmodifiers", "get", {
+            "SelectionCriteria": {"CampaignIds": [campaign_id]},
+            "FieldNames": ["Id", "CampaignId", "AdGroupId", "Type", "Level"],
+            "Levels": levels,
+            "MobileAdjustmentFieldNames": ["BidModifier", "OperatingSystemType"],
+            "DemographicsAdjustmentFieldNames": ["BidModifier", "Gender", "Age"],
+        })
+        cases.append({"case": f"get Levels={levels}", "verdict": classify(s, b),
+                      "raw": json.dumps(b, ensure_ascii=False)[:300]})
 
     s, b = _call(base, login, "bidmodifiers", "set", {
         "BidModifiers": [{"Id": NONEXISTENT_ID, "BidModifier": 110}],
