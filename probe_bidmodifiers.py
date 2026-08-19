@@ -111,11 +111,12 @@ def main() -> int:
                   "raw": json.dumps(b, ensure_ascii=False)[:300]})
 
     # Levels — обязательный параметр get (error 8000 без него). Проверяем значения.
+    # Levels лежит ВНУТРИ SelectionCriteria: на верхнем уровне params он не виден,
+    # и API продолжает жаловаться на его отсутствие.
     for levels in (["CAMPAIGN"], ["CAMPAIGN", "AD_GROUP"]):
         s, b = _call(base, login, "bidmodifiers", "get", {
-            "SelectionCriteria": {"CampaignIds": [campaign_id]},
+            "SelectionCriteria": {"CampaignIds": [campaign_id], "Levels": levels},
             "FieldNames": ["Id", "CampaignId", "AdGroupId", "Type", "Level"],
-            "Levels": levels,
             "MobileAdjustmentFieldNames": ["BidModifier", "OperatingSystemType"],
             "DemographicsAdjustmentFieldNames": ["BidModifier", "Gender", "Age"],
         })
