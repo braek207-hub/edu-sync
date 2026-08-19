@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-tests/test_agent_e1.py — тесты двух отклонений оркестратора Э1a от исходного
-плана задачи (см. task-9-report.md): кампании только своего кабинета,
-нормализация демографических корректировок с двумя измерениями сразу.
+tests/test_agent_e1.py — тесты отклонений оркестратора Э1a от исходного плана
+задачи (см. task-9-report.md): кампании только своего кабинета, нормализация
+демографических корректировок с двумя измерениями сразу, абсолютный порог
+красной линии из медианы базового CPA (правка по код-ревью — старый вызов
+red_line_for(action, baseline) без absolute_max_cpa молча получал дефолт
+3000 ₽, никак не связанный с экономикой кабинета).
 
-Все тесты — чистые функции: WriteClient подменён фейком по протоколу .get(),
-без сети и без БД.
+Все тесты — чистые функции/фейки по протоколу (.get()/.mutate(),
+find_action_by_key/insert_action/mark_action) — без сети и без БД.
 """
+
+import json
 
 import sync.agent_e1 as agent_e1
 
@@ -107,3 +112,111 @@ def test_normalize_actual_mobile_and_regional_unaffected():
 
 def test_normalize_actual_no_dimensions_returns_empty():
     assert agent_e1._normalize_actual({"Id": 1}) == []
+
+
+# ------------------------------------------ красная линия: медиана базового CPA
+
+
+def test_absolute_max_cpa_from_baseline_uses_median_times_multiplier():
+    baseline_cpa = {"111": 1000.0, "222": 3000.0, "333": 2000.0}  # медиана 2000.0
+
+    result = agent_e1.absolute_max_cpa_from_baseline(baseline_cpa)
+
+    assert result == 2000.0 * agent_e1.ABSOLUTE_MAX_CPA_MULTIPLIER
+
+
+def test_absolute_max_cpa_from_baseline_none_when_dict_empty():
+    # Справочник базовых CPA пуст целиком — медианы не существует.
+    assert agent_e1.absolute_max_cpa_from_baseline({}) is None
+
+
+def test_build_red_line_uses_own_baseline_when_present():
+    # Кампания с собственным base_cpa > 0 — относительный порог, absolute_max_cpa
+    # не участвует (можно передать None).
+    action = {"object_id": "111"}
+    baseline_cpa = {"111": 1000.0}
+
+    red_line = agent_e1.build_red_line(action, baseline_cpa, absolute_max_cpa=None)
+
+    assert red_line["has_baseline"] is True
+    assert red_line["baseline_cpa"] == 1000.0
+
+
+def test_build_red_line_passes_absolute_threshold_when_no_own_baseline():
+    # Порог считается от медианы и передаётся в красную линию: max_value
+    # красной линии обязан совпасть с absolute_max_cpa_from_baseline, а не с
+    # захардкоженным DEFAULT_ABSOLUTE_MAX_CPA=3000 из rollback.py.
+    action = {"object_id": "999"}  # нет в справочнике
+    baseline_cpa = {"111": 1000.0, "222": 3000.0}  # медиана 2000.0
+
+    absolute_max_cpa = agent_e1.absolute_max_cpa_from_baseline(baseline_cpa)
+    red_line = agent_e1.build_red_line(action, baseline_cpa, absolute_max_cpa)
+
+    assert absolute_max_cpa == 4000.0  # 2000.0 * ABSOLUTE_MAX_CPA_MULTIPLIER (2.0)
+    assert red_line["has_baseline"] is False
+    assert red_line["max_value"] == absolute_max_cpa
+
+
+def test_build_red_line_returns_none_when_no_baseline_and_no_absolute():
+    # Ни собственного base_cpa, ни медианы (справочник пуст целиком) —
+    # красную линию посчитать не из чего, действие не применяется.
+    action = {"object_id": "111"}
+
+    red_line = agent_e1.build_red_line(action, baseline_cpa={}, absolute_max_cpa=None)
+
+    assert red_line is None
+
+
+class _FakeWriteClient:
+    """Кампания 111 без корректировок — desired_bid_modifiers всегда предложит
+    добавление, которое дальше упирается в отсутствие красной линии."""
+
+    def __init__(self, login, sandbox=True, dry_run=True):
+        self.login = login
+        self.sandbox = sandbox
+        self.dry_run = dry_run
+        self.units_left = None
+
+    def get(self, service, params):
+        if service == "campaigns":
+            return {"Campaigns": [{"Id": 111}]}
+        if service == "bidmodifiers":
+            return {"BidModifiers": []}
+        raise AssertionError(f"неожиданный сервис: {service}")
+
+    def mutate(self, service, method, params):
+        raise AssertionError(
+            "mutate не должен вызываться: действие без красной линии обязано "
+            "быть исключено ДО apply_actions"
+        )
+
+
+def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeypatch, capsys):
+    # Сквозной тест правки по код-ревью: если справочник базовых CPA пуст
+    # целиком, ни у одного действия нет работающей красной линии — main()
+    # обязан не применять их (mutate не вызывается) и показать причину в
+    # отчёте прогона (no_red_line), а не тихо использовать дефолт-плейсхолдер.
+    monkeypatch.setattr(agent_e1, "_clients", lambda: [{"login": "acc-1"}])
+    monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables", lambda: None)
+    monkeypatch.setattr(
+        agent_e1.agent_db, "load_latest_computed_settings",
+        lambda: [{"setting_kind": "bid_modifier:device", "setting_key": "mobile",
+                  "value": 30.0, "support_n": 1000, "raw_value": 30.0}],
+    )
+    monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", lambda: [])
+    monkeypatch.setattr(agent_e1.agent_db, "load_daily_cost_by_campaign",
+                         lambda *_: {"111": 500.0})
+    monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa", lambda *_: {})
+    monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
+    monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
+    monkeypatch.setattr(agent_e1, "WriteClient", _FakeWriteClient)
+
+    exit_code = agent_e1.main()
+
+    assert exit_code == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["no_red_line"] == {"count": 1, "reason": agent_e1.NO_RED_LINE_REASON}
+    assert report["absolute_max_cpa"] is None
+    assert report["result"]["applied"] == 0
+    assert report["result"]["rejected"] == 0
+    assert report["result"]["failed"] == 0

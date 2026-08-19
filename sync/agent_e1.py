@@ -45,11 +45,24 @@ from sync.agent.writer.client import WriteClient
 from sync.agent.writer.diff import diff_modifiers
 from sync.agent.writer.guardrails import cap_actions, check_action, check_holdout
 from sync.agent.writer.plan import desired_bid_modifiers
-from sync.agent.writer.risk import action_risk, fit_into_budget, week_start
+from sync.agent.writer.risk import action_risk, fit_into_budget, median, week_start
 from sync.agent.writer.rollback import red_line_for
 
 DEFAULT_WEEKLY_RISK_RUB = 50_000.0
 CAMPAIGN_PAGE_LIMIT = 1000
+
+# Множитель медианы базового CPA → абсолютный аварийный порог красной линии
+# для кампаний без собственной базы (rollback.py::red_line_for, has_baseline=
+# False). Медиана — типичный CPA портфеля, а не потолок для конкретной новой
+# или непредсказуемой кампании: x2 даёт запас, прежде чем считать результат
+# провалом, но не настолько широкий, чтобы автооткат никогда не сработал —
+# тот же порядок величины, что и относительный потолок для кампаний с базой
+# (RED_LINE_TOLERANCE = +40% в rollback.py — здесь просто нет базы для %).
+ABSOLUTE_MAX_CPA_MULTIPLIER = 2.0
+
+# Причина, по которой действие не применяется, когда абсолютный порог
+# посчитать не из чего вообще (справочник базовых CPA пуст целиком).
+NO_RED_LINE_REASON = "нет базового CPA ни у одной кампании — красная линия недостижима"
 
 
 def _clients() -> List[Dict[str, Any]]:
@@ -126,6 +139,38 @@ def _normalize_actual(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def absolute_max_cpa_from_baseline(baseline_cpa: Dict[str, float]) -> Any:
+    """Абсолютный аварийный порог красной линии: медиана известных базовых
+    CPA × ABSOLUTE_MAX_CPA_MULTIPLIER. None, если справочник пуст целиком —
+    медианы не существует, порог из данных не выводится.
+    """
+    med = median(baseline_cpa.values())
+    if med is None:
+        return None
+    return round(med * ABSOLUTE_MAX_CPA_MULTIPLIER, 2)
+
+
+def build_red_line(
+    action: Dict[str, Any], baseline_cpa: Dict[str, float], absolute_max_cpa: Any,
+) -> Any:
+    """Красная линия для действия, или None, если её посчитать не из чего.
+
+    У кампании есть собственный baseline_cpa (>0) — относительный порог,
+    absolute_max_cpa не нужен. Нет — нужен absolute_max_cpa (медиана по
+    справочнику, см. absolute_max_cpa_from_baseline); если и его нет
+    (справочник baseline_cpa пуст целиком), у действия не будет работающей
+    красной линии вообще — применять его нельзя, вызывающий код обязан
+    исключить его до apply_actions, а не передавать дальше с тихим
+    дефолт-плейсхолдером.
+    """
+    baseline = {"cpa": baseline_cpa.get(str(action["object_id"]), 0.0)}
+    if baseline["cpa"] <= 0 and absolute_max_cpa is None:
+        return None
+    if absolute_max_cpa is not None:
+        return red_line_for(action, baseline, absolute_max_cpa)
+    return red_line_for(action, baseline)
+
+
 def _actual_modifiers(client: WriteClient, campaign_id: str) -> List[Dict[str, Any]]:
     """Свежее состояние корректировок кампании: между прогонами кабинет могли
     править руками, поэтому читаем заново на каждом прогоне, а не берём из журнала.
@@ -173,6 +218,14 @@ def main() -> int:
     baseline_cpa = agent_db.load_baseline_cpa(cutoff, today)
     wk = week_start(today)
 
+    # Абсолютный аварийный порог красной линии считается один раз на весь
+    # прогон из уже загруженного baseline_cpa — те же данные, тот же приём
+    # медианы, что и для неизвестного дневного расхода в risk.py. Справочник
+    # пуст целиком (None) — абсолютный порог из данных не выводится: такие
+    # действия ниже явно исключаются из применения, а не тихо получают
+    # дефолт-плейсхолдер, никак не связанный с экономикой кабинета.
+    absolute_max_cpa = absolute_max_cpa_from_baseline(baseline_cpa)
+
     for client_info in clients:
         client = WriteClient(client_info["login"], sandbox=sandbox, dry_run=dry_run)
 
@@ -205,13 +258,20 @@ def main() -> int:
 
         # Красная линия ставится ВМЕСТЕ с действием: у каждого применённого
         # изменения заранее известно, при каком исходе оно считается провалом.
+        # build_red_line возвращает None, если её посчитать не из чего — такое
+        # действие не применяется, причина уходит в no_red_line, а не в тихий
+        # дефолт-плейсхолдер.
         prepared = []
+        no_red_line: List[Dict[str, Any]] = []
         for a in fits:
-            baseline = {"cpa": baseline_cpa.get(str(a["object_id"]), 0.0)}
+            red_line = build_red_line(a, baseline_cpa, absolute_max_cpa)
+            if red_line is None:
+                no_red_line.append({**a, "blocked_reason": NO_RED_LINE_REASON})
+                continue
             prepared.append({
                 **a,
                 "risk_rub": risks[a["idempotency_key"]],
-                "red_line": red_line_for(a, baseline),
+                "red_line": red_line,
             })
         report = apply_actions(client, prepared, writer_db)
 
@@ -225,7 +285,12 @@ def main() -> int:
             "blocked": len(blocked),
             "deferred_by_risk": len(deferred),
             "deferred_by_cap": len(over_cap),
+            "no_red_line": {
+                "count": len(no_red_line),
+                "reason": NO_RED_LINE_REASON if no_red_line else None,
+            },
             "remaining_risk_rub": round(remaining, 2),
+            "absolute_max_cpa": absolute_max_cpa,
             "result": {k: v for k, v in report.items() if k != "details"},
             "units_left": client.units_left,
         }, ensure_ascii=False, indent=2))

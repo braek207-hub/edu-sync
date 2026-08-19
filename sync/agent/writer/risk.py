@@ -32,6 +32,25 @@ def week_start(today_iso: str) -> str:
     return (d - timedelta(days=d.weekday())).isoformat()
 
 
+def median(values) -> Optional[float]:
+    """Медиана списка чисел. None, если список пуст — оценивать не от чего.
+
+    Общий приём для консервативной оценки там, где для конкретного объекта
+    нет собственных данных: половина известных объектов ниже медианы,
+    половина — выше, оценка не занижена систематически в сторону нуля.
+    Используется и для дневного расхода (median_daily_cost ниже), и для
+    базового CPA красной линии (sync/agent_e1.py).
+    """
+    ordered = sorted(float(v) for v in values)
+    if not ordered:
+        return None
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
 def median_daily_cost(daily_cost_by_campaign: Dict[str, float]) -> Optional[float]:
     """Медиана дневного расхода по известным кампаниям.
 
@@ -40,14 +59,7 @@ def median_daily_cost(daily_cost_by_campaign: Dict[str, float]) -> Optional[floa
     систематически в сторону нуля. None, если справочник пуст —
     оценивать не от чего.
     """
-    values = sorted(float(v) for v in daily_cost_by_campaign.values())
-    if not values:
-        return None
-    n = len(values)
-    mid = n // 2
-    if n % 2:
-        return values[mid]
-    return (values[mid - 1] + values[mid]) / 2.0
+    return median(daily_cost_by_campaign.values())
 
 
 def action_risk(
