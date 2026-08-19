@@ -10,9 +10,12 @@ probe_bidmodifiers.py — какие формы принимает сервис 
   - bidmodifiers.get — какие поля возвращает и как называются наборы;
   - bidmodifiers.set — изменение процента у существующей корректировки;
   - bidmodifiers.add — создание корректировки (демография, устройство, регион);
-  - bidmodifiers.toggle — включение/выключение набора.
 
-Запуск: python probe_bidmodifiers.py [--prod]   (по умолчанию песочница)
+Запуск: python probe_bidmodifiers.py [--prod]
+
+Песочница боевым логинам недоступна (error 513 «логин не подключен», run 32217815538),
+поэтому формы проверяются на проде — по заведомо несуществующим Id, которые ничего
+не меняют. Метода toggle у сервиса нет (error 55), он из проб убран.
 ENV: DIRECT_TOKEN, DIRECT_CLIENTS_JSON
 """
 
@@ -27,6 +30,10 @@ SANDBOX = "https://api-sandbox.direct.yandex.com/json/v5"
 PROD = "https://api.direct.yandex.com/json/v5"
 
 _RIGHTS_CODES = {53, 54, 152, 513}
+
+# Заведомо несуществующие идентификаторы: ошибка уровня элемента подтверждает
+# форму запроса, ничего не меняя. Реальные объекты не затрагиваются.
+NONEXISTENT_ID = 999_999_999
 
 
 def classify(status: int, body: Dict[str, Any]) -> str:
@@ -89,7 +96,7 @@ def main() -> int:
         "SelectionCriteria": {}, "FieldNames": ["Id"], "Page": {"Limit": 1},
     })
     campaigns = ((body.get("result") or {}).get("Campaigns") or [])
-    campaign_id = campaigns[0]["Id"] if campaigns else 999_999_999
+    campaign_id = NONEXISTENT_ID
     print(f"кампания для проб: {campaign_id} (найдено {len(campaigns)})\n")
 
     cases: List[Dict[str, Any]] = []
@@ -104,7 +111,7 @@ def main() -> int:
                   "raw": json.dumps(b, ensure_ascii=False)[:300]})
 
     s, b = _call(base, login, "bidmodifiers", "set", {
-        "BidModifiers": [{"Id": 1, "BidModifier": 110}],
+        "BidModifiers": [{"Id": NONEXISTENT_ID, "BidModifier": 110}],
     })
     cases.append({"case": "set по Id", "verdict": classify(s, b),
                   "raw": json.dumps(b, ensure_ascii=False)[:300]})
@@ -125,13 +132,6 @@ def main() -> int:
         }],
     })
     cases.append({"case": "add mobile", "verdict": classify(s, b),
-                  "raw": json.dumps(b, ensure_ascii=False)[:300]})
-
-    s, b = _call(base, login, "bidmodifiers", "toggle", {
-        "BidModifierToggleItems": [{"CampaignId": campaign_id, "Type": "MOBILE_ADJUSTMENT",
-                                    "Enabled": "YES"}],
-    })
-    cases.append({"case": "toggle mobile", "verdict": classify(s, b),
                   "raw": json.dumps(b, ensure_ascii=False)[:300]})
 
     print(summarize(cases))
