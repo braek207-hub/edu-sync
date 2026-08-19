@@ -89,3 +89,44 @@ def test_gsc_rows_aggregate_brand_only_by_week():
         "2025-06-02": {"clicks": 60, "impressions": 600},
         "2025-06-09": {"clicks": 5, "impressions": 50},
     }
+
+
+def test_sync_gsc_seo_requests_from_monday(monkeypatch):
+    """Инкремент «сегодня − 8 недель» падает в середину недели; запрос обязан уезжать
+    к понедельнику, иначе граничная неделя перезаписывается усечённой суммой
+    (порча недель 2026-05-18…06-22, обнаружена 2026-08-19)."""
+    import sync.gsc as gsc
+
+    captured = {}
+
+    class FakeQuery:
+        def __init__(self, body):
+            self.body = body
+
+        def execute(self):
+            captured.setdefault("start_dates", []).append(self.body["startDate"])
+            return {}
+
+    class FakeSA:
+        def query(self, siteUrl, body):
+            return FakeQuery(body)
+
+    class FakeSites:
+        def list(self):
+            class R:
+                def execute(self_inner):
+                    return {"siteEntry": [{"siteUrl": "https://limestore.com/"}]}
+            return R()
+
+    class FakeService:
+        def searchanalytics(self):
+            return FakeSA()
+
+        def sites(self):
+            return FakeSites()
+
+    monkeypatch.setattr(gsc, "get_searchconsole_service", lambda: FakeService())
+    # 2026-06-24 — среда; пустой ответ → weekly пуст → до БД не доходит
+    n = gsc.sync_gsc_seo("2026-06-24", "2026-08-19", "kz")
+    assert n == 0
+    assert captured["start_dates"] == ["2026-06-22"]  # понедельник той недели

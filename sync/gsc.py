@@ -160,7 +160,13 @@ def fetch_site_country(service, site: str, country: str, region: str,
 
 
 def sync_gsc_seo(from_date: str, to_date: str, region: str = "kz") -> int:
-    """Синк недельных брендовых показов/кликов Google по региону. Число строк (неделя×страна)."""
+    """Синк недельных брендовых показов/кликов Google по региону. Число строк (неделя×страна).
+
+    from_date прижимается к понедельнику своей недели: инкремент «сегодня − 8 недель»
+    попадал в середину недели, граничная неделя приходила без первых дней, и upsert
+    перезаписывал её полное значение усечённой суммой — в пределе одним днём (порча
+    недель 2026-05-18…06-22 в обоих регионах, обнаружена 2026-08-19)."""
+    from_date = _monday(from_date)
     cfg = REGIONS[region]
     service = get_searchconsole_service()
     have = accessible_sites(service)
