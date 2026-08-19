@@ -7,6 +7,72 @@ def test_red_line_is_relative_to_baseline():
     assert line["metric"] == "cpa"
     assert line["max_value"] == 1400.0     # +40% от базы
     assert line["min_leads"] == 20
+    assert line["has_baseline"] is True
+
+
+def test_red_line_uses_absolute_threshold_when_no_baseline():
+    # Новая/малонаблюдаемая кампания: базового CPA нет вовсе. Относительный
+    # порог (проценты от нуля) не имеет смысла — красная линия обязана
+    # остаться непустой и явно помеченной, а не тихо превратиться в 0.
+    line = red_line_for({"object_id": "111"}, baseline={})
+    assert line["metric"] == "cpa"
+    assert line["has_baseline"] is False
+    assert line["max_value"] > 0
+    assert line["min_leads"] == 20
+
+
+def test_red_line_uses_absolute_threshold_when_baseline_zero():
+    # baseline.cpa == 0.0 — тот же случай "базы нет", что и пустой baseline:
+    # база не отрицательная и не положительная, относительный порог не считается.
+    line = red_line_for({"object_id": "111"}, baseline={"cpa": 0.0})
+    assert line["has_baseline"] is False
+    assert line["max_value"] > 0
+
+
+def test_red_line_absolute_threshold_is_configurable():
+    line = red_line_for({"object_id": "111"}, baseline={}, absolute_max_cpa=2500.0)
+    assert line["has_baseline"] is False
+    assert line["max_value"] == 2500.0
+
+
+def test_breach_without_baseline_above_absolute_threshold():
+    line = red_line_for({"object_id": "111"}, baseline={})
+    breached, reason = is_breached(line, {"cpa": line["max_value"] + 500.0, "leads": 25})
+    assert breached is True
+    assert "недостаточно" not in reason.lower()
+
+
+def test_no_breach_without_baseline_below_absolute_threshold():
+    line = red_line_for({"object_id": "111"}, baseline={})
+    breached, _ = is_breached(line, {"cpa": line["max_value"] - 100.0, "leads": 25})
+    assert breached is False
+
+
+def test_no_breach_before_minimum_leads_without_baseline():
+    # Минимум наблюдений уважается и в безбазовом режиме: шум на новой
+    # кампании не должен читаться как пробой аварийного порога.
+    line = red_line_for({"object_id": "111"}, baseline={})
+    breached, reason = is_breached(line, {"cpa": line["max_value"] + 1000.0, "leads": 3})
+    assert breached is False
+    assert "недостаточно" in reason.lower()
+
+
+def test_breach_when_threshold_is_exactly_zero():
+    # Регрессия: `if limit and value > limit` считал max_value=0.0 "порогом
+    # не задан" и никогда не пробивался. 0.0 — валидный порог: пробивается
+    # любым положительным наблюдаемым значением.
+    line = {"metric": "cpa", "max_value": 0.0, "min_leads": 20}
+    breached, reason = is_breached(line, {"cpa": 1.0, "leads": 25})
+    assert breached is True
+    assert "недостаточно" not in reason.lower()
+
+
+def test_no_breach_when_threshold_not_set_at_all():
+    # Противоположный случай той же регрессии: порог отсутствует в словаре
+    # вовсе (а не равен 0) — тут действительно нельзя судить о пробое.
+    line = {"metric": "cpa", "min_leads": 20}
+    breached, reason = is_breached(line, {"cpa": 999999.0, "leads": 25})
+    assert breached is False
 
 
 def test_no_breach_before_minimum_leads():

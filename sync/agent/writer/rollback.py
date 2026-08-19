@@ -9,6 +9,14 @@ sync/agent/writer/rollback.py — красные линии и автоотка�
 Красная линия ставится вместе с действием, а не после: у каждого применённого
 изменения заранее известно, при каком исходе оно считается провалом.
 
+Базовый CPA считается только по кампаниям с эффективными лидами за окно
+(sync/agent/db.py::load_baseline_cpa) — у новых и малонаблюдаемых кампаний
+базы нет, и вызывающий код передаёт пустой или нулевой baseline. «Нет базы» —
+не «всё хорошо»: относительный порог (проценты от базы) на нуле не считается,
+поэтому красная линия в этом случае явно помечена (has_baseline=False) и
+использует абсолютный аварийный порог вместо относительного — без этого у
+самых непредсказуемых кампаний не было бы защиты вообще.
+
 Откат никогда не удаляет: даже отмена добавленной корректировки — это
 установка нейтральных 0%, а не delete.
 
@@ -21,30 +29,63 @@ sync/agent/writer/rollback.py — красные линии и автоотка�
 
 from typing import Any, Dict, Optional, Tuple
 
-RED_LINE_TOLERANCE = 0.40   # +40% к базовой метрике
-MIN_LEADS_FOR_VERDICT = 20  # до этого объёма вывод делать нельзя
+RED_LINE_TOLERANCE = 0.40      # +40% к базовой метрике
+MIN_LEADS_FOR_VERDICT = 20     # до этого объёма вывод делать нельзя
+DEFAULT_ABSOLUTE_MAX_CPA = 3000.0  # аварийный потолок CPA, ₽, когда базы нет вовсе
 
 
-def red_line_for(action: Dict[str, Any], baseline: Dict[str, Any]) -> Dict[str, Any]:
-    """Условие, при котором изменение считается провалом."""
+def red_line_for(
+    action: Dict[str, Any],
+    baseline: Dict[str, Any],
+    absolute_max_cpa: float = DEFAULT_ABSOLUTE_MAX_CPA,
+) -> Dict[str, Any]:
+    """Условие, при котором изменение считается провалом.
+
+    База положительная — порог относительный, в процентах от неё. Базы нет
+    или она нулевая — относительный порог не считается (проценты от нуля —
+    ноль), поэтому используется абсолютный аварийный потолок, а красная
+    линия помечается has_baseline=False, чтобы это состояние было видно
+    вызывающему коду и сторожу, а не пряталось внутри max_value.
+    """
     base_cpa = float(baseline.get("cpa") or 0.0)
+    if base_cpa > 0:
+        return {
+            "metric": "cpa",
+            "max_value": round(base_cpa * (1 + RED_LINE_TOLERANCE), 2),
+            "min_leads": MIN_LEADS_FOR_VERDICT,
+            "baseline_cpa": base_cpa,
+            "has_baseline": True,
+        }
     return {
         "metric": "cpa",
-        "max_value": round(base_cpa * (1 + RED_LINE_TOLERANCE), 2),
+        "max_value": round(float(absolute_max_cpa), 2),
         "min_leads": MIN_LEADS_FOR_VERDICT,
         "baseline_cpa": base_cpa,
+        "has_baseline": False,
     }
 
 
 def is_breached(red_line: Dict[str, Any], observed: Dict[str, Any]) -> Tuple[bool, str]:
-    """Пробита ли красная линия. До минимума наблюдений — никогда."""
+    """Пробита ли красная линия. До минимума наблюдений — никогда.
+
+    Порог сравнивается через явную проверку на None, а не на истинность:
+    max_value=0.0 — валидный порог (пробивается любым положительным
+    значением), а не «порог не задан». Смешивать эти два случая через
+    `if limit and ...` — баг: нулевой порог тогда никогда не пробивался бы.
+    """
     leads = int(observed.get("leads") or 0)
     if leads < int(red_line.get("min_leads") or MIN_LEADS_FOR_VERDICT):
         return False, f"недостаточно наблюдений: {leads}"
-    value = float(observed.get(red_line.get("metric", "cpa")) or 0.0)
-    limit = float(red_line.get("max_value") or 0.0)
-    if limit and value > limit:
-        return True, f"{red_line['metric']} = {value:.0f} при пределе {limit:.0f}"
+
+    limit = red_line.get("max_value")
+    if limit is None:
+        return False, "порог не задан"
+
+    metric = red_line.get("metric", "cpa")
+    value = float(observed.get(metric) or 0.0)
+    limit = float(limit)
+    if value > limit:
+        return True, f"{metric} = {value:.0f} при пределе {limit:.0f}"
     return False, ""
 
 
