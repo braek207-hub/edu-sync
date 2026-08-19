@@ -120,13 +120,15 @@ def test_rollback_restores_previous_percent():
     service, method, params = rollback_payload(action)
     assert service == "bidmodifiers"
     assert method == "set"
-    assert params["BidModifiers"][0]["BidModifier"] == 10
+    # previous_state.percent — дельта (+10 %), в API уходит 110.
+    assert params["BidModifiers"][0]["BidModifier"] == 110
 
 
 def test_rollback_of_add_disables_instead_of_deleting():
-    # Удалять нельзя даже при откате: возвращаем нейтральные 0%, но только
-    # по Id из ответа API (result.AddResults[].Id) — Id никогда не
-    # придумывается заранее.
+    # Удалять нельзя даже при откате: возвращаем НЕЙТРАЛЬНЫЙ коэффициент, но
+    # только по Id из ответа API (result.AddResults[].Id) — Id никогда не
+    # придумывается заранее. Нейтраль в шкале Директа = 100; ноль там означал
+    # бы «ставка × 0», то есть удар сильнее исходного изменения.
     action = {"action_kind": "bidmodifier.add",
               "payload": {"CampaignId": 111, "Type": "MOBILE_ADJUSTMENT", "BidModifier": 30},
               "previous_state": {},
@@ -134,7 +136,7 @@ def test_rollback_of_add_disables_instead_of_deleting():
     service, method, params = rollback_payload(action)
     assert method == "set"
     assert params["BidModifiers"][0]["Id"] == 555
-    assert params["BidModifiers"][0]["BidModifier"] == 0
+    assert params["BidModifiers"][0]["BidModifier"] == 100
 
 
 def test_rollback_of_add_returns_none_when_id_unknown():

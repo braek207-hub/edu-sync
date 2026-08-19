@@ -14,15 +14,31 @@ import pytest
 from sync.agent.writer.apply import _element_errors, apply_actions, to_api_call
 
 
+# payload несёт ДЕЛЬТУ (30 = «+30 %»), в тело запроса уходит 100-базный
+# коэффициент Директа (130). Граница конверсии — sync/agent/writer/units.py,
+# сквозные тесты шкалы — tests/test_agent_writer_units.py.
+
+
 def test_add_maps_to_bidmodifiers_add_with_mobile_shape():
     action = {"action_kind": "bidmodifier.add",
               "payload": {"CampaignId": 111, "Type": "MOBILE_ADJUSTMENT",
-                          "key": "mobile", "BidModifier": 30}}
+                          "key": "MOBILE", "BidModifier": 30}}
     service, method, params = to_api_call(action)
     assert (service, method) == ("bidmodifiers", "add")
     item = params["BidModifiers"][0]
     assert item["CampaignId"] == 111
-    assert item["MobileAdjustment"]["BidModifier"] == 30
+    assert item["MobileAdjustment"]["BidModifier"] == 130
+
+
+def test_add_maps_desktop_and_tablet_to_their_own_shapes():
+    for direct_type, api_field in (("DESKTOP_ADJUSTMENT", "DesktopAdjustment"),
+                                   ("TABLET_ADJUSTMENT", "TabletAdjustment")):
+        action = {"action_kind": "bidmodifier.add",
+                  "payload": {"CampaignId": 111, "Type": direct_type,
+                              "key": api_field, "BidModifier": 30}}
+        item = to_api_call(action)[2]["BidModifiers"][0]
+        assert item[api_field]["BidModifier"] == 130
+        assert "MobileAdjustment" not in item
 
 
 def test_add_maps_demographics_shape():
@@ -32,14 +48,14 @@ def test_add_maps_demographics_shape():
     service, method, params = to_api_call(action)
     item = params["BidModifiers"][0]
     assert item["DemographicsAdjustments"][0]["Gender"] == "GENDER_MALE"
-    assert item["DemographicsAdjustments"][0]["BidModifier"] == 20
+    assert item["DemographicsAdjustments"][0]["BidModifier"] == 120
 
 
 def test_set_maps_to_bidmodifiers_set():
     action = {"action_kind": "bidmodifier.set", "payload": {"Id": 7, "BidModifier": 30}}
     service, method, params = to_api_call(action)
     assert (service, method) == ("bidmodifiers", "set")
-    assert params["BidModifiers"][0] == {"Id": 7, "BidModifier": 30}
+    assert params["BidModifiers"][0] == {"Id": 7, "BidModifier": 130}
 
 
 def test_unknown_action_kind_raises():

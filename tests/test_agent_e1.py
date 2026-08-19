@@ -78,8 +78,10 @@ def test_normalize_actual_splits_combined_gender_and_age():
     # Одна запись DemographicsAdjustment может нести Gender И Age одновременно
     # (ставка на пересечение сегментов) — без раскладки diff потерял бы
     # вторую половину и предложил add там, где нужен set.
+    # BidModifier здесь — то, что реально отдаёт API: 100-базный коэффициент
+    # (120 = «+20 %»). Нормализация переводит его в дельту плана.
     item = {"Id": 55, "DemographicsAdjustment": {
-        "BidModifier": 20, "Gender": "GENDER_MALE", "Age": "AGE_25_34"}}
+        "BidModifier": 120, "Gender": "GENDER_MALE", "Age": "AGE_25_34"}}
 
     out = agent_e1._normalize_actual(item)
 
@@ -93,7 +95,7 @@ def test_normalize_actual_splits_combined_gender_and_age():
 
 
 def test_normalize_actual_keeps_single_demographic_field_as_one_record():
-    item = {"Id": 77, "DemographicsAdjustment": {"BidModifier": 10, "Gender": "GENDER_FEMALE"}}
+    item = {"Id": 77, "DemographicsAdjustment": {"BidModifier": 110, "Gender": "GENDER_FEMALE"}}
 
     out = agent_e1._normalize_actual(item)
 
@@ -102,11 +104,11 @@ def test_normalize_actual_keeps_single_demographic_field_as_one_record():
 
 
 def test_normalize_actual_mobile_and_regional_unaffected():
-    mobile = agent_e1._normalize_actual({"Id": 9, "MobileAdjustment": {"BidModifier": 15}})
+    mobile = agent_e1._normalize_actual({"Id": 9, "MobileAdjustment": {"BidModifier": 115}})
     regional = agent_e1._normalize_actual(
-        {"Id": 3, "RegionalAdjustment": {"BidModifier": -10, "RegionId": 213}})
+        {"Id": 3, "RegionalAdjustment": {"BidModifier": 90, "RegionId": 213}})
 
-    assert mobile == [{"Id": 9, "Type": "MOBILE_ADJUSTMENT", "key": "mobile", "percent": 15}]
+    assert mobile == [{"Id": 9, "Type": "MOBILE_ADJUSTMENT", "key": "MOBILE", "percent": 15}]
     assert regional == [{"Id": 3, "Type": "REGIONAL_ADJUSTMENT", "key": "213", "percent": -10}]
 
 
@@ -220,3 +222,73 @@ def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeyp
     assert report["result"]["applied"] == 0
     assert report["result"]["rejected"] == 0
     assert report["result"]["failed"] == 0
+
+
+# --------------------------------- неприменимые настройки видны в отчёте
+
+
+class _RecordingWriteClient:
+    """Кампания 111 без корректировок; mutate только записывает вызовы."""
+
+    instances = []
+
+    def __init__(self, login, sandbox=True, dry_run=True):
+        self.login = login
+        self.units_left = None
+        self.sent = []
+        _RecordingWriteClient.instances.append(self)
+
+    def get(self, service, params):
+        if service == "campaigns":
+            return {"Campaigns": [{"Id": 111}]}
+        if service == "bidmodifiers":
+            return {"BidModifiers": []}
+        raise AssertionError(f"неожиданный сервис: {service}")
+
+    def mutate(self, service, method, params):
+        self.sent.append((service, method, params))
+        return {"dry_run": True}
+
+
+def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatch, capsys):
+    # Регион приходит НАЗВАНИЕМ (срез отдаёт TargetingLocationName). Раньше
+    # такое действие доходило до to_api_call, падало на int("Москва") в
+    # статус 'failed' и переприменялось каждый прогон, съедая слоты лимита.
+    # Теперь оно исключается из плана с явной причиной, видимой в отчёте, а
+    # устройство доезжает до API в 100-базной шкале и своим типом.
+    _RecordingWriteClient.instances = []
+    monkeypatch.setattr(agent_e1, "_clients", lambda: [{"login": "acc-1"}])
+    monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables", lambda: None)
+    monkeypatch.setattr(
+        agent_e1.agent_db, "load_latest_computed_settings",
+        lambda: [
+            {"setting_kind": "bid_modifier:region", "setting_key": "Москва",
+             "value": 30.0, "support_n": 1000, "raw_value": 1.3},
+            {"setting_kind": "bid_modifier:device", "setting_key": "DESKTOP",
+             "value": 30.0, "support_n": 1000, "raw_value": 1.3},
+        ],
+    )
+    monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", lambda: [])
+    monkeypatch.setattr(agent_e1.agent_db, "load_daily_cost_by_campaign",
+                         lambda *_: {"111": 500.0})
+    monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa", lambda *_: {"111": 1000.0})
+    monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
+    monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
+    monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
+    monkeypatch.setattr(agent_e1.writer_db, "insert_action", lambda action: 1)
+    monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: None)
+    monkeypatch.setattr(agent_e1, "WriteClient", _RecordingWriteClient)
+
+    assert agent_e1.main() == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["desired"] == 1                      # только устройство
+    assert report["unsupported"]["count"] == 1         # регион — с причиной
+    assert sum(report["unsupported"]["by_reason"].values()) == 1
+    assert report["result"]["failed"] == 0
+
+    sent = _RecordingWriteClient.instances[0].sent
+    assert len(sent) == 1
+    item = sent[0][2]["BidModifiers"][0]
+    assert item["DesktopAdjustment"]["BidModifier"] == 130   # дельта +30 → 100-база
+    assert "MobileAdjustment" not in item

@@ -21,40 +21,60 @@ result для разбора здесь. Без разбора такая оши
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from sync.agent.writer.units import delta_to_api
+
 # key корректировки → форма API. Проверено probe (задача 1).
 _DEMOGRAPHIC_KEYS = {"GENDER_MALE", "GENDER_FEMALE"}
+
+# Тип корректировки устройства → имя поля в теле запроса bidmodifiers.add.
+# У Директа это ТРИ разных типа, а не один «мобильный»: коэффициент,
+# посчитанный для десктопа, отправленный как MobileAdjustment, изменил бы
+# ставку не тому сегменту (образец разбора — sync/edu_direct_settings.py:844-866).
+_DEVICE_ADJUSTMENT_FIELD = {
+    "MOBILE_ADJUSTMENT": "MobileAdjustment",
+    "DESKTOP_ADJUSTMENT": "DesktopAdjustment",
+    "TABLET_ADJUSTMENT": "TabletAdjustment",
+}
 
 # API-метод → имя коллекции результатов по элементам в ответе.
 _RESULT_COLLECTION = {"add": "AddResults", "set": "SetResults"}
 
 
 def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
-    """Действие → (сервис, метод, параметры)."""
+    """Действие → (сервис, метод, параметры).
+
+    Здесь и только здесь дельта из плана превращается в 100-базный
+    коэффициент Директа (units.delta_to_api): payload несёт человеческие
+    единицы (30 = «+30 %»), наружу уходит 130.
+    """
     kind = str(action.get("action_kind") or "")
     payload = action.get("payload") or {}
 
     if kind == "bidmodifier.set":
         return "bidmodifiers", "set", {
-            "BidModifiers": [{"Id": payload["Id"], "BidModifier": int(payload["BidModifier"])}]
+            "BidModifiers": [{"Id": payload["Id"],
+                              "BidModifier": delta_to_api(payload["BidModifier"])}]
         }
 
     if kind == "bidmodifier.add":
         item: Dict[str, Any] = {"CampaignId": int(payload["CampaignId"])}
-        percent = int(payload["BidModifier"])
+        coefficient = delta_to_api(payload["BidModifier"])
         direct_type = payload.get("Type")
         key = str(payload.get("key") or "")
 
-        if direct_type == "MOBILE_ADJUSTMENT":
-            item["MobileAdjustment"] = {"BidModifier": percent}
+        device_field = _DEVICE_ADJUSTMENT_FIELD.get(str(direct_type))
+        if device_field:
+            item[device_field] = {"BidModifier": coefficient}
         elif direct_type == "DEMOGRAPHICS_ADJUSTMENT":
-            adjustment: Dict[str, Any] = {"BidModifier": percent}
+            adjustment: Dict[str, Any] = {"BidModifier": coefficient}
             if key in _DEMOGRAPHIC_KEYS:
                 adjustment["Gender"] = key
             else:
                 adjustment["Age"] = key
             item["DemographicsAdjustments"] = [adjustment]
         elif direct_type == "REGIONAL_ADJUSTMENT":
-            item["RegionalAdjustments"] = [{"RegionId": int(key), "BidModifier": percent}]
+            item["RegionalAdjustments"] = [{"RegionId": int(key),
+                                            "BidModifier": coefficient}]
         else:
             raise ValueError(f"неизвестный тип корректировки: {direct_type}")
         return "bidmodifiers", "add", {"BidModifiers": [item]}

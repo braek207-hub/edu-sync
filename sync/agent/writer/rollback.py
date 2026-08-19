@@ -18,7 +18,10 @@ sync/agent/writer/rollback.py — красные линии и автоотка�
 самых непредсказуемых кампаний не было бы защиты вообще.
 
 Откат никогда не удаляет: даже отмена добавленной корректировки — это
-установка нейтральных 0%, а не delete.
+установка нейтрального коэффициента, а не delete. Нейтраль в шкале Директа
+равна 100 (units.API_NEUTRAL), а НЕ нулю: ноль означает «ставка × 0», то есть
+максимальное подавление сегмента. Откат, ставящий 0, не отменял бы изменение,
+а бил бы сильнее исходного.
 
 Идентификатор корректировки для отката всегда берётся из ответа API
 (result.AddResults[].Id для bidmodifier.add), а не придумывается: Id=0 не
@@ -28,6 +31,8 @@ sync/agent/writer/rollback.py — красные линии и автоотка�
 """
 
 from typing import Any, Dict, Optional, Tuple
+
+from sync.agent.writer.units import delta_to_api
 
 RED_LINE_TOLERANCE = 0.40      # +40% к базовой метрике
 MIN_LEADS_FOR_VERDICT = 20     # до этого объёма вывод делать нельзя
@@ -118,15 +123,21 @@ def _added_modifier_id(action: Dict[str, Any]) -> Optional[Any]:
 def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[str, Any]]]:
     """Запрос, возвращающий объект в прошлое состояние.
 
-    Ничего не удаляет: отмена add — это set нейтрального 0%, а не delete.
+    Ничего не удаляет: отмена add — это set нейтрального коэффициента
+    (units.delta_to_api(0) == 100), а не delete и не ноль.
     Без известного Id откат невозможен — вслепую не отправляем.
+
+    previous_state.percent хранится в дельтах, как и весь внутренний план,
+    поэтому в тело запроса он идёт через ту же границу конверсии, что и
+    прямое применение (apply.to_api_call).
     """
     kind = str(action.get("action_kind") or "")
     previous = action.get("previous_state") or {}
 
     if kind == "bidmodifier.set" and previous.get("Id") is not None:
         return "bidmodifiers", "set", {
-            "BidModifiers": [{"Id": previous["Id"], "BidModifier": int(previous["percent"])}]
+            "BidModifiers": [{"Id": previous["Id"],
+                              "BidModifier": delta_to_api(previous["percent"])}]
         }
 
     if kind == "bidmodifier.add":
@@ -134,7 +145,7 @@ def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[st
         if modifier_id is None:
             return None
         return "bidmodifiers", "set", {
-            "BidModifiers": [{"Id": modifier_id, "BidModifier": 0}]
+            "BidModifiers": [{"Id": modifier_id, "BidModifier": delta_to_api(0)}]
         }
 
     return None

@@ -25,7 +25,12 @@ CANDIDATES = [
     "HourOfDay",
     "AdNetworkType",
     "TargetingLocationName",
+    # Числовой идентификатор региона: RegionalAdjustment в API записи требует
+    # RegionId, а название («Москва») в него не годится. Пока поле не проверено,
+    # региональные корректировки агентом не применяются.
+    "TargetingLocationId",
     "LocationOfPresenceName",
+    "LocationOfPresenceId",
     "CriterionType",
     "Slot",
 ]

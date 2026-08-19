@@ -42,6 +42,15 @@ OBJECT_WORKERS = 4
 # Device / Gender / Age / AdNetworkType / TargetingLocationName принимаются,
 # а HourOfDay отвергается ошибкой 8000 — почасовой детализации расхода
 # CUSTOM_REPORT не отдаёт вообще. Расписание считается на Э1 из Метрики.
+#
+# Регион отдаётся НАЗВАНИЕМ (TargetingLocationName), а RegionalAdjustment в
+# API записи требует числовой RegionId. Кандидат TargetingLocationId probe-ом
+# не проверялся (probe_report_fields.py его теперь спрашивает), поэтому поле
+# здесь не меняем вслепую: отказ по 8000 обрушил бы весь региональный срез,
+# который сейчас работает и нужен витрине. До ответа probe региональные
+# корректировки не ПРИМЕНЯЮТСЯ — с явной причиной в отчёте прогона
+# (sync/agent/writer/plan.py::UNSUPPORTED_REGION_REASON), а не падают на
+# int("Москва") с вечным переприменением.
 SEGMENT_FIELDS = {
     "device": "Device",
     "gender": "Gender",

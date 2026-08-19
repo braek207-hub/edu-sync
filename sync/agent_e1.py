@@ -44,9 +44,10 @@ from sync.agent.writer.apply import apply_actions
 from sync.agent.writer.client import WriteClient
 from sync.agent.writer.diff import diff_modifiers
 from sync.agent.writer.guardrails import cap_actions, check_action, check_holdout
-from sync.agent.writer.plan import desired_bid_modifiers
+from sync.agent.writer.plan import plan_bid_modifiers
 from sync.agent.writer.risk import action_risk, fit_into_budget, median, week_start
 from sync.agent.writer.rollback import red_line_for
+from sync.agent.writer.units import api_to_delta
 
 DEFAULT_WEEKLY_RISK_RUB = 50_000.0
 CAMPAIGN_PAGE_LIMIT = 1000
@@ -63,6 +64,15 @@ ABSOLUTE_MAX_CPA_MULTIPLIER = 2.0
 # Причина, по которой действие не применяется, когда абсолютный порог
 # посчитать не из чего вообще (справочник базовых CPA пуст целиком).
 NO_RED_LINE_REASON = "нет базового CPA ни у одной кампании — красная линия недостижима"
+
+# Поле ответа bidmodifiers.get → (тип корректировки, ключ в форме плана).
+# Устройство у Директа — три РАЗНЫХ типа корректировки, а не один мобильный;
+# ключи в верхнем регистре, как в plan.DEVICE_TYPE_MAP, иначе diff не сойдётся.
+_DEVICE_ADJUSTMENTS = (
+    ("MobileAdjustment", "MOBILE_ADJUSTMENT", "MOBILE"),
+    ("DesktopAdjustment", "DESKTOP_ADJUSTMENT", "DESKTOP"),
+    ("TabletAdjustment", "TABLET_ADJUSTMENT", "TABLET"),
+)
 
 
 def _clients() -> List[Dict[str, Any]]:
@@ -109,21 +119,34 @@ def own_campaign_ids(client: WriteClient, daily_cost_by_campaign: Dict[str, floa
 def _normalize_actual(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Одна запись bidmodifiers.get → 0..N нормализованных actual-записей.
 
+    Две обязанности, обе — про совпадение факта с планом:
+
+    1. Единицы. API отдаёт 100-базный коэффициент (100 = нейтраль), план
+       живёт в дельтах — здесь стоит обратная граница конверсии
+       (units.api_to_delta), парная той, что в apply.to_api_call. Без неё
+       diff сравнивал бы 130 с 30 и переписывал корректировку на каждом
+       прогоне.
+    2. Ключи. Форма ключа обязана совпадать с планом (plan.DEVICE_TYPE_MAP,
+       верхний регистр): устройство — это ТРИ разных типа корректировки, и
+       ключ "mobile" строчными не сойдётся с "MOBILE" из плана никогда,
+       из-за чего diff вечно предлагал бы add там, где нужен set.
+
     Демографическая корректировка может нести Gender И Age одновременно —
     такая запись раскладывается в ДВЕ отдельные normalized-записи с разными
     ключами (но одним Id: обе указывают на один физический объект в Директе).
     Без этого diff терял бы вторую половину и предлагал add вместо set.
     """
     out: List[Dict[str, Any]] = []
-    mobile = item.get("MobileAdjustment") or {}
     demo = item.get("DemographicsAdjustment") or {}
     regional = item.get("RegionalAdjustment") or {}
 
-    if mobile:
-        out.append({"Id": item["Id"], "Type": "MOBILE_ADJUSTMENT",
-                    "key": "mobile", "percent": int(mobile.get("BidModifier") or 0)})
+    for api_field, direct_type, key in _DEVICE_ADJUSTMENTS:
+        adjustment = item.get(api_field) or {}
+        if adjustment:
+            out.append({"Id": item["Id"], "Type": direct_type, "key": key,
+                        "percent": api_to_delta(adjustment.get("BidModifier") or 0)})
     if demo:
-        percent = int(demo.get("BidModifier") or 0)
+        percent = api_to_delta(demo.get("BidModifier") or 0)
         gender = demo.get("Gender")
         age = demo.get("Age")
         if gender:
@@ -135,8 +158,20 @@ def _normalize_actual(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     if regional:
         out.append({"Id": item["Id"], "Type": "REGIONAL_ADJUSTMENT",
                     "key": str(regional.get("RegionId") or ""),
-                    "percent": int(regional.get("BidModifier") or 0)})
+                    "percent": api_to_delta(regional.get("BidModifier") or 0)})
     return out
+
+
+def _unsupported_report(unsupported: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Неприменимая часть плана для отчёта прогона: сколько и почему.
+
+    Без этого блока «регион временно не применяется» выглядело бы как
+    «региона в данных нет» — и пауза жила бы незамеченной месяцами.
+    """
+    by_reason: Dict[str, int] = {}
+    for row in unsupported:
+        by_reason[row["reason"]] = by_reason.get(row["reason"], 0) + 1
+    return {"count": len(unsupported), "by_reason": by_reason}
 
 
 def absolute_max_cpa_from_baseline(baseline_cpa: Dict[str, float]) -> Any:
@@ -187,6 +222,8 @@ def _actual_modifiers(client: WriteClient, campaign_id: str) -> List[Dict[str, A
         "SelectionCriteria": {"CampaignIds": [int(campaign_id)], "Levels": ["CAMPAIGN"]},
         "FieldNames": ["Id", "CampaignId", "Type"],
         "MobileAdjustmentFieldNames": ["BidModifier"],
+        "DesktopAdjustmentFieldNames": ["BidModifier"],
+        "TabletAdjustmentFieldNames": ["BidModifier"],
         "DemographicsAdjustmentFieldNames": ["BidModifier", "Gender", "Age"],
         "RegionalAdjustmentFieldNames": ["BidModifier", "RegionId"],
     })
@@ -204,9 +241,16 @@ def main() -> int:
     writer_db.ensure_writer_tables()
 
     computed = agent_db.load_latest_computed_settings()
-    desired = desired_bid_modifiers(computed)
+    plan = plan_bid_modifiers(computed)
+    desired = plan["desired"]
+    # Значимые настройки, которые агент применить не умеет (нечисловой ключ
+    # региона, устройство вне DESKTOP/MOBILE/TABLET). Они не подставляются в
+    # чужой тип корректировки и не роняют применение — но и не пропадают
+    # молча: причина видна в отчёте прогона.
+    unsupported = _unsupported_report(plan["unsupported"])
     if not desired:
-        print(json.dumps({"verdict": "NOTHING_TO_DO", "reason": "нет значимых корректировок"},
+        print(json.dumps({"verdict": "NOTHING_TO_DO", "reason": "нет значимых корректировок",
+                          "unsupported": unsupported},
                          ensure_ascii=False, indent=2))
         return 0
 
@@ -285,6 +329,7 @@ def main() -> int:
             "dry_run": dry_run,
             "own_campaigns": len(campaign_ids),
             "desired": len(desired),
+            "unsupported": unsupported,
             "planned": len(planned),
             "blocked": len(blocked),
             "deferred_by_risk": len(deferred),
