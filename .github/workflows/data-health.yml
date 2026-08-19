@@ -40,8 +40,9 @@ jobs:
           code=$(curl -s -o response.json -w "%{http_code}" --max-time 60 \
             -H "Authorization: Bearer $CRON_SECRET" \
             "https://panda-bi.vercel.app/api/health/data?strict=1")
-          cat response.json
-          echo ""
+          # Полный ответ НЕ печатать: репозиторий публичный, логи Actions видны всем,
+          # а витрина отдаёт суммы расхода и выручки. В лог — только статусы источников.
+          jq -r '.probes[]? | "\(.status)\t\(.dashboard)/\(.source)\t\(.note // "")"' response.json 2>/dev/null || true
 
           if [ "$code" = "200" ]; then
             echo "Все источники свежие."
