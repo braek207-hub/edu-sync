@@ -143,7 +143,7 @@ def spent_risk(week_start: str) -> float:
         FROM edu_agent_actions
         WHERE status = 'applied'
           AND rolled_back_at IS NULL
-          AND created_at >= %s
+          AND applied_at >= %s
         """,
         (week_start,),
     )

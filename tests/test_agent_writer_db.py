@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-from sync.agent.writer.db import WRITER_DDL
+import inspect
+
+from sync.agent.writer.db import WRITER_DDL, spent_risk
 
 REQUIRED = ["edu_agent_actions", "edu_agent_risk_budget"]
 
@@ -28,3 +30,13 @@ def test_actions_have_idempotency_key_unique():
     ddl = "\n".join(WRITER_DDL)
     assert "idempotency_key" in ddl
     assert "UNIQUE" in ddl.upper()
+
+
+def test_spent_risk_filters_by_applied_at_not_created_at():
+    # Риск-бюджет — деньги под ПРИМЕНЁННЫМИ изменениями. Действие, созданное
+    # в одну неделю и применённое в другую, обязано списываться с недели
+    # применения, иначе гейт риска считает по чужой неделе и пропускает
+    # больше изменений, чем разрешено.
+    source = inspect.getsource(spent_risk)
+    assert "applied_at >=" in source
+    assert "created_at >=" not in source
