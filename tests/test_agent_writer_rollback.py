@@ -1,20 +1,36 @@
 # -*- coding: utf-8 -*-
+import pytest
+
 from sync.agent.writer.rollback import is_breached, red_line_for, rollback_payload
+
+# Тестовый аварийный потолок: раньше на его месте молча подставлялся
+# захардкоженный DEFAULT_ABSOLUTE_MAX_CPA=3000 из rollback.py — теперь
+# параметр обязателен, значение выбирает вызывающий тест явно.
+ABSOLUTE_MAX_CPA = 3000.0
 
 
 def test_red_line_is_relative_to_baseline():
-    line = red_line_for({"object_id": "111"}, baseline={"cpa": 1000.0})
+    line = red_line_for({"object_id": "111"}, baseline={"cpa": 1000.0},
+                         absolute_max_cpa=ABSOLUTE_MAX_CPA)
     assert line["metric"] == "cpa"
     assert line["max_value"] == 1400.0     # +40% от базы
     assert line["min_leads"] == 20
     assert line["has_baseline"] is True
 
 
+def test_red_line_for_requires_explicit_absolute_max_cpa():
+    # Правка по код-ревью: DEFAULT_ABSOLUTE_MAX_CPA убран, absolute_max_cpa
+    # обязателен. Забытый аргумент обязан упасть на вызове, а не тихо
+    # подставить число, никак не связанное с экономикой кабинета.
+    with pytest.raises(TypeError):
+        red_line_for({"object_id": "111"}, baseline={})
+
+
 def test_red_line_uses_absolute_threshold_when_no_baseline():
     # Новая/малонаблюдаемая кампания: базового CPA нет вовсе. Относительный
     # порог (проценты от нуля) не имеет смысла — красная линия обязана
     # остаться непустой и явно помеченной, а не тихо превратиться в 0.
-    line = red_line_for({"object_id": "111"}, baseline={})
+    line = red_line_for({"object_id": "111"}, baseline={}, absolute_max_cpa=ABSOLUTE_MAX_CPA)
     assert line["metric"] == "cpa"
     assert line["has_baseline"] is False
     assert line["max_value"] > 0
@@ -24,7 +40,8 @@ def test_red_line_uses_absolute_threshold_when_no_baseline():
 def test_red_line_uses_absolute_threshold_when_baseline_zero():
     # baseline.cpa == 0.0 — тот же случай "базы нет", что и пустой baseline:
     # база не отрицательная и не положительная, относительный порог не считается.
-    line = red_line_for({"object_id": "111"}, baseline={"cpa": 0.0})
+    line = red_line_for({"object_id": "111"}, baseline={"cpa": 0.0},
+                         absolute_max_cpa=ABSOLUTE_MAX_CPA)
     assert line["has_baseline"] is False
     assert line["max_value"] > 0
 
@@ -36,14 +53,14 @@ def test_red_line_absolute_threshold_is_configurable():
 
 
 def test_breach_without_baseline_above_absolute_threshold():
-    line = red_line_for({"object_id": "111"}, baseline={})
+    line = red_line_for({"object_id": "111"}, baseline={}, absolute_max_cpa=ABSOLUTE_MAX_CPA)
     breached, reason = is_breached(line, {"cpa": line["max_value"] + 500.0, "leads": 25})
     assert breached is True
     assert "недостаточно" not in reason.lower()
 
 
 def test_no_breach_without_baseline_below_absolute_threshold():
-    line = red_line_for({"object_id": "111"}, baseline={})
+    line = red_line_for({"object_id": "111"}, baseline={}, absolute_max_cpa=ABSOLUTE_MAX_CPA)
     breached, _ = is_breached(line, {"cpa": line["max_value"] - 100.0, "leads": 25})
     assert breached is False
 
@@ -51,7 +68,7 @@ def test_no_breach_without_baseline_below_absolute_threshold():
 def test_no_breach_before_minimum_leads_without_baseline():
     # Минимум наблюдений уважается и в безбазовом режиме: шум на новой
     # кампании не должен читаться как пробой аварийного порога.
-    line = red_line_for({"object_id": "111"}, baseline={})
+    line = red_line_for({"object_id": "111"}, baseline={}, absolute_max_cpa=ABSOLUTE_MAX_CPA)
     breached, reason = is_breached(line, {"cpa": line["max_value"] + 1000.0, "leads": 3})
     assert breached is False
     assert "недостаточно" in reason.lower()

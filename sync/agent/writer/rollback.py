@@ -31,13 +31,12 @@ from typing import Any, Dict, Optional, Tuple
 
 RED_LINE_TOLERANCE = 0.40      # +40% к базовой метрике
 MIN_LEADS_FOR_VERDICT = 20     # до этого объёма вывод делать нельзя
-DEFAULT_ABSOLUTE_MAX_CPA = 3000.0  # аварийный потолок CPA, ₽, когда базы нет вовсе
 
 
 def red_line_for(
     action: Dict[str, Any],
     baseline: Dict[str, Any],
-    absolute_max_cpa: float = DEFAULT_ABSOLUTE_MAX_CPA,
+    absolute_max_cpa: float,
 ) -> Dict[str, Any]:
     """Условие, при котором изменение считается провалом.
 
@@ -46,6 +45,12 @@ def red_line_for(
     ноль), поэтому используется абсолютный аварийный потолок, а красная
     линия помечается has_baseline=False, чтобы это состояние было видно
     вызывающему коду и сторожу, а не пряталось внутри max_value.
+
+    absolute_max_cpa обязателен и без значения по умолчанию: захардкоженный
+    дефолт — произвольное число, никак не связанное с экономикой конкретного
+    кабинета. Вызывающий код (sync/agent_e1.py::build_red_line) обязан
+    посчитать порог сам из медианы базовых CPA и передать явно; забытый
+    аргумент обязан уронить вызов, а не тихо подставить бессмысленное число.
     """
     base_cpa = float(baseline.get("cpa") or 0.0)
     if base_cpa > 0:

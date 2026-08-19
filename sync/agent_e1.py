@@ -156,19 +156,23 @@ def build_red_line(
     """Красная линия для действия, или None, если её посчитать не из чего.
 
     У кампании есть собственный baseline_cpa (>0) — относительный порог,
-    absolute_max_cpa не нужен. Нет — нужен absolute_max_cpa (медиана по
-    справочнику, см. absolute_max_cpa_from_baseline); если и его нет
-    (справочник baseline_cpa пуст целиком), у действия не будет работающей
-    красной линии вообще — применять его нельзя, вызывающий код обязан
-    исключить его до apply_actions, а не передавать дальше с тихим
+    absolute_max_cpa не нужен (red_line_for уйдёт в относительную ветку и
+    не тронет этот параметр, даже если он None). Нет — нужен absolute_max_cpa
+    (медиана по справочнику, см. absolute_max_cpa_from_baseline); если и его
+    нет (справочник baseline_cpa пуст целиком), у действия не будет
+    работающей красной линии вообще — применять его нельзя, вызывающий код
+    обязан исключить его до apply_actions, а не передавать дальше с тихим
     дефолт-плейсхолдером.
+
+    red_line_for после правки по код-ревью не имеет дефолта для
+    absolute_max_cpa — вызов без явного порога стал бы TypeError. Ветка
+    "своей базы нет и абсолютного порога тоже нет" уже отсечена гардом выше,
+    поэтому здесь всегда безопасно передать absolute_max_cpa как есть.
     """
     baseline = {"cpa": baseline_cpa.get(str(action["object_id"]), 0.0)}
     if baseline["cpa"] <= 0 and absolute_max_cpa is None:
         return None
-    if absolute_max_cpa is not None:
-        return red_line_for(action, baseline, absolute_max_cpa)
-    return red_line_for(action, baseline)
+    return red_line_for(action, baseline, absolute_max_cpa)
 
 
 def _actual_modifiers(client: WriteClient, campaign_id: str) -> List[Dict[str, Any]]:

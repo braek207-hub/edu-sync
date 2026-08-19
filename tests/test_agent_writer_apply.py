@@ -9,7 +9,9 @@ db_module.find_action_by_key/insert_action/mark_action) — без сети и �
 
 from typing import Any, Dict, List, Optional
 
-from sync.agent.writer.apply import apply_actions, to_api_call
+import pytest
+
+from sync.agent.writer.apply import _element_errors, apply_actions, to_api_call
 
 
 def test_add_maps_to_bidmodifiers_add_with_mobile_shape():
@@ -41,9 +43,18 @@ def test_set_maps_to_bidmodifiers_set():
 
 
 def test_unknown_action_kind_raises():
-    import pytest
     with pytest.raises(ValueError):
         to_api_call({"action_kind": "campaign.delete", "payload": {}})
+
+
+def test_element_errors_unknown_method_raises_instead_of_silent_no_errors():
+    # Правка по код-ревью: тот же дефект, что уже ловился для add/set (отклонённое
+    # API действие уходило в 'applied' и навсегда застревало за детерминированным
+    # идемпотентным ключом) — теперь ждёт любой будущий вид операции, если method
+    # не попал в _RESULT_COLLECTION. Неразобранный ответ обязан упасть, а не молча
+    # вернуть "ошибок нет".
+    with pytest.raises(ValueError):
+        _element_errors("delete", {"DeleteResults": [{"Errors": []}]})
 
 
 # ------------------------------------------------------------- apply_actions
@@ -171,6 +182,26 @@ def test_apply_actions_repeat_run_does_not_skip_rejected():
     assert report["skipped"] == 0
     assert report["applied"] == 1
     assert len(client.calls) == 1
+
+
+def test_apply_actions_unknown_method_marks_failed_not_applied(monkeypatch):
+    # Сквозной вариант предыдущего теста: если to_api_call когда-нибудь вернёт
+    # метод без записи в _RESULT_COLLECTION (новый вид операции), apply_actions
+    # обязан пометить действие 'failed' (отказ, переприменяется на следующем
+    # прогоне) — а не 'applied', как было бы при старом None-по-умолчанию.
+    import sync.agent.writer.apply as apply_module
+    monkeypatch.setattr(apply_module, "to_api_call",
+                         lambda action: ("bidmodifiers", "delete", {}))
+
+    db = _FakeDB()
+    client = _FakeClient(response={"DeleteResults": [{"Id": 7}]})
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["applied"] == 0
+    assert report["rejected"] == 0
+    assert report["failed"] == 1
+    assert db.rows["k1"]["status"] == "failed"
 
 
 def test_apply_actions_exception_on_send_marks_failed_and_stays_in_journal():
