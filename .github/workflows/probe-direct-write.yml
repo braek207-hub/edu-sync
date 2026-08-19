@@ -37,9 +37,11 @@ jobs:
         env:
           YM_TOKEN: ${{ secrets.YM_TOKEN }}
         run: python probe_metrika_fields.py
-      - name: Probe bidmodifiers (sandbox)
+      - name: Probe bidmodifiers
         env:
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
           DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
           DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
-        run: python probe_bidmodifiers.py
+        # --prod: песочница боевым логинам недоступна (error 513). Формы проверяются
+        # на проде по несуществующим Id — реальные объекты не затрагиваются.
+        run: python probe_bidmodifiers.py --prod
