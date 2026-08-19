@@ -9,12 +9,23 @@ sync/agent/writer/apply.py — применение действий.
 
 Идемпотентность: действие с уже применённым ключом пропускается. Повторный
 прогон в тот же день не отправляет запрос второй раз.
+
+Транспорт (client.py) намеренно НЕ поднимает исключение на ошибку уровня
+ЭЛЕМЕНТА (result.AddResults[]/SetResults[].Errors, например код 8800
+«кампания не найдена») — она приходит в успешном HTTP-ответе и остаётся в
+result для разбора здесь. Без разбора такая ошибка выглядела бы как success:
+статус ушёл бы в 'applied', а на следующем прогоне идемпотентный ключ нашёлся
+бы уже применённым и действие, которое физически не создалось в кабинете,
+навсегда осталось бы недостижимым для повторной попытки.
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # key корректировки → форма API. Проверено probe (задача 1).
 _DEMOGRAPHIC_KEYS = {"GENDER_MALE", "GENDER_FEMALE"}
+
+# API-метод → имя коллекции результатов по элементам в ответе.
+_RESULT_COLLECTION = {"add": "AddResults", "set": "SetResults"}
 
 
 def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
@@ -51,9 +62,44 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
     raise ValueError(f"неизвестный вид действия: {kind}")
 
 
+def _element_errors(method: str, response: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """Ошибки уровня элемента в успешном HTTP-ответе (result.*Results[].Errors).
+
+    to_api_call всегда кладёт ровно один элемент в BidModifiers, поэтому
+    результатов по элементам тоже ровно один — берём первый. Нет коллекции
+    для метода (неизвестный method) или коллекция пуста — считать нечего,
+    возвращаем None, а не пустой список, чтобы вызывающий код не путал
+    «нет данных для разбора» с «разобрали, ошибок нет».
+    """
+    collection_key = _RESULT_COLLECTION.get(method)
+    if not collection_key:
+        return None
+    items = response.get(collection_key) or []
+    if not items:
+        return None
+    errors = (items[0] or {}).get("Errors")
+    return errors or None
+
+
 def apply_actions(client, actions: List[Dict[str, Any]], db_module) -> Dict[str, Any]:
-    """Применяет действия по одному: журнал → отправка → отметка результата."""
-    applied = skipped = failed = 0
+    """Применяет действия по одному: журнал → отправка → отметка результата.
+
+    Статус действия после отправки — один из четырёх, не два:
+      - 'dry_run'  — mutate не уходил в API (client.dry_run=True);
+      - 'applied'  — API принял запрос И элемент применился без Errors;
+      - 'rejected' — API вернул 200, но ОТКЛОНИЛ элемент (Errors в
+                     AddResults/SetResults, например 8800 «кампания не
+                     найдена»). Это не 'failed' — запрос состоялся, ответ
+                     разобран; и не 'applied' — в кабинете ничего не
+                     изменилось. Не входит в набор {'applied','rolled_back'},
+                     который блокирует повтор по идемпотентности, поэтому
+                     отклонённое действие ОБЯЗАНО переприменяться на
+                     следующем прогоне, а не пропускаться;
+      - 'failed'   — исключение при отправке (сеть, 5xx после ретраев,
+                     error уровня запроса). Тоже переприменяется на
+                     следующем прогоне по той же причине.
+    """
+    applied = skipped = failed = rejected = 0
     details: List[Dict[str, Any]] = []
 
     for action in actions:
@@ -67,9 +113,14 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module) -> Dict[str,
         try:
             service, method, params = to_api_call(action)
             response = client.mutate(service, method, params)
-            status = "dry_run" if response.get("dry_run") else "applied"
+            if response.get("dry_run"):
+                status = "dry_run"
+            else:
+                errors = _element_errors(method, response)
+                status = "rejected" if errors else "applied"
             db_module.mark_action(action_id, status, response)
             applied += 1 if status == "applied" else 0
+            rejected += 1 if status == "rejected" else 0
             details.append({"key": action["idempotency_key"], "result": status})
         except Exception as exc:
             db_module.mark_action(action_id, "failed", {"error": f"{type(exc).__name__}: {exc}"[:400]})
@@ -77,4 +128,5 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module) -> Dict[str,
             details.append({"key": action["idempotency_key"], "result": "failed",
                             "error": str(exc)[:200]})
 
-    return {"applied": applied, "skipped": skipped, "failed": failed, "details": details}
+    return {"applied": applied, "skipped": skipped, "failed": failed, "rejected": rejected,
+            "details": details}
