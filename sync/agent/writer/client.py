@@ -4,7 +4,8 @@ sync/agent/writer/client.py — транспорт записи в Яндекс 
 
 Формы вызовов взяты с рабочего d:\\vscode\\EDU кампании\\direct\\client.py: тот
 репозиторий недоступен из CI, поэтому код здесь самодостаточный, но повторяет
-проверенные на проде решения (батчи, ретраи на 5xx, учёт Units). Стиль запроса
+проверенные на проде решения (ретраи на 5xx, учёт Units). Батчи не переносились —
+здесь нет кода, который бы их использовал; появятся вместе с ним. Стиль запроса
 согласован с sync/agent/segments.py (_api_headers/_api_post — тот же кабинет,
 та же кодировка ответа).
 
@@ -29,10 +30,6 @@ import requests
 
 PROD_BASE = "https://api.direct.yandex.com/json/v5"
 SANDBOX_BASE = "https://api-sandbox.direct.yandex.com/json/v5"
-
-# Лимиты API v5 на размер запроса: превышение — ошибка целиком, не частичная запись.
-BATCH_LIMITS = {"campaigns": 10, "adgroups": 1000, "keywords": 1000,
-                 "ads": 1000, "bidmodifiers": 1000}
 
 RETRY_CODES = {500, 502, 503, 504}
 
@@ -90,9 +87,16 @@ class WriteClient:
                                  headers=headers, timeout=120)
             # Директ отдаёт русские ошибки без charset — без этого текст нечитаем.
             resp.encoding = "utf-8"
-            if resp.status_code in RETRY_CODES and attempt < retries - 1:
-                time.sleep(2 ** attempt)
-                continue
+            if resp.status_code in RETRY_CODES:
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                # Последняя попытка и статус всё ещё retryable: тело могло быть
+                # валидным JSON без ключа "error" (например, {} от балансировщика) —
+                # такое нельзя разбирать как успех, иначе журнал действий пометит
+                # мутацию applied, хотя Директ её не применил.
+                raise DirectWriteError(service, resp.status_code,
+                                       "сервис недоступен после ретраев", resp.text[:300])
             units = parse_units(resp.headers.get("Units", ""))
             if units is not None:
                 self.units_left = units
