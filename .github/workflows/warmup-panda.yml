@@ -1,0 +1,28 @@
+name: Прогрев кэша Panda-BI
+
+# Дублёр прогрева из EduDash: тот репозиторий приватный, и при исчерпанной квоте
+# Actions (2000 мин/мес Free) событие деплоя пропадает впустую. Здесь — расписание:
+# эндпоинт сам помнит, грет ли текущий деплой, поэтому лишние вызовы дёшевы, а после
+# выкатки кэш прогреется максимум через интервал крона. Когда квота EduDash живая,
+# его warmup срабатывает мгновенно по deployment_status — двойной прогрев безвреден.
+#
+# Ответ без секрета не содержит цифр (см. app/api/warmup/route.ts в EduDash),
+# печатать его в публичный лог безопасно.
+on:
+  schedule:
+    - cron: "*/15 5-21 * * *" # каждые 15 мин в рабочее окно 08:00–24:00 МСК
+  workflow_dispatch:
+
+concurrency:
+  group: warmup-panda
+  cancel-in-progress: false
+
+jobs:
+  warmup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Дёрнуть /api/warmup
+        run: |
+          curl -fsS --max-time 300 --retry 3 --retry-delay 20 --retry-all-errors \
+            "https://panda-bi.vercel.app/api/warmup" | tee /dev/stderr
