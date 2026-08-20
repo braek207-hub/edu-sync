@@ -1,0 +1,22 @@
+name: Probe GSC brand methods
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Write Google service-account key
+        env:
+          GSC_SA_KEY: ${{ secrets.GSC_SA_KEY }}
+        run: printf '%s' "$GSC_SA_KEY" > sa.json
+      - name: Probe
+        run: python scripts/probe_gsc_brand_methods.py
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
