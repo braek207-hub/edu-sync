@@ -1,0 +1,71 @@
+name: Sync Bjorn Marketing → Supabase
+
+# Переехал из приватного bjorn-dashboard 20.08.2026. Причина: минуты Actions
+# бесплатны только публичным репозиториям, и в приватных задания перестали
+# стартовать вовсе — синк bjorn встал 19.08, данные замерли на 18.08.
+# Расписание и шаги сохранены один в один; секреты — свои в этом репозитории.
+on:
+  schedule:
+    # 03:20 UTC = 06:20 МСК — как было в bjorn-dashboard.
+    - cron: "20 3 * * *"
+  workflow_dispatch:
+    inputs:
+      rewrite_days:
+        description: "Сколько последних завершённых дней переписать"
+        required: false
+        default: "7"
+
+concurrency:
+  group: bjorn-marketing-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      SUPABASE_URL: ${{ secrets.BJORN_SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.BJORN_SUPABASE_SERVICE_KEY }}
+      METRICA_TOKEN: ${{ secrets.BJORN_METRICA_TOKEN }}
+      METRICA_COUNTER_ID: ${{ secrets.BJORN_METRICA_COUNTER_ID }}
+      METRICA_ATTRIBUTIONS: "automatic,first,lastsign"
+      METRICA_GOAL_ADD_TO_CART: ${{ secrets.BJORN_METRICA_GOAL_ADD_TO_CART }}
+      METRICA_GOAL_BEGIN_CHECKOUT: ${{ secrets.BJORN_METRICA_GOAL_BEGIN_CHECKOUT }}
+      METRICA_GOAL_PURCHASE: ${{ secrets.BJORN_METRICA_GOAL_PURCHASE }}
+      METRICA_ECOM_METRICS: ${{ secrets.BJORN_METRICA_ECOM_METRICS }}
+      METRICA_ECOM_PURCHASE_DIMENSION: ${{ secrets.BJORN_METRICA_ECOM_PURCHASE_DIMENSION }}
+      METRICA_ECOM_SKU_DIMENSION: ${{ secrets.BJORN_METRICA_ECOM_SKU_DIMENSION }}
+      DIRECT_TOKEN: ${{ secrets.BJORN_DIRECT_TOKEN }}
+      DIRECT_CLIENTS_JSON: ${{ secrets.BJORN_DIRECT_CLIENTS_JSON }}
+      REWRITE_DAYS: ${{ github.event.inputs.rewrite_days || '7' }}
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Шаги те же и в том же порядке, что в bjorn-dashboard: витрина собирается
+      # из двух источников (Метрика и Директ), затем сверяется. Порядок важен —
+      # build_fact читает то, что положили sync_*.
+      - name: Метрика — staging
+        run: python -m sync.bjorn.sync_metrica
+
+      - name: Метрика — строки ecommerce
+        run: python -m sync.bjorn.sync_metrica_ecommerce
+
+      - name: Директ — staging
+        run: python -m sync.bjorn.sync_direct
+
+      - name: Сборка витрины
+        run: python -m sync.bjorn.build_fact
+
+      - name: Сверка итогов
+        run: python -m sync.bjorn.verify_fact
