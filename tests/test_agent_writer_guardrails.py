@@ -4,8 +4,9 @@ from sync.agent.writer.guardrails import (
     check_action,
     check_holdout,
     check_rollback,
+    expected_rollback_coefficient,
 )
-from sync.agent.writer.units import API_MAX
+from sync.agent.writer.units import API_MAX, API_NEUTRAL
 
 
 def _action(kind="bidmodifier.set", percent=30, object_id="111"):
@@ -13,9 +14,22 @@ def _action(kind="bidmodifier.set", percent=30, object_id="111"):
             "payload": {"BidModifier": percent}}
 
 
-def _rollback(kind="bidmodifier.set", coefficient=110, object_id="111"):
+_KEEP_IN_SYNC = object()   # «прошлое состояние не задано явно»
+
+
+def _rollback(kind="bidmodifier.set", coefficient=110, object_id="111",
+              origin="bidmodifier.set", previous=_KEEP_IN_SYNC):
+    """Запрос на возврат в форме, которую рельса получает от сторожа.
+
+    По умолчанию прошлое состояние согласовано с коэффициентом: тесты про
+    диапазон и allow-лист проверяют своё, а не спотыкаются о сверку намерения.
+    Рассогласование задаётся явно параметром previous.
+    """
+    if previous is _KEEP_IN_SYNC:
+        previous = {"Id": 7, "percent": (coefficient or 0) - API_NEUTRAL}
     return {"action_kind": kind, "object_level": "campaign", "object_id": object_id,
-            "api_coefficient": coefficient, "payload": {"Id": 7}}
+            "api_coefficient": coefficient, "payload": {"Id": 7},
+            "origin_action_kind": origin, "previous_state": previous}
 
 
 def test_allows_normal_modifier():
@@ -105,6 +119,77 @@ def test_rollback_rejects_add_because_it_creates_a_new_object():
 def test_rollback_rejects_request_without_coefficient():
     ok, reason = check_rollback(_rollback(coefficient=None))
     assert ok is False
+
+
+# --------------------------- рельса возврата сверяет НАМЕРЕНИЕ, а не форму
+
+def test_rollback_rejects_coefficient_that_is_not_the_past_value():
+    # Диапазон API Директа — 0..1300, то есть рельса «по форме» пропускает
+    # почти любое значение. Единственное, что связывает запрос с реальным
+    # прошлым значением, — код, который его строит; ошибка в нём (предельное
+    # значение вместо прежнего) шла бы прямо в боевой кабинет: путь возврата
+    # больше ничем не проверен.
+    ok, reason = check_rollback(
+        _rollback(coefficient=150, previous={"Id": 7, "percent": 10}))
+    assert ok is False
+    assert "110" in reason and "прошл" in reason.lower()
+
+
+def test_rollback_allows_coefficient_equal_to_the_past_value():
+    ok, reason = check_rollback(
+        _rollback(coefficient=110, previous={"Id": 7, "percent": 10}))
+    assert ok is True
+    assert reason == ""
+
+
+def test_rollback_of_added_modifier_must_go_to_neutral():
+    # Отмена добавления возвращает нейтраль: объекта до действия не было.
+    ok, _ = check_rollback(_rollback(coefficient=API_NEUTRAL,
+                                     origin="bidmodifier.add", previous={}))
+    assert ok is True
+
+    ok, reason = check_rollback(_rollback(coefficient=130,
+                                          origin="bidmodifier.add", previous={}))
+    assert ok is False
+    assert "100" in reason
+
+
+def test_rollback_rejects_when_past_value_is_unknown():
+    # Прошлого коэффициента в журнале нет — сверять не с чем. Пропустить
+    # «раз проверить нечем» означало бы отключать сверку ровно на тех
+    # строках, где журнал испорчен.
+    ok, reason = check_rollback(_rollback(previous={"Id": 7}))
+    assert ok is False
+    assert "previous_state" in reason
+
+
+def test_rollback_rejects_unknown_origin_action_kind():
+    ok, reason = check_rollback(_rollback(origin="campaign.pause"))
+    assert ok is False
+    assert "исходного действия" in reason
+
+
+def test_rollback_rejects_unreadable_past_value_without_raising():
+    ok, reason = check_rollback(_rollback(previous={"Id": 7, "percent": "много"}))
+    assert ok is False
+    assert "нечита" in reason.lower()
+
+
+def test_expected_coefficient_is_derived_from_the_journal():
+    assert expected_rollback_coefficient("bidmodifier.set", {"percent": 10})[0] == 110
+    assert expected_rollback_coefficient("bidmodifier.set", {"percent": -100})[0] == 0
+    assert expected_rollback_coefficient("bidmodifier.add", {})[0] == API_NEUTRAL
+    assert expected_rollback_coefficient("bidmodifier.set", None)[0] is None
+
+
+def test_rollback_refuses_non_numeric_coefficient_instead_of_raising():
+    # Отказ обязан быть отказом: исключение отсюда вызывающий код
+    # (agent_e1_watchdog.rollback_one) превращает в пометку «неоткатываемо
+    # НАВСЕГДА» — то есть падение рельсы хоронит действие в кабинете.
+    ok, reason = check_rollback(_rollback(coefficient="сто десять",
+                                          previous={"Id": 7, "percent": 10}))
+    assert ok is False
+    assert "не число" in reason
 
 
 def test_holdout_campaigns_are_untouched():

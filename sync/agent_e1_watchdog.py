@@ -42,6 +42,7 @@ ENV: DATABASE_URL, DIRECT_TOKEN
 """
 
 import json
+import math
 import sys
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -85,11 +86,23 @@ LEADS_LAG_DAYS = 2
 OBSERVATION_TAIL_DAYS = 1 + LEADS_LAG_DAYS
 OBSERVATION_HORIZON_DAYS = 14   # длина окна наблюдения, дней
 
-# Доля дней окна, по которым в витрине обязаны быть факты. Вердикт по окну,
-# наполненному наполовину, — это вердикт по случайной выборке дней: прогон
-# расчёта (agent_e0) идёт по ручному запуску и расписания не имеет, поэтому
-# дыры в витрине — штатное состояние, а не авария.
+# Доля дней окна, за которые ВИТРИНА обязана быть наполнена (хоть по одной
+# кампании кабинета — см. mart_filled_days). Вердикт по окну, наполненному
+# наполовину, — это вердикт по случайной выборке дней: прогон расчёта
+# (agent_e0) идёт по ручному запуску и расписания не имеет, поэтому дыры в
+# витрине — штатное состояние, а не авария. Считать эту долю по дням САМОЙ
+# кампании нельзя: см. mart_filled_days.
 MIN_WINDOW_COVERAGE = 0.8
+
+# Доля кампаний витрины, которую обязан покрывать день, считающийся «свежим».
+# Гейт свежести смотрел на максимум даты по ВСЕМ кампаниям сразу: одна живая
+# кампания красила его зелёным при мёртвых остальных. Обратная крайность —
+# требовать свежести от КАЖДОЙ кампании — воспроизводит ту же ошибку, что и
+# покрытие по дням кампании: у кампании, которую правка агента придушила до
+# нуля, свежих строк нет, и красный гейт запретил бы откат именно там, где он
+# нужен. Поэтому порог по ШИРИНЕ дня: свежий день — тот, за который витрина
+# наполнена по строгому большинству известных ей кампаний.
+GATE_MIN_BREADTH = 0.5
 
 # Витрина фактов обязана быть свежее этого возраста, иначе сторож СМОТРИТ, но
 # НЕ ОТКАТЫВАЕТ. Порог в сутках, а не в часах: витрина дневная, и её последний
@@ -128,6 +141,12 @@ DATA_GATE_REASON = (
     "гейт витрины фактов красный: наблюдение показано, но откат не выполняется "
     "— на битых данных сторож бьёт по здоровым кампаниям"
 )
+GATE_DEFERS_CLOSING_REASON = (
+    "гейт витрины фактов красный: строка БЕЗ вердикта не закрывается — "
+    "«вердикта не будет никогда» на мёртвой витрине означает лишь «данных не "
+    "было», и перманентная пометка похоронила бы действие по той же причине, "
+    "что и запрещённый прогон в песочнице. Ждём зелёного гейта"
+)
 SANDBOX_APPLY_REFUSAL = (
     "запрещённая комбинация «песочница + запись»: боевые логины в песочнице "
     "недоступны, каждый откат там падает ошибкой «логин не подключен», а "
@@ -140,10 +159,10 @@ SANDBOX_APPLY_REFUSAL = (
 #   waiting      — окно ещё не открылось, данных быть не может;
 #   collecting   — окно открыто, наблюдений меньше минимума: молчим намеренно,
 #                  иначе шум примут за провал и откатят здоровое изменение;
-#   low_coverage — окно открыто, но фактов по нему нет или они дырявые: судить
-#                  по случайной выборке дней нельзя;
-#   unconfirmed  — линия пробита впервые и только за счёт последнего дня:
-#                  ждём подтверждения следующим прогоном;
+#   low_coverage — окно открыто, но витрина по нему не наполнена или дырявая:
+#                  судить по случайной выборке дней нельзя;
+#   unconfirmed  — линия пробита, но держится только на самом дорогом дне
+#                  окна: это выброс, а не деградация (breach_survives_peak_day);
 #   expired      — горизонт закрыт, а вердикта так и нет: автоматически он не
 #                  появится никогда, строка уходит на ручной разбор;
 #   watched      — наблюдений достаточно, линия не пробита;
@@ -162,6 +181,10 @@ STATE_NO_RED_LINE = "no_red_line"
 # наблюдении: изменение живёт в кабинете непроверенным, а прогон каждый раз
 # пересчитывает по нему одно и то же. Строка закрывается для автоматики и
 # попадает в счётчик ручного разбора (failed_rollbacks_count).
+#
+# «Не появится сам» верно только при ЗЕЛЁНОМ гейте витрины: на красном это
+# утверждение о данных, которых не было, и закрытие ставится на паузу (см.
+# GATE_DEFERS_CLOSING_REASON и счётчик closing_deferred).
 TERMINAL_UNVERIFIED_STATES = {STATE_EXPIRED, STATE_NO_RED_LINE}
 
 # Сервис API → префикс вида действия для рельс. Запрос на возврат обязан
@@ -212,7 +235,8 @@ def observation_window(
     return start, end, end >= horizon_end
 
 
-def observed_metrics(rows: Iterable[Dict[str, Any]], window: Tuple[date, date, bool]) -> Dict[str, Any]:
+def observed_metrics(rows: Iterable[Dict[str, Any]], window: Tuple[date, date, bool],
+                     exclude: Optional[date] = None) -> Dict[str, Any]:
     """Наблюдаемые метрики объекта за окно: расход, эффективные лиды, CPA.
 
     Знаменатель — eff_leads, тот же, что у базового CPA (agent/db.py::
@@ -222,6 +246,11 @@ def observed_metrics(rows: Iterable[Dict[str, Any]], window: Tuple[date, date, b
     leads=0 → cpa=0: is_breached всё равно не выносит вердикт до минимума
     наблюдений, а деление на ноль дало бы бесконечность, которая пробила бы
     любой порог на первом же дне.
+
+    exclude — день, который надо выбросить из подсчёта. Используется проверкой
+    на выброс (breach_survives_peak_day): «то же окно, но без самого дорогого
+    дня». Выбрасывается день целиком, вместе со своими лидами, иначе сравнение
+    считалось бы по разным знаменателям.
     """
     start, end, _ = window
     cost = 0.0
@@ -230,6 +259,8 @@ def observed_metrics(rows: Iterable[Dict[str, Any]], window: Tuple[date, date, b
     for row in rows:
         fact_date = _as_date(row.get("fact_date"))
         if fact_date is None or fact_date < start or fact_date > end:
+            continue
+        if exclude is not None and fact_date == exclude:
             continue
         cost += float(row.get("cost") or 0.0)
         leads += int(row.get("eff_leads") or 0)
@@ -242,13 +273,93 @@ def observed_metrics(rows: Iterable[Dict[str, Any]], window: Tuple[date, date, b
     }
 
 
-def window_coverage(observed: Dict[str, Any], window: Tuple[date, date, bool]) -> float:
-    """Доля дней окна, по которым в витрине есть факты."""
+def peak_cost_day(rows: Iterable[Dict[str, Any]],
+                  window: Tuple[date, date, bool]) -> Optional[date]:
+    """День окна с максимальным расходом. None — фактов в окне нет вовсе."""
+    start, end, _ = window
+    by_day: Dict[date, float] = {}
+    for row in rows:
+        fact_date = _as_date(row.get("fact_date"))
+        if fact_date is None or fact_date < start or fact_date > end:
+            continue
+        by_day[fact_date] = by_day.get(fact_date, 0.0) + float(row.get("cost") or 0.0)
+    if not by_day:
+        return None
+    return max(sorted(by_day), key=lambda d: by_day[d])
+
+
+def breach_survives_peak_day(
+    red_line: Dict[str, Any], rows: Iterable[Dict[str, Any]],
+    window: Tuple[date, date, bool]
+) -> Tuple[bool, Optional[date], Dict[str, Any]]:
+    """Держится ли пробой, если выбросить самый дорогой день окна.
+
+    Фильтр разового выброса. Вердикт берётся на КАЖДОМ прогоне по РАСТУЩЕМУ
+    окну, и выигрывает первое же пересечение порога: чем дольше наблюдение,
+    тем больше независимых попыток пробить линию случайностью, и фактическая
+    вероятность ложного отката выше номинальной.
+
+    Проверять «то же окно без последнего дня» для этого нельзя, хотя выглядит
+    похоже: окно НАКОПИТЕЛЬНОЕ, растёт от даты применения, поэтому «окно без
+    последнего дня» — это буквально окно предыдущего прогона. Разовый дорогой
+    день, продавивший накопительную среднюю сегодня, продавит её и завтра, и
+    послезавтра: такая проверка откладывает откат ровно на один прогон, а не
+    отфильтровывает выброс. Здоровая кампания с одним дорогим днём без лидов
+    откатывалась на втором прогоне.
+
+    Выброс невосстановим — значит и убирать надо его сам, а не хвост окна:
+    пробой засчитывается, только если он держится БЕЗ дня с максимальным
+    расходом. Настоящая деградация держится (она не в одном дне), одиночный
+    сбой синка лидов или разовый дорогой клик — нет, и не начнёт держаться от
+    того, что окно выросло.
+
+    Плата за фильтр названа явно: деградация, целиком уместившаяся в один
+    день, вердикта не получит никогда и уйдёт человеку по истечении горизонта
+    (STATE_EXPIRED). Для однодневного эффекта это правильный размен —
+    красная линия судит устойчивый вред, а не дневной шум.
+    """
+    peak = peak_cost_day(rows, window)
+    if peak is None:
+        return False, None, {}
+    without_peak = observed_metrics(rows, window, exclude=peak)
+    survives, _ = is_breached(red_line, without_peak)
+    return survives, peak, without_peak
+
+
+def mart_filled_days(facts_by_campaign: Dict[str, List[Dict[str, Any]]],
+                     window: Tuple[date, date, bool]) -> int:
+    """Сколько дней окна витрина наполнена ХОТЬ ПО ОДНОЙ кампании кабинета.
+
+    Знаменатель полноты обязан описывать ВИТРИНУ, а не открутку конкретной
+    кампании: витрина наполняется парами «день, кампания», реально
+    присутствующими в источниках, и дня с нулевой откруткой в ней нет вовсе.
+    Считая покрытие по дням самой кампании, сторож требовал бы от неё
+    ежедневной открутки: кампания с прерывистой откруткой не получала бы
+    вердикта никогда и по закрытии горизонта уходила в ручной разбор.
+
+    Хуже того, смещение было направлено не в ту сторону: чем сильнее правка
+    агента придушила кампанию, тем меньше у неё дней с фактами, тем ниже
+    покрытие и тем вернее вердикта не будет — защита слабела ровно там, где
+    вред сильнее. День, за который витрина наполнена, а у кампании расхода
+    нет, — это честный ноль (ноль расхода, ноль лидов), а не дыра в данных.
+    """
+    start, end, _ = window
+    days = set()
+    for rows in facts_by_campaign.values():
+        for row in rows:
+            fact_date = _as_date(row.get("fact_date"))
+            if fact_date is not None and start <= fact_date <= end:
+                days.add(fact_date)
+    return len(days)
+
+
+def window_coverage(filled_days: int, window: Tuple[date, date, bool]) -> float:
+    """Доля дней окна, за которые витрина наполнена."""
     start, end, _ = window
     length = (end - start).days + 1
     if length <= 0:
         return 0.0
-    return min(1.0, int(observed.get("days") or 0) / float(length))
+    return min(1.0, int(filled_days) / float(length))
 
 
 def _unverified(state: str, closed: bool) -> str:
@@ -277,10 +388,12 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
     rows = facts_by_campaign.get(str(action.get("object_id"))) or []
     observed = observed_metrics(rows, window)
     start, end, closed = window
-    coverage = window_coverage(observed, window)
+    filled = mart_filled_days(facts_by_campaign, window)
+    coverage = window_coverage(filled, window)
     verdict = {
         "observed": observed,
         "coverage": round(coverage, 2),
+        "mart_filled_days": filled,
         "window": {"from": start.isoformat(), "to": end.isoformat(), "closed": closed},
     }
 
@@ -290,27 +403,25 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
     # горизонта. Отсутствие данных — это отсутствие данных, а не здоровье.
     if coverage < MIN_WINDOW_COVERAGE:
         return {**verdict, "state": _unverified(STATE_LOW_COVERAGE, closed),
-                "reason": (f"фактов за {observed['days']} дн. из "
+                "reason": (f"витрина наполнена за {filled} дн. из "
                            f"{(end - start).days + 1} — покрытие "
                            f"{coverage:.0%} при минимуме {MIN_WINDOW_COVERAGE:.0%}")}
 
     breached, reason = is_breached(red_line, observed)
     if breached:
-        # Вердикт берётся на КАЖДОМ прогоне по РАСТУЩЕМУ окну, и выигрывает
-        # первое же пересечение порога: чем дольше наблюдение, тем больше
-        # независимых попыток пробить линию случайным выбросом, и фактическая
-        # вероятность ложного отката выше номинальной. Поэтому пробой обязан
-        # держаться и без последнего дня — то есть прожить минимум два
-        # прогона. Однодневный выброс (сбой синка лидов, разовый дорогой
-        # клик) этого не переживает, настоящая деградация переживает легко.
-        confirm_window = (start, end - timedelta(days=1), closed)
-        confirmed = False
-        if confirm_window[1] >= start:
-            confirmed, _ = is_breached(red_line, observed_metrics(rows, confirm_window))
+        # Пробой засчитывается, только если переживает выброс: см.
+        # breach_survives_peak_day — там же, почему прежняя проверка «то же
+        # окно без последнего дня» ничего не фильтровала на накопительном окне.
+        confirmed, peak, without_peak = breach_survives_peak_day(red_line, rows, window)
+        if peak is not None:
+            verdict["without_peak_day"] = {"date": peak.isoformat(), **without_peak}
         if not confirmed:
             return {**verdict, "state": _unverified(STATE_UNCONFIRMED, closed),
-                    "reason": f"{reason}; пробой не подтверждён без последнего дня окна"}
-        return {**verdict, "state": STATE_BREACHED, "reason": reason}
+                    "reason": (f"{reason}; пробой держится только на самом дорогом "
+                               f"дне окна ({peak.isoformat() if peak else '—'}) — "
+                               f"это выброс, а не деградация")}
+        return {**verdict, "state": STATE_BREACHED,
+                "reason": f"{reason}; держится и без самого дорогого дня окна"}
 
     min_leads = int(red_line.get("min_leads") or 0)
     if observed["leads"] < min_leads:
@@ -336,13 +447,37 @@ def facts_gate(facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
     ложные откаты. Поэтому свежесть витрины проверяется на каждом прогоне, а
     красный гейт запрещает откат, но не наблюдение: смотреть на плохие данные
     можно, действовать по ним — нет.
+
+    Свежесть считается не по максимуму даты среди всех кампаний: одна живая
+    кампания красила бы гейт зелёным при мёртвых остальных. Свежим считается
+    последний день, за который витрина наполнена по БОЛЬШИНСТВУ известных ей
+    кампаний (GATE_MIN_BREADTH) — так виден и обрыв расчёта целиком, и его
+    частичный отказ, но остановка одной кампании гейт не роняет.
     """
-    latest: Optional[date] = None
+    breadth: Dict[date, int] = {}
+    known = 0
+    newest_any: Optional[date] = None
     for rows in facts_by_campaign.values():
+        days = set()
         for row in rows:
             fact_date = _as_date(row.get("fact_date"))
-            if fact_date is not None and (latest is None or fact_date > latest):
-                latest = fact_date
+            if fact_date is None:
+                continue
+            days.add(fact_date)
+            if newest_any is None or fact_date > newest_any:
+                newest_any = fact_date
+        if not days:
+            continue
+        known += 1
+        for day in days:
+            breadth[day] = breadth.get(day, 0) + 1
+
+    # Строгое большинство: при двух кампаниях нужны обе, при трёх — две.
+    # Округление вниз плюс единица, а не ceil: ceil(2 × 0.5) = 1 вернул бы ту
+    # же дыру, ради которой ширина и вводится.
+    need = max(1, math.floor(known * GATE_MIN_BREADTH) + 1) if known else 0
+    wide = [day for day, count in breadth.items() if count >= need] if known else []
+    latest: Optional[date] = max(wide) if wide else None
 
     checks = check_freshness(
         {"edu_agent_facts": f"{latest.isoformat()}T00:00:00+00:00" if latest else None},
@@ -353,13 +488,23 @@ def facts_gate(facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
     if status == "GREEN":
         reason = ""
     elif latest is None:
-        reason = "витрина фактов пуста по наблюдаемым кампаниям"
+        reason = ("витрина фактов пуста по наблюдаемым кампаниям"
+                  if newest_any is None else
+                  f"ни один день витрины не наполнен по {need} кампаниям из "
+                  f"{known}: последняя строка есть за {newest_any.isoformat()}, "
+                  f"но она одиночная — прогон расчёта (agent_e0) отработал не весь")
     else:
-        reason = (f"последний день витрины {latest.isoformat()} при пороге "
+        reason = (f"последний широкий день витрины {latest.isoformat()} при пороге "
                   f"{max_age_days} дн. — прогон расчёта (agent_e0) не идёт")
     return {
         "status": status,
         "latest_fact_date": latest.isoformat() if latest else None,
+        # Максимум по всем кампаниям сохранён отдельным полем: именно им гейт
+        # судил раньше, и расхождение двух дат — прямая улика частичного
+        # отказа расчёта, а не повод считать витрину свежей.
+        "latest_any_fact_date": newest_any.isoformat() if newest_any else None,
+        "campaigns_in_mart": known,
+        "campaigns_required_per_day": need,
         "max_age_days": max_age_days,
         "reason": reason,
         "checks": checks,
@@ -380,6 +525,11 @@ def rollback_guard_form(action: Dict[str, Any], service: str, method: str,
     (0..1300), а не потолок назначения ±50 %. Потолок описывает, что агенту
     позволено НАЗНАЧАТЬ; прошлое значение он не описывает вообще — его
     поставил человек, и +80 % или 0 («показы выключены») для Директа штатны.
+
+    Вместе с запросом рельсе передаются СЫРЫЕ поля журнала — вид исходного
+    действия и previous_state, — а не готовое ожидание: рельса выводит, куда
+    обязан вернуть откат, сама и сверяет с тем, что построил rollback_payload.
+    Посчитай ожидание здесь — сверка проверяла бы построитель им же самим.
     """
     prefix = _SERVICE_KIND_PREFIX.get(str(service), str(service))
     item = ((params.get("BidModifiers") or [{}])[0]) or {}
@@ -388,6 +538,8 @@ def rollback_guard_form(action: Dict[str, Any], service: str, method: str,
         "object_level": action.get("object_level"),
         "object_id": action.get("object_id"),
         "api_coefficient": item.get("BidModifier"),
+        "origin_action_kind": action.get("action_kind"),
+        "previous_state": action.get("previous_state") or {},
         "payload": {"Id": item.get("Id")},
     }
 
@@ -600,6 +752,7 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
     blocked_by_gate: List[Dict[str, Any]] = []
     would_roll_back: List[Dict[str, Any]] = []
     needs_review: List[Dict[str, Any]] = []
+    deferred_closing: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
     rollback_allowed = gate_allows_rollback(data_gate)
     conflicted: List[Dict[str, Any]] = []
@@ -621,6 +774,23 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
         states[state] = states.get(state, 0) + 1
 
         if state in TERMINAL_UNVERIFIED_STATES:
+            if not rollback_allowed:
+                # Перманентная пометка — тот же приговор, что и неудавшийся
+                # откат: строка уходит из наблюдения навсегда, изменение
+                # остаётся живым в кабинете, красная линия по нему не
+                # сработает уже никогда. Ставить его по красному гейту
+                # нельзя: цепочка «расчёт перестали запускать → покрытие
+                # низкое каждый прогон → горизонт закрылся» хоронила действие
+                # именно тогда, когда данных не было вовсе. Ждём зелёного
+                # гейта — состояние при этом видно в отчёте, а не молчит.
+                deferred_closing.append({
+                    "action_id": action.get("action_id"),
+                    "object_id": action.get("object_id"),
+                    "state": state,
+                    "reason": GATE_DEFERS_CLOSING_REASON,
+                    "gate": (data_gate or {}).get("reason"),
+                })
+                continue
             reason = EXPIRED_REASON if state == STATE_EXPIRED else NO_RED_LINE_REASON
             detail = verdict.get("reason")
             if detail and state == STATE_EXPIRED:
@@ -724,6 +894,12 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
         "needs_review": len(needs_review),
         "needs_review_sample": [{k: v for k, v in n.items() if k != "result"}
                                 for n in needs_review[:PREVIEW_SAMPLE_LIMIT]],
+        # Строки без вердикта, которые прогон НАМЕРЕННО не закрыл: гейт
+        # витрины красный, и «вердикта не будет никогда» на мёртвых данных
+        # неотличимо от «данных не было». Останутся под наблюдением до
+        # зелёного гейта — но в отчёте видны отдельным счётчиком.
+        "closing_deferred": len(deferred_closing),
+        "closing_deferred_sample": deferred_closing[:PREVIEW_SAMPLE_LIMIT],
         # Строки, которые прогон не смог даже рассудить: испорченные данные
         # журнала. Не «ноль пробитых», а явный отдельный счётчик.
         "errors": len(errors),

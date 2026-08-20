@@ -1004,3 +1004,260 @@ def test_lost_lease_stops_the_watchdog_before_it_writes():
                        _LostLease())
 
     assert client.calls == [], "после потери аренды откат в кабинет не уходит"
+
+
+# =========================================================================
+# Дефект Г1: подтверждение пробоя не фильтровало выброс
+# =========================================================================
+#
+# Прежняя проверка требовала, чтобы пробой держался «на том же окне без
+# последнего дня». Окно НАКОПИТЕЛЬНОЕ — растёт от даты применения, — поэтому
+# «окно без последнего дня» есть буквально окно предыдущего прогона: для
+# накопительной средней пробой персистентен по построению. Разовый дорогой
+# день, продавивший порог сегодня, продавливал его и назавтра, и здоровая
+# кампания откатывалась на втором прогоне. Теперь пробой обязан пережить
+# выброс: он проверяется на окне БЕЗ дня с максимальным расходом.
+
+def _healthy_with_one_expensive_day():
+    """Пять здоровых дней, один дорогой без лидов, дальше снова здоровые."""
+    return {"111": (
+        _facts("111", date(2026, 8, 2), 5, cost=1000.0, leads=5)      # здоровые
+        + _facts("111", date(2026, 8, 7), 1, cost=30000.0, leads=0)   # выброс
+        + _facts("111", date(2026, 8, 8), 5, cost=1000.0, leads=5)    # снова здоровые
+    )}
+
+
+def test_single_expensive_day_never_becomes_a_confirmed_breach():
+    # Прогон 2: окно 02–08 августа, выброс уже НЕ последний день.
+    facts = _healthy_with_one_expensive_day()
+    report, client, db = _run(_action(), facts, today=date(2026, 8, 11))
+
+    assert report["states"] == {watchdog.STATE_UNCONFIRMED: 1}
+    assert report["rolled_back"] == 0
+    assert client.calls == []
+    assert db.rolled_back == [] and db.failed == []
+
+
+def test_old_confirmation_rule_would_have_rolled_this_campaign_back():
+    # Та же кампания и тот же прогон глазами прежнего правила: «окно без
+    # последнего дня» — это окно вчерашнего прогона, и пробой на нём есть.
+    # Тест держит дефект зафиксированным: почини мы его переименованием, а не
+    # по существу, здесь было бы видно.
+    rows = _healthy_with_one_expensive_day()["111"]
+    red_line = _action()["red_line"]
+    window = watchdog.observation_window(_action(), date(2026, 8, 11))
+    start, end, closed = window
+
+    full = watchdog.observed_metrics(rows, window)
+    without_last_day = watchdog.observed_metrics(rows, (start, end - timedelta(days=1), closed))
+    without_peak = watchdog.observed_metrics(
+        rows, window, exclude=watchdog.peak_cost_day(rows, window))
+
+    assert watchdog.is_breached(red_line, full)[0] is True              # порог пробит
+    assert watchdog.is_breached(red_line, without_last_day)[0] is True  # прежнее «подтверждение»
+    assert watchdog.is_breached(red_line, without_peak)[0] is False     # выброс снят — пробоя нет
+
+
+def test_expensive_day_is_visible_in_the_report():
+    # Отчёт обязан показывать, ЧТО именно не подтвердилось: иначе «сторож
+    # молчит» неотличимо от «всё хорошо».
+    facts = _healthy_with_one_expensive_day()
+    verdict = watchdog.judge(_action(), facts, date(2026, 8, 11))
+
+    assert verdict["without_peak_day"]["date"] == "2026-08-07"
+    assert verdict["without_peak_day"]["cost"] == 6000.0
+    assert "2026-08-07" in verdict["reason"]
+
+
+def test_persistent_degradation_is_still_rolled_back():
+    # Обратная половина: фильтр выброса не должен глушить настоящую
+    # деградацию. Она размазана по дням и переживает снятие любого одного.
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    report, client, db = _run(_action(), facts)
+
+    assert report["states"] == {watchdog.STATE_BREACHED: 1}
+    assert report["rolled_back"] == 1
+    assert "без самого дорогого дня" in report["breached_sample"][0]["reason"]
+
+
+def test_breach_carried_by_two_expensive_days_survives_the_filter():
+    # Фильтр снимает ОДИН день, а не «все дорогие»: два дорогих дня подряд —
+    # уже не выброс, и вердикт обязан состояться.
+    facts = {"111": (_facts("111", date(2026, 8, 2), 4, cost=1000.0, leads=6)
+                     + _facts("111", date(2026, 8, 6), 2, cost=30000.0, leads=0))}
+    report, client, db = _run(_action(), facts)
+
+    assert report["states"] == {watchdog.STATE_BREACHED: 1}
+    assert report["rolled_back"] == 1
+
+
+# =========================================================================
+# Дефект Г2: мёртвая витрина хоронила действие навсегда
+# =========================================================================
+
+
+def test_expired_action_is_not_buried_while_the_data_gate_is_red():
+    # Цепочка «расчёт перестали запускать → покрытие низкое каждый прогон →
+    # горизонт закрылся» помечала действие непроверяемым НАВСЕГДА — по
+    # причине «данных не было». Перманентная пометка на красном гейте
+    # ставиться не должна.
+    facts = {"111": _facts("111", date(2026, 8, 2), 2, cost=5000.0, leads=15)}
+    report, client, db = _run(_action(), facts, today=date(2026, 9, 1), gate=RED_GATE)
+
+    assert report["states"] == {watchdog.STATE_EXPIRED: 1}
+    assert db.failed == []                       # журнал не тронут
+    assert report["needs_review"] == 0
+    assert report["closing_deferred"] == 1       # но состояние видно в отчёте
+    assert report["closing_deferred_sample"][0]["object_id"] == "111"
+    assert report["closing_deferred_sample"][0]["reason"] == watchdog.GATE_DEFERS_CLOSING_REASON
+
+
+def test_action_without_red_line_is_not_buried_on_a_red_gate_either():
+    report, client, db = _run(_action(red_line={}), {}, gate=RED_GATE)
+
+    assert db.failed == []
+    assert report["closing_deferred"] == 1
+
+
+def test_missing_gate_also_defers_the_permanent_mark():
+    # Умолчание — запрет, ровно как у отката.
+    facts = {"111": _facts("111", date(2026, 8, 2), 2, cost=5000.0, leads=15)}
+    report, client, db = _run(_action(), facts, today=date(2026, 9, 1), gate=None)
+
+    assert db.failed == []
+    assert report["closing_deferred"] == 1
+
+
+def test_green_gate_still_closes_the_unverified_action():
+    # Обратная половина: на здоровой витрине «вердикта не будет» — правда, и
+    # строка обязана уйти человеку, а не висеть в наблюдении вечно.
+    facts = {"111": _facts("111", date(2026, 8, 2), 2, cost=5000.0, leads=15)}
+    report, client, db = _run(_action(), facts, today=date(2026, 9, 1))
+
+    assert report["needs_review"] == 1
+    assert report["closing_deferred"] == 0
+    assert db.failed[0]["permanent"] is True
+
+
+# =========================================================================
+# Дефект Г3: покрытие окна считалось не от того знаменателя
+# =========================================================================
+
+
+def test_campaign_with_intermittent_delivery_still_gets_a_verdict():
+    # Витрина наполняется парами «день, кампания», реально присутствующими в
+    # источниках: дня с нулевой откруткой в ней нет вовсе. Считая покрытие по
+    # дням САМОЙ кампании, сторож требовал от неё ежедневной открутки — и чем
+    # сильнее правка агента придушила кампанию, тем вернее вердикта не будет.
+    intermittent = [
+        {"campaign_id": "111", "fact_date": day, "cost": 8000.0, "eff_leads": 7}
+        for day in (date(2026, 8, 2), date(2026, 8, 3), date(2026, 8, 5), date(2026, 8, 7))
+    ]
+    facts = {"111": intermittent,
+             # витрина за окно наполнена: расчёт отработал все шесть дней
+             "222": _facts("222", date(2026, 8, 2), 6, cost=100.0, leads=5)}
+    report, client, db = _run(_action(), facts)
+
+    assert report["states"] == {watchdog.STATE_BREACHED: 1}
+    assert report["rolled_back"] == 1
+    # По прежнему знаменателю это 4 дня из 6 — 67 % при минимуме 80 %.
+    assert len(intermittent) / 6 < watchdog.MIN_WINDOW_COVERAGE
+
+
+def test_coverage_is_measured_on_the_mart_not_on_the_campaign():
+    window = (date(2026, 8, 2), date(2026, 8, 7), False)
+    facts = {"111": _facts("111", date(2026, 8, 2), 2, cost=10.0, leads=1),
+             "222": _facts("222", date(2026, 8, 2), 6, cost=10.0, leads=1)}
+
+    assert watchdog.mart_filled_days(facts, window) == 6
+    assert watchdog.window_coverage(watchdog.mart_filled_days(facts, window), window) == 1.0
+
+
+def test_dead_mart_is_still_low_coverage():
+    # Обратная половина: если витрины нет ни по одной кампании, покрытия нет
+    # ни у кого — вердикт по нулям не выносится.
+    report, client, _ = _run(_action(), {"222": _facts("222", date(2026, 8, 2), 2,
+                                                       cost=10.0, leads=1)})
+
+    assert report["states"] == {watchdog.STATE_LOW_COVERAGE: 1}
+    assert client.calls == []
+
+
+# =========================================================================
+# Дефект Г4: рельса возврата проверяла форму, но не намерение
+# =========================================================================
+
+
+def test_rollback_to_a_value_that_is_not_the_past_state_is_refused(monkeypatch):
+    # 1300 — предел шкалы Директа, то есть «в диапазоне»: прежняя рельса
+    # пропустила бы его насквозь, и агент вкрутил бы ставку сегмента в потолок
+    # под видом отмены. Путь возврата больше ничем не проверен.
+    monkeypatch.setattr(watchdog, "rollback_payload",
+                        lambda action: ("bidmodifiers", "set",
+                                        {"BidModifiers": [{"Id": 7, "BidModifier": 1300}]}))
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    report, client, db = _run(_action(), facts)
+
+    assert client.calls == []
+    assert report["rollback_failed"] == 1
+    assert "рельсы" in db.failed[0]["reason"]
+    assert "110" in db.failed[0]["reason"]
+
+
+def test_rollback_guard_form_carries_the_journal_past_state():
+    # Рельса выводит ожидаемый коэффициент САМА из полей журнала: посчитай его
+    # сторож — сверка проверяла бы построитель запроса им же самим.
+    form = watchdog.rollback_guard_form(_action(), "bidmodifiers", "set",
+                                        {"BidModifiers": [{"Id": 7, "BidModifier": 110}]})
+
+    assert form["origin_action_kind"] == "bidmodifier.set"
+    assert form["previous_state"] == {"Id": 7, "percent": 10}
+
+
+def test_correct_rollback_still_passes_the_rail():
+    # Обратная половина: сверка намерения не должна ломать нормальный откат.
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    report, client, db = _run(_action(), facts)
+
+    assert report["rolled_back"] == 1
+    assert client.calls[0][2] == {"BidModifiers": [{"Id": 7, "BidModifier": 110}]}
+
+
+# =========================================================================
+# Мелкое: умолчания, которые молчат
+# =========================================================================
+
+
+def test_client_without_sandbox_flag_is_a_broken_client_not_a_prod_one():
+    # Оба умолчания плохие: «боевой» открывает боевой журнал прогону
+    # неизвестного окружения, «песочный» — молча выключает журнал боевому.
+    class _NoFlag:
+        def is_write_allowed(self):
+            return True
+
+    with pytest.raises(AttributeError):
+        watchdog.journal_allowed(_NoFlag())
+
+
+def test_gate_is_red_when_only_one_campaign_of_two_is_fresh():
+    # Максимум даты по всем кампаниям красил гейт зелёным при мёртвых
+    # остальных: расчёт мог отработать частично, а сторож этого не видел.
+    facts = {"111": _facts("111", TODAY - timedelta(days=2), 2, cost=100.0, leads=1),
+             "222": _facts("222", date(2026, 7, 20), 3, cost=100.0, leads=1)}
+    gate = watchdog.facts_gate(facts, TODAY)
+
+    assert gate["status"] == "RED"
+    assert gate["latest_any_fact_date"] == (TODAY - timedelta(days=1)).isoformat()
+    assert gate["campaigns_required_per_day"] == 2
+
+
+def test_gate_stays_green_when_a_single_campaign_stops_delivering():
+    # Обратная половина, и она же — граница: требовать свежести от КАЖДОЙ
+    # кампании нельзя. У кампании, которую правка агента придушила до нуля,
+    # свежих строк нет по построению, и красный гейт запретил бы откат ровно
+    # там, где он нужен.
+    facts = {"111": _facts("111", TODAY - timedelta(days=2), 2, cost=100.0, leads=1),
+             "222": _facts("222", TODAY - timedelta(days=2), 2, cost=100.0, leads=1),
+             "333": _facts("333", date(2026, 7, 20), 3, cost=100.0, leads=1)}
+
+    assert watchdog.facts_gate(facts, TODAY)["status"] == "GREEN"

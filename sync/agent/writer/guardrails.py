@@ -11,12 +11,15 @@ sync/agent/writer/guardrails.py — рельсы движка записи (сл
   - заповедник неприкосновенен: его кампании не получают ни одного действия,
     иначе база сравнения для всех замеров теряется;
   - число действий за прогон ограничено: массовое изменение невозможно
-    проверить сторожем и невозможно осмысленно откатить.
+    проверить сторожем и невозможно осмысленно откатить;
+  - откат обязан возвращать ИМЕННО в прошлое состояние журнала, а не в любое
+    значение, которое примет API: рельса возврата сверяет намерение, а не
+    только форму запроса (check_rollback).
 """
 
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from sync.agent.writer.units import API_MAX, API_MIN
+from sync.agent.writer.units import API_MAX, API_MIN, API_NEUTRAL
 
 # Рельса работает по ДЕЛЬТЕ, а не по 100-базному коэффициенту Директа: в
 # payload действия (diff.py) лежит внутренняя единица движка, перевод в шкалу
@@ -38,6 +41,12 @@ ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set"}
 # прежнее значение. add на этом пути означал бы создание НОВОГО объекта вместо
 # восстановления старого, то есть ещё одно изменение кабинета под видом отмены.
 ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set"}
+
+# Куда обязан возвращать откат, в зависимости от вида ИСХОДНОГО действия.
+# Отмена добавления — нейтраль (объекта до действия не было), отмена
+# перезаписи — прежний коэффициент из previous_state журнала.
+ROLLBACK_ORIGIN_ADD = "bidmodifier.add"
+ROLLBACK_ORIGIN_SET = "bidmodifier.set"
 
 _DELETE_REASON = "удаление объектов запрещено: агент только паузит"
 
@@ -67,6 +76,42 @@ def check_action(action: Dict[str, Any]) -> Tuple[bool, str]:
     return True, ""
 
 
+def expected_rollback_coefficient(
+    origin_action_kind: Any, previous_state: Any
+) -> Tuple[Optional[int], str]:
+    """Коэффициент, в который откат ОБЯЗАН вернуть объект, — из журнала.
+
+    Выводится здесь, а не принимается готовым от вызывающего кода: смысл
+    сверки в том, чтобы рельса считала ожидание НЕЗАВИСИМО от построителя
+    запроса (rollback.rollback_payload). Получи она ожидание из того же
+    источника, что и сам запрос, — сверяла бы код сам с собой.
+
+    Отмена добавления возвращает нейтраль (объекта до действия не было),
+    отмена перезаписи — прежний коэффициент. previous_state хранится в
+    ДЕЛЬТАХ, как весь внутренний план, поэтому переводится в 100-базу API.
+
+    None вместо числа — «ожидание не выводится»: вид исходного действия
+    неизвестен или прошлое состояние нечитаемо. Это отказ, а не исключение:
+    вызывающий код превращает исключение в пометку «неоткатываемо навсегда».
+    """
+    origin = str(origin_action_kind or "")
+    previous = previous_state if isinstance(previous_state, dict) else {}
+
+    if origin == ROLLBACK_ORIGIN_ADD:
+        return API_NEUTRAL, ""
+
+    if origin == ROLLBACK_ORIGIN_SET:
+        percent = previous.get("percent")
+        if percent is None:
+            return None, "в журнале нет прошлого коэффициента (previous_state.percent)"
+        try:
+            return API_NEUTRAL + int(percent), ""
+        except (TypeError, ValueError):
+            return None, f"прошлый коэффициент нечитаем: {percent!r}"
+
+    return None, f"вид исходного действия неизвестен рельсе: {origin or '—'}"
+
+
 def check_rollback(request: Dict[str, Any]) -> Tuple[bool, str]:
     """Рельса пути ВОЗВРАТА. Проверяет вид действия и диапазон API, но не потолок.
 
@@ -85,12 +130,25 @@ def check_rollback(request: Dict[str, Any]) -> Tuple[bool, str]:
       * allow-лист уже пути назначения (только set: возврат переписывает
         существующий объект, а не создаёт новый);
       * коэффициент обязан лежать в диапазоне API Директа — вне его запрос
-        либо будет отклонён поэлементно, либо применит не то, что задумано.
+        либо будет отклонён поэлементно, либо применит не то, что задумано;
+      * коэффициент обязан СОВПАДАТЬ с прошлым состоянием из журнала (для
+        отмены добавления — с нейтралью). Без этой сверки рельса проверяла бы
+        только форму: любое значение внутри диапазона API — а это 0..1300, то
+        есть почти что угодно, — проходило бы насквозь, и единственным, что
+        связывает запрос с реальным прошлым значением, оставался бы сам код,
+        который этот запрос строит. Ошибка в нём (предельное значение вместо
+        прежнего, чужой previous_state, потерянный знак дельты) шла бы прямо в
+        боевой кабинет: путь возврата больше ничем не проверен.
 
     Коэффициент здесь — в 100-БАЗНОЙ ШКАЛЕ API (api_coefficient), а не в
     дельтах, как у check_action. Поле названо иначе намеренно: две рельсы
     считают в разных единицах, и одноимённое поле рано или поздно передали бы
     не в ту функцию молча.
+
+    Отказ всегда возвращается парой (False, причина) и никогда не летит
+    исключением: вызывающий код (agent_e1_watchdog.rollback_one) трактует
+    исключение на этом участке как «запрос не строится» и хоронит действие
+    пометкой permanent=True — то есть падение рельсы стоило бы дороже отказа.
     """
     kind = str(request.get("action_kind") or "")
     if _is_delete(kind.lower()):
@@ -102,10 +160,21 @@ def check_rollback(request: Dict[str, Any]) -> Tuple[bool, str]:
     coefficient = request.get("api_coefficient")
     if coefficient is None:
         return False, "коэффициент возврата не задан"
-    value = int(coefficient)
+    try:
+        value = int(coefficient)
+    except (TypeError, ValueError):
+        return False, f"коэффициент возврата не число: {coefficient!r}"
     if not (API_MIN <= value <= API_MAX):
         return False, (f"коэффициент возврата {value} вне диапазона Директа "
                        f"{API_MIN}..{API_MAX}")
+
+    expected, why = expected_rollback_coefficient(
+        request.get("origin_action_kind"), request.get("previous_state"))
+    if expected is None:
+        return False, f"куда возвращать — неизвестно: {why}"
+    if value != expected:
+        return False, (f"коэффициент возврата {value} не равен прошлому состоянию "
+                       f"журнала {expected}: это не отмена, а новое изменение")
     return True, ""
 
 
