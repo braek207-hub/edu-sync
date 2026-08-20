@@ -190,3 +190,47 @@ def test_domain_country_unknown():
     assert map_domain_country("limestore.com") is None
     assert map_domain_country("") is None
     assert map_domain_country(None) is None
+
+
+# === GA4 группы каналов (авторитет границы платный/органика, как ручной отчёт) ===
+
+from sync.gcc_channels import map_ga4_channel_grouped  # noqa: E402
+
+
+def test_grouped_google_paid_families():
+    """Paid Search / Cross-network (PMax) / Shopping / Display → Google.Adwords."""
+    for g in ("Paid Search", "Cross-network", "Paid Shopping", "Display"):
+        assert map_ga4_channel_grouped(g, "google", "cpc") == ("SEM", "Google.Adwords", "Платный")
+    assert map_ga4_channel_grouped("Paid Search", "bing", "cpc") == ("SEM", "Bing", "Платный")
+
+
+def test_grouped_paid_social_meta():
+    assert map_ga4_channel_grouped("Paid Social", "facebook", "paid") == ("SMM paid", "Meta Ads", "Платный")
+    assert map_ga4_channel_grouped("Paid Social", "instagram", "cpc") == ("SMM paid", "Meta Ads", "Платный")
+
+
+def test_grouped_group_overrides_medium():
+    """Группа — авторитет: даже со странным medium Paid Search остаётся платным Google."""
+    assert map_ga4_channel_grouped("Paid Search", "google", "(not set)") == ("SEM", "Google.Adwords", "Платный")
+    # и наоборот: cpc-medium в органической группе не делает канал платным
+    assert map_ga4_channel_grouped("Organic Search", "google", "cpc") == ("SEO", "SEO Google", "Бесплатный")
+
+
+def test_grouped_organic_buckets():
+    assert map_ga4_channel_grouped("Organic Search", "yandex", "organic") == ("SEO", "SEO Yandex", "Бесплатный")
+    assert map_ga4_channel_grouped("Organic Shopping", "google", "organic") == ("SEO", "SEO Google", "Бесплатный")
+    assert map_ga4_channel_grouped("Organic Social", "instagram.com", "referral") == ("SMM (organic)", "Instagram", "Бесплатный")
+    assert map_ga4_channel_grouped("Direct", "(direct)", "(none)") == ("Direct", "Direct", "Бесплатный")
+    assert map_ga4_channel_grouped("Unassigned", "(not set)", "(not set)") == ("Others", "Unassigned", "Бесплатный")
+
+
+def test_grouped_email_and_referral():
+    assert map_ga4_channel_grouped("Email", "limeshop-uae.maestra.io", "email") == ("CRM", "Mindbox", "Бесплатный")
+    assert map_ga4_channel_grouped("Referral", "ae.limestore.com", "referral") == ("Internal", "Internal", "Бесплатный")
+    assert map_ga4_channel_grouped("Referral", "shop.app", "referral") == ("Referrals", "shop.app", "Бесплатный")
+    assert map_ga4_channel_grouped("AI Assistant", "chatgpt.com", "referral") == ("Referrals", "chatgpt.com", "Бесплатный")
+
+
+def test_grouped_unknown_group_falls_back():
+    """Новая/неизвестная группа GA4 → прежний маппер source/medium, не падение."""
+    assert map_ga4_channel_grouped("Weird Future Group", "google", "cpc") == ("SEM", "Google.Adwords", "Платный")
