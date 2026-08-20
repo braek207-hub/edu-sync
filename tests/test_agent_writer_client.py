@@ -2,7 +2,12 @@
 import pytest
 
 import sync.agent.writer.client as client_module
-from sync.agent.writer.client import WriteClient, DirectWriteError, parse_units
+from sync.agent.writer.client import (
+    DirectWriteError,
+    WriteClient,
+    is_outcome_unknown,
+    parse_units,
+)
 
 
 class _FakeResponse:
@@ -94,3 +99,65 @@ def test_retryable_status_error_carries_status_code(monkeypatch):
         client.mutate("bidmodifiers", "add", {"x": 1})
 
     assert excinfo.value.code == 503
+
+
+# ============================== исход неизвестен ≠ «запрос не ушёл»
+# Дефект C: под статусом 'failed' пряталась недоступность сервиса после
+# ретраев — а запрос к тому моменту уходил в Директ несколько раз, и 5xx мог
+# прийти уже ПОСЛЕ применения. Такая строка обязана попасть в тот же контур,
+# что и обрыв процесса, иначе изменение живёт в кабинете без наблюдения и без
+# списанного риска, а diff следующего прогона его не предложит.
+
+
+def test_unavailable_after_retries_is_marked_outcome_unknown(monkeypatch):
+    def fake_post(url, data=None, headers=None, timeout=None):
+        return _FakeResponse(503, json_body={}, text="service unavailable")
+
+    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    monkeypatch.setattr(client_module.time, "sleep", lambda seconds: None)
+
+    client = WriteClient("login-1", dry_run=False, token="t")
+    with pytest.raises(DirectWriteError) as excinfo:
+        client.mutate("bidmodifiers", "add", {"x": 1})
+
+    assert excinfo.value.outcome_unknown is True
+    assert is_outcome_unknown(excinfo.value) is True
+
+
+def test_unparsable_response_is_marked_outcome_unknown(monkeypatch):
+    # Ответ пришёл, но это не JSON: что Директ сделал с запросом — неизвестно.
+    def fake_post(url, data=None, headers=None, timeout=None):
+        return _FakeResponse(200, json_body=None, text="<html>502</html>")
+
+    monkeypatch.setattr(client_module.requests, "post", fake_post)
+
+    client = WriteClient("login-1", dry_run=False, token="t")
+    with pytest.raises(DirectWriteError) as excinfo:
+        client.mutate("bidmodifiers", "add", {"x": 1})
+
+    assert excinfo.value.outcome_unknown is True
+
+
+def test_request_level_error_from_direct_is_not_outcome_unknown(monkeypatch):
+    # Директ явно ответил отказом уровня запроса — изменения точно нет.
+    def fake_post(url, data=None, headers=None, timeout=None):
+        return _FakeResponse(200, json_body={
+            "error": {"error_code": 54, "error_string": "Нет прав"}})
+
+    monkeypatch.setattr(client_module.requests, "post", fake_post)
+
+    client = WriteClient("login-1", dry_run=False, token="t")
+    with pytest.raises(DirectWriteError) as excinfo:
+        client.mutate("bidmodifiers", "add", {"x": 1})
+
+    assert excinfo.value.outcome_unknown is False
+    assert is_outcome_unknown(excinfo.value) is False
+
+
+def test_missing_token_is_not_outcome_unknown():
+    # Ошибка ДО отправки: запрос не строился вовсе.
+    client = WriteClient("login-1", dry_run=False)
+    with pytest.raises(DirectWriteError) as excinfo:
+        client.mutate("bidmodifiers", "add", {"x": 1})
+
+    assert excinfo.value.outcome_unknown is False
