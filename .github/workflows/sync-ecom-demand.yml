@@ -9,6 +9,10 @@ on:
         description: "Бэкфилл недель с даты (YYYY-MM-DD); пусто = инкремент"
         required: false
         default: ""
+      slugs:
+        description: "Только эти проекты (через запятую, напр. meshnflesh); пусто = все"
+        required: false
+        default: ""
 
 jobs:
   sync:
@@ -27,6 +31,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           YANDEX_SEARCHAPI_KEY: ${{ secrets.YANDEX_SEARCHAPI_KEY }}
           WORDSTAT_FROM: ${{ github.event.inputs.wordstat_from }}
+          ECOM_DEMAND_SLUGS: ${{ github.event.inputs.slugs }}
       - name: Revalidate dashboard cache
         if: success()
         run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate

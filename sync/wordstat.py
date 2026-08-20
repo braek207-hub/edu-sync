@@ -15,6 +15,7 @@ Env: YANDEX_SEARCHAPI_KEY, YANDEX_CLOUD_FOLDER_ID, DATABASE_URL.
 """
 import datetime as dt
 import os
+import time
 
 import requests
 
@@ -107,16 +108,27 @@ def aggregate_weekly(responses: list[dict]) -> dict[str, int]:
 
 
 def _post_dynamics(body: dict) -> dict:
-    """POST GetDynamics с авторизацией. Общий транспорт weekly- и daily-запросов."""
+    """POST GetDynamics с авторизацией. Общий транспорт weekly- и daily-запросов.
+
+    Ретрай с бэкоффом на 429 (rate limit Search API): объединённый ecom-синк дёргает
+    много фраз подряд по нескольким проектам и упирается в лимит — без ретрая наборы
+    падали целиком (последний, meshnflesh, страдал больше всех). Уважаем Retry-After,
+    иначе экспонента 2^n (кап 30с), до 6 попыток.
+    """
     api_key = os.environ["YANDEX_SEARCHAPI_KEY"]
     folder_id = os.environ.get("YANDEX_CLOUD_FOLDER_ID")  # опц.: ключ привязан к каталогу СА
     if folder_id:
         body["folderId"] = folder_id
-    r = requests.post(
-        WORDSTAT_URL, json=body, timeout=60,
-        headers={"Authorization": f"Api-Key {api_key}", "Content-Type": "application/json"},
-    )
-    r.raise_for_status()
+    headers = {"Authorization": f"Api-Key {api_key}", "Content-Type": "application/json"}
+    for attempt in range(6):
+        r = requests.post(WORDSTAT_URL, json=body, timeout=60, headers=headers)
+        if r.status_code == 429 and attempt < 5:
+            wait = float(r.headers.get("Retry-After") or 0) or min(2**attempt, 30)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()  # недостижимо: цикл всегда вернул или бросил — для полноты типов
     return r.json()
 
 

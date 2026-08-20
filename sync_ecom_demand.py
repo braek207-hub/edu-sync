@@ -34,8 +34,13 @@ def main() -> None:
 
     today = dt.date.today().isoformat()
     backfill = os.environ.get("WORDSTAT_FROM")
+    # Точечный бэкфилл одного/нескольких проектов (ECOM_DEMAND_SLUGS=meshnflesh) — чтобы
+    # добрать отставший набор, не передёргивая уже полные и не упираясь в rate limit Wordstat.
+    only = {s.strip() for s in os.environ.get("ECOM_DEMAND_SLUGS", "").split(",") if s.strip()}
 
     for slug, kinds in ECOM_PHRASE_SETS.items():
+        if only and slug not in only:
+            continue
         for kind, phrases in kinds.items():
             tag = f"{slug}/{kind}"
             # Недельный. Отдельный try на набор — падение одного не роняет остальные.
