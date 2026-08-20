@@ -1022,3 +1022,105 @@ def test_every_state_transition_has_a_guard():
                 writer_db.MARK_ROLLBACK_FAILED_SQL):
         assert "rolled_back_at IS NULL" in sql
         assert "RETURNING" in sql
+
+
+# --------------- живое исполнение выборок по сегментам
+# Оба запроса до сих пор проверялись только подстроками в тексте и подменённым
+# _fetch. Их особенность в том, что ошибка была бы не синтаксической, а
+# семантической: GROUP BY по выражению с COALESCE, HAVING поверх SUM, три
+# позиционных параметра подряд, из которых два — один и тот же account.
+# Такое ловится только исполнением против Postgres.
+
+
+def _set_columns(key: str, **cols) -> None:
+    """Проставляет колонки, которых нет в insert_action (статус попыток,
+    отметки вердиктов) — воспроизводит состояние журнала после прогонов."""
+    sets = ", ".join(f"{name} = %s" for name in cols)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE edu_agent_actions SET {sets} WHERE idempotency_key = %s",
+                (*cols.values(), key),
+            )
+        conn.commit()
+
+
+@live_db
+def test_live_exhausted_segments_sums_attempts_of_one_segment():
+    # Два прогона бились в один сегмент разными ключами идемпотентности —
+    # порог считается по СУММЕ попыток сегмента, иначе стена не видна никогда.
+    ensure_writer_tables()
+    suffix = uuid.uuid4().hex[:8]
+    account = "test-" + suffix
+    first, second = "test-exh-a-" + suffix, "test-exh-b-" + suffix
+    try:
+        writer_db.insert_action(_journal_row(first, account))
+        writer_db.insert_action(_journal_row(second, account))
+        _set_columns(first, status="failed", apply_attempts=1)
+        _set_columns(second, status="rejected", apply_attempts=1)
+
+        out = writer_db.exhausted_segments(max_attempts=2, account=account)
+
+        assert list(out) == [("111", "MOBILE_ADJUSTMENT", "MOBILE")]
+        assert out[("111", "MOBILE_ADJUSTMENT", "MOBILE")]["attempts"] == 2
+        assert out[("111", "MOBILE_ADJUSTMENT", "MOBILE")]["last_attempt_at"] is not None
+
+        # Порог выше суммы — сегмент ещё не исчерпан.
+        assert writer_db.exhausted_segments(max_attempts=3, account=account) == {}
+    finally:
+        _cleanup(first, second)
+
+
+@live_db
+def test_live_exhausted_segments_ignores_a_segment_that_once_succeeded():
+    # Строка дошла до applied — сегмент стеной не является, сколько бы попыток
+    # ни было потрачено по дороге.
+    ensure_writer_tables()
+    suffix = uuid.uuid4().hex[:8]
+    account = "test-" + suffix
+    key = "test-exh-ok-" + suffix
+    try:
+        writer_db.insert_action(_journal_row(key, account))
+        _set_columns(key, status="applied", apply_attempts=5)
+
+        assert writer_db.exhausted_segments(max_attempts=1, account=account) == {}
+    finally:
+        _cleanup(key)
+
+
+@live_db
+def test_live_harmful_segments_respects_the_cooldown_window():
+    # GREATEST по двум отметкам и сравнение с make_interval — выражение, которое
+    # молча вернуло бы пустоту при ошибке в типах, то есть сняло бы кулдаун.
+    ensure_writer_tables()
+    suffix = uuid.uuid4().hex[:8]
+    account = "test-" + suffix
+    fresh, old = "test-harm-new-" + suffix, "test-harm-old-" + suffix
+    try:
+        writer_db.insert_action(_journal_row(fresh, account))
+        writer_db.insert_action(_journal_row(old, account, object_id="222"))
+        _set_columns(fresh, harmful_verdict_at=datetime.utcnow() - timedelta(days=1))
+        _set_columns(old, rolled_back_at=datetime.utcnow() - timedelta(days=40))
+
+        out = writer_db.harmful_segments(cooldown_days=14, account=account)
+
+        assert list(out) == [("111", "MOBILE_ADJUSTMENT", "MOBILE")]
+        # За горизонтом кулдауна ничего не осталось, а внутри широкого — обе.
+        assert len(writer_db.harmful_segments(cooldown_days=60, account=account)) == 2
+    finally:
+        _cleanup(fresh, old)
+
+
+@live_db
+def test_live_harmful_segments_ignores_rows_without_a_verdict():
+    # Строка без обеих отметок отсекается самим сравнением (NULL > interval даёт
+    # NULL) — отдельного IS NOT NULL в запросе нет, и это утверждение живое.
+    ensure_writer_tables()
+    suffix = uuid.uuid4().hex[:8]
+    account = "test-" + suffix
+    key = "test-harm-none-" + suffix
+    try:
+        writer_db.insert_action(_journal_row(key, account))
+        assert writer_db.harmful_segments(cooldown_days=14, account=account) == {}
+    finally:
+        _cleanup(key)

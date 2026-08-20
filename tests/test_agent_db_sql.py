@@ -1,3 +1,6 @@
+import os
+from datetime import date, timedelta
+
 import pytest
 
 import sync.agent.db as agent_db
@@ -156,3 +159,43 @@ def test_computed_settings_read_under_normalized_key(monkeypatch):
     agent_db.load_latest_computed_settings(" acc-1 ")
 
     assert captured["params"] == ("account", "acc-1", "account", "acc-1")
+
+
+# --------------- живое исполнение выборки ширины витрины
+# GROUPING SETS ((fact_date), ()) — единственное место в агенте с таким
+# синтаксисом, и от его итоговой строки (fact_date = NULL) зависит знаменатель
+# гейта свежести. Ошибись в нём — гейт получит campaigns_total = 0, порог
+# обнулится, и витрина будет считаться здоровой всегда. В тексте запроса это
+# не видно, поэтому здесь запрос исполняется по-настоящему.
+
+live_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="нужен DATABASE_URL")
+
+
+@live_db
+def test_live_mart_day_breadth_returns_days_and_a_wider_total():
+    today = date.today()
+    out = agent_db.load_mart_day_breadth(
+        (today - timedelta(days=30)).isoformat(), today.isoformat())
+
+    assert set(out) == {"days", "campaigns_total"}
+    assert isinstance(out["campaigns_total"], int)
+    assert all(isinstance(v, int) and v > 0 for v in out["days"].values())
+    # Итог — РАЗНЫЕ кампании за всё окно, поэтому он не меньше любого дня.
+    # Максимумом по дням его считать нельзя: в разные дни кампании разные.
+    if out["days"]:
+        assert out["campaigns_total"] >= max(out["days"].values())
+    else:
+        assert out["campaigns_total"] == 0
+    # Итоговая строка не должна протечь в дни отдельным ключом None.
+    assert None not in out["days"]
+
+
+@live_db
+def test_live_mart_day_breadth_is_empty_outside_the_mart():
+    # Окно в будущем строк не даёт — и запрос обязан вернуть честные нули,
+    # а не упасть и не отдать итоговую строку без дней.
+    future = date.today() + timedelta(days=365)
+    out = agent_db.load_mart_day_breadth(
+        future.isoformat(), (future + timedelta(days=7)).isoformat())
+
+    assert out == {"days": {}, "campaigns_total": 0}
