@@ -76,13 +76,37 @@ WRITER_DDL: List[str] = [
       ADD COLUMN IF NOT EXISTS direct_type TEXT,
       ADD COLUMN IF NOT EXISTS setting_key TEXT
     """,
+    # ВЕРДИКТ СТОРОЖА, отдельно от успешности технической операции возврата.
+    #
+    # Кулдаун планирования (agent_e1.COOLDOWN_AFTER_ROLLBACK_DAYS) смотрел
+    # только на rolled_back_at — то есть на то, УДАЛСЯ ли откат. А вредным
+    # сегмент делает не удавшийся возврат, а пробитая красная линия: если
+    # линия пробита, а откатить не смогли (Id неизвестен, рельсы отклонили,
+    # кабинет не отвечает), изменение снимается с наблюдения — и планировщик
+    # об этом не знает. Процент дрейфует на пункт между расчётами, ключ
+    # идемпотентности получается новый, и агент назавтра крутит тот же
+    # сегмент той же кампании ещё раз.
+    #
+    #   harmful_verdict_at — момент, когда сторож признал изменение вредным;
+    #   harmful_reason     — формулировка пробоя, для отчёта и разбора.
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS harmful_verdict_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS harmful_reason     TEXT
+    """,
     # Кулдаун по сегменту читается на каждом прогоне по (кабинет, объект,
-    # тип, ключ) среди откатанных строк — без индекса это seq scan по всему
-    # журналу на каждый прогон.
+    # тип, ключ) среди вредных строк — без индексов это seq scan по всему
+    # журналу на каждый прогон. Индекса два, потому что вредность даёт любая
+    # из двух отметок.
     """
     CREATE INDEX IF NOT EXISTS edu_agent_actions_rolled_back_idx
       ON edu_agent_actions (rolled_back_at)
       WHERE rolled_back_at IS NOT NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS edu_agent_actions_harmful_idx
+      ON edu_agent_actions (harmful_verdict_at)
+      WHERE harmful_verdict_at IS NOT NULL
     """,
     # Аренда на прогон: два одновременных прогона на одном ключе создают в
     # кабинете ДВА объекта, и Id первого теряется навсегда — без строки
@@ -433,15 +457,78 @@ def mark_stale_planned(
     return rows
 
 
-def mark_rolled_back(action_id: str) -> None:
+# Отметка «откатано» — единственный переход состояния, остававшийся без гарда:
+# UPDATE по одному только action_id, без условия на текущее состояние и без
+# проверки, что строка действительно изменилась. Соседние переходы
+# (MARK_ACTION_SQL, MARK_UNKNOWN_OUTCOME_SQL, MARK_STALE_SQL) давно приведены
+# к безопасной форме, и по той же причине: строку между решением и отметкой
+# мог забрать другой контур.
+#
+# Условие — «строка ещё живая»: статус из LIVE_STATUSES и пустой
+# rolled_back_at. Что это отсекает:
+#   * повторный откат уже откатанной строки (второй сторож, ретрай отчёта) —
+#     rolled_back_at не сдвигается, и кулдаун сегмента не продлевается задним
+#     числом от чужой попытки;
+#   * пометку строки, которую параллельный контур уже перевёл в 'planned'
+#     повторной планировкой, — иначе в журнале появилось бы 'rolled_back' у
+#     действия, которого в кабинете ещё не было.
+MARK_ROLLED_BACK_SQL = """
+    UPDATE edu_agent_actions
+       SET rolled_back_at = now(),
+           status         = 'rolled_back'
+     WHERE action_id = %(action_id)s
+       AND rolled_back_at IS NULL
+       AND status IN (__LIVE_STATUSES__)
+    RETURNING action_id
+""".replace("__LIVE_STATUSES__", _sql_literals(LIVE_STATUSES))
+
+
+def mark_rolled_back(action_id: str) -> bool:
+    """True — отметка легла. False — строку уже забрал другой контур.
+
+    Возврат обязателен: вызывающий код (сторож) должен различать «отметили» и
+    «строка ушла из-под нас», иначе отчёт утверждает про журнал то, чего в нём
+    нет.
+    """
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE edu_agent_actions SET rolled_back_at = now(), status = 'rolled_back' "
-                "WHERE action_id = %s",
-                (action_id,),
-            )
+            cur.execute(MARK_ROLLED_BACK_SQL, {"action_id": action_id})
+            updated = cur.fetchone() is not None
         conn.commit()
+    return updated
+
+
+# Вердикт сторожа «изменение вредно» — отдельно от того, удался ли возврат.
+# Гард тот же и по той же причине, что у соседей; повторная пометка живой
+# строки не сдвигает момент вердикта (COALESCE), чтобы кулдаун сегмента
+# отсчитывался от ПЕРВОГО пробоя, а не продлевался каждым прогоном сторожа.
+MARK_HARMFUL_SQL = """
+    UPDATE edu_agent_actions
+       SET harmful_verdict_at = COALESCE(harmful_verdict_at, now()),
+           harmful_reason     = %(reason)s
+     WHERE action_id = %(action_id)s
+       AND rolled_back_at IS NULL
+       AND status IN (__LIVE_STATUSES__)
+    RETURNING action_id, harmful_verdict_at
+""".replace("__LIVE_STATUSES__", _sql_literals(LIVE_STATUSES))
+
+
+def mark_harmful_verdict(action_id: str, reason: str) -> bool:
+    """Фиксирует вердикт сторожа: красная линия пробита.
+
+    Ставится ДО попытки отката и независимо от её исхода — потому что
+    признак вредности сегмента это вердикт, а не успешность технической
+    операции возврата. Из этой отметки планировщик берёт кулдаун
+    (harmful_segments), и без неё неоткатанный пробой был бы для него
+    невидим.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(MARK_HARMFUL_SQL, {"action_id": action_id,
+                                           "reason": str(reason)[:500]})
+            updated = cur.fetchone() is not None
+        conn.commit()
+    return updated
 
 
 # Сколько раз откат одного действия вообще стоит пытаться отправить.
@@ -510,6 +597,43 @@ def failed_rollbacks_count() -> int:
     return int(rows[0]["n"]) if rows else 0
 
 
+# --------------------------------------------- срок хранения строк репетиции
+
+# Сколько дней живут собственные строки репетиционного прогона (статус
+# 'dry_run'). У них не было судьбы вообще: статус не финальный (журнал их
+# перезапишет повторной планировкой) и не живой (риск-бюджет их не считает,
+# сторож не наблюдает) — то есть ни один механизм их не закрывает, а ключ
+# репетиции с новым процентом каждый раз новый, поэтому строки копились вечно.
+#
+# Судьба — срок хранения. Удалять их безопасно ровно потому, что за ними
+# ничего нет: mutate в репетиции не уходил в кабинет, отката такая строка не
+# требует, риск не оплачивает. Двух недель хватает, чтобы прочитать отчёт
+# репетиции и сравнить его с журналом руками.
+DRY_RUN_RETENTION_DAYS = 14
+
+PURGE_DRY_RUN_SQL = """
+    DELETE FROM edu_agent_actions
+     WHERE status = 'dry_run'
+       AND rolled_back_at IS NULL
+       AND created_at < now() - make_interval(days => %s)
+"""
+
+
+def purge_dry_run_actions(older_than_days: int = DRY_RUN_RETENTION_DAYS) -> int:
+    """Убирает старые строки репетиции. Возвращает число удалённых.
+
+    Условие бьёт только по статусу 'dry_run': ни одна строка, за которой стоит
+    отправленный в кабинет запрос, под него не попадает — у таких статус
+    'applied', 'stale', 'rejected', 'failed' или 'rolled_back'.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(PURGE_DRY_RUN_SQL, (int(older_than_days),))
+            removed = cur.rowcount or 0
+        conn.commit()
+    return int(removed)
+
+
 # ------------------------------------------------ обратная связь от отката
 
 # Сегмент, по которому был откат, определяется ОБЪЕКТОМ И СЕГМЕНТОМ, а не
@@ -522,15 +646,25 @@ def failed_rollbacks_count() -> int:
 # setting_key: у действия bidmodifier.add сегмент лежал в payload, у
 # bidmodifier.set его не было нигде. Что не восстанавливается, то в кулдаун не
 # попадает, и это честнее, чем угадывать сегмент по Id корректировки.
-ROLLED_BACK_SEGMENTS_SQL = """
+# Вредным сегмент делает ВЕРДИКТ сторожа, а не успешность возврата. Поэтому
+# в выборку входят обе отметки:
+#   rolled_back_at     — линия пробита, изменение отменено;
+#   harmful_verdict_at — линия пробита, откатить не удалось (Id неизвестен,
+#                        рельсы отклонили, кабинет не ответил). Изменение
+#                        снято с наблюдения и ждёт человека — но сегмент от
+#                        этого не стал безопасным, и трогать его снова
+#                        планировщику нельзя тем более.
+# GREATEST в Postgres игнорирует NULL и возвращает NULL только когда NULL все
+# аргументы, а NULL > interval даёт NULL — то есть строки без обеих отметок
+# отсекаются самим сравнением, отдельного IS NOT NULL не нужно.
+HARMFUL_SEGMENTS_SQL = """
     SELECT account,
            object_id,
            COALESCE(direct_type, payload->>'Type') AS direct_type,
            COALESCE(setting_key, payload->>'key')  AS setting_key,
-           MAX(rolled_back_at)                     AS last_rolled_back_at
+           MAX(GREATEST(rolled_back_at, harmful_verdict_at)) AS last_harmful_at
     FROM edu_agent_actions
-    WHERE rolled_back_at IS NOT NULL
-      AND rolled_back_at > now() - make_interval(days => %s)
+    WHERE GREATEST(rolled_back_at, harmful_verdict_at) > now() - make_interval(days => %s)
       AND (%s IS NULL OR account = %s)
       AND COALESCE(direct_type, payload->>'Type') IS NOT NULL
       AND COALESCE(setting_key, payload->>'key') IS NOT NULL
@@ -538,19 +672,19 @@ ROLLED_BACK_SEGMENTS_SQL = """
 """
 
 
-def rolled_back_segments(
+def harmful_segments(
     cooldown_days: int, account: Optional[str] = None
 ) -> Dict[Tuple[str, str, str], Any]:
-    """Сегменты кампаний, откатанные за последние cooldown_days.
+    """Сегменты кампаний, признанные вредными за последние cooldown_days.
 
     Ключ — (object_id, direct_type, setting_key), значение — момент последнего
-    отката. Кабинет в ключ не входит: выборка уже ограничена одним кабинетом,
-    а идентификаторы кампаний между кабинетами не пересекаются.
+    вердикта. Кабинет в ключ не входит: выборка уже ограничена одним
+    кабинетом, а идентификаторы кампаний между кабинетами не пересекаются.
     """
-    rows = _fetch(ROLLED_BACK_SEGMENTS_SQL, (int(cooldown_days), account, account))
+    rows = _fetch(HARMFUL_SEGMENTS_SQL, (int(cooldown_days), account, account))
     return {
         (str(r["object_id"]), str(r["direct_type"]), str(r["setting_key"])):
-            r["last_rolled_back_at"]
+            r["last_harmful_at"]
         for r in rows
     }
 
@@ -604,18 +738,93 @@ ACQUIRE_RUN_LOCK_SQL = """
 """
 
 
+# Продление аренды. Условие «мы всё ещё владелец И аренда не протухла» — то
+# же самое, по которому её мог бы перехватить чужой прогон: пустой ответ
+# означает «аренда уже не наша», и продлевать её нельзя ни в коем случае —
+# иначе прогон отобрал бы у живого владельца то, что тот успел взять.
+RENEW_RUN_LOCK_SQL = """
+    UPDATE edu_agent_run_lock
+       SET expires_at = now() + make_interval(mins => %(ttl)s)
+     WHERE lock_name = %(name)s
+       AND holder    = %(holder)s
+       AND expires_at > now()
+    RETURNING expires_at
+"""
+
+
 class RunLockBusy(RuntimeError):
     """Прогон уже идёт. Второй одновременный прогон на том же ключе создал бы
     в кабинете второй объект, а Id первого потерялся бы навсегда."""
+
+
+class RunLeaseLost(RuntimeError):
+    """Аренда прогона перестала быть нашей.
+
+    Значит, её мог взять другой прогон, и с этого момента в кабинете возможны
+    два одновременных пишущих процесса. Единственное безопасное поведение —
+    немедленно прекратить запись; сделанное остаётся в журнале, недоделанное
+    доедет следующим прогоном.
+    """
 
 
 def _lock_holder() -> str:
     return f"{uuid.uuid4().hex[:12]}@{socket.gethostname()}:{os.getpid()}"
 
 
+class RunLease:
+    """Аренда прогона, которую можно продлить и перепроверить.
+
+    Зачем этого мало — «взяли аренду на час в начале прогона»: срок аренды
+    фиксирован, а длительность прогона нет. Сотни кампаний, чтение состояния
+    по каждой, таймаут запроса в две минуты — прогон легко живёт дольше часа,
+    и тогда его аренда протухает НА ХОДУ. Следующий по расписанию прогон видит
+    свободный ключ, стартует штатно, и оба шлют bidmodifiers.add по одной
+    кампании: в кабинете два объекта, Id первого не знает никто. Это ровно тот
+    сценарий, от которого аренда и заводилась.
+
+    Защита обязана не зависеть от того, уложился ли прогон в срок, поэтому её
+    две половины:
+      * продление (renew) — пока прогон жив и работает, аренда не протухает, и
+        второй прогон просто не стартует;
+      * перепроверка владения перед КАЖДЫМ изменяющим запросом (guard) — если
+        аренда всё-таки потеряна (пауза процесса, недоступность БД, ручное
+        снятие), прогон узнаёт об этом ДО отправки, а не после.
+    Первая половина закрывает штатный случай, вторая — всё остальное.
+    Обе — один и тот же UPDATE, поэтому продление и есть перепроверка: пустой
+    ответ означает, что аренда уже не наша.
+    """
+
+    def __init__(self, conn, name: str, holder: str, ttl_minutes: int):
+        self._conn = conn
+        self.name = name
+        self.holder = holder
+        self.ttl_minutes = int(ttl_minutes)
+
+    def renew(self) -> bool:
+        """Продлевает аренду. False — аренда больше не наша."""
+        with self._conn.cursor() as cur:
+            cur.execute(RENEW_RUN_LOCK_SQL, {"name": self.name, "holder": self.holder,
+                                             "ttl": self.ttl_minutes})
+            alive = cur.fetchone() is not None
+        self._conn.commit()
+        return alive
+
+    def guard(self) -> None:
+        """Проверка владения перед изменяющим запросом. Не наша — RunLeaseLost."""
+        if not self.renew():
+            raise RunLeaseLost(
+                f"аренда прогона {self.name} потеряна (держатель {self.holder}): "
+                f"параллельный прогон мог начать писать в тот же кабинет — "
+                f"запись прекращена"
+            )
+
+
 @contextmanager
 def run_lock(name: str, ttl_minutes: int = RUN_LOCK_TTL_MINUTES):
     """Аренда на прогон. RunLockBusy — если прогон уже идёт.
+
+    Отдаёт RunLease: аренду мало взять, её надо продлевать по ходу прогона и
+    перепроверять перед каждым изменяющим запросом (см. RunLease).
 
     Соединение держится на всё тело блока, но сама аренда живёт в таблице:
     так она переживает пулер (сессионная advisory-блокировка через
@@ -637,7 +846,7 @@ def run_lock(name: str, ttl_minutes: int = RUN_LOCK_TTL_MINUTES):
                 f"два прогона на одном ключе создают в кабинете два объекта"
             )
         try:
-            yield holder
+            yield RunLease(conn, name, holder, int(ttl_minutes))
         finally:
             # Снимает аренду ТОЛЬКО её владелец: если аренда успела протухнуть
             # и её перехватил другой прогон, снимать чужую нельзя.

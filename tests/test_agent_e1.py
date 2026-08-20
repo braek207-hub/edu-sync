@@ -12,6 +12,7 @@ find_action_by_key/insert_action/mark_action) — без сети и без БД
 """
 
 import json
+import sys
 from contextlib import contextmanager
 from datetime import date, timedelta
 
@@ -20,20 +21,45 @@ import pytest
 import sync.agent_e1 as agent_e1
 
 
-@contextmanager
-def _no_lock(*a, **k):
+class _FakeLease:
+    """Аренда прогона без БД: считает перепроверки и умеет «потеряться».
+
+    lost=True — аренду перехватил другой прогон: guard обязан уронить
+    прогон, а не дать ему дописать изменения в кабинет, куда уже пишет
+    второй процесс.
+    """
+
+    def __init__(self, lost=False):
+        self.holder = "test-holder"
+        self.lost = lost
+        self.guards = 0
+
+    def renew(self):
+        return not self.lost
+
+    def guard(self):
+        self.guards += 1
+        if self.lost:
+            raise agent_e1.writer_db.RunLeaseLost("аренда потеряна")
+
+
+def _no_lock(lease=None):
     """Аренда на прогон в тестах не берётся — она требует БД."""
-    yield "test-holder"
+    @contextmanager
+    def _cm(*a, **k):
+        yield lease if lease is not None else _FakeLease()
+    return _cm
 
 
-def _patch_infra(monkeypatch, cooled=None, final_keys=()):
+def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None):
     """Общая подмена того, что прогон спрашивает у журнала помимо действий:
-    аренда на прогон, история откатов, уже закрытые ключи."""
-    monkeypatch.setattr(agent_e1.writer_db, "run_lock", _no_lock)
-    monkeypatch.setattr(agent_e1.writer_db, "rolled_back_segments",
+    аренда на прогон, история вредных сегментов, уже закрытые ключи."""
+    monkeypatch.setattr(agent_e1.writer_db, "run_lock", _no_lock(lease))
+    monkeypatch.setattr(agent_e1.writer_db, "harmful_segments",
                         lambda *a, **k: dict(cooled or {}))
     monkeypatch.setattr(agent_e1.writer_db, "final_status_keys",
                         lambda keys: set(final_keys))
+    monkeypatch.setattr(agent_e1.writer_db, "purge_dry_run_actions", lambda *a, **k: 0)
 
 
 class _FakeCampaignsClient:
@@ -414,7 +440,13 @@ def _reports(capsys):
 
 
 def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
-               baseline_cpa=None, stale=(), journal=None, cooled=None, final_keys=()):
+               baseline_cpa=None, stale=(), journal=None, cooled=None, final_keys=(),
+               lease=None, prod_apply=False):
+    # prod_apply — боевой режим (--prod --apply). Нужен там, где проверяется
+    # изменение состояния журнала: по общему правилу движка
+    # (writer/client.py::journal_writes_allowed) репетиция журнал не трогает.
+    if prod_apply:
+        monkeypatch.setattr(sys, "argv", ["agent_e1", "--prod", "--apply"])
     _MultiCabinetClient.instances = []
     _MultiCabinetClient.campaigns_by_login = campaigns_by_login
     logins = list(computed_by_login.keys())
@@ -443,7 +475,7 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
     monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1.writer_db, "mark_unknown_outcome", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1, "WriteClient", _MultiCabinetClient)
-    _patch_infra(monkeypatch, cooled=cooled, final_keys=final_keys)
+    _patch_infra(monkeypatch, cooled=cooled, final_keys=final_keys, lease=lease)
     return rows
 
 
@@ -645,6 +677,7 @@ def test_stuck_planned_rows_are_reported(monkeypatch, capsys):
         campaigns_by_login={"acc-1": [111]},
         daily_cost={"111": 10.0},
         stale=stuck,
+        prod_apply=True,
     )
 
     assert agent_e1.main() == 0
@@ -666,6 +699,7 @@ def test_stuck_rows_are_asked_per_cabinet(monkeypatch, capsys):
                            "acc-2": []},
         campaigns_by_login={"acc-1": [111], "acc-2": [222]},
         daily_cost={"111": 10.0, "222": 10.0},
+        prod_apply=True,
     )
     monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned",
                         lambda minutes, account=None: calls.append((minutes, account)) or [])
@@ -689,6 +723,7 @@ def test_stuck_rows_are_marked_not_only_printed(monkeypatch, capsys):
         computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
         campaigns_by_login={"acc-1": [111]},
         daily_cost={"111": 10.0},
+        prod_apply=True,
     )
     marked, read_only = [], []
     monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned",
@@ -982,3 +1017,161 @@ def test_failure_on_one_cabinet_does_not_block_the_others(monkeypatch, capsys):
     assert by_account["acc-2"]["result"]["dry_run"] == 1, "второй кабинет обработан"
     assert reports[-1]["verdict"] == "PARTIAL_FAILURE"
     assert reports[-1]["failed_accounts"][0]["account"] == "acc-1"
+
+
+# =========================================================================
+# Дефект 5: аренда прогона живёт дольше часа только если её продлевать
+# =========================================================================
+
+
+def test_run_renews_the_lease_while_reading_campaign_state(monkeypatch, capsys):
+    # Аренду берут на час, а прогон читает состояние по каждой кампании — с
+    # ретраями и таймаутом в две минуты на запрос. Сотни кампаний легко
+    # переживают срок аренды, и тогда второй прогон стартует штатно: оба шлют
+    # bidmodifiers.add по одной кампании, второй объект в кабинете, Id первого
+    # не знает никто.
+    lease = _FakeLease()
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111, 222, 333]},
+        daily_cost={"111": 10.0, "222": 10.0, "333": 10.0},
+        lease=lease,
+    )
+    # Считаем перепроверки, увиденные ИМЕННО на чтении состояния кампаний:
+    # проверок на отправке недостаточно — до отправки прогон успевает
+    # прожить всё самое долгое время.
+    seen_on_read = []
+    real_actual = agent_e1._actual_modifiers
+    monkeypatch.setattr(
+        agent_e1, "_actual_modifiers",
+        lambda client, campaign_id: (seen_on_read.append(lease.guards),
+                                     real_actual(client, campaign_id))[1],
+    )
+
+    assert agent_e1.main() == 0
+    capsys.readouterr()
+
+    assert seen_on_read == [1, 2, 3], "аренда продлевается на каждой кампании"
+
+
+def test_lost_lease_aborts_the_whole_run_not_just_one_cabinet(monkeypatch, capsys):
+    # Потеря аренды означает, что в кабинет уже может писать второй прогон.
+    # Это не отказ одного кабинета: следующий кабинет писать тем более не
+    # вправе, и прогон обязан оборваться с явным вердиктом.
+    lease = _FakeLease(lost=True)
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)],
+                           "acc-2": [_setting("bid_modifier:device", "MOBILE", -20)]},
+        campaigns_by_login={"acc-1": [111], "acc-2": [222]},
+        daily_cost={"111": 10.0, "222": 10.0},
+        lease=lease,
+    )
+
+    assert agent_e1.main() == 1
+
+    out = capsys.readouterr().out
+    assert "RUN_LEASE_LOST" in out
+    assert "PARTIAL_FAILURE" not in out, "потеря аренды — не отказ отдельного кабинета"
+    assert all(c.sent == [] for c in _MultiCabinetClient.instances)
+
+
+# =========================================================================
+# Мелкое: репетиция не меняет журнал, а её собственные строки не вечны
+# =========================================================================
+
+
+def test_rehearsal_does_not_mark_stuck_rows_in_the_journal(monkeypatch, capsys):
+    # Правило журнала одно на оба рабочих процесса: сторож в репетиции журнал
+    # не трогает, и прямое применение тоже. Пометка 'stale' закрывает строку
+    # от повторной отправки И списывает за неё риск-бюджет — репетиция делала
+    # это, ничего никуда не отправив.
+    called = []
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+    )
+    monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned",
+                        lambda *a, **k: called.append(1) or [])
+
+    assert agent_e1.main() == 0
+
+    assert called == []
+    report = _reports(capsys)[0]
+    # Молчать об этом нельзя: «ноль зависших строк» и «мы их не искали» —
+    # разные состояния.
+    assert report["stale_planned"]["journal_written"] is False
+    assert report["stale_planned"]["skipped_reason"] == agent_e1.REHEARSAL_STALE_REASON
+
+
+def test_prod_apply_still_marks_stuck_rows(monkeypatch, capsys):
+    # Обратная половина правила: боевая запись помечать обязана, иначе
+    # зависшая строка снова стала бы вечным шумом в отчёте.
+    called = []
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+        prod_apply=True,
+    )
+    monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned",
+                        lambda *a, **k: called.append(1) or [])
+
+    assert agent_e1.main() == 0
+
+    assert called == [1]
+    assert _reports(capsys)[0]["stale_planned"]["journal_written"] is True
+
+
+def test_run_purges_old_rehearsal_rows(monkeypatch, capsys):
+    # У строк репетиции не было судьбы вообще: статус не финальный и не живой,
+    # ни один механизм журнала их не закрывает — они копились вечно.
+    purged = []
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+    )
+    monkeypatch.setattr(agent_e1.writer_db, "purge_dry_run_actions",
+                        lambda days: purged.append(days) or 3)
+
+    assert agent_e1.main() == 0
+
+    assert purged == [agent_e1.writer_db.DRY_RUN_RETENTION_DAYS]
+    maintenance = [r for r in _reports(capsys) if r.get("verdict") == "JOURNAL_MAINTENANCE"]
+    assert maintenance and maintenance[0]["dry_run_rows_purged"] == 3
+
+
+# =========================================================================
+# Дефект 3: кулдаун обязан включать неоткатанный пробой
+# =========================================================================
+
+
+def test_cooldown_is_asked_about_harmful_segments_not_only_rolled_back(monkeypatch,
+                                                                       capsys):
+    # Планировщик спрашивает журнал о ВРЕДНЫХ сегментах: и откатанных, и тех,
+    # чей откат не удался. Отдельного вопроса «что откатано» больше нет.
+    asked = []
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+    )
+    monkeypatch.setattr(
+        agent_e1.writer_db, "harmful_segments",
+        lambda days, account=None: asked.append((days, account)) or {
+            ("111", "DESKTOP_ADJUSTMENT", "DESKTOP"): "2026-08-19T10:00:00+00:00"},
+    )
+
+    assert agent_e1.main() == 0
+
+    assert asked == [(agent_e1.COOLDOWN_AFTER_ROLLBACK_DAYS, "acc-1")]
+    report = _reports(capsys)[0]
+    assert report["blocked_by_cooldown"]["count"] == 1
+    assert _MultiCabinetClient.instances[0].sent == []

@@ -84,7 +84,74 @@ def test_retryable_status_on_last_attempt_raises_not_empty_result(monkeypatch):
     with pytest.raises(DirectWriteError):
         client.mutate("bidmodifiers", "add", {"x": 1})
 
-    assert len(calls) == 4  # retries по умолчанию, ни одна попытка не "успешна"
+    assert calls  # пустой результат вместо ошибки не возвращается
+
+
+# ================== повтор — только для чтения (дефект 1)
+# Транспорт переотправлял ОДНО И ТО ЖЕ тело до четырёх раз при недоступности
+# сервиса, одинаково для чтения и для записи. У bidmodifiers.add нет ключа
+# идемпотентности на стороне Директа, и 5xx может прийти уже ПОСЛЕ применения:
+# одна сетевая икота давала в кабинете до четырёх корректировок вместо одной,
+# и три из них — без строки журнала, без красной линии и без возможности
+# отката (Id сохраняется только у последнего ответа).
+
+
+def test_mutating_request_is_sent_exactly_once_on_unavailable_service(monkeypatch):
+    calls = []
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        calls.append(url)
+        return _FakeResponse(503, json_body={}, text="service unavailable")
+
+    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    monkeypatch.setattr(client_module.time, "sleep", lambda seconds: None)
+
+    client = WriteClient("login-1", dry_run=False, token="t")
+    with pytest.raises(DirectWriteError) as excinfo:
+        client.mutate("bidmodifiers", "add", {"x": 1})
+
+    assert len(calls) == 1, "изменяющий запрос не переотправляется"
+    # И исход при этом честно неизвестен: строка уходит под наблюдение
+    # сторожа, а не переприменяется как «не ушло».
+    assert excinfo.value.outcome_unknown is True
+    assert is_outcome_unknown(excinfo.value) is True
+
+
+def test_read_is_still_retried_on_unavailable_service(monkeypatch):
+    # Обратная половина правила: чтение идемпотентно, повтор ему нужен и
+    # полезен — сорванное чтение состояния кабинета останавливает весь прогон.
+    calls = []
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        calls.append(url)
+        return _FakeResponse(503, json_body={}, text="service unavailable")
+
+    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    monkeypatch.setattr(client_module.time, "sleep", lambda seconds: None)
+
+    client = WriteClient("login-1", dry_run=False, token="t")
+    with pytest.raises(DirectWriteError):
+        client.get("campaigns", {"x": 1})
+
+    assert client_module.READ_RETRIES > 1
+    assert len(calls) == client_module.READ_RETRIES
+
+
+def test_call_refuses_retries_for_a_mutating_method(monkeypatch):
+    # Страховка от будущего вызывающего кода: повторять можно только чтение,
+    # и проверка идёт по МЕТОДУ, а не по флагу вызывающего.
+    def fake_post(url, data=None, headers=None, timeout=None):  # pragma: no cover
+        raise AssertionError("запрос не должен уйти вовсе")
+
+    monkeypatch.setattr(client_module.requests, "post", fake_post)
+
+    client = WriteClient("login-1", dry_run=False, token="t")
+    with pytest.raises(ValueError):
+        client._call("bidmodifiers", "add", {"x": 1}, retries=4)
+
+
+def test_write_attempts_constant_is_a_single_attempt():
+    assert client_module.WRITE_ATTEMPTS == 1
 
 
 def test_retryable_status_error_carries_status_code(monkeypatch):
@@ -161,3 +228,23 @@ def test_missing_token_is_not_outcome_unknown():
         client.mutate("bidmodifiers", "add", {"x": 1})
 
     assert excinfo.value.outcome_unknown is False
+
+
+# ============================ одно правило журнала на оба рабочих процесса
+# Сторож в репетиции журнал не трогал сознательно, а прогон применения ровно
+# в той же репетиции переводил зависшие строки в 'stale' — то есть закрывал
+# их от повторной отправки и списывал за них риск-бюджет, ничего не отправив.
+
+
+def test_journal_writes_only_in_prod_apply():
+    from sync.agent.writer.client import journal_allowed, journal_writes_allowed
+
+    assert journal_writes_allowed(sandbox=False, dry_run=False) is True
+    assert journal_writes_allowed(sandbox=False, dry_run=True) is False   # репетиция
+    assert journal_writes_allowed(sandbox=True, dry_run=False) is False   # песочница
+    assert journal_writes_allowed(sandbox=True, dry_run=True) is False
+
+    # И то же правило по клиенту — им пользуется сторож.
+    assert journal_allowed(WriteClient("l", sandbox=False, dry_run=False)) is True
+    assert journal_allowed(WriteClient("l", sandbox=False, dry_run=True)) is False
+    assert journal_allowed(WriteClient("l", sandbox=True, dry_run=False)) is False

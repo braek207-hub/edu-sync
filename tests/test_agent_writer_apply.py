@@ -579,3 +579,92 @@ def test_live_stale_action_is_not_sent_again():
         assert _live_row(key)["previous_state"] == {"Id": 7, "percent": 10}
     finally:
         _live_cleanup(key)
+
+
+# =========================================================================
+# Дефект 5: аренда прогона перепроверяется перед КАЖДЫМ изменяющим запросом
+# =========================================================================
+#
+# Аренду берут на час, а прогон по сотням кампаний живёт дольше. Протухшая на
+# ходу аренда пускает второй прогон, и оба шлют bidmodifiers.add по одной
+# кампании — второй объект в кабинете, Id первого не знает никто. Поэтому
+# владение подтверждается прямо перед отправкой, а не только на старте.
+
+
+class _FakeLease:
+    def __init__(self, lost_after=None):
+        self.guards = 0
+        self.lost_after = lost_after
+
+    def guard(self):
+        self.guards += 1
+        if self.lost_after is not None and self.guards > self.lost_after:
+            raise writer_db.RunLeaseLost("аренда потеряна")
+
+
+def test_apply_actions_checks_the_lease_before_every_send():
+    db = _FakeDB()
+    client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+    lease = _FakeLease()
+
+    apply_actions(client, [_action("k1"), _action("k2")], db, lease=lease)
+
+    assert lease.guards == 2
+    assert len(client.calls) == 2
+
+
+def test_lost_lease_stops_the_run_instead_of_writing_further():
+    # Потеря аренды — не ошибка одного действия: в кабинет уже может писать
+    # второй прогон. Исключение обязано выйти наружу, а не превратиться в
+    # 'failed' у одного действия и продолжение у остальных.
+    db = _FakeDB()
+    client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+    lease = _FakeLease(lost_after=1)
+
+    with pytest.raises(writer_db.RunLeaseLost):
+        apply_actions(client, [_action("k1"), _action("k2")], db, lease=lease)
+
+    assert len(client.calls) == 1, "после потери аренды запросы не уходят"
+    assert "insert:k2" not in db.events
+
+
+def test_lease_is_checked_before_the_journal_row_is_written():
+    order = []
+
+    class _OrderedDB(_FakeDB):
+        def insert_action(self, row):
+            order.append("insert")
+            return super().insert_action(row)
+
+    class _OrderedLease(_FakeLease):
+        def guard(self):
+            order.append("guard")
+            super().guard()
+
+    apply_actions(_FakeClient(response={"SetResults": [{"Id": 7}]}),
+                  [_action()], _OrderedDB(), lease=_OrderedLease())
+
+    assert order == ["guard", "insert"]
+
+
+def test_apply_actions_works_without_a_lease():
+    # Вызывающий код без аренды (разовый разбор, тесты) остаётся рабочим.
+    report = apply_actions(_FakeClient(response={"SetResults": [{"Id": 7}]}),
+                           [_action()], _FakeDB())
+    assert report["applied"] == 1
+
+
+# ============================ докстринг применения сходится с машиной статусов
+
+
+def test_apply_docstring_lists_every_status_of_the_machine():
+    # Докстринг обещал «один из четырёх», перечислял пять, а в машине журнала
+    # их семь. Отчёт по нему читают глазами перед включением боевой записи —
+    # расхождение здесь дороже, чем кажется.
+    doc = apply_actions.__doc__
+    machine = {"planned", "dry_run", "applied", "rejected", "failed", "stale",
+               "rolled_back"}
+    for status in machine:
+        assert "'%s'" % status in doc, status
+    assert "семь" in doc
+    assert "один из четырёх" not in doc

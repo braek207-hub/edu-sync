@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Set, Tuple
 from sync.agent import db as agent_db
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import apply_actions
-from sync.agent.writer.client import WriteClient
+from sync.agent.writer.client import WriteClient, journal_writes_allowed
 from sync.agent.writer.diff import diff_modifiers
 from sync.agent.writer.guardrails import (
     MAX_ACTIONS_PER_RUN,
@@ -94,7 +94,22 @@ NO_COMPUTED_REASON = (
 # дальше строка живёт как непроверенное изменение — видна сторожу отката
 # (open_actions), оплачена риск-бюджетом (spent_risk) и защищена от повторной
 # отправки. Печать без последствий оставляла её вечным шумом в каждом отчёте.
+#
+# Но пометка — это изменение состояния БОЕВОГО журнала, и делать его от имени
+# репетиции нельзя: 'stale' входит и в FINAL_STATUSES, и в LIVE_STATUSES, то
+# есть репетиция закрывала строку от повторной отправки и списывала за неё
+# риск-бюджет, ничего никуда не отправив. Сторож в репетиции журнал не трогает
+# сознательно (writer/client.py::journal_writes_allowed) — правило на журнал
+# одно, и прямое применение подчиняется ему так же.
 STALE_PLANNED_MINUTES = 60
+
+# Почему в репетиции зависшие строки не помечены. В отчёте это обязано быть
+# видно: «ноль находок» и «не искали» — разные состояния.
+REHEARSAL_STALE_REASON = (
+    "репетиция журнал не меняет: пометка 'stale' закрывает строку от повторной "
+    "отправки и списывает за неё риск-бюджет — это утверждение о боевом "
+    "кабинете, и делать его вправе только боевая запись (--prod --apply)"
+)
 
 # Сколько дней после отката сегмент кампании не трогаем.
 #
@@ -121,10 +136,16 @@ STALE_PLANNED_MINUTES = 60
 #     изменением, ради отмены которого откат и делался.
 COOLDOWN_AFTER_ROLLBACK_DAYS = 60
 
+# Кулдаун считается по ВЕРДИКТУ сторожа, а не по успешности возврата: пробитая
+# красная линия делает сегмент вредным независимо от того, удалось ли откатить
+# изменение. Неоткатанный пробой — случай ХУДШИЙ, а не лучший: изменение всё
+# ещё живёт в кабинете, и добавлять к нему второе по тому же сегменту нельзя
+# тем более.
 COOLDOWN_REASON = (
-    "сегмент откатан за последние {days} дн.: повтор запрещён до конца кулдауна "
-    "(проверка по объекту и сегменту, а не по проценту — процент дрейфует между "
-    "расчётами и обходил бы идемпотентность)"
+    "сегмент признан вредным за последние {days} дн. (красная линия пробита; "
+    "откат при этом мог и не удаться): повтор запрещён до конца кулдауна — "
+    "проверка по объекту и сегменту, а не по проценту, потому что процент "
+    "дрейфует между расчётами и обходил бы идемпотентность"
 )
 
 # Причина отказа для действия, чей ключ уже закрыт финальным статусом.
@@ -386,20 +407,38 @@ def actions_preview(
     }
 
 
-def _stale_report(rows: List[Dict[str, Any]], limit: int = PREVIEW_SAMPLE_LIMIT) -> Dict[str, Any]:
+def mark_stale_rows(login: str, journal_ok: bool) -> List[Dict[str, Any]]:
+    """Помечает зависшие строки кабинета — или не трогает журнал в репетиции.
+
+    Единственная точка, где прогон решает, менять ли состояние журнала:
+    правило (journal_writes_allowed) общее со сторожем, и разъехаться им
+    больше негде.
+    """
+    if not journal_ok:
+        return []
+    return writer_db.mark_stale_planned(STALE_PLANNED_MINUTES, account=login)
+
+
+def _stale_report(rows: List[Dict[str, Any]], journal_ok: bool = True,
+                  limit: int = PREVIEW_SAMPLE_LIMIT) -> Dict[str, Any]:
     """Зависшие строки для отчёта: сколько, какие, с какого времени.
 
     Здесь только ВПЕРВЫЕ обнаруженные — те, что этот прогон перевёл в статус
     'stale'. Уже помеченные не возвращаются mark_stale_planned и в отчёте не
     повторяются: отчёт читается глазами перед решением включать боевую
     запись, и вечная неизменная строка в нём быстро перестаёт читаться.
+
+    В репетиции журнал не трогается вовсе, и отчёт говорит об этом прямо:
+    иначе «ноль зависших строк» неотличимо от «мы их не искали».
     """
     return {
         "count": len(rows),
         "older_than_minutes": STALE_PLANNED_MINUTES,
         # Статус, в который прогон перевёл эти строки, — чтобы из отчёта было
         # видно, что с находкой что-то произошло, а не только напечаталось.
-        "marked_status": "stale",
+        "marked_status": "stale" if journal_ok else None,
+        "journal_written": bool(journal_ok),
+        "skipped_reason": None if journal_ok else REHEARSAL_STALE_REASON,
         "sample": [
             {"action_id": r.get("action_id"), "object_id": r.get("object_id"),
              "action_kind": r.get("action_kind"), "created_at": str(r.get("created_at"))}
@@ -423,7 +462,11 @@ def split_by_cooldown(
     actions: List[Dict[str, Any]], cooled: Dict[Tuple[str, str, str], Any],
     cooldown_days: int = COOLDOWN_AFTER_ROLLBACK_DAYS,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Делит действия на разрешённые и запертые кулдауном после отката."""
+    """Делит действия на разрешённые и запертые кулдауном.
+
+    cooled — сегменты с вердиктом «вредно» (writer_db.harmful_segments):
+    и откатанные, и те, чей откат не удался.
+    """
     allowed: List[Dict[str, Any]] = []
     blocked: List[Dict[str, Any]] = []
     reason = COOLDOWN_REASON.format(days=cooldown_days)
@@ -433,7 +476,7 @@ def split_by_cooldown(
             allowed.append(action)
         else:
             blocked.append({**action, "blocked_reason": reason,
-                            "last_rolled_back_at": str(last)})
+                            "last_harmful_at": str(last)})
     return allowed, blocked
 
 
@@ -562,6 +605,14 @@ def run_account(
     holdout_ids = ctx["holdout_ids"]
     charged_objects = ctx["charged_objects"]
     wk = ctx["week_start"]
+    lease = ctx.get("lease")
+
+    # Клиент создаётся ДО первого решения о журнале: конструктор в сеть не
+    # ходит (токен резолвится лениво), зато режим прогона дальше берётся из
+    # одного места.
+    client = WriteClient(login, sandbox=sandbox, dry_run=dry_run)
+    # Право менять состояние журнала — по тому же правилу, что у сторожа.
+    journal_ok = journal_writes_allowed(sandbox, dry_run)
 
     # Настройки — этого кабинета, а не общий набор на всех: числа посчитаны
     # по его аудитории и применимы только к его кампаниям.
@@ -592,11 +643,9 @@ def run_account(
             "computed_settings": len(computed),
             "computed_age_days": computed_age_days(computed, date.fromisoformat(today)),
             "unsupported": unsupported,
-            "stale_planned": _stale_report(
-                writer_db.mark_stale_planned(STALE_PLANNED_MINUTES, account=login)),
+            "stale_planned": _stale_report(mark_stale_rows(login, journal_ok),
+                                           journal_ok),
         }
-
-    client = WriteClient(login, sandbox=sandbox, dry_run=dry_run)
 
     # Рулинг 1: кампании только этого кабинета, не всего справочника расходов.
     campaign_ids = own_campaign_ids(client, daily_cost)
@@ -606,6 +655,12 @@ def run_account(
     unusable_actual = 0
 
     for campaign_id in campaign_ids:
+        # Самая длинная часть прогона: чтение состояния по каждой кампании, с
+        # ретраями и таймаутом в две минуты на запрос. Именно здесь прогон
+        # переживает срок аренды — поэтому аренда продлевается на каждом шаге
+        # цикла, а не только берётся в начале.
+        if lease is not None:
+            lease.guard()
         actual = _actual_modifiers(client, campaign_id)
         unusable_actual += sum(1 for a in actual if a.get("unusable"))
         for action in diff_modifiers(desired, actual, campaign_id):
@@ -621,7 +676,7 @@ def run_account(
     # Обратная связь от отката к планированию. Стоит ДО отбора по лимиту:
     # отсечённое здесь не занимает слотов прогона. Тот же довод — у отсева
     # уже закрытых ключей ниже.
-    cooled = writer_db.rolled_back_segments(COOLDOWN_AFTER_ROLLBACK_DAYS, account=login)
+    cooled = writer_db.harmful_segments(COOLDOWN_AFTER_ROLLBACK_DAYS, account=login)
     allowed, in_cooldown = split_by_cooldown(allowed, cooled)
     blocked += in_cooldown
 
@@ -659,8 +714,8 @@ def run_account(
     prepared, deferred = fit_into_budget(with_red_line, risks, remaining, charged_objects)
     ctx["remaining_cap"] -= len(prepared)
 
-    stale = writer_db.mark_stale_planned(STALE_PLANNED_MINUTES, account=login)
-    report = apply_actions(client, prepared, writer_db)
+    stale = mark_stale_rows(login, journal_ok)
+    report = apply_actions(client, prepared, writer_db, lease=lease)
 
     return {
         "account": login,
@@ -706,7 +761,7 @@ def run_account(
         # Состав того, что уходит (или ушло бы) в кабинет. В режиме
         # репетиции это единственное место, где он вообще виден.
         "prepared": actions_preview(prepared),
-        "stale_planned": _stale_report(stale),
+        "stale_planned": _stale_report(stale, journal_ok),
         "result": {k: v for k, v in report.items() if k != "details"},
         "units_left": client.units_left,
     }
@@ -729,17 +784,29 @@ def main() -> int:
     # кабинете ДВА объекта: оба читают факт до записи, оба видят, что
     # корректировки нет, оба шлют bidmodifiers.add — и Id первого теряется
     # навсегда, без строки журнала, без красной линии и без возможности отката.
+    #
+    # Аренды мало ВЗЯТЬ: её срок — час, а прогон по сотням кампаний живёт
+    # дольше, и протухшая на ходу аренда пускает следующий прогон штатно.
+    # Поэтому аренда продлевается по ходу прогона и перепроверяется перед
+    # каждым изменяющим запросом (writer/db.py::RunLease).
     try:
-        with writer_db.run_lock("agent_e1"):
-            return _run_all(clients, sandbox, dry_run, today)
+        with writer_db.run_lock("agent_e1") as lease:
+            return _run_all(clients, sandbox, dry_run, today, lease)
     except writer_db.RunLockBusy as exc:
         print(json.dumps({"verdict": "RUN_LOCKED", "reason": str(exc)},
+                         ensure_ascii=False, indent=2))
+        return 1
+    except writer_db.RunLeaseLost as exc:
+        # Аренда потеряна на ходу: с этого момента в кабинет мог начать писать
+        # второй прогон. Прогон оборван намеренно — это не сбой одного
+        # кабинета, а условие, при котором писать нельзя вообще.
+        print(json.dumps({"verdict": "RUN_LEASE_LOST", "reason": str(exc)},
                          ensure_ascii=False, indent=2))
         return 1
 
 
 def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
-             today: str) -> int:
+             today: str, lease: Any = None) -> int:
 
     holdout_ids = set(agent_db.load_holdout_ids())
     cutoff = (date.today() - timedelta(days=30)).isoformat()
@@ -771,7 +838,20 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "charged_objects": charged_objects,
         "week_start": wk,
         "remaining_cap": remaining_cap,
+        "lease": lease,
     }
+
+    # Уборка собственных строк репетиции: у них нет ни финального, ни живого
+    # статуса, то есть ни один механизм журнала их не закрывает, — без срока
+    # хранения они копятся вечно. За ними ничего не стоит: mutate в репетиции
+    # в кабинет не уходил.
+    purged = writer_db.purge_dry_run_actions(writer_db.DRY_RUN_RETENTION_DAYS)
+    if purged:
+        print(json.dumps({
+            "verdict": "JOURNAL_MAINTENANCE",
+            "dry_run_rows_purged": purged,
+            "retention_days": writer_db.DRY_RUN_RETENTION_DAYS,
+        }, ensure_ascii=False, indent=2))
 
     failed_accounts: List[Dict[str, Any]] = []
     for client_info in clients:
@@ -785,6 +865,11 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         # пропуск кабинета их не ломает.
         try:
             report = run_account(login, sandbox, dry_run, today, ctx)
+        except writer_db.RunLeaseLost:
+            # Единственное исключение, которое НЕ локализуется кабинетом:
+            # аренду потерял весь прогон, и следующий кабинет писать тем более
+            # не вправе.
+            raise
         except Exception as exc:
             report = {
                 "account": login,

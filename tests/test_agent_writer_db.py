@@ -472,16 +472,114 @@ def test_unknown_outcome_status_is_live_and_final():
 # ==================================================== обратная связь от отката
 
 
-def test_rolled_back_segments_sql_groups_by_object_and_segment():
-    sql = " ".join(writer_db.ROLLED_BACK_SEGMENTS_SQL.split())
+def test_harmful_segments_sql_groups_by_object_and_segment():
+    sql = " ".join(writer_db.HARMFUL_SEGMENTS_SQL.split())
     # Ключ истории — объект и сегмент. Процента в группировке нет и быть не
     # может: он дрейфует между расчётами и обходил бы кулдаун.
     assert "GROUP BY 1, 2, 3, 4" in sql
     assert "percent" not in sql
-    assert "rolled_back_at IS NOT NULL" in sql
     assert "make_interval(days => %s)" in sql
     # Строки старого формата: сегмент достаётся из payload, пока колонок не было.
     assert "COALESCE(direct_type, payload->>'Type')" in sql
+
+
+def test_cooldown_covers_breach_without_successful_rollback():
+    # Дефект 3: кулдаун смотрел только на отметку об УСПЕШНОМ откате. Пробитая
+    # красная линия без удавшегося возврата планировщику не сообщалась вовсе —
+    # процент дрейфует на пункт, ключ идемпотентности получается новый, и агент
+    # назавтра крутит тот же сегмент ещё раз, поверх живого вредного изменения.
+    sql = " ".join(writer_db.HARMFUL_SEGMENTS_SQL.split())
+    assert "harmful_verdict_at" in sql
+    assert "GREATEST(rolled_back_at, harmful_verdict_at)" in sql
+    # Условия «только откатанные» больше нет: оно и отсекало неоткатанные.
+    assert "WHERE rolled_back_at IS NOT NULL" not in sql
+
+
+def test_harmful_verdict_columns_are_added_by_ddl():
+    ddl = " ".join(" ".join(WRITER_DDL).split())
+    assert "ADD COLUMN IF NOT EXISTS harmful_verdict_at" in ddl
+    assert "ADD COLUMN IF NOT EXISTS harmful_reason" in ddl
+
+
+def test_mark_harmful_sql_keeps_the_first_verdict_time():
+    sql = " ".join(writer_db.MARK_HARMFUL_SQL.split())
+    # Кулдаун отсчитывается от ПЕРВОГО пробоя: повторный прогон сторожа не
+    # должен продлевать его задним числом.
+    assert "harmful_verdict_at = COALESCE(harmful_verdict_at, now())" in sql
+    assert "RETURNING" in sql
+
+
+# ======================================= переход «откатано» тоже под гардом
+
+
+def test_mark_rolled_back_sql_has_state_guard_and_confirms_the_update():
+    # Дефект 4: единственный переход состояния, остававшийся безусловным —
+    # UPDATE по одному action_id, без условия на текущее состояние и без
+    # подтверждения, что строка действительно изменилась.
+    sql = " ".join(writer_db.MARK_ROLLED_BACK_SQL.split())
+    assert "WHERE action_id = %(action_id)s" in sql
+    assert "rolled_back_at IS NULL" in sql
+    expected = ", ".join("'%s'" % x for x in writer_db.LIVE_STATUSES)
+    assert "status IN (%s)" % expected in sql
+    assert "RETURNING" in sql
+
+
+def test_mark_rolled_back_reports_whether_the_row_was_taken(monkeypatch):
+    # Вызывающий код обязан различать «отметили» и «строку уже забрал другой
+    # контур»: отчёт сторожа иначе утверждает про журнал то, чего в нём нет.
+    class _Cur:
+        def __init__(self, row):
+            self.row = row
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, *a, **k):
+            pass
+
+        def fetchone(self):
+            return self.row
+
+    class _Conn:
+        def __init__(self, row):
+            self.row = row
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self, *a, **k):
+            return _Cur(self.row)
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(writer_db, "get_connection", lambda: _Conn(("act-1",)))
+    assert writer_db.mark_rolled_back("act-1") is True
+
+    monkeypatch.setattr(writer_db, "get_connection", lambda: _Conn(None))
+    assert writer_db.mark_rolled_back("act-1") is False
+
+
+# ================================ срок хранения строк репетиционных прогонов
+
+
+def test_purge_touches_only_rehearsal_rows():
+    # У строк репетиции не было судьбы: статус не финальный и не живой, ни один
+    # механизм журнала их не закрывает — и они копились вечно. Удаление
+    # безопасно ровно потому, что за ними не стоит ни одного запроса в кабинет.
+    sql = " ".join(writer_db.PURGE_DRY_RUN_SQL.split())
+    assert sql.startswith("DELETE FROM edu_agent_actions")
+    assert "status = 'dry_run'" in sql
+    assert "created_at < now() - make_interval(days => %s)" in sql
+    for status in set(writer_db.FINAL_STATUSES) | set(writer_db.LIVE_STATUSES):
+        assert "'%s'" % status not in sql, status
+    assert writer_db.DRY_RUN_RETENTION_DAYS > 0
 
 
 def test_insert_action_writes_segment_columns():
@@ -513,11 +611,13 @@ def test_final_status_keys_does_not_query_on_empty_input(monkeypatch):
 # ============================================================ аренда на прогон
 
 
-def test_run_lock_registry_covers_both_workers():
-    # Параллельный запуск опасен у обоих рабочих процессов движка, и у
-    # каждого своё имя: прямое применение и откат друг другу не мешают.
-    assert "agent_e1" in writer_db.RUN_LOCK_NAMES
-    assert "agent_e1_watchdog" in writer_db.RUN_LOCK_NAMES
+# Проверки «имя сторожа есть в реестре RUN_LOCK_NAMES» здесь больше нет: она
+# была зелёной ровно всё время, пока сторож аренду НЕ БРАЛ, — то есть давала
+# ложное чувство покрытия. Факт использования аренды каждым рабочим процессом
+# проверяется там, где он и происходит: tests/test_agent_e1.py и
+# tests/test_agent_e1_watchdog.py (main обязан взять аренду и остановиться,
+# если она занята). Реестр как таковой прикрыт снизу — run_lock отвергает
+# незнакомое имя (тест ниже).
 
 
 def test_acquire_run_lock_sql_takes_only_expired_lease():
@@ -534,6 +634,86 @@ def test_run_lock_rejects_unknown_name():
             pass  # pragma: no cover
 
 
+# ---------------------------------------- аренда продлевается и перепроверяется
+# Дефект 5: аренду брали на час и больше о ней не вспоминали. Прогон по сотням
+# кампаний (чтение состояния по каждой, ретраи, таймауты по две минуты) живёт
+# дольше часа — аренда протухает НА ХОДУ, следующий прогон стартует штатно, и
+# оба шлют bidmodifiers.add по одной кампании. Это ровно тот сценарий с двумя
+# объектами в кабинете, ради которого аренда и заводилась.
+
+
+def test_renew_run_lock_sql_extends_only_our_own_live_lease():
+    sql = " ".join(writer_db.RENEW_RUN_LOCK_SQL.split())
+    assert "expires_at = now() + make_interval(mins => %(ttl)s)" in sql
+    assert "holder = %(holder)s" in sql      # чужую аренду не продлеваем
+    assert "expires_at > now()" in sql       # и протухшую — тоже не воскрешаем
+    assert "RETURNING" in sql
+
+
+class _FakeCursor:
+    def __init__(self, conn, row):
+        self.conn = conn
+        self.row = row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.conn.executed.append((sql, params))
+
+    def fetchone(self):
+        return self.row
+
+
+class _FakeConn:
+    def __init__(self, row):
+        self.row = row
+        self.executed = []
+        self.commits = 0
+
+    def cursor(self, *a, **k):
+        return _FakeCursor(self, self.row)
+
+    def commit(self):
+        self.commits += 1
+
+
+def test_lease_renew_reports_loss_instead_of_pretending_to_own():
+    alive = writer_db.RunLease(_FakeConn(("2026-08-20",)), "agent_e1", "me", 60)
+    assert alive.renew() is True
+    alive.guard()   # владение подтверждено — прогон продолжается
+
+    lost = writer_db.RunLease(_FakeConn(None), "agent_e1", "me", 60)
+    assert lost.renew() is False
+    with pytest.raises(writer_db.RunLeaseLost):
+        lost.guard()
+
+
+def test_lease_guard_renews_the_lease_it_checks():
+    # Продление и перепроверка — один и тот же запрос: пока прогон работает,
+    # аренда не протухает, а если она уже не наша, это видно сразу же.
+    conn = _FakeConn(("2026-08-20",))
+    lease = writer_db.RunLease(conn, "agent_e1", "me", 60)
+
+    lease.guard()
+
+    assert len(conn.executed) == 1
+    assert conn.executed[0][0] is writer_db.RENEW_RUN_LOCK_SQL
+    assert conn.executed[0][1] == {"name": "agent_e1", "holder": "me", "ttl": 60}
+
+
+def _lock_expires(name: str):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT expires_at FROM edu_agent_run_lock WHERE lock_name = %s",
+                        (name,))
+            row = cur.fetchone()
+    return row[0] if row else None
+
+
 # ================================================================= живой SQL
 
 
@@ -547,7 +727,9 @@ def test_live_mark_action_does_not_resurrect_rolled_back_row():
     key = "test-mark-guard-" + uuid.uuid4().hex[:8]
     try:
         action_id = writer_db.insert_action(_journal_row(key, "test-acc"))
-        writer_db.mark_rolled_back(action_id)
+        # Откатить можно только живую строку — гард mark_rolled_back.
+        assert writer_db.mark_action(action_id, "applied", {"ok": True}) is True
+        assert writer_db.mark_rolled_back(action_id) is True
 
         landed = writer_db.mark_action(action_id, "applied", {"ok": True})
 
@@ -633,7 +815,7 @@ def test_live_rolled_back_segment_is_visible_to_planning():
         writer_db.mark_action(action_id, "applied", {})
         writer_db.mark_rolled_back(action_id)
 
-        cooled = writer_db.rolled_back_segments(60, account=account)
+        cooled = writer_db.harmful_segments(60, account=account)
 
         assert ("111", "MOBILE_ADJUSTMENT", "MOBILE") in cooled
     finally:
@@ -649,6 +831,7 @@ def test_live_rollback_outside_cooldown_window_does_not_block():
     try:
         action_id = writer_db.insert_action(_journal_row(
             key, account, direct_type="MOBILE_ADJUSTMENT", key="MOBILE"))
+        writer_db.mark_action(action_id, "applied", {})
         writer_db.mark_rolled_back(action_id)
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -660,7 +843,7 @@ def test_live_rollback_outside_cooldown_window_does_not_block():
                 )
             conn.commit()
 
-        assert writer_db.rolled_back_segments(60, account=account) == {}
+        assert writer_db.harmful_segments(60, account=account) == {}
     finally:
         _cleanup(key)
 
@@ -695,6 +878,48 @@ def test_live_expired_lease_is_taken_over():
 
     with writer_db.run_lock("agent_e1") as holder:
         assert holder != "dead-process"
+
+
+@live_db
+def test_live_lease_is_renewable_while_the_run_is_alive():
+    # Продление сдвигает срок годности вперёд: прогон, идущий дольше часа, не
+    # теряет аренду, и второй прогон не стартует.
+    ensure_writer_tables()
+    with writer_db.run_lock("agent_e1", ttl_minutes=1) as lease:
+        before = _lock_expires("agent_e1")
+        lease.ttl_minutes = 60
+        assert lease.renew() is True
+        assert _lock_expires("agent_e1") > before
+
+        # И чужой прогон по-прежнему не пройдёт.
+        with pytest.raises(writer_db.RunLockBusy):
+            with writer_db.run_lock("agent_e1"):
+                pass  # pragma: no cover
+
+
+@live_db
+def test_live_lost_lease_is_not_silently_renewed():
+    # Аренду перехватили — продлевать её нельзя ни в коем случае: иначе прогон
+    # отобрал бы у живого владельца то, что тот успел взять.
+    ensure_writer_tables()
+    with writer_db.run_lock("agent_e1") as lease:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE edu_agent_run_lock SET holder = 'other-run' "
+                    "WHERE lock_name = 'agent_e1'"
+                )
+            conn.commit()
+
+        assert lease.renew() is False
+        with pytest.raises(writer_db.RunLeaseLost):
+            lease.guard()
+
+    # Уборка: чужую аренду контекст не снимает, снимаем сами.
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM edu_agent_run_lock WHERE lock_name = 'agent_e1'")
+        conn.commit()
 
 
 @live_db

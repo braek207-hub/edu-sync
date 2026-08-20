@@ -50,7 +50,13 @@ from sync.agent import db as agent_db
 from sync.agent.guard import check_freshness, verdict as guard_verdict
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import _element_errors
-from sync.agent.writer.client import WriteClient
+# journal_allowed — общее правило движка (writer/client.py), а не местное
+# решение сторожа: журнал ОДИН на оба окружения, и тем же правилом
+# пользуется прогон применения. Для сторожа это второй рубеж — комбинация
+# «песочница + запись» отклоняется ещё в main() до единого обращения к БД;
+# здесь — защита от вызывающего кода, который соберёт такой клиент
+# программно (живой тест, разовый скрипт).
+from sync.agent.writer.client import WriteClient, journal_allowed
 from sync.agent.writer.guardrails import check_rollback
 from sync.agent.writer.rollback import rollback_payload, is_breached
 
@@ -113,6 +119,10 @@ NO_RED_LINE_REASON = (
 EXPIRED_REASON = (
     "горизонт наблюдения закрыт, вердикт так и не вынесен: автоматически он не "
     "появится никогда — нужна ручная сверка"
+)
+JOURNAL_CONFLICT_REASON = (
+    "возврат в кабинет прошёл, но строку журнала уже закрыл другой контур: "
+    "его отметка описывает исход точнее и не перезаписывается — сверять руками"
 )
 DATA_GATE_REASON = (
     "гейт витрины фактов красный: наблюдение показано, но откат не выполняется "
@@ -361,23 +371,6 @@ def gate_allows_rollback(gate: Optional[Dict[str, Any]]) -> bool:
     return bool(gate) and str(gate.get("status")) == "GREEN"
 
 
-def journal_allowed(client) -> bool:
-    """Можно ли этому клиенту писать в журнал действий.
-
-    Журнал ОДИН на оба окружения — база одна. Поэтому право записи в него не
-    равно праву записи в кабинет: песочный клиент, отправляющий запросы в
-    песочницу, оставлял бы в БОЕВОМ журнале отметки о боевых действиях,
-    которых в боевом кабинете не происходило. Три такие отметки хоронят
-    действие (MAX_ROLLBACK_ATTEMPTS), и красная линия по нему не сработает
-    уже никогда.
-
-    Это второй рубеж: комбинация «песочница + запись» отклоняется ещё в main()
-    до единого обращения к БД. Здесь — защита от вызывающего кода, который
-    соберёт такой клиент программно (живой тест, разовый скрипт).
-    """
-    return bool(client.is_write_allowed()) and not bool(getattr(client, "sandbox", False))
-
-
 def rollback_guard_form(action: Dict[str, Any], service: str, method: str,
                         params: Dict[str, Any]) -> Dict[str, Any]:
     """Запрос на возврат в той форме, которую понимает рельса пути возврата.
@@ -569,8 +562,20 @@ def rollback_one(client, action: Dict[str, Any], db_module,
         return _fail(db_module, action, f"API отклонил возврат: {json.dumps(errors, ensure_ascii=False)}"[:300],
                      False, journal_ok)
 
-    if journal_ok:
-        db_module.mark_rolled_back(action["action_id"])
+    if journal_ok and db_module.mark_rolled_back(action["action_id"]) is False:
+        # Возврат в кабинет ушёл и прошёл, но строку журнала уже забрал другой
+        # контур (второй сторож, ручная правка). Перезаписывать его исход
+        # нельзя: он описывает строку точнее, чем эта попытка. Сам кабинет при
+        # этом в порядке — возврат идемпотентен, это set прежнего или
+        # нейтрального коэффициента.
+        # Отметка на None не проверяется намеренно: модуль журнала мог не
+        # вернуть ничего (тестовый двойник, старая сигнатура), и трактовать
+        # отсутствие возврата как конфликт значило бы заваливать отчёт
+        # ложными конфликтами.
+        return {"result": "conflicted", "action_id": action.get("action_id"),
+                "object_id": action.get("object_id"),
+                "reason": JOURNAL_CONFLICT_REASON,
+                "journal_written": False, "response": response}
     return {"result": "rolled_back", "action_id": action.get("action_id"),
             "object_id": action.get("object_id"),
             "journal_written": bool(journal_ok), "response": response}
@@ -578,7 +583,7 @@ def rollback_one(client, action: Dict[str, Any], db_module,
 
 def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
           facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
-          data_gate: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+          data_gate: Optional[Dict[str, Any]], lease: Any = None) -> Dict[str, Any]:
     """Наблюдение и откат по всем открытым действиям одного кабинета.
 
     data_gate — вердикт гейта витрины фактов (facts_gate). Красный гейт
@@ -597,6 +602,7 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
     needs_review: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
     rollback_allowed = gate_allows_rollback(data_gate)
+    conflicted: List[Dict[str, Any]] = []
 
     for action in actions:
         # Одна испорченная строка журнала не должна ослеплять сторожа по всем
@@ -639,6 +645,22 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
             "observed": verdict.get("observed"),
         })
 
+        # Вердикт «вредно» фиксируется в журнале ДО попытки возврата и
+        # независимо от её исхода: признак вредности сегмента — пробитая
+        # красная линия, а не успешность технической операции отката. Из этой
+        # отметки планировщик берёт кулдаун (writer_db.harmful_segments), и
+        # без неё неоткатанный пробой был бы для него невидим: процент
+        # дрейфует между расчётами, ключ идемпотентности получается новый, и
+        # агент назавтра подкрутил бы тот же сегмент ещё раз.
+        if rollback_allowed and journal_allowed(client):
+            try:
+                db_module.mark_harmful_verdict(
+                    action["action_id"], str(verdict.get("reason") or "")[:500])
+            except Exception as exc:
+                errors.append({"action_id": action.get("action_id"),
+                               "object_id": action.get("object_id"),
+                               "error": f"{type(exc).__name__}: {exc}"[:200]})
+
         if not rollback_allowed:
             # Смотрим, но не откатываем: линия пробита по данным, качеству
             # которых доверять нельзя.
@@ -649,7 +671,15 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
             continue
 
         try:
+            # Откат — тоже запись в кабинет, и аренда прогона перед ней
+            # перепроверяется по тому же правилу, что и прямое применение:
+            # два сторожа откатят одно действие дважды и дважды спишут
+            # попытки.
+            if lease is not None:
+                lease.guard()
             outcome = rollback_one(client, action, db_module, holdout_ids)
+        except writer_db.RunLeaseLost:
+            raise
         except Exception as exc:
             errors.append({"action_id": action.get("action_id"),
                            "object_id": action.get("object_id"),
@@ -661,6 +691,8 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
             failures.append(outcome)
         elif outcome["result"] == "blocked_holdout":
             blocked_holdout.append(outcome)
+        elif outcome["result"] == "conflicted":
+            conflicted.append(outcome)
         else:
             would_roll_back.append(outcome)
 
@@ -675,6 +707,12 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
         "failures": [{k: v for k, v in f.items() if k != "result"}
                      for f in failures[:PREVIEW_SAMPLE_LIMIT]],
         "blocked_holdout": len(blocked_holdout),
+        # Возврат прошёл в кабинете, а отметку в журнале уже поставил другой
+        # контур. Не «откатано» и не «не удалось» — отдельное состояние,
+        # которое сверяют руками.
+        "conflicted": len(conflicted),
+        "conflicted_sample": [{k: v for k, v in c.items() if k != "result"}
+                              for c in conflicted[:PREVIEW_SAMPLE_LIMIT]],
         # Пробои, по которым прогон намеренно ничего не сделал: гейт данных
         # красный. Отдельный счётчик, а не тишина, — иначе «сторож молчит»
         # неотличимо от «всё хорошо».
@@ -759,6 +797,26 @@ def main() -> int:
         return 2
 
     writer_db.ensure_writer_tables()
+
+    # Аренда на прогон — та же, что у прямого применения, и по той же причине.
+    # Имя сторожа лежало в реестре RUN_LOCK_NAMES с самого начала, но сам он
+    # аренду не брал: два одновременных сторожа откатывают одно действие
+    # дважды и дважды списывают попытки (MAX_ROLLBACK_ATTEMPTS = 3 — двух
+    # параллельных прогонов хватает, чтобы похоронить строку за один заход).
+    try:
+        with writer_db.run_lock("agent_e1_watchdog") as lease:
+            return _run_all(sandbox, dry_run, today, lease)
+    except writer_db.RunLockBusy as exc:
+        print(json.dumps({"verdict": "RUN_LOCKED", "reason": str(exc)},
+                         ensure_ascii=False, indent=2))
+        return 1
+    except writer_db.RunLeaseLost as exc:
+        print(json.dumps({"verdict": "RUN_LEASE_LOST", "reason": str(exc)},
+                         ensure_ascii=False, indent=2))
+        return 1
+
+
+def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None) -> int:
     actions = writer_db.open_actions()
     holdout_ids = {str(h) for h in agent_db.load_holdout_ids()}
     facts_by_campaign = load_facts(actions, today)
@@ -772,7 +830,7 @@ def main() -> int:
     for login, account_actions in sorted(by_account.items()):
         client = WriteClient(login, sandbox=sandbox, dry_run=dry_run)
         report = watch(client, account_actions, writer_db, holdout_ids,
-                       facts_by_campaign, today, gate)
+                       facts_by_campaign, today, gate, lease)
         accounts.append({"account": login, **report, "units_left": client.units_left})
 
     print(json.dumps({

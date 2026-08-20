@@ -85,13 +85,22 @@ class _FakeClient:
 
 
 class _FakeDb:
-    def __init__(self, failed_at=None):
+    def __init__(self, failed_at=None, rolled_back_taken=False):
         self.rolled_back = []
         self.failed = []
+        self.harmful = []
         self._failed_at = failed_at
+        # True — строку журнала между вердиктом и отметкой забрал другой
+        # контур: реальный UPDATE с гардом её не тронет и вернёт False.
+        self._rolled_back_taken = rolled_back_taken
 
     def mark_rolled_back(self, action_id):
         self.rolled_back.append(action_id)
+        return not self._rolled_back_taken
+
+    def mark_harmful_verdict(self, action_id, reason):
+        self.harmful.append({"action_id": action_id, "reason": reason})
+        return True
 
     def mark_rollback_failed(self, action_id, reason, permanent=False):
         self.failed.append({"action_id": action_id, "reason": reason,
@@ -820,3 +829,178 @@ def test_live_spent_risk_still_counts_row_awaiting_manual_rollback():
         assert spent_risk(week) == with_action - 777.0
     finally:
         _cleanup(key)
+
+
+# =========================================================================
+# Дефект 2: сторож работает без аренды прогона
+# =========================================================================
+#
+# Механизм аренды был, имя сторожа лежало в реестре — а сам он аренду не брал.
+# Два одновременных сторожа откатывают одно действие дважды и дважды списывают
+# попытки (MAX_ROLLBACK_ATTEMPTS = 3: двух параллельных прогонов хватает,
+# чтобы похоронить строку за один заход). Старый тест проверял, что имя есть
+# в списке, — он зеленел ровно всё время, пока аренда не бралась.
+
+
+class _RecordingLock:
+    """Аренда на прогон, которая записывает, кто и под каким именем её взял."""
+
+    def __init__(self, busy=False, lease=None):
+        self.busy = busy
+        self.names = []
+        self.lease = lease
+
+    def __call__(self, name, *a, **k):
+        self.names.append(name)
+        lock = self
+
+        class _Ctx:
+            def __enter__(self_inner):
+                if lock.busy:
+                    raise writer_db.RunLockBusy("прогон уже идёт")
+                return lock.lease
+
+            def __exit__(self_inner, *exc):
+                return False
+
+        return _Ctx()
+
+
+def _patch_watchdog_main(monkeypatch, lock):
+    monkeypatch.setattr(sys, "argv", ["agent_e1_watchdog", "--prod"])
+    monkeypatch.setattr(watchdog.writer_db, "ensure_writer_tables", lambda: None)
+    monkeypatch.setattr(watchdog.writer_db, "run_lock", lock)
+    monkeypatch.setattr(watchdog.writer_db, "open_actions", lambda: [])
+    monkeypatch.setattr(watchdog.writer_db, "failed_rollbacks_count", lambda: 0)
+    monkeypatch.setattr(watchdog.agent_db, "load_holdout_ids", lambda: [])
+
+
+def test_watchdog_takes_the_run_lease_under_its_own_name(monkeypatch, capsys):
+    lock = _RecordingLock()
+    _patch_watchdog_main(monkeypatch, lock)
+
+    assert watchdog.main() == 0
+    capsys.readouterr()
+
+    assert lock.names == ["agent_e1_watchdog"], "аренда обязана быть ВЗЯТА, а не просто числиться в реестре"
+
+
+def test_second_watchdog_does_not_start(monkeypatch, capsys):
+    # Второй сторож откатил бы то же действие второй раз и вторично списал бы
+    # попытку — журнал бы решил, что откат не удаётся.
+    lock = _RecordingLock(busy=True)
+    _patch_watchdog_main(monkeypatch, lock)
+    monkeypatch.setattr(watchdog.writer_db, "open_actions",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("занятая аренда обязана остановить прогон ДО работы")))
+
+    code = watchdog.main()
+
+    assert code == 1
+    assert "RUN_LOCKED" in capsys.readouterr().out
+
+
+# =========================================================================
+# Дефект 3: неудавшийся откат не доходил до планировщика
+# =========================================================================
+
+
+def test_breach_is_recorded_even_when_rollback_fails():
+    # Линия пробита, откатить не смогли (Id корректировки неизвестен). Строка
+    # снимается с наблюдения — но сегмент от этого не стал безопасным, и
+    # планировщик обязан узнать о вердикте: иначе процент дрейфует на пункт,
+    # ключ идемпотентности получается новый, и агент назавтра крутит тот же
+    # сегмент ещё раз, поверх живого вредного изменения.
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    action = _action(action_kind="bidmodifier.add",
+                     payload={"CampaignId": 111, "Type": "MOBILE_ADJUSTMENT",
+                              "key": "MOBILE", "BidModifier": 30},
+                     previous_state={}, response={})
+    report, client, db = _run(action, facts)
+
+    assert report["rollback_failed"] == 1
+    assert db.rolled_back == []
+    assert [h["action_id"] for h in db.harmful] == ["act-1"]
+
+
+def test_breach_verdict_is_recorded_before_a_successful_rollback():
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    report, client, db = _run(_action(), facts)
+
+    assert report["rolled_back"] == 1
+    assert [h["action_id"] for h in db.harmful] == ["act-1"]
+
+
+def test_healthy_action_is_never_marked_harmful():
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=100.0, leads=5)}
+    report, client, db = _run(_action(), facts)
+
+    assert db.harmful == []
+
+
+def test_breach_on_red_data_gate_is_not_recorded_as_harmful():
+    # Гейт витрины красный: пробой показан, но данным доверять нельзя — ни
+    # откатывать, ни запирать сегмент на два месяца по ним не будем.
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    report, client, db = _run(_action(), facts, gate=RED_GATE)
+
+    assert report["breached"] == 1
+    assert report["blocked_data_gate"] == 1
+    assert db.harmful == []
+
+
+def test_rehearsal_does_not_record_the_verdict_in_the_journal():
+    # То же правило журнала, что и везде: репетиция боевых записей не меняет.
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    report, client, db = _run(_action(), facts, client=_FakeClient(dry_run=True))
+
+    assert db.harmful == []
+
+
+# =========================================================================
+# Дефект 4: переход «откатано» писался без гарда
+# =========================================================================
+
+
+def test_rollback_whose_journal_row_was_taken_is_not_reported_as_rolled_back():
+    # Возврат в кабинет прошёл, но строку журнала уже закрыл другой контур.
+    # «Отметили» и «строку забрал кто-то другой» — разные исходы, и отчёт
+    # обязан их различать, а не утверждать про журнал то, чего в нём нет.
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    db = _FakeDb(rolled_back_taken=True)
+    report, client, db = _run(_action(), facts, db=db)
+
+    assert report["rolled_back"] == 0
+    assert report["conflicted"] == 1
+    assert report["conflicted_sample"][0]["reason"] == watchdog.JOURNAL_CONFLICT_REASON
+
+
+def test_rollback_marked_in_the_journal_is_reported_as_rolled_back():
+    # Обратная половина: нормальный путь обязан остаться нормальным, иначе
+    # проверка выше зеленела бы на коде, который вообще ничего не отмечает.
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    report, client, db = _run(_action(), facts)
+
+    assert report["rolled_back"] == 1
+    assert report["conflicted"] == 0
+
+
+# =========================================================================
+# Дефект 5: аренда перепроверяется и перед откатом
+# =========================================================================
+
+
+class _LostLease:
+    def guard(self):
+        raise writer_db.RunLeaseLost("аренда потеряна")
+
+
+def test_lost_lease_stops_the_watchdog_before_it_writes():
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    client, db = _FakeClient(), _FakeDb()
+
+    with pytest.raises(writer_db.RunLeaseLost):
+        watchdog.watch(client, [_action()], db, set(), facts, TODAY, GREEN_GATE,
+                       _LostLease())
+
+    assert client.calls == [], "после потери аренды откат в кабинет не уходит"
