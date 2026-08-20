@@ -4,7 +4,10 @@
 Для «GA4-заказы вторым источником в дашборде» (Павел, 2026-08-20). Печатает только агрегаты.
 Запуск: python scripts/probe_gcc_ga4_purchases.py (нужен SA-ключ lime-reports в .env)
 """
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
 
