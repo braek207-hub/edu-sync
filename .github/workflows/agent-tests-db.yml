@@ -1,0 +1,26 @@
+name: agent-tests-db
+# Живые тесты движка записи: они единственные исполняют реальный SQL журнала действий.
+# Локально уходят в skipped без DATABASE_URL, поэтому ошибка в запросе иначе вылезла бы
+# впервые в бою — на записи перед отправкой изменения в кабинет.
+on:
+  workflow_dispatch:
+
+jobs:
+  db-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Живые тесты журнала и применения
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -m pytest tests/test_agent_writer_db.py tests/test_agent_writer_apply.py -v
+      - name: Весь набор агента с доступом к БД
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -m pytest tests/test_agent_e0.py tests/test_agent_e1.py tests/test_agent_writer_*.py tests/test_agent_db_sql.py -q
