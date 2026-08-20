@@ -25,6 +25,7 @@ result для разбора здесь. Без разбора такая оши
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from sync.agent.writer.client import is_outcome_unknown
 from sync.agent.writer.db import FINAL_STATUSES
 from sync.agent.writer.units import delta_to_api
 
@@ -127,15 +128,36 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module) -> Dict[str,
                      который блокирует повтор по идемпотентности, поэтому
                      отклонённое действие ОБЯЗАНО переприменяться на
                      следующем прогоне, а не пропускаться;
-      - 'failed'   — исключение при отправке (сеть, 5xx после ретраев,
-                     error уровня запроса) ИЛИ ответ пришёл, но разобрать
-                     его нечем (_element_errors не знает метод — новый вид
-                     операции без записи в _RESULT_COLLECTION). Оба случая
-                     переприменяются на следующем прогоне по той же причине:
-                     неразобранный ответ — отказ по умолчанию, а не 'applied'.
+      - 'failed'   — запрос ТОЧНО не ушёл (ошибка до отправки, соединение не
+                     установлено, отказ уровня запроса от самого Директа)
+                     ИЛИ ответ пришёл, но разобрать его нечем (_element_errors
+                     не знает метод — новый вид операции без записи в
+                     _RESULT_COLLECTION). Переприменяется на следующем прогоне;
+      - 'stale'    — исход НЕИЗВЕСТЕН: таймаут на записи, разрыв после
+                     отправки тела, недоступность сервиса после ретраев
+                     (client.is_outcome_unknown). Изменение может быть живым в
+                     кабинете, поэтому строка уходит в тот же контур, что и
+                     обрыв процесса: под наблюдение сторожа и под риск-бюджет,
+                     без повторной отправки. Считать такое 'failed' — дыра
+                     того же класса и размера, что закрывал механизм зависших
+                     строк: изменение исчезает из виду навсегда.
+
+    Отметка результата может не лечь: между проверкой статуса и отметкой
+    строку мог забрать сторож (перевод в 'stale' и откат). Тогда действие
+    попадает в счётчик 'conflicted' — журнал уже описывает исход точнее, чем
+    эта отправка, и затирать его нельзя (db.MARK_ACTION_SQL держит гард).
     """
-    applied = skipped = failed = rejected = dry_run = 0
+    applied = skipped = failed = rejected = dry_run = unknown = conflicted = 0
     details: List[Dict[str, Any]] = []
+
+    def _mark(action_id: str, status: str, response: Dict[str, Any]) -> bool:
+        """True — отметка легла. False — строку забрал другой контур.
+
+        Модуль журнала мог не обновиться (тесты со своим двойником, старая
+        сигнатура) — None трактуется как «легла», чтобы отсутствие возврата
+        не превращалось в поток ложных конфликтов.
+        """
+        return db_module.mark_action(action_id, status, response) is not False
 
     for action in actions:
         existing = db_module.find_action_by_key(action["idempotency_key"])
@@ -153,13 +175,34 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module) -> Dict[str,
             else:
                 errors = _element_errors(method, response)
                 status = "rejected" if errors else "applied"
-            db_module.mark_action(action_id, status, response)
+            if not _mark(action_id, status, response):
+                conflicted += 1
+                details.append({"key": action["idempotency_key"], "result": "conflicted",
+                                "attempted_status": status})
+                continue
             applied += 1 if status == "applied" else 0
             rejected += 1 if status == "rejected" else 0
             dry_run += 1 if status == "dry_run" else 0
             details.append({"key": action["idempotency_key"], "result": status})
         except Exception as exc:
-            db_module.mark_action(action_id, "failed", {"error": f"{type(exc).__name__}: {exc}"[:400]})
+            reason = f"{type(exc).__name__}: {exc}"[:400]
+            if is_outcome_unknown(exc):
+                landed = db_module.mark_unknown_outcome(action_id, reason)
+                if landed is False:
+                    conflicted += 1
+                    details.append({"key": action["idempotency_key"],
+                                    "result": "conflicted",
+                                    "attempted_status": "stale"})
+                    continue
+                unknown += 1
+                details.append({"key": action["idempotency_key"],
+                                "result": "unknown_outcome", "error": str(exc)[:200]})
+                continue
+            if not _mark(action_id, "failed", {"error": reason}):
+                conflicted += 1
+                details.append({"key": action["idempotency_key"], "result": "conflicted",
+                                "attempted_status": "failed"})
+                continue
             failed += 1
             details.append({"key": action["idempotency_key"], "result": "failed",
                             "error": str(exc)[:200]})
@@ -168,5 +211,9 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module) -> Dict[str,
     # репетиции ВСЕ действия получают этот статус, и отчёт без него показывал
     # ровные нули по всем счётчикам. Ровно по этому отчёту принимается решение
     # включать боевую запись, и он обязан показывать объём репетиции.
+    # unknown_outcome — отдельный счётчик, а не часть failed: это ЖИВЫЕ
+    # непроверенные изменения, они заняли риск-бюджет и стоят под наблюдением.
+    # conflicted — строки, исход которых записал другой контур.
     return {"applied": applied, "skipped": skipped, "failed": failed, "rejected": rejected,
-            "dry_run": dry_run, "details": details}
+            "dry_run": dry_run, "unknown_outcome": unknown, "conflicted": conflicted,
+            "details": details}

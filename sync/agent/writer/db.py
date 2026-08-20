@@ -9,7 +9,11 @@ sync/agent/writer/db.py — таблицы движка записи и дост
 
 import hashlib
 import json
-from typing import Any, Dict, List, Optional
+import os
+import socket
+import uuid
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import psycopg2.extras
 
@@ -56,6 +60,49 @@ WRITER_DDL: List[str] = [
       ADD COLUMN IF NOT EXISTS rollback_attempts  INTEGER NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS rollback_failed_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS rollback_error     TEXT
+    """,
+    # СЕГМЕНТ действия отдельными колонками, а не только внутри payload.
+    # Без них история откатов неадресуема: payload действия bidmodifier.set
+    # несёт лишь Id корректировки и коэффициент — ни вида, ни ключа сегмента
+    # там нет вообще, и «этот сегмент этой кампании признан вредным» не
+    # выводится из журнала ничем. Ключ идемпотентности тоже не помогает: в нём
+    # зашит ПРОЦЕНТ, а он дрейфует между расчётами, поэтому вчерашний откат
+    # завтрашнему действию по тому же сегменту не соответствует.
+    #
+    #   direct_type — тип корректировки Директа (MOBILE_ADJUSTMENT, ...);
+    #   setting_key — ключ сегмента внутри типа (MOBILE, GENDER_MALE, 213).
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS direct_type TEXT,
+      ADD COLUMN IF NOT EXISTS setting_key TEXT
+    """,
+    # Кулдаун по сегменту читается на каждом прогоне по (кабинет, объект,
+    # тип, ключ) среди откатанных строк — без индекса это seq scan по всему
+    # журналу на каждый прогон.
+    """
+    CREATE INDEX IF NOT EXISTS edu_agent_actions_rolled_back_idx
+      ON edu_agent_actions (rolled_back_at)
+      WHERE rolled_back_at IS NOT NULL
+    """,
+    # Аренда на прогон: два одновременных прогона на одном ключе создают в
+    # кабинете ДВА объекта, и Id первого теряется навсегда — без строки
+    # журнала и без красной линии. Таблица, а не pg_advisory_lock: сессионная
+    # advisory-блокировка не переживает пулер в транзакционном режиме
+    # (sync/db.py::_database_url специально снимает pgbouncer=true из URI —
+    # значит через пулер сюда ходят), а аренда со сроком годности работает
+    # одинаково при любом способе подключения.
+    #
+    #   holder     — кто держит: uuid прогона + pid + хост, чтобы снять аренду
+    #                мог только он сам, а не случайный следующий прогон;
+    #   expires_at — срок годности. Прогон, умерший вместе с процессом, не
+    #                оставляет вечную блокировку: аренда просто протухает.
+    """
+    CREATE TABLE IF NOT EXISTS edu_agent_run_lock (
+      lock_name    TEXT PRIMARY KEY,
+      holder       TEXT NOT NULL,
+      acquired_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at   TIMESTAMPTZ NOT NULL
+    )
     """,
     # Недельный риск-бюджет: сколько денег под непроверенными изменениями.
     """
@@ -138,17 +185,20 @@ def find_action_by_key(idempotency_key: str) -> Optional[Dict[str, Any]]:
 INSERT_ACTION_SQL = """
     INSERT INTO edu_agent_actions (
         action_id, idempotency_key, account, object_level, object_id,
-        action_kind, payload, previous_state, red_line, risk_rub, status
+        action_kind, direct_type, setting_key, payload, previous_state,
+        red_line, risk_rub, status
     ) VALUES (
         %(action_id)s, %(idempotency_key)s, %(account)s, %(object_level)s,
-        %(object_id)s, %(action_kind)s, %(payload)s, %(previous_state)s,
-        %(red_line)s, %(risk_rub)s, 'planned'
+        %(object_id)s, %(action_kind)s, %(direct_type)s, %(setting_key)s,
+        %(payload)s, %(previous_state)s, %(red_line)s, %(risk_rub)s, 'planned'
     )
     ON CONFLICT (idempotency_key) DO UPDATE SET
         account        = EXCLUDED.account,
         object_level   = EXCLUDED.object_level,
         object_id      = EXCLUDED.object_id,
         action_kind    = EXCLUDED.action_kind,
+        direct_type    = EXCLUDED.direct_type,
+        setting_key    = EXCLUDED.setting_key,
         payload        = EXCLUDED.payload,
         previous_state = EXCLUDED.previous_state,
         red_line       = EXCLUDED.red_line,
@@ -173,6 +223,11 @@ def insert_action(row: Dict[str, Any]) -> str:
     params = {
         **row,
         "action_id": action_id,
+        # Сегмент — в собственные колонки. В действии он лежит на верхнем
+        # уровне (diff.py кладёт direct_type/key рядом с payload); ключ
+        # называется "key", потому что это ключ настройки, а не действия.
+        "direct_type": row.get("direct_type"),
+        "setting_key": None if row.get("key") is None else str(row.get("key")),
         "payload": json.dumps(row.get("payload", {}), ensure_ascii=False),
         "previous_state": json.dumps(row.get("previous_state", {}), ensure_ascii=False),
         "red_line": json.dumps(row.get("red_line", {}), ensure_ascii=False),
@@ -184,20 +239,88 @@ def insert_action(row: Dict[str, Any]) -> str:
     return action_id
 
 
-def mark_action(action_id: str, status: str, response: Dict[str, Any]) -> None:
+# Отметка результата — единственный запрос модуля, который раньше стоял БЕЗ
+# условия на текущее состояние строки. Достижимое состояние было такое: статус
+# 'applied' И проставленный rolled_back_at одновременно. Путь: apply.py увидел
+# нефинальный статус, отправил запрос, а пока он летел, сторож перевёл строку в
+# 'stale' и откатил её; безусловный UPDATE затирал откат обратно в 'applied'.
+#
+# Такая строка исчезала из ВСЕХ трёх контуров сразу: наблюдение её не видит
+# (open_actions фильтрует rolled_back_at IS NULL), риск-бюджет не считает
+# (spent_risk фильтрует так же), переприменить нельзя (статус финальный).
+#
+# Гард ровно про это: строку с проставленным откатом или в финальном статусе
+# не трогаем. Возврат RETURNING отличает «отметили» от «строку забрал кто-то
+# другой» — вызывающий код обязан это увидеть, а не считать отметку успешной.
+MARK_ACTION_SQL = """
+    UPDATE edu_agent_actions
+       SET status = %(status)s,
+           response = %(response)s,
+           applied_at = CASE WHEN %(status)s = 'applied' THEN now() ELSE applied_at END
+     WHERE action_id = %(action_id)s
+       AND rolled_back_at IS NULL
+       AND status NOT IN (__FINAL_STATUSES__)
+    RETURNING action_id
+""".replace("__FINAL_STATUSES__", _sql_literals(FINAL_STATUSES))
+
+
+def mark_action(action_id: str, status: str, response: Dict[str, Any]) -> bool:
+    """Отмечает исход отправки. True — отметка легла, False — строку уже
+    забрал другой контур (откат сторожа или пометка зависшей)."""
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE edu_agent_actions
-                   SET status = %s,
-                       response = %s,
-                       applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END
-                 WHERE action_id = %s
-                """,
-                (status, json.dumps(response, ensure_ascii=False), status, action_id),
-            )
+            cur.execute(MARK_ACTION_SQL, {
+                "status": status,
+                "response": json.dumps(response, ensure_ascii=False),
+                "action_id": action_id,
+            })
+            landed = cur.fetchone() is not None
         conn.commit()
+    return landed
+
+
+# Исход НЕИЗВЕСТЕН: запрос ушёл, а ответа нет (таймаут на записи, разрыв после
+# отправки тела, недоступность сервиса после ретраев). Это не 'failed': под
+# 'failed' строка не наблюдается сторожем, риск по ней не списан, а diff
+# следующего прогона её не предложит — фактическое состояние кабинета уже
+# совпало с планом. Изменение исчезает из виду навсегда.
+#
+# Поэтому такой исход попадает в тот же контур, что и обрыв процесса, — статус
+# 'stale' с applied_at на момент отправки: живое непроверенное изменение под
+# наблюдением и под риск-бюджетом, повторно не отправляемое.
+# Гард тот же, что у MARK_ACTION_SQL, и по той же причине.
+MARK_UNKNOWN_OUTCOME_SQL = """
+    UPDATE edu_agent_actions
+       SET status     = 'stale',
+           applied_at = COALESCE(applied_at, created_at, now()),
+           response   = %(response)s
+     WHERE action_id = %(action_id)s
+       AND rolled_back_at IS NULL
+       AND status NOT IN (__FINAL_STATUSES__)
+    RETURNING action_id
+""".replace("__FINAL_STATUSES__", _sql_literals(FINAL_STATUSES))
+
+
+def mark_unknown_outcome(action_id: str, reason: str) -> bool:
+    """Переводит действие с неизвестным исходом в 'stale'.
+
+    True — отметка легла, False — строку уже забрал другой контур.
+    """
+    response = {
+        "unknown_outcome": True,
+        "error": str(reason)[:400],
+        "note": ("исход отправки неизвестен: запрос мог примениться в кабинете. "
+                 "Строка считается живым непроверенным изменением до ручной сверки"),
+    }
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(MARK_UNKNOWN_OUTCOME_SQL, {
+                "response": json.dumps(response, ensure_ascii=False),
+                "action_id": action_id,
+            })
+            landed = cur.fetchone() is not None
+        conn.commit()
+    return landed
 
 
 def open_actions() -> List[Dict[str, Any]]:
@@ -385,6 +508,152 @@ def failed_rollbacks_count() -> int:
         """
     )
     return int(rows[0]["n"]) if rows else 0
+
+
+# ------------------------------------------------ обратная связь от отката
+
+# Сегмент, по которому был откат, определяется ОБЪЕКТОМ И СЕГМЕНТОМ, а не
+# ключом идемпотентности: в ключ зашит процент, а он пересчитывается на каждом
+# прогоне по скользящему окну и дрейфует на пункт-другой. Применили тридцать,
+# откатили, назавтра расчёт дал двадцать девять — это уже другой ключ, и
+# идемпотентность цикл не ловит вообще.
+#
+# COALESCE с payload — для строк, записанных до появления колонок direct_type/
+# setting_key: у действия bidmodifier.add сегмент лежал в payload, у
+# bidmodifier.set его не было нигде. Что не восстанавливается, то в кулдаун не
+# попадает, и это честнее, чем угадывать сегмент по Id корректировки.
+ROLLED_BACK_SEGMENTS_SQL = """
+    SELECT account,
+           object_id,
+           COALESCE(direct_type, payload->>'Type') AS direct_type,
+           COALESCE(setting_key, payload->>'key')  AS setting_key,
+           MAX(rolled_back_at)                     AS last_rolled_back_at
+    FROM edu_agent_actions
+    WHERE rolled_back_at IS NOT NULL
+      AND rolled_back_at > now() - make_interval(days => %s)
+      AND (%s IS NULL OR account = %s)
+      AND COALESCE(direct_type, payload->>'Type') IS NOT NULL
+      AND COALESCE(setting_key, payload->>'key') IS NOT NULL
+    GROUP BY 1, 2, 3, 4
+"""
+
+
+def rolled_back_segments(
+    cooldown_days: int, account: Optional[str] = None
+) -> Dict[Tuple[str, str, str], Any]:
+    """Сегменты кампаний, откатанные за последние cooldown_days.
+
+    Ключ — (object_id, direct_type, setting_key), значение — момент последнего
+    отката. Кабинет в ключ не входит: выборка уже ограничена одним кабинетом,
+    а идентификаторы кампаний между кабинетами не пересекаются.
+    """
+    rows = _fetch(ROLLED_BACK_SEGMENTS_SQL, (int(cooldown_days), account, account))
+    return {
+        (str(r["object_id"]), str(r["direct_type"]), str(r["setting_key"])):
+            r["last_rolled_back_at"]
+        for r in rows
+    }
+
+
+def final_status_keys(keys: Iterable[str]) -> Set[str]:
+    """Ключи идемпотентности, уже закрытые финальным статусом.
+
+    Нужны ДО отбора по лимиту действий. Раньше такое действие доходило до
+    apply_actions и отсеивалось только там: порядок обхода детерминирован,
+    накопившиеся закрытые ключи стабильно занимали начало списка и съедали
+    лимит прогона целиком — отчёт рапортовал «подготовлено пятьдесят,
+    применено ноль», и ни одно новое действие в кабинет не уходило.
+    """
+    keys = [str(k) for k in keys]
+    if not keys:
+        return set()
+    rows = _fetch(
+        "SELECT idempotency_key FROM edu_agent_actions "
+        "WHERE idempotency_key = ANY(%s) AND status IN (__FINAL_STATUSES__)".replace(
+            "__FINAL_STATUSES__", _sql_literals(FINAL_STATUSES)),
+        (keys,),
+    )
+    return {str(r["idempotency_key"]) for r in rows}
+
+
+# ------------------------------------------------------- аренда на прогон
+
+# Имя аренды → назначение. Реестр общий на оба рабочих процесса движка:
+# параллельный запуск опасен у обоих, и у каждого своё имя, потому что
+# прямое применение и откат друг другу не мешают.
+RUN_LOCK_NAMES = ("agent_e1", "agent_e1_watchdog")
+
+# Срок годности аренды. Прогон живёт минуты; час — тот же порог, по которому
+# строка журнала признаётся зависшей (agent_e1.STALE_PLANNED_MINUTES): процесс,
+# держащий аренду дольше, по тому же критерию считается мёртвым, и его аренду
+# можно перехватить, иначе смерть процесса блокировала бы движок навсегда.
+RUN_LOCK_TTL_MINUTES = 60
+
+# Захват аренды — одним запросом: проверка «свободно ли» и запись владельца не
+# могут разъехаться между двумя прогонами. Строка возвращается только тому, кто
+# аренду действительно получил; занятая и не протухшая аренда даёт пустой ответ.
+ACQUIRE_RUN_LOCK_SQL = """
+    INSERT INTO edu_agent_run_lock (lock_name, holder, acquired_at, expires_at)
+    VALUES (%(name)s, %(holder)s, now(), now() + make_interval(mins => %(ttl)s))
+    ON CONFLICT (lock_name) DO UPDATE SET
+        holder      = EXCLUDED.holder,
+        acquired_at = now(),
+        expires_at  = EXCLUDED.expires_at
+    WHERE edu_agent_run_lock.expires_at < now()
+    RETURNING lock_name, holder, expires_at
+"""
+
+
+class RunLockBusy(RuntimeError):
+    """Прогон уже идёт. Второй одновременный прогон на том же ключе создал бы
+    в кабинете второй объект, а Id первого потерялся бы навсегда."""
+
+
+def _lock_holder() -> str:
+    return f"{uuid.uuid4().hex[:12]}@{socket.gethostname()}:{os.getpid()}"
+
+
+@contextmanager
+def run_lock(name: str, ttl_minutes: int = RUN_LOCK_TTL_MINUTES):
+    """Аренда на прогон. RunLockBusy — если прогон уже идёт.
+
+    Соединение держится на всё тело блока, но сама аренда живёт в таблице:
+    так она переживает пулер (сессионная advisory-блокировка через
+    транзакционный пулер не гарантируется) и не переживает смерть процесса
+    дольше срока годности.
+    """
+    if name not in RUN_LOCK_NAMES:
+        raise ValueError(f"неизвестное имя аренды прогона: {name}")
+    holder = _lock_holder()
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(ACQUIRE_RUN_LOCK_SQL, {
+                "name": name, "holder": holder, "ttl": int(ttl_minutes)})
+            got = cur.fetchone()
+        conn.commit()
+        if got is None:
+            raise RunLockBusy(
+                f"прогон {name} уже идёт: параллельный запуск запрещён — "
+                f"два прогона на одном ключе создают в кабинете два объекта"
+            )
+        try:
+            yield holder
+        finally:
+            # Снимает аренду ТОЛЬКО её владелец: если аренда успела протухнуть
+            # и её перехватил другой прогон, снимать чужую нельзя.
+            # Сбой снятия не подменяет собой исходную ошибку прогона: аренда
+            # всё равно протухнет сама, а потерять причину падения хуже.
+            try:
+                conn.rollback()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM edu_agent_run_lock "
+                        "WHERE lock_name = %s AND holder = %s",
+                        (name, holder),
+                    )
+                conn.commit()
+            except Exception:
+                pass
 
 
 def spent_risk(week_start: str) -> float:

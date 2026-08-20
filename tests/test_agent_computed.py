@@ -13,6 +13,7 @@ tests/test_agent_computed.py — вычисляемые настройки ав�
 называют причину.
 """
 
+import sync.agent.computed as computed
 from sync.agent.computed import (
     DEGENERATE_REASON,
     NO_CLICKS_REASON,
@@ -187,3 +188,18 @@ def test_schedule_refuses_degenerate_profile():
     out, reason = compute_schedule(rows)
     assert out == []
     assert reason == DEGENERATE_REASON
+
+
+def test_cap_constants_carry_their_unit_in_the_name():
+    # Одноимённые потолки в РАЗНЫХ шкалах уже роняли ветку смешением единиц:
+    # здесь доля (0.5), в рельсах движка записи — проценты (50). Пока имена
+    # совпадали, спутать их можно было только внимательностью, а единица
+    # обязана читаться из имени.
+    from sync.agent.writer import guardrails
+
+    assert not hasattr(computed, "MODIFIER_CAP"), (
+        "имя без единицы измерения вернулось — рядом живёт одноимённая "
+        "константа в процентах (guardrails.MODIFIER_CAP)")
+    assert computed.MODIFIER_CAP_RATIO == 0.5
+    assert guardrails.MODIFIER_CAP == 50
+    assert computed.MODIFIER_CAP_RATIO * 100 == guardrails.MODIFIER_CAP

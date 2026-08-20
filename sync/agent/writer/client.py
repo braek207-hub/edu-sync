@@ -35,9 +35,62 @@ RETRY_CODES = {500, 502, 503, 504}
 
 
 class DirectWriteError(RuntimeError):
-    def __init__(self, service: str, code: Any, message: str, detail: str = ""):
+    """Ошибка записи. outcome_unknown отделяет «запрос точно не ушёл» от
+    «исход неизвестен».
+
+    Разница не косметическая. «Точно не ушло» — изменения в кабинете нет,
+    действие переприменяется на следующем прогоне. «Исход неизвестен» —
+    изменение МОЖЕТ БЫТЬ живым: строка обязана уйти в тот же контур, что и
+    обрыв процесса после отправки ('stale'), иначе она не наблюдается
+    сторожем, не оплачена риск-бюджетом, и diff следующего прогона её не
+    предложит — фактическое состояние уже совпало с планом.
+    """
+
+    def __init__(self, service: str, code: Any, message: str, detail: str = "",
+                 outcome_unknown: bool = False):
         self.service, self.code, self.detail = service, code, detail
+        self.outcome_unknown = bool(outcome_unknown)
         super().__init__(f"{service}: [{code}] {message} {detail}".strip())
+
+
+# Исключения транспорта, при которых запрос МОГ дойти до Директа: тело уже
+# ушло, а ответа нет. Порядок проверки важен — ConnectTimeout наследует и
+# ConnectionError, и Timeout, но означает как раз обратное: соединение не
+# установилось, тело не отправлялось.
+_REQUEST_NEVER_SENT = (
+    requests.exceptions.ConnectTimeout,
+    requests.exceptions.InvalidURL,
+    requests.exceptions.MissingSchema,
+    requests.exceptions.InvalidSchema,
+    requests.exceptions.InvalidHeader,
+)
+
+_OUTCOME_UNKNOWN = (
+    requests.exceptions.ReadTimeout,
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectionError,     # разрыв, в т.ч. ПОСЛЕ отправки тела
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.RequestException,    # неопознанный сбой транспорта
+)
+
+
+def is_outcome_unknown(exc: BaseException) -> bool:
+    """Мог ли запрос примениться в кабинете, несмотря на исключение.
+
+    True — исход неизвестен (таймаут, разрыв, недоступность после ретраев).
+    False — запрос точно не ушёл (соединение не установлено, ошибка до
+    отправки) ИЛИ Директ явно ответил отказом уровня запроса.
+
+    Умолчание — False: неизвестный тип исключения возникает до сети куда
+    чаще, чем в момент отправки, и записывать всё подряд в живые изменения
+    значит наполнить наблюдение и риск-бюджет фантомами. Транспортные
+    случаи перечислены явно выше.
+    """
+    if isinstance(exc, DirectWriteError):
+        return exc.outcome_unknown
+    if isinstance(exc, _REQUEST_NEVER_SENT):
+        return False
+    return isinstance(exc, _OUTCOME_UNKNOWN)
 
 
 def parse_units(header: str) -> Optional[int]:
@@ -95,16 +148,23 @@ class WriteClient:
                 # валидным JSON без ключа "error" (например, {} от балансировщика) —
                 # такое нельзя разбирать как успех, иначе журнал действий пометит
                 # мутацию applied, хотя Директ её не применил.
+                # Исход НЕИЗВЕСТЕН, а не «не применилось»: запрос уходил в
+                # Директ (и уходил несколько раз), 5xx мог прийти уже ПОСЛЕ
+                # применения — от балансировщика, из-за таймаута на стороне
+                # сервиса, из-за сбоя на ответе.
                 raise DirectWriteError(service, resp.status_code,
-                                       "сервис недоступен после ретраев", resp.text[:300])
+                                       "сервис недоступен после ретраев", resp.text[:300],
+                                       outcome_unknown=True)
             units = parse_units(resp.headers.get("Units", ""))
             if units is not None:
                 self.units_left = units
             try:
                 data = resp.json()
             except ValueError:
+                # Ответ пришёл, но это не JSON — что сделал Директ с запросом,
+                # неизвестно. Считать «не применилось» нельзя.
                 raise DirectWriteError(service, resp.status_code, "нераспознанный ответ",
-                                       resp.text[:300])
+                                       resp.text[:300], outcome_unknown=True)
             if "error" in data:
                 # Ошибка уровня ЗАПРОСА: ключ error в теле. Ошибки уровня ЭЛЕМЕНТА
                 # (result.*Results[].Errors) сюда не попадают — они не ошибка
@@ -114,7 +174,8 @@ class WriteClient:
                                        err.get("error_string", ""),
                                        err.get("error_detail", ""))
             return data.get("result") or {}
-        raise DirectWriteError(service, "retries", "исчерпаны попытки")
+        raise DirectWriteError(service, "retries", "исчерпаны попытки",
+                               outcome_unknown=True)
 
     def get(self, service: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Чтение разрешено всегда — оно не меняет состояние."""

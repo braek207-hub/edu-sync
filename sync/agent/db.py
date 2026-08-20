@@ -337,11 +337,17 @@ def load_latest_computed_settings(
     object_id нормализуется той же функцией, что и на записи
     (upsert_computed_settings): пробел по краям логина не должен превращать
     один кабинет в два разных текстовых ключа.
+
+    calc_date возвращается в каждой строке и не является служебным полем:
+    «последний расчёт» не значит «свежий». Если Э0 не запускался месяц,
+    выборка честно отдаёт месячные коэффициенты, и без даты вызывающий код
+    не может отличить их от вчерашних — он обязан ограничить возраст сам
+    (sync/agent_e1.py::MAX_COMPUTED_AGE_DAYS).
     """
     object_id = normalize_login(object_id)
     return _fetch_dicts(
         """
-        SELECT setting_kind, setting_key, value, support_n, raw_value
+        SELECT calc_date, setting_kind, setting_key, value, support_n, raw_value
         FROM edu_agent_computed_settings
         WHERE object_level = %s AND object_id = %s
           AND calc_date = (

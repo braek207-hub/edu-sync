@@ -12,8 +12,28 @@ find_action_by_key/insert_action/mark_action) — без сети и без БД
 """
 
 import json
+from contextlib import contextmanager
+from datetime import date, timedelta
+
+import pytest
 
 import sync.agent_e1 as agent_e1
+
+
+@contextmanager
+def _no_lock(*a, **k):
+    """Аренда на прогон в тестах не берётся — она требует БД."""
+    yield "test-holder"
+
+
+def _patch_infra(monkeypatch, cooled=None, final_keys=()):
+    """Общая подмена того, что прогон спрашивает у журнала помимо действий:
+    аренда на прогон, история откатов, уже закрытые ключи."""
+    monkeypatch.setattr(agent_e1.writer_db, "run_lock", _no_lock)
+    monkeypatch.setattr(agent_e1.writer_db, "rolled_back_segments",
+                        lambda *a, **k: dict(cooled or {}))
+    monkeypatch.setattr(agent_e1.writer_db, "final_status_keys",
+                        lambda keys: set(final_keys))
 
 
 class _FakeCampaignsClient:
@@ -239,8 +259,7 @@ def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeyp
     monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables", lambda: None)
     monkeypatch.setattr(
         agent_e1.agent_db, "load_latest_computed_settings",
-        lambda *_: [{"setting_kind": "bid_modifier:device", "setting_key": "mobile",
-                  "value": 30.0, "support_n": 1000, "raw_value": 30.0}],
+        lambda *_: [_setting("bid_modifier:device", "mobile", 30.0)],
     )
     monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", lambda: [])
     monkeypatch.setattr(agent_e1.agent_db, "load_daily_cost_by_campaign",
@@ -250,6 +269,7 @@ def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeyp
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
     monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: [])
     monkeypatch.setattr(agent_e1, "WriteClient", _FakeWriteClient)
+    _patch_infra(monkeypatch)
 
     exit_code = agent_e1.main()
 
@@ -300,10 +320,8 @@ def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatc
     monkeypatch.setattr(
         agent_e1.agent_db, "load_latest_computed_settings",
         lambda *_: [
-            {"setting_kind": "bid_modifier:region", "setting_key": "Москва",
-             "value": 30.0, "support_n": 1000, "raw_value": 1.3},
-            {"setting_kind": "bid_modifier:device", "setting_key": "DESKTOP",
-             "value": 30.0, "support_n": 1000, "raw_value": 1.3},
+            _setting("bid_modifier:region", "Москва", 30.0),
+            _setting("bid_modifier:device", "DESKTOP", 30.0),
         ],
     )
     monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", lambda: [])
@@ -314,9 +332,11 @@ def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatc
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
     monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
     monkeypatch.setattr(agent_e1.writer_db, "insert_action", lambda action: 1)
-    monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: None)
+    monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: True)
+    monkeypatch.setattr(agent_e1.writer_db, "mark_unknown_outcome", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: [])
     monkeypatch.setattr(agent_e1, "WriteClient", _RecordingWriteClient)
+    _patch_infra(monkeypatch)
 
     assert agent_e1.main() == 0
 
@@ -369,9 +389,12 @@ class _MultiCabinetClient:
         return {"dry_run": True}
 
 
-def _setting(kind, key, value, support=1000):
+def _setting(kind, key, value, support=1000, calc_date=None):
+    # calc_date по умолчанию сегодняшняя: возраст расчёта — рельса, и без даты
+    # прогон обязан отказаться применять настройки (см. тесты свежести ниже).
     return {"setting_kind": kind, "setting_key": key, "value": float(value),
-            "support_n": support, "raw_value": 1.0 + value / 100.0}
+            "support_n": support, "raw_value": 1.0 + value / 100.0,
+            "calc_date": calc_date or date.today().isoformat()}
 
 
 def _reports(capsys):
@@ -391,7 +414,7 @@ def _reports(capsys):
 
 
 def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
-               baseline_cpa=None, stale=(), journal=None):
+               baseline_cpa=None, stale=(), journal=None, cooled=None, final_keys=()):
     _MultiCabinetClient.instances = []
     _MultiCabinetClient.campaigns_by_login = campaigns_by_login
     logins = list(computed_by_login.keys())
@@ -417,8 +440,10 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
     rows = journal if journal is not None else []
     monkeypatch.setattr(agent_e1.writer_db, "insert_action",
                         lambda row: (rows.append(row), row["idempotency_key"])[1])
-    monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: None)
+    monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: True)
+    monkeypatch.setattr(agent_e1.writer_db, "mark_unknown_outcome", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1, "WriteClient", _MultiCabinetClient)
+    _patch_infra(monkeypatch, cooled=cooled, final_keys=final_keys)
     return rows
 
 
@@ -698,3 +723,262 @@ def test_second_run_does_not_repeat_the_same_stuck_row(monkeypatch, capsys):
     report = _reports(capsys)[0]
     assert report["stale_planned"]["count"] == 0
     assert report["stale_planned"]["sample"] == []
+
+
+# =========================================================================
+# Дефект A: откат ничего не сообщал планированию, и обходился сдвигом на процент
+# =========================================================================
+
+
+def _bidmod_key(campaign_id, direct_type, key, percent):
+    from sync.agent.writer.diff import _idempotency_key
+    return _idempotency_key(campaign_id, direct_type, key, percent)
+
+
+def test_cooldown_key_ignores_percent_drift():
+    # Ключ истории — объект и сегмент, БЕЗ процента. Именно на проценте цикл и
+    # держался: применили 30, откатили, назавтра расчёт дал 29 — другой ключ
+    # идемпотентности, и то же вредное изменение уезжало снова.
+    cooled = {("111", "MOBILE_ADJUSTMENT", "MOBILE"): "2026-08-01"}
+    actions = [
+        {"object_id": "111", "direct_type": "MOBILE_ADJUSTMENT", "key": "MOBILE",
+         "payload": {"BidModifier": 30}, "idempotency_key": "a"},
+        {"object_id": "111", "direct_type": "MOBILE_ADJUSTMENT", "key": "MOBILE",
+         "payload": {"BidModifier": 29}, "idempotency_key": "b"},
+    ]
+
+    allowed, blocked = agent_e1.split_by_cooldown(actions, cooled)
+
+    assert allowed == []
+    assert len(blocked) == 2, "сдвиг процента не должен открывать кулдаун"
+    assert all("кулдаун" in b["blocked_reason"] for b in blocked)
+
+
+def test_cooldown_does_not_block_other_segments_of_same_campaign():
+    # Кулдаун адресный: вредным признан сегмент, а не вся кампания.
+    cooled = {("111", "MOBILE_ADJUSTMENT", "MOBILE"): "2026-08-01"}
+    actions = [
+        {"object_id": "111", "direct_type": "DESKTOP_ADJUSTMENT", "key": "DESKTOP",
+         "payload": {"BidModifier": 30}, "idempotency_key": "a"},
+        {"object_id": "222", "direct_type": "MOBILE_ADJUSTMENT", "key": "MOBILE",
+         "payload": {"BidModifier": 30}, "idempotency_key": "b"},
+    ]
+
+    allowed, blocked = agent_e1.split_by_cooldown(actions, cooled)
+
+    assert [a["idempotency_key"] for a in allowed] == ["a", "b"]
+    assert blocked == []
+
+
+def test_cooldown_is_longer_than_full_observation_cycle():
+    # Кулдаун короче полного цикла наблюдения цикл не разрывает, а удлиняет:
+    # сегмент так же уезжает снова, просто реже. Порог сверяется с окном
+    # сторожа, а не назначен на глаз.
+    import sync.agent_e1_watchdog as watchdog
+
+    full_cycle = watchdog.OBSERVATION_LAG_DAYS + watchdog.OBSERVATION_HORIZON_DAYS
+    assert agent_e1.COOLDOWN_AFTER_ROLLBACK_DAYS >= 2 * full_cycle
+    # И длиннее окна, из которого берутся расход и базовый CPA: иначе повтор
+    # судился бы по базе, испорченной откатанным изменением.
+    assert agent_e1.COOLDOWN_AFTER_ROLLBACK_DAYS > 30
+
+
+def test_rolled_back_segment_is_cut_before_the_action_cap(monkeypatch, capsys):
+    # Сквозной: лимит действий равен одному, первым по порядку обхода идёт
+    # сегмент в кулдауне. Если отсев стоит ПОСЛЕ отбора по лимиту (или его нет
+    # вовсе), запертое действие занимает единственный слот и в кабинет не
+    # уходит ничего. Кулдаун обязан отсекать ДО лимита.
+    monkeypatch.setattr(agent_e1, "MAX_ACTIONS_PER_RUN", 1)
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [
+            _setting("bid_modifier:device", "DESKTOP", 30),
+            _setting("bid_modifier:device", "MOBILE", 20),
+        ]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+        cooled={("111", "DESKTOP_ADJUSTMENT", "DESKTOP"): "2026-08-01"},
+    )
+
+    assert agent_e1.main() == 0
+
+    sent = [c for inst in _MultiCabinetClient.instances for c in inst.sent]
+    assert len(sent) == 1, "слот лимита обязан достаться незапертому сегменту"
+    assert "MobileAdjustment" in sent[0][2]["BidModifiers"][0]
+    report = _reports(capsys)[0]
+    assert report["blocked_by_cooldown"]["count"] == 1
+    assert report["blocked_by_cooldown"]["cooldown_days"] == \
+        agent_e1.COOLDOWN_AFTER_ROLLBACK_DAYS
+    assert report["blocked_by_cooldown"]["segments"] == ["111:DESKTOP_ADJUSTMENT:DESKTOP"]
+
+
+def test_action_closed_by_idempotency_does_not_eat_the_cap(monkeypatch, capsys):
+    # Второе следствие той же природы: действие с уже закрытым ключом
+    # доходило до применения и отсеивалось только там — а слот лимита
+    # занимало. Накопившиеся закрытые ключи стабильно съедали лимит целиком:
+    # «подготовлено пятьдесят, применено ноль».
+    monkeypatch.setattr(agent_e1, "MAX_ACTIONS_PER_RUN", 1)
+    closed = _bidmod_key("111", "DESKTOP_ADJUSTMENT", "DESKTOP", 30)
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [
+            _setting("bid_modifier:device", "DESKTOP", 30),
+            _setting("bid_modifier:device", "MOBILE", 20),
+        ]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+        final_keys=(closed,),
+    )
+
+    assert agent_e1.main() == 0
+
+    sent = [c for inst in _MultiCabinetClient.instances for c in inst.sent]
+    assert len(sent) == 1
+    assert "MobileAdjustment" in sent[0][2]["BidModifiers"][0]
+    report = _reports(capsys)[0]
+    assert report["skipped_already_final"]["count"] == 1
+
+
+# =========================================================================
+# Дефект B: параллельный запуск
+# =========================================================================
+
+
+def test_second_simultaneous_run_refuses_to_start(monkeypatch, capsys):
+    # Два одновременных прогона на одном ключе создают в кабинете ДВА объекта,
+    # и Id первого теряется навсегда — без строки журнала и без красной линии.
+    monkeypatch.setattr(agent_e1, "_clients", lambda: [{"login": "acc-1"}])
+    monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables", lambda: None)
+
+    @contextmanager
+    def _busy(*a, **k):
+        raise agent_e1.writer_db.RunLockBusy("прогон agent_e1 уже идёт")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(agent_e1.writer_db, "run_lock", _busy)
+    monkeypatch.setattr(agent_e1, "_run_all",
+                        lambda *a, **k: pytest.fail("прогон стартовал вторым"))
+
+    assert agent_e1.main() == 1
+
+    report = _reports(capsys)[0]
+    assert report["verdict"] == "RUN_LOCKED"
+
+
+# =========================================================================
+# Сопутствующее: ноль вместо нейтрали, свежесть расчёта, падение кабинета
+# =========================================================================
+
+
+def test_missing_bid_modifier_is_unusable_not_full_suppression():
+    # Подстановка нуля превращала отсутствующий коэффициент в
+    # api_to_delta(0) = -100, то есть «подавить сегмент на сто процентов».
+    # Это уезжало в previous_state, и откат вместо возврата ставки выставлял
+    # бы коэффициент 0 — бил бы сильнее исходного изменения.
+    out = agent_e1._normalize_actual({"Id": 9, "MobileAdjustment": {"Foo": 1}})
+
+    assert len(out) == 1
+    assert out[0]["percent"] != -100
+    assert out[0]["percent"] is None
+    assert out[0]["unusable"] is True
+
+
+def test_unusable_actual_produces_no_action_at_all():
+    # Ни set (прошлое состояние неизвестно — откат станет невозможен), ни add
+    # (объект в кабинете есть, второй такой же создавать нельзя).
+    from sync.agent.writer.diff import diff_modifiers
+
+    desired = [{"kind": "bid_modifier:device", "direct_type": "MOBILE_ADJUSTMENT",
+                "key": "MOBILE", "percent": 30}]
+    actual = agent_e1._normalize_actual({"Id": 9, "MobileAdjustment": {"Foo": 1}})
+
+    assert diff_modifiers(desired, actual, campaign_id="111") == []
+
+
+def test_stale_computed_settings_are_not_applied(monkeypatch, capsys):
+    # «Последний расчёт» не значит «свежий»: без верхней границы возраста
+    # движок раскатает месячные коэффициенты.
+    old = (date.today() - timedelta(days=agent_e1.MAX_COMPUTED_AGE_DAYS + 1)).isoformat()
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [
+            _setting("bid_modifier:device", "DESKTOP", 30, calc_date=old)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+    )
+
+    assert agent_e1.main() == 0
+
+    sent = [c for inst in _MultiCabinetClient.instances for c in inst.sent]
+    assert sent == []
+    report = _reports(capsys)[0]
+    assert report["verdict"] == "STALE_COMPUTED_SETTINGS"
+    assert str(agent_e1.MAX_COMPUTED_AGE_DAYS) in report["reason"]
+    assert report["computed_age_days"] == agent_e1.MAX_COMPUTED_AGE_DAYS + 1
+
+
+def test_computed_settings_within_max_age_are_applied(monkeypatch, capsys):
+    # Граница включающая: расчёт ровно предельного возраста ещё применяется —
+    # иначе рельса резала бы строже заявленного.
+    edge = (date.today() - timedelta(days=agent_e1.MAX_COMPUTED_AGE_DAYS)).isoformat()
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [
+            _setting("bid_modifier:device", "DESKTOP", 30, calc_date=edge)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+    )
+
+    assert agent_e1.main() == 0
+
+    sent = [c for inst in _MultiCabinetClient.instances for c in inst.sent]
+    assert len(sent) == 1
+
+
+def test_computed_settings_without_calc_date_are_refused(monkeypatch, capsys):
+    # «Возраст неизвестен» — не «свежо».
+    setting = _setting("bid_modifier:device", "DESKTOP", 30)
+    setting.pop("calc_date")
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [setting]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+    )
+
+    assert agent_e1.main() == 0
+
+    sent = [c for inst in _MultiCabinetClient.instances for c in inst.sent]
+    assert sent == []
+    report = _reports(capsys)[0]
+    assert report["verdict"] == "STALE_COMPUTED_SETTINGS"
+    assert report["reason"] == agent_e1.UNKNOWN_COMPUTED_DATE_REASON
+
+
+def test_failure_on_one_cabinet_does_not_block_the_others(monkeypatch, capsys):
+    # Четыре кабинета, падение на первом — остальные обязаны быть обработаны,
+    # а отказ обязан быть виден в отчёте и в коде возврата.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)],
+                           "acc-2": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111], "acc-2": [221]},
+        daily_cost={"111": 10.0, "221": 10.0},
+    )
+    real_run_account = agent_e1.run_account
+
+    def _boom(login, *a, **k):
+        if login == "acc-1":
+            raise RuntimeError("кабинет отвалился")
+        return real_run_account(login, *a, **k)
+
+    monkeypatch.setattr(agent_e1, "run_account", _boom)
+
+    assert agent_e1.main() == 1, "частичный отказ обязан быть виден кодом возврата"
+
+    reports = _reports(capsys)
+    by_account = {r.get("account"): r for r in reports if r.get("account")}
+    assert by_account["acc-1"]["verdict"] == "ACCOUNT_FAILED"
+    assert by_account["acc-2"]["result"]["dry_run"] == 1, "второй кабинет обработан"
+    assert reports[-1]["verdict"] == "PARTIAL_FAILURE"
+    assert reports[-1]["failed_accounts"][0]["account"] == "acc-1"

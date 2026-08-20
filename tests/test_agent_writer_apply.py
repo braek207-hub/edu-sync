@@ -18,9 +18,11 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import pytest
+import requests
 
 import sync.agent.writer.db as writer_db
 from sync.agent.writer.apply import _element_errors, apply_actions, to_api_call
+from sync.agent.writer.client import DirectWriteError, is_outcome_unknown
 from sync.agent.writer.db import ensure_writer_tables
 from sync.db import get_connection
 
@@ -113,9 +115,11 @@ class _FakeDB:
     конце файла, а фейк отвечает только за счётчики отчёта и порядок вызовов.
     """
 
-    def __init__(self, seed: Optional[Dict[str, Dict[str, Any]]] = None):
+    def __init__(self, seed: Optional[Dict[str, Dict[str, Any]]] = None,
+                 conflict_on_mark: bool = False):
         self.rows: Dict[str, Dict[str, Any]] = dict(seed or {})
         self.events: List[str] = []
+        self.conflict_on_mark = conflict_on_mark
 
     def find_action_by_key(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
         return self.rows.get(idempotency_key)
@@ -125,10 +129,23 @@ class _FakeDB:
         self.rows[row["idempotency_key"]] = {**row, "status": "planned"}
         return row["idempotency_key"]  # action_id — в тестах достаточно ключа
 
-    def mark_action(self, action_id: str, status: str, response: Dict[str, Any]) -> None:
+    def mark_action(self, action_id: str, status: str, response: Dict[str, Any]) -> bool:
         self.events.append(f"mark:{action_id}:{status}")
+        if self.conflict_on_mark:
+            # Строку забрал другой контур (сторож перевёл в 'stale' и откатил):
+            # реальный запрос с гардом её не тронет и вернёт False.
+            return False
         self.rows[action_id]["status"] = status
         self.rows[action_id]["response"] = response
+        return True
+
+    def mark_unknown_outcome(self, action_id: str, reason: str) -> bool:
+        self.events.append(f"unknown:{action_id}")
+        if self.conflict_on_mark:
+            return False
+        self.rows[action_id]["status"] = "stale"
+        self.rows[action_id]["response"] = {"unknown_outcome": True, "error": reason}
+        return True
 
 
 class _FakeClient:
@@ -152,7 +169,8 @@ def test_apply_actions_marks_applied_on_clean_success():
     report = apply_actions(client, [_action()], db)
 
     assert report == {"applied": 1, "skipped": 0, "failed": 0, "rejected": 0,
-                       "dry_run": 0, "details": [{"key": "k1", "result": "applied"}]}
+                       "dry_run": 0, "unknown_outcome": 0, "conflicted": 0,
+                       "details": [{"key": "k1", "result": "applied"}]}
     assert db.rows["k1"]["status"] == "applied"
     assert len(client.calls) == 1
 
@@ -197,7 +215,8 @@ def test_apply_actions_repeat_run_skips_already_applied():
     report = apply_actions(client, [_action()], db)
 
     assert report == {"applied": 0, "skipped": 1, "failed": 0, "rejected": 0,
-                       "dry_run": 0, "details": [{"key": "k1", "result": "skipped"}]}
+                       "dry_run": 0, "unknown_outcome": 0, "conflicted": 0,
+                       "details": [{"key": "k1", "result": "skipped"}]}
     assert client.calls == []  # запрос не ушёл второй раз
 
 
@@ -330,6 +349,132 @@ def test_apply_actions_dry_run_counter_present_even_when_zero():
     report = apply_actions(client, [_action()], db)
 
     assert report["dry_run"] == 0
+
+
+# =========================================================================
+# Дефект C: неизвестный исход трактовался как «не применилось»
+# =========================================================================
+#
+# Механизм зависших строк закрывал ровно одну дыру — смерть процесса после
+# отправки. Но под статусом 'failed' пряталось то же самое: недоступность
+# сервиса после ретраев, таймаут на записи, разрыв соединения после отправки
+# тела. Во всех трёх случаях изменение может быть живым в кабинете, а строка
+# не наблюдается сторожем, риск по ней не списан, и diff следующего прогона её
+# не предложит — фактическое состояние уже совпало с планом.
+
+
+def test_timeout_on_write_goes_to_stale_not_failed():
+    db = _FakeDB()
+    client = _FakeClient(raises=requests.exceptions.ReadTimeout("нет ответа"))
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["unknown_outcome"] == 1
+    assert report["failed"] == 0
+    # Статус — тот же, что у обрыва процесса: живое непроверенное изменение.
+    assert db.rows["k1"]["status"] == "stale"
+    assert "unknown:k1" in db.events
+
+
+def test_service_unavailable_after_retries_goes_to_stale():
+    # 5xx после ретраев: запрос уходил в Директ, и не один раз.
+    db = _FakeDB()
+    client = _FakeClient(raises=DirectWriteError(
+        "bidmodifiers", 503, "сервис недоступен после ретраев", outcome_unknown=True))
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["unknown_outcome"] == 1
+    assert db.rows["k1"]["status"] == "stale"
+
+
+def test_connection_error_after_body_sent_goes_to_stale():
+    db = _FakeDB()
+    client = _FakeClient(raises=requests.exceptions.ConnectionError("сброс соединения"))
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["unknown_outcome"] == 1
+    assert db.rows["k1"]["status"] == "stale"
+
+
+def test_request_that_never_left_stays_failed():
+    # Соединение не установилось — тело не отправлялось, изменения нет.
+    # Такое действие обязано переприменяться, а не занимать наблюдение и
+    # риск-бюджет фантомом.
+    db = _FakeDB()
+    client = _FakeClient(raises=requests.exceptions.ConnectTimeout("не достучались"))
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["failed"] == 1
+    assert report["unknown_outcome"] == 0
+    assert db.rows["k1"]["status"] == "failed"
+
+
+def test_direct_rejection_at_request_level_stays_failed():
+    # Директ явно ответил отказом уровня запроса — исход известен.
+    db = _FakeDB()
+    client = _FakeClient(raises=DirectWriteError("bidmodifiers", 54, "нет прав"))
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["failed"] == 1
+    assert report["unknown_outcome"] == 0
+
+
+def test_is_outcome_unknown_separates_the_two_families():
+    assert is_outcome_unknown(requests.exceptions.ReadTimeout()) is True
+    assert is_outcome_unknown(requests.exceptions.ConnectionError()) is True
+    assert is_outcome_unknown(requests.exceptions.ChunkedEncodingError()) is True
+    # ConnectTimeout наследует и ConnectionError, и Timeout — но означает
+    # обратное: соединение не установилось, тело не отправлялось.
+    assert is_outcome_unknown(requests.exceptions.ConnectTimeout()) is False
+    assert is_outcome_unknown(ValueError("неизвестный тип корректировки")) is False
+    assert is_outcome_unknown(DirectWriteError("s", 54, "нет прав")) is False
+    assert is_outcome_unknown(
+        DirectWriteError("s", 503, "недоступен", outcome_unknown=True)) is True
+
+
+def test_unknown_outcome_is_not_counted_as_applied():
+    # Отдельный счётчик: неизвестный исход не «применено» и не «не удалось».
+    db = _FakeDB()
+    client = _FakeClient(raises=requests.exceptions.ReadTimeout())
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["applied"] == 0
+    assert report["rejected"] == 0
+    assert report["failed"] == 0
+
+
+# ---------------------------- гонка с откатом: отметка не затирает чужой исход
+
+
+def test_mark_conflict_does_not_count_as_applied():
+    # Строку между проверкой и отметкой забрал сторож (перевёл в 'stale' и
+    # откатил). Запрос с гардом её не тронет — вызывающий код обязан это
+    # увидеть, а не считать действие применённым.
+    db = _FakeDB(conflict_on_mark=True)
+    client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["applied"] == 0
+    assert report["conflicted"] == 1
+    assert report["details"][0]["result"] == "conflicted"
+    assert report["details"][0]["attempted_status"] == "applied"
+
+
+def test_mark_conflict_on_unknown_outcome_is_visible_too():
+    db = _FakeDB(conflict_on_mark=True)
+    client = _FakeClient(raises=requests.exceptions.ReadTimeout())
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["unknown_outcome"] == 0
+    assert report["conflicted"] == 1
+    assert report["details"][0]["attempted_status"] == "stale"
 
 
 # ------------------- повтор непринятого действия несёт свежее прошлое состояние

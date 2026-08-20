@@ -37,7 +37,7 @@ ENV: DATABASE_URL, DIRECT_TOKEN, DIRECT_CLIENTS_JSON
 import json
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Set, Tuple
 
 from sync.agent import db as agent_db
@@ -96,6 +96,63 @@ NO_COMPUTED_REASON = (
 # отправки. Печать без последствий оставляла её вечным шумом в каждом отчёте.
 STALE_PLANNED_MINUTES = 60
 
+# Сколько дней после отката сегмент кампании не трогаем.
+#
+# Зачем вообще: ключ идемпотентности содержит ПРОЦЕНТ, а процент
+# пересчитывается на каждом прогоне по скользящему окну и дрейфует на пункт-
+# другой. Применили тридцать, откатили, назавтра расчёт дал двадцать девять —
+# это уже другой ключ, идемпотентность молчит, и цикл «применили → две недели
+# ухудшенного показателя → откат» крутится вечно. Обратная связь от отката к
+# планированию обязана опираться на ОБЪЕКТ И СЕГМЕНТ, а не на точное значение.
+#
+# Почему 60, а не «чуть больше окна наблюдения»:
+#   * полный цикл применение → вердикт → откат укладывается в 15 дней
+#     (agent_e1_watchdog: OBSERVATION_LAG_DAYS=1 + OBSERVATION_HORIZON_DAYS=14).
+#     Кулдаун порядка этих же 15 дней цикл не разрывает, а только удлиняет:
+#     доля времени, которое сегмент проводит под повтором вредного изменения,
+#     осталась бы около половины;
+#   * 60 дней — вчетверо больше полного цикла: та же доля падает примерно до
+#     двадцати процентов, а число повторов по одному сегменту — с двух десятков
+#     в год до шести;
+#   * и главное — 60 вдвое больше тридцатидневного окна, из которого берутся
+#     дневной расход и базовый CPA (cutoff в main()). К моменту, когда повтор
+#     снова разрешён, и оценка риска, и красная линия посчитаны ЦЕЛИКОМ по дням
+#     ПОСЛЕ отката. Иначе повтор судился бы по базе, испорченной тем самым
+#     изменением, ради отмены которого откат и делался.
+COOLDOWN_AFTER_ROLLBACK_DAYS = 60
+
+COOLDOWN_REASON = (
+    "сегмент откатан за последние {days} дн.: повтор запрещён до конца кулдауна "
+    "(проверка по объекту и сегменту, а не по проценту — процент дрейфует между "
+    "расчётами и обходил бы идемпотентность)"
+)
+
+# Причина отказа для действия, чей ключ уже закрыт финальным статусом.
+# Отсекается ДО отбора по лимиту действий: порядок обхода детерминирован, и
+# накопившиеся закрытые ключи стабильно занимали начало списка, съедая лимит
+# целиком, — прогон рапортовал «подготовлено пятьдесят, применено ноль».
+ALREADY_FINAL_REASON = (
+    "ключ действия уже закрыт финальным статусом журнала: повторная отправка "
+    "исключена, слот лимита действий занимать нельзя"
+)
+
+# Предельный возраст расчёта Э0, дни. «Последний расчёт» не значит «свежий»:
+# без верхней границы движок раскатает месячные коэффициенты, посчитанные по
+# аудитории, которой больше нет. Неделя — потому что расчёт сжат к нулю по
+# объёму наблюдений, и недельного дрейфа он ещё не замечает, а месячный уже
+# описывает другой кабинет.
+MAX_COMPUTED_AGE_DAYS = 7
+
+STALE_COMPUTED_REASON = (
+    "расчёт Э0 старше {max_days} дн. (calc_date={calc_date}, возраст {age} дн.): "
+    "коэффициенты посчитаны по устаревшей аудитории и не применяются"
+)
+
+UNKNOWN_COMPUTED_DATE_REASON = (
+    "в расчёте Э0 нет даты (calc_date): возраст коэффициентов неизвестен, "
+    "а «неизвестно» — не «свежо»"
+)
+
 # Сколько действий показать поимённо в отчёте. Остальное — агрегатом по видам
 # настроек: полный список из полусотни строк превращает отчёт в стену текста,
 # а он читается глазами перед решением включать боевую запись.
@@ -117,6 +174,20 @@ _DEVICE_ADJUSTMENTS = (
 # разнотипной меткой — чтобы план не сопоставился с ним по случайности.
 COMPOSITE_KEY_SEPARATOR = "+"
 COMPOSITE_TYPE = "COMPOSITE_ADJUSTMENT"
+
+# Запись факта, в которой не оказалось коэффициента. Прежде отсутствующее
+# значение проходило через `or 0` и превращалось в api_to_delta(0) = -100 —
+# «подавить сегмент на сто процентов». Ноль в шкале Директа это НЕ нейтраль
+# (нейтраль — 100), поэтому такая подмена не безобидна: -100 уезжал в
+# previous_state действия set, и откат вместо возврата к прежней ставке
+# выставил бы коэффициент 0, то есть полное подавление сегмента.
+# Отсутствующее значение значит «запись негодна» и не порождает действий
+# вообще — ни set (прошлое состояние неизвестно), ни add (объект в кабинете
+# существует, второй такой же создавать нельзя).
+UNUSABLE_ACTUAL_REASON = (
+    "в ответе bidmodifiers.get нет коэффициента: прошлое состояние неизвестно, "
+    "действие по этому объекту не строится (ноль — не нейтраль, а подавление)"
+)
 
 
 def _clients() -> List[Dict[str, Any]]:
@@ -172,6 +243,22 @@ def own_campaign_ids(client: WriteClient, daily_cost_by_campaign: Dict[str, floa
     return sorted(own & set(daily_cost_by_campaign.keys()))
 
 
+def _delta_or_none(raw: Any) -> Any:
+    """Коэффициент из ответа API → дельта. None, если коэффициента нет.
+
+    Отсутствие значения НЕ подменяется нулём: ноль в шкале Директа означает
+    «ставка × 0», то есть максимальное подавление сегмента, а не «нейтраль»
+    и не «неизвестно». Подмена уезжала в previous_state и делала откат
+    оружием против той же кампании (см. UNUSABLE_ACTUAL_REASON).
+    """
+    if raw is None:
+        return None
+    try:
+        return api_to_delta(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_actual(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Одна запись bidmodifiers.get → 0 или 1 нормализованная actual-запись.
 
@@ -202,17 +289,17 @@ def _normalize_actual(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     предложит добавить её отдельным объектом, не трогая многомерную —
     в Директе это разные объекты, и они сосуществуют штатно.
     """
-    dimensions: List[Tuple[str, str, int]] = []  # (тип, ключ, дельта)
+    dimensions: List[Tuple[str, str, Any]] = []  # (тип, ключ, дельта или None)
 
     for api_field, direct_type, key in _DEVICE_ADJUSTMENTS:
         adjustment = item.get(api_field) or {}
         if adjustment:
             dimensions.append(
-                (direct_type, key, api_to_delta(adjustment.get("BidModifier") or 0)))
+                (direct_type, key, _delta_or_none(adjustment.get("BidModifier"))))
 
     demo = item.get("DemographicsAdjustment") or {}
     if demo:
-        percent = api_to_delta(demo.get("BidModifier") or 0)
+        percent = _delta_or_none(demo.get("BidModifier"))
         for value in (demo.get("Gender"), demo.get("Age")):
             if value:
                 dimensions.append(("DEMOGRAPHICS_ADJUSTMENT", str(value), percent))
@@ -220,25 +307,36 @@ def _normalize_actual(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     regional = item.get("RegionalAdjustment") or {}
     if regional:
         dimensions.append(("REGIONAL_ADJUSTMENT", str(regional.get("RegionId") or ""),
-                           api_to_delta(regional.get("BidModifier") or 0)))
+                           _delta_or_none(regional.get("BidModifier"))))
 
     if not dimensions:
         return []
+
+    # Негодность — свойство ВСЕЙ записи: это один физический объект Директа с
+    # одним коэффициентом, и если коэффициента нет, негодны все её измерения.
+    unusable = any(p is None for _, _, p in dimensions)
+
     if len(dimensions) == 1:
         direct_type, key, percent = dimensions[0]
-        return [{"Id": item["Id"], "Type": direct_type, "key": key, "percent": percent}]
+        record: Dict[str, Any] = {"Id": item["Id"], "Type": direct_type, "key": key,
+                                  "percent": percent}
+    else:
+        types = {t for t, _, _ in dimensions}
+        record = {
+            "Id": item["Id"],
+            # Измерения одного типа (пол+возраст) сохраняют свой тип; разнотипная
+            # комбинация типу не принадлежит вообще — своя метка, чтобы она не
+            # сошлась с планом по чистой случайности.
+            "Type": dimensions[0][0] if len(types) == 1 else COMPOSITE_TYPE,
+            "key": COMPOSITE_KEY_SEPARATOR.join(k for _, k, _ in dimensions),
+            "percent": dimensions[0][2],
+            "composite": True,
+        }
 
-    types = {t for t, _, _ in dimensions}
-    return [{
-        "Id": item["Id"],
-        # Измерения одного типа (пол+возраст) сохраняют свой тип; разнотипная
-        # комбинация типу не принадлежит вообще — своя метка, чтобы она не
-        # сошлась с планом по чистой случайности.
-        "Type": dimensions[0][0] if len(types) == 1 else COMPOSITE_TYPE,
-        "key": COMPOSITE_KEY_SEPARATOR.join(k for _, k, _ in dimensions),
-        "percent": dimensions[0][2],
-        "composite": True,
-    }]
+    if unusable:
+        record["unusable"] = True
+        record["unusable_reason"] = UNUSABLE_ACTUAL_REASON
+    return [record]
 
 
 def _unsupported_report(unsupported: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -310,6 +408,85 @@ def _stale_report(rows: List[Dict[str, Any]], limit: int = PREVIEW_SAMPLE_LIMIT)
     }
 
 
+def segment_of(action: Dict[str, Any]) -> Tuple[str, str, str]:
+    """Адрес действия для истории откатов: объект + сегмент, БЕЗ процента.
+
+    Ровно это отличает обратную связь от идемпотентности: ключ идемпотентности
+    привязан к значению, а вредным признаётся не значение, а трогание этого
+    сегмента этой кампании.
+    """
+    return (str(action.get("object_id")), str(action.get("direct_type")),
+            str(action.get("key")))
+
+
+def split_by_cooldown(
+    actions: List[Dict[str, Any]], cooled: Dict[Tuple[str, str, str], Any],
+    cooldown_days: int = COOLDOWN_AFTER_ROLLBACK_DAYS,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Делит действия на разрешённые и запертые кулдауном после отката."""
+    allowed: List[Dict[str, Any]] = []
+    blocked: List[Dict[str, Any]] = []
+    reason = COOLDOWN_REASON.format(days=cooldown_days)
+    for action in actions:
+        last = cooled.get(segment_of(action))
+        if last is None:
+            allowed.append(action)
+        else:
+            blocked.append({**action, "blocked_reason": reason,
+                            "last_rolled_back_at": str(last)})
+    return allowed, blocked
+
+
+def split_by_final_keys(
+    actions: List[Dict[str, Any]], final_keys: Any,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Делит действия на живые и уже закрытые финальным статусом журнала."""
+    final_keys = set(final_keys or ())
+    allowed = [a for a in actions if a["idempotency_key"] not in final_keys]
+    blocked = [{**a, "blocked_reason": ALREADY_FINAL_REASON}
+               for a in actions if a["idempotency_key"] in final_keys]
+    return allowed, blocked
+
+
+def computed_age_days(computed: List[Dict[str, Any]], today: date) -> Any:
+    """Возраст расчёта в днях. None — даты нет, возраст неизвестен."""
+    dates = []
+    for row in computed:
+        raw = row.get("calc_date")
+        if isinstance(raw, datetime):
+            dates.append(raw.date())
+        elif isinstance(raw, date):
+            dates.append(raw)
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                dates.append(date.fromisoformat(raw.strip()[:10]))
+            except ValueError:
+                continue
+    if not dates:
+        return None
+    return (today - max(dates)).days
+
+
+def computed_freshness_refusal(
+    computed: List[Dict[str, Any]], today: date,
+    max_age_days: int = MAX_COMPUTED_AGE_DAYS,
+) -> Any:
+    """Причина отказа применять расчёт из-за возраста, или None.
+
+    Возраст неизвестен — тоже отказ: «неизвестно» не равно «свежо», а
+    молчаливое применение недатированных коэффициентов ничем не отличается
+    от применения месячных.
+    """
+    age = computed_age_days(computed, today)
+    if age is None:
+        return UNKNOWN_COMPUTED_DATE_REASON
+    if age > max_age_days:
+        latest = today - timedelta(days=age)
+        return STALE_COMPUTED_REASON.format(
+            max_days=max_age_days, calc_date=latest.isoformat(), age=age)
+    return None
+
+
 def absolute_max_cpa_from_baseline(baseline_cpa: Dict[str, float]) -> Any:
     """Абсолютный аварийный порог красной линии: медиана известных базовых
     CPA × ABSOLUTE_MAX_CPA_MULTIPLIER. None, если справочник пуст целиком —
@@ -369,6 +546,172 @@ def _actual_modifiers(client: WriteClient, campaign_id: str) -> List[Dict[str, A
     return out
 
 
+def run_account(
+    login: str, sandbox: bool, dry_run: bool, today: str, ctx: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Весь прогон по ОДНОМУ кабинету. Возвращает его отчёт.
+
+    Вынесено из main() целиком, чтобы отказ одного кабинета можно было
+    поймать снаружи одной точкой: раньше исключение на первом из четырёх
+    кабинетов означало, что три остальных не обрабатывались вовсе — и не
+    потому, что было нечего делать, а потому, что прогон умер.
+    """
+    daily_cost = ctx["daily_cost"]
+    baseline_cpa = ctx["baseline_cpa"]
+    absolute_max_cpa = ctx["absolute_max_cpa"]
+    holdout_ids = ctx["holdout_ids"]
+    charged_objects = ctx["charged_objects"]
+    wk = ctx["week_start"]
+
+    # Настройки — этого кабинета, а не общий набор на всех: числа посчитаны
+    # по его аудитории и применимы только к его кампаниям.
+    computed = agent_db.load_latest_computed_settings(login)
+    # Возраст расчёта — рельса того же рода, что и остальные: применить
+    # месячные коэффициенты хуже, чем не применить ничего.
+    stale_computed = (computed_freshness_refusal(computed, date.fromisoformat(today))
+                      if computed else None)
+    plan = plan_bid_modifiers(computed) if not stale_computed else {"desired": [],
+                                                                   "unsupported": []}
+    desired = plan["desired"]
+    # Значимые настройки, которые агент применить не умеет (нечисловой ключ
+    # региона, устройство вне DESKTOP/MOBILE/TABLET). Они не подставляются в
+    # чужой тип корректировки и не роняют применение — но и не пропадают
+    # молча: причина видна в отчёте прогона.
+    unsupported = _unsupported_report(plan["unsupported"])
+    if not desired:
+        if stale_computed:
+            verdict, reason = "STALE_COMPUTED_SETTINGS", stale_computed
+        elif not computed:
+            verdict, reason = "NO_COMPUTED_SETTINGS", NO_COMPUTED_REASON.format(login=login)
+        else:
+            verdict, reason = "NOTHING_TO_DO", "нет значимых корректировок"
+        return {
+            "account": login,
+            "verdict": verdict,
+            "reason": reason,
+            "computed_settings": len(computed),
+            "computed_age_days": computed_age_days(computed, date.fromisoformat(today)),
+            "unsupported": unsupported,
+            "stale_planned": _stale_report(
+                writer_db.mark_stale_planned(STALE_PLANNED_MINUTES, account=login)),
+        }
+
+    client = WriteClient(login, sandbox=sandbox, dry_run=dry_run)
+
+    # Рулинг 1: кампании только этого кабинета, не всего справочника расходов.
+    campaign_ids = own_campaign_ids(client, daily_cost)
+
+    planned: List[Dict[str, Any]] = []
+    blocked: List[Dict[str, Any]] = []
+    unusable_actual = 0
+
+    for campaign_id in campaign_ids:
+        actual = _actual_modifiers(client, campaign_id)
+        unusable_actual += sum(1 for a in actual if a.get("unusable"))
+        for action in diff_modifiers(desired, actual, campaign_id):
+            ok, reason = check_action(action)
+            if not ok:
+                blocked.append({**action, "blocked_reason": reason})
+                continue
+            planned.append({**action, "account": login})
+
+    allowed, in_holdout = check_holdout(planned, holdout_ids)
+    blocked += [{**a, "blocked_reason": "заповедник"} for a in in_holdout]
+
+    # Обратная связь от отката к планированию. Стоит ДО отбора по лимиту:
+    # отсечённое здесь не занимает слотов прогона. Тот же довод — у отсева
+    # уже закрытых ключей ниже.
+    cooled = writer_db.rolled_back_segments(COOLDOWN_AFTER_ROLLBACK_DAYS, account=login)
+    allowed, in_cooldown = split_by_cooldown(allowed, cooled)
+    blocked += in_cooldown
+
+    already_final = writer_db.final_status_keys(a["idempotency_key"] for a in allowed)
+    allowed, closed_keys = split_by_final_keys(allowed, already_final)
+    blocked += closed_keys
+
+    # Порядок рельс: сначала отсекается всё, что применять нельзя или
+    # незачем (лимит прогона, отсутствие красной линии), и только потом
+    # считается бюджет. Обратный порядок списывал бы риск за действия,
+    # которые дальше отваливаются, — объект помечался бы оплаченным, а
+    # изменение по нему так и не уходило бы в кабинет.
+    allowed, over_cap = cap_actions(allowed, max_per_run=max(ctx["remaining_cap"], 0))
+
+    # Красная линия ставится ВМЕСТЕ с действием: у каждого применённого
+    # изменения заранее известно, при каком исходе оно считается провалом.
+    # build_red_line возвращает None, если её посчитать не из чего — такое
+    # действие не применяется, причина уходит в no_red_line, а не в тихий
+    # дефолт-плейсхолдер.
+    with_red_line: List[Dict[str, Any]] = []
+    no_red_line: List[Dict[str, Any]] = []
+    for a in allowed:
+        red_line = build_red_line(a, baseline_cpa, absolute_max_cpa)
+        if red_line is None:
+            no_red_line.append({**a, "blocked_reason": NO_RED_LINE_REASON})
+            continue
+        with_red_line.append({**a, "red_line": red_line})
+
+    risks = {a["idempotency_key"]: action_risk(a, daily_cost) for a in with_red_line}
+    # Бюджет читается заново для каждого кабинета: он общий на весь прогон,
+    # а не на кабинет, и предыдущий клиент этого же прогона мог его уже
+    # частично занять (spent_risk читает applied_at из журнала, куда
+    # apply_actions уже успел записать применённые действия).
+    remaining = writer_db.risk_limit(wk, DEFAULT_WEEKLY_RISK_RUB) - writer_db.spent_risk(wk)
+    prepared, deferred = fit_into_budget(with_red_line, risks, remaining, charged_objects)
+    ctx["remaining_cap"] -= len(prepared)
+
+    stale = writer_db.mark_stale_planned(STALE_PLANNED_MINUTES, account=login)
+    report = apply_actions(client, prepared, writer_db)
+
+    return {
+        "account": login,
+        "sandbox": sandbox,
+        "dry_run": dry_run,
+        "own_campaigns": len(campaign_ids),
+        "computed_settings": len(computed),
+        "computed_age_days": computed_age_days(computed, date.fromisoformat(today)),
+        "desired": len(desired),
+        "unsupported": unsupported,
+        # Записи факта без коэффициента: по ним не строится ни одно действие,
+        # и это состояние обязано быть видно, а не выглядеть как «в кабинете
+        # ничего не настроено».
+        "unusable_actual": {"count": unusable_actual,
+                            "reason": UNUSABLE_ACTUAL_REASON if unusable_actual else None},
+        "planned": len(planned),
+        "blocked": len(blocked),
+        # Отдельные счётчики, а не общая куча blocked: обратная связь от
+        # отката и съеденный закрытыми ключами лимит — разные болезни с
+        # разным лечением, и в отчёте их надо различать.
+        "blocked_by_cooldown": {
+            "count": len(in_cooldown),
+            "cooldown_days": COOLDOWN_AFTER_ROLLBACK_DAYS,
+            "reason": COOLDOWN_REASON.format(days=COOLDOWN_AFTER_ROLLBACK_DAYS)
+                      if in_cooldown else None,
+            "segments": sorted({f"{a['object_id']}:{a['direct_type']}:{a['key']}"
+                                for a in in_cooldown})[:PREVIEW_SAMPLE_LIMIT],
+        },
+        "skipped_already_final": {
+            "count": len(closed_keys),
+            "reason": ALREADY_FINAL_REASON if closed_keys else None,
+        },
+        "deferred_by_risk": len(deferred),
+        "deferred_by_cap": len(over_cap),
+        "actions_left_in_run": max(ctx["remaining_cap"], 0),
+        "no_red_line": {
+            "count": len(no_red_line),
+            "reason": NO_RED_LINE_REASON if no_red_line else None,
+        },
+        "remaining_risk_rub": round(remaining, 2),
+        "risk_charged_rub": round(sum(a["risk_rub"] for a in prepared), 2),
+        "absolute_max_cpa": absolute_max_cpa,
+        # Состав того, что уходит (или ушло бы) в кабинет. В режиме
+        # репетиции это единственное место, где он вообще виден.
+        "prepared": actions_preview(prepared),
+        "stale_planned": _stale_report(stale),
+        "result": {k: v for k, v in report.items() if k != "details"},
+        "units_left": client.units_left,
+    }
+
+
 def main() -> int:
     sandbox = "--prod" not in sys.argv
     dry_run = "--apply" not in sys.argv
@@ -381,6 +724,22 @@ def main() -> int:
         print(json.dumps({"verdict": "NOTHING_TO_DO", "reason": "нет кабинетов в DIRECT_CLIENTS_JSON"},
                          ensure_ascii=False, indent=2))
         return 0
+
+    # Аренда на прогон. Два одновременных прогона на одном ключе создают в
+    # кабинете ДВА объекта: оба читают факт до записи, оба видят, что
+    # корректировки нет, оба шлют bidmodifiers.add — и Id первого теряется
+    # навсегда, без строки журнала, без красной линии и без возможности отката.
+    try:
+        with writer_db.run_lock("agent_e1"):
+            return _run_all(clients, sandbox, dry_run, today)
+    except writer_db.RunLockBusy as exc:
+        print(json.dumps({"verdict": "RUN_LOCKED", "reason": str(exc)},
+                         ensure_ascii=False, indent=2))
+        return 1
+
+
+def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
+             today: str) -> int:
 
     holdout_ids = set(agent_db.load_holdout_ids())
     cutoff = (date.today() - timedelta(days=30)).isoformat()
@@ -404,112 +763,46 @@ def main() -> int:
     # Объекты, риск которых прогон уже оплатил (см. risk.fit_into_budget).
     charged_objects: Set[str] = set()
 
+    ctx: Dict[str, Any] = {
+        "daily_cost": daily_cost,
+        "baseline_cpa": baseline_cpa,
+        "absolute_max_cpa": absolute_max_cpa,
+        "holdout_ids": holdout_ids,
+        "charged_objects": charged_objects,
+        "week_start": wk,
+        "remaining_cap": remaining_cap,
+    }
+
+    failed_accounts: List[Dict[str, Any]] = []
     for client_info in clients:
         login = client_info["login"]
-
-        # Настройки — этого кабинета, а не общий набор на всех: числа посчитаны
-        # по его аудитории и применимы только к его кампаниям.
-        computed = agent_db.load_latest_computed_settings(login)
-        plan = plan_bid_modifiers(computed)
-        desired = plan["desired"]
-        # Значимые настройки, которые агент применить не умеет (нечисловой ключ
-        # региона, устройство вне DESKTOP/MOBILE/TABLET). Они не подставляются в
-        # чужой тип корректировки и не роняют применение — но и не пропадают
-        # молча: причина видна в отчёте прогона.
-        unsupported = _unsupported_report(plan["unsupported"])
-        if not desired:
-            print(json.dumps({
+        # Отказ ОДНОГО кабинета не отменяет остальные. Кабинетов четыре, и
+        # непойманное исключение на первом означало, что три следующих не
+        # обработаны вовсе — причём молча, потому что снаружи это выглядит
+        # просто как упавший прогон. Кабинеты независимы: у каждого свой
+        # токен-заголовок, свои кампании, свой расчёт; общее у них только
+        # лимит действий и риск-бюджет, и оба уже посчитаны так, что
+        # пропуск кабинета их не ломает.
+        try:
+            report = run_account(login, sandbox, dry_run, today, ctx)
+        except Exception as exc:
+            report = {
                 "account": login,
-                "verdict": "NO_COMPUTED_SETTINGS" if not computed else "NOTHING_TO_DO",
-                "reason": (NO_COMPUTED_REASON.format(login=login) if not computed
-                           else "нет значимых корректировок"),
-                "computed_settings": len(computed),
-                "unsupported": unsupported,
-                "stale_planned": _stale_report(
-                    writer_db.mark_stale_planned(STALE_PLANNED_MINUTES, account=login)),
-            }, ensure_ascii=False, indent=2))
-            continue
+                "verdict": "ACCOUNT_FAILED",
+                "reason": f"{type(exc).__name__}: {exc}"[:400],
+            }
+            failed_accounts.append({"account": login, "error": report["reason"]})
+        print(json.dumps(report, ensure_ascii=False, indent=2))
 
-        client = WriteClient(login, sandbox=sandbox, dry_run=dry_run)
-
-        # Рулинг 1: кампании только этого кабинета, не всего справочника расходов.
-        campaign_ids = own_campaign_ids(client, daily_cost)
-
-        planned: List[Dict[str, Any]] = []
-        blocked: List[Dict[str, Any]] = []
-
-        for campaign_id in campaign_ids:
-            actual = _actual_modifiers(client, campaign_id)
-            for action in diff_modifiers(desired, actual, campaign_id):
-                ok, reason = check_action(action)
-                if not ok:
-                    blocked.append({**action, "blocked_reason": reason})
-                    continue
-                planned.append({**action, "account": login})
-
-        allowed, in_holdout = check_holdout(planned, holdout_ids)
-        blocked += [{**a, "blocked_reason": "заповедник"} for a in in_holdout]
-
-        # Порядок рельс: сначала отсекается всё, что применять нельзя или
-        # незачем (лимит прогона, отсутствие красной линии), и только потом
-        # считается бюджет. Обратный порядок списывал бы риск за действия,
-        # которые дальше отваливаются, — объект помечался бы оплаченным, а
-        # изменение по нему так и не уходило бы в кабинет.
-        allowed, over_cap = cap_actions(allowed, max_per_run=max(remaining_cap, 0))
-
-        # Красная линия ставится ВМЕСТЕ с действием: у каждого применённого
-        # изменения заранее известно, при каком исходе оно считается провалом.
-        # build_red_line возвращает None, если её посчитать не из чего — такое
-        # действие не применяется, причина уходит в no_red_line, а не в тихий
-        # дефолт-плейсхолдер.
-        with_red_line: List[Dict[str, Any]] = []
-        no_red_line: List[Dict[str, Any]] = []
-        for a in allowed:
-            red_line = build_red_line(a, baseline_cpa, absolute_max_cpa)
-            if red_line is None:
-                no_red_line.append({**a, "blocked_reason": NO_RED_LINE_REASON})
-                continue
-            with_red_line.append({**a, "red_line": red_line})
-
-        risks = {a["idempotency_key"]: action_risk(a, daily_cost) for a in with_red_line}
-        # Бюджет читается заново для каждого кабинета: он общий на весь прогон,
-        # а не на кабинет, и предыдущий клиент этого же прогона мог его уже
-        # частично занять (spent_risk читает applied_at из журнала, куда
-        # apply_actions уже успел записать применённые действия).
-        remaining = writer_db.risk_limit(wk, DEFAULT_WEEKLY_RISK_RUB) - writer_db.spent_risk(wk)
-        prepared, deferred = fit_into_budget(with_red_line, risks, remaining, charged_objects)
-        remaining_cap -= len(prepared)
-
-        stale = writer_db.mark_stale_planned(STALE_PLANNED_MINUTES, account=login)
-        report = apply_actions(client, prepared, writer_db)
-
+    if failed_accounts:
+        # Итоговая строка отдельно от кабинетных отчётов: иначе отказ первого
+        # кабинета теряется в потоке успешных отчётов остальных трёх.
         print(json.dumps({
-            "account": login,
-            "sandbox": sandbox,
-            "dry_run": dry_run,
-            "own_campaigns": len(campaign_ids),
-            "computed_settings": len(computed),
-            "desired": len(desired),
-            "unsupported": unsupported,
-            "planned": len(planned),
-            "blocked": len(blocked),
-            "deferred_by_risk": len(deferred),
-            "deferred_by_cap": len(over_cap),
-            "actions_left_in_run": max(remaining_cap, 0),
-            "no_red_line": {
-                "count": len(no_red_line),
-                "reason": NO_RED_LINE_REASON if no_red_line else None,
-            },
-            "remaining_risk_rub": round(remaining, 2),
-            "risk_charged_rub": round(sum(a["risk_rub"] for a in prepared), 2),
-            "absolute_max_cpa": absolute_max_cpa,
-            # Состав того, что уходит (или ушло бы) в кабинет. В режиме
-            # репетиции это единственное место, где он вообще виден.
-            "prepared": actions_preview(prepared),
-            "stale_planned": _stale_report(stale),
-            "result": {k: v for k, v in report.items() if k != "details"},
-            "units_left": client.units_left,
+            "verdict": "PARTIAL_FAILURE",
+            "failed_accounts": failed_accounts,
+            "accounts_total": len(clients),
         }, ensure_ascii=False, indent=2))
+        return 1
 
     return 0
 

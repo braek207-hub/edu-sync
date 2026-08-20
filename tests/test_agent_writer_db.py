@@ -237,13 +237,17 @@ def test_mark_stale_sql_marks_only_rows_past_threshold():
 live_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="нужен DATABASE_URL")
 
 
-def _journal_row(key: str, account: str, **over):
+def _journal_row(idem_key: str, account: str, **over):
     row = {
-        "idempotency_key": key,
+        "idempotency_key": idem_key,
         "account": account,
         "object_level": "campaign",
         "object_id": "111",
         "action_kind": "bidmodifier.set",
+        # Сегмент — отдельными полями: у bidmodifier.set в payload его нет
+        # вовсе, а история откатов адресуется именно по сегменту.
+        "direct_type": "MOBILE_ADJUSTMENT",
+        "key": "MOBILE",
         "payload": {"Id": 7, "BidModifier": 30},
         "previous_state": {"Id": 7, "percent": 10},
         "red_line": {"max_cpa": 1000.0},
@@ -426,3 +430,277 @@ def test_live_stale_row_is_watched_and_charged_to_risk():
         assert row["risk_rub"] == 444.0
     finally:
         _cleanup(key)
+
+
+# ============================================================ гард отметки
+# Дефект B: отметка результата была ЕДИНСТВЕННЫМ запросом модуля без условия
+# на текущее состояние строки. Достижимое состояние — статус 'applied' И
+# проставленный rolled_back_at одновременно: наблюдение такую строку не видит,
+# риск-бюджет её не считает, переприменить нельзя. Действие исчезает из всех
+# трёх контуров разом.
+
+
+def test_mark_action_sql_refuses_rolled_back_and_final_rows():
+    sql = " ".join(writer_db.MARK_ACTION_SQL.split())
+    assert sql.startswith("UPDATE edu_agent_actions")
+    assert "rolled_back_at IS NULL" in sql
+    assert "status NOT IN (" in sql
+    for status in writer_db.FINAL_STATUSES:
+        assert "'%s'" % status in sql.rsplit("NOT IN", 1)[1], status
+    # RETURNING — то, чем вызывающий код отличает «отметили» от «строку забрал
+    # другой контур». Без него гард молчит, и апплай считает действие успешным.
+    assert "RETURNING" in sql
+
+
+def test_mark_unknown_outcome_sql_puts_row_under_watch():
+    sql = " ".join(writer_db.MARK_UNKNOWN_OUTCOME_SQL.split())
+    assert "SET status = 'stale'" in sql
+    # applied_at обязателен: по нему считается и окно наблюдения, и неделя
+    # риск-бюджета. Без него строка формально живая, но невидимая обоим.
+    assert "applied_at = COALESCE(applied_at, created_at, now())" in sql
+    assert "rolled_back_at IS NULL" in sql
+    assert "RETURNING" in sql
+
+
+def test_unknown_outcome_status_is_live_and_final():
+    # Неизвестный исход попадает в тот же контур, что и обрыв процесса:
+    # под наблюдение и под риск-бюджет (LIVE), без повторной отправки (FINAL).
+    assert "stale" in writer_db.LIVE_STATUSES
+    assert "stale" in writer_db.FINAL_STATUSES
+
+
+# ==================================================== обратная связь от отката
+
+
+def test_rolled_back_segments_sql_groups_by_object_and_segment():
+    sql = " ".join(writer_db.ROLLED_BACK_SEGMENTS_SQL.split())
+    # Ключ истории — объект и сегмент. Процента в группировке нет и быть не
+    # может: он дрейфует между расчётами и обходил бы кулдаун.
+    assert "GROUP BY 1, 2, 3, 4" in sql
+    assert "percent" not in sql
+    assert "rolled_back_at IS NOT NULL" in sql
+    assert "make_interval(days => %s)" in sql
+    # Строки старого формата: сегмент достаётся из payload, пока колонок не было.
+    assert "COALESCE(direct_type, payload->>'Type')" in sql
+
+
+def test_insert_action_writes_segment_columns():
+    sql = " ".join(writer_db.INSERT_ACTION_SQL.split())
+    assert "direct_type" in sql and "setting_key" in sql
+    assert "direct_type = EXCLUDED.direct_type" in sql
+    assert "setting_key = EXCLUDED.setting_key" in sql
+
+
+def test_final_status_keys_asks_only_about_given_keys(monkeypatch):
+    sql, params = _captured_sql(
+        monkeypatch, lambda: writer_db.final_status_keys(["a", "b"]))
+
+    assert "idempotency_key = ANY(%s)" in sql
+    expected = ", ".join("'%s'" % x for x in writer_db.FINAL_STATUSES)
+    assert "status IN (%s)" % expected in sql
+    assert params == (["a", "b"],)
+
+
+def test_final_status_keys_does_not_query_on_empty_input(monkeypatch):
+    called = []
+    monkeypatch.setattr(writer_db, "_fetch",
+                        lambda sql, params=(): called.append(1) or [])
+
+    assert writer_db.final_status_keys([]) == set()
+    assert called == []
+
+
+# ============================================================ аренда на прогон
+
+
+def test_run_lock_registry_covers_both_workers():
+    # Параллельный запуск опасен у обоих рабочих процессов движка, и у
+    # каждого своё имя: прямое применение и откат друг другу не мешают.
+    assert "agent_e1" in writer_db.RUN_LOCK_NAMES
+    assert "agent_e1_watchdog" in writer_db.RUN_LOCK_NAMES
+
+
+def test_acquire_run_lock_sql_takes_only_expired_lease():
+    sql = " ".join(writer_db.ACQUIRE_RUN_LOCK_SQL.split())
+    assert "ON CONFLICT (lock_name) DO UPDATE SET" in sql
+    # Чужую живую аренду перехватывать нельзя — только протухшую.
+    assert "WHERE edu_agent_run_lock.expires_at < now()" in sql
+    assert "RETURNING" in sql
+
+
+def test_run_lock_rejects_unknown_name():
+    with pytest.raises(ValueError):
+        with writer_db.run_lock("agent_e9"):
+            pass  # pragma: no cover
+
+
+# ================================================================= живой SQL
+
+
+@live_db
+def test_live_mark_action_does_not_resurrect_rolled_back_row():
+    # Гонка: apply увидел нефинальный статус и отправил запрос; пока он летел,
+    # сторож перевёл строку в 'stale' и откатил её. Безусловный UPDATE затирал
+    # откат обратно в 'applied' — и строка выпадала из наблюдения, из
+    # риск-бюджета и из переприменения одновременно.
+    ensure_writer_tables()
+    key = "test-mark-guard-" + uuid.uuid4().hex[:8]
+    try:
+        action_id = writer_db.insert_action(_journal_row(key, "test-acc"))
+        writer_db.mark_rolled_back(action_id)
+
+        landed = writer_db.mark_action(action_id, "applied", {"ok": True})
+
+        assert landed is False, "отметка обязана НЕ ложиться на откатанную строку"
+        row = _read_row(key)
+        assert row["status"] == "rolled_back"
+        assert row["rolled_back_at"] is not None
+    finally:
+        _cleanup(key)
+
+
+@live_db
+def test_live_mark_action_lands_on_planned_row():
+    # Обратная половина гарда: нормальный путь обязан работать, иначе гард
+    # зеленел бы просто потому, что не обновляет ничего и никогда.
+    ensure_writer_tables()
+    key = "test-mark-ok-" + uuid.uuid4().hex[:8]
+    try:
+        action_id = writer_db.insert_action(_journal_row(key, "test-acc"))
+
+        assert writer_db.mark_action(action_id, "applied", {"ok": True}) is True
+
+        row = _read_row(key)
+        assert row["status"] == "applied"
+        assert row["applied_at"] is not None
+    finally:
+        _cleanup(key)
+
+
+@live_db
+def test_live_unknown_outcome_row_is_watched_and_charged():
+    # Строка с неизвестным исходом обязана вести себя как зависшая: попадать
+    # в наблюдение сторожа и занимать риск-бюджет. Иначе изменение живёт в
+    # кабинете бесплатно и без присмотра.
+    ensure_writer_tables()
+    key = "test-unknown-" + uuid.uuid4().hex[:8]
+    account = "test-" + uuid.uuid4().hex[:8]
+    try:
+        action_id = writer_db.insert_action(_journal_row(key, account))
+
+        assert writer_db.mark_unknown_outcome(action_id, "ReadTimeout") is True
+
+        row = _read_row(key)
+        assert row["status"] == "stale"
+        assert row["applied_at"] is not None
+        assert row["response"]["unknown_outcome"] is True
+        assert key in {r["idempotency_key"] for r in writer_db.open_actions()}
+        week = row["applied_at"].date().isoformat()
+        assert writer_db.spent_risk(week) >= 100.0
+    finally:
+        _cleanup(key)
+
+
+@live_db
+def test_live_unknown_outcome_is_not_sent_again():
+    # 'stale' входит в FINAL_STATUSES: повторная отправка исключена, иначе
+    # bidmodifiers.add создал бы в кабинете второй объект.
+    ensure_writer_tables()
+    key = "test-unknown-repeat-" + uuid.uuid4().hex[:8]
+    try:
+        action_id = writer_db.insert_action(_journal_row(key, "test-acc"))
+        writer_db.mark_unknown_outcome(action_id, "ReadTimeout")
+
+        assert writer_db.final_status_keys([key]) == {key}
+        # Повторная планировка того же ключа не переписывает previous_state.
+        writer_db.insert_action(_journal_row(key, "test-acc",
+                                             previous_state={"Id": 7, "percent": 99}))
+        assert _read_row(key)["previous_state"] == {"Id": 7, "percent": 10}
+    finally:
+        _cleanup(key)
+
+
+@live_db
+def test_live_rolled_back_segment_is_visible_to_planning():
+    # Ключевой факт дефекта A: после отката планирование обязано УЗНАТЬ об
+    # этом по объекту и сегменту, а не по проценту.
+    ensure_writer_tables()
+    key = "test-cooldown-" + uuid.uuid4().hex[:8]
+    account = "test-" + uuid.uuid4().hex[:8]
+    try:
+        action_id = writer_db.insert_action(_journal_row(
+            key, account, direct_type="MOBILE_ADJUSTMENT", key="MOBILE"))
+        writer_db.mark_action(action_id, "applied", {})
+        writer_db.mark_rolled_back(action_id)
+
+        cooled = writer_db.rolled_back_segments(60, account=account)
+
+        assert ("111", "MOBILE_ADJUSTMENT", "MOBILE") in cooled
+    finally:
+        _cleanup(key)
+
+
+@live_db
+def test_live_rollback_outside_cooldown_window_does_not_block():
+    # Кулдаун конечен: старый откат планирование не запирает навсегда.
+    ensure_writer_tables()
+    key = "test-cooldown-old-" + uuid.uuid4().hex[:8]
+    account = "test-" + uuid.uuid4().hex[:8]
+    try:
+        action_id = writer_db.insert_action(_journal_row(
+            key, account, direct_type="MOBILE_ADJUSTMENT", key="MOBILE"))
+        writer_db.mark_rolled_back(action_id)
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE edu_agent_actions "
+                    "SET rolled_back_at = now() - make_interval(days => 61) "
+                    "WHERE idempotency_key = %s",
+                    (key,),
+                )
+            conn.commit()
+
+        assert writer_db.rolled_back_segments(60, account=account) == {}
+    finally:
+        _cleanup(key)
+
+
+@live_db
+def test_live_second_run_cannot_take_the_same_lock():
+    # Два одновременных прогона на одном ключе создают в кабинете два объекта.
+    ensure_writer_tables()
+    with writer_db.run_lock("agent_e1"):
+        with pytest.raises(writer_db.RunLockBusy):
+            with writer_db.run_lock("agent_e1"):
+                pass  # pragma: no cover
+
+    # Аренда снята по выходу — следующий прогон стартует штатно.
+    with writer_db.run_lock("agent_e1"):
+        pass
+
+
+@live_db
+def test_live_expired_lease_is_taken_over():
+    # Смерть процесса не должна блокировать движок навсегда: аренда протухает.
+    ensure_writer_tables()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO edu_agent_run_lock (lock_name, holder, expires_at) "
+                "VALUES ('agent_e1', 'dead-process', now() - make_interval(mins => 1)) "
+                "ON CONFLICT (lock_name) DO UPDATE SET holder = EXCLUDED.holder, "
+                "expires_at = EXCLUDED.expires_at"
+            )
+        conn.commit()
+
+    with writer_db.run_lock("agent_e1") as holder:
+        assert holder != "dead-process"
+
+
+@live_db
+def test_live_watchdog_lock_is_independent_of_the_main_run():
+    # Прямое применение и откат друг другу не мешают: имена разные.
+    ensure_writer_tables()
+    with writer_db.run_lock("agent_e1"):
+        with writer_db.run_lock("agent_e1_watchdog"):
+            pass
