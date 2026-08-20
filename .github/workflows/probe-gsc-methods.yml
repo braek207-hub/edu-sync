@@ -17,6 +17,6 @@ jobs:
           GSC_SA_KEY: ${{ secrets.GSC_SA_KEY }}
         run: printf '%s' "$GSC_SA_KEY" > sa.json
       - name: Probe
-        run: python scripts/probe_gsc_brand_methods.py
+        run: python -m scripts.probe_gsc_brand_methods
         env:
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
