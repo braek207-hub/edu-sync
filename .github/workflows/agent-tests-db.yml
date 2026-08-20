@@ -18,7 +18,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          python -m pytest tests/test_agent_writer_db.py tests/test_agent_writer_apply.py -v
+          python -m pytest tests/test_agent_writer_db.py tests/test_agent_writer_apply.py tests/test_agent_e1_watchdog.py -v
       - name: Что осталось в журнале действий
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -27,4 +27,4 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          python -m pytest tests/test_agent_e0.py tests/test_agent_e1.py tests/test_agent_writer_*.py tests/test_agent_db_sql.py -q
+          python -m pytest tests/test_agent_e0.py tests/test_agent_e1*.py tests/test_agent_writer_*.py tests/test_agent_db_sql.py -q

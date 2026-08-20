@@ -380,6 +380,34 @@ def load_baseline_cpa(date_from: str, date_to: str) -> Dict[str, float]:
     return {str(r["campaign_id"]): float(r["cpa"]) for r in rows}
 
 
+def load_daily_facts(
+    campaign_ids: List[str], date_from: str, date_to: str
+) -> List[Dict[str, Any]]:
+    """Дневные факты названных кампаний за окно — сырьё сторожа красных линий.
+
+    Намеренно БЕЗ агрегата, в отличие от load_baseline_cpa: у каждого
+    применённого действия своё окно наблюдения, отсчитанное от собственного
+    момента применения, и свернуть их в один SUM по кампании нельзя — два
+    действия по одной кампании, применённые в разные дни, судятся по разным
+    отрезкам. Агрегат считает вызывающий код, по дням.
+
+    Знаменатель наблюдения — eff_leads, тот же, что у базового CPA
+    (load_baseline_cpa): красная линия сравнивает наблюдаемый CPA с базовым,
+    и считать их по разным знаменателям значит сравнивать разные величины.
+    """
+    ids = sorted({str(c) for c in campaign_ids})
+    if not ids:
+        return []
+    return _fetch_dicts(
+        """
+        SELECT campaign_id, fact_date, cost, eff_leads
+        FROM edu_agent_facts
+        WHERE campaign_id = ANY(%s) AND fact_date BETWEEN %s AND %s
+        """,
+        (ids, date_from, date_to),
+    )
+
+
 def load_daily_cost_by_campaign(date_from: str, date_to: str) -> Dict[str, float]:
     """Средний дневной расход кампании за окно — множитель цены ошибки."""
     rows = _fetch_dicts(

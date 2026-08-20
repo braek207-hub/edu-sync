@@ -36,6 +36,27 @@ WRITER_DDL: List[str] = [
       rolled_back_at   TIMESTAMPTZ
     )
     """,
+    # Неудавшийся откат. Колонки добавляются отдельным ALTER, а не правкой
+    # CREATE TABLE выше: таблица уже существует в базе, и CREATE TABLE IF NOT
+    # EXISTS её не трогает — новая колонка в теле CREATE появилась бы только на
+    # чистой базе, а на рабочей молча отсутствовала бы.
+    #
+    #   rollback_attempts  — сколько раз откат пытались отправить. Ограничитель
+    #                        повторов: сетевой сбой стоит повторить, но не вечно.
+    #   rollback_failed_at — откат признан неисполнимым автоматически. Строка
+    #                        снимается с наблюдения (open_actions), потому что
+    #                        каждый следующий прогон повторял бы ровно тот же
+    #                        обречённый запрос. Изменение при этом ОСТАЁТСЯ
+    #                        живым: статус не меняется, rolled_back_at пуст,
+    #                        риск-бюджет продолжает его оплачивать — деньги под
+    #                        неоткатанным изменением никуда не делись.
+    #   rollback_error     — причина последней неудачи, для отчёта и разбора.
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS rollback_attempts  INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS rollback_failed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS rollback_error     TEXT
+    """,
     # Недельный риск-бюджет: сколько денег под непроверенными изменениями.
     """
     CREATE TABLE IF NOT EXISTS edu_agent_risk_budget (
@@ -188,10 +209,17 @@ def open_actions() -> List[Dict[str, Any]]:
     и оставлять его без наблюдения нельзя. Именно из-за прежнего фильтра
     только по 'applied' зависшая строка не попадала в поле зрения ни сторожа,
     ни отката — и вечно печаталась в отчёте, ничем больше не отзываясь.
+
+    Строки с проставленным rollback_failed_at исключены: их откат уже признан
+    неисполнимым автоматически (неизвестен Id, рельсы отклонили запрос на
+    возврат, исчерпаны попытки отправки). Держать их в наблюдении значило бы
+    отправлять один и тот же обречённый запрос каждый прогон. Потерянными они
+    не становятся: их считает failed_rollbacks_count и разбирает человек.
     """
     return _fetch(
         "SELECT * FROM edu_agent_actions "
-        "WHERE status IN (__LIVE_STATUSES__) AND rolled_back_at IS NULL".replace(
+        "WHERE status IN (__LIVE_STATUSES__) AND rolled_back_at IS NULL "
+        "AND rollback_failed_at IS NULL".replace(
             "__LIVE_STATUSES__", _sql_literals(LIVE_STATUSES))
     )
 
@@ -291,6 +319,72 @@ def mark_rolled_back(action_id: str) -> None:
                 (action_id,),
             )
         conn.commit()
+
+
+# Сколько раз откат одного действия вообще стоит пытаться отправить.
+# Сбой отправки бывает разовым (сеть, 5xx после ретраев клиента) — такой
+# повтор на следующем прогоне осмыслен. Но повторять бесконечно нельзя:
+# детерминированный отказ (кампании больше нет, объект удалён руками) иначе
+# уходил бы в кабинет каждый час вечно и вечно же занимал бы отчёт.
+MAX_ROLLBACK_ATTEMPTS = 3
+
+# Попытка и её исход — одним UPDATE ... RETURNING: счётчик попыток и решение
+# «снимать ли с повторов» не могут разъехаться между двумя прогонами.
+#
+# permanent=True приходит для отказов, которые повтор не исправит в принципе:
+# неизвестен Id корректировки (откат вслепую) или запрос на возврат отклонён
+# рельсами. Ждать три попытки в этом случае бессмысленно — исход тот же.
+MARK_ROLLBACK_FAILED_SQL = """
+    UPDATE edu_agent_actions
+       SET rollback_attempts  = rollback_attempts + 1,
+           rollback_error     = %(reason)s,
+           rollback_failed_at = CASE
+               WHEN %(permanent)s OR rollback_attempts + 1 >= %(max_attempts)s
+                   THEN COALESCE(rollback_failed_at, now())
+               ELSE rollback_failed_at
+           END
+     WHERE action_id = %(action_id)s
+    RETURNING action_id, object_id, action_kind, rollback_attempts,
+              rollback_failed_at, rollback_error
+"""
+
+
+def mark_rollback_failed(
+    action_id: str, reason: str, permanent: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Фиксирует неудачную попытку отката и возвращает новое состояние строки.
+
+    Изменение остаётся живым: статус не трогается, rolled_back_at не ставится.
+    Проставленный в ответе rollback_failed_at означает, что автоматических
+    попыток больше не будет и строку разбирает человек.
+    """
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(MARK_ROLLBACK_FAILED_SQL, {
+                "action_id": action_id,
+                "reason": reason[:500],
+                "permanent": bool(permanent),
+                "max_attempts": MAX_ROLLBACK_ATTEMPTS,
+            })
+            row = cur.fetchone()
+        conn.commit()
+    return dict(row) if row else None
+
+
+def failed_rollbacks_count() -> int:
+    """Сколько живых изменений остались неоткатанными и ждут человека.
+
+    Число, а не список: отчёт читается глазами каждый прогон, и растущий
+    перечень одних и тех же строк перестаёт читаться (тот же довод, что у
+    mark_stale_planned). Список достаётся из журнала по rollback_failed_at.
+    """
+    rows = _fetch(
+        """
+        SELECT COUNT(*) AS n FROM edu_agent_actions
+        WHERE rollback_failed_at IS NOT NULL AND rolled_back_at IS NULL
+        """
+    )
+    return int(rows[0]["n"]) if rows else 0
 
 
 def spent_risk(week_start: str) -> float:
