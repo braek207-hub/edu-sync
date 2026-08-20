@@ -351,3 +351,30 @@ def test_aggregate_orders_totals_unchanged_by_campaign_split():
     assert sum(r["orders"] for r in rows) == pytest.approx(len(orders))
     assert abs(sum(r["revenue"] for r in rows)
                - sum(float(o["total_price"]) for o in orders)) < 0.01
+
+
+def test_linear_all_internal_touch_dropped_from_denominator():
+    """Касание своего домена не получает кредита — вес делится между внешними."""
+    order = {"total_price": 100,
+             "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}],
+             "attribution": {"linearAll": [
+                 {"source": "google-ads", "campaignId": "111"},
+                 {"source": "organic_and_social", "campaignId": "sa.limestore.com"},
+             ]}}
+    rows = aggregate_orders_by_channel([order], "2026-08-20")
+    assert len(rows) == 1
+    assert rows[0]["subchannel"] == "Google.Adwords"
+    assert rows[0]["orders"] == pytest.approx(1.0) and rows[0]["revenue"] == pytest.approx(100.0)
+
+
+def test_linear_all_pure_internal_path_stays_internal():
+    """Путь целиком из своих доменов — заказ остаётся в Internal, не пропадает."""
+    order = {"total_price": 50,
+             "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}],
+             "attribution": {"linearAll": [
+                 {"source": "organic_and_social", "campaignId": "lime-shop.com"},
+             ]}}
+    rows = aggregate_orders_by_channel([order], "2026-08-20")
+    assert len(rows) == 1
+    assert rows[0]["channel"] == "Internal"
+    assert rows[0]["orders"] == pytest.approx(1.0)

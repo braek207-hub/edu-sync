@@ -9,7 +9,7 @@ import time
 
 import requests
 
-from sync.gcc_channels import map_domain_country, map_tw_source
+from sync.gcc_channels import _OWN_DOMAINS, map_domain_country, map_tw_source
 
 _HOST_RE = re.compile(r"https?://([^/]+)", re.I)
 
@@ -141,6 +141,14 @@ def order_country(order: dict) -> str | None:
     return None
 
 
+def _is_internal_touch(touchpoint: dict) -> bool:
+    """Касание «своего домена»: organic_and_social с реферером витрины (Internal)."""
+    if (touchpoint.get("source") or "").lower() != "organic_and_social":
+        return False
+    referrer = (touchpoint.get("campaignId") or "").strip().lower()
+    return any(own in referrer for own in _OWN_DOMAINS)
+
+
 def aggregate_orders_by_channel(orders: list[dict], date: str,
                                 country_by_order: dict[str, str | None] | None = None,
                                 exclude_orders: set[str] | None = None,
@@ -148,9 +156,15 @@ def aggregate_orders_by_channel(orders: list[dict], date: str,
     """Свернуть заказы в строки заказы/выручка по каналу и стране — атрибуция **linearAll**.
 
     Методика ручного отчёта Павла (решение 2026-08-20): каждый заказ делится поровну между
-    ВСЕМИ касаниями пути (`attribution.linearAll`, вес 1/N), заказы и выручка по каналам
-    дробные. Заказ без linearAll (нет журнала) — целиком последнему платформенному клику
+    касаниями пути (`attribution.linearAll`, вес 1/N), заказы и выручка по каналам дробные.
+    Заказ без linearAll (нет журнала) — целиком последнему платформенному клику
     (прежняя цепочка order_touchpoint), поэтому тотал всегда = числу заказов.
+
+    Касания СВОИХ доменов (organic_and_social с реферером limestore/lime-shop — «Internal»)
+    выкидываются из знаменателя: переход с витрины на витрину — не маркетинговый канал, и
+    зонд W33 (2026-08-20) показал, что так доли каналов сходятся с ручным отчётом
+    (paid 54.3% против 54.6%, блок органики 37.2% против 36.3%). Путь целиком из
+    внутренних касаний остаётся как есть — канал Internal живёт для честных остатков.
     Округление дробей до INTEGER-колонки — на стороне lime_gcc (largest remainder).
 
     Args:
@@ -180,6 +194,8 @@ def aggregate_orders_by_channel(orders: list[dict], date: str,
         touchpoints = (order.get("attribution") or {}).get("linearAll") or []
         if not touchpoints:
             touchpoints = [order_touchpoint(order)]
+        external = [t for t in touchpoints if not _is_internal_touch(t)]
+        touchpoints = external or touchpoints
         weight = 1.0 / len(touchpoints)
         country = ship[oid0] if oid0 in ship else order_country(order)
         revenue = float(order.get("total_price") or 0)
