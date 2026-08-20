@@ -104,6 +104,93 @@ def fetch_ga4_traffic(property_id: str, dates: list[str], metric: str = "activeU
     return out
 
 
+# Служебные значения GA4-измерений — это «нет данных», а не имя кампании/источника.
+_GA4_NOT_SET = {"", "(not set)", "(none)", "(direct)", "(organic)", "(referral)", "(not provided)"}
+
+# Страна дашборда: 5 продуктовых стран GCC (как Метрика-GCC5 и ручной файл Павла).
+# Русские имена — те же, что пишет в lime_stats Метрика-пайплайн и TW-заказы.
+_HOST_COUNTRY_RU = {
+    "ae": "ОАЭ", "sa": "Саудовская Аравия", "qa": "Катар", "kw": "Кувейт", "om": "Оман",
+}
+
+_FUNNEL_EVENTS = ("add_to_cart", "begin_checkout")
+
+
+def _host_country_ru(host: str | None) -> str | None:
+    return _HOST_COUNTRY_RU.get((host or "").strip().lower().split(".")[0])
+
+
+def fetch_ga4_dashboard_traffic(property_id: str, frm: str, to: str) -> list[dict]:
+    """Трафик GCC для lime_stats: строки формы Метрика-пайплайна, но из GA4.
+
+    Два запроса: (1) трафик по date×host×source×medium×campaignId×campaignName —
+    sessions/totalUsers/newUsers/bounceRate/pageViewsPerSession; (2) воронка тем же ключом
+    без campaignName + eventName (add_to_cart/begin_checkout) — sessions с событием,
+    джойн по ключу. users = totalUsers (метрика ручного файла Павла, = «Всего» в UI GA4).
+
+    Только 5 GCC-хостов (bh и прочее отбрасывается — как Метрика-GCC5): сумма 5 стран =
+    GCC-тотал, строк country=None нет.
+
+    Returns:
+        Строки {date, country, campaign, campaign_label, channel, subchannel, traffic_type,
+        visits, users, new_users, bounce_w, depth_w, cart_reaches, checkout_reaches}.
+        campaign — sessionCampaignId (id площадки), campaign_label — sessionCampaignName
+        (метка для моста, когда id "(not set)").
+    """
+    from sync.gcc_channels import map_ga4_channel
+
+    dims = ["date", "hostName", "sessionSource", "sessionMedium",
+            "sessionCampaignId", "sessionCampaignName"]
+    traffic = run_report(property_id, frm, to, dims,
+                         ("sessions", "totalUsers", "newUsers",
+                          "bounceRate", "screenPageViewsPerSession"))
+
+    # Ключ воронки = ПОЛНЫЙ ключ трафика (с campaignName): без него один campaignId
+    # с несколькими метками (например "(not set)" у писем) заджойнился бы в каждую
+    # строку-метку и события задвоились.
+    funnel_rows = run_report(
+        property_id, frm, to, dims + ["eventName"], ("sessions",),
+        {"filter": {"fieldName": "eventName", "inListFilter": {"values": list(_FUNNEL_EVENTS)}}},
+    )
+    funnel: dict[tuple, list[int]] = {}
+    for r in funnel_rows:
+        key = tuple(r["dims"][:6])
+        acc = funnel.setdefault(key, [0, 0])
+        acc[_FUNNEL_EVENTS.index(r["dims"][6])] += int(r["metrics"][0])
+
+    out: list[dict] = []
+    for r in traffic:
+        d_raw, host, src, med, camp_id, camp_name = r["dims"]
+        country = _host_country_ru(host)
+        if not country:
+            continue
+        iso = f"{d_raw[:4]}-{d_raw[4:6]}-{d_raw[6:8]}"
+        sessions = int(r["metrics"][0])
+        channel, subchannel, traffic_type = map_ga4_channel(src, med)
+        cart, checkout = funnel.get((d_raw, host, src, med, camp_id, camp_name), (0, 0))
+        campaign = (camp_id or "").strip()
+        label = (camp_name or "").strip()
+        out.append({
+            "date": iso,
+            "country": country,
+            "campaign": None if campaign in _GA4_NOT_SET else campaign,
+            "campaign_label": None if label in _GA4_NOT_SET else label,
+            "channel": channel,
+            "subchannel": subchannel,
+            "traffic_type": traffic_type,
+            "visits": sessions,
+            "users": int(r["metrics"][1]),
+            "new_users": int(r["metrics"][2]),
+            # Конвенция bounce_w/depth_w Метрика-пайплайна: взвешено на визиты,
+            # мерж делит обратно (bounce → доля×100 = %).
+            "bounce_w": float(r["metrics"][3] or 0) * sessions,
+            "depth_w": float(r["metrics"][4] or 0) * sessions,
+            "cart_reaches": cart,
+            "checkout_reaches": checkout,
+        })
+    return out
+
+
 def validate() -> None:
     """Сверка с ручным файлом: печать per-country ORG/PAID/Total за окно, activeUsers И sessions."""
     import os as _os

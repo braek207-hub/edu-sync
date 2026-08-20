@@ -2,12 +2,12 @@ name: Sync LIME GCC → Supabase
 
 on:
   schedule:
-    # РАННИЙ прогон 00:00 UTC = 03:00 МСК: вчера уже завершилось (~3ч назад), Метрика/TW обычно
+    # РАННИЙ прогон 00:00 UTC = 03:00 МСК: вчера уже завершилось (~3ч назад), GA4/TW обычно
     # готовы. Ранний старт = запас на зависание планировщика GitHub (кроны опаздывают на 1-3ч),
     # чтобы полные данные за вчера были к утру. Лист GCC подтянется сразу после (workflow_run).
     - cron: "0 0 * * *"
     # СТРАХОВКА 02:30 UTC = 05:30 МСК: DELETE+INSERT 7 дн. перезапишет вчера, если к 3 ночи
-    # Метрика ещё не финализировала день (идемпотентно — второй прогон уточняет). Все страховки
+    # GA4 ещё не финализировал день (идемпотентно — второй прогон уточняет). Все страховки
     # укладываются ДО 08:00 МСК (лист подтянется ~05:45 через workflow_run).
     - cron: "30 2 * * *"
   workflow_dispatch:
@@ -52,10 +52,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Write GA4 service account key
+        env:
+          GSC_SA_KEY: ${{ secrets.GSC_SA_KEY }}   # lime-reports SA — scope analytics.readonly (GA4 трафик)
+        run: |
+          if [ -z "$GSC_SA_KEY" ]; then echo "GSC_SA_KEY пуст" && exit 1; fi
+          printf '%s' "$GSC_SA_KEY" > sa.json
+
       - name: Run GCC sync
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GCC_METRICA_TOKEN: ${{ secrets.GCC_METRICA_TOKEN }}
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
           GCC_TRIPLEWHALE_API_KEY: ${{ secrets.GCC_TRIPLEWHALE_API_KEY }}
           GCC_TW_SHOP_DOMAIN: ${{ secrets.GCC_TW_SHOP_DOMAIN }}
           API_LIME_SHOPIFY: ${{ secrets.API_LIME_SHOPIFY }}   # offline Admin API token — страна доставки заказа
