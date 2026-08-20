@@ -1,25 +1,34 @@
 # -*- coding: utf-8 -*-
-"""sync/lime_gcc.py — оркестратор GCC: Метрика(трафик) + Triple Whale(заказы/расход) → lime_stats (region='gcc').
+"""sync/lime_gcc.py — оркестратор GCC: GA4(трафик) + Triple Whale(заказы/расход) → lime_stats (region='gcc').
 
-Мержит три источника по ключу (channel, subchannel) в единую строку `lime_stats`:
-- sync.gcc_metrika.fetch_metrika_traffic — визиты/юзеры (Яндекс.Метрика, счётчик GCC)
-- sync.gcc_triplewhale.aggregate_orders_by_channel — заказы/выручка (TW attribution, AED)
+Методика = ручной недельный отчёт Павла (решение 2026-08-20, план
+docs/superpowers/plans/2026-08-20-lime-gcc-linearall-ga4.md в EDU v2):
+- sync.gcc_ga4.fetch_ga4_dashboard_traffic — сессии/юзеры/воронка (GA4 property 417919368);
+  до 2026-08-20 трафик брала Яндекс.Метрика 98232701 (модуль gcc_metrika остаётся для аудита)
+- sync.gcc_triplewhale.aggregate_orders_by_channel — заказы/выручка по **linearAll**
+  (1/N на касание, дробно; AED)
 - sync.gcc_triplewhale.spend_by_channel — расход (TW summary-page, AED)
 Деньги (cost/revenue) конвертируются AED→RUB по курсу ЦБ (sync.fx.to_rub); трафик — как есть.
 
-Каналы каждого источника уже приведены к единой таксономии (sync.gcc_channels): Метрика через
-map_metrika_channel, TW-заказы/расход через map_tw_source/SPEND_METRIC_MAP — поэтому мерж по
+Каналы каждого источника уже приведены к единой таксономии (sync.gcc_channels): GA4 через
+map_ga4_channel, TW-заказы/расход через map_tw_source/SPEND_METRIC_MAP — поэтому мерж по
 (channel, subchannel) валиден.
 
-customers/new_users/new_customers/new_customers_revenue = 0: TW-атрибуция не даёт чистого
+Дробные заказы linearAll округляются в INTEGER-колонку purchases_count методом largest
+remainder внутри (день, страна): тотал дня и страны точный, дробится только раскладка
+по каналам/кампаниям. Выручка (FLOAT) остаётся точной дробной.
+
+customers/new_customers/new_customers_revenue = 0: TW-атрибуция не даёт чистого
 per-channel деления новый/лояльный клиент — блок «Новые/Лояльные» GCC пуст в v1.
 
-ENV: GCC_METRICA_TOKEN, GCC_METRICA_COUNTER_ID (default 98232701), GCC_TRIPLEWHALE_API_KEY,
-GCC_TW_SHOP_DOMAIN, DATABASE_URL, LIME_GCC_SYNC_FROM/LIME_GCC_SYNC_TO или LIME_GCC_SYNC_DAYS
-(default 7). LIME_GCC_DRY_RUN — пропустить БД, только напечатать сводку (для локальной проверки
+ENV: GOOGLE_APPLICATION_CREDENTIALS/LIME_REPORTS_SA_JSON (SA lime-reports, scope analytics),
+GCC_GA4_PROPERTY (default 417919368), GCC_TRIPLEWHALE_API_KEY, GCC_TW_SHOP_DOMAIN,
+DATABASE_URL, LIME_GCC_SYNC_FROM/LIME_GCC_SYNC_TO или LIME_GCC_SYNC_DAYS (default 7).
+LIME_GCC_DRY_RUN — пропустить БД, только напечатать сводку (для локальной проверки
 без доступа к прод-Supabase с машины).
 Запуск: python -m sync.lime_gcc
 """
+import math
 import os
 import time
 from datetime import date, timedelta
@@ -29,13 +38,11 @@ import psycopg2.extras
 
 from sync.fx import to_rub as fx_to_rub
 from sync.gcc_campaign_bridge import bridge_metrika_campaign, fetch_campaign_index
-from sync.gcc_channels import map_metrika_channel
+from sync.gcc_ga4 import GA4_PROPERTY, fetch_ga4_dashboard_traffic
 from sync.gcc_google_geo import fetch_geo_spend
-from sync.gcc_metrika import fetch_metrika_traffic
 from sync.gcc_tw_ads import fetch_ads_spend, spend_metrics_covered
 from sync.gcc_triplewhale import aggregate_orders_by_channel, fetch_tw_orders, fetch_tw_spend, spend_by_channel
 
-METRICA_COUNTER_ID = os.environ.get("GCC_METRICA_COUNTER_ID") or "98232701"
 SYNC_DAYS = int(os.environ.get("LIME_GCC_SYNC_DAYS") or "7")
 
 DELETE_SQL = "DELETE FROM lime_stats WHERE region = 'gcc' AND date >= %s AND date <= %s"
@@ -54,17 +61,42 @@ COLUMNS = (
 INSERT_SQL = f"INSERT INTO lime_stats ({', '.join(COLUMNS)}) VALUES %s"
 
 
-def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
-               rub_spend_rows=(), campaign_index=None) -> list[tuple]:
-    """Свернуть трафик (Метрика) + заказы/расход (Triple Whale) по (country, channel, subchannel).
+def _round_orders_largest_remainder(agg: dict) -> dict:
+    """Дробные заказы linearAll → целые с точным тоталом внутри каждой страны.
 
-    Страна берётся из самого источника: Метрика — домен витрины, TW-заказы — journey.
+    Группа = country (ключ agg[0]); в группе floor каждому, остаток до round(суммы)
+    раздаётся строкам с наибольшей дробной частью. Тотал дня и страны не плывёт,
+    погрешность ±1 живёт только в раскладке по каналам/кампаниям.
+
+    Returns:
+        {key из agg: целые заказы}.
+    """
+    by_country: dict[str | None, list[tuple]] = {}
+    for key, row in agg.items():
+        by_country.setdefault(key[0], []).append((key, float(row["orders"])))
+    out: dict = {}
+    for items in by_country.values():
+        target = round(sum(v for _, v in items))
+        base = {k: math.floor(v) for k, v in items}
+        rem = target - sum(base.values())
+        for k, _v in sorted(items, key=lambda kv: -(kv[1] - math.floor(kv[1])))[:rem]:
+            base[k] += 1
+        out.update(base)
+    return out
+
+
+def merge_rows(ga4_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
+               rub_spend_rows=(), campaign_index=None) -> list[tuple]:
+    """Свернуть трафик (GA4) + заказы/расход (Triple Whale) по (country, channel, subchannel).
+
+    Страна берётся из самого источника: GA4 — хост витрины, TW-заказы — Shopify/journey.
     Источники без гео-разбивки (расход из TW summary-page — он на весь магазин) дают
     country=None: такие строки не приписываются ни одной стране, но входят в GCC-тотал.
 
     Args:
-        metrika_rows: sync.gcc_metrika.fetch_metrika_traffic() за день date_s.
-        tw_order_rows: sync.gcc_triplewhale.aggregate_orders_by_channel() за день date_s.
+        ga4_rows: sync.gcc_ga4.fetch_ga4_dashboard_traffic() за день date_s.
+        tw_order_rows: sync.gcc_triplewhale.aggregate_orders_by_channel() за день date_s
+            (заказы дробные, linearAll).
         tw_spend_rows: sync.gcc_triplewhale.spend_by_channel() за день date_s (в AED).
         fx_rate: курс AED→RUB (sync.fx.to_rub("AED", date_s)).
         date_s: дата строк (YYYY-MM-DD).
@@ -77,7 +109,7 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
     agg: dict[tuple[str | None, str, str, str], dict] = {}
 
     def _bucket(country, campaign, channel, subchannel, traffic_type):
-        # Кампания в ключе: id одинаков в utm Метрики, attribution TW и кабинете Google,
+        # Кампания в ключе: id одинаков в GA4 (sessionCampaignId), attribution TW и кабинете,
         # поэтому визиты, заказы и расход одной кампании сходятся в одну строку.
         key = (country, campaign or "", channel, subchannel)
         row = agg.get(key)
@@ -103,15 +135,14 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
             row["traffic_type"] = traffic_type
         return row
 
-    for m in metrika_rows:
-        channel, subchannel, traffic_type = map_metrika_channel(
-            m["traffic_source"], m["source_engine"], m.get("utm_source")
-        )
-        # Метрика пишет в utm имя кампании Meta с префиксом плейсмента, а заказы и расход
-        # ссылаются на числовой id — переводим метку в id, иначе визиты не сойдутся
-        # с деньгами той же кампании. Неопознанные метки остаются как есть.
-        campaign = bridge_metrika_campaign(m.get("campaign"), campaign_index or {})
-        row = _bucket(m.get("country"), campaign, channel, subchannel, traffic_type)
+    for m in ga4_rows:
+        # GA4 отдаёт числовой sessionCampaignId (Google И Meta) — он же в заказах TW и
+        # ads_table, мост не нужен. Когда id пуст, а метка есть (письма, ручные utm) —
+        # переводим метку в id мостом; неопознанные метки остаются как есть.
+        campaign = m.get("campaign") or bridge_metrika_campaign(
+            m.get("campaign_label"), campaign_index or {})
+        row = _bucket(m.get("country"), campaign, m["channel"], m["subchannel"],
+                      m["traffic_type"])
         row["sessions"] += int(m["visits"] or 0)
         row["users"] += int(m["users"] or 0)
         row["new_users"] += int(m.get("new_users") or 0)
@@ -123,7 +154,7 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
     for o in tw_order_rows:
         row = _bucket(o.get("country"), o.get("campaign"), o["channel"], o["subchannel"],
                       o.get("traffic_type"))
-        row["orders"] += int(o["orders"] or 0)
+        row["orders"] += float(o["orders"] or 0)
         row["revenue"] += float(o["revenue"] or 0)
 
     for sp in tw_spend_rows:
@@ -145,8 +176,10 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
         if sp.get("campaign_name") and not row["campaign_name"]:
             row["campaign_name"] = sp["campaign_name"]
 
+    orders_int = _round_orders_largest_remainder(agg)
     out: list[tuple] = []
-    for (country, campaign, channel, subchannel), row in agg.items():
+    for key, row in agg.items():
+        country, campaign, channel, subchannel = key
         cost_rub = round(row["cost"] * fx_rate + row["cost_rub"], 2)
         revenue_rub = round(row["revenue"] * fx_rate, 2)
         sessions = row["sessions"]
@@ -154,7 +187,7 @@ def merge_rows(metrika_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
             date_s, "web", "gcc", country, channel, subchannel, row["traffic_type"],
             campaign, row["campaign_name"],                    # campaign_id, campaign_name
             cost_rub, 0, 0, row["sessions"], row["users"], 0,   # cost, clicks, impressions, sessions, users, clients
-            row["orders"], revenue_rub, 0,                      # purchases_count, purchases_revenue, customers
+            orders_int[key], revenue_rub, 0,                    # purchases_count, purchases_revenue, customers
             row["new_users"], 0, 0.0,                           # new_users, new_customers, new_customers_revenue
             # Средневзвешенные по визитам; проценты и «страниц за визит» — конвенция
             # polinarepik_metrica_visits, хендлер взвешивает обратно (SUM(x * sessions)).
@@ -169,15 +202,18 @@ def app_order_rows(app_agg: list[dict], fx_rate: float, date_s: str) -> list[tup
     """Заказы приложения (Shopify app-канал) → строки lime_stats data_source='app'.
 
     Только заказы/выручка (трафика тут нет — app-трафик считает AppMetrica). Атрибуция
-    (paid/organic) и страна доставки — те же, что у web (из TW/Shopify), но канал app.
+    (paid/organic, linearAll) и страна доставки — те же, что у web (из TW/Shopify), но
+    канал app. Дробные заказы округляются так же, как web (largest remainder по стране).
     """
+    pseudo_agg = {(o.get("country"), i): o for i, o in enumerate(app_agg)}
+    orders_int = _round_orders_largest_remainder(pseudo_agg)
     out: list[tuple] = []
-    for o in app_agg:
+    for key, o in pseudo_agg.items():
         out.append((
             date_s, "app", "gcc", o.get("country"), o["channel"], o["subchannel"],
             o.get("traffic_type"), o.get("campaign"), "",
             0.0, 0, 0, 0, 0, 0,                                    # cost, clicks, impressions, sessions, users, clients
-            int(o["orders"] or 0), round(float(o["revenue"] or 0) * fx_rate, 2), 0,
+            orders_int[key], round(float(o["revenue"] or 0) * fx_rate, 2), 0,
             0, 0, 0.0, None, None, 0, 0,
         ))
     return out
@@ -217,9 +253,9 @@ def _write_day(conn, day_s: str, rows: list[tuple]) -> None:
 def _month_spans(frm: date, to: date) -> list[tuple[date, date]]:
     """Разбить период на календарные месяцы (границы включительно).
 
-    Помесячно, а не одним куском: у Stat API limit=100000 строк на ответ, и на длинном
-    диапазоне с пятью измерениями выдача упёрлась бы в него молча — без ошибки, просто
-    обрезанная. Месяц GCC даёт ~3-4 тысячи строк, запас двадцатикратный.
+    Помесячно, а не одним куском: у GA4 runReport limit=250000 строк на ответ, и на длинном
+    диапазоне с шестью измерениями выдача упёрлась бы в него молча — без ошибки, просто
+    обрезанная. Месяц GCC даёт ~4 тысячи строк, запас многократный.
     """
     spans: list[tuple[date, date]] = []
     start = frm
@@ -234,28 +270,27 @@ def _month_spans(frm: date, to: date) -> list[tuple[date, date]]:
     return spans
 
 
-def _fetch_metrika_by_month(token: str, frm: date, to: date) -> dict[str, list[dict]]:
-    """Трафик за весь период помесячно, разложенный по дням.
+def _fetch_ga4_by_month(frm: date, to: date) -> dict[str, list[dict]]:
+    """Трафик GA4 за весь период помесячно, разложенный по дням.
 
     Returns:
-        {"YYYY-MM-DD": [строки parse_metrika_traffic за этот день]}.
+        {"YYYY-MM-DD": [строки fetch_ga4_dashboard_traffic за этот день]}.
         Дни без трафика в словаре отсутствуют — вызывающий берёт пустой список.
     """
     by_day: dict[str, list[dict]] = {}
     spans = _month_spans(frm, to)
     for i, (span_from, span_to) in enumerate(spans, 1):
-        rows = fetch_metrika_traffic(
-            METRICA_COUNTER_ID, token, span_from.isoformat(), span_to.isoformat()
+        rows = fetch_ga4_dashboard_traffic(
+            GA4_PROPERTY, span_from.isoformat(), span_to.isoformat()
         )
         for row in rows:
-            by_day.setdefault(str(row.get("date") or "")[:10], []).append(row)
-        print(f"lime_gcc: Метрика {span_from}…{span_to} → {len(rows)} строк "
+            by_day.setdefault(row["date"], []).append(row)
+        print(f"lime_gcc: GA4 {span_from}…{span_to} → {len(rows)} строк "
               f"(месяц {i} из {len(spans)})")
     return by_day
 
 
 def _sync_range(frm: date, to: date, conn) -> int:
-    token = os.environ["GCC_METRICA_TOKEN"]
     tw_key = os.environ["GCC_TRIPLEWHALE_API_KEY"]
     shop = os.environ["GCC_TW_SHOP_DOMAIN"]
 
@@ -282,19 +317,15 @@ def _sync_range(frm: date, to: date, conn) -> int:
     else:
         print("lime_gcc: API_LIME_SHOPIFY не задан — страна заказов по домену витрины, app не исключён")
 
-    # Метрику тянем ПОМЕСЯЧНО, а не по дню. `ym:s:date` стоит в измерениях, поэтому
-    # диапазон возвращает те же построчные данные. На день уходит пять запросов
-    # (нерекламный + реклама детально/эталон + соцсети детально/эталон), и по дню это
-    # 5×657 = 3285 обращений на полную историю — Метрика отвечает 429 и не отпускает
-    # даже после пяти ретраев с паузой (прогон 2026-07-19 умер на первом же дне).
-    # Помесячно — 5 запросов на месяц, ~110 на всю историю.
-    metrika_by_day = _fetch_metrika_by_month(token, frm, to)
+    # GA4 тянем ПОМЕСЯЧНО (2 запроса на месяц: трафик + воронка), `date` стоит в
+    # измерениях — диапазон возвращает те же построчные данные, что и по дню.
+    ga4_by_day = _fetch_ga4_by_month(frm, to)
 
     total = 0
     day = frm
     while day <= to:
         day_s = day.isoformat()
-        metrika = metrika_by_day.get(day_s, [])
+        traffic = ga4_by_day.get(day_s, [])
         tw_orders_raw = fetch_tw_orders(tw_key, shop, day_s, day_s)
         # web-срез (Online Store, app исключён) и app-срез (только app-канал) — оба с
         # TW-атрибуцией и Shopify-страной. Канал web/app знает только Shopify.
@@ -317,7 +348,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
             tw_metrics = {k: v for k, v in tw_metrics.items() if k not in covered}
         spend = spend_by_channel(tw_metrics, day_s) + ads_spend
         fx_rate = fx_to_rub("AED", day_s)
-        rows = merge_rows(metrika, orders, spend, fx_rate, day_s,
+        rows = merge_rows(traffic, orders, spend, fx_rate, day_s,
                           rub_spend_rows=google_geo, campaign_index=campaign_index)
         rows += app_order_rows(app_ord, fx_rate, day_s)
 
@@ -358,7 +389,7 @@ def _read_preserved(conn, day_s: str) -> tuple[list[dict], list[tuple]]:
 
     Для режима regeo: заказы/расход НЕ перезапрашиваем у TW/Shopify (Павел: «заказы не трогаем»,
     Shopify отдаёт страну только за ~60 дней) — берём как есть. Трафик (sessions/users/…) из
-    web-строк отбрасываем, его даёт свежая Метрика. app-строки (там Метрики нет) — целиком.
+    web-строк отбрасываем, его даёт свежий GA4. app-строки (трафика там нет) — целиком.
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT * FROM lime_stats WHERE region='gcc' AND date=%s", (day_s,))
@@ -379,8 +410,8 @@ def _read_preserved(conn, day_s: str) -> tuple[list[dict], list[tuple]]:
     return web, app_rows
 
 
-def _merge_regeo(metrika_rows, preserved_web, day_s, campaign_index) -> list[tuple]:
-    """Свежий трафик (Метрика гео) + СОХРАНЁННЫЕ заказы/расход (из lime_stats, уже в рублях)."""
+def _merge_regeo(ga4_rows, preserved_web, day_s, campaign_index) -> list[tuple]:
+    """Свежий трафик (GA4) + СОХРАНЁННЫЕ заказы/расход (из lime_stats, уже в рублях)."""
     agg: dict[tuple, dict] = {}
 
     def bucket(country, campaign, channel, subchannel, tt):
@@ -395,10 +426,10 @@ def _merge_regeo(metrika_rows, preserved_web, day_s, campaign_index) -> list[tup
             row["traffic_type"] = tt
         return row
 
-    for m in metrika_rows:
-        channel, subchannel, tt = map_metrika_channel(
-            m["traffic_source"], m["source_engine"], m.get("utm_source"))
-        campaign = bridge_metrika_campaign(m.get("campaign"), campaign_index or {})
+    for m in ga4_rows:
+        channel, subchannel, tt = m["channel"], m["subchannel"], m["traffic_type"]
+        campaign = m.get("campaign") or bridge_metrika_campaign(
+            m.get("campaign_label"), campaign_index or {})
         row = bucket(m.get("country"), campaign, channel, subchannel, tt)
         row["sessions"] += int(m["visits"] or 0)
         row["users"] += int(m["users"] or 0)
@@ -433,23 +464,22 @@ def _merge_regeo(metrika_rows, preserved_web, day_s, campaign_index) -> list[tup
 
 
 def _regeo_range(frm: date, to: date, conn, dry: bool = False) -> int:
-    """Ре-ингест ТОЛЬКО web-трафика на гео за период. Заказы/расход/app — из lime_stats как есть."""
-    token = os.environ["GCC_METRICA_TOKEN"]
+    """Ре-ингест ТОЛЬКО web-трафика за период. Заказы/расход/app — из lime_stats как есть."""
     tw_key = os.environ["GCC_TRIPLEWHALE_API_KEY"]
     shop = os.environ["GCC_TW_SHOP_DOMAIN"]
     campaign_index = fetch_campaign_index(
         tw_key, shop, (frm - timedelta(days=90)).isoformat(), to.isoformat())
     print(f"regeo: справочник кампаний — {len(campaign_index)} имён")
-    metrika_by_day = _fetch_metrika_by_month(token, frm, to)
+    ga4_by_day = _fetch_ga4_by_month(frm, to)
 
     total, day = 0, frm
     while day <= to:
         day_s = day.isoformat()
-        metrika = metrika_by_day.get(day_s, [])
+        traffic = ga4_by_day.get(day_s, [])
         web_pres, app_rows = _read_preserved(conn, day_s)
-        rows = _merge_regeo(metrika, web_pres, day_s, campaign_index) + app_rows
+        rows = _merge_regeo(traffic, web_pres, day_s, campaign_index) + app_rows
         if dry:
-            m_users = sum(int(m["users"] or 0) for m in metrika)
+            m_users = sum(int(m["users"] or 0) for m in traffic)
             o_sum = sum(p["orders"] for p in web_pres)
             print(f"regeo [DRY] {day_s}: трафик users {m_users}, сохр. заказов {o_sum} "
                   f"({len(web_pres)} web-строк), app {len(app_rows)} → {len(rows)} строк")

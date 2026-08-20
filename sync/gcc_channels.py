@@ -36,43 +36,82 @@ def map_domain_country(domain: str | None) -> str | None:
     return GCC_DOMAIN_COUNTRY.get(prefix)
 
 
-def map_channel(source: str, medium: str) -> tuple[str, str]:
+# Медиумы платного трафика GA4. Живые значения витрины (зонд 2026-08-20): google/cpc,
+# facebook/paid, instagram/cpc; остальные — на вырост тем же словарём.
+_GA4_PAID_MEDIUMS = {"cpc", "cpa", "cpm", "ppc", "paid", "paid_social", "display", "retargeting"}
+
+# Соцсети в source (реферальный/огранический заход) → подканал как у TW-рефереров,
+# иначе визиты GA4 и заказы TW одной сети встанут разными строками.
+_GA4_SOCIAL_RULES = (
+    ("instagram", "Instagram"),
+    ("facebook", "Facebook"),
+    ("tiktok", "Tiktok"),
+    ("telegram", "Telegram"),
+    ("t.me", "Telegram"),
+    ("youtube", "Youtube"),
+    ("pinterest", "Pinterest"),
+    ("snap", "Snapchat"),
+    ("twitter", "Twitter"),
+)
+
+
+def map_ga4_channel(source: str | None, medium: str | None) -> tuple[str, str, str]:
+    """GA4 sessionSource/sessionMedium → (channel, subchannel, traffic_type) таксономии дашборда.
+
+    Ключи каналов/подканалов совпадают с map_tw_source и map_metrika_channel — на этом
+    держится мерж трафика с заказами/расходом по (channel, subchannel) в lime_gcc.
+    """
     s = (source or "").lower().strip()
     m = (medium or "").lower().strip()
-    paid = m in ("cpc", "cpa", "cpm", "paid", "paid_social", "display")
 
-    if "google" in s and paid:
-        return "SEM", "Google.Adwords"
-    if any(x in s for x in ("facebook", "instagram", "meta", "fb", "ig")) and paid:
-        return "SMM paid", "Meta Ads"
-    if "tiktok" in s and paid:
-        return "SMM paid", "TikTok Ads"
-    if any(x in s for x in ("snapchat", "snap")) and paid:
-        return "SMM paid", "Snapchat Ads"
+    if m in _GA4_PAID_MEDIUMS:
+        if "google" in s:
+            return "SEM", "Google.Adwords", "Платный"
+        if "bing" in s:
+            return "SEM", "Bing", "Платный"
+        if any(x in s for x in ("facebook", "instagram", "meta")) or s in ("fb", "ig"):
+            return "SMM paid", "Meta Ads", "Платный"
+        if "tiktok" in s:
+            return "SMM paid", "TikTok Ads", "Платный"
+        if "snap" in s:
+            return "SMM paid", "Snapchat Ads", "Платный"
+        if "pinterest" in s:
+            return "SMM paid", "Pinterest Ads", "Платный"
+        return "Others", (source or "").strip() or "Ad", "Платный"
 
-    if "google" in s and m == "organic":
-        return "SEO", "SEO Google"
     if m == "organic":
-        return "SEO", "SEO Others"
+        if "google" in s:
+            return "SEO", "SEO Google", "Бесплатный"
+        if "yandex" in s:
+            return "SEO", "SEO Yandex", "Бесплатный"
+        return "SEO", "SEO Others", "Бесплатный"
 
-    if m == "email" or "klaviyo" in s:
-        return "CRM", "Email"
-    if m in ("sms",):
-        return "CRM", "SMS"
-    if m in ("push",):
-        return "CRM", "Push"
+    if "mindbox" in s or "maestra" in s:
+        return "CRM", "Mindbox", "Бесплатный"
+    if m in ("email", "e-mail") or "klaviyo" in s:
+        return "CRM", "Email", "Бесплатный"
+    if m == "sms":
+        return "CRM", "SMS", "Бесплатный"
+    if m in ("push", "mobile_push"):
+        return "CRM", "Push", "Бесплатный"
 
-    if any(x in s for x in ("facebook", "instagram", "tiktok", "youtube", "meta")) \
-            and m in ("social", "organic_social", "referral", ""):
-        return "SMM (organic)", s.capitalize()
+    if s in ("(direct)", "(none)", "direct", "") and m in ("(none)", "(not set)", "none", ""):
+        return "Direct", "Direct", "Бесплатный"
 
-    if m == "referral":
-        return "Referrals", s.capitalize() or "Referral"
+    if any(own in s for own in _OWN_DOMAINS):
+        return "Internal", "Internal", "Бесплатный"
 
-    if s in ("(direct)", "(none)", "", "direct") or m in ("(none)", "none", "(not set)"):
-        return "Direct", "Direct"
+    for needle, name in _GA4_SOCIAL_RULES:
+        if needle in s:
+            return "SMM (organic)", name, "Бесплатный"
 
-    return "Others", (s or m or "Unknown").capitalize()
+    if s in ("qr", "qrcode") or m == "qr":
+        return "Others", "QR", "Бесплатный"
+
+    if m in ("referral", "social", "organic_social"):
+        return "Referrals", (source or "").strip() or "Реферал", "Бесплатный"
+
+    return "Others", (source or medium or "Unknown").strip(), "Бесплатный"
 
 
 # Домены-рефереры TW у organic_and_social → канон подканалов. Зонд P4 (GCC_CONTRACTS.md):

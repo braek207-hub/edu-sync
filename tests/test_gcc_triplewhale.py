@@ -105,12 +105,75 @@ def test_order_source_none_when_no_touchpoints():
 def test_aggregate_orders_totals_match():
     orders = _load("tw_orders_sample.json")["ordersWithJourneys"]
     rows = aggregate_orders_by_channel(orders, "2026-07-17")
-    assert sum(r["orders"] for r in rows) == len(orders)
+    assert sum(r["orders"] for r in rows) == pytest.approx(len(orders))
     assert abs(sum(r["revenue"] for r in rows) - sum(float(o["total_price"]) for o in orders)) < 0.01
     # каждый row имеет дату и канал из таксономии
     assert all(r["date"] == "2026-07-17" and r["channel"] for r in rows)
     # facebook-ads заказ дал строку Meta
     assert any(r["channel"] == "SMM paid" and r["subchannel"] == "Meta Ads" for r in rows)
+
+
+# === Атрибуция linearAll: 1/N на касание, дробные заказы ===
+
+
+def test_linear_all_splits_order_across_touchpoints():
+    order = {"total_price": 100,
+             "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}],
+             "attribution": {
+                 "lastPlatformClick": [{"source": "google-ads", "campaignId": "111"}],
+                 "linearAll": [
+                     {"source": "google-ads", "campaignId": "111"},
+                     {"source": "facebook-ads", "campaignId": "222"},
+                 ]}}
+    rows = aggregate_orders_by_channel([order], "2026-07-17")
+    got = {(r["subchannel"], r["campaign"]): (r["orders"], r["revenue"]) for r in rows}
+    assert got[("Google.Adwords", "111")] == (pytest.approx(0.5), pytest.approx(50.0))
+    assert got[("Meta Ads", "222")] == (pytest.approx(0.5), pytest.approx(50.0))
+    # тотал заказа не плывёт
+    assert sum(r["orders"] for r in rows) == pytest.approx(1.0)
+    assert sum(r["revenue"] for r in rows) == pytest.approx(100.0)
+
+
+def test_linear_all_organic_touch_split_by_referrer():
+    """organic_and_social касание делится по домену-реферу, campaignId не течёт в кампанию."""
+    order = {"total_price": 90,
+             "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}],
+             "attribution": {"linearAll": [
+                 {"source": "google-ads", "campaignId": "111"},
+                 {"source": "organic_and_social", "campaignId": "google"},
+                 {"source": "organic_and_social", "campaignId": "instagram"},
+             ]}}
+    rows = aggregate_orders_by_channel([order], "2026-07-17")
+    got = {(r["channel"], r["subchannel"]): r for r in rows}
+    seo = got[("SEO", "SEO Google")]
+    smm = got[("SMM (organic)", "Instagram")]
+    assert seo["orders"] == pytest.approx(1 / 3) and seo["campaign"] is None
+    assert smm["orders"] == pytest.approx(1 / 3) and smm["campaign"] is None
+    assert got[("SEM", "Google.Adwords")]["campaign"] == "111"
+
+
+def test_linear_all_missing_falls_back_to_last_platform_click():
+    """Нет linearAll (нет журнала) → заказ целиком последнему платформенному клику."""
+    order = {"total_price": 100,
+             "journey": [{"event": "page loaded", "path": "https://ae.limestore.com/"}],
+             "attribution": {"lastPlatformClick": [{"source": "google-ads", "campaignId": "111"}]}}
+    rows = aggregate_orders_by_channel([order], "2026-07-17")
+    assert len(rows) == 1
+    assert rows[0]["orders"] == pytest.approx(1.0) and rows[0]["revenue"] == pytest.approx(100.0)
+    assert rows[0]["subchannel"] == "Google.Adwords"
+
+
+def test_linear_all_country_shared_by_all_touchpoints():
+    """Страна одна на заказ (Shopify/journey) — все касания её наследуют."""
+    order = {"order_id": 42, "total_price": 60,
+             "journey": [{"event": "page loaded", "path": "https://sa.limestore.com/"}],
+             "attribution": {"linearAll": [
+                 {"source": "google-ads", "campaignId": "111"},
+                 {"source": "Direct", "campaignId": ""},
+             ]}}
+    rows = aggregate_orders_by_channel([order], "2026-07-17")
+    assert all(r["country"] == "Саудовская Аравия" for r in rows)
+    assert sum(r["orders"] for r in rows) == pytest.approx(1.0)
 
 
 def test_spend_by_channel():
@@ -166,14 +229,14 @@ def test_order_country_empty_journey():
 def test_aggregate_orders_splits_by_country():
     orders = _load("tw_orders_journey_sample.json")["ordersWithJourneys"]
     rows = aggregate_orders_by_channel(orders, "2026-07-17")
-    # тотал не поехал: сумма по строкам = сумма по заказам
-    assert sum(r["orders"] for r in rows) == len(orders)
+    # тотал не поехал: сумма по строкам = сумма по заказам (веса каждого заказа дают 1)
+    assert sum(r["orders"] for r in rows) == pytest.approx(len(orders))
     assert abs(sum(r["revenue"] for r in rows)
                - sum(float(o["total_price"]) for o in orders)) < 0.01
     # страна попала в ключ агрегации
     assert {r["country"] for r in rows} == {"ОАЭ", "Саудовская Аравия", "Кувейт", None}
     sa = [r for r in rows if r["country"] == "Саудовская Аравия"]
-    assert sum(r["orders"] for r in sa) == 2
+    assert sum(r["orders"] for r in sa) == pytest.approx(2)
     assert abs(sum(r["revenue"] for r in sa) - (1737 + 1306)) < 0.01
 
 
@@ -285,6 +348,6 @@ def test_aggregate_orders_splits_by_campaign():
 def test_aggregate_orders_totals_unchanged_by_campaign_split():
     orders = _load("tw_orders_journey_sample.json")["ordersWithJourneys"]
     rows = aggregate_orders_by_channel(orders, "2026-07-17")
-    assert sum(r["orders"] for r in rows) == len(orders)
+    assert sum(r["orders"] for r in rows) == pytest.approx(len(orders))
     assert abs(sum(r["revenue"] for r in rows)
                - sum(float(o["total_price"]) for o in orders)) < 0.01

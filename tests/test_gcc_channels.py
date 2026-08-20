@@ -4,37 +4,59 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from sync.gcc_channels import (
-    map_channel,
     map_domain_country,
+    map_ga4_channel,
     map_metrika_channel,
     map_tw_source,
 )
 
-
-def test_google_ads_paid():
-    assert map_channel("google", "cpc") == ("SEM", "Google.Adwords")
+# === GA4 sessionSource/sessionMedium (живые значения витрины, зонд 2026-08-20) ===
 
 
-def test_meta_paid():
-    assert map_channel("facebook", "cpc") == ("SMM paid", "Meta Ads")
-    assert map_channel("instagram", "paid") == ("SMM paid", "Meta Ads")
+def test_ga4_google_ads_paid():
+    assert map_ga4_channel("google", "cpc") == ("SEM", "Google.Adwords", "Платный")
 
 
-def test_organic_search():
-    assert map_channel("google", "organic") == ("SEO", "SEO Google")
+def test_ga4_meta_paid():
+    """Живые формы Meta в GA4: facebook/paid, instagram/cpc, l.facebook.com/paid."""
+    assert map_ga4_channel("facebook", "paid") == ("SMM paid", "Meta Ads", "Платный")
+    assert map_ga4_channel("instagram", "cpc") == ("SMM paid", "Meta Ads", "Платный")
+    assert map_ga4_channel("l.facebook.com", "paid") == ("SMM paid", "Meta Ads", "Платный")
 
 
-def test_direct():
-    assert map_channel("(direct)", "(none)") == ("Direct", "Direct")
+def test_ga4_organic_search():
+    assert map_ga4_channel("google", "organic") == ("SEO", "SEO Google", "Бесплатный")
+    assert map_ga4_channel("yandex", "organic") == ("SEO", "SEO Yandex", "Бесплатный")
+    assert map_ga4_channel("bing", "organic") == ("SEO", "SEO Others", "Бесплатный")
 
 
-def test_email_crm():
-    assert map_channel("klaviyo", "email") == ("CRM", "Email")
+def test_ga4_direct():
+    assert map_ga4_channel("(direct)", "(none)") == ("Direct", "Direct", "Бесплатный")
 
 
-def test_unknown_fallback():
-    ch, sub = map_channel("weirdsource", "")
-    assert ch == "Others"
+def test_ga4_email_crm():
+    assert map_ga4_channel("klaviyo", "email") == ("CRM", "Email", "Бесплатный")
+    # Maestra (ESP LIME, бренд Mindbox) — тот же подканал, что у заказов TW
+    assert map_ga4_channel("limeshop-uae.maestra.io", "referral") == ("CRM", "Mindbox", "Бесплатный")
+
+
+def test_ga4_social_referral_matches_tw_subchannels():
+    """Соцсети рефералом — подканалы как у TW-рефереров, иначе визиты и заказы разойдутся."""
+    assert map_ga4_channel("instagram.com", "referral") == ("SMM (organic)", "Instagram", "Бесплатный")
+    assert map_ga4_channel("m.facebook.com", "referral") == ("SMM (organic)", "Facebook", "Бесплатный")
+
+
+def test_ga4_own_domain_internal():
+    assert map_ga4_channel("ae.limestore.com", "referral") == ("Internal", "Internal", "Бесплатный")
+
+
+def test_ga4_referral():
+    assert map_ga4_channel("shop.app", "referral") == ("Referrals", "shop.app", "Бесплатный")
+
+
+def test_ga4_unknown_fallback():
+    ch, _sub, tt = map_ga4_channel("weirdsource", "")
+    assert ch == "Others" and tt == "Бесплатный"
 
 
 # Tests for Metrika channel mapping

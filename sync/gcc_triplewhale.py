@@ -145,7 +145,13 @@ def aggregate_orders_by_channel(orders: list[dict], date: str,
                                 country_by_order: dict[str, str | None] | None = None,
                                 exclude_orders: set[str] | None = None,
                                 only_orders: set[str] | None = None) -> list[dict]:
-    """Свернуть заказы attribution-эндпоинта в строки заказы/выручка по каналу и стране.
+    """Свернуть заказы в строки заказы/выручка по каналу и стране — атрибуция **linearAll**.
+
+    Методика ручного отчёта Павла (решение 2026-08-20): каждый заказ делится поровну между
+    ВСЕМИ касаниями пути (`attribution.linearAll`, вес 1/N), заказы и выручка по каналам
+    дробные. Заказ без linearAll (нет журнала) — целиком последнему платформенному клику
+    (прежняя цепочка order_touchpoint), поэтому тотал всегда = числу заказов.
+    Округление дробей до INTEGER-колонки — на стороне lime_gcc (largest remainder).
 
     Args:
         orders: список `ordersWithJourneys`.
@@ -153,10 +159,11 @@ def aggregate_orders_by_channel(orders: list[dict], date: str,
         country_by_order: {order_id: страна(RU)|None} из Shopify (адрес доставки — правда о
             стране). Если заказ есть в мапе — берём её (даже None = доставка вне Залива).
             Если заказа нет в мапе (Shopify не отдал) — fallback на домен витрины.
+            Страна одна на заказ — все касания её наследуют.
 
     Returns:
         Список дектов {date, country, campaign, channel, subchannel, traffic_type,
-        orders, revenue}.
+        orders(float), revenue}.
         country=None (доставка вне Залива / заказ без journey) — суммируется в GCC-тотал.
     """
     ship = country_by_order or {}
@@ -170,32 +177,37 @@ def aggregate_orders_by_channel(orders: list[dict], date: str,
             continue
         if oid0 in skip:
             continue
-        touchpoint = order_touchpoint(order)
-        src = touchpoint.get("source") or None
-        # У organic_and_social в campaignId лежит домен-реферер, а НЕ id кампании
-        # (зонд P4). Он нужен маппингу, чтобы расщепить органику и соцсети, но в
-        # колонку кампании его класть нельзя — иначе «yandex.ru» станет кампанией.
-        raw_campaign = (touchpoint.get("campaignId") or "").strip() or None
-        is_referrer = (src or "").lower() == "organic_and_social"
-        channel, subchannel, traffic_type = map_tw_source(src, raw_campaign)
+        touchpoints = (order.get("attribution") or {}).get("linearAll") or []
+        if not touchpoints:
+            touchpoints = [order_touchpoint(order)]
+        weight = 1.0 / len(touchpoints)
         country = ship[oid0] if oid0 in ship else order_country(order)
-        campaign = None if is_referrer else raw_campaign
-        key = (country, campaign, channel, subchannel, traffic_type)
-        row = agg.setdefault(
-            key,
-            {
-                "date": date,
-                "country": country,
-                "campaign": campaign,
-                "channel": channel,
-                "subchannel": subchannel,
-                "traffic_type": traffic_type,
-                "orders": 0,
-                "revenue": 0.0,
-            },
-        )
-        row["orders"] += 1
-        row["revenue"] += float(order.get("total_price") or 0)
+        revenue = float(order.get("total_price") or 0)
+        for touchpoint in touchpoints:
+            src = touchpoint.get("source") or None
+            # У organic_and_social в campaignId лежит домен-реферер, а НЕ id кампании
+            # (зонд P4). Он нужен маппингу, чтобы расщепить органику и соцсети, но в
+            # колонку кампании его класть нельзя — иначе «yandex.ru» станет кампанией.
+            raw_campaign = (touchpoint.get("campaignId") or "").strip() or None
+            is_referrer = (src or "").lower() == "organic_and_social"
+            channel, subchannel, traffic_type = map_tw_source(src, raw_campaign)
+            campaign = None if is_referrer else raw_campaign
+            key = (country, campaign, channel, subchannel, traffic_type)
+            row = agg.setdefault(
+                key,
+                {
+                    "date": date,
+                    "country": country,
+                    "campaign": campaign,
+                    "channel": channel,
+                    "subchannel": subchannel,
+                    "traffic_type": traffic_type,
+                    "orders": 0.0,
+                    "revenue": 0.0,
+                },
+            )
+            row["orders"] += weight
+            row["revenue"] += revenue * weight
     return list(agg.values())
 
 
