@@ -43,6 +43,7 @@ ENV: DATABASE_URL, DIRECT_TOKEN
 
 import json
 import math
+from statistics import median
 import sys
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -102,6 +103,13 @@ MIN_WINDOW_COVERAGE = 0.8
 # нуля, свежих строк нет, и красный гейт запретил бы откат именно там, где он
 # нужен. Поэтому порог по ШИРИНЕ дня: свежий день — тот, за который витрина
 # наполнена по строгому большинству известных ей кампаний.
+# Доля от ТИПИЧНОГО дня витрины, ниже которой день считается неполным.
+# Не доля от объединения кампаний за окно: за две недели в витрине копятся все
+# кампании, которые хоть раз откручивались, а в отдельный день активна лишь
+# часть — кампании включают, выключают, у них кончается бюджет. Порог от
+# объединения недостижим ни в один день, и гейт вставал бы в вечный отказ:
+# сторож наблюдал бы и не откатывал никогда, а в отчёте это выглядело бы
+# штатным ожиданием данных.
 GATE_MIN_BREADTH = 0.5
 
 # Витрина фактов обязана быть свежее этого возраста, иначе сторож СМОТРИТ, но
@@ -480,11 +488,12 @@ def facts_gate(mart: Dict[str, Any], today: date,
     known = int((mart or {}).get("campaigns_total") or 0)
     newest_any: Optional[date] = max(breadth) if breadth else None
 
-    # Строгое большинство: при двух кампаниях нужны обе, при трёх — две.
-    # Округление вниз плюс единица, а не ceil: ceil(2 × 0.5) = 1 вернул бы ту
-    # же дыру, ради которой ширина и вводится.
-    need = max(1, math.floor(known * GATE_MIN_BREADTH) + 1) if known else 0
-    wide = [day for day, count in breadth.items() if count >= need] if known else []
+    # Эталон — МЕДИАННЫЙ день окна, а не объединение кампаний за окно.
+    # Медиана устойчива к краям: единичный битый день её не сдвигает, а
+    # обрыв расчёта роняет её вместе со всеми днями, и гейт краснеет.
+    typical = int(median(sorted(breadth.values()))) if breadth else 0
+    need = max(1, math.floor(typical * GATE_MIN_BREADTH)) if typical else 0
+    wide = [day for day, count in breadth.items() if count >= need] if need else []
     latest: Optional[date] = max(wide) if wide else None
 
     checks = check_freshness(
@@ -498,8 +507,9 @@ def facts_gate(mart: Dict[str, Any], today: date,
     elif latest is None:
         reason = ("витрина фактов пуста за окно наблюдения"
                   if newest_any is None else
-                  f"ни один день витрины не наполнен по {need} кампаниям из "
-                  f"{known}: последняя строка есть за {newest_any.isoformat()}, "
+                  f"ни один день витрины не наполнен по {need} кампаниям при "
+                  f"типичном дне в {typical}: последняя строка есть за "
+                  f"{newest_any.isoformat()}, "
                   f"но она одиночная — прогон расчёта (agent_e0) отработал не весь")
     else:
         reason = (f"последний широкий день витрины {latest.isoformat()} при пороге "
@@ -512,6 +522,7 @@ def facts_gate(mart: Dict[str, Any], today: date,
         # отказа расчёта, а не повод считать витрину свежей.
         "latest_any_fact_date": newest_any.isoformat() if newest_any else None,
         "campaigns_in_mart": known,
+        "campaigns_typical_per_day": typical,
         "campaigns_required_per_day": need,
         "max_age_days": max_age_days,
         "reason": reason,

@@ -121,8 +121,9 @@ def _mart(facts):
     agent_db.load_mart_day_breadth — по всем кампаниям витрины, без фильтра
     по кампаниям открытых действий. В тестах «вся витрина» это ровно те
     кампании, которые тест положил в facts, поэтому структура собирается из
-    них: так фикстуры остаются в одном месте, а разница источников проверена
-    отдельными тестами ниже (см. «дефект И5»).
+    них: так фикстуры остаются в одном месте. Что в БОЮ источник другой —
+    отдельный запрос по всей витрине без фильтра по наблюдаемым кампаниям —
+    проверяют тесты «дефект И5» ниже по файлу.
     """
     days = {}
     campaigns = set()
@@ -636,6 +637,43 @@ def test_load_facts_asks_the_mart_up_to_today(monkeypatch):
 
     assert seen["from"] == "2026-08-02"
     assert seen["to"] == TODAY.isoformat()
+
+
+# ------------------------------------- дефект И5: источник знаменателя ширины
+
+def test_mart_breadth_is_asked_for_the_whole_mart_not_for_watched_campaigns(monkeypatch):
+    """Ширина витрины — отдельный запрос БЕЗ фильтра по кампаниям действий.
+
+    Дефект И5: знаменатель «большинства кампаний» брался из фактов кампаний,
+    по которым открыты действия. На первом боевом прогоне их одна-две — гейт
+    превращался в термометр одной кампании и объявлял витрину здоровой,
+    пока жива она. Запрос обязан идти по всей витрине.
+    """
+    seen = {}
+
+    def fake_breadth(date_from, date_to):
+        seen.update({"args": (date_from, date_to)})
+        # витрина шире наблюдаемых кампаний — так и должно быть
+        return {"days": {"2026-08-10": 84}, "campaigns_total": 84}
+
+    monkeypatch.setattr(watchdog.agent_db, "load_mart_day_breadth", fake_breadth)
+    out = watchdog.load_mart_breadth([_action()], TODAY)
+
+    # Ни идентификаторов кампаний, ни коллекций в аргументах — только даты.
+    assert seen["args"] == ("2026-08-02", TODAY.isoformat())
+    # Ответ витрины возвращается как есть: 84 кампании, а не одна наблюдаемая.
+    assert out["campaigns_total"] == 84
+    assert out["days"] == {"2026-08-10": 84}
+
+
+def test_mart_breadth_is_empty_when_there_is_nothing_to_watch(monkeypatch):
+    # Нет открытых действий — нет и окна: запрос не должен уходить с
+    # выдуманными границами, а гейт получает честно пустую витрину.
+    def boom(*args, **kwargs):
+        raise AssertionError("запрос ширины без окна наблюдения")
+
+    monkeypatch.setattr(watchdog.agent_db, "load_mart_day_breadth", boom)
+    assert watchdog.load_mart_breadth([], TODAY) == {"days": {}, "campaigns_total": 0}
 
 
 # ------------------------------------- состояния без вердикта: ручной разбор
@@ -1261,16 +1299,57 @@ def test_client_without_sandbox_flag_is_a_broken_client_not_a_prod_one():
         watchdog.journal_allowed(_NoFlag())
 
 
-def test_gate_is_red_when_only_one_campaign_of_two_is_fresh():
-    # Максимум даты по всем кампаниям красил гейт зелёным при мёртвых
-    # остальных: расчёт мог отработать частично, а сторож этого не видел.
-    facts = {"111": _facts("111", TODAY - timedelta(days=2), 2, cost=100.0, leads=1),
+def test_gate_is_red_when_the_whole_mart_stopped():
+    # Частичный отказ расчёта = отстала ВСЯ витрина, а не одна кампания.
+    # Раньше порог считался от объединения кампаний за окно, и такой день
+    # не набирался никогда: за две недели в витрине копятся все кампании,
+    # что хоть раз откручивались, а в отдельный день активна лишь часть.
+    # Гейт вставал в вечный отказ, и сторож не откатывал НИКОГДА.
+    facts = {"111": _facts("111", date(2026, 7, 20), 3, cost=100.0, leads=1),
              "222": _facts("222", date(2026, 7, 20), 3, cost=100.0, leads=1)}
     gate = watchdog.facts_gate(_mart(facts), TODAY)
 
     assert gate["status"] == "RED"
+    assert "расчёт" in gate["reason"]
+
+
+def test_gate_is_red_when_the_freshest_day_is_too_narrow():
+    # Свежесть по дате ещё не значит наполненность: расчёт мог упасть на
+    # середине и записать последний день по одной кампании из десяти.
+    # Без проверки ширины дня гейт зеленел бы по одной строке — мутация
+    # «считать широкими все дни» этого теста не переживает.
+    facts = {}
+    for i in range(10):
+        cid = str(200 + i)
+        # день начала: витрина полна по TODAY-5 включительно, дальше обрыв
+        facts[cid] = _facts(cid, TODAY - timedelta(days=8), 4, cost=100.0, leads=1)
+    # вчерашний день есть, но только у одной кампании
+    facts["299"] = _facts("299", TODAY - timedelta(days=1), 1, cost=100.0, leads=1)
+    gate = watchdog.facts_gate(_mart(facts), TODAY, max_age_days=2)
+
+    assert gate["status"] == "RED", gate
+    # Одиночная свежая строка видна отдельным полем — это улика частичного
+    # отказа расчёта, а не повод считать витрину свежей.
     assert gate["latest_any_fact_date"] == (TODAY - timedelta(days=1)).isoformat()
-    assert gate["campaigns_required_per_day"] == 2
+    assert gate["latest_fact_date"] != gate["latest_any_fact_date"]
+
+
+def test_gate_is_green_when_campaigns_come_and_go_within_the_window():
+    # Сигнатура дефекта: кампании включаются и выключаются, в каждый день
+    # активна лишь часть окна. Витрина при этом живая — гейт обязан быть
+    # зелёным, иначе откат запрещён навсегда.
+    facts = {}
+    for i in range(6):
+        cid = str(100 + i)
+        # каждая кампания «работает» свои три дня подряд внутри окна
+        facts[cid] = _facts(cid, TODAY - timedelta(days=3 + i), 3,
+                            cost=100.0, leads=1)
+    gate = watchdog.facts_gate(_mart(facts), TODAY)
+
+    assert gate["status"] == "GREEN", gate["reason"]
+    # Порог считается от типичного дня, а не от объединения за окно.
+    assert gate["campaigns_required_per_day"] <= gate["campaigns_typical_per_day"]
+    assert gate["campaigns_required_per_day"] < gate["campaigns_in_mart"]
 
 
 def test_gate_stays_green_when_a_single_campaign_stops_delivering():
