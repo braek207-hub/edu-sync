@@ -19,6 +19,10 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           python -m pytest tests/test_agent_writer_db.py tests/test_agent_writer_apply.py -v
+      - name: Что осталось в журнале действий
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python probe_agent_journal.py
       - name: Весь набор агента с доступом к БД
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
