@@ -124,9 +124,11 @@ def fetch_ga4_dashboard_traffic(property_id: str, frm: str, to: str) -> list[dic
     """Трафик GCC для lime_stats: строки формы Метрика-пайплайна, но из GA4.
 
     Два запроса: (1) трафик по date×host×source×medium×campaignId×campaignName —
-    sessions/totalUsers/newUsers/bounceRate/pageViewsPerSession; (2) воронка тем же ключом
-    без campaignName + eventName (add_to_cart/begin_checkout) — sessions с событием,
-    джойн по ключу. users = totalUsers (метрика ручного файла Павла, = «Всего» в UI GA4).
+    sessions/activeUsers/newUsers/bounceRate/pageViewsPerSession; (2) воронка тем же
+    полным ключом + eventName (add_to_cart/begin_checkout) — sessions с событием.
+    users = **activeUsers**: зонд W33 (2026-08-20) — дневные суммы activeUsers по группам
+    каналов дали 27 223 против 27 291 в ручном отчёте (0.25%), totalUsers промахивается
+    на +4.5%. «Пользователи» в стандартных отчётах GA4 — это activeUsers.
 
     Только 5 GCC-хостов (bh и прочее отбрасывается — как Метрика-GCC5): сумма 5 стран =
     GCC-тотал, строк country=None нет.
@@ -142,7 +144,7 @@ def fetch_ga4_dashboard_traffic(property_id: str, frm: str, to: str) -> list[dic
     dims = ["date", "hostName", "sessionSource", "sessionMedium",
             "sessionCampaignId", "sessionCampaignName"]
     traffic = run_report(property_id, frm, to, dims,
-                         ("sessions", "totalUsers", "newUsers",
+                         ("sessions", "activeUsers", "newUsers",
                           "bounceRate", "screenPageViewsPerSession"))
 
     # Ключ воронки = ПОЛНЫЙ ключ трафика (с campaignName): без него один campaignId
