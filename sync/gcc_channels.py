@@ -114,6 +114,94 @@ def map_ga4_channel(source: str | None, medium: str | None) -> tuple[str, str, s
     return "Others", (source or medium or "Unknown").strip(), "Бесплатный"
 
 
+# Короткие алиасы соцсетей — только точным совпадением: подстрока «ig» ловила бы
+# digital/night, «fb» — левые домены.
+_SOCIAL_ALIASES = {"ig": "Instagram", "fb": "Facebook", "yt": "Youtube", "tt": "Tiktok"}
+
+
+def _social_net(s: str) -> str | None:
+    """Имя соцсети из source: точный алиас (ig/fb) или подстрока (_GA4_SOCIAL_RULES)."""
+    alias = _SOCIAL_ALIASES.get(s)
+    if alias:
+        return alias
+    for needle, name in _GA4_SOCIAL_RULES:
+        if needle in s:
+            return name
+    return None
+
+
+def map_ga4_channel_grouped(group: str | None, source: str | None,
+                            medium: str | None) -> tuple[str, str, str]:
+    """GA4 sessionDefaultChannelGroup (+source/medium) → таксономия дашборда.
+
+    Группа каналов GA4 — АВТОРИТЕТ границы платный/органика и канала: ручной отчёт Залива
+    собирается из отчётов GA4 по группам, и только так раскладка совпадает с ним по
+    построению (решение 2026-08-20). source уточняет подканал (площадку/сеть/поисковик).
+    Неизвестная группа → fallback на map_ga4_channel(source, medium).
+    """
+    g = (group or "").strip()
+    s = (source or "").lower().strip()
+
+    if g in ("Paid Search", "Cross-network", "Paid Shopping", "Display"):
+        if "bing" in s:
+            return "SEM", "Bing", "Платный"
+        if any(x in s for x in ("facebook", "instagram", "meta")):
+            return "SMM paid", "Meta Ads", "Платный"
+        return "SEM", "Google.Adwords", "Платный"
+
+    if g in ("Paid Social", "Paid Video", "Paid Other", "Audio"):
+        for needle, sub in (("facebook", "Meta Ads"), ("instagram", "Meta Ads"),
+                            ("meta", "Meta Ads"), ("tiktok", "TikTok Ads"),
+                            ("snap", "Snapchat Ads"), ("pinterest", "Pinterest Ads")):
+            if needle in s:
+                return "SMM paid", sub, "Платный"
+        if "google" in s or "youtube" in s:
+            return "SEM", "Google.Adwords", "Платный"
+        return "SMM paid", (source or "").strip() or "Social Ads", "Платный"
+
+    if g in ("Organic Search", "Organic Shopping"):
+        if "yandex" in s:
+            return "SEO", "SEO Yandex", "Бесплатный"
+        if "google" in s or g == "Organic Shopping":
+            return "SEO", "SEO Google", "Бесплатный"
+        return "SEO", "SEO Others", "Бесплатный"
+
+    if g in ("Organic Social", "Organic Video"):
+        name = _social_net(s)
+        if name:
+            return "SMM (organic)", name, "Бесплатный"
+        return "SMM (organic)", (source or "").strip().capitalize() or "Social", "Бесплатный"
+
+    if g == "Email":
+        if "mindbox" in s or "maestra" in s:
+            return "CRM", "Mindbox", "Бесплатный"
+        return "CRM", "Email", "Бесплатный"
+    if g == "SMS":
+        return "CRM", "SMS", "Бесплатный"
+    if g in ("Mobile Push Notifications", "Push"):
+        return "CRM", "Push", "Бесплатный"
+
+    if g == "Direct":
+        return "Direct", "Direct", "Бесплатный"
+
+    if g == "Referral":
+        if any(own in s for own in _OWN_DOMAINS):
+            return "Internal", "Internal", "Бесплатный"
+        name = _social_net(s)
+        if name:
+            return "SMM (organic)", name, "Бесплатный"
+        if "mindbox" in s or "maestra" in s:
+            return "CRM", "Mindbox", "Бесплатный"
+        return "Referrals", (source or "").strip() or "Реферал", "Бесплатный"
+
+    if g in ("AI Assistant", "Affiliates"):
+        return "Referrals", (source or "").strip() or g, "Бесплатный"
+    if g == "Unassigned":
+        return "Others", "Unassigned", "Бесплатный"
+
+    return map_ga4_channel(source, medium)
+
+
 # Партнёр AppMetrica (publisher_name касания, last-touch) → таксономия. Ключи каналов те же,
 # что у web-заказов TW (map_tw_source) — app-строки в дашборде группируются в те же каналы.
 _APP_PUBLISHER_RULES = (

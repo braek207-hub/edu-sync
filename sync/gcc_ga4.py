@@ -123,9 +123,11 @@ def _host_country_ru(host: str | None) -> str | None:
 def fetch_ga4_dashboard_traffic(property_id: str, frm: str, to: str) -> list[dict]:
     """Трафик GCC для lime_stats: строки формы Метрика-пайплайна, но из GA4.
 
-    Два запроса: (1) трафик по date×host×source×medium×campaignId×campaignName —
+    Два запроса: (1) трафик по date×host×channelGroup×source×medium×campaignId×campaignName —
     sessions/activeUsers/newUsers/bounceRate/pageViewsPerSession; (2) воронка тем же
     полным ключом + eventName (add_to_cart/begin_checkout) — sessions с событием.
+    Канал — из sessionDefaultChannelGroup (map_ga4_channel_grouped): граница платный/органика
+    и раскладка = отчётам GA4, из которых собирается ручной файл.
     users = **activeUsers**: зонд W33 (2026-08-20) — дневные суммы activeUsers по группам
     каналов дали 27 223 против 27 291 в ручном отчёте (0.25%), totalUsers промахивается
     на +4.5%. «Пользователи» в стандартных отчётах GA4 — это activeUsers.
@@ -139,10 +141,13 @@ def fetch_ga4_dashboard_traffic(property_id: str, frm: str, to: str) -> list[dic
         campaign — sessionCampaignId (id площадки), campaign_label — sessionCampaignName
         (метка для моста, когда id "(not set)").
     """
-    from sync.gcc_channels import map_ga4_channel
+    from sync.gcc_channels import map_ga4_channel_grouped
 
-    dims = ["date", "hostName", "sessionSource", "sessionMedium",
-            "sessionCampaignId", "sessionCampaignName"]
+    # sessionDefaultChannelGroup в измерениях: группа GA4 — авторитет канала (как в ручном
+    # отчёте). Один source/medium может жить в двух группах (google/cpc = Paid Search И
+    # Cross-network у PMax) — строки делятся так же, как в отчёте агентства.
+    dims = ["date", "hostName", "sessionDefaultChannelGroup", "sessionSource",
+            "sessionMedium", "sessionCampaignId", "sessionCampaignName"]
     traffic = run_report(property_id, frm, to, dims,
                          ("sessions", "activeUsers", "newUsers",
                           "bounceRate", "screenPageViewsPerSession"))
@@ -156,20 +161,20 @@ def fetch_ga4_dashboard_traffic(property_id: str, frm: str, to: str) -> list[dic
     )
     funnel: dict[tuple, list[int]] = {}
     for r in funnel_rows:
-        key = tuple(r["dims"][:6])
+        key = tuple(r["dims"][:7])
         acc = funnel.setdefault(key, [0, 0])
-        acc[_FUNNEL_EVENTS.index(r["dims"][6])] += int(r["metrics"][0])
+        acc[_FUNNEL_EVENTS.index(r["dims"][7])] += int(r["metrics"][0])
 
     out: list[dict] = []
     for r in traffic:
-        d_raw, host, src, med, camp_id, camp_name = r["dims"]
+        d_raw, host, group, src, med, camp_id, camp_name = r["dims"]
         country = _host_country_ru(host)
         if not country:
             continue
         iso = f"{d_raw[:4]}-{d_raw[4:6]}-{d_raw[6:8]}"
         sessions = int(r["metrics"][0])
-        channel, subchannel, traffic_type = map_ga4_channel(src, med)
-        cart, checkout = funnel.get((d_raw, host, src, med, camp_id, camp_name), (0, 0))
+        channel, subchannel, traffic_type = map_ga4_channel_grouped(group, src, med)
+        cart, checkout = funnel.get((d_raw, host, group, src, med, camp_id, camp_name), (0, 0))
         campaign = (camp_id or "").strip()
         label = (camp_name or "").strip()
         out.append({
