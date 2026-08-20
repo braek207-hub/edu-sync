@@ -66,6 +66,7 @@ jobs:
           GCC_TRIPLEWHALE_API_KEY: ${{ secrets.GCC_TRIPLEWHALE_API_KEY }}
           GCC_TW_SHOP_DOMAIN: ${{ secrets.GCC_TW_SHOP_DOMAIN }}
           API_LIME_SHOPIFY: ${{ secrets.API_LIME_SHOPIFY }}   # offline Admin API token — страна доставки заказа
+          APPMETRICA_TOKEN: ${{ secrets.APPMETRICA_TOKEN }}   # app-трафик (Reporting DAU + Logs-сплит best-effort)
           LIME_GCC_SYNC_DAYS: ${{ github.event.inputs.sync_days || '7' }}
           # Пусто на кроне → синк уходит в режим SYNC_DAYS (в коде `if frm and to`)
           LIME_GCC_SYNC_FROM: ${{ github.event.inputs.sync_from }}

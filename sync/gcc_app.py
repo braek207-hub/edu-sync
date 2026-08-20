@@ -222,6 +222,121 @@ def fetch_app_traffic(token: str, app_id: str, dates: list[str],
     return combined
 
 
+# ISO страны → русское имя (как пишет lime_stats web-пайплайн GCC).
+ISO_RU = {"AE": "ОАЭ", "SA": "Саудовская Аравия", "QA": "Катар", "KW": "Кувейт", "OM": "Оман"}
+_CODE_RU = {"UAE": "ОАЭ", "KSA": "Саудовская Аравия", "QA": "Катар", "KW": "Кувейт", "OM": "Оман"}
+
+
+def aggregate_traffic_channels(sessions: list[dict], touches: dict,
+                               dates: list[str]) -> dict:
+    """DAU и сессии app по (дата, страна, канал) — publisher last-touch → таксономия.
+
+    Returns:
+        {date: {country_ru: {(channel, subchannel, traffic_type): [dau, sessions]}}}.
+        DAU = уникальные устройства в срезе за день (по сегментам не аддитивен).
+    """
+    from sync.gcc_channels import map_app_publisher
+
+    dset = set(dates)
+    dev: dict = {d: {} for d in dates}
+    ses: dict = {d: {} for d in dates}
+    for r in sessions:
+        iso = (r.get("session_start_datetime") or "")[:10]
+        country = ISO_RU.get(r.get("country_iso_code"))
+        did = r.get("appmetrica_device_id")
+        if iso not in dset or not country or not did:
+            continue
+        key = map_app_publisher(attribute(did, r["session_start_datetime"], touches))
+        dev[iso].setdefault(country, {}).setdefault(key, set()).add(did)
+        ses[iso].setdefault(country, {}).setdefault(key, 0)
+        ses[iso][country][key] += 1
+
+    out: dict = {d: {} for d in dates}
+    for iso in dates:
+        for country, by_key in dev[iso].items():
+            out[iso][country] = {k: [len(s), ses[iso][country].get(k, 0)]
+                                 for k, s in by_key.items()}
+    return out
+
+
+def build_app_traffic_rows(total_by_day: dict, channels_by_day: dict,
+                           dates: list[str]) -> list[dict]:
+    """Строки app-трафика для lime_stats: тотал из Reporting (=UI), платные каналы из Logs.
+
+    Тотал страны = Reporting (`fetch_app_dau_total`, «Аудитория» в UI, как ручной файл).
+    Платные/реферальные каналы — сырые DAU из Logs (недоохват Logs остаётся в остатке).
+    Остаток (тотал − размеченные каналы) кладётся в Direct — «открыл приложение сам» плюс
+    неразмеченное. Нет Logs по стране → весь тотал в Direct.
+
+    Args:
+        total_by_day: {date: {code(UAE/…): total}} из fetch_app_dau_total.
+        channels_by_day: {date: {country_ru: {(ch, sub, tt): [dau, sessions]}}}
+            из aggregate_traffic_channels; допускается пустой ({}).
+
+    Returns:
+        [{date, country, channel, subchannel, traffic_type, users, sessions}] — Direct-строка
+        одна на страну (в неё же вошёл остаток), users ≥ 0.
+    """
+    rows: list[dict] = []
+    for iso in dates:
+        for code, total in (total_by_day.get(iso) or {}).items():
+            country = _CODE_RU.get(code)
+            if not country or not total:
+                continue
+            by_key = (channels_by_day.get(iso) or {}).get(country) or {}
+            direct_key = ("Direct", "Direct", "Бесплатный")
+            tagged = sum(dau for k, (dau, _s) in by_key.items() if k != direct_key)
+            residual = max(total - tagged, 0)
+            emitted_direct = False
+            for (ch, sub, tt), (dau, n_ses) in sorted(by_key.items()):
+                users = residual if (ch, sub, tt) == direct_key else dau
+                emitted_direct = emitted_direct or (ch, sub, tt) == direct_key
+                rows.append({"date": iso, "country": country, "channel": ch,
+                             "subchannel": sub, "traffic_type": tt,
+                             "users": users, "sessions": n_ses})
+            if not emitted_direct and residual:
+                rows.append({"date": iso, "country": country, "channel": "Direct",
+                             "subchannel": "Direct", "traffic_type": "Бесплатный",
+                             "users": residual, "sessions": 0})
+    return rows
+
+
+def fetch_app_traffic_dashboard(token: str, app_id: str, dates: list[str],
+                                lookback_days: int = 90) -> list[dict]:
+    """App-трафик GCC для lime_stats: Reporting-тотал + best-effort канальный сплит из Logs.
+
+    Logs упал/таймаут → строки только из Reporting (весь тотал в Direct), синк жив.
+    """
+    total = fetch_app_dau_total(token, app_id, dates)
+    channels: dict = {}
+    try:
+        from sync.appmetrica_logs import fetch_sessions
+        chunk_days = int(os.environ.get("LIME_GCC_APP_CHUNK_DAYS") or "7")
+        dmin, dmax = min(dates), max(dates)
+        look_from = (date.fromisoformat(dmin) - timedelta(days=lookback_days)).isoformat()
+        floor = os.environ.get("LIME_GCC_APP_LOOK_FLOOR") or "2026-06-01"
+        look_from = max(look_from, floor)
+        touches = _fetch_touches(token, app_id, look_from, dmax)
+        d, dmax_d = date.fromisoformat(dmin), date.fromisoformat(dmax)
+        while d <= dmax_d:
+            c_to = min(d + timedelta(days=chunk_days - 1), dmax_d)
+            cdates = [(d + timedelta(days=k)).isoformat() for k in range((c_to - d).days + 1)]
+            try:
+                s = fetch_sessions(app_id, token, d.isoformat(), c_to.isoformat(), country=True)
+            except Exception as e:  # noqa: BLE001 — сбойный чанк: дни уйдут Reporting-only
+                print(f"app_dash чанк {d}..{c_to}: ПРОПУЩЕН ({type(e).__name__}: {e})")
+                d = c_to + timedelta(days=1)
+                continue
+            t = aggregate_traffic_channels(s, touches, cdates)
+            for iso in cdates:
+                channels[iso] = t[iso]
+            print(f"app_dash чанк {d}..{c_to}: сессий {len(s)}")
+            d = c_to + timedelta(days=1)
+    except Exception as e:  # noqa: BLE001
+        print(f"app_dash: Logs-сплит ПРОПУЩЕН целиком ({type(e).__name__}: {e}) — тотал в Direct")
+    return build_app_traffic_rows(total, channels, dates)
+
+
 def fetch_app(token: str, app_id: str, dates: list[str], lookback_days: int = 90,
               event_name: str = "purchase") -> tuple[dict, dict]:
     """Собрать app-трафик и заказы GCC за `dates`. Касания тянем с lookback назад."""

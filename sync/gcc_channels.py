@@ -114,6 +114,40 @@ def map_ga4_channel(source: str | None, medium: str | None) -> tuple[str, str, s
     return "Others", (source or medium or "Unknown").strip(), "Бесплатный"
 
 
+# Партнёр AppMetrica (publisher_name касания, last-touch) → таксономия. Ключи каналов те же,
+# что у web-заказов TW (map_tw_source) — app-строки в дашборде группируются в те же каналы.
+_APP_PUBLISHER_RULES = (
+    ("google ads", ("SEM", "Google.Adwords", "Платный")),
+    ("yandex.direct", ("SEM", "Яндекс.Директ", "Платный")),
+    ("bing", ("SEM", "Bing", "Платный")),
+    ("facebook", ("SMM paid", "Meta Ads", "Платный")),
+    ("instagram", ("SMM paid", "Meta Ads", "Платный")),
+    ("meta ads", ("SMM paid", "Meta Ads", "Платный")),
+    ("tiktok", ("SMM paid", "TikTok Ads", "Платный")),
+    ("snapchat", ("SMM paid", "Snapchat Ads", "Платный")),
+    ("vk ads", ("SMM paid", "VK.Ads", "Платный")),
+    ("vkads", ("SMM paid", "VK.Ads", "Платный")),
+    ("mytarget", ("SMM paid", "VK.Ads", "Платный")),
+)
+
+
+def map_app_publisher(publisher: str | None) -> tuple[str, str, str]:
+    """AppMetrica publisher_name → (channel, subchannel, traffic_type).
+
+    Пустой publisher = касаний нет = человек открыл приложение сам → Direct (как прямые
+    заходы web). Непустой, но не рекламная сеть (трекер-партнёр, размещение) → Referrals,
+    как у партнёрских меток TW.
+    """
+    p = (publisher or "").strip()
+    if not p:
+        return "Direct", "Direct", "Бесплатный"
+    p_lower = p.lower()
+    for needle, mapped in _APP_PUBLISHER_RULES:
+        if needle in p_lower:
+            return mapped
+    return "Referrals", p, "Бесплатный"
+
+
 # Домены-рефереры TW у organic_and_social → канон подканалов. Зонд P4 (GCC_CONTRACTS.md):
 # у organic_and_social поле `campaignId` несёт НЕ id кампании, а домен-реферер, причём
 # в смешанном формате — то голое имя движка ("google", "instagram"), то FQDN

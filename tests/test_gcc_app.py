@@ -148,3 +148,73 @@ def test_aggregate_empty():
     traffic, orders = aggregate([], [], {}, ["2026-07-28"])
     assert traffic["2026-07-28"]["GCC"]["app_org"] == 0
     assert orders["2026-07-28"]["UAE"]["app_paid"] == 0
+
+
+# === App-трафик для дашборда (lime_stats data_source='app') ===
+
+from sync.gcc_app import build_app_traffic_rows  # noqa: E402
+from sync.gcc_channels import map_app_publisher  # noqa: E402
+
+
+def test_map_app_publisher_paid_networks():
+    assert map_app_publisher("Google Ads") == ("SEM", "Google.Adwords", "Платный")
+    assert map_app_publisher("Instagram") == ("SMM paid", "Meta Ads", "Платный")
+    assert map_app_publisher("Facebook Ads") == ("SMM paid", "Meta Ads", "Платный")
+    assert map_app_publisher("TikTok For Business") == ("SMM paid", "TikTok Ads", "Платный")
+
+
+def test_map_app_publisher_empty_is_direct():
+    """Нет касаний = открыл приложение сам → Direct, как прямые заходы web."""
+    assert map_app_publisher("") == ("Direct", "Direct", "Бесплатный")
+    assert map_app_publisher(None) == ("Direct", "Direct", "Бесплатный")
+
+
+def test_map_app_publisher_unknown_partner_is_referral():
+    ch, sub, tt = map_app_publisher("Website")
+    assert ch == "Referrals" and sub == "Website" and tt == "Бесплатный"
+
+
+def test_build_app_traffic_rows_residual_in_direct():
+    """Тотал страны = Reporting; размеченные каналы из Logs; остаток — в Direct."""
+    total = {"2026-08-10": {"UAE": 100}}
+    channels = {"2026-08-10": {"ОАЭ": {
+        ("SEM", "Google.Adwords", "Платный"): [30, 45],
+        ("Direct", "Direct", "Бесплатный"): [50, 80],   # Logs-цифра Direct отбрасывается
+    }}}
+    rows = build_app_traffic_rows(total, channels, ["2026-08-10"])
+    by_ch = {r["subchannel"]: r for r in rows}
+    assert by_ch["Google.Adwords"]["users"] == 30 and by_ch["Google.Adwords"]["sessions"] == 45
+    # Direct = 100 − 30 (остаток к Reporting-тоталу), не 50 из Logs
+    assert by_ch["Direct"]["users"] == 70
+    assert sum(r["users"] for r in rows) == 100
+
+
+def test_build_app_traffic_rows_reporting_only():
+    """Logs упал → весь тотал страны одной строкой Direct."""
+    total = {"2026-08-10": {"KSA": 40}}
+    rows = build_app_traffic_rows(total, {}, ["2026-08-10"])
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["country"] == "Саудовская Аравия" and r["channel"] == "Direct" and r["users"] == 40
+
+
+def test_build_app_traffic_rows_clamps_negative_residual():
+    """Logs-каналы больше Reporting-тотала (пересечение уников) → Direct не уходит в минус."""
+    total = {"2026-08-10": {"QA": 20}}
+    channels = {"2026-08-10": {"Катар": {("SEM", "Google.Adwords", "Платный"): [25, 30]}}}
+    rows = build_app_traffic_rows(total, channels, ["2026-08-10"])
+    assert all(r["users"] >= 0 for r in rows)
+    assert not any(r["channel"] == "Direct" for r in rows)  # остатка нет
+
+
+def test_app_traffic_tuples_column_positions():
+    from sync.lime_gcc import COLUMNS, app_traffic_tuples
+    rows = [{"date": "2026-08-10", "country": "ОАЭ", "channel": "SEM",
+             "subchannel": "Google.Adwords", "traffic_type": "Платный",
+             "users": 30, "sessions": 45}]
+    by_day = app_traffic_tuples(rows)
+    (t,) = by_day["2026-08-10"]
+    assert len(t) == len(COLUMNS)
+    row = dict(zip(COLUMNS, t))
+    assert row["data_source"] == "app" and row["users"] == 30 and row["sessions"] == 45
+    assert row["purchases_count"] == 0 and row["cost"] == 0.0

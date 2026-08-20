@@ -219,6 +219,54 @@ def app_order_rows(app_agg: list[dict], fx_rate: float, date_s: str) -> list[tup
     return out
 
 
+# Приложение LIME International (AppMetrica); запущено ~2026-06-02 — раньше строк app нет.
+APP_ID = os.environ.get("GCC_APP_ID") or "6299245"
+APP_TRAFFIC_FLOOR = "2026-06-02"
+APP_LOOKBACK = int(os.environ.get("LIME_GCC_APP_LOOKBACK_DAYS") or "90")
+
+
+def app_traffic_tuples(traffic_rows: list[dict]) -> dict[str, list[tuple]]:
+    """Строки app-трафика (gcc_app.build_app_traffic_rows) → кортежи lime_stats по дням.
+
+    Только users/sessions (заказы app в отдельных строках из TW, app_order_rows).
+    """
+    by_day: dict[str, list[tuple]] = {}
+    for r in traffic_rows:
+        by_day.setdefault(r["date"], []).append((
+            r["date"], "app", "gcc", r["country"], r["channel"], r["subchannel"],
+            r["traffic_type"], None, "",
+            0.0, 0, 0, int(r.get("sessions") or 0), int(r["users"] or 0), 0,
+            0, 0.0, 0,
+            0, 0, 0.0, None, None, 0, 0,
+        ))
+    return by_day
+
+
+def _fetch_app_traffic_by_day(frm: date, to: date) -> dict[str, list[tuple]]:
+    """App-трафик за диапазон (best-effort): {день: кортежи}. Нет токена/данных → {}."""
+    token = os.environ.get("APPMETRICA_TOKEN")
+    if not token:
+        print("lime_gcc: APPMETRICA_TOKEN не задан — app-трафик не пишем")
+        return {}
+    floor = date.fromisoformat(APP_TRAFFIC_FLOOR)
+    if to < floor:
+        return {}
+    app_frm = max(frm, floor)
+    dates = []
+    d = app_frm
+    while d <= to:
+        dates.append(d.isoformat())
+        d += timedelta(days=1)
+    try:
+        from sync.gcc_app import fetch_app_traffic_dashboard
+        rows = fetch_app_traffic_dashboard(token, APP_ID, dates, APP_LOOKBACK)
+    except Exception as e:  # noqa: BLE001 — app-трафик не должен ронять заказы/web
+        print(f"lime_gcc: app-трафик ПРОПУЩЕН ({type(e).__name__}: {e})")
+        return {}
+    print(f"lime_gcc: app-трафик — {len(rows)} строк за {dates[0]}…{dates[-1]}")
+    return app_traffic_tuples(rows)
+
+
 DEADLOCK_RETRIES = 4
 DEADLOCK_BACKOFF_SEC = 3
 
@@ -320,6 +368,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
     # GA4 тянем ПОМЕСЯЧНО (2 запроса на месяц: трафик + воронка), `date` стоит в
     # измерениях — диапазон возвращает те же построчные данные, что и по дню.
     ga4_by_day = _fetch_ga4_by_month(frm, to)
+    app_traffic_by_day = _fetch_app_traffic_by_day(frm, to)
 
     total = 0
     day = frm
@@ -351,6 +400,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
         rows = merge_rows(traffic, orders, spend, fx_rate, day_s,
                           rub_spend_rows=google_geo, campaign_index=campaign_index)
         rows += app_order_rows(app_ord, fx_rate, day_s)
+        rows += app_traffic_by_day.get(day_s, [])
 
         if conn is None:
             i_country = COLUMNS.index("country")
