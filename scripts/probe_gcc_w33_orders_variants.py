@@ -72,43 +72,63 @@ def main() -> None:
     _country, app_ids = fetch_order_meta(os.environ["API_LIME_SHOPIFY"], FRM, TO)
     print(f"W33 заказов TW: {len(orders)}, app-канал Shopify: {len(app_ids)}")
 
-    variants = {
-        "V0 все касания": lambda tps: tps,
-        "V1 без Internal": lambda tps: [t for t in tps if not is_internal(t)] or tps,
-        "V2 без Internal и Non-attr": lambda tps: [t for t in tps
-                                                   if not is_internal(t) and not is_nonattr(t)] or tps,
+    filters = {
+        "все": lambda tps: tps,
+        "безInt": lambda tps: [t for t in tps if not is_internal(t)] or tps,
+        "безInt+NA": lambda tps: [t for t in tps
+                                  if not is_internal(t) and not is_nonattr(t)] or tps,
     }
 
-    for vname, keep in variants.items():
-        web = defaultdict(lambda: [0.0, 0.0])
-        app = [0.0, 0.0]
-        for o in orders:
-            oid = str(o.get("order_id") or "")
-            iso = str(o.get("created_at") or TO)[:10]
-            rate = to_rub("AED", iso if FRM <= iso <= TO else TO)
-            rev = float(o.get("total_price") or 0) * rate
-            tps = (o.get("attribution") or {}).get("linearAll") or []
-            if not tps:
-                tps = [order_touchpoint(o)]
-            tps = keep(tps)
-            w = 1.0 / len(tps)
-            if oid in app_ids:
-                app[0] += 1
-                app[1] += rev
-                continue
-            for tp in tps:
-                b = bucket(*touch_class(tp))
-                web[b][0] += w
-                web[b][1] += rev * w
-        paid_o = sum(web[b][0] for b in ("Meta", "Google", "PaidOther"))
-        paid_r = sum(web[b][1] for b in ("Meta", "Google", "PaidOther"))
-        print(f"\n=== {vname} ===")
-        print(f"  {'корзина':<10} {'заказы':>8} {'ручной':>7} | {'выручка ₽':>10} {'ручной':>9}")
-        for b in ("Meta", "Google", "PaidOther", "CRM", "DSS", "Others"):
-            mo, mr = MANUAL["web"].get(b, ("—", "—"))
-            print(f"  {b:<10} {web[b][0]:>8.1f} {mo!s:>7} | {web[b][1]:>10.0f} {mr!s:>9}")
-        print(f"  {'PAID web':<10} {paid_o:>8.1f} {161:>7} | {paid_r:>10.0f} {2290400:>9}")
-        print(f"  {'APP':<10} {app[0]:>8.0f} {42:>7} | {app[1]:>10.0f} {610310:>9}")
+    def fine_bucket(channel, subchannel, tt):
+        """Мелкие корзины — чтобы видеть, куда агентство кладёт Referrals."""
+        if tt == "Платный":
+            return {"Meta Ads": "Meta", "Google.Adwords": "Google"}.get(subchannel, "PaidOther")
+        if channel == "CRM":
+            return "CRM"
+        if channel in ("Direct", "SEO", "SMM (organic)"):
+            return "DSS"
+        if channel == "Internal":
+            return "Internal"
+        if channel == "Referrals":
+            return "Referrals"
+        return "Others"
+
+    for fname, keep in filters.items():
+        for mode in ("касание", "канал"):
+            web = defaultdict(lambda: [0.0, 0.0])
+            app = [0.0, 0.0]
+            for o in orders:
+                oid = str(o.get("order_id") or "")
+                iso = str(o.get("created_at") or TO)[:10]
+                rate = to_rub("AED", iso if FRM <= iso <= TO else TO)
+                rev = float(o.get("total_price") or 0) * rate
+                if oid in app_ids:
+                    app[0] += 1
+                    app[1] += rev
+                    continue
+                tps = (o.get("attribution") or {}).get("linearAll") or []
+                if not tps:
+                    tps = [order_touchpoint(o)]
+                tps = keep(tps)
+                if mode == "канал":
+                    # вес 1/K на УНИКАЛЬНЫЙ канал пути (дедуп повторных касаний площадки)
+                    units = sorted({fine_bucket(*touch_class(t)) for t in tps})
+                else:
+                    units = [fine_bucket(*touch_class(t)) for t in tps]
+                w = 1.0 / len(units)
+                for b in units:
+                    web[b][0] += w
+                    web[b][1] += rev * w
+            paid_o = sum(web[b][0] for b in ("Meta", "Google", "PaidOther"))
+            dss_plus_ref = web["DSS"][0] + web["Internal"][0] + web["Referrals"][0]
+            print(f"\n=== фильтр {fname} · вес на {mode} ===")
+            print(f"  Meta {web['Meta'][0]:.1f}/40  Google {web['Google'][0]:.1f}/121  "
+                  f"PAID {paid_o:.1f}/161  CRM {web['CRM'][0]:.1f}/27")
+            print(f"  DSS {web['DSS'][0]:.1f}  +Int {web['Internal'][0]:.1f} "
+                  f"+Ref {web['Referrals'][0]:.1f} = {dss_plus_ref:.1f}/107  "
+                  f"Others {web['Others'][0]:.1f}/2  APP {app[0]:.0f}/42")
+            print(f"  выручка: Meta {web['Meta'][1]:.0f}/487617  Google {web['Google'][1]:.0f}/1802783  "
+                  f"CRM {web['CRM'][1]:.0f}/321783")
 
 
 if __name__ == "__main__":
