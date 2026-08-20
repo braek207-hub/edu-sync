@@ -114,12 +114,34 @@ RED_GATE = {"status": "RED", "latest_fact_date": "2026-07-01",
             "reason": "витрина фактов не обновлялась"}
 
 
+def _mart(facts):
+    """Витрина, какой её увидел бы отдельный запрос по ВСЕЙ витрине.
+
+    В бою знаменатель покрытия и ширину гейта считает
+    agent_db.load_mart_day_breadth — по всем кампаниям витрины, без фильтра
+    по кампаниям открытых действий. В тестах «вся витрина» это ровно те
+    кампании, которые тест положил в facts, поэтому структура собирается из
+    них: так фикстуры остаются в одном месте, а разница источников проверена
+    отдельными тестами ниже (см. «дефект И5»).
+    """
+    days = {}
+    campaigns = set()
+    for campaign_id, rows in (facts or {}).items():
+        campaigns.add(str(campaign_id))
+        for row in rows:
+            day = row.get("fact_date")
+            days.setdefault(day, set()).add(str(campaign_id))
+    return {"days": {d: len(c) for d, c in days.items()},
+            "campaigns_total": len(campaigns)}
+
+
 def _run(action, facts, client=None, db=None, holdout=(), today=TODAY,
-         gate=GREEN_GATE):
+         gate=GREEN_GATE, mart=None):
     client = client or _FakeClient()
     db = db or _FakeDb()
     report = watchdog.watch(client, [action], db, {str(h) for h in holdout},
-                            facts, today, gate)
+                            facts, today, gate, None,
+                            _mart(facts) if mart is None else mart)
     return report, client, db
 
 
@@ -427,7 +449,7 @@ def test_report_counts_actions_under_watch_and_failures():
     client, db = _FakeClient(), _FakeDb()
 
     report = watchdog.watch(client, [_action(), healthy], db, set(), facts, TODAY,
-                            GREEN_GATE)
+                            GREEN_GATE, None, _mart(facts))
 
     assert report["under_watch"] == 2
     assert report["states"] == {watchdog.STATE_BREACHED: 1, watchdog.STATE_WATCHED: 1}
@@ -446,7 +468,7 @@ def test_broken_journal_row_does_not_blind_the_watchdog():
     client, db = _FakeClient(), _FakeDb()
 
     report = watchdog.watch(client, [broken, _action()], db, set(), facts, TODAY,
-                            GREEN_GATE)
+                            GREEN_GATE, None, _mart(facts))
 
     assert report["errors"] == 1
     assert report["errors_sample"][0]["object_id"] == "333"
@@ -584,19 +606,19 @@ def test_missing_gate_forbids_rollback():
 
 def test_facts_gate_is_red_when_mart_is_stale():
     facts = {"111": _facts("111", date(2026, 7, 20), 3, cost=100.0, leads=1)}
-    gate = watchdog.facts_gate(facts, TODAY)
+    gate = watchdog.facts_gate(_mart(facts), TODAY)
 
     assert gate["status"] == "RED"
     assert gate["latest_fact_date"] == "2026-07-22"
 
 
 def test_facts_gate_is_red_when_mart_is_empty():
-    assert watchdog.facts_gate({}, TODAY)["status"] == "RED"
+    assert watchdog.facts_gate(_mart({}), TODAY)["status"] == "RED"
 
 
 def test_facts_gate_is_green_on_fresh_mart():
     facts = {"111": _facts("111", TODAY - timedelta(days=3), 3, cost=100.0, leads=1)}
-    assert watchdog.facts_gate(facts, TODAY)["status"] == "GREEN"
+    assert watchdog.facts_gate(_mart(facts), TODAY)["status"] == "GREEN"
 
 
 def test_load_facts_asks_the_mart_up_to_today(monkeypatch):
@@ -1001,7 +1023,7 @@ def test_lost_lease_stops_the_watchdog_before_it_writes():
 
     with pytest.raises(writer_db.RunLeaseLost):
         watchdog.watch(client, [_action()], db, set(), facts, TODAY, GREEN_GATE,
-                       _LostLease())
+                       _LostLease(), _mart(facts))
 
     assert client.calls == [], "после потери аренды откат в кабинет не уходит"
 
@@ -1062,7 +1084,7 @@ def test_expensive_day_is_visible_in_the_report():
     # Отчёт обязан показывать, ЧТО именно не подтвердилось: иначе «сторож
     # молчит» неотличимо от «всё хорошо».
     facts = _healthy_with_one_expensive_day()
-    verdict = watchdog.judge(_action(), facts, date(2026, 8, 11))
+    verdict = watchdog.judge(_action(), facts, date(2026, 8, 11), _mart(facts))
 
     assert verdict["without_peak_day"]["date"] == "2026-08-07"
     assert verdict["without_peak_day"]["cost"] == 6000.0
@@ -1169,8 +1191,8 @@ def test_coverage_is_measured_on_the_mart_not_on_the_campaign():
     facts = {"111": _facts("111", date(2026, 8, 2), 2, cost=10.0, leads=1),
              "222": _facts("222", date(2026, 8, 2), 6, cost=10.0, leads=1)}
 
-    assert watchdog.mart_filled_days(facts, window) == 6
-    assert watchdog.window_coverage(watchdog.mart_filled_days(facts, window), window) == 1.0
+    assert watchdog.mart_filled_days(_mart(facts), window) == 6
+    assert watchdog.window_coverage(watchdog.mart_filled_days(_mart(facts), window), window) == 1.0
 
 
 def test_dead_mart_is_still_low_coverage():
@@ -1244,7 +1266,7 @@ def test_gate_is_red_when_only_one_campaign_of_two_is_fresh():
     # остальных: расчёт мог отработать частично, а сторож этого не видел.
     facts = {"111": _facts("111", TODAY - timedelta(days=2), 2, cost=100.0, leads=1),
              "222": _facts("222", date(2026, 7, 20), 3, cost=100.0, leads=1)}
-    gate = watchdog.facts_gate(facts, TODAY)
+    gate = watchdog.facts_gate(_mart(facts), TODAY)
 
     assert gate["status"] == "RED"
     assert gate["latest_any_fact_date"] == (TODAY - timedelta(days=1)).isoformat()
@@ -1260,4 +1282,4 @@ def test_gate_stays_green_when_a_single_campaign_stops_delivering():
              "222": _facts("222", TODAY - timedelta(days=2), 2, cost=100.0, leads=1),
              "333": _facts("333", date(2026, 7, 20), 3, cost=100.0, leads=1)}
 
-    assert watchdog.facts_gate(facts, TODAY)["status"] == "GREEN"
+    assert watchdog.facts_gate(_mart(facts), TODAY)["status"] == "GREEN"
