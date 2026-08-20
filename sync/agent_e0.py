@@ -86,41 +86,21 @@ def _direct_clients() -> List[Dict[str, Any]]:
     return [{"login": login, "goal_ids": []}] if login else []
 
 
-def _attach_expected_payments(
-    segment_rows: List[Dict[str, Any]], total_expected: float
-) -> List[Dict[str, Any]]:
-    """Reports API не отдаёт p_pay — переносим ожидаемые оплаты на сегмент по доле кликов.
-
-    Приближение осознанное: точная привязка лида к сегменту требует связки лид↔визит,
-    которой на Э0 нет. Доля кликов — консервативная оценка, а сжатие к базе не даёт ей
-    развернуться в большую корректировку.
-    """
-    total_clicks = sum(int(r.get("clicks") or 0) for r in segment_rows)
-    out: List[Dict[str, Any]] = []
-    for r in segment_rows:
-        clicks = int(r.get("clicks") or 0)
-        share = (clicks / total_clicks) if total_clicks else 0.0
-        out.append({
-            "segment_kind": r["segment_kind"],
-            "segment_key": r["segment_key"],
-            "clicks": clicks,
-            "leads": 0,
-            "sum_p_pay": total_expected * share,
-        })
-    return out
-
-
-def computed_rows_for_job(
-    job: Dict[str, Any], base_conv: float, base_expected: float
-) -> tuple:
-    """Результат одного отчёта → (кабинет, строки вычисленных настроек).
+def computed_rows_for_job(job: Dict[str, Any]) -> tuple:
+    """Результат одного отчёта → (кабинет, строки настроек, причина отказа).
 
     Кабинет едет ВМЕСТЕ с числами и дальше становится object_id записи. Без
     него строки четырёх кабинетов ложились в один ключ таблицы и перетирали
     друг друга, а движок записи раскатывал выживший набор на всех.
+
+    Конверсионность считается по Conversions самого отчёта Директа. Раньше сюда
+    подавались ожидаемые оплаты, размазанные по доле кликов, — из-за чего
+    конверсионность всех сегментов среза совпадала и «корректировка по сегменту»
+    сегменты не различала. Причина отказа возвращается наружу и печатается в
+    отчёте прогона: вырождение обязано быть видно, а не тихо давать нули.
     """
-    enriched = _attach_expected_payments(job["rows"], base_expected)
-    return job["login"], compute_segment_modifiers(enriched, base_conv)
+    rows, reason = compute_segment_modifiers(job["rows"])
+    return job["login"], rows, reason
 
 
 def main() -> int:
@@ -196,19 +176,18 @@ def main() -> int:
     # десятки — последовательный обход делал прогон многочасовым (run 31781846178
     # висел 25+ минут и был отменён). Воркеров немного: Директ ограничивает число
     # одновременно формируемых отчётов на кабинет.
-    base_clicks = sum(f["clicks"] for f in recent)
-    base_expected = sum(f["sum_p_pay"] for f in recent)
-    base_conv = (base_expected / base_clicks) if base_clicks else 0.0
-
     jobs: List[Dict[str, Any]] = []
     for client in clients:
         login, goals = client["login"], client["goal_ids"]
-        if base_conv > 0:
-            # Расписания здесь нет: HourOfDay отвергается Reports API (probe 31781715471),
-            # почасовой профиль приходит из Метрики (шаг 9).
-            for kind in ("device", "gender", "age"):
-                jobs.append({"purpose": "computed", "login": login, "goals": goals,
-                             "kind": kind, "date_from": cutoff, "by_campaign": False})
+        # Расписания здесь нет: HourOfDay отвергается Reports API (probe 31781715471),
+        # почасовой профиль приходит из Метрики (шаг 9).
+        #
+        # Срезы запрашиваются независимо от объёма оплат: конверсионность сегмента
+        # считается по Conversions самого отчёта Директа. Прежний гейт по оплатам
+        # аккаунта остался от расчёта, который сегменты не различал.
+        for kind in ("device", "gender", "age"):
+            jobs.append({"purpose": "computed", "login": login, "goals": goals,
+                         "kind": kind, "date_from": cutoff, "by_campaign": False})
         for kind in ("region", "network", "device"):
             jobs.append({"purpose": "sliced", "login": login, "goals": goals,
                          "kind": kind, "date_from": slice_from, "by_campaign": True})
@@ -225,16 +204,30 @@ def main() -> int:
     # идентификатор на всех схлопывал четыре набора в один — ключ таблицы
     # совпадал, и в базе оставались числа последнего успевшего кабинета.
     computed_by_account: Dict[str, List[Dict[str, Any]]] = {}
+    # Срезы, по которым корректировки НЕ посчитаны, и почему. Молчаливый пропуск
+    # неотличим от «данных нет» — а именно так и выглядел дефект размазывания.
+    computed_skipped: List[Dict[str, Any]] = []
     sliced_rows: List[Dict[str, Any]] = []
     if jobs:
         with ThreadPoolExecutor(max_workers=REPORT_WORKERS) as pool:
             for done in as_completed([pool.submit(_run_job, j) for j in jobs]):
                 job = done.result()
                 if job["purpose"] == "computed":
-                    login, rows = computed_rows_for_job(job, base_conv, base_expected)
-                    computed_by_account.setdefault(login, []).extend(rows)
+                    login, rows, reason = computed_rows_for_job(job)
+                    if reason:
+                        computed_skipped.append(
+                            {"account": login, "slice": job["kind"], "reason": reason})
+                    if rows:
+                        computed_by_account.setdefault(login, []).extend(rows)
                 else:
                     sliced_rows += collapse_tail(build_sliced_facts(job["rows"], job["kind"]))
+
+    if computed_skipped:
+        agent_db.insert_guard_checks([
+            {"check_name": f"computed:{sk['account']}:{sk['slice']}", "status": "SKIP",
+             "detail": {"reason": sk["reason"]}}
+            for sk in computed_skipped
+        ])
 
     computed_count = 0
     for login, rows in computed_by_account.items():
@@ -306,16 +299,22 @@ def main() -> int:
                 }])
 
     if hourly_rows:
-        hourly_clicks = sum(r["clicks"] for r in hourly_rows)
-        hourly_goals = sum(r["sum_p_pay"] for r in hourly_rows)
-        hourly_base = (hourly_goals / hourly_clicks) if hourly_clicks else 0.0
-        if hourly_base > 0:
-            schedule_rows = compute_schedule(hourly_rows, hourly_base)
-            # Почасовой профиль посчитан по счётчикам Метрики всего EDU, а не
-            # по одному кабинету, но применяется в каждом — пишем его под
-            # каждым логином. Хранить его под общим «ничьим» идентификатором
-            # нельзя: тогда загрузчик, который читает настройки строго по
-            # кабинету, не найдёт расписание ни для одного из них.
+        # База считается внутри compute_schedule по тем же строкам: внешняя база
+        # в чужих единицах — та самая ошибка, что вырождала сегментные корректировки.
+        schedule_rows, schedule_reason = compute_schedule(hourly_rows)
+        if schedule_reason:
+            computed_skipped.append(
+                {"account": "*", "slice": "hour", "reason": schedule_reason})
+            agent_db.insert_guard_checks([{
+                "check_name": "computed:*:hour", "status": "SKIP",
+                "detail": {"reason": schedule_reason},
+            }])
+        # Почасовой профиль посчитан по счётчикам Метрики всего EDU, а не
+        # по одному кабинету, но применяется в каждом — пишем его под
+        # каждым логином. Хранить его под общим «ничьим» идентификатором
+        # нельзя: тогда загрузчик, который читает настройки строго по
+        # кабинету, не найдёт расписание ни для одного из них.
+        if schedule_rows:
             for client in clients:
                 agent_db.upsert_computed_settings(
                     schedule_rows, calc_date=today_iso, object_id=client["login"])
@@ -356,6 +355,7 @@ def main() -> int:
         "quasi_experiments": len(quasi),
         "computed_settings": computed_count,
         "computed_settings_by_account": {k: len(v) for k, v in computed_by_account.items()},
+        "computed_settings_skipped": computed_skipped,
         "profile_rows": len(profile_rows),
         "metrika_hourly": len(hourly_rows),
         "metrika_behavior": len(resolved_behavior),

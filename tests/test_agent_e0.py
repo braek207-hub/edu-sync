@@ -9,41 +9,79 @@ tests/test_agent_e0.py — тесты расчётной стороны Э0.
 объекта. Первичный ключ таблицы включает этот идентификатор, запись построчная —
 дубликаты не падали, а тихо перетирали друг друга: в базе выживали числа того
 кабинета, который дописался последним. Кабинет обязан ехать вместе с числами.
+
+Дефект 2: конверсионность сегмента считалась по ожидаемым оплатам, размазанным
+по ДОЛЕ КЛИКОВ (_attach_expected_payments) — из-за чего у всех сегментов среза
+она получалась одинаковой и «корректировка по сегменту» сегменты не различала.
+Теперь она считается по Conversions самого отчёта Директа, а вырожденный срез
+корректировок не даёт вовсе и называет причину в отчёте прогона.
 """
 
 import sync.agent_e0 as agent_e0
+from sync.agent.computed import DEGENERATE_REASON, NO_CONVERSIONS_REASON
 
 
-def _segment_rows(clicks: int, p_pay: float):
-    return [{"segment_kind": "device", "segment_key": "MOBILE",
-             "clicks": clicks, "sum_p_pay": p_pay}]
+def _segment_rows(*specs):
+    """(ключ, клики, конверсии) → строки сегментного отчёта Директа."""
+    return [{"segment_kind": "device", "segment_key": key,
+             "clicks": clicks, "conversions": conversions}
+            for key, clicks, conversions in specs]
 
 
 def test_computed_rows_carry_their_own_account():
     job_a = {"purpose": "computed", "login": "acc-1", "kind": "device",
-             "rows": _segment_rows(clicks=1000, p_pay=0.0)}
+             "rows": _segment_rows(("MOBILE", 20000, 1200), ("DESKTOP", 20000, 200))}
     job_b = {"purpose": "computed", "login": "acc-2", "kind": "device",
-             "rows": _segment_rows(clicks=1000, p_pay=0.0)}
+             "rows": _segment_rows(("MOBILE", 20000, 200), ("DESKTOP", 20000, 1200))}
 
-    login_a, rows_a = agent_e0.computed_rows_for_job(job_a, base_conv=1.0, base_expected=2000.0)
-    login_b, rows_b = agent_e0.computed_rows_for_job(job_b, base_conv=1.0, base_expected=1000.0)
+    login_a, rows_a, reason_a = agent_e0.computed_rows_for_job(job_a)
+    login_b, rows_b, reason_b = agent_e0.computed_rows_for_job(job_b)
 
-    assert login_a == "acc-1"
-    assert login_b == "acc-2"
-    # Числа кабинетов разные (разный объём ожидаемых оплат) — именно поэтому
-    # их нельзя писать под общим ключом: один набор перетирал бы другой.
-    assert rows_a and rows_b
-    assert rows_a[0]["value"] != rows_b[0]["value"]
+    assert (login_a, login_b) == ("acc-1", "acc-2")
+    assert reason_a is None and reason_b is None
+    # Аудитория кабинетов разная — и числа обязаны получиться разные: именно
+    # поэтому их нельзя писать под общим ключом, один набор перетирал бы другой.
+    value_a = {r["setting_key"]: r["value"] for r in rows_a}
+    value_b = {r["setting_key"]: r["value"] for r in rows_b}
+    assert value_a["MOBILE"] != value_b["MOBILE"]
+
+
+def test_computed_rows_distinguish_segments():
+    """Сегменты одного среза расходятся по конверсиям, а не по объёму кликов.
+
+    На старом коде оплаты раздавались по доле кликов: при равных кликах оба
+    сегмента получали одну конверсионность и одно и то же значение.
+    """
+    job = {"purpose": "computed", "login": "acc-1", "kind": "device",
+           "rows": _segment_rows(("MOBILE", 20000, 1200), ("DESKTOP", 20000, 200))}
+
+    _, rows, reason = agent_e0.computed_rows_for_job(job)
+
+    assert reason is None
+    value = {r["setting_key"]: r["value"] for r in rows}
+    assert value["MOBILE"] > 0 > value["DESKTOP"]
+
+
+def test_computed_rows_refuse_slice_without_conversions():
+    job = {"purpose": "computed", "login": "acc-1", "kind": "device",
+           "rows": _segment_rows(("MOBILE", 20000, 0), ("DESKTOP", 20000, 0))}
+
+    login, rows, reason = agent_e0.computed_rows_for_job(job)
+
+    assert login == "acc-1"
+    assert rows == []
+    assert reason == NO_CONVERSIONS_REASON
 
 
 def test_computed_rows_are_empty_when_segment_below_support():
     job = {"purpose": "computed", "login": "acc-1", "kind": "device",
-           "rows": _segment_rows(clicks=5, p_pay=100.0)}
+           "rows": _segment_rows(("MOBILE", 5, 2))}
 
-    login, rows = agent_e0.computed_rows_for_job(job, base_conv=1.0, base_expected=100.0)
+    login, rows, reason = agent_e0.computed_rows_for_job(job)
 
     assert login == "acc-1"
     assert rows == []
+    assert reason is not None
 
 
 # --------------- дефект 1, сквозная половина: расчёт ПЕРЕДАЁТ кабинет при записи
@@ -65,11 +103,24 @@ _DB_EMPTY_LOADERS = (
     "load_campaign_features", "table_sizes",
 )
 
-# Отчёты Директа по кабинетам: у каждого свой сегмент и свой объём кликов —
+# Отчёты Директа по кабинетам: у каждого свои сегменты и своя конверсионность —
 # именно поэтому их числа нельзя писать под общим ключом.
 _REPORTS_BY_LOGIN = {
-    "acc-1": [{"segment_kind": "device", "segment_key": "MOBILE", "clicks": 900}],
-    "acc-2": [{"segment_kind": "device", "segment_key": "DESKTOP", "clicks": 400}],
+    "acc-1": _segment_rows(("MOBILE", 20000, 1200), ("DESKTOP", 20000, 200)),
+    "acc-2": _segment_rows(("TABLET", 20000, 1200), ("DESKTOP", 20000, 200)),
+}
+
+# Цели не настроены / отчёт отдал нули — считать конверсионность нечем.
+_REPORTS_NO_CONVERSIONS = {
+    "acc-1": _segment_rows(("MOBILE", 20000, 0), ("DESKTOP", 20000, 0)),
+    "acc-2": _segment_rows(("TABLET", 20000, 0), ("DESKTOP", 20000, 0)),
+}
+
+# Конверсионность сегментов совпала (0.02 у обоих) — сигнатура починенного
+# дефекта: данные не различают сегменты, корректировок быть не должно.
+_REPORTS_DEGENERATE = {
+    "acc-1": _segment_rows(("MOBILE", 50000, 1000), ("DESKTOP", 10000, 200)),
+    "acc-2": _segment_rows(("TABLET", 50000, 1000), ("DESKTOP", 10000, 200)),
 }
 
 
@@ -81,7 +132,7 @@ def _fact(today):
     }
 
 
-def _patch_e0_run(monkeypatch):
+def _patch_e0_run(monkeypatch, reports=None):
     """Расчёт Э0 без сети и без БД. Возвращает список вызовов записи настроек."""
     import json as _json
     from datetime import date as _date
@@ -119,14 +170,14 @@ def _patch_e0_run(monkeypatch):
     monkeypatch.setattr(agent_e0, "fetch_campaign_ids", lambda *a, **k: [])
     monkeypatch.setattr(agent_e0, "fetch_objects", lambda *a, **k: [])
     monkeypatch.setattr(agent_e0, "fetch_search_queries", lambda *a, **k: [])
+    by_login = _REPORTS_BY_LOGIN if reports is None else reports
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
         # Числа отдаёт только срез по устройствам: пол и возраст оставлены
-        # пустыми, чтобы в проверке участвовали ровно две строки — по одной
-        # на кабинет, и разбивка отчёта читалась однозначно.
+        # пустыми, чтобы разбивка отчёта читалась однозначно.
         lambda login, kind, date_from, date_to, by_campaign=False, goals=():
             [] if (by_campaign or kind != "device")
-            else list(_REPORTS_BY_LOGIN.get(login, [])),
+            else list(by_login.get(login, [])),
     )
     return calls
 
@@ -147,8 +198,25 @@ def test_main_saves_each_account_settings_under_its_own_key(monkeypatch, capsys)
     keys_2 = {r["setting_key"] for r in by_account["acc-2"]}
     # Числа каждого кабинета — под своим ключом и только своим: сегменты
     # кабинетов разные, и перепутать их нельзя ни в одну сторону.
-    assert keys_1 == {"MOBILE"}
-    assert keys_2 == {"DESKTOP"}
+    assert keys_1 == {"MOBILE", "DESKTOP"}
+    assert keys_2 == {"TABLET", "DESKTOP"}
+
+
+# --------------- дефект 2, сквозная половина: до записи доезжают РАЗНЫЕ числа
+# Чистая функция может считать честно, а размазывание вернуться прямо в тело
+# main() — ровно так дефект 1 пережил свой набор тестов. Поэтому проверка идёт
+# по аргументам записи, а не по возврату computed_rows_for_job.
+
+def test_main_writes_different_modifiers_for_different_segments(monkeypatch, capsys):
+    calls = _patch_e0_run(monkeypatch)
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+
+    written = [r for call in calls if call["object_id"] == "acc-1" for r in call["rows"]]
+    value = {r["setting_key"]: r["value"] for r in written}
+    # Клики у сегментов равные — разъехаться они могут только по конверсиям.
+    assert value["MOBILE"] > 0 > value["DESKTOP"]
 
 
 def test_main_reports_computed_settings_per_account(monkeypatch, capsys):
@@ -162,4 +230,39 @@ def test_main_reports_computed_settings_per_account(monkeypatch, capsys):
 
     report = _json.loads(capsys.readouterr().out)
     assert set(report["computed_settings_by_account"]) == {"acc-1", "acc-2"}
-    assert report["computed_settings"] == 2
+    assert report["computed_settings"] == 4
+
+
+def test_main_reports_slice_without_conversions(monkeypatch, capsys):
+    """Нули вместо конверсий не дают нулевых корректировок: срез отбрасывается,
+    а причина попадает в отчёт прогона. Молчаливые нули недопустимы."""
+    import json as _json
+
+    calls = _patch_e0_run(monkeypatch, reports=_REPORTS_NO_CONVERSIONS)
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    assert calls == []
+    assert report["computed_settings"] == 0
+    skipped = {(s["account"], s["slice"]): s["reason"]
+               for s in report["computed_settings_skipped"]}
+    assert skipped[("acc-1", "device")] == NO_CONVERSIONS_REASON
+    assert skipped[("acc-2", "device")] == NO_CONVERSIONS_REASON
+
+
+def test_main_reports_degenerate_slice(monkeypatch, capsys):
+    """Совпавшая у всех сегментов конверсионность — отказ с причиной в отчёте,
+    а не набор одинаковых корректировок."""
+    import json as _json
+
+    calls = _patch_e0_run(monkeypatch, reports=_REPORTS_DEGENERATE)
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    assert calls == []
+    skipped = {(s["account"], s["slice"]): s["reason"]
+               for s in report["computed_settings_skipped"]}
+    assert skipped[("acc-1", "device")] == DEGENERATE_REASON
+    assert skipped[("acc-2", "device")] == DEGENERATE_REASON
