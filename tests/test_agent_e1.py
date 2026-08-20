@@ -19,6 +19,7 @@ from datetime import date, timedelta
 import pytest
 
 import sync.agent_e1 as agent_e1
+from sync.agent.writer.apply import SandboxApplyRefusal, apply_actions
 
 
 class _FakeLease:
@@ -1175,3 +1176,112 @@ def test_cooldown_is_asked_about_harmful_segments_not_only_rolled_back(monkeypat
     report = _reports(capsys)[0]
     assert report["blocked_by_cooldown"]["count"] == 1
     assert _MultiCabinetClient.instances[0].sent == []
+
+
+# =========================================================================
+# Дефект (Critical): «песочница + запись» у прямого применения — как у сторожа
+# =========================================================================
+
+
+def test_refusal_blocks_only_sandbox_with_apply():
+    # То же правило, что у сторожа (agent_e1_watchdog.refusal): запрещена
+    # ровно комбинация sandbox=True И dry_run=False. Остальные три — рабочие
+    # режимы прогона и обязаны оставаться разрешёнными.
+    assert agent_e1.refusal(sandbox=True, dry_run=False) == agent_e1.SANDBOX_APPLY_REFUSAL
+    assert agent_e1.refusal(sandbox=True, dry_run=True) is None
+    assert agent_e1.refusal(sandbox=False, dry_run=True) is None
+    assert agent_e1.refusal(sandbox=False, dry_run=False) is None
+
+
+def test_main_refuses_sandbox_apply_before_touching_db(monkeypatch, capsys):
+    # --apply без --prod: sandbox=True, dry_run=False — запрещённая
+    # комбинация. Раньше main() её не отсекал вовсе и уходил писать в
+    # БОЕВОЙ журнал строки о песочнице. Отказ обязан случиться ДО первого
+    # обращения к БД — оба подменённых вызова роняют тест, если их всё же
+    # позвали.
+    monkeypatch.setattr(sys, "argv", ["agent_e1", "--apply"])
+    monkeypatch.setattr(
+        agent_e1.writer_db, "ensure_writer_tables",
+        lambda: pytest.fail("ensure_writer_tables не должен вызываться при отказе"),
+    )
+    monkeypatch.setattr(
+        agent_e1, "_clients",
+        lambda: pytest.fail("_clients не должен вызываться при отказе"),
+    )
+
+    exit_code = agent_e1.main()
+
+    assert exit_code == 2
+    report = _reports(capsys)[0]
+    assert report["verdict"] == "REFUSED"
+    assert report["sandbox"] is True
+    assert report["dry_run"] is False
+    assert report["reason"] == agent_e1.SANDBOX_APPLY_REFUSAL
+
+
+def test_main_prod_apply_is_not_refused(monkeypatch, capsys):
+    # Соседний режим (--prod --apply) не должен зацепиться отказом —
+    # это ровно тот режим, ради которого прогон вообще существует.
+    monkeypatch.setattr(agent_e1, "_clients", lambda: [])
+    monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["agent_e1", "--prod", "--apply"])
+
+    assert agent_e1.main() == 0
+    report = _reports(capsys)[0]
+    assert report["verdict"] == "NOTHING_TO_DO"
+
+
+class _NoDBTouch:
+    """Двойник журнала: падает на любом обращении, чтобы доказать, что
+    отказ apply_actions случается ДО первой записи в БД."""
+
+    def __getattr__(self, name):
+        def _fail(*a, **k):
+            pytest.fail(f"db_module.{name} не должен вызываться при отказе")
+        return _fail
+
+
+class _StubMutateClient:
+    def __init__(self, sandbox, dry_run):
+        self.sandbox = sandbox
+        self.dry_run = dry_run
+
+    def mutate(self, service, method, params):
+        return {"dry_run": True} if self.dry_run else {}
+
+
+def test_apply_actions_refuses_sandbox_write_client_without_touching_db():
+    # Второй рубеж инварианта «песочный клиент журнала не касается»: даже
+    # если вызывающий код (живой тест, разовый скрипт) соберёт запрещённый
+    # клиент в обход main(), apply_actions обязан отказаться сам, а не
+    # начать писать в боевой журнал строки о песочнице.
+    client = _StubMutateClient(sandbox=True, dry_run=False)
+
+    with pytest.raises(SandboxApplyRefusal):
+        apply_actions(client, [{"idempotency_key": "x"}], _NoDBTouch())
+
+
+def test_apply_actions_allows_sandbox_rehearsal_and_prod_apply():
+    # Оба легитимных режима не задеты новым рубежом: песочница-репетиция
+    # (умолчание) и боевая запись (sandbox=False) обязаны работать как
+    # раньше — это и есть «боевой путь не меняется ни на шаг».
+    class _FakeDB:
+        def find_action_by_key(self, key):
+            return None
+
+        def insert_action(self, action):
+            return action["idempotency_key"]
+
+        def mark_action(self, action_id, status, response):
+            return True
+
+    action = {"idempotency_key": "x", "action_kind": "bidmodifier.set",
+              "payload": {"Id": 1, "BidModifier": 10}}
+
+    sandbox_rehearsal = apply_actions(
+        _StubMutateClient(sandbox=True, dry_run=True), [action], _FakeDB())
+    assert sandbox_rehearsal["dry_run"] == 1
+
+    prod_apply = apply_actions(
+        _StubMutateClient(sandbox=False, dry_run=False), [action], _FakeDB())
+    assert prod_apply["applied"] == 1

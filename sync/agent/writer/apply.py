@@ -21,6 +21,11 @@ result для разбора здесь. Без разбора такая оши
 статус ушёл бы в 'applied', а на следующем прогоне идемпотентный ключ нашёлся
 бы уже применённым и действие, которое физически не создалось в кабинете,
 навсегда осталось бы недостижимым для повторной попытки.
+
+Инвариант «песочный клиент журнала не касается» держится здесь кодом:
+apply_actions отказывается стартовать (SandboxApplyRefusal), если клиент
+собран с sandbox=True и dry_run=False, — до первой записи в журнал. Это
+второй рубеж; первый — отказ main() ДО обращения к БД (agent_e1.refusal).
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,6 +33,47 @@ from typing import Any, Dict, List, Optional, Tuple
 from sync.agent.writer.client import is_outcome_unknown
 from sync.agent.writer.db import FINAL_STATUSES
 from sync.agent.writer.units import delta_to_api
+
+# Второй рубеж инварианта «песочный клиент журнала не касается» (первый —
+# отказ ДО первого обращения к БД в agent_e1.refusal/agent_e1_watchdog.refusal).
+# Тот рубеж защищает штатный запуск через main(); этот — саму функцию
+# применения, которую вызывающий код (живой тест, разовый скрипт) может
+# собрать и вызвать напрямую, минуя main(). «Песочница + запись» здесь та же
+# запрещённая комбинация, что и там: боевые логины в песочнице недоступны,
+# а запись о попытке всё равно ушла бы в БОЕВОЙ журнал (база одна) —
+# при транспортной ошибке такая строка получает статус «исход неизвестен»,
+# занимает риск-бюджет и подставляет сторожа под откат объекта, которого в
+# боевом кабинете никогда не было.
+#
+# Атрибуты читаются через getattr с умолчаниями, повторяющими умолчания
+# самого WriteClient (sandbox=True, dry_run=True): боевой путь клиент
+# всегда создаёт с явными sandbox/dry_run, так что для него поведение не
+# меняется ни на шаг; это только подстраховка для кода, который передал
+# объект без этих атрибутов вовсе.
+SANDBOX_APPLY_REFUSAL = (
+    "запрещённая комбинация «песочница + запись»: клиент собран с "
+    "sandbox=True и без dry_run — применение отказывается писать в "
+    "БОЕВОЙ журнал от имени песочницы. Нужна боевая запись — "
+    "WriteClient(sandbox=False, dry_run=False); нужна репетиция — "
+    "dry_run=True"
+)
+
+
+class SandboxApplyRefusal(RuntimeError):
+    """Применение отказалось начинать: клиент — «песочница + запись».
+
+    Держит инвариант «песочный клиент журнала не касается» кодом, а не
+    дисциплиной вызывающего: main() уже отказывается стартовать в этой
+    комбинации (agent_e1.refusal), но apply_actions — не единственная точка
+    входа в применение, и второй рубеж здесь дешевле любой будущей утечки
+    инварианта через новый вызывающий код.
+    """
+
+
+def _sandbox_apply_refused(client) -> bool:
+    sandbox = bool(getattr(client, "sandbox", True))
+    dry_run = bool(getattr(client, "dry_run", True))
+    return sandbox and not dry_run
 
 # key корректировки → форма API. Проверено probe (задача 1).
 _DEMOGRAPHIC_KEYS = {"GENDER_MALE", "GENDER_FEMALE"}
@@ -164,6 +210,11 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
     попадает в счётчик 'conflicted' — журнал уже описывает исход точнее, чем
     эта отправка, и затирать его нельзя (db.MARK_ACTION_SQL держит гард).
     """
+    # Отказ ДО первого обращения к БД — тот же порядок, что и в main(): ничего
+    # не должно лечь в журнал прежде, чем комбинация будет проверена.
+    if _sandbox_apply_refused(client):
+        raise SandboxApplyRefusal(SANDBOX_APPLY_REFUSAL)
+
     applied = skipped = failed = rejected = dry_run = unknown = conflicted = 0
     details: List[Dict[str, Any]] = []
 
