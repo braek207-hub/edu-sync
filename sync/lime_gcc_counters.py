@@ -27,6 +27,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync.db import _database_url
 from sync.gcc_channels import map_ga4_channel
 from sync.gcc_ga4 import GA4_PROPERTY, run_report
 from sync.gcc_metrika import fetch_metrika_traffic
@@ -121,7 +122,8 @@ def run() -> None:
         print("DRY RUN — БД не тронута")
         return
 
-    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    # Prisma pooler URI (?pgbouncer=true) чистит db._database_url — psycopg2 параметр не понимает.
+    conn = psycopg2.connect(_database_url(), connect_timeout=30)
     try:
         with conn, conn.cursor() as cur:
             # Идемпотентная миграция таблицы — тем же прогоном (паттерн lime_ru_metrika).
