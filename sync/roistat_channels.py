@@ -34,7 +34,12 @@ _MAP = {
     "Яндекс.Директ 1":  ("SEM", "Яндекс.Директ", PAID),
     "Facebook":         ("SMM paid", "Meta Ads", PAID),
     "Прямые визиты":    ("Direct", "Direct", FREE),
-    "direct":           ("Direct", "Direct", FREE),
+    # UTM-псевдоканалы битых/ручных меток (utm_source=direct|google). Ручной отчёт
+    # относит их к своим рекламным каналам (сверка W33: Yandex ручного 3 519 =
+    # «Яндекс.Директ 1» 3 464 + «direct» 56) — повторяем, иначе они оседали в
+    # Прямых/Others и детализация расходилась с ручным при сходящемся тотале.
+    "direct":           ("SEM", "Яндекс.Директ", PAID),
+    "google":           ("SEM", "Google.Adwords", PAID),
     "SEO":              ("SEO", "SEO Others", FREE),
     "Визиты с сайтов":  ("Referrals", "Реферал", FREE),
     "web_sharing":      ("Referrals", "web_sharing", FREE),
