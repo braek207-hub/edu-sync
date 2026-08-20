@@ -1,0 +1,22 @@
+name: Probe GCC GA4 purchases (temp)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Probe GA4 ecommerce purchases (property 417919368)
+        env:
+          LIME_REPORTS_SA_JSON: ${{ secrets.LIME_REPORTS_SA_JSON }}
+          GCC_GA4_PROPERTY: ${{ secrets.GCC_GA4_PROPERTY }}
+          PYTHONIOENCODING: "utf-8"
+        run: python scripts/probe_gcc_ga4_purchases.py
