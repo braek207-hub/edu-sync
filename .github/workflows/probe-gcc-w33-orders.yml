@@ -21,3 +21,9 @@ jobs:
           API_LIME_SHOPIFY: ${{ secrets.API_LIME_SHOPIFY }}
           PYTHONIOENCODING: "utf-8"
         run: python scripts/probe_gcc_w33_orders_variants.py
+
+      - name: Probe app DAU by country
+        env:
+          APPMETRICA_TOKEN: ${{ secrets.APPMETRICA_TOKEN }}
+          PYTHONIOENCODING: "utf-8"
+        run: python scripts/probe_gcc_app_dau_countries.py
