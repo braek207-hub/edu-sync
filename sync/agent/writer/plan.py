@@ -8,7 +8,9 @@ sync/agent/writer/plan.py — желаемое состояние кабинет
 
 Источник — edu_agent_computed_settings, посчитанные на Э0. Расписание
 (schedule:*) в Э1a не применяется: у него другой механизм (TimeTargeting
-в стратегии кампании), он войдёт отдельной задачей позже.
+в стратегии кампании), он войдёт отдельной задачей позже. «Не применяется»
+здесь значит «видно в отчёте с причиной», а не «выпало молча»: любая значимая
+строка, для которой не нашлось типа корректировки, уходит в unsupported.
 
 Единицы: percent — ДЕЛЬТА (30 = «+30 %»), как её считает Э0 и как её читает
 человек. Перевод в 100-базный коэффициент Директа делается ровно на границе с
@@ -36,6 +38,39 @@ SETTING_KIND_MAP: Dict[str, str] = {
 }
 
 DEVICE_KIND = "bid_modifier:device"
+GENDER_KIND = "bid_modifier:gender"
+AGE_KIND = "bid_modifier:age"
+
+# Допустимые значения демографических сегментов Директа. Перечни не выдуманы:
+# это те же списки, по которым рабочий код проекта РАЗБИРАЕТ корректировки,
+# прочитанные из кабинета (sync/edu_direct_settings.py::_GENDER_RU и _AGE_RU,
+# строки 43–51). Здесь они стоят на ЗАПИСИ.
+#
+# Зачем список вообще. У устройств допустимые значения перечислены
+# (DEVICE_TYPE_MAP), у региона стоит проверка на числовой идентификатор, а у
+# пола и возраста не было ничего: любой ключ уезжал в тело запроса. Отчёты
+# Директа штатно отдают значение «не определено» (UNKNOWN) и по полу, и по
+# возрасту — сегмент крупный, порог по объёму наблюдений проходит легко, — а
+# в bidmodifiers.add такого значения нет. Итог: отказ уровня элемента,
+# статус 'rejected' и вечная переотправка каждый прогон.
+GENDER_KEYS: Tuple[str, ...] = ("GENDER_MALE", "GENDER_FEMALE")
+AGE_KEYS: Tuple[str, ...] = (
+    "AGE_0_17", "AGE_18_24", "AGE_25_34", "AGE_35_44", "AGE_45_54", "AGE_55",
+)
+
+# Ключ демографического сегмента → поле тела запроса bidmodifiers.add.
+# Явное отображение, а не «если не пол, значит возраст»: неизвестный ключ при
+# таком «иначе» молча становился возрастом и уходил в API.
+DEMOGRAPHIC_FIELD: Dict[str, str] = {
+    **{k: "Gender" for k in GENDER_KEYS},
+    **{k: "Age" for k in AGE_KEYS},
+}
+
+# Вид настройки → его перечень допустимых ключей.
+DEMOGRAPHIC_KEYS_BY_KIND: Dict[str, Tuple[str, ...]] = {
+    GENDER_KIND: GENDER_KEYS,
+    AGE_KIND: AGE_KEYS,
+}
 
 # Ключ устройства → тип корректировки. Ключ приходит из среза Reports API
 # (поле Device); сравнение регистронезависимое, а канонической формой ключа
@@ -65,12 +100,33 @@ UNSUPPORTED_REGION_REASON = (
     "ключ региона не числовой RegionId (срез отдаёт название): "
     "региональные корректировки не применяются до появления TargetingLocationId"
 )
+# Демографический сегмент вне перечня API. Первый и самый частый постоялец —
+# «не определено» (UNKNOWN): отчёты Директа отдают такой сегмент штатно, а
+# запрос на создание корректировки такого значения не принимает.
+UNSUPPORTED_DEMOGRAPHIC_REASON = (
+    "демографический сегмент «{key}» вне перечня API Директа ({allowed}): "
+    "отчёты отдают и «не определено», а корректировка такого значения не "
+    "принимает — элемент был бы отклонён и переотправлялся каждый прогон"
+)
+# Вид настройки, которого нет ни в SETTING_KIND_MAP, ни среди устройств.
+# Молчаливое выпадение здесь уже стоило дорого: расписание (schedule:*) в Э1a
+# не применяется сознательно, но так же молча исчезал и bid_modifier:network —
+# посчитанный, значимый и никем не замеченный. «Не применяем» и «в данных
+# нет» обязаны различаться в отчёте.
+UNSUPPORTED_KIND_REASON = (
+    "вид настройки «{kind}» движок Э1a не применяет: его нет ни среди "
+    "корректировок (устройство/пол/возраст/регион), ни в справочнике типов "
+    "API — применение такой строки не запланировано, а не потеряно"
+)
 
 
 def direct_type_for(kind: str, key: str) -> Tuple[Optional[str], str, str]:
     """(вид, ключ) → (тип корректировки, канонический ключ, причина отказа).
 
-    Тип None значит «применить нельзя»; причина непустая и уходит в отчёт.
+    Тип None значит «применить нельзя»; причина непустая ВСЕГДА и уходит в
+    отчёт. Пустая причина при отказе означала бы молчаливое выпадение строки —
+    ровно то, из-за чего значимые корректировки исчезали, не попадая ни в
+    план, ни в «неподдерживаемые».
     """
     if kind == DEVICE_KIND:
         canonical = str(key).strip().upper()
@@ -81,10 +137,21 @@ def direct_type_for(kind: str, key: str) -> Tuple[Optional[str], str, str]:
 
     direct_type = SETTING_KIND_MAP.get(kind)
     if direct_type is None:
-        return None, str(key), ""
+        return None, str(key), UNSUPPORTED_KIND_REASON.format(kind=kind or "—")
 
     if direct_type == "REGIONAL_ADJUSTMENT" and not str(key).strip().isdigit():
         return None, str(key), UNSUPPORTED_REGION_REASON
+
+    if direct_type == "DEMOGRAPHICS_ADJUSTMENT":
+        # Канонический регистр — верхний, как у устройств и как в самих
+        # ответах API: иначе план ("gender_male") и факт ("GENDER_MALE") не
+        # сойдутся по паре (тип, ключ) никогда.
+        canonical = str(key).strip().upper()
+        allowed = DEMOGRAPHIC_KEYS_BY_KIND.get(kind, ())
+        if canonical not in allowed:
+            return None, canonical, UNSUPPORTED_DEMOGRAPHIC_REASON.format(
+                key=canonical or "—", allowed="/".join(allowed))
+        return direct_type, canonical, ""
 
     return direct_type, str(key).strip(), ""
 
@@ -105,8 +172,12 @@ def plan_bid_modifiers(
 
     for row in computed:
         kind = str(row.get("setting_kind") or "")
-        if kind != DEVICE_KIND and kind not in SETTING_KIND_MAP:
-            continue
+        # Отбор по виду настройки СНЯТ намеренно. Прежде незнакомый вид
+        # (schedule:*, bid_modifier:network) выпадал здесь молча: строка не
+        # попадала ни в desired, ни в unsupported, и отчёт прогона был
+        # неотличим от «таких данных нет». Теперь незнакомый вид проходит
+        # те же пороги значимости, что и остальные, и отказ по нему выносит
+        # direct_type_for — с причиной.
         if int(row.get("support_n") or 0) < min_support:
             continue
         percent = int(round(float(row.get("value") or 0.0)))

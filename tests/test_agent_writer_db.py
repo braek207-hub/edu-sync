@@ -929,3 +929,96 @@ def test_live_watchdog_lock_is_independent_of_the_main_run():
     with writer_db.run_lock("agent_e1"):
         with writer_db.run_lock("agent_e1_watchdog"):
             pass
+
+
+# =========================================================================
+# Дефект И3: у применения не было потолка попыток
+# =========================================================================
+
+
+def test_apply_attempts_column_is_added_by_ddl():
+    ddl = chr(10).join(WRITER_DDL)
+    assert "apply_attempts" in ddl
+    # Отдельным ALTER, а не правкой CREATE TABLE: таблица уже существует в
+    # базе, и CREATE TABLE IF NOT EXISTS её не трогает — колонка в теле
+    # CREATE появилась бы только на чистой базе.
+    assert "ADD COLUMN IF NOT EXISTS apply_attempts" in ddl
+
+
+def test_attempts_grow_only_on_reattempted_statuses():
+    # Счётчик обязан расти ровно там, где действие уйдёт на повтор.
+    # 'applied' и 'dry_run' его не двигают: за ними повтора нет.
+    assert writer_db.REATTEMPTED_STATUSES == ("rejected", "failed")
+    for status in writer_db.REATTEMPTED_STATUSES:
+        assert f"'{status}'" in writer_db.MARK_ACTION_SQL
+    assert "apply_attempts = apply_attempts + CASE" in writer_db.MARK_ACTION_SQL
+
+
+def test_replanning_does_not_reset_the_attempt_counter():
+    # Повторная планировка обновляет previous_state, риск и красную линию —
+    # но не счётчик попыток. Сбрасывай она его, потолок не наступал бы
+    # никогда: каждый прогон переписывает строку заново.
+    assert "apply_attempts" not in writer_db.INSERT_ACTION_SQL
+
+
+def test_exhausted_segments_sql_counts_by_segment_not_by_key():
+    sql = writer_db.EXHAUSTED_SEGMENTS_SQL
+    # Группировка по объекту и сегменту, а не по ключу идемпотентности: в ключ
+    # зашит процент, он дрейфует между расчётами, и у каждой попытки свой ключ.
+    assert "idempotency_key" not in sql
+    assert "SUM(apply_attempts)" in sql
+    assert "GROUP BY" in sql and "HAVING SUM(apply_attempts) >= %s" in sql
+    # Сегмент восстанавливается и у строк, записанных до появления колонок.
+    assert "COALESCE(direct_type, payload->>'Type')" in sql
+    assert "COALESCE(setting_key, payload->>'key')" in sql
+
+
+def test_exhausted_segments_looks_only_at_refused_rows():
+    # Сегмент, по которому изменение однажды состоялось, стеной не является:
+    # строки в 'applied'/'stale'/'rolled_back' в выборку не входят.
+    sql = writer_db.EXHAUSTED_SEGMENTS_SQL
+    assert "status IN ('rejected', 'failed')" in sql
+    for closed in ("applied", "rolled_back", "stale"):
+        assert f"'{closed}'" not in sql
+
+
+def test_exhausted_segments_passes_account_and_threshold(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(writer_db, "_fetch",
+                        lambda sql, params=(): seen.update({"sql": sql, "params": params}) or [])
+
+    writer_db.exhausted_segments(account="cab")
+
+    assert seen["params"] == ("cab", "cab", writer_db.MAX_APPLY_ATTEMPTS)
+
+
+def test_apply_attempt_cap_matches_the_rollback_one():
+    # Разовый сбой стоит повторить, детерминированный — нет. Довод и порядок
+    # величины у обоих путей одинаковые, и расхождение цифр было бы случайным.
+    assert writer_db.MAX_APPLY_ATTEMPTS == writer_db.MAX_ROLLBACK_ATTEMPTS == 3
+
+
+# =========================================================================
+# Мелкое: пометка неудачного отката шла без условия на состояние строки
+# =========================================================================
+
+
+def test_mark_rollback_failed_sql_has_a_state_guard():
+    # Единственный переход модуля, остававшийся без гарда: счётчик попыток рос
+    # и у УЖЕ ОТКАТАННОЙ строки, если её забрал параллельный контур между
+    # решением и отметкой, — и следующая настоящая неудача хоронила бы её
+    # раньше срока.
+    sql = writer_db.MARK_ROLLBACK_FAILED_SQL
+    assert "rolled_back_at IS NULL" in sql
+    assert "status IN ('applied', 'stale')" in sql
+
+
+def test_every_state_transition_has_a_guard():
+    # Свойство всего модуля, а не одного запроса: строку между решением и
+    # отметкой может забрать другой контур, и безусловный UPDATE затирает
+    # чужой, более точный исход.
+    for sql in (writer_db.MARK_ACTION_SQL, writer_db.MARK_UNKNOWN_OUTCOME_SQL,
+                writer_db.MARK_ROLLED_BACK_SQL, writer_db.MARK_HARMFUL_SQL,
+                writer_db.MARK_ROLLBACK_FAILED_SQL):
+        assert "rolled_back_at IS NULL" in sql
+        assert "RETURNING" in sql

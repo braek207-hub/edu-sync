@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.writer.client import is_outcome_unknown
 from sync.agent.writer.db import FINAL_STATUSES
+from sync.agent.writer.plan import DEMOGRAPHIC_FIELD
 from sync.agent.writer.units import delta_to_api
 
 # Второй рубеж инварианта «песочный клиент журнала не касается» (первый —
@@ -75,8 +76,17 @@ def _sandbox_apply_refused(client) -> bool:
     dry_run = bool(getattr(client, "dry_run", True))
     return sandbox and not dry_run
 
-# key корректировки → форма API. Проверено probe (задача 1).
-_DEMOGRAPHIC_KEYS = {"GENDER_MALE", "GENDER_FEMALE"}
+# Ключ демографического сегмента → поле тела запроса (Gender или Age).
+# Справочник один на планирование и на сборку запроса (plan.DEMOGRAPHIC_FIELD),
+# потому что расхождение между «какие ключи мы разрешаем» и «как мы их
+# раскладываем по полям» и есть тот класс ошибки, ради которого справочник
+# заводится.
+#
+# Прежде здесь стояло «если ключ не пол, значит возраст»: любое значение,
+# прошедшее планирование, молча становилось Age и уезжало в API. «Не
+# определено» (UNKNOWN) из отчётов Директа проходило этот путь целиком и
+# возвращалось отказом уровня элемента.
+_DEMOGRAPHIC_FIELD = DEMOGRAPHIC_FIELD
 
 # Тип корректировки устройства → имя поля в теле запроса bidmodifiers.add.
 # У Директа это ТРИ разных типа, а не один «мобильный»: коэффициент,
@@ -118,12 +128,13 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
         if device_field:
             item[device_field] = {"BidModifier": coefficient}
         elif direct_type == "DEMOGRAPHICS_ADJUSTMENT":
-            adjustment: Dict[str, Any] = {"BidModifier": coefficient}
-            if key in _DEMOGRAPHIC_KEYS:
-                adjustment["Gender"] = key
-            else:
-                adjustment["Age"] = key
-            item["DemographicsAdjustments"] = [adjustment]
+            field = _DEMOGRAPHIC_FIELD.get(key)
+            if field is None:
+                raise ValueError(
+                    f"демографический ключ вне перечня API Директа: {key!r} "
+                    f"(допустимы {', '.join(sorted(_DEMOGRAPHIC_FIELD))})")
+            item["DemographicsAdjustments"] = [{"BidModifier": coefficient,
+                                                field: key}]
         elif direct_type == "REGIONAL_ADJUSTMENT":
             item["RegionalAdjustments"] = [{"RegionId": int(key),
                                             "BidModifier": coefficient}]
@@ -148,7 +159,9 @@ def _element_errors(method: str, response: Dict[str, Any]) -> Optional[List[Dict
     ловился для add/set (отклонённое API действие уходило в 'applied' и
     навсегда застревало за детерминированным идемпотентным ключом) — для
     любого будущего вида операции без записи в _RESULT_COLLECTION вызов
-    обязан упасть явно, а не молча вернуть «ошибок нет».
+    обязан упасть явно, а не молча вернуть «ошибок нет». Падение происходит
+    ПОСЛЕ отправки, поэтому apply_actions трактует его как неизвестный исход
+    ('stale'), а не как неудачу.
     """
     collection_key = _RESULT_COLLECTION.get(method)
     if not collection_key:
@@ -184,19 +197,25 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
                      который блокирует повтор по идемпотентности, поэтому
                      отклонённое действие ОБЯЗАНО переприменяться на
                      следующем прогоне, а не пропускаться;
-      - 'failed'   — запрос ТОЧНО не ушёл (ошибка до отправки, соединение не
-                     установлено, отказ уровня запроса от самого Директа)
-                     ИЛИ ответ пришёл, но разобрать его нечем (_element_errors
-                     не знает метод — новый вид операции без записи в
-                     _RESULT_COLLECTION). Переприменяется на следующем прогоне;
+      - 'failed'   — запрос ТОЧНО не ушёл: ошибка ДО отправки (сборка тела,
+                     неизвестный демографический ключ), соединение не
+                     установлено, отказ уровня запроса от самого Директа.
+                     Переприменяется на следующем прогоне;
       - 'stale'    — исход НЕИЗВЕСТЕН: таймаут на записи, разрыв после
                      отправки тела, недоступность сервиса после ретраев
-                     (client.is_outcome_unknown). Изменение может быть живым в
-                     кабинете, поэтому строка уходит в тот же контур, что и
-                     обрыв процесса: под наблюдение сторожа и под риск-бюджет,
-                     без повторной отправки. Считать такое 'failed' — дыра
-                     того же класса и размера, что закрывал механизм зависших
-                     строк: изменение исчезает из виду навсегда.
+                     (client.is_outcome_unknown) — И ЛЮБОЕ исключение ПОСЛЕ
+                     возврата из транспорта, например ответ, который нечем
+                     разобрать (_element_errors не знает метод — новый вид
+                     операции без записи в _RESULT_COLLECTION). Граница
+                     проходит по факту отправки, а не по типу исключения:
+                     после mutate запрос уже состоялся, и переприменение
+                     bidmodifier.add создало бы в кабинете ВТОРОЙ объект.
+                     Изменение может быть живым, поэтому строка уходит в тот
+                     же контур, что и обрыв процесса: под наблюдение сторожа
+                     и под риск-бюджет, без повторной отправки. Считать такое
+                     'failed' — дыра того же класса и размера, что закрывал
+                     механизм зависших строк: изменение исчезает из виду
+                     навсегда.
 
     Ещё два ставятся вне этой функции, и знать про них здесь обязательно —
     именно из-за них действие может быть пропущено или перехвачено:
@@ -242,10 +261,25 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
             lease.guard()
 
         action_id = db_module.insert_action(action)
+        # Факт отправки отмечается СРАЗУ после возврата из транспорта, до
+        # любого разбора ответа. Всё, что падает после этой отметки, —
+        # неизвестный исход, а не «запрос не ушёл»: запрос уже состоялся, и
+        # для bidmodifiers.add переприменение означало бы ВТОРОЙ объект в
+        # кабинете. Прежде обе половины докстринга статуса 'failed' («точно
+        # не ушло» И «разобрать нечем») лечились одним лекарством, и выбрано
+        # было небезопасное.
+        sent = False
         try:
             service, method, params = to_api_call(action)
             response = client.mutate(service, method, params)
-            if response.get("dry_run"):
+            # Репетиция отправкой не считается: mutate вернул пометку, не
+            # сходив в сеть (client.WriteClient.mutate). Пометь мы её как
+            # отправку — исключение при разборе увело бы строку репетиции в
+            # 'stale', то есть в живые непроверенные изменения боевого
+            # журнала, за которыми ничего не стоит.
+            rehearsal = bool(isinstance(response, dict) and response.get("dry_run"))
+            sent = not rehearsal
+            if rehearsal:
                 status = "dry_run"
             else:
                 errors = _element_errors(method, response)
@@ -261,7 +295,12 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
             details.append({"key": action["idempotency_key"], "result": status})
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"[:400]
-            if is_outcome_unknown(exc):
+            if sent:
+                # Запрос ушёл и вернулся — а дальше сломался разбор. Исход
+                # неизвестен по определению: 'failed' здесь означал бы
+                # переприменение уже совершённого изменения.
+                reason = f"ответ получен, но не разобран — {reason}"
+            if sent or is_outcome_unknown(exc):
                 landed = db_module.mark_unknown_outcome(action_id, reason)
                 if landed is False:
                     conflicted += 1

@@ -251,11 +251,13 @@ def test_apply_actions_skips_action_in_any_final_status(status):
     assert client.calls == [], status
 
 
-def test_apply_actions_unknown_method_marks_failed_not_applied(monkeypatch):
+def test_apply_actions_unknown_method_is_unknown_outcome_not_failure(monkeypatch):
     # Сквозной вариант предыдущего теста: если to_api_call когда-нибудь вернёт
-    # метод без записи в _RESULT_COLLECTION (новый вид операции), apply_actions
-    # обязан пометить действие 'failed' (отказ, переприменяется на следующем
-    # прогоне) — а не 'applied', как было бы при старом None-по-умолчанию.
+    # метод без записи в _RESULT_COLLECTION (новый вид операции), разбор
+    # ответа падает — но падает ПОСЛЕ отправки. Запрос состоялся, изменение
+    # может быть живым в кабинете, и 'failed' здесь означал бы переприменение
+    # уже совершённого добавления, то есть ВТОРОЙ объект в кабинете.
+    # 'applied' тоже нельзя: ответ не разобран, элемент мог быть отклонён.
     import sync.agent.writer.apply as apply_module
     monkeypatch.setattr(apply_module, "to_api_call",
                          lambda action: ("bidmodifiers", "delete", {}))
@@ -267,8 +269,58 @@ def test_apply_actions_unknown_method_marks_failed_not_applied(monkeypatch):
 
     assert report["applied"] == 0
     assert report["rejected"] == 0
+    assert report["failed"] == 0
+    assert report["unknown_outcome"] == 1
+    assert db.rows["k1"]["status"] == "stale"
+
+
+def test_apply_actions_failure_before_send_is_still_a_failure(monkeypatch):
+    # Обратная половина: граница проходит по ФАКТУ ОТПРАВКИ, а не по месту в
+    # try. Ошибка сборки тела запроса случается ДО mutate — запрос точно не
+    # ушёл, в кабинете ничего нет, и такое действие обязано переприменяться,
+    # а не занимать наблюдение и риск-бюджет как живое изменение.
+    import sync.agent.writer.apply as apply_module
+
+    def _boom(action):
+        raise ValueError("демографический ключ вне перечня API Директа")
+
+    monkeypatch.setattr(apply_module, "to_api_call", _boom)
+
+    db = _FakeDB()
+    client = _FakeClient(response={"AddResults": [{"Id": 7}]})
+
+    report = apply_actions(client, [_action()], db)
+
+    assert client.calls == []
     assert report["failed"] == 1
+    assert report["unknown_outcome"] == 0
     assert db.rows["k1"]["status"] == "failed"
+
+
+def test_apply_actions_rehearsal_parse_failure_is_not_a_live_change(monkeypatch):
+    # Репетиция отправкой не считается: mutate вернул пометку, не сходив в
+    # сеть. Пометь мы её как отправку — исключение при разборе увело бы
+    # строку репетиции в 'stale', то есть в живые непроверенные изменения
+    # БОЕВОГО журнала, за которыми ничего не стоит.
+    import sync.agent.writer.apply as apply_module
+
+    calls = {"n": 0}
+
+    def _explode(method, response):
+        calls["n"] += 1
+        raise RuntimeError("разбор ответа сломан")
+
+    monkeypatch.setattr(apply_module, "_element_errors", _explode)
+
+    db = _FakeDB()
+    client = _FakeClient(response={"dry_run": True})
+
+    report = apply_actions(client, [_action()], db)
+
+    assert calls["n"] == 0, "в репетиции ответ вообще не разбирается"
+    assert report["dry_run"] == 1
+    assert report["unknown_outcome"] == 0
+    assert db.rows["k1"]["status"] == "dry_run"
 
 
 def test_apply_actions_exception_on_send_marks_failed_and_stays_in_journal():
@@ -668,3 +720,41 @@ def test_apply_docstring_lists_every_status_of_the_machine():
         assert "'%s'" % status in doc, status
     assert "семь" in doc
     assert "один из четырёх" not in doc
+
+
+# =========================================================================
+# Дефект И2 (вторая сторона): выбор между полом и возрастом по «иначе»
+# =========================================================================
+
+
+def test_age_key_goes_to_the_age_field_by_list_not_by_elimination():
+    action = {"action_kind": "bidmodifier.add",
+              "payload": {"CampaignId": 111, "Type": "DEMOGRAPHICS_ADJUSTMENT",
+                          "key": "AGE_25_34", "BidModifier": 20}}
+    adjustment = to_api_call(action)[2]["BidModifiers"][0]["DemographicsAdjustments"][0]
+
+    assert adjustment["Age"] == "AGE_25_34"
+    assert "Gender" not in adjustment
+
+
+def test_unknown_demographic_key_never_reaches_the_request():
+    # Прежде выбор делался по принципу «если ключ не пол, значит возраст», и
+    # любое значение, дошедшее сюда, молча становилось Age. Первый и самый
+    # частый постоялец — «не определено» (UNKNOWN) из отчётов Директа.
+    action = {"action_kind": "bidmodifier.add",
+              "payload": {"CampaignId": 111, "Type": "DEMOGRAPHICS_ADJUSTMENT",
+                          "key": "UNKNOWN", "BidModifier": 20}}
+
+    with pytest.raises(ValueError) as exc:
+        to_api_call(action)
+    assert "UNKNOWN" in str(exc.value)
+
+
+def test_demographic_field_map_matches_the_planning_lists():
+    # Один справочник на планирование и на сборку запроса: расхождение между
+    # «какие ключи мы разрешаем» и «как мы их раскладываем по полям» и есть
+    # тот класс ошибки, ради которого справочник заводится.
+    from sync.agent.writer.plan import AGE_KEYS, DEMOGRAPHIC_FIELD, GENDER_KEYS
+
+    assert {k for k, v in DEMOGRAPHIC_FIELD.items() if v == "Gender"} == set(GENDER_KEYS)
+    assert {k for k, v in DEMOGRAPHIC_FIELD.items() if v == "Age"} == set(AGE_KEYS)

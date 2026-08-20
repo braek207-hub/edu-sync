@@ -60,10 +60,30 @@ def test_ignores_unknown_setting_kinds():
     assert out == []
 
 
-def test_unknown_setting_kind_is_not_reported_as_unsupported():
-    # schedule:* — не «сломалось», а «сюда не относится»: в отчёт о
-    # неприменимых настройках такое попадать не должно.
-    assert plan_bid_modifiers([_row("schedule:hour", "9", 30.0)])["unsupported"] == []
+def test_unknown_setting_kind_is_reported_as_unsupported():
+    # Прежде вид настройки, которого нет ни в одном справочнике, выпадал
+    # МОЛЧА: строка не попадала ни в desired, ни в unsupported, и отчёт
+    # прогона был неотличим от «таких данных нет». Так исчезал не только
+    # schedule:* (его пауза осознанна), но и bid_modifier:network —
+    # посчитанный, значимый и никем не замеченный. Отказ обязан быть громким.
+    report = plan_bid_modifiers([_row("schedule:hour", "9", 30.0)])
+
+    assert report["desired"] == []
+    assert len(report["unsupported"]) == 1
+    assert report["unsupported"][0]["kind"] == "schedule:hour"
+    assert "schedule:hour" in report["unsupported"][0]["reason"]
+
+
+def test_unknown_bid_modifier_kind_is_not_lost_silently():
+    # Обратная половина того же дефекта и его настоящая цена: сетевой срез
+    # считается тем же движком (sync/agent/segments.py::SEGMENT_FIELDS), его
+    # корректировки значимы, а применить их Э1a не умеет — и до правки об
+    # этом нельзя было узнать ниоткуда.
+    report = plan_bid_modifiers([_row("bid_modifier:network", "SEARCH", 30.0)])
+
+    assert report["desired"] == []
+    assert [r["kind"] for r in report["unsupported"]] == ["bid_modifier:network"]
+    assert report["unsupported"][0]["reason"]
 
 
 def test_percent_is_integer():
@@ -73,3 +93,80 @@ def test_percent_is_integer():
 
 def test_empty_input():
     assert desired_bid_modifiers([]) == []
+
+
+# =========================================================================
+# Дефект И2: демографические ключи уходили в API без списка допустимых
+#
+# У устройств список есть (DEVICE_TYPE_MAP), у регионов — проверка на числовой
+# RegionId, а у пола и возраста не было ничего: любой ключ проходил план
+# насквозь и попадал в тело запроса.
+# =========================================================================
+
+
+def test_allowed_demographic_keys_come_from_the_working_code():
+    # Перечни не выдуманы: это те же списки, по которым рабочий код проекта
+    # РАЗБИРАЕТ корректировки, прочитанные из кабинета. Разойдись они — и
+    # движок писал бы значения, которых сам же не понимает при чтении.
+    from sync.agent.writer.plan import AGE_KEYS, GENDER_KEYS
+    from sync.edu_direct_settings import _AGE_RU, _GENDER_RU
+
+    assert set(GENDER_KEYS) == set(_GENDER_RU)
+    assert set(AGE_KEYS) == set(_AGE_RU)
+
+
+def test_undefined_gender_is_unsupported_not_planned():
+    # Отчёты Директа штатно отдают сегмент «не определено» (UNKNOWN), а
+    # bidmodifiers.add такого значения не принимает. Порог по объёму
+    # наблюдений такой сегмент проходит легко — значит без списка он
+    # доезжал до API, получал отказ уровня элемента и переотправлялся вечно.
+    report = plan_bid_modifiers([_row("bid_modifier:gender", "UNKNOWN", 30.0)])
+
+    assert report["desired"] == []
+    assert len(report["unsupported"]) == 1
+    assert "UNKNOWN" in report["unsupported"][0]["reason"]
+
+
+def test_undefined_age_is_unsupported_not_planned():
+    report = plan_bid_modifiers([_row("bid_modifier:age", "UNKNOWN", 30.0)])
+
+    assert report["desired"] == []
+    assert len(report["unsupported"]) == 1
+
+
+def test_gender_value_is_not_accepted_as_age_and_back():
+    # Список работает В ОБЕ СТОРОНЫ: значение пола под видом возраста —
+    # такой же неизвестный ключ, как UNKNOWN, и уходит в «неподдерживаемые».
+    assert direct_type_for("bid_modifier:age", "GENDER_MALE")[0] is None
+    assert direct_type_for("bid_modifier:gender", "AGE_25_34")[0] is None
+
+
+def test_known_demographic_keys_still_pass():
+    # Обратная половина: список не должен глушить нормальные сегменты.
+    for kind, key in (("bid_modifier:gender", "GENDER_MALE"),
+                      ("bid_modifier:gender", "GENDER_FEMALE"),
+                      ("bid_modifier:age", "AGE_0_17"),
+                      ("bid_modifier:age", "AGE_55")):
+        direct_type, canonical, reason = direct_type_for(kind, key)
+        assert direct_type == "DEMOGRAPHICS_ADJUSTMENT", (kind, key)
+        assert canonical == key and reason == ""
+
+
+def test_demographic_key_is_canonicalised_to_upper_case():
+    # Регистр канонизируется так же, как у устройств: иначе план
+    # ("gender_male") и факт из API ("GENDER_MALE") не сойдутся по паре
+    # (тип, ключ) никогда, и diff вечно предлагал бы add вместо set.
+    assert direct_type_for("bid_modifier:gender", " gender_male ")[1] == "GENDER_MALE"
+
+
+def test_refusal_always_carries_a_reason():
+    # Пустая причина при отказе означала бы молчаливое выпадение строки.
+    for kind, key in (("bid_modifier:gender", "UNKNOWN"),
+                      ("bid_modifier:age", "UNKNOWN"),
+                      ("bid_modifier:device", "TV"),
+                      ("bid_modifier:region", "Москва"),
+                      ("schedule:hour", "9"),
+                      ("совсем незнакомый вид", "x")):
+        direct_type, _, reason = direct_type_for(kind, key)
+        assert direct_type is None, (kind, key)
+        assert reason, (kind, key)

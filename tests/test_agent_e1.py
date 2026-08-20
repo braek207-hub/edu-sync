@@ -52,12 +52,15 @@ def _no_lock(lease=None):
     return _cm
 
 
-def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None):
+def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=None):
     """Общая подмена того, что прогон спрашивает у журнала помимо действий:
-    аренда на прогон, история вредных сегментов, уже закрытые ключи."""
+    аренда на прогон, история вредных сегментов, исчерпавшие попытки
+    сегменты, уже закрытые ключи."""
     monkeypatch.setattr(agent_e1.writer_db, "run_lock", _no_lock(lease))
     monkeypatch.setattr(agent_e1.writer_db, "harmful_segments",
                         lambda *a, **k: dict(cooled or {}))
+    monkeypatch.setattr(agent_e1.writer_db, "exhausted_segments",
+                        lambda *a, **k: dict(exhausted or {}))
     monkeypatch.setattr(agent_e1.writer_db, "final_status_keys",
                         lambda keys: set(final_keys))
     monkeypatch.setattr(agent_e1.writer_db, "purge_dry_run_actions", lambda *a, **k: 0)
@@ -401,6 +404,7 @@ class _MultiCabinetClient:
         self.dry_run = dry_run
         self.units_left = None
         self.sent = []
+        self.read = []
         _MultiCabinetClient.instances.append(self)
 
     def get(self, service, params):
@@ -408,6 +412,10 @@ class _MultiCabinetClient:
             ids = self.campaigns_by_login.get(self.login, [])
             return {"Campaigns": [{"Id": i} for i in ids]}
         if service == "bidmodifiers":
+            # По каким кампаниям кабинет вообще ЧИТАЛСЯ. Ограничитель прогона
+            # обязан урезать именно этот список: отсечение действий в конце
+            # оставило бы кабинет прочитанным целиком.
+            self.read += [str(c) for c in params["SelectionCriteria"]["CampaignIds"]]
             return {"BidModifiers": []}
         raise AssertionError(f"неожиданный сервис: {service}")
 
@@ -442,12 +450,16 @@ def _reports(capsys):
 
 def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
                baseline_cpa=None, stale=(), journal=None, cooled=None, final_keys=(),
-               lease=None, prod_apply=False):
+               lease=None, prod_apply=False, exhausted=None, argv=()):
     # prod_apply — боевой режим (--prod --apply). Нужен там, где проверяется
     # изменение состояния журнала: по общему правилу движка
     # (writer/client.py::journal_writes_allowed) репетиция журнал не трогает.
+    args = ["agent_e1"]
     if prod_apply:
-        monkeypatch.setattr(sys, "argv", ["agent_e1", "--prod", "--apply"])
+        args += ["--prod", "--apply"]
+    args += list(argv)
+    if len(args) > 1:
+        monkeypatch.setattr(sys, "argv", args)
     _MultiCabinetClient.instances = []
     _MultiCabinetClient.campaigns_by_login = campaigns_by_login
     logins = list(computed_by_login.keys())
@@ -476,7 +488,8 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
     monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1.writer_db, "mark_unknown_outcome", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1, "WriteClient", _MultiCabinetClient)
-    _patch_infra(monkeypatch, cooled=cooled, final_keys=final_keys, lease=lease)
+    _patch_infra(monkeypatch, cooled=cooled, final_keys=final_keys, lease=lease,
+                 exhausted=exhausted)
     return rows
 
 
@@ -1285,3 +1298,324 @@ def test_apply_actions_allows_sandbox_rehearsal_and_prod_apply():
     prod_apply = apply_actions(
         _StubMutateClient(sandbox=False, dry_run=False), [action], _FakeDB())
     assert prod_apply["applied"] == 1
+
+
+# =========================================================================
+# Дефект И1: нечем ограничить первый боевой прогон
+#
+# Песочница боевым логинам недоступна (выяснено пробой), поэтому безопасность
+# первого применения держат три вещи вместе: репетиция без записи, проба по
+# несуществующим идентификаторам и ПЕРВОЕ ПРИМЕНЕНИЕ НА ОДНОЙ КАМПАНИИ.
+# Третьего в коде не было вовсе: вычисленные настройки лежат на уровне
+# кабинета, то есть один набор ключей раскатывается на все его кампании, и
+# сколько кампаний тронет прогон, решали лимит действий и порядок сортировки.
+# =========================================================================
+
+
+def test_first_prod_run_can_be_limited_to_one_campaign(monkeypatch, capsys):
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111, 222, 333]},
+        daily_cost={"111": 10.0, "222": 10.0, "333": 10.0},
+        argv=["--max-campaigns=1"],
+    )
+
+    assert agent_e1.main() == 0
+
+    client = _MultiCabinetClient.instances[0]
+    assert len(client.sent) == 1, "тронута ровно одна кампания, а не сколько влезло в лимит"
+    report = _reports(capsys)[0]
+    assert report["campaigns_touched"] == 1
+    assert report["campaign_scope"]["max_campaigns"] == 1
+    assert report["campaign_scope"]["campaigns_left_in_run"] == 0
+
+
+def test_campaign_limit_cuts_the_campaign_list_not_the_actions(monkeypatch, capsys):
+    # Ограничение стоит ТАМ, ГДЕ СТРОИТСЯ СПИСОК КАМПАНИЙ. Отсечение действий
+    # в конце означало бы, что кабинет прочитан целиком, план построен по всем
+    # кампаниям и от порядка сортировки по-прежнему зависит, кто доживёт до
+    # отправки. Проверяем по факту ЧТЕНИЯ кабинета, а не по числу отправок.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111, 222, 333]},
+        daily_cost={"111": 10.0, "222": 10.0, "333": 10.0},
+        argv=["--max-campaigns=1"],
+    )
+
+    assert agent_e1.main() == 0
+
+    client = _MultiCabinetClient.instances[0]
+    assert client.read == ["111"], "остальные кампании не должны даже читаться"
+
+
+def test_named_campaigns_are_the_only_ones_touched(monkeypatch, capsys):
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111, 222, 333]},
+        daily_cost={"111": 10.0, "222": 10.0, "333": 10.0},
+        argv=["--campaigns=222"],
+    )
+
+    assert agent_e1.main() == 0
+
+    client = _MultiCabinetClient.instances[0]
+    assert client.read == ["222"]
+    sent_campaign = client.sent[0][2]["BidModifiers"][0]["CampaignId"]
+    assert sent_campaign == 222
+    report = _reports(capsys)[0]
+    assert report["campaign_scope"]["only"] == ["222"]
+    assert report["campaigns_touched"] == 1
+
+
+def test_campaign_limit_is_shared_across_cabinets(monkeypatch, capsys):
+    # Тот же довод, что у лимита действий: «первое применение на одной
+    # кампании» при потолке НА КАБИНЕТ означало бы четыре кампании на четырёх
+    # кабинетах.
+    settings = [_setting("bid_modifier:device", "DESKTOP", 30)]
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": settings, "acc-2": settings},
+        campaigns_by_login={"acc-1": [111, 112], "acc-2": [221, 222]},
+        daily_cost={"111": 10.0, "112": 10.0, "221": 10.0, "222": 10.0},
+        argv=["--max-campaigns=1"],
+    )
+
+    assert agent_e1.main() == 0
+
+    touched = sum(len(c.read) for c in _MultiCabinetClient.instances)
+    assert touched == 1, "потолок кампаний обязан считаться на все кабинеты сразу"
+    reports = {r["account"]: r for r in _reports(capsys)}
+    assert reports["acc-2"]["campaigns_touched"] == 0
+
+
+def test_campaigns_touched_counts_campaigns_not_actions(monkeypatch, capsys):
+    # Отдельное поле нужно именно потому, что ни одно соседнее число на этот
+    # вопрос не отвечает: три действия по одной кампании — это одна тронутая
+    # кампания, а prepared.count покажет три.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [
+            _setting("bid_modifier:device", "DESKTOP", 30),
+            _setting("bid_modifier:device", "MOBILE", 20),
+            _setting("bid_modifier:gender", "GENDER_MALE", 15),
+        ]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+    )
+
+    assert agent_e1.main() == 0
+
+    report = _reports(capsys)[0]
+    assert report["prepared"]["count"] == 3
+    assert report["campaigns_touched"] == 1
+
+
+def test_scope_is_visible_in_the_report_even_when_off(monkeypatch, capsys):
+    # «Ограничение не сработало» и «ограничения не было» обязаны различаться
+    # при чтении отчёта первого боевого прогона.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111, 222]},
+        daily_cost={"111": 10.0, "222": 10.0},
+    )
+
+    assert agent_e1.main() == 0
+
+    scope = _reports(capsys)[0]["campaign_scope"]
+    assert scope["enabled"] is False
+    assert scope["only"] is None and scope["max_campaigns"] is None
+
+
+def test_unparsable_campaign_limit_refuses_the_run(monkeypatch, capsys):
+    # Молчаливое игнорирование неразобранного аргумента здесь недопустимо:
+    # оператор, набравший --max-campaigns=one перед ПЕРВЫМ боевым прогоном,
+    # получил бы прогон без ограничения вообще, будучи уверенным в обратном.
+    monkeypatch.setattr(sys, "argv", ["agent_e1", "--prod", "--apply",
+                                      "--max-campaigns=one"])
+    monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables",
+                        lambda: (_ for _ in ()).throw(AssertionError("БД тронута")))
+
+    assert agent_e1.main() == 2
+
+    report = _reports(capsys)[0]
+    assert report["verdict"] == "REFUSED"
+    assert "--max-campaigns" in report["reason"]
+
+
+def test_empty_campaign_list_is_not_read_as_all_campaigns(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["agent_e1", "--prod", "--apply", "--campaigns="])
+    monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables",
+                        lambda: (_ for _ in ()).throw(AssertionError("БД тронута")))
+
+    assert agent_e1.main() == 2
+    assert _reports(capsys)[0]["verdict"] == "REFUSED"
+
+
+def test_campaign_scope_selection_is_deterministic():
+    # Повторный прогон с тем же ограничением обязан взять ТЕ ЖЕ кампании:
+    # иначе «применили на одной кампании и посмотрели» превращается в
+    # «применили на разных кампаниях по одному разу».
+    first = agent_e1.CampaignScope(max_campaigns=2).select(["111", "222", "333"])
+    second = agent_e1.CampaignScope(max_campaigns=2).select(["111", "222", "333"])
+    assert first == second == ["111", "222"]
+
+
+def test_campaign_scope_without_limits_changes_nothing():
+    scope = agent_e1.CampaignScope()
+    assert scope.enabled is False
+    assert scope.select(["111", "222"]) == ["111", "222"]
+
+
+# =========================================================================
+# Дефект И3: отклонённое и неудавшееся переотправляются вечно
+#
+# Статус 'rejected' сознательно не финальный — действие обязано быть
+# переприменимо. Но счётчика попыток у этого пути не было, в отличие от
+# отката. Детерминированный отказ (неподдерживаемый ключ, неподходящий тип
+# кампании, «объект уже существует») переотправлялся бы каждый прогон вечно,
+# каждый раз занимая слот лимита и часть риск-бюджета.
+# =========================================================================
+
+
+def test_segment_out_of_attempts_is_not_sent_again(monkeypatch, capsys):
+    exhausted = {("111", "DESKTOP_ADJUSTMENT", "DESKTOP"):
+                 {"attempts": 3, "last_attempt_at": "2026-08-19"}}
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+        exhausted=exhausted,
+    )
+
+    assert agent_e1.main() == 0
+
+    assert [c for inst in _MultiCabinetClient.instances for c in inst.sent] == []
+    report = _reports(capsys)[0]
+    assert report["blocked_by_attempts"]["count"] == 1
+    assert report["blocked_by_attempts"]["max_attempts"] == \
+        agent_e1.writer_db.MAX_APPLY_ATTEMPTS
+    assert report["blocked_by_attempts"]["segments"] == \
+        ["111:DESKTOP_ADJUSTMENT:DESKTOP"]
+    assert report["blocked_by_attempts"]["reason"]
+
+
+def test_exhausted_segment_is_cut_before_the_action_cap(monkeypatch, capsys):
+    # Главная цена вечной переотправки — не сам запрос, а СЛОТ: порядок обхода
+    # детерминирован, и накопившиеся отказные сегменты стабильно занимали
+    # начало списка. Отсев обязан стоять до лимита, как кулдаун и закрытые ключи.
+    monkeypatch.setattr(agent_e1, "MAX_ACTIONS_PER_RUN", 1)
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [
+            _setting("bid_modifier:device", "DESKTOP", 30),
+            _setting("bid_modifier:device", "MOBILE", 20),
+        ]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+        exhausted={("111", "DESKTOP_ADJUSTMENT", "DESKTOP"): {"attempts": 3}},
+    )
+
+    assert agent_e1.main() == 0
+
+    sent = [c for inst in _MultiCabinetClient.instances for c in inst.sent]
+    assert len(sent) == 1, "слот лимита обязан достаться живому сегменту"
+    assert "MobileAdjustment" in sent[0][2]["BidModifiers"][0]
+
+
+def test_attempts_are_counted_by_segment_not_by_idempotency_key(monkeypatch, capsys):
+    # Тот же довод, что у кулдауна: в ключ идемпотентности зашит ПРОЦЕНТ, а он
+    # пересчитывается на каждом прогоне по скользящему окну. Считай мы попытки
+    # по ключу — у каждой попытки был бы свой ключ, счётчик показывал бы
+    # единицу вечно, и потолок не наступал бы никогда.
+    exhausted = {("111", "DESKTOP_ADJUSTMENT", "DESKTOP"): {"attempts": 3}}
+    _patch_run(
+        monkeypatch,
+        # Процент ДРУГОЙ: ключ идемпотентности у этого действия новый.
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 29)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+        exhausted=exhausted,
+    )
+
+    assert agent_e1.main() == 0
+
+    assert [c for inst in _MultiCabinetClient.instances for c in inst.sent] == []
+    assert _reports(capsys)[0]["blocked_by_attempts"]["count"] == 1
+
+
+def test_exhausted_segment_does_not_block_other_segments(monkeypatch, capsys):
+    # Обратная половина: потолок попыток адресован сегменту, а не кампании.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [
+            _setting("bid_modifier:device", "DESKTOP", 30),
+            _setting("bid_modifier:device", "MOBILE", 20),
+        ]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+        exhausted={("111", "DESKTOP_ADJUSTMENT", "DESKTOP"): {"attempts": 3}},
+    )
+
+    assert agent_e1.main() == 0
+
+    sent = [c for inst in _MultiCabinetClient.instances for c in inst.sent]
+    assert len(sent) == 1
+    assert "MobileAdjustment" in sent[0][2]["BidModifiers"][0]
+
+
+def test_split_by_attempts_leaves_untouched_segments_alone():
+    action = {"object_id": "111", "direct_type": "MOBILE_ADJUSTMENT", "key": "MOBILE"}
+    allowed, blocked = agent_e1.split_by_attempts([action], {})
+    assert allowed == [action] and blocked == []
+
+
+# =========================================================================
+# Мелкое: порядок пометки зависших строк и чтения закрытых ключей
+# =========================================================================
+
+
+def test_stuck_row_does_not_eat_the_cap_on_the_run_that_finds_it(monkeypatch, capsys):
+    # Список закрытых ключей читался ДО пометки зависших строк. На прогоне
+    # ОБНАРУЖЕНИЯ зависшая строка ещё стояла в 'planned' — final_status_keys
+    # её не видел, действие доходило до отбора по лимиту, занимало слот и
+    # помечало свой объект оплаченным риск-бюджетом.
+    #
+    # Журнал здесь фейковый: пометка переводит ключ в закрытые, и правильный
+    # порядок обязан этот перевод УВИДЕТЬ.
+    monkeypatch.setattr(agent_e1, "MAX_ACTIONS_PER_RUN", 1)
+    stuck_key = _bidmod_key("111", "DESKTOP_ADJUSTMENT", "DESKTOP", 30)
+    closed = set()
+
+    def _mark_stale(*a, **k):
+        closed.add(stuck_key)
+        return [{"action_id": "act-1", "object_id": "111",
+                 "action_kind": "bidmodifier.add", "created_at": "2026-08-19",
+                 "idempotency_key": stuck_key}]
+
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [
+            _setting("bid_modifier:device", "DESKTOP", 30),
+            _setting("bid_modifier:device", "MOBILE", 20),
+        ]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+        prod_apply=True,
+    )
+    monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", _mark_stale)
+    monkeypatch.setattr(agent_e1.writer_db, "final_status_keys",
+                        lambda keys: {k for k in keys if k in closed})
+
+    assert agent_e1.main() == 0
+
+    sent = [c for inst in _MultiCabinetClient.instances for c in inst.sent]
+    assert len(sent) == 1, "слот лимита не должен достаться зависшей строке"
+    assert "MobileAdjustment" in sent[0][2]["BidModifiers"][0]
+    report = _reports(capsys)[0]
+    assert report["skipped_already_final"]["count"] == 1
+    assert report["stale_planned"]["count"] == 1

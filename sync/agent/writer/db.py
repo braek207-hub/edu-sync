@@ -94,6 +94,32 @@ WRITER_DDL: List[str] = [
       ADD COLUMN IF NOT EXISTS harmful_verdict_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS harmful_reason     TEXT
     """,
+    # ЧИСЛО ПОПЫТОК ПРИМЕНЕНИЯ, парное rollback_attempts.
+    #
+    # Статус 'rejected' сознательно не финальный: API вернул 200 и отклонил
+    # элемент, в кабинете ничего не изменилось, и действие обязано быть
+    # переприменимо. Но потолка попыток у этого пути не было вовсе — в
+    # отличие от отката, где он есть с самого начала. Детерминированный отказ
+    # (неподдерживаемый ключ сегмента, неподходящий тип кампании, «объект уже
+    # существует») переотправлялся бы КАЖДЫЙ прогон бесконечно, каждый раз
+    # занимая слот лимита действий и часть риск-бюджета. Это ровно та
+    # болезнь, ради которой введён отсев уже закрытых ключей
+    # (final_status_keys), воспроизведённая через другой статус.
+    #
+    # Счётчик растёт на статусах 'rejected' и 'failed' (см. MARK_ACTION_SQL) и
+    # НЕ сбрасывается повторной планировкой: INSERT_ACTION_SQL его не трогает.
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS apply_attempts INTEGER NOT NULL DEFAULT 0
+    """,
+    # Потолок попыток читается на каждом прогоне по сегменту среди строк,
+    # оставшихся в отказных статусах, — тот же довод про seq scan, что у
+    # индексов кулдауна.
+    """
+    CREATE INDEX IF NOT EXISTS edu_agent_actions_apply_attempts_idx
+      ON edu_agent_actions (account, object_id, direct_type, setting_key)
+      WHERE apply_attempts > 0
+    """,
     # Кулдаун по сегменту читается на каждом прогоне по (кабинет, объект,
     # тип, ключ) среди вредных строк — без индексов это seq scan по всему
     # журналу на каждый прогон. Индекса два, потому что вредность даёт любая
@@ -157,6 +183,29 @@ FINAL_STATUSES = ("applied", "rolled_back", "stale")
 # Статусы ЖИВОГО изменения в кабинете: наблюдаются сторожем красных линий и
 # оплачены риск-бюджетом. 'rolled_back' сюда не входит — изменения больше нет.
 LIVE_STATUSES = ("applied", "stale")
+
+# Статусы, из которых действие уходит на ПОВТОРНУЮ отправку следующим
+# прогоном. В кабинете по ним ничего не изменилось, поэтому они не финальные,
+# — но именно они и копят попытки: отказ бывает детерминированным, и тогда
+# повтор не поможет никогда.
+#
+#   rejected — API ответил 200 и отклонил элемент (Errors в AddResults/
+#              SetResults): неподдерживаемый ключ сегмента, неподходящий тип
+#              кампании, «объект уже существует»;
+#   failed   — запрос точно не ушёл (ошибка сборки тела, отказ уровня запроса).
+REATTEMPTED_STATUSES = ("rejected", "failed")
+
+# Сколько прогонов подряд один СЕГМЕНТ вправе получать отказ, прежде чем
+# движок перестанет его переотправлять. Столько же, сколько у отката
+# (MAX_ROLLBACK_ATTEMPTS), и по той же причине: разовый сбой стоит повторить,
+# детерминированный — нет.
+#
+# По сегменту, а не по ключу идемпотентности: в ключ зашит ПРОЦЕНТ, а он
+# пересчитывается на каждом прогоне по скользящему окну и дрейфует на пункт-
+# другой — то есть у каждой попытки свой ключ, и счётчик на ключе показывал бы
+# единицу вечно. Тот же довод, по которому кулдаун после отката считается по
+# сегменту (harmful_segments).
+MAX_APPLY_ATTEMPTS = 3
 
 
 def _sql_literals(values) -> str:
@@ -276,16 +325,25 @@ def insert_action(row: Dict[str, Any]) -> str:
 # Гард ровно про это: строку с проставленным откатом или в финальном статусе
 # не трогаем. Возврат RETURNING отличает «отметили» от «строку забрал кто-то
 # другой» — вызывающий код обязан это увидеть, а не считать отметку успешной.
+#
+# Счётчик попыток применения растёт ровно на отказных статусах
+# (REATTEMPTED_STATUSES) и тем же UPDATE, что ставит статус: попытка и её
+# исход не могут разъехаться между двумя прогонами — тот же приём, что у
+# MARK_ROLLBACK_FAILED_SQL. На 'applied' и 'dry_run' счётчик не двигается.
 MARK_ACTION_SQL = """
     UPDATE edu_agent_actions
        SET status = %(status)s,
            response = %(response)s,
-           applied_at = CASE WHEN %(status)s = 'applied' THEN now() ELSE applied_at END
+           applied_at = CASE WHEN %(status)s = 'applied' THEN now() ELSE applied_at END,
+           apply_attempts = apply_attempts + CASE
+               WHEN %(status)s IN (__REATTEMPTED_STATUSES__) THEN 1 ELSE 0
+           END
      WHERE action_id = %(action_id)s
        AND rolled_back_at IS NULL
        AND status NOT IN (__FINAL_STATUSES__)
     RETURNING action_id
-""".replace("__FINAL_STATUSES__", _sql_literals(FINAL_STATUSES))
+""".replace("__FINAL_STATUSES__", _sql_literals(FINAL_STATUSES)) \
+   .replace("__REATTEMPTED_STATUSES__", _sql_literals(REATTEMPTED_STATUSES))
 
 
 def mark_action(action_id: str, status: str, response: Dict[str, Any]) -> bool:
@@ -544,6 +602,15 @@ MAX_ROLLBACK_ATTEMPTS = 3
 # permanent=True приходит для отказов, которые повтор не исправит в принципе:
 # неизвестен Id корректировки (откат вслепую) или запрос на возврат отклонён
 # рельсами. Ждать три попытки в этом случае бессмысленно — исход тот же.
+#
+# Гард на состояние строки — последний из переходов модуля, который его не
+# имел. Условие то же, что у MARK_ROLLBACK_FAILED_SQL-соседей (MARK_ACTION_SQL,
+# MARK_HARMFUL_SQL, MARK_ROLLED_BACK_SQL): строка ещё живая и не откатана.
+# Что это отсекает: строку, которую параллельный сторож успел откатить между
+# решением и отметкой, — без гарда её счётчик попыток рос бы у УЖЕ ОТКАТАННОГО
+# изменения, и следующая (настоящая) неудача по этой строке хоронила бы её
+# раньше срока. Возврат None вызывающий код (agent_e1_watchdog._fail) уже
+# трактует как «строку забрал другой контур».
 MARK_ROLLBACK_FAILED_SQL = """
     UPDATE edu_agent_actions
        SET rollback_attempts  = rollback_attempts + 1,
@@ -554,9 +621,11 @@ MARK_ROLLBACK_FAILED_SQL = """
                ELSE rollback_failed_at
            END
      WHERE action_id = %(action_id)s
+       AND rolled_back_at IS NULL
+       AND status IN (__LIVE_STATUSES__)
     RETURNING action_id, object_id, action_kind, rollback_attempts,
               rollback_failed_at, rollback_error
-"""
+""".replace("__LIVE_STATUSES__", _sql_literals(LIVE_STATUSES))
 
 
 def mark_rollback_failed(
@@ -567,6 +636,9 @@ def mark_rollback_failed(
     Изменение остаётся живым: статус не трогается, rolled_back_at не ставится.
     Проставленный в ответе rollback_failed_at означает, что автоматических
     попыток больше не будет и строку разбирает человек.
+
+    None — строку забрал другой контур (её уже откатили или она вернулась в
+    планирование): попытка не засчитывается, счётчик не растёт.
     """
     with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -685,6 +757,58 @@ def harmful_segments(
     return {
         (str(r["object_id"]), str(r["direct_type"]), str(r["setting_key"])):
             r["last_harmful_at"]
+        for r in rows
+    }
+
+
+# Сегменты, исчерпавшие попытки применения. Считается СУММА попыток по всем
+# строкам сегмента, оставшимся в отказных статусах, — по той же причине, по
+# которой по сегменту считается кулдаун: процент дрейфует, ключ идемпотентности
+# каждый прогон новый, и у каждой строки попытка ровно одна. Сумма по сегменту
+# и есть «сколько прогонов подряд мы бились в эту стену».
+#
+# Строки, дошедшие до 'applied'/'stale'/'rolled_back', в выборку не входят: они
+# уже не отказные, и сегмент, по которому изменение однажды состоялось, стеной
+# не является.
+#
+# COALESCE с payload — тот же, что в HARMFUL_SEGMENTS_SQL: у строк, записанных
+# до появления колонок direct_type/setting_key, сегмент лежал только в payload.
+EXHAUSTED_SEGMENTS_SQL = """
+    SELECT account,
+           object_id,
+           COALESCE(direct_type, payload->>'Type') AS direct_type,
+           COALESCE(setting_key, payload->>'key')  AS setting_key,
+           SUM(apply_attempts) AS attempts,
+           MAX(created_at)     AS last_attempt_at
+    FROM edu_agent_actions
+    WHERE apply_attempts > 0
+      AND status IN (__REATTEMPTED_STATUSES__)
+      AND (%s IS NULL OR account = %s)
+      AND COALESCE(direct_type, payload->>'Type') IS NOT NULL
+      AND COALESCE(setting_key, payload->>'key') IS NOT NULL
+    GROUP BY 1, 2, 3, 4
+    HAVING SUM(apply_attempts) >= %s
+""".replace("__REATTEMPTED_STATUSES__", _sql_literals(REATTEMPTED_STATUSES))
+
+
+def exhausted_segments(
+    max_attempts: int = MAX_APPLY_ATTEMPTS, account: Optional[str] = None
+) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    """Сегменты, которым движок больше не отправляет действия.
+
+    Ключ — (object_id, direct_type, setting_key), как у harmful_segments и по
+    той же причине: кабинет в ключ не входит, выборка уже ограничена одним
+    кабинетом, а идентификаторы кампаний между кабинетами не пересекаются.
+
+    Значение — число накопленных попыток и момент последней: отчёт прогона
+    обязан показывать не только «заблокировано», но и на чём именно движок
+    остановился, — эти строки разбирает человек.
+    """
+    rows = _fetch(EXHAUSTED_SEGMENTS_SQL, (account, account, int(max_attempts)))
+    return {
+        (str(r["object_id"]), str(r["direct_type"]), str(r["setting_key"])):
+            {"attempts": int(r["attempts"] or 0),
+             "last_attempt_at": r["last_attempt_at"]}
         for r in rows
     }
 

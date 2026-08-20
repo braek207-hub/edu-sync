@@ -13,6 +13,18 @@ sync/agent_e1.py — прогон Э1a: применение вычисленн�
     python -m sync.agent_e1                    # песочница, dry-run
     python -m sync.agent_e1 --prod             # боевой кабинет, dry-run
     python -m sync.agent_e1 --prod --apply     # боевая запись
+    ... --campaigns=123        # только названные кампании
+    ... --max-campaigns=1      # не больше N кампаний НА ВЕСЬ прогон
+
+ПЕРВЫЙ БОЕВОЙ ПРОГОН запускается ограниченным по кампаниям — это третья опора
+безопасности наравне с репетицией и пробой по несуществующим идентификаторам
+(песочница боевым логинам недоступна, выяснено пробой):
+
+    python -m sync.agent_e1 --prod --apply --max-campaigns=1
+
+Сколько кампаний прогон тронул на самом деле — поле campaigns_touched в отчёте
+каждого кабинета.
+
 ENV: DATABASE_URL, DIRECT_TOKEN, DIRECT_CLIENTS_JSON
 
 Два отклонения от исходного плана задачи (см. task-9-report.md):
@@ -58,6 +70,112 @@ from sync.agent.writer.units import api_to_delta
 
 DEFAULT_WEEKLY_RISK_RUB = 50_000.0
 CAMPAIGN_PAGE_LIMIT = 1000
+
+# --------------------------------------------- ограничение объёма прогона
+
+# Безопасность ПЕРВОГО боевого применения держится на трёх вещах сразу:
+# репетиция без записи (--prod без --apply), проба по несуществующим
+# идентификаторам и первое применение НА ОДНОЙ КАМПАНИИ. Песочница боевым
+# логинам недоступна (выяснено пробой), поэтому третье — не удобство, а
+# полноправная часть защиты, и его не было в коде вовсе.
+#
+# Что ограничивало прогон до этого: лимит действий (MAX_ACTIONS_PER_RUN = 50)
+# и риск-бюджет. Ни то, ни другое не про кампании: вычисленные настройки
+# лежат на уровне КАБИНЕТА, то есть один набор ключей раскатывается на все
+# его кампании сразу — первый боевой прогон тронул бы столько кампаний,
+# сколько влезет в лимит действий, а какие именно, решил бы порядок
+# сортировки own_campaign_ids.
+CAMPAIGNS_ARG = "--campaigns="
+MAX_CAMPAIGNS_ARG = "--max-campaigns="
+
+BAD_CAMPAIGNS_ARG_REASON = (
+    "{arg}: список кампаний пуст. Форма — --campaigns=123 или "
+    "--campaigns=123,456; пустой список это не «все кампании», а опечатка"
+)
+BAD_MAX_CAMPAIGNS_ARG_REASON = (
+    "{arg}: число кампаний должно быть целым и не меньше единицы. Форма — "
+    "--max-campaigns=1"
+)
+
+
+class CampaignScope:
+    """Сколько кампаний и каких именно прогону позволено трогать.
+
+    Ограничение применяется ТАМ, ГДЕ СТРОИТСЯ СПИСОК КАМПАНИЙ КАБИНЕТА
+    (own_campaign_ids), а не отсечением действий в конце. Разница
+    принципиальная: отсечение в конце всё равно означало бы, что кабинет
+    прочитан целиком, план построен по всем кампаниям, риск посчитан по всем
+    кампаниям, — и от порядка сортировки по-прежнему зависело бы, какие
+    кампании доживут до отправки. Ограничение на входе делает прогон по одной
+    кампании ровно прогоном по одной кампании.
+
+    Число кампаний — потолок на ПРОГОН, а не на кабинет: тем же доводом, что
+    и лимит действий (MAX_ACTIONS_PER_RUN). «Первое применение на одной
+    кампании» при потолке на кабинет означало бы четыре кампании на четырёх
+    кабинетах.
+
+    Именованный список кампаний потолком на кабинет не страдает вовсе:
+    идентификаторы кампаний между кабинетами не пересекаются, и чужая
+    кампания просто не найдётся в списке своего кабинета.
+    """
+
+    def __init__(self, only: Any = None, max_campaigns: Any = None) -> None:
+        names = {str(c).strip() for c in (only or ())} - {""}
+        self.only: Optional[Set[str]] = names or None
+        self.max_campaigns: Optional[int] = (None if max_campaigns is None
+                                             else int(max_campaigns))
+        self.remaining: Optional[int] = self.max_campaigns
+
+    @property
+    def enabled(self) -> bool:
+        return self.only is not None or self.max_campaigns is not None
+
+    def select(self, campaign_ids: List[str]) -> List[str]:
+        """Кампании кабинета → та их часть, которую прогону позволено трогать.
+
+        Порядок входного списка сохраняется (own_campaign_ids отдаёт его
+        отсортированным), поэтому выбор при --max-campaigns детерминирован:
+        повторный прогон с тем же ограничением возьмёт те же кампании, а не
+        случайные.
+        """
+        selected = list(campaign_ids)
+        if self.only is not None:
+            selected = [c for c in selected if str(c) in self.only]
+        if self.remaining is not None:
+            selected = selected[:max(self.remaining, 0)]
+            self.remaining -= len(selected)
+        return selected
+
+    def report(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "only": sorted(self.only) if self.only else None,
+            "max_campaigns": self.max_campaigns,
+            "campaigns_left_in_run": self.remaining,
+        }
+
+
+def parse_campaign_scope(argv: List[str]) -> CampaignScope:
+    """Аргументы прогона → ограничитель кампаний. Мусор — ValueError.
+
+    Молчаливое игнорирование неразобранного аргумента здесь недопустимо:
+    оператор, набравший --max-campaigns=one перед ПЕРВЫМ боевым прогоном,
+    получил бы прогон без ограничения вообще, будучи уверенным в обратном.
+    """
+    only: Optional[List[str]] = None
+    max_campaigns: Optional[int] = None
+    for arg in argv:
+        if arg.startswith(CAMPAIGNS_ARG):
+            only = [p.strip() for p in arg[len(CAMPAIGNS_ARG):].split(",") if p.strip()]
+            if not only:
+                raise ValueError(BAD_CAMPAIGNS_ARG_REASON.format(arg=arg))
+        elif arg.startswith(MAX_CAMPAIGNS_ARG):
+            raw = arg[len(MAX_CAMPAIGNS_ARG):].strip()
+            if not raw.isdigit() or int(raw) < 1:
+                raise ValueError(BAD_MAX_CAMPAIGNS_ARG_REASON.format(arg=arg))
+            max_campaigns = int(raw)
+    return CampaignScope(only, max_campaigns)
+
 
 # Множитель медианы базового CPA → абсолютный аварийный порог красной линии
 # для кампаний без собственной базы (rollback.py::red_line_for, has_baseline=
@@ -177,6 +295,22 @@ ALREADY_FINAL_REASON = (
     "исключена, слот лимита действий занимать нельзя"
 )
 
+# Причина отказа для сегмента, исчерпавшего попытки применения.
+#
+# Статус 'rejected' намеренно не финальный: API вернул 200 и отклонил элемент,
+# в кабинете ничего не изменилось, и действие обязано быть переприменимо.
+# Потолка попыток у этого пути не было — в отличие от отката, где он есть.
+# Детерминированный отказ (неподдерживаемый ключ сегмента, неподходящий тип
+# кампании, «объект уже существует») переотправлялся бы каждый прогон вечно,
+# каждый раз занимая слот лимита и часть риск-бюджета: та же болезнь, ради
+# которой введён отсев уже закрытых ключей, только через другой статус.
+EXHAUSTED_ATTEMPTS_REASON = (
+    "сегмент исчерпал попытки применения ({attempts} из {max_attempts}): "
+    "отказ детерминированный, повтор его не исправит — строка ждёт разбора "
+    "человеком. Счёт по сегменту, а не по ключу идемпотентности: процент "
+    "дрейфует между расчётами и обходил бы счётчик на ключе"
+)
+
 # Предельный возраст расчёта Э0, дни. «Последний расчёт» не значит «свежий»:
 # без верхней границы движок раскатает месячные коэффициенты, посчитанные по
 # аудитории, которой больше нет. Неделя — потому что расчёт сжат к нулю по
@@ -274,14 +408,20 @@ def fetch_campaign_ids(client: WriteClient) -> List[int]:
     return out
 
 
-def own_campaign_ids(client: WriteClient, daily_cost_by_campaign: Dict[str, float]) -> List[str]:
+def own_campaign_ids(client: WriteClient, daily_cost_by_campaign: Dict[str, float],
+                     scope: Optional[CampaignScope] = None) -> List[str]:
     """Кампании ЭТОГО кабинета, пересечённые со справочником расходов.
 
     daily_cost_by_campaign построен по ВСЕМ кабинетам сразу — без пересечения
     с собственным списком кампаний агент опрашивал бы чужие Id чужим логином.
+
+    scope — ограничитель первого боевого прогона. Он стоит ЗДЕСЬ, на входе:
+    всё, что ниже по течению (чтение корректировок, diff, риск, отправка),
+    работает уже с урезанным списком и про ограничение ничего не знает.
     """
     own = {str(i) for i in fetch_campaign_ids(client)}
-    return sorted(own & set(daily_cost_by_campaign.keys()))
+    ids = sorted(own & set(daily_cost_by_campaign.keys()))
+    return scope.select(ids) if scope is not None else ids
 
 
 def _delta_or_none(raw: Any) -> Any:
@@ -500,6 +640,37 @@ def split_by_cooldown(
     return allowed, blocked
 
 
+def split_by_attempts(
+    actions: List[Dict[str, Any]], exhausted: Dict[Tuple[str, str, str], Any],
+    max_attempts: int = writer_db.MAX_APPLY_ATTEMPTS,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Делит действия на живые и запертые исчерпанными попытками применения.
+
+    exhausted — сегменты, накопившие потолок отказов (writer_db.
+    exhausted_segments). Адрес сегмента тот же, что у кулдауна (segment_of):
+    объект + вид + ключ, БЕЗ процента. По ключу идемпотентности счёт не
+    работает вовсе — процент дрейфует между расчётами, ключ каждый прогон
+    новый, и «третья попытка» никогда не наступает.
+
+    Стоит ДО отбора по лимиту действий, тем же доводом, что кулдаун и отсев
+    закрытых ключей: отсечённое здесь не занимает слотов прогона. Ровно этим
+    вечная переотправка и была дорогой — она съедала лимит и риск-бюджет.
+    """
+    allowed: List[Dict[str, Any]] = []
+    blocked: List[Dict[str, Any]] = []
+    for action in actions:
+        hit = exhausted.get(segment_of(action))
+        if hit is None:
+            allowed.append(action)
+            continue
+        attempts = (hit or {}).get("attempts") if isinstance(hit, dict) else hit
+        blocked.append({**action,
+                        "blocked_reason": EXHAUSTED_ATTEMPTS_REASON.format(
+                            attempts=attempts, max_attempts=max_attempts),
+                        "apply_attempts": attempts})
+    return allowed, blocked
+
+
 def split_by_final_keys(
     actions: List[Dict[str, Any]], final_keys: Any,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -663,12 +834,19 @@ def run_account(
             "computed_settings": len(computed),
             "computed_age_days": computed_age_days(computed, date.fromisoformat(today)),
             "unsupported": unsupported,
+            # Ни одной кампании не тронуто — и это сказано явно тем же полем,
+            # что и в полном отчёте, а не отсутствием поля.
+            "campaign_scope": ctx["campaign_scope"].report(),
+            "campaigns_touched": 0,
             "stale_planned": _stale_report(mark_stale_rows(login, journal_ok),
                                            journal_ok),
         }
 
     # Рулинг 1: кампании только этого кабинета, не всего справочника расходов.
-    campaign_ids = own_campaign_ids(client, daily_cost)
+    # Здесь же применяется ограничитель прогона (CampaignScope): дальше по
+    # течению про него никто не знает.
+    scope = ctx["campaign_scope"]
+    campaign_ids = own_campaign_ids(client, daily_cost, scope)
 
     planned: List[Dict[str, Any]] = []
     blocked: List[Dict[str, Any]] = []
@@ -699,6 +877,22 @@ def run_account(
     cooled = writer_db.harmful_segments(COOLDOWN_AFTER_ROLLBACK_DAYS, account=login)
     allowed, in_cooldown = split_by_cooldown(allowed, cooled)
     blocked += in_cooldown
+
+    # Потолок попыток применения — там же, где кулдаун, и по той же причине:
+    # сегмент, по которому API отказывает детерминированно, обязан выпасть ДО
+    # лимита действий, а не занимать его слот каждый прогон.
+    exhausted = writer_db.exhausted_segments(account=login)
+    allowed, out_of_attempts = split_by_attempts(allowed, exhausted)
+    blocked += out_of_attempts
+
+    # Пометка зависших строк стоит ДО чтения закрытых ключей. Порядок был
+    # обратным, и это стоило слота: строка, зависшая в 'planned' с прошлого
+    # прогона, на прогоне ОБНАРУЖЕНИЯ ещё не была закрыта финальным статусом
+    # (её только сейчас переводят в 'stale'), поэтому final_status_keys её не
+    # видел — действие доходило до отбора по лимиту, занимало слот и помечало
+    # свой объект оплаченным риск-бюджетом. Теперь пометка происходит раньше,
+    # и ключ уже закрыт к моменту чтения.
+    stale = mark_stale_rows(login, journal_ok)
 
     already_final = writer_db.final_status_keys(a["idempotency_key"] for a in allowed)
     allowed, closed_keys = split_by_final_keys(allowed, already_final)
@@ -734,7 +928,6 @@ def run_account(
     prepared, deferred = fit_into_budget(with_red_line, risks, remaining, charged_objects)
     ctx["remaining_cap"] -= len(prepared)
 
-    stale = mark_stale_rows(login, journal_ok)
     report = apply_actions(client, prepared, writer_db, lease=lease)
 
     return {
@@ -742,6 +935,16 @@ def run_account(
         "sandbox": sandbox,
         "dry_run": dry_run,
         "own_campaigns": len(campaign_ids),
+        # Ограничитель прогона и его остаток — в отчёте всегда, а не только
+        # когда он включён: «ограничение не сработало» и «ограничения не
+        # было» обязаны различаться при чтении отчёта первого боевого прогона.
+        "campaign_scope": scope.report(),
+        # Сколько кампаний прогон ФАКТИЧЕСКИ тронул: столько разных кампаний
+        # среди действий, дошедших до отправки. Отдельным полем, потому что
+        # ни одно из соседних чисел на этот вопрос не отвечает: own_campaigns
+        # это сколько прочитано, prepared.count — сколько действий, а на одну
+        # кампанию их приходится несколько.
+        "campaigns_touched": len({str(a["object_id"]) for a in prepared}),
         "computed_settings": len(computed),
         "computed_age_days": computed_age_days(computed, date.fromisoformat(today)),
         "desired": len(desired),
@@ -767,6 +970,18 @@ def run_account(
         "skipped_already_final": {
             "count": len(closed_keys),
             "reason": ALREADY_FINAL_REASON if closed_keys else None,
+        },
+        # Сегменты, которым движок больше не отправляет действия. Отдельным
+        # счётчиком, а не в общей куче blocked: это единственные строки
+        # прогона, которые не рассосутся сами и требуют разбора человеком.
+        "blocked_by_attempts": {
+            "count": len(out_of_attempts),
+            "max_attempts": writer_db.MAX_APPLY_ATTEMPTS,
+            "reason": (EXHAUSTED_ATTEMPTS_REASON.format(
+                attempts="…", max_attempts=writer_db.MAX_APPLY_ATTEMPTS)
+                if out_of_attempts else None),
+            "segments": sorted({f"{a['object_id']}:{a['direct_type']}:{a['key']}"
+                                for a in out_of_attempts})[:PREVIEW_SAMPLE_LIMIT],
         },
         "deferred_by_risk": len(deferred),
         "deferred_by_cap": len(over_cap),
@@ -815,6 +1030,18 @@ def main() -> int:
                          ensure_ascii=False, indent=2))
         return 2
 
+    # Ограничитель кампаний разбирается ДО обращения к БД, вместе с остальными
+    # отказами: неразобранный аргумент означал бы прогон без ограничения — а
+    # оператор, набравший его перед первым боевым применением, уверен в
+    # обратном. Молчать тут нельзя.
+    try:
+        campaign_scope = parse_campaign_scope(sys.argv[1:])
+    except ValueError as exc:
+        print(json.dumps({"verdict": "REFUSED", "sandbox": sandbox,
+                          "dry_run": dry_run, "reason": str(exc)},
+                         ensure_ascii=False, indent=2))
+        return 2
+
     writer_db.ensure_writer_tables()
 
     clients = _clients()
@@ -834,7 +1061,8 @@ def main() -> int:
     # каждым изменяющим запросом (writer/db.py::RunLease).
     try:
         with writer_db.run_lock("agent_e1") as lease:
-            return _run_all(clients, sandbox, dry_run, today, lease)
+            return _run_all(clients, sandbox, dry_run, today, lease,
+                            campaign_scope)
     except writer_db.RunLockBusy as exc:
         print(json.dumps({"verdict": "RUN_LOCKED", "reason": str(exc)},
                          ensure_ascii=False, indent=2))
@@ -849,7 +1077,8 @@ def main() -> int:
 
 
 def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
-             today: str, lease: Any = None) -> int:
+             today: str, lease: Any = None,
+             campaign_scope: Optional[CampaignScope] = None) -> int:
 
     holdout_ids = set(agent_db.load_holdout_ids())
     cutoff = (date.today() - timedelta(days=30)).isoformat()
@@ -881,6 +1110,11 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "charged_objects": charged_objects,
         "week_start": wk,
         "remaining_cap": remaining_cap,
+        # Ограничитель кампаний — один объект на весь прогон: его остаток
+        # общий на все кабинеты, тем же доводом, что и лимит действий.
+        # Пустой (ничего не ограничивает) — когда прогон запущен без
+        # соответствующих аргументов.
+        "campaign_scope": campaign_scope or CampaignScope(),
         "lease": lease,
     }
 

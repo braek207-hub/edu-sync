@@ -326,9 +326,12 @@ def breach_survives_peak_day(
     return survives, peak, without_peak
 
 
-def mart_filled_days(facts_by_campaign: Dict[str, List[Dict[str, Any]]],
-                     window: Tuple[date, date, bool]) -> int:
-    """Сколько дней окна витрина наполнена ХОТЬ ПО ОДНОЙ кампании кабинета.
+def mart_filled_days(mart: Dict[str, Any], window: Tuple[date, date, bool]) -> int:
+    """Сколько дней окна наполнена ВИТРИНА — вся, а не наблюдаемые кампании.
+
+    mart — ширина витрины по дням (agent_db.load_mart_day_breadth): отдельный
+    дешёвый запрос по всей витрине за окно, БЕЗ фильтра по кампаниям открытых
+    действий.
 
     Знаменатель полноты обязан описывать ВИТРИНУ, а не открутку конкретной
     кампании: витрина наполняется парами «день, кампания», реально
@@ -342,15 +345,17 @@ def mart_filled_days(facts_by_campaign: Dict[str, List[Dict[str, Any]]],
     покрытие и тем вернее вердикта не будет — защита слабела ровно там, где
     вред сильнее. День, за который витрина наполнена, а у кампании расхода
     нет, — это честный ноль (ноль расхода, ноль лидов), а не дыра в данных.
+
+    Ровно этот дефект вернулся через границу ЗАГРУЗКИ данных: строки брались
+    только по кампаниям открытых действий, и при двух открытых действиях
+    «доля дней, за которые наполнена витрина» означала «доля дней, когда была
+    открутка у этих двух кампаний». Поэтому источник знаменателя теперь
+    отдельный и к наблюдаемым кампаниям отношения не имеет.
     """
     start, end, _ = window
-    days = set()
-    for rows in facts_by_campaign.values():
-        for row in rows:
-            fact_date = _as_date(row.get("fact_date"))
-            if fact_date is not None and start <= fact_date <= end:
-                days.add(fact_date)
-    return len(days)
+    days = (mart or {}).get("days") or {}
+    return sum(1 for raw in days
+               if _as_date(raw) is not None and start <= _as_date(raw) <= end)
 
 
 def window_coverage(filled_days: int, window: Tuple[date, date, bool]) -> float:
@@ -375,8 +380,14 @@ def _unverified(state: str, closed: bool) -> str:
 
 
 def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, Any]]],
-          today: date) -> Dict[str, Any]:
-    """Вердикт по одному действию: состояние наблюдения и наблюдаемые метрики."""
+          today: date, mart: Dict[str, Any]) -> Dict[str, Any]:
+    """Вердикт по одному действию: состояние наблюдения и наблюдаемые метрики.
+
+    Два источника данных, и они РАЗНЫЕ намеренно: наблюдаемые метрики берутся
+    по кампании действия (facts_by_campaign), а знаменатель полноты — по всей
+    витрине (mart). Считай их по одним строкам — и полнота данных мерилась бы
+    откруткой той самой кампании, которую действие могло придушить.
+    """
     red_line = action.get("red_line") or {}
     if not red_line:
         return {"state": STATE_NO_RED_LINE, "reason": NO_RED_LINE_REASON}
@@ -388,7 +399,7 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
     rows = facts_by_campaign.get(str(action.get("object_id"))) or []
     observed = observed_metrics(rows, window)
     start, end, closed = window
-    filled = mart_filled_days(facts_by_campaign, window)
+    filled = mart_filled_days(mart, window)
     coverage = window_coverage(filled, window)
     verdict = {
         "observed": observed,
@@ -433,7 +444,7 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
     return {**verdict, "state": STATE_WATCHED, "reason": reason or ""}
 
 
-def facts_gate(facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
+def facts_gate(mart: Dict[str, Any], today: date,
                max_age_days: int = FACTS_MAX_AGE_DAYS) -> Dict[str, Any]:
     """Гейт качества витрины фактов ВНУТРИ сторожевого прогона.
 
@@ -453,24 +464,21 @@ def facts_gate(facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
     последний день, за который витрина наполнена по БОЛЬШИНСТВУ известных ей
     кампаний (GATE_MIN_BREADTH) — так виден и обрыв расчёта целиком, и его
     частичный отказ, но остановка одной кампании гейт не роняет.
+
+    Ширина считается по ВСЕЙ витрине (agent_db.load_mart_day_breadth), а не по
+    кампаниям открытых действий. Прежде «большинство известных кампаний»
+    означало «большинство из тех двух-трёх, по которым сейчас есть открытые
+    действия», — то есть на первом боевом прогоне гейт судил о здоровье
+    расчёта по одной кампании и молча становился её термометром.
     """
+    days_raw = (mart or {}).get("days") or {}
     breadth: Dict[date, int] = {}
-    known = 0
-    newest_any: Optional[date] = None
-    for rows in facts_by_campaign.values():
-        days = set()
-        for row in rows:
-            fact_date = _as_date(row.get("fact_date"))
-            if fact_date is None:
-                continue
-            days.add(fact_date)
-            if newest_any is None or fact_date > newest_any:
-                newest_any = fact_date
-        if not days:
-            continue
-        known += 1
-        for day in days:
-            breadth[day] = breadth.get(day, 0) + 1
+    for raw, count in days_raw.items():
+        day = _as_date(raw)
+        if day is not None:
+            breadth[day] = int(count or 0)
+    known = int((mart or {}).get("campaigns_total") or 0)
+    newest_any: Optional[date] = max(breadth) if breadth else None
 
     # Строгое большинство: при двух кампаниях нужны обе, при трёх — две.
     # Округление вниз плюс единица, а не ceil: ceil(2 × 0.5) = 1 вернул бы ту
@@ -488,7 +496,7 @@ def facts_gate(facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
     if status == "GREEN":
         reason = ""
     elif latest is None:
-        reason = ("витрина фактов пуста по наблюдаемым кампаниям"
+        reason = ("витрина фактов пуста за окно наблюдения"
                   if newest_any is None else
                   f"ни один день витрины не наполнен по {need} кампаниям из "
                   f"{known}: последняя строка есть за {newest_any.isoformat()}, "
@@ -735,7 +743,8 @@ def rollback_one(client, action: Dict[str, Any], db_module,
 
 def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
           facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
-          data_gate: Optional[Dict[str, Any]], lease: Any = None) -> Dict[str, Any]:
+          data_gate: Optional[Dict[str, Any]], lease: Any = None,
+          mart: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Наблюдение и откат по всем открытым действиям одного кабинета.
 
     data_gate — вердикт гейта витрины фактов (facts_gate). Красный гейт
@@ -764,7 +773,7 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
         # ошибкой видна в отчёте и разбирается руками — но не молча, и не
         # ценой всех остальных.
         try:
-            verdict = judge(action, facts_by_campaign, today)
+            verdict = judge(action, facts_by_campaign, today, mart or {})
         except Exception as exc:
             errors.append({"action_id": action.get("action_id"),
                            "object_id": action.get("object_id"),
@@ -941,6 +950,24 @@ def load_facts(actions: List[Dict[str, Any]], today: date) -> Dict[str, List[Dic
     return out
 
 
+def load_mart_breadth(actions: List[Dict[str, Any]], today: date) -> Dict[str, Any]:
+    """Ширина витрины по дням — отдельным дешёвым запросом по ВСЕЙ витрине.
+
+    Верхняя граница та же, что у load_facts, и по той же причине: свежесть
+    витрины видна только за границей окна наблюдения, отодвинутой от сегодня
+    на запас под лаг лидов.
+
+    Список действий нужен только чтобы узнать НИЖНЮЮ границу окна — фильтра
+    по их кампаниям здесь нет и быть не должно: и знаменатель покрытия, и
+    ширина гейта описывают состояние витрины, а не открутку наблюдаемых
+    кампаний.
+    """
+    span = facts_window(actions, today)
+    if span is None:
+        return {"days": {}, "campaigns_total": 0}
+    return agent_db.load_mart_day_breadth(span[0].isoformat(), today.isoformat())
+
+
 def refusal(sandbox: bool, dry_run: bool) -> Optional[str]:
     """Причина не начинать прогон вовсе, или None.
 
@@ -996,7 +1023,10 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None) -> in
     actions = writer_db.open_actions()
     holdout_ids = {str(h) for h in agent_db.load_holdout_ids()}
     facts_by_campaign = load_facts(actions, today)
-    gate = facts_gate(facts_by_campaign, today)
+    # Полнота данных — по витрине, наблюдаемые метрики — по кампаниям
+    # действий. Два разных запроса намеренно: см. mart_filled_days.
+    mart = load_mart_breadth(actions, today)
+    gate = facts_gate(mart, today)
 
     by_account: Dict[str, List[Dict[str, Any]]] = {}
     for action in actions:
@@ -1006,7 +1036,7 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None) -> in
     for login, account_actions in sorted(by_account.items()):
         client = WriteClient(login, sandbox=sandbox, dry_run=dry_run)
         report = watch(client, account_actions, writer_db, holdout_ids,
-                       facts_by_campaign, today, gate, lease)
+                       facts_by_campaign, today, gate, lease, mart)
         accounts.append({"account": login, **report, "units_left": client.units_left})
 
     print(json.dumps({
@@ -1020,6 +1050,10 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None) -> in
             "tail_days": OBSERVATION_TAIL_DAYS,
             "leads_lag_days": LEADS_LAG_DAYS,
             "min_window_coverage": MIN_WINDOW_COVERAGE,
+            # Знаменатель покрытия — по всей витрине, а не по наблюдаемым
+            # кампаниям. В отчёте видно, по скольким дням он считался.
+            "mart_days_in_window": len((mart or {}).get("days") or {}),
+            "mart_campaigns_total": (mart or {}).get("campaigns_total"),
         },
         "under_watch": len(actions),
         "accounts": accounts,
