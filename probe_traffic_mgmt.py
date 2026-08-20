@@ -24,6 +24,10 @@ def col_letter(idx: int) -> str:
 
 
 def main() -> None:
+    import json
+    gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if gac and os.path.exists(gac):
+        print("SA client_email:", json.load(open(gac)).get("client_email"))
     service = get_write_service()
     tabs = list_tabs(service, SHEET_ID)
     print("Вкладки книги:", tabs)
