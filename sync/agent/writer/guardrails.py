@@ -16,6 +16,8 @@ sync/agent/writer/guardrails.py — рельсы движка записи (сл
 
 from typing import Any, Dict, List, Set, Tuple
 
+from sync.agent.writer.units import API_MAX, API_MIN
+
 # Рельса работает по ДЕЛЬТЕ, а не по 100-базному коэффициенту Директа: в
 # payload действия (diff.py) лежит внутренняя единица движка, перевод в шкалу
 # API делается позже и только один раз — в apply.to_api_call через
@@ -32,6 +34,17 @@ MAX_ACTIONS_PER_RUN = 50
 # "никогда", а не эвристику по подстроке.
 ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set"}
 
+# Путь ВОЗВРАТА — только set: он переписывает уже существующий объект в его
+# прежнее значение. add на этом пути означал бы создание НОВОГО объекта вместо
+# восстановления старого, то есть ещё одно изменение кабинета под видом отмены.
+ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set"}
+
+_DELETE_REASON = "удаление объектов запрещено: агент только паузит"
+
+
+def _is_delete(kind_lower: str) -> bool:
+    return "delete" in kind_lower or "remove" in kind_lower
+
 
 def check_action(action: Dict[str, Any]) -> Tuple[bool, str]:
     """Проверка одного действия. Возвращает (можно ли, причина отказа)."""
@@ -41,8 +54,8 @@ def check_action(action: Dict[str, Any]) -> Tuple[bool, str]:
     # Отдельная явная проверка поверх allow-листа — не для защиты (её уже
     # даёт allow-лист), а чтобы в журнале была понятная причина отказа
     # именно "удаление", а не общая "вне allow-листа".
-    if "delete" in kind_lower or "remove" in kind_lower:
-        return False, "удаление объектов запрещено: агент только паузит"
+    if _is_delete(kind_lower):
+        return False, _DELETE_REASON
 
     if kind not in ALLOWED_ACTION_KINDS:
         return False, f"вид действия вне allow-листа: {kind}"
@@ -51,6 +64,48 @@ def check_action(action: Dict[str, Any]) -> Tuple[bool, str]:
     if percent is not None:
         if abs(int(percent)) > MODIFIER_CAP:
             return False, f"потолок корректировки ±{MODIFIER_CAP}%, получено {percent}%"
+    return True, ""
+
+
+def check_rollback(request: Dict[str, Any]) -> Tuple[bool, str]:
+    """Рельса пути ВОЗВРАТА. Проверяет вид действия и диапазон API, но не потолок.
+
+    Потолок MODIFIER_CAP описывает, что агенту позволено НАЗНАЧАТЬ: коридор
+    ±50 % — это ограничение на его собственные решения. Куда агенту позволено
+    ВЕРНУТЬСЯ, эта величина не описывает вообще: прошлое значение поставил
+    человек, оно уже действовало в кабинете и штатно для Директа (+80 % на
+    кампании или 0 — «показы на устройстве выключены» — обычные настройки).
+    Пропущенное через потолок назначения, такое возвращаемое значение
+    отклонялось бы, действие помечалось неоткатываемым навсегда, и изменение
+    агента оставалось бы в кабинете вечно — то есть рельса, поставленная для
+    защиты, сама отменяла бы третий слой защиты.
+
+    Что на пути возврата остаётся жёстким:
+      * удаление запрещено так же, как везде;
+      * allow-лист уже пути назначения (только set: возврат переписывает
+        существующий объект, а не создаёт новый);
+      * коэффициент обязан лежать в диапазоне API Директа — вне его запрос
+        либо будет отклонён поэлементно, либо применит не то, что задумано.
+
+    Коэффициент здесь — в 100-БАЗНОЙ ШКАЛЕ API (api_coefficient), а не в
+    дельтах, как у check_action. Поле названо иначе намеренно: две рельсы
+    считают в разных единицах, и одноимённое поле рано или поздно передали бы
+    не в ту функцию молча.
+    """
+    kind = str(request.get("action_kind") or "")
+    if _is_delete(kind.lower()):
+        return False, _DELETE_REASON
+
+    if kind not in ROLLBACK_ALLOWED_ACTION_KINDS:
+        return False, f"вид действия вне allow-листа возврата: {kind}"
+
+    coefficient = request.get("api_coefficient")
+    if coefficient is None:
+        return False, "коэффициент возврата не задан"
+    value = int(coefficient)
+    if not (API_MIN <= value <= API_MAX):
+        return False, (f"коэффициент возврата {value} вне диапазона Директа "
+                       f"{API_MIN}..{API_MAX}")
     return True, ""
 
 

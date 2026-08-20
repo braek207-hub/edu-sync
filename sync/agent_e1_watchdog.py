@@ -12,21 +12,27 @@ sync/agent_e1_watchdog.py — сторож красных линий: наблю
 было, хотя всё вокруг написано так, будто он есть.
 
 Цикл прогона:
-    открытые действия журнала → окно наблюдения каждого → факты за окно →
-    пробита ли красная линия → рельсы для запроса на возврат → откат → отчёт
+    гейт витрины фактов → открытые действия журнала → окно наблюдения каждого →
+    факты за окно → пробита ли красная линия (с подтверждением) → рельсы пути
+    возврата → откат → отчёт
 
 Окно наблюдения — не «всё время с момента применения»:
   * день применения не считается (OBSERVATION_LAG_DAYS): изменение работало
     неполные сутки, и этот день смешивает «до» и «после»;
-  * верхняя граница — вчера (OBSERVATION_TAIL_DAYS): факты за сегодня неполны,
-    синк приносит завершённый день;
+  * верхняя граница отодвинута от сегодня на OBSERVATION_TAIL_DAYS: сутки за
+    неполный сегодняшний день плюс запас под лаг источника лидов (см.
+    LEADS_LAG_DAYS) — расход и эффективные лиды приходят из разных источников
+    с разной задержкой, и лид-неполный день завышает наблюдаемый CPA всегда в
+    одну сторону;
   * длина ограничена горизонтом (OBSERVATION_HORIZON_DAYS): красная линия
     судит эффект изменения, а не общий дрейф кампании за квартал. Без
     горизонта наблюдение месячной давности сравнивало бы базовый CPA с
     накопленным средним, где влияния самого изменения почти не осталось.
 
 По умолчанию ПЕСОЧНИЦА и DRY-RUN. Откат — это тоже запись в кабинет, поэтому
-он требует тех же двух явных флагов, что и прямое применение.
+он требует тех же двух явных флагов, что и прямое применение. Комбинация
+«песочница + запись» ЗАПРЕЩЕНА (см. SANDBOX_APPLY_REFUSAL): она выглядит
+безопасной репетицией, а на деле разоружает боевые красные линии.
 
 Запуск:
     python -m sync.agent_e1_watchdog                 # песочница, репетиция
@@ -41,16 +47,48 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sync.agent import db as agent_db
+from sync.agent.guard import check_freshness, verdict as guard_verdict
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import _element_errors
 from sync.agent.writer.client import WriteClient
-from sync.agent.writer.guardrails import check_action
+from sync.agent.writer.guardrails import check_rollback
 from sync.agent.writer.rollback import rollback_payload, is_breached
-from sync.agent.writer.units import api_to_delta
+
+# Чтение корректировок кампании берётся у прогона применения, а не пишется
+# заново: форма запроса выверена пробой (Levels внутри SelectionCriteria), а
+# нормализация ключей (_normalize_actual внутри) — единственное место, где
+# определено, как ключ сегмента из API сходится с ключом плана. Вторая копия
+# этой логики разошлась бы с первой на первом же изменении справочника типов.
+from sync.agent_e1 import _actual_modifiers as read_actual_modifiers
 
 OBSERVATION_LAG_DAYS = 1        # день применения в наблюдение не входит
-OBSERVATION_TAIL_DAYS = 1       # верхняя граница наблюдения — вчера
+
+# Запас верхней границы под лаг ИСТОЧНИКА ЛИДОВ. Расход и эффективные лиды
+# приходят в витрину фактов из разных источников: расход за вчера уже полон,
+# а лиды по вчерашним визитам ещё дозревают в CRM. Смещение от этого не
+# случайное, а систематическое и всегда в одну сторону — наблюдаемый CPA
+# завышается, а порог пробоя (+40 % к базе) перешагивается недосчётом лидов
+# на треть. Минимум наблюдений от этого не защищает: это порог по ОБЪЁМУ, а
+# не по ПОЛНОТЕ, и лид-неполный день проходит его наравне с полным.
+#
+# Двое суток — заведомый запас, а не измеренная величина: точный лаг CRM здесь
+# не замерен, и число обязано быть пересчитано по расхождению eff_leads одного
+# и того же дня между соседними прогонами Э0. До замера действует правило
+# «лучше рассудить на день позже, чем откатить здоровое изменение».
+LEADS_LAG_DAYS = 2
+OBSERVATION_TAIL_DAYS = 1 + LEADS_LAG_DAYS
 OBSERVATION_HORIZON_DAYS = 14   # длина окна наблюдения, дней
+
+# Доля дней окна, по которым в витрине обязаны быть факты. Вердикт по окну,
+# наполненному наполовину, — это вердикт по случайной выборке дней: прогон
+# расчёта (agent_e0) идёт по ручному запуску и расписания не имеет, поэтому
+# дыры в витрине — штатное состояние, а не авария.
+MIN_WINDOW_COVERAGE = 0.8
+
+# Витрина фактов обязана быть свежее этого возраста, иначе сторож СМОТРИТ, но
+# НЕ ОТКАТЫВАЕТ. Порог в сутках, а не в часах: витрина дневная, и её последний
+# день при живом синке — вчерашний.
+FACTS_MAX_AGE_DAYS = 2
 
 PREVIEW_SAMPLE_LIMIT = 5
 
@@ -62,7 +100,7 @@ PREVIEW_SAMPLE_LIMIT = 5
 # failed_rollbacks_count показывает его в каждом отчёте.
 NO_ID_REASON = (
     "неизвестен Id корректировки: откат вслепую невозможен "
-    "(Id приходит только в ответе bidmodifier.add)"
+    "(Id приходит только в ответе bidmodifier.add и не найден в кабинете)"
 )
 INCOMPLETE_REASON = "тело запроса на возврат неполное: нет Id или коэффициента"
 HOLDOUT_REASON = (
@@ -72,27 +110,55 @@ HOLDOUT_REASON = (
 NO_RED_LINE_REASON = (
     "у действия нет красной линии — судить не по чему, нужна ручная сверка"
 )
+EXPIRED_REASON = (
+    "горизонт наблюдения закрыт, вердикт так и не вынесен: автоматически он не "
+    "появится никогда — нужна ручная сверка"
+)
+DATA_GATE_REASON = (
+    "гейт витрины фактов красный: наблюдение показано, но откат не выполняется "
+    "— на битых данных сторож бьёт по здоровым кампаниям"
+)
+SANDBOX_APPLY_REFUSAL = (
+    "запрещённая комбинация «песочница + запись»: боевые логины в песочнице "
+    "недоступны, каждый откат там падает ошибкой «логин не подключен», а "
+    "неудача пишется в БОЕВОЙ журнал (база одна). Три таких «безопасных» "
+    "прогона снимают действие с наблюдения навсегда. Нужен реальный откат — "
+    "--prod --apply; нужна репетиция — без --apply"
+)
 
 # Состояния наблюдения. Разделены, потому что за ними стоят разные решения:
-#   waiting    — окно ещё не открылось, данных быть не может;
-#   collecting — окно открыто, наблюдений меньше минимума: молчим намеренно,
-#                иначе шум примут за провал и откатят здоровое изменение;
-#   expired    — горизонт закрыт, а минимум наблюдений так и не набран:
-#                вердикта не будет никогда, изменение живёт непроверенным;
-#   watched    — наблюдений достаточно, линия не пробита;
-#   breached   — линия пробита, действие откатывается.
+#   waiting      — окно ещё не открылось, данных быть не может;
+#   collecting   — окно открыто, наблюдений меньше минимума: молчим намеренно,
+#                  иначе шум примут за провал и откатят здоровое изменение;
+#   low_coverage — окно открыто, но фактов по нему нет или они дырявые: судить
+#                  по случайной выборке дней нельзя;
+#   unconfirmed  — линия пробита впервые и только за счёт последнего дня:
+#                  ждём подтверждения следующим прогоном;
+#   expired      — горизонт закрыт, а вердикта так и нет: автоматически он не
+#                  появится никогда, строка уходит на ручной разбор;
+#   watched      — наблюдений достаточно, линия не пробита;
+#   breached     — линия пробита и подтверждена, действие откатывается;
+#   no_red_line  — линии нет вовсе, судить не по чему: на ручной разбор.
 STATE_WAITING = "waiting"
 STATE_COLLECTING = "collecting"
+STATE_LOW_COVERAGE = "low_coverage"
+STATE_UNCONFIRMED = "unconfirmed"
 STATE_EXPIRED = "expired"
 STATE_WATCHED = "watched"
 STATE_BREACHED = "breached"
 STATE_NO_RED_LINE = "no_red_line"
 
+# Состояния, из которых вердикт уже не появится сам. Их нельзя оставлять в
+# наблюдении: изменение живёт в кабинете непроверенным, а прогон каждый раз
+# пересчитывает по нему одно и то же. Строка закрывается для автоматики и
+# попадает в счётчик ручного разбора (failed_rollbacks_count).
+TERMINAL_UNVERIFIED_STATES = {STATE_EXPIRED, STATE_NO_RED_LINE}
+
 # Сервис API → префикс вида действия для рельс. Запрос на возврат обязан
-# пройти те же рельсы, что обычное действие: иначе путь отката — единственный
-# путь в кабинет, не проверенный ничем. Вид собирается из СЕРВИСА И МЕТОДА
-# фактического запроса, а не берётся из действия: если rollback_payload
-# когда-нибудь вернёт delete, allow-лист обязан это увидеть и отклонить.
+# пройти рельсы пути возврата: иначе откат — единственный путь в кабинет, не
+# проверенный ничем. Вид собирается из СЕРВИСА И МЕТОДА фактического запроса,
+# а не берётся из действия: если rollback_payload когда-нибудь вернёт delete,
+# allow-лист обязан это увидеть и отклонить.
 _SERVICE_KIND_PREFIX = {"bidmodifiers": "bidmodifier"}
 
 
@@ -166,6 +232,27 @@ def observed_metrics(rows: Iterable[Dict[str, Any]], window: Tuple[date, date, b
     }
 
 
+def window_coverage(observed: Dict[str, Any], window: Tuple[date, date, bool]) -> float:
+    """Доля дней окна, по которым в витрине есть факты."""
+    start, end, _ = window
+    length = (end - start).days + 1
+    if length <= 0:
+        return 0.0
+    return min(1.0, int(observed.get("days") or 0) / float(length))
+
+
+def _unverified(state: str, closed: bool) -> str:
+    """Незавершённое состояние на закрытом горизонте — это 'истекло'.
+
+    Пока горизонт открыт, «мало наблюдений», «дырявое покрытие» и
+    «неподтверждённый пробой» рассосутся сами: окно растёт, данные доезжают.
+    После закрытия горизонта окно уже не меняется, и каждый следующий прогон
+    будет считать по нему ровно то же самое — вечно. Такая строка обязана
+    уйти человеку, а не висеть в наблюдении.
+    """
+    return STATE_EXPIRED if closed else state
+
+
 def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, Any]]],
           today: date) -> Dict[str, Any]:
     """Вердикт по одному действию: состояние наблюдения и наблюдаемые метрики."""
@@ -179,13 +266,40 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
 
     rows = facts_by_campaign.get(str(action.get("object_id"))) or []
     observed = observed_metrics(rows, window)
-    breached, reason = is_breached(red_line, observed)
     start, end, closed = window
+    coverage = window_coverage(observed, window)
     verdict = {
         "observed": observed,
+        "coverage": round(coverage, 2),
         "window": {"from": start.isoformat(), "to": end.isoformat(), "closed": closed},
     }
+
+    # Полнота ДО вывода. Пустое окно даёт нули по всем метрикам, и «нулей нет
+    # выше порога» читается как «проблемы нет»: красная линия молча не
+    # срабатывает никогда, а изменение живёт непроверенным до истечения
+    # горизонта. Отсутствие данных — это отсутствие данных, а не здоровье.
+    if coverage < MIN_WINDOW_COVERAGE:
+        return {**verdict, "state": _unverified(STATE_LOW_COVERAGE, closed),
+                "reason": (f"фактов за {observed['days']} дн. из "
+                           f"{(end - start).days + 1} — покрытие "
+                           f"{coverage:.0%} при минимуме {MIN_WINDOW_COVERAGE:.0%}")}
+
+    breached, reason = is_breached(red_line, observed)
     if breached:
+        # Вердикт берётся на КАЖДОМ прогоне по РАСТУЩЕМУ окну, и выигрывает
+        # первое же пересечение порога: чем дольше наблюдение, тем больше
+        # независимых попыток пробить линию случайным выбросом, и фактическая
+        # вероятность ложного отката выше номинальной. Поэтому пробой обязан
+        # держаться и без последнего дня — то есть прожить минимум два
+        # прогона. Однодневный выброс (сбой синка лидов, разовый дорогой
+        # клик) этого не переживает, настоящая деградация переживает легко.
+        confirm_window = (start, end - timedelta(days=1), closed)
+        confirmed = False
+        if confirm_window[1] >= start:
+            confirmed, _ = is_breached(red_line, observed_metrics(rows, confirm_window))
+        if not confirmed:
+            return {**verdict, "state": _unverified(STATE_UNCONFIRMED, closed),
+                    "reason": f"{reason}; пробой не подтверждён без последнего дня окна"}
         return {**verdict, "state": STATE_BREACHED, "reason": reason}
 
     min_leads = int(red_line.get("min_leads") or 0)
@@ -193,45 +307,157 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
         # Горизонт закрыт, а минимума так и нет — вердикта не будет никогда.
         # Это не «всё хорошо»: изменение живёт непроверенным, и в отчёте оно
         # обязано стоять отдельной строкой, а не растворяться в «под наблюдением».
-        state = STATE_EXPIRED if closed else STATE_COLLECTING
-        return {**verdict, "state": state,
+        return {**verdict, "state": _unverified(STATE_COLLECTING, closed),
                 "reason": f"наблюдений {observed['leads']} из {min_leads}"}
     return {**verdict, "state": STATE_WATCHED, "reason": reason or ""}
 
 
-def guard_form(action: Dict[str, Any], service: str, method: str,
-               params: Dict[str, Any]) -> Dict[str, Any]:
-    """Запрос на возврат в той форме, которую понимают рельсы (guardrails).
+def facts_gate(facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
+               max_age_days: int = FACTS_MAX_AGE_DAYS) -> Dict[str, Any]:
+    """Гейт качества витрины фактов ВНУТРИ сторожевого прогона.
 
-    Коэффициент переводится обратно в дельту (api_to_delta): рельса
-    MODIFIER_CAP откалибрована по дельтам, и 100-базный коэффициент из тела
-    запроса она прочитала бы как «+100 %» — нейтраль отката (100) отклонялась
-    бы как выход за потолок, а настоящий выход за потолок (например 170)
-    проходил бы под видом «+70» только по случайности совпадения шкал.
+    Тот же гейт (agent/guard.py), что стоит перед расчётом, — но расчёт лишь
+    считает числа, а сторож МЕНЯЕТ КАБИНЕТ, и до этой правки единственный
+    прогон с правом записи шёл вообще без проверки данных, на которых судит.
+
+    Витрину фактов наполняет agent_e0, у которого нет расписания — только
+    ручной запуск. Перестанут запускать — сторож будет исправно отчитываться
+    о наблюдении по мёртвым данным: нули вместо лидов, завышенный CPA,
+    ложные откаты. Поэтому свежесть витрины проверяется на каждом прогоне, а
+    красный гейт запрещает откат, но не наблюдение: смотреть на плохие данные
+    можно, действовать по ним — нет.
+    """
+    latest: Optional[date] = None
+    for rows in facts_by_campaign.values():
+        for row in rows:
+            fact_date = _as_date(row.get("fact_date"))
+            if fact_date is not None and (latest is None or fact_date > latest):
+                latest = fact_date
+
+    checks = check_freshness(
+        {"edu_agent_facts": f"{latest.isoformat()}T00:00:00+00:00" if latest else None},
+        now_iso=f"{today.isoformat()}T00:00:00+00:00",
+        max_age_hours=max_age_days * 24,
+    )
+    status = guard_verdict(checks)
+    if status == "GREEN":
+        reason = ""
+    elif latest is None:
+        reason = "витрина фактов пуста по наблюдаемым кампаниям"
+    else:
+        reason = (f"последний день витрины {latest.isoformat()} при пороге "
+                  f"{max_age_days} дн. — прогон расчёта (agent_e0) не идёт")
+    return {
+        "status": status,
+        "latest_fact_date": latest.isoformat() if latest else None,
+        "max_age_days": max_age_days,
+        "reason": reason,
+        "checks": checks,
+    }
+
+
+def gate_allows_rollback(gate: Optional[Dict[str, Any]]) -> bool:
+    """Красный или невычисленный гейт откат запрещает. Умолчание — запрет."""
+    return bool(gate) and str(gate.get("status")) == "GREEN"
+
+
+def journal_allowed(client) -> bool:
+    """Можно ли этому клиенту писать в журнал действий.
+
+    Журнал ОДИН на оба окружения — база одна. Поэтому право записи в него не
+    равно праву записи в кабинет: песочный клиент, отправляющий запросы в
+    песочницу, оставлял бы в БОЕВОМ журнале отметки о боевых действиях,
+    которых в боевом кабинете не происходило. Три такие отметки хоронят
+    действие (MAX_ROLLBACK_ATTEMPTS), и красная линия по нему не сработает
+    уже никогда.
+
+    Это второй рубеж: комбинация «песочница + запись» отклоняется ещё в main()
+    до единого обращения к БД. Здесь — защита от вызывающего кода, который
+    соберёт такой клиент программно (живой тест, разовый скрипт).
+    """
+    return bool(client.is_write_allowed()) and not bool(getattr(client, "sandbox", False))
+
+
+def rollback_guard_form(action: Dict[str, Any], service: str, method: str,
+                        params: Dict[str, Any]) -> Dict[str, Any]:
+    """Запрос на возврат в той форме, которую понимает рельса пути возврата.
+
+    Коэффициент передаётся в 100-БАЗНОЙ шкале API и под именем
+    api_coefficient — check_rollback проверяет по нему диапазон Директа
+    (0..1300), а не потолок назначения ±50 %. Потолок описывает, что агенту
+    позволено НАЗНАЧАТЬ; прошлое значение он не описывает вообще — его
+    поставил человек, и +80 % или 0 («показы выключены») для Директа штатны.
     """
     prefix = _SERVICE_KIND_PREFIX.get(str(service), str(service))
     item = ((params.get("BidModifiers") or [{}])[0]) or {}
-    percent = item.get("BidModifier")
     return {
         "action_kind": f"{prefix}.{method}",
         "object_level": action.get("object_level"),
         "object_id": action.get("object_id"),
-        "payload": {
-            "Id": item.get("Id"),
-            "BidModifier": None if percent is None else api_to_delta(percent),
-        },
+        "api_coefficient": item.get("BidModifier"),
+        "payload": {"Id": item.get("Id")},
     }
 
 
+def _segment_of(action: Dict[str, Any]) -> Tuple[str, str]:
+    """Сегмент действия: (тип корректировки Директа, ключ внутри типа).
+
+    Колонки direct_type/setting_key появились позже payload, поэтому у старых
+    строк журнала сегмент лежит только в payload.
+    """
+    payload = action.get("payload") or {}
+    direct_type = action.get("direct_type") or payload.get("Type") or ""
+    setting_key = action.get("setting_key") or payload.get("key") or ""
+    return str(direct_type), str(setting_key)
+
+
+def resolve_added_modifier_id(client, action: Dict[str, Any]) -> Optional[Any]:
+    """Id добавленной корректировки, восстановленный ЧТЕНИЕМ кабинета.
+
+    Строка bidmodifier.add без сохранённого ответа API (обрыв процесса между
+    отправкой и отметкой — статус 'stale') неоткатываема по построению: Id
+    созданного объекта неизвестен. Но он не потерян: bidmodifiers.get отдаёт
+    Id для каждой пары «тип, ключ» кампании, а тип и ключ у действия записаны.
+    Сверка с кабинетом превращает вечно неоткатываемую строку в обычную.
+
+    Чтение состояния не меняет и потому разрешено всегда — в том числе в
+    репетиции.
+
+    Совпадение обязано быть ЕДИНСТВЕННЫМ и однозначным: составная
+    корректировка («мужчины 25–34») и запись без годного коэффициента в
+    кандидаты не берутся, а двойное совпадение по одному сегменту означает,
+    что кабинет не такой, каким мы его считаем, — угадывать там нельзя.
+    """
+    want_type, want_key = _segment_of(action)
+    if not want_type or not want_key:
+        return None
+    try:
+        actual = read_actual_modifiers(client, str(action.get("object_id")))
+    except Exception:
+        # Кабинет недоступен — это не «Id не существует». Молчаливый None
+        # оставит строку неоткатываемой на этот прогон, но не пометит её
+        # неоткатываемой навсегда: пометку ставит вызывающий код по своей
+        # причине, и следующий прогон попробует прочитать снова.
+        return None
+    matched = [item.get("Id") for item in actual
+               if str(item.get("Type")) == want_type
+               and str(item.get("key")) == want_key
+               and not item.get("composite")
+               and not item.get("unusable")
+               and item.get("Id") is not None]
+    return matched[0] if len(matched) == 1 else None
+
+
 def _fail(db_module, action: Dict[str, Any], reason: str, permanent: bool,
-          write_allowed: bool) -> Dict[str, Any]:
+          journal_ok: bool) -> Dict[str, Any]:
     """Неудачный откат: пометка в журнале и строка для отчёта.
 
-    В репетиции журнал не трогается — отчёт всё равно показывает, что откат
-    неисполним, но состояние базы репетиция не меняет.
+    В репетиции и у песочного клиента журнал не трогается — отчёт всё равно
+    показывает, что откат неисполним, но состояние боевой базы от этого не
+    меняется.
     """
     marked = None
-    if write_allowed:
+    if journal_ok:
         marked = db_module.mark_rollback_failed(action["action_id"], reason,
                                                 permanent=permanent)
     return {
@@ -240,7 +466,35 @@ def _fail(db_module, action: Dict[str, Any], reason: str, permanent: bool,
         "object_id": action.get("object_id"),
         "reason": reason,
         "permanent": bool(permanent),
+        "journal_written": bool(journal_ok),
         "attempts": (marked or {}).get("rollback_attempts"),
+        "retries_stopped": bool((marked or {}).get("rollback_failed_at")),
+    }
+
+
+def close_unverified(db_module, action: Dict[str, Any], state: str, reason: str,
+                     journal_ok: bool) -> Dict[str, Any]:
+    """Снимает с наблюдения строку, по которой вердикта уже не будет.
+
+    Механизм тот же, что у неисполнимого отката (rollback_failed_at): строка
+    уходит из open_actions, изменение ОСТАЁТСЯ живым в кабинете, риск-бюджет
+    продолжает его оплачивать, а failed_rollbacks_count показывает её в
+    отчёте каждого прогона как ждущую человека. Отдельного механизма для
+    этого случая в журнале нет и заводить его незачем: последствия ровно те
+    же — автоматика сделала всё, что могла, дальше решает человек.
+    """
+    marked = None
+    if journal_ok:
+        marked = db_module.mark_rollback_failed(action["action_id"], reason,
+                                                permanent=True)
+    return {
+        "result": "closed_unverified",
+        "action_id": action.get("action_id"),
+        "object_id": action.get("object_id"),
+        "action_kind": action.get("action_kind"),
+        "state": state,
+        "reason": reason,
+        "journal_written": bool(journal_ok),
         "retries_stopped": bool((marked or {}).get("rollback_failed_at")),
     }
 
@@ -250,10 +504,12 @@ def rollback_one(client, action: Dict[str, Any], db_module,
     """Возврат одного объекта в прошлое состояние.
 
     Ничего не удаляет ни при каких обстоятельствах: rollback_payload строит
-    только set нейтрального или прежнего коэффициента, а allow-лист рельс
-    (check_action) не пропустил бы delete, даже если бы он там появился.
+    только set нейтрального или прежнего коэффициента, а allow-лист рельсы
+    возврата (check_rollback) не пропустил бы delete, даже если бы он там
+    появился.
     """
     write_allowed = client.is_write_allowed()
+    journal_ok = journal_allowed(client)
 
     if str(action.get("object_id")) in holdout_ids:
         # Действия в заповедник не попадают (agent_e1 отсекает их check_holdout
@@ -267,24 +523,33 @@ def rollback_one(client, action: Dict[str, Any], db_module,
 
     try:
         request = rollback_payload(action)
+        if request is None:
+            # Id созданного объекта неизвестен — но он восстановим чтением
+            # кабинета по паре «тип, ключ». Пробуем, прежде чем хоронить.
+            recovered = resolve_added_modifier_id(client, action)
+            if recovered is not None:
+                request = rollback_payload({
+                    **action,
+                    "payload": {**(action.get("payload") or {}), "Id": recovered},
+                })
     except Exception as exc:
         # delta_to_api роняет вызов на коэффициенте вне диапазона Директа:
         # прошлое состояние испорчено, и повтор его не починит.
         return _fail(db_module, action, f"запрос на возврат не строится: {exc}"[:300],
-                     True, write_allowed)
+                     True, journal_ok)
 
     if request is None:
-        return _fail(db_module, action, NO_ID_REASON, True, write_allowed)
+        return _fail(db_module, action, NO_ID_REASON, True, journal_ok)
 
     service, method, params = request
     item = ((params.get("BidModifiers") or [{}])[0]) or {}
     if item.get("Id") is None or item.get("BidModifier") is None:
-        return _fail(db_module, action, INCOMPLETE_REASON, True, write_allowed)
+        return _fail(db_module, action, INCOMPLETE_REASON, True, journal_ok)
 
-    ok, reason = check_action(guard_form(action, service, method, params))
+    ok, reason = check_rollback(rollback_guard_form(action, service, method, params))
     if not ok:
         return _fail(db_module, action, f"рельсы отклонили запрос на возврат: {reason}",
-                     True, write_allowed)
+                     True, journal_ok)
 
     if not write_allowed:
         return {"result": "dry_run", "action_id": action.get("action_id"),
@@ -298,27 +563,40 @@ def rollback_one(client, action: Dict[str, Any], db_module,
         # Сбой отправки бывает разовым — попытка засчитывается, но строка не
         # снимается с наблюдения сразу: её снимет счётчик попыток.
         return _fail(db_module, action, f"{type(exc).__name__}: {exc}"[:300],
-                     False, write_allowed)
+                     False, journal_ok)
 
     if errors:
         return _fail(db_module, action, f"API отклонил возврат: {json.dumps(errors, ensure_ascii=False)}"[:300],
-                     False, write_allowed)
+                     False, journal_ok)
 
-    db_module.mark_rolled_back(action["action_id"])
+    if journal_ok:
+        db_module.mark_rolled_back(action["action_id"])
     return {"result": "rolled_back", "action_id": action.get("action_id"),
-            "object_id": action.get("object_id"), "response": response}
+            "object_id": action.get("object_id"),
+            "journal_written": bool(journal_ok), "response": response}
 
 
 def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
-          facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date) -> Dict[str, Any]:
-    """Наблюдение и откат по всем открытым действиям одного кабинета."""
+          facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
+          data_gate: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Наблюдение и откат по всем открытым действиям одного кабинета.
+
+    data_gate — вердикт гейта витрины фактов (facts_gate). Красный гейт
+    наблюдение не отменяет: состояния считаются и печатаются, пробои видны,
+    но в кабинет прогон не пишет. Параметр обязателен и без умолчания:
+    забытый гейт обязан быть виден как ошибка вызова, а не тихо разрешать
+    откат по данным неизвестного качества.
+    """
     states: Dict[str, int] = {}
     breached: List[Dict[str, Any]] = []
     rolled_back = 0
     failures: List[Dict[str, Any]] = []
     blocked_holdout: List[Dict[str, Any]] = []
+    blocked_by_gate: List[Dict[str, Any]] = []
     would_roll_back: List[Dict[str, Any]] = []
+    needs_review: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
+    rollback_allowed = gate_allows_rollback(data_gate)
 
     for action in actions:
         # Одна испорченная строка журнала не должна ослеплять сторожа по всем
@@ -335,6 +613,21 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
             continue
         state = verdict["state"]
         states[state] = states.get(state, 0) + 1
+
+        if state in TERMINAL_UNVERIFIED_STATES:
+            reason = EXPIRED_REASON if state == STATE_EXPIRED else NO_RED_LINE_REASON
+            detail = verdict.get("reason")
+            if detail and state == STATE_EXPIRED:
+                reason = f"{reason}: {detail}"
+            try:
+                needs_review.append(close_unverified(
+                    db_module, action, state, reason, journal_allowed(client)))
+            except Exception as exc:
+                errors.append({"action_id": action.get("action_id"),
+                               "object_id": action.get("object_id"),
+                               "error": f"{type(exc).__name__}: {exc}"[:200]})
+            continue
+
         if state != STATE_BREACHED:
             continue
 
@@ -345,6 +638,16 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
             "reason": verdict.get("reason"),
             "observed": verdict.get("observed"),
         })
+
+        if not rollback_allowed:
+            # Смотрим, но не откатываем: линия пробита по данным, качеству
+            # которых доверять нельзя.
+            blocked_by_gate.append({"action_id": action.get("action_id"),
+                                    "object_id": action.get("object_id"),
+                                    "reason": DATA_GATE_REASON,
+                                    "gate": (data_gate or {}).get("reason")})
+            continue
+
         try:
             outcome = rollback_one(client, action, db_module, holdout_ids)
         except Exception as exc:
@@ -372,6 +675,17 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
         "failures": [{k: v for k, v in f.items() if k != "result"}
                      for f in failures[:PREVIEW_SAMPLE_LIMIT]],
         "blocked_holdout": len(blocked_holdout),
+        # Пробои, по которым прогон намеренно ничего не сделал: гейт данных
+        # красный. Отдельный счётчик, а не тишина, — иначе «сторож молчит»
+        # неотличимо от «всё хорошо».
+        "blocked_data_gate": len(blocked_by_gate),
+        "blocked_data_gate_sample": blocked_by_gate[:PREVIEW_SAMPLE_LIMIT],
+        # Строки, снятые с наблюдения без вердикта: горизонт истёк или красной
+        # линии не было вовсе. Изменение живёт в кабинете непроверенным и ждёт
+        # человека — молчать о таких нельзя.
+        "needs_review": len(needs_review),
+        "needs_review_sample": [{k: v for k, v in n.items() if k != "result"}
+                                for n in needs_review[:PREVIEW_SAMPLE_LIMIT]],
         # Строки, которые прогон не смог даже рассудить: испорченные данные
         # журнала. Не «ноль пробитых», а явный отдельный счётчик.
         "errors": len(errors),
@@ -393,15 +707,41 @@ def facts_window(actions: List[Dict[str, Any]], today: date) -> Optional[Tuple[d
 
 
 def load_facts(actions: List[Dict[str, Any]], today: date) -> Dict[str, List[Dict[str, Any]]]:
+    """Факты по наблюдаемым кампаниям — до СЕГОДНЯ, а не до конца окон.
+
+    Верхняя граница запроса шире верхней границы наблюдения намеренно: по
+    этим же строкам гейт (facts_gate) судит о свежести витрины, а последний
+    её день лежит за границей окна — окно отодвинуто от сегодня на запас под
+    лаг лидов. Запрашивай мы ровно окно — «витрина мертва неделю» и «мы
+    спросили только про старые дни» выглядели бы одинаково. На вердикты
+    лишние дни не влияют: observed_metrics режет строки по своему окну.
+    """
     span = facts_window(actions, today)
     if span is None:
         return {}
     rows = agent_db.load_daily_facts(
-        [str(a.get("object_id")) for a in actions], span[0].isoformat(), span[1].isoformat())
+        [str(a.get("object_id")) for a in actions], span[0].isoformat(), today.isoformat())
     out: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         out.setdefault(str(row["campaign_id"]), []).append(row)
     return out
+
+
+def refusal(sandbox: bool, dry_run: bool) -> Optional[str]:
+    """Причина не начинать прогон вовсе, или None.
+
+    «Песочница + запись» выглядит безопасной репетицией и потому будет первым,
+    что попробует оператор. На деле песочница боевым логинам НЕДОСТУПНА: любой
+    вызов отвечает «логин не подключен», исключение ловится, попытка отката
+    засчитывается неудачной — и запись об этом уходит в БОЕВОЙ журнал, потому
+    что база одна. После MAX_ROLLBACK_ATTEMPTS таких прогонов действие
+    снимается с наблюдения навсегда: изменение остаётся живым в кабинете, а
+    красная линия по нему не сработает уже никогда. То есть самый безопасный
+    на вид режим — единственный, который разоружает боевые красные линии.
+    """
+    if sandbox and not dry_run:
+        return SANDBOX_APPLY_REFUSAL
+    return None
 
 
 def main() -> int:
@@ -409,10 +749,20 @@ def main() -> int:
     dry_run = "--apply" not in sys.argv
     today = date.today()
 
+    # Отказ ДО первого обращения к БД: боевой журнал не должен получить ни
+    # строчки от прогона, который физически не может ничего откатить.
+    refused = refusal(sandbox, dry_run)
+    if refused:
+        print(json.dumps({"verdict": "REFUSED", "sandbox": sandbox,
+                          "dry_run": dry_run, "reason": refused},
+                         ensure_ascii=False, indent=2))
+        return 2
+
     writer_db.ensure_writer_tables()
     actions = writer_db.open_actions()
     holdout_ids = {str(h) for h in agent_db.load_holdout_ids()}
     facts_by_campaign = load_facts(actions, today)
+    gate = facts_gate(facts_by_campaign, today)
 
     by_account: Dict[str, List[Dict[str, Any]]] = {}
     for action in actions:
@@ -422,17 +772,20 @@ def main() -> int:
     for login, account_actions in sorted(by_account.items()):
         client = WriteClient(login, sandbox=sandbox, dry_run=dry_run)
         report = watch(client, account_actions, writer_db, holdout_ids,
-                       facts_by_campaign, today)
+                       facts_by_campaign, today, gate)
         accounts.append({"account": login, **report, "units_left": client.units_left})
 
     print(json.dumps({
         "sandbox": sandbox,
         "dry_run": dry_run,
         "today": today.isoformat(),
+        "data_gate": gate,
         "observation": {
             "lag_days": OBSERVATION_LAG_DAYS,
             "horizon_days": OBSERVATION_HORIZON_DAYS,
             "tail_days": OBSERVATION_TAIL_DAYS,
+            "leads_lag_days": LEADS_LAG_DAYS,
+            "min_window_coverage": MIN_WINDOW_COVERAGE,
         },
         "under_watch": len(actions),
         "accounts": accounts,
