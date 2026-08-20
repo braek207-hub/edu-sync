@@ -3,15 +3,28 @@
 tests/test_agent_writer_apply.py — тесты преобразования действий в вызовы API
 и применения действий (журнал → отправка → отметка результата).
 
-Фейковые client/db_module по протоколу реальных (client.mutate,
-db_module.find_action_by_key/insert_action/mark_action) — без сети и без БД.
+Клиент везде фейковый (client.mutate) — сеть не нужна ни одному тесту.
+
+База — двух видов, и это важно. Счётчики отчёта и порядок вызовов проверяются
+на фейковом журнале: он ничего не решает, только записывает. А контракт журнала
+(что переписывается повторной планировкой, а что неприкосновенно) проверяется
+на РЕАЛЬНОМ модуле работы с базой, под гейтом DATABASE_URL. Раньше фейк
+воспроизводил этот контракт руками — и «поведенческие» тесты проходили на
+сломанном коде, потому что проверяли сами себя.
 """
 
+import os
+import uuid
 from typing import Any, Dict, List, Optional
 
 import pytest
 
+import sync.agent.writer.db as writer_db
 from sync.agent.writer.apply import _element_errors, apply_actions, to_api_call
+from sync.agent.writer.db import ensure_writer_tables
+from sync.db import get_connection
+
+live_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="нужен DATABASE_URL")
 
 
 # payload несёт ДЕЛЬТУ (30 = «+30 %»), в тело запроса уходит 100-базный
@@ -91,11 +104,13 @@ def _action(key: str = "k1") -> Dict[str, Any]:
 
 
 class _FakeDB:
-    """Минимальная замена sync.agent.writer.db по протоколу apply_actions.
+    """Журнал-протокол: только записывает, ничего не решает.
 
-    insert_action повторяет ON CONFLICT (idempotency_key) DO UPDATE реального
-    кода: повторная вставка ещё не применённого действия обновляет строку
-    свежими данными, применённую (или откатанную) — не трогает.
+    Никакой логики ON CONFLICT здесь НЕТ намеренно. Пока фейк повторял
+    контракт реального INSERT, тесты «повтор несёт свежие данные» и
+    «применённое не переписывается» проверяли именно этот повтор — и зеленели
+    на сломанном коде. Контракт журнала теперь проверяется живыми тестами в
+    конце файла, а фейк отвечает только за счётчики отчёта и порядок вызовов.
     """
 
     def __init__(self, seed: Optional[Dict[str, Dict[str, Any]]] = None):
@@ -107,12 +122,8 @@ class _FakeDB:
 
     def insert_action(self, row: Dict[str, Any]) -> str:
         self.events.append(f"insert:{row['idempotency_key']}")
-        key = row["idempotency_key"]
-        existing = self.rows.get(key)
-        if existing and existing.get("status") in {"applied", "rolled_back"}:
-            return key
-        self.rows[key] = {**row, "status": "planned"}
-        return key  # action_id — в тестах достаточно самого ключа
+        self.rows[row["idempotency_key"]] = {**row, "status": "planned"}
+        return row["idempotency_key"]  # action_id — в тестах достаточно ключа
 
     def mark_action(self, action_id: str, status: str, response: Dict[str, Any]) -> None:
         self.events.append(f"mark:{action_id}:{status}")
@@ -201,6 +212,24 @@ def test_apply_actions_repeat_run_does_not_skip_rejected():
     assert report["skipped"] == 0
     assert report["applied"] == 1
     assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize("status", writer_db.FINAL_STATUSES)
+def test_apply_actions_skips_action_in_any_final_status(status):
+    # «Кого журнал не переписывает» и «кого применение не отправляет второй
+    # раз» — один список (db.FINAL_STATUSES). Разъехавшись, они дают ровно тот
+    # дефект, ради которого список и заведён: повторная планировка затирает
+    # previous_state строки, отправку которой применение пропускает, — и
+    # единственное основание для отката теряется. Отдельный случай — 'stale':
+    # запрос по такой строке уже ушёл в кабинет, и повторный bidmodifier.add
+    # создал бы там второй объект.
+    db = _FakeDB(seed={"k1": {"status": status}})
+    client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["skipped"] == 1, status
+    assert client.calls == [], status
 
 
 def test_apply_actions_unknown_method_marks_failed_not_applied(monkeypatch):
@@ -304,30 +333,104 @@ def test_apply_actions_dry_run_counter_present_even_when_zero():
 
 
 # ------------------- повтор непринятого действия несёт свежее прошлое состояние
-# Дефект 5, поведенческая половина: apply_actions обязан переписать журнал
-# заново для действия, которое ещё не применилось успешно.
+# Дефект 5, поведенческая половина. Эти две проверки раньше стояли на фейковой
+# БД, которая ВОСПРОИЗВОДИЛА контракт ON CONFLICT руками, — то есть проверяли
+# сами себя и зеленели на сломанном коде. Теперь они идут через реальный модуль
+# работы с базой, под тем же гейтом доступа, что и остальные живые тесты
+# (tests/test_agent_writer_db.py).
 
 
-def test_replanned_action_overwrites_previous_state_of_failed_attempt():
-    db = _FakeDB()
-    first = {**_action("k1"), "previous_state": {"Id": 7, "percent": 10}}
-    apply_actions(_FakeClient(raises=RuntimeError("сеть недоступна")), [first], db)
-    assert db.rows["k1"]["status"] == "failed"
-
-    # Человек поправил корректировку руками — свежий факт другой.
-    second = {**_action("k1"), "previous_state": {"Id": 7, "percent": 25}}
-    apply_actions(_FakeClient(response={"SetResults": [{"Id": 7}]}), [second], db)
-
-    assert db.rows["k1"]["previous_state"] == {"Id": 7, "percent": 25}
+def _live_action(key: str, account: str, percent: int) -> Dict[str, Any]:
+    return {**_action(key), "account": account,
+            "previous_state": {"Id": 7, "percent": percent}}
 
 
-def test_applied_action_is_not_replanned():
-    db = _FakeDB()
-    apply_actions(_FakeClient(response={"SetResults": [{"Id": 7}]}),
-                  [{**_action("k1"), "previous_state": {"Id": 7, "percent": 10}}], db)
+def _live_row(key: str):
+    rows = writer_db._fetch(
+        "SELECT * FROM edu_agent_actions WHERE idempotency_key = %s", (key,))
+    return rows[0] if rows else None
 
-    report = apply_actions(_FakeClient(response={"SetResults": [{"Id": 7}]}),
-                           [{**_action("k1"), "previous_state": {"Id": 7, "percent": 99}}], db)
 
-    assert report["skipped"] == 1
-    assert db.rows["k1"]["previous_state"] == {"Id": 7, "percent": 10}
+def _live_cleanup(key: str) -> None:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM edu_agent_actions WHERE idempotency_key = %s", (key,))
+        conn.commit()
+
+
+@live_db
+def test_live_replanned_action_overwrites_previous_state_of_failed_attempt():
+    # Первая попытка упала на отправке; человек поправил корректировку руками;
+    # вторая попытка несёт свежий факт. Журнал обязан хранить именно его —
+    # иначе откат вернёт кабинет не туда, откуда агент его вывел.
+    ensure_writer_tables()
+    suffix = uuid.uuid4().hex[:8]
+    key = "test-apply-replan-" + suffix
+    account = "test-" + suffix
+    try:
+        apply_actions(_FakeClient(raises=RuntimeError("сеть недоступна")),
+                      [_live_action(key, account, 10)], writer_db)
+        assert _live_row(key)["status"] == "failed"
+
+        apply_actions(_FakeClient(response={"SetResults": [{"Id": 7}]}),
+                      [_live_action(key, account, 25)], writer_db)
+
+        row = _live_row(key)
+        assert row["previous_state"] == {"Id": 7, "percent": 25}
+        assert row["status"] == "applied"
+    finally:
+        _live_cleanup(key)
+
+
+@live_db
+def test_live_applied_action_is_not_replanned():
+    # Применённое действие не отправляется второй раз и не переписывается:
+    # его previous_state — единственное основание для отката.
+    ensure_writer_tables()
+    suffix = uuid.uuid4().hex[:8]
+    key = "test-apply-skip-" + suffix
+    account = "test-" + suffix
+    try:
+        apply_actions(_FakeClient(response={"SetResults": [{"Id": 7}]}),
+                      [_live_action(key, account, 10)], writer_db)
+
+        client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+        report = apply_actions(client, [_live_action(key, account, 99)], writer_db)
+
+        assert report["skipped"] == 1
+        assert client.calls == []  # запрос не ушёл второй раз
+        assert _live_row(key)["previous_state"] == {"Id": 7, "percent": 10}
+    finally:
+        _live_cleanup(key)
+
+
+@live_db
+def test_live_stale_action_is_not_sent_again():
+    # Зависшая строка ('stale') закрыта для повторной отправки наравне с
+    # применённой: запрос по ней уже ушёл в кабинет, и второй bidmodifiers.add
+    # создал бы там второй объект.
+    ensure_writer_tables()
+    suffix = uuid.uuid4().hex[:8]
+    key = "test-apply-stale-" + suffix
+    account = "test-" + suffix
+    try:
+        apply_actions(_FakeClient(raises=RuntimeError("обрыв")),
+                      [_live_action(key, account, 10)], writer_db)
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE edu_agent_actions SET status = 'planned', "
+                    "created_at = now() - make_interval(mins => 90) "
+                    "WHERE idempotency_key = %s", (key,))
+            conn.commit()
+        assert [r["idempotency_key"] for r in
+                writer_db.mark_stale_planned(60, account=account)] == [key]
+
+        client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+        report = apply_actions(client, [_live_action(key, account, 99)], writer_db)
+
+        assert report["skipped"] == 1
+        assert client.calls == []
+        assert _live_row(key)["previous_state"] == {"Id": 7, "percent": 10}
+    finally:
+        _live_cleanup(key)

@@ -47,6 +47,33 @@ WRITER_DDL: List[str] = [
 ]
 
 
+# Статусы, при которых строка журнала ЗАКРЫТА для повторной планировки и
+# повторной отправки. Один кортеж на три места (INSERT_ACTION_SQL, apply.py,
+# читатели журнала) — потому что расхождение между «кого не переписываем» и
+# «кого не отправляем второй раз» и есть тот самый класс ошибки, когда два
+# куска по отдельности корректны, а вместе не сходятся.
+#
+#   applied      — изменение совершилось, previous_state описывает точку возврата;
+#   rolled_back  — изменение уже отменено;
+#   stale        — запрос ушёл в кабинет, а результат не отмечен (обрыв процесса
+#                  между отправкой и отметкой). Считаем применённым, пока не
+#                  доказано обратное: повторная отправка bidmodifiers.add
+#                  создала бы в кабинете второй объект, а перезапись
+#                  previous_state стёрла бы единственное основание для отката.
+FINAL_STATUSES = ("applied", "rolled_back", "stale")
+
+# Статусы ЖИВОГО изменения в кабинете: наблюдаются сторожем красных линий и
+# оплачены риск-бюджетом. 'rolled_back' сюда не входит — изменения больше нет.
+LIVE_STATUSES = ("applied", "stale")
+
+
+def _sql_literals(values) -> str:
+    """Кортеж статусов → список литералов для IN (...). Значения — константы
+    модуля, не пользовательский ввод, поэтому подстановка в текст безопасна и
+    даёт то, ради чего затевалась: SQL не может разойтись с FINAL_STATUSES."""
+    return ", ".join("'%s'" % v for v in values)
+
+
 def ensure_writer_tables() -> None:
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -81,8 +108,9 @@ def find_action_by_key(idempotency_key: str) -> Optional[Dict[str, Any]]:
 # не туда, откуда агент его вывел. То же с оценкой риска и красной линией.
 #
 # Условие в DO UPDATE — граница между «ещё не сделано» и «сделано»: строку в
-# статусе applied/rolled_back не трогаем никогда, её previous_state описывает
-# реально совершённое изменение и является единственным основанием для отката.
+# закрытом статусе (FINAL_STATUSES) не трогаем никогда, её previous_state
+# описывает реально совершённое изменение и является единственным основанием
+# для отката.
 # status/response сбрасываются: прошлая ошибка не должна выглядеть ответом на
 # новую попытку, а created_at обновляется, чтобы «зависшая» строка считалась от
 # последней попытки (stale_planned ниже).
@@ -107,8 +135,8 @@ INSERT_ACTION_SQL = """
         status         = 'planned',
         response       = '{}'::jsonb,
         created_at     = now()
-    WHERE edu_agent_actions.status NOT IN ('applied', 'rolled_back')
-"""
+    WHERE edu_agent_actions.status NOT IN (__FINAL_STATUSES__)
+""".replace("__FINAL_STATUSES__", _sql_literals(FINAL_STATUSES))
 
 
 def insert_action(row: Dict[str, Any]) -> str:
@@ -152,9 +180,19 @@ def mark_action(action_id: str, status: str, response: Dict[str, Any]) -> None:
 
 
 def open_actions() -> List[Dict[str, Any]]:
-    """Применённые и ещё не откатанные — за ними следит сторож красных линий."""
+    """Живые изменения в кабинете — за ними следит сторож красных линий.
+
+    Два статуса, а не один. 'applied' — изменение точно состоялось. 'stale' —
+    запрос ушёл, а результат не отмечен (обрыв процесса), и по умолчанию мы
+    считаем изменение состоявшимся: пока обратное не доказано, оно живое,
+    и оставлять его без наблюдения нельзя. Именно из-за прежнего фильтра
+    только по 'applied' зависшая строка не попадала в поле зрения ни сторожа,
+    ни отката — и вечно печаталась в отчёте, ничем больше не отзываясь.
+    """
     return _fetch(
-        "SELECT * FROM edu_agent_actions WHERE status = 'applied' AND rolled_back_at IS NULL"
+        "SELECT * FROM edu_agent_actions "
+        "WHERE status IN (__LIVE_STATUSES__) AND rolled_back_at IS NULL".replace(
+            "__LIVE_STATUSES__", _sql_literals(LIVE_STATUSES))
     )
 
 
@@ -186,8 +224,62 @@ def stale_planned(older_than_minutes: int, account: Optional[str] = None) -> Lis
     который надо разобрать руками (сверить кабинет с журналом), а не автоматом:
     достоверно отличить «запрос ушёл и применился» от «запрос не ушёл» по
     самой строке невозможно.
+
+    Только чтение: перевод строки в статус 'stale' делает mark_stale_planned.
     """
     return _fetch(STALE_PLANNED_SQL, (int(older_than_minutes), account, account))
+
+
+# Перевод зависшей строки в терминальный статус 'stale' — единственным
+# UPDATE ... RETURNING, то есть атомарно: обнаружение и пометка не могут
+# разъехаться между двумя прогонами (и двумя параллельными прогонами тоже —
+# строку заберёт ровно один).
+#
+# Что даёт статус, кроме печати в отчёте (ради чего он и заведён):
+#   1. Отчёт перестаёт повторять одно и то же вечно — печатаются только
+#      строки, обнаруженные ВПЕРВЫЕ, то есть возвращённые этим запросом.
+#   2. Строка попадает в open_actions → её увидит будущий сторож отката.
+#   3. Риск списывается: applied_at проставляется моментом ОТПРАВКИ запроса
+#      (created_at), а не моментом обнаружения, — иначе изменение прошлой
+#      недели съело бы бюджет текущей.
+#   4. Повторная отправка исключена: 'stale' входит в FINAL_STATUSES, а
+#      значит и apply.py пропустит действие, и INSERT не перезапишет его
+#      previous_state.
+# Ответ помечается флагом, а не выдумывается: результат запроса неизвестен,
+# и строка всё равно требует ручной сверки кабинета с журналом.
+MARK_STALE_SQL = """
+    UPDATE edu_agent_actions
+       SET status     = 'stale',
+           applied_at = COALESCE(applied_at, created_at),
+           response   = jsonb_build_object(
+                            'stale', true,
+                            'detected_at', now(),
+                            'note', 'обрыв после отправки: результат неизвестен, '
+                                    'нужна ручная сверка кабинета с журналом')
+     WHERE status = 'planned'
+       AND created_at < now() - make_interval(mins => %s)
+       AND (%s IS NULL OR account = %s)
+    RETURNING action_id, idempotency_key, account, object_level, object_id,
+              action_kind, created_at, risk_rub
+"""
+
+
+def mark_stale_planned(
+    older_than_minutes: int, account: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Помечает зависшие planned-строки статусом 'stale' и отдаёт ТОЛЬКО те,
+    что помечены этим вызовом, — то есть обнаруженные впервые.
+
+    Повторный вызов вернёт пустой список: строка уже не в статусе 'planned'.
+    Ровно этим отчёт прогона перестаёт бесконечно повторять одну и ту же
+    находку, а сама находка не теряется — она видна через open_actions.
+    """
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(MARK_STALE_SQL, (int(older_than_minutes), account, account))
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.commit()
+    return rows
 
 
 def mark_rolled_back(action_id: str) -> None:
@@ -202,14 +294,21 @@ def mark_rolled_back(action_id: str) -> None:
 
 
 def spent_risk(week_start: str) -> float:
+    """Деньги под живыми непроверенными изменениями недели.
+
+    Зависшая строка ('stale') считается наравне с применённой: запрос ушёл в
+    кабинет, изменение с высокой вероятностью живое, и не списывать за него
+    риск значит выдавать бюджет, которого нет. Неделя берётся по applied_at,
+    который для такой строки равен моменту отправки (см. MARK_STALE_SQL).
+    """
     rows = _fetch(
         """
         SELECT COALESCE(SUM(risk_rub), 0) AS spent
         FROM edu_agent_actions
-        WHERE status = 'applied'
+        WHERE status IN (__LIVE_STATUSES__)
           AND rolled_back_at IS NULL
           AND applied_at >= %s
-        """,
+        """.replace("__LIVE_STATUSES__", _sql_literals(LIVE_STATUSES)),
         (week_start,),
     )
     return float(rows[0]["spent"]) if rows else 0.0

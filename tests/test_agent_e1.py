@@ -248,7 +248,7 @@ def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeyp
     monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa", lambda *_: {})
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
-    monkeypatch.setattr(agent_e1.writer_db, "stale_planned", lambda *a, **k: [])
+    monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: [])
     monkeypatch.setattr(agent_e1, "WriteClient", _FakeWriteClient)
 
     exit_code = agent_e1.main()
@@ -315,7 +315,7 @@ def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatc
     monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
     monkeypatch.setattr(agent_e1.writer_db, "insert_action", lambda action: 1)
     monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: None)
-    monkeypatch.setattr(agent_e1.writer_db, "stale_planned", lambda *a, **k: [])
+    monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: [])
     monkeypatch.setattr(agent_e1, "WriteClient", _RecordingWriteClient)
 
     assert agent_e1.main() == 0
@@ -410,7 +410,9 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
                         lambda *_: dict(baseline_cpa or {c: 1000.0 for c in daily_cost}))
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
-    monkeypatch.setattr(agent_e1.writer_db, "stale_planned", lambda *a, **k: list(stale))
+    # Прогон не читает зависшие строки, а ПОМЕЧАЕТ их: mark_stale_planned
+    # возвращает только впервые обнаруженные (writer/db.py::MARK_STALE_SQL).
+    monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: list(stale))
     monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
     rows = journal if journal is not None else []
     monkeypatch.setattr(agent_e1.writer_db, "insert_action",
@@ -640,10 +642,59 @@ def test_stuck_rows_are_asked_per_cabinet(monkeypatch, capsys):
         campaigns_by_login={"acc-1": [111], "acc-2": [222]},
         daily_cost={"111": 10.0, "222": 10.0},
     )
-    monkeypatch.setattr(agent_e1.writer_db, "stale_planned",
+    monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned",
                         lambda minutes, account=None: calls.append((minutes, account)) or [])
 
     assert agent_e1.main() == 0
 
     assert calls == [(agent_e1.STALE_PLANNED_MINUTES, "acc-1"),
                      (agent_e1.STALE_PLANNED_MINUTES, "acc-2")]
+
+
+def test_stuck_rows_are_marked_not_only_printed(monkeypatch, capsys):
+    # Дефект: зависшая строка печаталась в отчёте КАЖДОГО прогона вечно, и
+    # больше с ней не происходило ничего — её не видел ни сторож применённых
+    # действий, ни откат, риск по ней не был списан. Прогон обязан ПОМЕТИТЬ
+    # находку (перевести в статус 'stale'), а не ограничиться чтением.
+    stuck = [{"action_id": "abc123", "idempotency_key": "k-stuck",
+              "account": "acc-1", "object_level": "campaign", "object_id": "111",
+              "action_kind": "bidmodifier.add", "created_at": "2026-08-18T10:00:00+00:00"}]
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+    )
+    marked, read_only = [], []
+    monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned",
+                        lambda minutes, account=None: marked.append(account) or list(stuck))
+    monkeypatch.setattr(agent_e1.writer_db, "stale_planned",
+                        lambda *a, **k: read_only.append(1) or [])
+
+    assert agent_e1.main() == 0
+
+    assert marked == ["acc-1"]
+    # Чтения без пометки достаточно не было: находка бесконечно повторялась бы.
+    assert read_only == []
+    report = _reports(capsys)[0]
+    assert report["stale_planned"]["count"] == 1
+    assert report["stale_planned"]["marked_status"] == "stale"
+
+
+def test_second_run_does_not_repeat_the_same_stuck_row(monkeypatch, capsys):
+    # Второй прогон: строка уже помечена, mark_stale_planned её не возвращает —
+    # отчёт про неё молчит. Сама находка не потеряна: она видна через
+    # open_actions (живой тест — tests/test_agent_writer_db.py).
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+        stale=(),
+    )
+
+    assert agent_e1.main() == 0
+
+    report = _reports(capsys)[0]
+    assert report["stale_planned"]["count"] == 0
+    assert report["stale_planned"]["sample"] == []

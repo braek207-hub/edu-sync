@@ -7,8 +7,12 @@ sync/agent/writer/apply.py — применение действий.
 видно; если бы порядок был обратным, изменение в кабинете оказалось бы без следа
 и без возможности отката.
 
-Идемпотентность: действие с уже применённым ключом пропускается. Повторный
-прогон в тот же день не отправляет запрос второй раз.
+Идемпотентность: действие с ключом в закрытом статусе (db.FINAL_STATUSES —
+applied / rolled_back / stale) пропускается. Повторный прогон в тот же день не
+отправляет запрос второй раз. Набор статусов берётся из того же кортежа, что
+стоит в условии ON CONFLICT журнала: «кого не переписываем» и «кого не
+отправляем второй раз» обязаны быть одним списком, иначе повторная планировка
+затрёт previous_state строки, отправку которой пропускает apply_actions.
 
 Транспорт (client.py) намеренно НЕ поднимает исключение на ошибку уровня
 ЭЛЕМЕНТА (result.AddResults[]/SetResults[].Errors, например код 8800
@@ -21,6 +25,7 @@ result для разбора здесь. Без разбора такая оши
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from sync.agent.writer.db import FINAL_STATUSES
 from sync.agent.writer.units import delta_to_api
 
 # key корректировки → форма API. Проверено probe (задача 1).
@@ -134,7 +139,7 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module) -> Dict[str,
 
     for action in actions:
         existing = db_module.find_action_by_key(action["idempotency_key"])
-        if existing and existing.get("status") in {"applied", "rolled_back"}:
+        if existing and existing.get("status") in set(FINAL_STATUSES):
             skipped += 1
             details.append({"key": action["idempotency_key"], "result": "skipped"})
             continue

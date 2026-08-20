@@ -87,7 +87,13 @@ NO_COMPUTED_REASON = (
 
 # Сколько минут строка может простоять в статусе planned, прежде чем считаться
 # зависшей. Прогон живёт минуты; всё, что старше, — след обрыва прошлого прогона
-# ПОСЛЕ отправки запроса (см. writer/db.py::STALE_PLANNED_SQL).
+# ПОСЛЕ отправки запроса (см. writer/db.py::MARK_STALE_SQL).
+#
+# Прогон не просто печатает такую строку, а переводит её в статус 'stale'
+# (writer_db.mark_stale_planned): отчёт показывает только ПЕРВОЕ обнаружение,
+# дальше строка живёт как непроверенное изменение — видна сторожу отката
+# (open_actions), оплачена риск-бюджетом (spent_risk) и защищена от повторной
+# отправки. Печать без последствий оставляла её вечным шумом в каждом отчёте.
 STALE_PLANNED_MINUTES = 60
 
 # Сколько действий показать поимённо в отчёте. Остальное — агрегатом по видам
@@ -114,12 +120,24 @@ COMPOSITE_TYPE = "COMPOSITE_ADJUSTMENT"
 
 
 def _clients() -> List[Dict[str, Any]]:
+    """Кабинеты прогона. Форма — та же, что у расчёта (agent_e0._direct_clients).
+
+    Логин нормализуется ТОЙ ЖЕ функцией, что на записи настроек: он едет и в
+    заголовок Client-Login запроса, и в load_latest_computed_settings как
+    ключ object_id. Прежде условие проверяло обрезанное значение, а в список
+    клало сырое — пробел по краям логина в переменной окружения разводил
+    запись и чтение по разным ключам, и прогон молча рапортовал, что
+    применять нечего.
+    """
     raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
     out: List[Dict[str, Any]] = []
     if raw:
         for item in json.loads(raw):
-            if isinstance(item, dict) and str(item.get("login", "")).strip():
-                out.append({"login": item["login"]})
+            if not isinstance(item, dict):
+                continue
+            login = agent_db.normalize_login(item.get("login"))
+            if login:
+                out.append({"login": login})
     return out
 
 
@@ -271,10 +289,19 @@ def actions_preview(
 
 
 def _stale_report(rows: List[Dict[str, Any]], limit: int = PREVIEW_SAMPLE_LIMIT) -> Dict[str, Any]:
-    """Зависшие planned-строки для отчёта: сколько, какие, с какого времени."""
+    """Зависшие строки для отчёта: сколько, какие, с какого времени.
+
+    Здесь только ВПЕРВЫЕ обнаруженные — те, что этот прогон перевёл в статус
+    'stale'. Уже помеченные не возвращаются mark_stale_planned и в отчёте не
+    повторяются: отчёт читается глазами перед решением включать боевую
+    запись, и вечная неизменная строка в нём быстро перестаёт читаться.
+    """
     return {
         "count": len(rows),
         "older_than_minutes": STALE_PLANNED_MINUTES,
+        # Статус, в который прогон перевёл эти строки, — чтобы из отчёта было
+        # видно, что с находкой что-то произошло, а не только напечаталось.
+        "marked_status": "stale",
         "sample": [
             {"action_id": r.get("action_id"), "object_id": r.get("object_id"),
              "action_kind": r.get("action_kind"), "created_at": str(r.get("created_at"))}
@@ -399,7 +426,7 @@ def main() -> int:
                 "computed_settings": len(computed),
                 "unsupported": unsupported,
                 "stale_planned": _stale_report(
-                    writer_db.stale_planned(STALE_PLANNED_MINUTES, account=login)),
+                    writer_db.mark_stale_planned(STALE_PLANNED_MINUTES, account=login)),
             }, ensure_ascii=False, indent=2))
             continue
 
@@ -453,7 +480,7 @@ def main() -> int:
         prepared, deferred = fit_into_budget(with_red_line, risks, remaining, charged_objects)
         remaining_cap -= len(prepared)
 
-        stale = writer_db.stale_planned(STALE_PLANNED_MINUTES, account=login)
+        stale = writer_db.mark_stale_planned(STALE_PLANNED_MINUTES, account=login)
         report = apply_actions(client, prepared, writer_db)
 
         print(json.dumps({

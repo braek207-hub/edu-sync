@@ -109,3 +109,50 @@ def test_load_latest_computed_settings_filters_by_account(monkeypatch):
     # другого — выборка по MAX по всей таблице просто не находила бы строк.
     assert captured["sql"].count("object_id = %s") == 2
     assert captured["params"] == ("account", "acc-1", "account", "acc-1")
+
+
+# ---------------------------------- логин кабинета: одна нормализация на оба конца
+# Дефект: расчёт (agent_e0) обрезал пробелы у логина, движок записи (agent_e1)
+# проверял обрезанное значение, а в список кабинетов клал сырое. Логин — это
+# ключ object_id таблицы вычисленных настроек: пробел по краям любого логина в
+# DIRECT_CLIENTS_JSON разводил запись и чтение по разным ключам, и прогон молча
+# рапортовал, что применять нечего.
+
+
+def test_calculation_and_writer_derive_the_same_login_from_env(monkeypatch):
+    import json
+
+    import sync.agent_e0 as agent_e0
+    import sync.agent_e1 as agent_e1
+
+    monkeypatch.setenv("DIRECT_CLIENTS_JSON", json.dumps(
+        [{"login": " acc-1 ", "goal_ids": ["1"]}, {"login": "acc-2\t", "goal_ids": []}]))
+
+    calc = [c["login"] for c in agent_e0._direct_clients()]
+    writer = [c["login"] for c in agent_e1._clients()]
+
+    assert calc == writer == ["acc-1", "acc-2"]
+
+
+def test_computed_settings_written_under_normalized_key(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(agent_db, "_batch",
+                        lambda sql, payload: captured.update(payload=payload) or len(payload))
+
+    agent_db.upsert_computed_settings(
+        [{"setting_kind": "bid_modifier:device", "setting_key": "MOBILE",
+          "value": 30.0, "support_n": 100, "raw_value": 1.3}],
+        calc_date="2026-08-19", object_id=" acc-1 ",
+    )
+
+    assert captured["payload"][0]["object_id"] == "acc-1"
+
+
+def test_computed_settings_read_under_normalized_key(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(agent_db, "_fetch_dicts",
+                        lambda sql, params: captured.update(params=params) or [])
+
+    agent_db.load_latest_computed_settings(" acc-1 ")
+
+    assert captured["params"] == ("account", "acc-1", "account", "acc-1")

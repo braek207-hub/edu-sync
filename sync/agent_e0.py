@@ -64,21 +64,25 @@ def _direct_clients() -> List[Dict[str, Any]]:
 
     Цели нужны не для красоты: без Goals в запросе Reports API не отдаёт колонку
     Conversions и отвергает FieldNames с ошибкой 8000.
+
+    Логин нормализуется общей функцией agent_db.normalize_login — той же, что
+    у движка записи и у самой таблицы: он становится ключом object_id, и
+    расхождение нормализаций разводит запись и чтение по разным ключам.
     """
     raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
     out: List[Dict[str, Any]] = []
     if raw:
         for item in json.loads(raw):
             if isinstance(item, dict):
-                login = str(item.get("login", "")).strip()
+                login = agent_db.normalize_login(item.get("login"))
                 goals = item.get("goal_ids") or item.get("goals") or []
             else:
-                login, goals = str(item).strip(), []
+                login, goals = agent_db.normalize_login(item), []
             if login:
                 out.append({"login": login, "goal_ids": [str(g) for g in goals]})
         if out:
             return out
-    login = (os.environ.get("DIRECT_CLIENT_LOGIN") or "").strip()
+    login = agent_db.normalize_login(os.environ.get("DIRECT_CLIENT_LOGIN"))
     return [{"login": login, "goal_ids": []}] if login else []
 
 
