@@ -12,6 +12,15 @@ on:
         required: false
         type: boolean
         default: false
+      max_campaigns:
+        # Ограничитель существовал в коде (--max-campaigns), но не был проброшен
+        # сюда — а прогон запускается только отсюда. То есть первую боевую
+        # запись нечем было ограничить: настройки уровня кабинета
+        # раскатываются на все кампании сразу.
+        description: "Не больше N кампаний за прогон (первая боевая запись — 1)"
+        required: false
+        type: string
+        default: ""
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -43,4 +52,14 @@ jobs:
           ARGS=""
           if [ "${{ github.event.inputs.prod }}" = "true" ]; then ARGS="$ARGS --prod"; fi
           if [ "${{ github.event.inputs.apply }}" = "true" ]; then ARGS="$ARGS --apply"; fi
+          LIMIT="${{ github.event.inputs.max_campaigns }}"
+          if [ -n "$LIMIT" ]; then
+            # Только целое: непустая нечисловая строка иначе молча уехала бы в
+            # аргумент и уронила прогон разбором — но уже после старта.
+            case "$LIMIT" in
+              ''|*[!0-9]*) echo "max_campaigns должно быть целым числом, получено: $LIMIT"; exit 1;;
+            esac
+            ARGS="$ARGS --max-campaigns=$LIMIT"
+          fi
+          echo "Аргументы прогона:$ARGS"
           python -m sync.agent_e1 $ARGS
