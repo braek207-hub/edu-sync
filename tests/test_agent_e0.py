@@ -18,6 +18,8 @@ tests/test_agent_e0.py — тесты расчётной стороны Э0.
 """
 
 import sync.agent_e0 as agent_e0
+from sync.agent.guard import check_freshness as real_check_freshness
+from sync.agent.guard import verdict as real_verdict
 from sync.agent.computed import DEGENERATE_REASON, NO_CONVERSIONS_REASON
 
 
@@ -336,3 +338,67 @@ def test_main_sends_account_goals_into_the_report_request(monkeypatch, capsys):
     assert seen_goals, "отчёты не запрашивались вовсе"
     # Ни одного запроса без целей: без них Reports API не отдаёт Conversions.
     assert all(g == ["555", "666"] for g in seen_goals), seen_goals
+
+
+# --------------- пороги свежести: у источников разная норма отставания
+
+def _fresh_direct(monkeypatch, today):
+    """Свежий расход Директа: у него свой порог, и он не должен мешать
+    проверять поведение гейта по CRM."""
+    monkeypatch.setattr(agent_e0.agent_db, "load_direct_rows",
+                        lambda *a, **k: [{"date": today.isoformat(), "campaign_id": "111",
+                                          "cost": 100.0, "clicks": 10, "impressions": 100}])
+
+
+def test_normal_crm_lag_does_not_kill_the_run(monkeypatch, capsys):
+    """Отставание CRM на четыре дня — норма, а не повод не считать.
+
+    Общий порог в 72 часа ронял ВЕСЬ расчёт на штатном лаге (боевой прогон
+    32450489955: crm_lead_details 77 часов при лимите 72 → verdict RED, выход 1).
+    Защита, срабатывающая на норме, просто останавливает работу — тот же класс
+    дефекта, что вечный RED у гейта витрины сторожа.
+    """
+    import json as _json
+    from datetime import date as _date, timedelta as _td
+
+    _patch_e0_run(monkeypatch)
+    today = _date.today()
+    _fresh_direct(monkeypatch, today)
+    monkeypatch.setattr(agent_e0.agent_db, "load_lead_rows",
+                        lambda *a, **k: [{"lead_id": "l1", "campaign_id": "111",
+                                          "created_date": (today - _td(days=4)).isoformat()}])
+    monkeypatch.setattr(agent_e0, "check_freshness", real_check_freshness)
+    monkeypatch.setattr(agent_e0, "verdict", real_verdict)
+
+    assert agent_e0.main() == 0
+
+    report = _json.loads(capsys.readouterr().out)
+    assert report["verdict"] == "GREEN"
+    assert report["crm_lag_days"] == 4
+
+
+def test_dead_crm_still_stops_the_run(monkeypatch, capsys):
+    # Неделя тишины — уже поломка: 02.08.2026 таблица встала на четверо суток,
+    # и никто не замечал четыре дня. Порог обязан остаться, просто выше нормы.
+    import json as _json
+    from datetime import date as _date, timedelta as _td
+
+    _patch_e0_run(monkeypatch)
+    today = _date.today()
+    _fresh_direct(monkeypatch, today)
+    monkeypatch.setattr(agent_e0.agent_db, "load_lead_rows",
+                        lambda *a, **k: [{"lead_id": "l1", "campaign_id": "111",
+                                          "created_date": (today - _td(days=9)).isoformat()}])
+    monkeypatch.setattr(agent_e0, "check_freshness", real_check_freshness)
+    monkeypatch.setattr(agent_e0, "verdict", real_verdict)
+
+    assert agent_e0.main() == 1
+    assert _json.loads(capsys.readouterr().out)["verdict"] == "RED"
+
+
+def test_direct_keeps_the_strict_threshold(monkeypatch, capsys):
+    # Расход Директа приезжает своим синком и почти не отстаёт: послабление
+    # для CRM не должно распространяться на него, иначе вставший синк расхода
+    # пройдёт незамеченным целую неделю.
+    assert agent_e0.DIRECT_MAX_AGE_HOURS == 72
+    assert agent_e0.CRM_MAX_AGE_HOURS > agent_e0.DIRECT_MAX_AGE_HOURS

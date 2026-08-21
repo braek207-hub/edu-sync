@@ -48,8 +48,23 @@ SLICE_WINDOW_DAYS = 90
 # Кандидаты в минус-слова считаются по свежим данным, глубокая история не нужна.
 QUERY_WINDOW_DAYS = 30
 PROFILE_FEATURES = ["groups_count", "phrases_per_group", "title2_fill_share"]
-# Окно истории, а не оперативный контур: дневной лаг синков допустим.
-HISTORY_MAX_AGE_HOURS = 72
+# Пороги свежести РАЗНЫЕ, потому что источники разной природы.
+#
+# Расход Директа приезжает своим синком и почти не отстаёт: трое суток без
+# новых строк — это уже поломка синка, а не задержка.
+DIRECT_MAX_AGE_HOURS = 72
+# CRM отстаёт ШТАТНО на 2-4 дня: выгрузка из Битрикса в Google-таблицу идёт
+# не каждый день (слова владельца кабинета + замер 21.08.2026). Общий порог в
+# 72 часа ронял ВЕСЬ расчёт Э0 на этой норме — то есть защита срабатывала на
+# штатной ситуации и просто останавливала работу. Это тот же класс дефекта,
+# что вечный RED у гейта витрины сторожа.
+#
+# Шесть суток — запас поверх наблюдаемого лага, но заметно меньше настоящей
+# поломки: 02.08.2026 таблица встала на четверо суток и никто не заметил
+# четыре дня (см. sync/data_freshness.py). За неделю тишины падать обязаны.
+CRM_MAX_AGE_HOURS = 144
+# Оставлено для совместимости чтения старых записей гейта в edu_agent_guard.
+HISTORY_MAX_AGE_HOURS = DIRECT_MAX_AGE_HOURS
 # Директ ограничивает число одновременно формируемых отчётов на кабинет.
 REPORT_WORKERS = 4
 
@@ -154,13 +169,18 @@ def main() -> int:
     now_iso = datetime.now(timezone.utc).isoformat()
     latest_direct = max((str(r["date"]) for r in direct_rows), default=None)
     latest_lead = max((str(r["created_date"]) for r in lead_rows), default=None)
+    # Два вызова с разными порогами: у источников разная норма отставания, и
+    # мерить их одной меркой значит либо ронять расчёт на штатном лаге CRM,
+    # либо проспать вставший синк Директа.
     checks: List[Dict[str, Any]] = check_freshness(
-        {
-            "direct_stats": f"{latest_direct}T00:00:00+00:00" if latest_direct else None,
-            "crm_lead_details": f"{latest_lead}T00:00:00+00:00" if latest_lead else None,
-        },
+        {"direct_stats": f"{latest_direct}T00:00:00+00:00" if latest_direct else None},
         now_iso=now_iso,
-        max_age_hours=HISTORY_MAX_AGE_HOURS,
+        max_age_hours=DIRECT_MAX_AGE_HOURS,
+    )
+    checks += check_freshness(
+        {"crm_lead_details": f"{latest_lead}T00:00:00+00:00" if latest_lead else None},
+        now_iso=now_iso,
+        max_age_hours=CRM_MAX_AGE_HOURS,
     )
     checks.append(check_continuity(
         sorted({str(r["date"]) for r in direct_rows}),
@@ -377,8 +397,15 @@ def main() -> int:
     sizes = agent_db.table_sizes()
     total_mb = round(sum(int(s["size_bytes"] or 0) for s in sizes) / 1024 / 1024, 1)
 
+    # Граница зрелости CRM и величина отставания — в отчёт каждого прогона.
+    # Без них «лидов за последние дни нет» читается как обвал конверсии, а не
+    # как «выгрузка ещё не приехала», и разбор уходит не туда.
+    crm_lag = (date.today() - date.fromisoformat(latest_lead)).days if latest_lead else None
+
     print(json.dumps({
         "verdict": "GREEN",
+        "crm_through": latest_lead,
+        "crm_lag_days": crm_lag,
         "facts_rows": len(facts),
         "sliced_rows": len(sliced_rows),
         "objects": len(object_rows),
