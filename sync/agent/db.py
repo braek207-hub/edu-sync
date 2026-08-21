@@ -13,7 +13,8 @@ DDL идемпотентен: ensure_agent_tables() безопасно вызы�
 """
 
 import json
-from typing import Any, Dict, List
+from datetime import date
+from typing import Any, Dict, List, Optional
 
 import psycopg2.extras
 
@@ -412,6 +413,35 @@ def load_daily_facts(
         """,
         (ids, date_from, date_to),
     )
+
+
+def crm_maturity_date() -> Optional[date]:
+    """Последний день, за который лиды в CRM РЕАЛЬНО есть. Граница зрелости.
+
+    CRM EDU штатно отстаёт на 2-4 дня, и отставание плавает. Ключевое свойство,
+    измеренное 21.08.2026 (сравнение снимка edu_agent_facts с текущей CRM по
+    одним и тем же дням): дни приходят ЦЕЛИКОМ и не дозаполняются — все 45 дней
+    совпали точно, leads_added = 0 везде. То есть дня либо нет вовсе, либо он
+    полон.
+
+    Отсюда защита. Расход Директа приезжает вовремя, лиды — нет, и в витрине
+    появляется день с почти миллионом расхода и нулём лидов (19.08.2026:
+    927 945 рублей, 0 лидов). CPA такого дня бесконечен: попади он в окно
+    наблюдения — красная линия пробита, и сторож откатит ЗДОРОВОЕ изменение.
+
+    Раньше от этого защищал фиксированный отступ (LEADS_LAG_DAYS = 2, «заведомый
+    запас»). Он переживает лаг в два-три дня и ломается на четырёх — то есть
+    именно тогда, когда защита нужна. Константу заменяет факт: граница окна
+    берётся из данных и двигается вместе с ними.
+
+    None — лидов нет вовсе. Это не «граница сегодня», а «наблюдать не по чему»:
+    подставлять здесь сегодняшний день значило бы разрешить вердикт по пустоте.
+    """
+    rows = _fetch_dicts("SELECT MAX(created_date) AS d FROM crm_lead_details")
+    raw = rows[0]["d"] if rows else None
+    if raw is None:
+        return None
+    return raw if isinstance(raw, date) else date.fromisoformat(str(raw))
 
 
 def load_mart_day_breadth(date_from: str, date_to: str) -> Dict[str, Any]:

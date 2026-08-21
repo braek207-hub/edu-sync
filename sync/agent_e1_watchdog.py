@@ -214,7 +214,7 @@ def _as_date(value: Any) -> Optional[date]:
 
 
 def observation_window(
-    action: Dict[str, Any], today: date
+    action: Dict[str, Any], today: date, crm_through: Optional[date]
 ) -> Optional[Tuple[date, date, bool]]:
     """Окно наблюдения действия: (первый день, последний день, закрыто ли).
 
@@ -235,9 +235,18 @@ def observation_window(
     applied = _as_date(action.get("applied_at")) or _as_date(action.get("created_at"))
     if applied is None:
         return None
+    if crm_through is None:
+        # Лидов нет вовсе — наблюдать не по чему. Подставить сюда сегодня
+        # значило бы вынести вердикт по пустоте: расход есть, лидов ноль,
+        # CPA бесконечен, красная линия пробита на ровном месте.
+        return None
     start = applied + timedelta(days=OBSERVATION_LAG_DAYS)
     horizon_end = start + timedelta(days=OBSERVATION_HORIZON_DAYS - 1)
-    end = min(horizon_end, today - timedelta(days=OBSERVATION_TAIL_DAYS))
+    # Три ограничителя, и каждый отвечает за своё: горизонт — чтобы не судить
+    # об изменении по кварталу дрейфа; вчера — сегодняшний день неполон по
+    # расходу; граница зрелости CRM — дальше неё лежат дни с расходом и нулём
+    # лидов, и это не провал кампании, а отставание источника.
+    end = min(horizon_end, today - timedelta(days=1), crm_through)
     if start > end:
         return None
     return start, end, end >= horizon_end
@@ -388,7 +397,8 @@ def _unverified(state: str, closed: bool) -> str:
 
 
 def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, Any]]],
-          today: date, mart: Dict[str, Any]) -> Dict[str, Any]:
+          today: date, mart: Dict[str, Any],
+          crm_through: Optional[date]) -> Dict[str, Any]:
     """Вердикт по одному действию: состояние наблюдения и наблюдаемые метрики.
 
     Два источника данных, и они РАЗНЫЕ намеренно: наблюдаемые метрики берутся
@@ -400,7 +410,7 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
     if not red_line:
         return {"state": STATE_NO_RED_LINE, "reason": NO_RED_LINE_REASON}
 
-    window = observation_window(action, today)
+    window = observation_window(action, today, crm_through)
     if window is None:
         return {"state": STATE_WAITING, "reason": "окно наблюдения ещё не открылось"}
 
@@ -754,9 +764,15 @@ def rollback_one(client, action: Dict[str, Any], db_module,
 
 def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
           facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
-          data_gate: Optional[Dict[str, Any]], lease: Any = None,
-          mart: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+          data_gate: Optional[Dict[str, Any]], crm_through: Optional[date],
+          lease: Any = None, mart: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Наблюдение и откат по всем открытым действиям одного кабинета.
+
+    crm_through — граница зрелости CRM (agent_db.crm_maturity_date). Как и
+    data_gate, параметр обязателен и без умолчания: забытая граница означает
+    наблюдение по дням, где расход уже есть, а лидов ещё нет, — то есть откат
+    здорового изменения по бесконечному CPA. Такая ошибка обязана быть видна
+    как ошибка вызова.
 
     data_gate — вердикт гейта витрины фактов (facts_gate). Красный гейт
     наблюдение не отменяет: состояния считаются и печатаются, пробои видны,
@@ -784,7 +800,7 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
         # ошибкой видна в отчёте и разбирается руками — но не молча, и не
         # ценой всех остальных.
         try:
-            verdict = judge(action, facts_by_campaign, today, mart or {})
+            verdict = judge(action, facts_by_campaign, today, mart or {}, crm_through)
         except Exception as exc:
             errors.append({"action_id": action.get("action_id"),
                            "object_id": action.get("object_id"),
@@ -927,20 +943,22 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
     }
 
 
-def facts_window(actions: List[Dict[str, Any]], today: date) -> Optional[Tuple[date, date]]:
+def facts_window(actions: List[Dict[str, Any]], today: date,
+                 crm_through: Optional[date]) -> Optional[Tuple[date, date]]:
     """Общий отрезок дат, покрывающий окна наблюдения всех действий.
 
     Один запрос к фактам на прогон вместо запроса на действие; окно каждого
     действия вырезается из этих строк по его собственным границам.
     """
-    windows = [observation_window(a, today) for a in actions]
+    windows = [observation_window(a, today, crm_through) for a in actions]
     windows = [w for w in windows if w]
     if not windows:
         return None
     return min(w[0] for w in windows), max(w[1] for w in windows)
 
 
-def load_facts(actions: List[Dict[str, Any]], today: date) -> Dict[str, List[Dict[str, Any]]]:
+def load_facts(actions: List[Dict[str, Any]], today: date,
+               crm_through: Optional[date]) -> Dict[str, List[Dict[str, Any]]]:
     """Факты по наблюдаемым кампаниям — до СЕГОДНЯ, а не до конца окон.
 
     Верхняя граница запроса шире верхней границы наблюдения намеренно: по
@@ -950,7 +968,7 @@ def load_facts(actions: List[Dict[str, Any]], today: date) -> Dict[str, List[Dic
     спросили только про старые дни» выглядели бы одинаково. На вердикты
     лишние дни не влияют: observed_metrics режет строки по своему окну.
     """
-    span = facts_window(actions, today)
+    span = facts_window(actions, today, crm_through)
     if span is None:
         return {}
     rows = agent_db.load_daily_facts(
@@ -961,7 +979,8 @@ def load_facts(actions: List[Dict[str, Any]], today: date) -> Dict[str, List[Dic
     return out
 
 
-def load_mart_breadth(actions: List[Dict[str, Any]], today: date) -> Dict[str, Any]:
+def load_mart_breadth(actions: List[Dict[str, Any]], today: date,
+                      crm_through: Optional[date]) -> Dict[str, Any]:
     """Ширина витрины по дням — отдельным дешёвым запросом по ВСЕЙ витрине.
 
     Верхняя граница та же, что у load_facts, и по той же причине: свежесть
@@ -973,7 +992,7 @@ def load_mart_breadth(actions: List[Dict[str, Any]], today: date) -> Dict[str, A
     ширина гейта описывают состояние витрины, а не открутку наблюдаемых
     кампаний.
     """
-    span = facts_window(actions, today)
+    span = facts_window(actions, today, crm_through)
     if span is None:
         return {"days": {}, "campaigns_total": 0}
     return agent_db.load_mart_day_breadth(span[0].isoformat(), today.isoformat())
@@ -1033,10 +1052,14 @@ def main() -> int:
 def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None) -> int:
     actions = writer_db.open_actions()
     holdout_ids = {str(h) for h in agent_db.load_holdout_ids()}
-    facts_by_campaign = load_facts(actions, today)
+    # Граница зрелости CRM — один запрос на прогон. Дальше неё лежат дни, где
+    # расход Директа уже приехал, а лиды ещё нет: 19.08.2026 — 927 945 рублей
+    # и НОЛЬ лидов. Судить по таким дням значит откатывать здоровое.
+    crm_through = agent_db.crm_maturity_date()
+    facts_by_campaign = load_facts(actions, today, crm_through)
     # Полнота данных — по витрине, наблюдаемые метрики — по кампаниям
     # действий. Два разных запроса намеренно: см. mart_filled_days.
-    mart = load_mart_breadth(actions, today)
+    mart = load_mart_breadth(actions, today, crm_through)
     gate = facts_gate(mart, today)
 
     by_account: Dict[str, List[Dict[str, Any]]] = {}
@@ -1047,7 +1070,7 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None) -> in
     for login, account_actions in sorted(by_account.items()):
         client = WriteClient(login, sandbox=sandbox, dry_run=dry_run)
         report = watch(client, account_actions, writer_db, holdout_ids,
-                       facts_by_campaign, today, gate, lease, mart)
+                       facts_by_campaign, today, gate, crm_through, lease, mart)
         accounts.append({"account": login, **report, "units_left": client.units_left})
 
     print(json.dumps({
@@ -1055,6 +1078,8 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None) -> in
         "dry_run": dry_run,
         "today": today.isoformat(),
         "data_gate": gate,
+        "crm_through": crm_through.isoformat() if crm_through else None,
+        "crm_lag_days": (today - crm_through).days if crm_through else None,
         "observation": {
             "lag_days": OBSERVATION_LAG_DAYS,
             "horizon_days": OBSERVATION_HORIZON_DAYS,

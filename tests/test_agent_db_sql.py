@@ -199,3 +199,70 @@ def test_live_mart_day_breadth_is_empty_outside_the_mart():
         future.isoformat(), (future + timedelta(days=7)).isoformat())
 
     assert out == {"days": {}, "campaigns_total": 0}
+
+
+# --------------- граница зрелости CRM: важен ИСТОЧНИК, а не только число
+
+def test_maturity_asks_crm_not_the_facts_mart(monkeypatch):
+    """Граница берётся из CRM, а не из витрины фактов.
+
+    Разница не косметическая. В edu_agent_facts лежат дни, собранные по
+    расходу Директа, — включая те, где лидов ещё нет вовсе (19.08.2026:
+    927 945 рублей, 0 лидов). Взяв максимум оттуда, граница накроет ровно те
+    дни, от которых обязана защищать, и защита исчезнет молча — окно снова
+    станет включать бесконечный CPA.
+    """
+    seen = {}
+    monkeypatch.setattr(agent_db, "_fetch_dicts",
+                        lambda sql, params=(): seen.update({"sql": sql}) or [{"d": None}])
+
+    agent_db.crm_maturity_date()
+
+    assert "crm_lead_details" in seen["sql"]
+    assert "created_date" in seen["sql"]
+    assert "edu_agent_facts" not in seen["sql"], (
+        "граница из витрины фактов накроет дни с расходом и нулём лидов")
+
+
+def test_maturity_is_none_when_crm_is_empty(monkeypatch):
+    # Пустая CRM — это «наблюдать не по чему», а не «граница сегодня».
+    monkeypatch.setattr(agent_db, "_fetch_dicts", lambda sql, params=(): [{"d": None}])
+    assert agent_db.crm_maturity_date() is None
+
+    monkeypatch.setattr(agent_db, "_fetch_dicts", lambda sql, params=(): [])
+    assert agent_db.crm_maturity_date() is None
+
+
+def test_maturity_accepts_both_date_and_string(monkeypatch):
+    # Драйвер отдаёт date, но через REST/JSON та же величина приходит строкой.
+    from datetime import date as _date
+
+    monkeypatch.setattr(agent_db, "_fetch_dicts",
+                        lambda sql, params=(): [{"d": _date(2026, 8, 18)}])
+    assert agent_db.crm_maturity_date() == _date(2026, 8, 18)
+
+    monkeypatch.setattr(agent_db, "_fetch_dicts",
+                        lambda sql, params=(): [{"d": "2026-08-18"}])
+    assert agent_db.crm_maturity_date() == _date(2026, 8, 18)
+
+
+@live_db
+def test_live_maturity_is_not_ahead_of_the_facts_mart():
+    """Живая проверка на боевых данных: граница CRM отстаёт от витрины фактов.
+
+    Именно это расхождение и есть лаг: расход за вчера в витрине уже есть, а
+    лидов за него ещё нет. Обгони граница витрину — значит запрос смотрит не
+    туда, и защита не работает.
+    """
+    from datetime import date as _date
+
+    maturity = agent_db.crm_maturity_date()
+    assert maturity is not None, "в CRM нет ни одного лида"
+
+    rows = agent_db._fetch_dicts("SELECT MAX(fact_date) AS d FROM edu_agent_facts")
+    facts_through = rows[0]["d"] if rows else None
+    if facts_through is not None:
+        if not isinstance(facts_through, _date):
+            facts_through = _date.fromisoformat(str(facts_through))
+        assert maturity <= facts_through
+    assert maturity <= _date.today()

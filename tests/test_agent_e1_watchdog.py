@@ -136,20 +136,29 @@ def _mart(facts):
             "campaigns_total": len(campaigns)}
 
 
+# Граница зрелости CRM по умолчанию: столько же, сколько давал прежний
+# фиксированный отступ (сегодня минус три дня). Так проверки, написанные до
+# перехода на границу из данных, продолжают описывать то же самое окно, а
+# новые — задают crm_through явно.
+DEFAULT_CRM_THROUGH = TODAY - timedelta(days=3)
+
+
 def _run(action, facts, client=None, db=None, holdout=(), today=TODAY,
-         gate=GREEN_GATE, mart=None):
+         gate=GREEN_GATE, mart=None, crm_through=None):
     client = client or _FakeClient()
     db = db or _FakeDb()
     report = watchdog.watch(client, [action], db, {str(h) for h in holdout},
-                            facts, today, gate, None,
-                            _mart(facts) if mart is None else mart)
+                            facts, today, gate,
+                            today - timedelta(days=3) if crm_through is None
+                            else crm_through,
+                            None, _mart(facts) if mart is None else mart)
     return report, client, db
 
 
 # --------------------------------------------------------------- окно наблюдения
 
 def test_window_starts_after_application_day_and_reserves_lead_lag():
-    start, end, closed = watchdog.observation_window(_action(), TODAY)
+    start, end, closed = watchdog.observation_window(_action(), TODAY, TODAY - timedelta(days=3))
     assert start == date(2026, 8, 2)   # день применения не наблюдаем
     # Верхняя граница отодвинута от сегодня на неполный день ПЛЮС запас под
     # лаг источника лидов: расход за вчера уже полон, а лиды ещё дозревают, и
@@ -161,19 +170,21 @@ def test_window_starts_after_application_day_and_reserves_lead_lag():
 
 
 def test_window_is_capped_by_horizon():
-    start, end, closed = watchdog.observation_window(_action(), date(2026, 9, 1))
+    start, end, closed = watchdog.observation_window(_action(), date(2026, 9, 1),
+                                                     date(2026, 9, 1) - timedelta(days=3))
     assert start == date(2026, 8, 2)
     assert end == date(2026, 8, 2) + timedelta(days=watchdog.OBSERVATION_HORIZON_DAYS - 1)
     assert closed is True
 
 
 def test_window_is_none_until_first_full_day_passed():
-    assert watchdog.observation_window(_action(), date(2026, 8, 2)) is None
+    assert watchdog.observation_window(_action(), date(2026, 8, 2),
+                                       date(2026, 8, 2) - timedelta(days=3)) is None
 
 
 def test_window_falls_back_to_created_at_for_row_without_applied_at():
     action = _action(applied_at=None, created_at=datetime(2026, 8, 3, 9, 0))
-    start, _, _ = watchdog.observation_window(action, TODAY)
+    start, _, _ = watchdog.observation_window(action, TODAY, TODAY - timedelta(days=3))
     assert start == date(2026, 8, 4)
 
 
@@ -450,7 +461,7 @@ def test_report_counts_actions_under_watch_and_failures():
     client, db = _FakeClient(), _FakeDb()
 
     report = watchdog.watch(client, [_action(), healthy], db, set(), facts, TODAY,
-                            GREEN_GATE, None, _mart(facts))
+                            GREEN_GATE, DEFAULT_CRM_THROUGH, None, _mart(facts))
 
     assert report["under_watch"] == 2
     assert report["states"] == {watchdog.STATE_BREACHED: 1, watchdog.STATE_WATCHED: 1}
@@ -469,7 +480,7 @@ def test_broken_journal_row_does_not_blind_the_watchdog():
     client, db = _FakeClient(), _FakeDb()
 
     report = watchdog.watch(client, [broken, _action()], db, set(), facts, TODAY,
-                            GREEN_GATE, None, _mart(facts))
+                            GREEN_GATE, DEFAULT_CRM_THROUGH, None, _mart(facts))
 
     assert report["errors"] == 1
     assert report["errors_sample"][0]["object_id"] == "333"
@@ -479,12 +490,13 @@ def test_broken_journal_row_does_not_blind_the_watchdog():
 
 def test_facts_window_covers_every_action_window():
     old = _action(action_id="old", applied_at=datetime(2026, 7, 20, 10, 0))
-    span = watchdog.facts_window([old, _action()], TODAY)
+    span = watchdog.facts_window([old, _action()], TODAY, DEFAULT_CRM_THROUGH)
     assert span == (date(2026, 7, 21), date(2026, 8, 7))
 
 
 def test_facts_window_is_none_when_no_action_is_observable_yet():
-    assert watchdog.facts_window([_action()], date(2026, 8, 2)) is None
+    assert watchdog.facts_window([_action()], date(2026, 8, 2),
+                                     date(2026, 8, 2) - timedelta(days=3)) is None
 
 
 # ------------------------------------------- окружение: песочница vs боевой
@@ -633,7 +645,7 @@ def test_load_facts_asks_the_mart_up_to_today(monkeypatch):
         return []
 
     monkeypatch.setattr(watchdog.agent_db, "load_daily_facts", fake_load)
-    watchdog.load_facts([_action()], TODAY)
+    watchdog.load_facts([_action()], TODAY, DEFAULT_CRM_THROUGH)
 
     assert seen["from"] == "2026-08-02"
     assert seen["to"] == TODAY.isoformat()
@@ -657,7 +669,7 @@ def test_mart_breadth_is_asked_for_the_whole_mart_not_for_watched_campaigns(monk
         return {"days": {"2026-08-10": 84}, "campaigns_total": 84}
 
     monkeypatch.setattr(watchdog.agent_db, "load_mart_day_breadth", fake_breadth)
-    out = watchdog.load_mart_breadth([_action()], TODAY)
+    out = watchdog.load_mart_breadth([_action()], TODAY, DEFAULT_CRM_THROUGH)
 
     # Ни идентификаторов кампаний, ни коллекций в аргументах — только даты.
     assert seen["args"] == ("2026-08-02", TODAY.isoformat())
@@ -673,7 +685,7 @@ def test_mart_breadth_is_empty_when_there_is_nothing_to_watch(monkeypatch):
         raise AssertionError("запрос ширины без окна наблюдения")
 
     monkeypatch.setattr(watchdog.agent_db, "load_mart_day_breadth", boom)
-    assert watchdog.load_mart_breadth([], TODAY) == {"days": {}, "campaigns_total": 0}
+    assert watchdog.load_mart_breadth([], TODAY, TODAY - timedelta(days=3)) == {"days": {}, "campaigns_total": 0}
 
 
 # ------------------------------------- состояния без вердикта: ручной разбор
@@ -933,6 +945,10 @@ def _patch_watchdog_main(monkeypatch, lock):
     monkeypatch.setattr(watchdog.writer_db, "open_actions", lambda: [])
     monkeypatch.setattr(watchdog.writer_db, "failed_rollbacks_count", lambda: 0)
     monkeypatch.setattr(watchdog.agent_db, "load_holdout_ids", lambda: [])
+    # Граница зрелости CRM — запрос к БД на каждом прогоне: без подмены тест
+    # аренды падал бы на отсутствии DATABASE_URL, а не на своём утверждении.
+    monkeypatch.setattr(watchdog.agent_db, "crm_maturity_date",
+                        lambda: DEFAULT_CRM_THROUGH)
 
 
 def test_watchdog_takes_the_run_lease_under_its_own_name(monkeypatch, capsys):
@@ -1061,7 +1077,7 @@ def test_lost_lease_stops_the_watchdog_before_it_writes():
 
     with pytest.raises(writer_db.RunLeaseLost):
         watchdog.watch(client, [_action()], db, set(), facts, TODAY, GREEN_GATE,
-                       _LostLease(), _mart(facts))
+                       DEFAULT_CRM_THROUGH, _LostLease(), _mart(facts))
 
     assert client.calls == [], "после потери аренды откат в кабинет не уходит"
 
@@ -1105,7 +1121,8 @@ def test_old_confirmation_rule_would_have_rolled_this_campaign_back():
     # по существу, здесь было бы видно.
     rows = _healthy_with_one_expensive_day()["111"]
     red_line = _action()["red_line"]
-    window = watchdog.observation_window(_action(), date(2026, 8, 11))
+    window = watchdog.observation_window(_action(), date(2026, 8, 11),
+                                         date(2026, 8, 11) - timedelta(days=3))
     start, end, closed = window
 
     full = watchdog.observed_metrics(rows, window)
@@ -1122,7 +1139,8 @@ def test_expensive_day_is_visible_in_the_report():
     # Отчёт обязан показывать, ЧТО именно не подтвердилось: иначе «сторож
     # молчит» неотличимо от «всё хорошо».
     facts = _healthy_with_one_expensive_day()
-    verdict = watchdog.judge(_action(), facts, date(2026, 8, 11), _mart(facts))
+    verdict = watchdog.judge(_action(), facts, date(2026, 8, 11), _mart(facts),
+                             date(2026, 8, 11) - timedelta(days=3))
 
     assert verdict["without_peak_day"]["date"] == "2026-08-07"
     assert verdict["without_peak_day"]["cost"] == 6000.0
@@ -1362,3 +1380,91 @@ def test_gate_stays_green_when_a_single_campaign_stops_delivering():
              "333": _facts("333", date(2026, 7, 20), 3, cost=100.0, leads=1)}
 
     assert watchdog.facts_gate(_mart(facts), TODAY)["status"] == "GREEN"
+
+
+# =========================================================================
+# Лаг CRM: граница окна берётся из данных, а не из константы
+# =========================================================================
+#
+# Замер 21.08.2026: CRM EDU отстаёт на 2-4 дня, и дни приходят ЦЕЛИКОМ —
+# дозревания нет (сравнение снимка edu_agent_facts с текущей CRM: leads_added=0
+# на всех 45 днях). Значит опасность не в неполных днях, а в днях, которых в
+# CRM ещё нет вовсе: расход Директа приехал, лидов ноль. 19.08.2026 в витрине
+# лежало 927 945 рублей расхода и НОЛЬ лидов — CPA такого дня бесконечен.
+#
+# Прежняя защита (фиксированный отступ LEADS_LAG_DAYS=2 плюс день применения)
+# переживает лаг в два-три дня и ломается на четырёх — то есть ровно тогда,
+# когда нужна. Константу заменяет факт: граница из данных двигается вместе с
+# ними.
+
+def test_window_stops_at_crm_maturity_not_at_a_fixed_offset():
+    # CRM отстала на четыре дня. Фиксированный отступ в три дня оставил бы в
+    # окне день, где расход есть, а лидов ещё нет.
+    crm_through = TODAY - timedelta(days=4)
+    _, end, _ = watchdog.observation_window(_action(), TODAY, crm_through)
+
+    assert end == crm_through
+    assert end < TODAY - timedelta(days=1 + watchdog.LEADS_LAG_DAYS)
+
+
+def test_window_extends_when_crm_catches_up():
+    # Отставание плавает. Приехала CRM за вчера — окно обязано вырасти само,
+    # иначе агент вечно судит по позавчерашним данным и реагирует медленнее,
+    # чем мог бы.
+    _, end, _ = watchdog.observation_window(_action(), TODAY, TODAY - timedelta(days=1))
+
+    assert end == TODAY - timedelta(days=1)
+
+
+def test_today_is_never_observed_even_if_crm_says_so():
+    # Даже если CRM отдала сегодняшний день, расход за сегодня неполон:
+    # наблюдаемый CPA был бы занижен, а это пропущенный вред, а не ложный.
+    _, end, _ = watchdog.observation_window(_action(), TODAY, TODAY)
+
+    assert end == TODAY - timedelta(days=1)
+
+
+def test_no_crm_data_means_no_observation():
+    # Лидов нет вовсе. Подставить сюда сегодня значило бы вынести вердикт по
+    # пустоте: расход есть, лидов ноль, красная линия пробита на ровном месте.
+    assert watchdog.observation_window(_action(), TODAY, None) is None
+
+
+def test_cost_without_leads_day_never_reaches_the_verdict():
+    """Сквозная проверка: день с расходом и нулём лидов не попадает в вердикт.
+
+    Ровно эта пара чисел лежала в витрине 21.08.2026. Считай мы по ней — CPA
+    улетает, красная линия пробита, здоровое изменение откатывается.
+    """
+    rows = _facts("111", date(2026, 8, 2), 6, cost=100.0, leads=5)
+    # два дня «расход есть, лидов нет» — CRM за них ещё не приехала
+    for offset in (0, 1):
+        rows.append({"campaign_id": "111",
+                     "fact_date": TODAY - timedelta(days=2 - offset),
+                     "cost": 927945.0, "eff_leads": 0})
+    facts = {"111": rows}
+
+    report, client, _ = _run(_action(), facts,
+                             crm_through=TODAY - timedelta(days=3))
+
+    assert report["rolled_back"] == 0, "откат по дням, которых в CRM ещё нет"
+    assert client.calls == []
+
+
+def test_report_shows_how_far_crm_lags(monkeypatch, capsys):
+    # Отставание обязано быть видно глазами: иначе «агент почему-то ничего не
+    # делает» и «CRM встала неделю назад» выглядят одинаково.
+    import json as _json
+
+    # main() берёт сегодняшний день сам (date.today()), поэтому отставание
+    # считается от реальной даты, а не от TODAY фикстур.
+    real_today = date.today()
+    _patch_watchdog_main(monkeypatch, _RecordingLock())
+    monkeypatch.setattr(watchdog.agent_db, "crm_maturity_date",
+                        lambda: real_today - timedelta(days=4))
+
+    watchdog.main()
+
+    report = _json.loads(capsys.readouterr().out)
+    assert report["crm_through"] == (real_today - timedelta(days=4)).isoformat()
+    assert report["crm_lag_days"] == 4
