@@ -1,18 +1,26 @@
 # -*- coding: utf-8 -*-
 """Google Search Console API → lime_gsc_seo (регионы KZ и GCC).
 
-Недельные брендовые показы и клики Google. Спрос = показы, SEO = клики (в KZ и GCC
+Недельные показы и клики Google. Спрос = показы, SEO = клики (в KZ и GCC
 Google доминирует). ОТДЕЛЬНО от Яндекс.Вебмастера (lime_brand_seo, RU): другая выдача,
 другой регион — не суммировать.
 
-Страна берётся из dimension country (гео ПОЛЬЗОВАТЕЛЯ), не из домена: пользователи
-Бахрейна видят в выдаче в основном ae./sa., по своему домену их спрос почти не виден.
-Показы и клики суммируются по всем ресурсам региона — ряд «Спрос» это показы наших
-доменов в выдаче, а не число поисков бренда (см. дизайн-спеку).
+МЕТОДИКА = ручные листы Павла «Брендовые запросы LIMÉ (KZ)/(UAE)» 1-в-1
+(решение Павла 2026-08-20, сверено по живому API бит-в-бит, неделя 33):
+- KZ: limestore.com, страна пользователя Казахстан, БЕЗ фильтра по запросам
+  (все запросы, включая анонимные, которые GSC прячет при группировке по query).
+  Замер нед. 33: 2 101 клик, из них брендовых 1 728 (82%), небрендовых видимых 33.
+- GCC: каждая витрина ЦЕЛИКОМ, без фильтров вовсе — все запросы, все страны
+  пользователей; «страна» строки = страна витрины (ae → ОАЭ), а не гео пользователя.
+  Замер ae нед. 33: 2 028 кликов = бренд-ОАЭ 555 + бренд из других стран 909
+  (Ирак 178, Сауд 79, Россия 68…) + анонимные 451 + небрендовых 113 (6%).
+Прежняя брендовая методика (регекс написаний + гео пользователя) — в git-истории
+до 2026-08-20 и в отчёте panda-bi /reports/lime-brand-method-kz-gcc.
 
-Контракт searchanalytics.query: rows[].{keys:[date, query], clicks, impressions, ctr,
-position} (подтверждён зондом). Фильтр — одна группа (AND): query по регексу написаний
-бренда И country=<ISO alpha-3>.
+Корневой limestore.com в GCC не входит (решение 18.07): его клики ведут на глобальный
+сайт, а не в магазин; для ОАЭ он мал (199 кликов/нед против 2 028 у витрины).
+
+Контракт searchanalytics.query: rows[].{keys:[date], clicks, impressions} (dims=[date]).
 
 Auth: сервис-аккаунт добавлен пользователем ресурсов в Search Console (siteFullUser на
 всех семи). Env: GOOGLE_APPLICATION_CREDENTIALS | GOOGLE_SERVICE_ACCOUNT, DATABASE_URL.
@@ -23,43 +31,28 @@ import datetime as dt
 import json
 import os
 
-from sync.brand_terms import brand_regex, is_brand_query
-
 SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 ROW_LIMIT = 25000
 
-# Ресурсы и страны по регионам. Значение в countries — то, что ложится в колонку
-# lime_gsc_seo.country: русское название как в lime_stats (sync/gcc_channels.py),
-# для KZ — пустая строка (регион целиком, без разбивки).
+# Ресурсы по регионам. sites: {siteUrl: страна-строки в lime_gsc_seo.country}.
+# Для KZ страна строки пустая (регион целиком), но запрос фильтруется по гео
+# пользователя (country_filter): limestore.com — общий с RU хост, без фильтра
+# там Россия (~119 тыс брендовых кликов/нед против ~2 тыс казахстанских).
 REGIONS = {
     "kz": {
-        # KZ Google-SEO живёт на limestore.com (/kz_ru); lime-shop.com — RU-хост Вебмастера.
-        "sites": ["https://limestore.com/"],
-        "countries": {"kaz": ""},
+        "sites": {"https://limestore.com/": ""},
+        "country_filter": "kaz",
     },
     "gcc": {
-        # Только 6 страновых витрин Залива. Корневой limestore.com сознательно НЕ входит
-        # (решение Павла, 2026-07-18): он тоже собирает брендовый спрос Залива, но клики с
-        # него ведут на глобальный сайт, а не в магазин, и по малым странам он перекрывал
-        # картину — при его включении у Бахрейна 75% органических кликов приходилось на
-        # него, у Кувейта 67%. Блок отвечает на вопрос «как работает магазин Залива»,
-        # поэтому считаем по его витринам. Цифры сравнения — в дизайн-спеке.
-        "sites": [
-            "https://ae.limestore.com/",
-            "https://sa.limestore.com/",
-            "https://kw.limestore.com/",
-            "https://qa.limestore.com/",
-            "https://bh.limestore.com/",
-            "https://om.limestore.com/",
-        ],
-        "countries": {
-            "are": "ОАЭ",
-            "sau": "Саудовская Аравия",
-            "kwt": "Кувейт",
-            "qat": "Катар",
-            "bhr": "Бахрейн",
-            "omn": "Оман",
+        "sites": {
+            "https://ae.limestore.com/": "ОАЭ",
+            "https://sa.limestore.com/": "Саудовская Аравия",
+            "https://kw.limestore.com/": "Кувейт",
+            "https://qa.limestore.com/": "Катар",
+            "https://bh.limestore.com/": "Бахрейн",
+            "https://om.limestore.com/": "Оман",
         },
+        "country_filter": None,
     },
 }
 
@@ -80,16 +73,15 @@ def get_searchconsole_service():
     return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
 
 
-def parse_search_analytics(resp: dict) -> list[dict]:
-    """rows[].{keys:[date, query], clicks, impressions} → [{query, date, clicks, impressions}]."""
+def parse_daily_totals(resp: dict) -> list[dict]:
+    """rows[].{keys:[date], clicks, impressions} → [{date, clicks, impressions}]."""
     out: list[dict] = []
     for r in resp.get("rows", []):
         keys = r.get("keys", [])
-        if len(keys) < 2:
+        if not keys:
             continue
         out.append({
             "date": keys[0],
-            "query": keys[1],
             "clicks": int(r.get("clicks", 0) or 0),
             "impressions": int(r.get("impressions", 0) or 0),
         })
@@ -107,17 +99,14 @@ def _monday(date_str: str) -> str:
     return (d - dt.timedelta(days=d.weekday())).isoformat()
 
 
-def aggregate_by_country(rows: list[dict], region: str) -> dict[tuple, dict]:
-    """[{query,date,clicks,impressions,country}] → {(week_start, country): {clicks, impressions}}.
+def aggregate_weekly(rows: list[dict]) -> dict[tuple, dict]:
+    """[{date,clicks,impressions,country}] → {(week_start, country): {clicks, impressions}}.
 
-    Строки разных ресурсов по одной стране СУММИРУЮТСЯ. Дедупа нет намеренно: запрос к API
-    один на (ресурс, страна), пересечений между ними не бывает, а прежний дедуп по
-    (date, query) при семи ресурсах терял данные.
+    Дневные тоталы витрин суммируются в ISO-неделю; строки разных витрин одной страны
+    не пересекаются (страна = витрина), дедуп не нужен.
     """
     out: dict[tuple, dict] = {}
     for r in rows:
-        if not is_brand_query(r.get("query", ""), region):
-            continue
         key = (_monday(r["date"]), r.get("country", ""))
         acc = out.setdefault(key, {"clicks": 0, "impressions": 0})
         acc["clicks"] += int(r.get("clicks", 0) or 0)
@@ -125,58 +114,51 @@ def aggregate_by_country(rows: list[dict], region: str) -> dict[tuple, dict]:
     return out
 
 
-def fetch_site_country(service, site: str, country: str, region: str,
-                       start: str, end: str) -> list[dict]:
-    """Брендовые запросы ресурса из страны за период → [{query,date,clicks,impressions}].
+def fetch_site_totals(service, site: str, country_filter: str | None,
+                      start: str, end: str) -> list[dict]:
+    """Дневные тоталы ресурса (все запросы, вкл. анонимные) → [{date,clicks,impressions}].
 
-    Один запрос с регекспом написаний бренда (RE2) — раньше был запрос на каждый термин
-    с дедупом, теперь он не нужен. Пагинация по startRow.
+    dims=[date] без query — иначе GSC прячет анонимные запросы и клики теряются
+    (у ae это 451 из 2 028 за неделю). country_filter — гео пользователя (только KZ).
     """
-    rows: list[dict] = []
-    start_row = 0
-    while True:
-        body = {
-            "startDate": start,
-            "endDate": end,
-            "dimensions": ["date", "query"],
-            "dimensionFilterGroups": [
-                {"filters": [
-                    {"dimension": "query", "operator": "includingRegex",
-                     "expression": brand_regex(region)},
-                    {"dimension": "country", "operator": "equals", "expression": country},
-                ]}
-            ],
-            "rowLimit": ROW_LIMIT,
-            "startRow": start_row,
-            "type": "web",
-        }
-        resp = service.searchanalytics().query(siteUrl=site, body=body).execute()
-        batch = parse_search_analytics(resp)
-        rows += batch
-        if len(batch) < ROW_LIMIT:
-            break
-        start_row += ROW_LIMIT
-    return rows
+    body = {
+        "startDate": start,
+        "endDate": end,
+        "dimensions": ["date"],
+        "rowLimit": ROW_LIMIT,
+        "type": "web",
+    }
+    if country_filter:
+        body["dimensionFilterGroups"] = [{"filters": [
+            {"dimension": "country", "operator": "equals", "expression": country_filter},
+        ]}]
+    resp = service.searchanalytics().query(siteUrl=site, body=body).execute()
+    return parse_daily_totals(resp)
 
 
 def sync_gsc_seo(from_date: str, to_date: str, region: str = "kz") -> int:
-    """Синк недельных брендовых показов/кликов Google по региону. Число строк (неделя×страна)."""
+    """Синк недельных показов/кликов Google по региону. Число строк (неделя×страна).
+
+    from_date прижимается к понедельнику своей недели: инкремент «сегодня − 8 недель»
+    попадал в середину недели, граничная неделя приходила без первых дней, и upsert
+    перезаписывал её полное значение усечённой суммой — в пределе одним днём (порча
+    недель 2026-05-18…06-22 в обоих регионах, обнаружена 2026-08-19)."""
+    from_date = _monday(from_date)
     cfg = REGIONS[region]
     service = get_searchconsole_service()
     have = accessible_sites(service)
 
     all_rows: list[dict] = []
-    for site in cfg["sites"]:
+    for site, country_name in cfg["sites"].items():
         if site not in have:
             print(f"gsc[{region}]: пропуск {site} — нет доступа сервис-аккаунта")
             continue
-        for iso_country, country_name in cfg["countries"].items():
-            batch = fetch_site_country(service, site, iso_country, region, from_date, to_date)
-            for r in batch:
-                r["country"] = country_name
-            all_rows += batch
+        batch = fetch_site_totals(service, site, cfg["country_filter"], from_date, to_date)
+        for r in batch:
+            r["country"] = country_name
+        all_rows += batch
 
-    weekly = aggregate_by_country(all_rows, region)
+    weekly = aggregate_weekly(all_rows)
     if not weekly:
         return 0
     from sync.db import get_connection  # ленивый импорт psycopg2

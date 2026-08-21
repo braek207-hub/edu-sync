@@ -51,7 +51,9 @@ def main() -> None:
             )
 
             # Лаг дневного Wordstat 1-3 дня: пока «вчера-1» нет — дёргаем API, появился — отдыхаем.
-            if daily_demand_up_to_date("lime_wordstat_demand_daily"):
+            # WORDSTAT_FROM (бэкфилл/смена методики) перезаписывает и дневное окно:
+            # свежесть не гарантирует, что старые дни сняты той же методикой, что недельный ряд.
+            if not os.environ.get("WORDSTAT_FROM") and daily_demand_up_to_date("lime_wordstat_demand_daily"):
                 print("wordstat-daily: свежие дни уже есть — пропуск (до нового отставания)")
             else:
                 # Всё доступное окно (60 дней): upsert идемпотентен, поэтому первый запуск —
