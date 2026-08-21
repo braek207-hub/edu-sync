@@ -534,38 +534,6 @@ def upsert_monthly_plans(rows: List[Dict[str, Any]]) -> int:
     return replace_monthly_plans(rows)
 
 
-def ensure_dashboard_extras_table() -> None:
-    ddl = """
-        CREATE TABLE IF NOT EXISTS dashboard_extras (
-            id TEXT PRIMARY KEY DEFAULT 'main',
-            crm_leads_lite JSONB NOT NULL DEFAULT '[]',
-            crm_payments_lite JSONB NOT NULL DEFAULT '[]',
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(ddl)
-        conn.commit()
-
-
-def upsert_dashboard_extras(crm_leads_lite_json: str, crm_payments_lite_json: str) -> int:
-    ensure_dashboard_extras_table()
-    sql = """
-        INSERT INTO dashboard_extras (id, crm_leads_lite, crm_payments_lite, updated_at)
-        VALUES ('main', %s::jsonb, %s::jsonb, NOW())
-        ON CONFLICT (id) DO UPDATE SET
-            crm_leads_lite = EXCLUDED.crm_leads_lite,
-            crm_payments_lite = EXCLUDED.crm_payments_lite,
-            updated_at = NOW()
-    """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (crm_leads_lite_json, crm_payments_lite_json))
-        conn.commit()
-    return 1
-
-
 def replace_crm_payments(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
