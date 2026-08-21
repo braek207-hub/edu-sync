@@ -24,6 +24,38 @@ from sync.agent.db import _fetch_dicts
 def main() -> int:
     out = {}
 
+    # 0. ЕСТЕСТВЕННЫЙ ЭКСПЕРИМЕНТ. edu_agent_facts — снимок, сделанный прогоном
+    #    Э0 и с тех пор не перезаписанный (следующий прогон упал на гейте).
+    #    Сравнение его с сегодняшней CRM по тем же дням показывает, СКОЛЬКО
+    #    лидов дозрело после снимка. Это и есть дозревание, измеренное честно:
+    #    два независимых замера одного и того же дня, разнесённые во времени.
+    out["snapshot_vs_now"] = _fetch_dicts(
+        """
+        WITH snap AS (
+            SELECT fact_date, SUM(leads) AS leads_then,
+                   SUM(eff_leads) AS eff_then, MAX(collected_at) AS collected_at
+            FROM edu_agent_facts
+            WHERE fact_date >= CURRENT_DATE - 45
+            GROUP BY fact_date
+        ), now_crm AS (
+            SELECT created_date AS fact_date, COUNT(*) AS leads_now,
+                   COUNT(*) FILTER (WHERE is_eff) AS eff_now
+            FROM crm_lead_details
+            WHERE created_date >= CURRENT_DATE - 45
+            GROUP BY created_date
+        )
+        SELECT s.fact_date,
+               (s.collected_at AT TIME ZONE 'UTC')::date AS snapshot_taken,
+               (s.collected_at AT TIME ZONE 'UTC')::date - s.fact_date AS days_old_at_snapshot,
+               s.leads_then, n.leads_now,
+               s.eff_then, n.eff_now,
+               n.leads_now - s.leads_then AS leads_added,
+               ROUND(100.0 * s.leads_then / NULLIF(n.leads_now, 0), 1) AS pct_seen_at_snapshot
+        FROM snap s JOIN now_crm n USING (fact_date)
+        ORDER BY s.fact_date
+        """
+    )
+
     # 1. Кривая дозревания: какая доля лидов дня видна через k суток.
     out["maturity_curve"] = _fetch_dicts(
         """
@@ -43,6 +75,10 @@ def main() -> int:
     )
 
     # 2. Распределение задержки — медиана и хвост.
+    #    ВНИМАНИЕ: synced_at перезаписывается синком (замер 32455026738 показал
+    #    last_seen = сегодня у всех дней, включая месячной давности), поэтому
+    #    п.1-3 НЕ измеряют лаг. Оставлены как улика перезаписи, судить по ним
+    #    о дозревании нельзя — источник истины здесь п.0.
     out["lag_percentiles"] = _fetch_dicts(
         """
         WITH lag AS (
