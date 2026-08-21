@@ -1,127 +1,60 @@
-import datetime as dt
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from sync.webmaster import (
-    aggregate_seo_daily,
-    aggregate_seo_weekly,
-    is_brand_query,
-    parse_query_analytics,
+    drop_leading_partial_week,
+    drop_trailing_zero_days,
+    merge_days,
     seo_daily_fresh_target,
+    weekly_sums,
 )
+import datetime as dt
 
 
-def test_is_brand_query_matches_lime_and_cyrillic():
-    assert is_brand_query("lime магазин")
-    assert is_brand_query("лайм одежда")
-    assert is_brand_query("LIME")            # регистронезависимо
-    assert not is_brand_query("платье женское")
-    assert not is_brand_query("")
+def test_merge_days_sums_hosts():
+    a = {"2026-08-03": 100, "2026-08-04": 50}
+    b = {"2026-08-03": 30, "2026-08-05": 7}
+    assert merge_days([a, b]) == {"2026-08-03": 130, "2026-08-04": 50, "2026-08-05": 7}
 
 
-def test_parse_query_analytics_extracts_clicks_impressions_by_date():
-    # реальная структура ответа query-analytics/list (см. фикстуру probe)
-    data = {
-        "count": 2,
-        "text_indicator_to_statistics": [
-            {
-                "text_indicator": {"type": "QUERY", "value": "lime"},
-                "statistics": [
-                    {"date": "2026-06-29", "field": "CTR", "value": 23.8},
-                    {"date": "2026-06-29", "field": "IMPRESSIONS", "value": 4537.0},
-                    {"date": "2026-06-29", "field": "CLICKS", "value": 1080.0},
-                    {"date": "2026-06-30", "field": "CLICKS", "value": 900.0},
-                ],
-            }
-        ],
-    }
-    out = parse_query_analytics(data)
-    assert out["lime"] == [
-        {"date": "2026-06-29", "clicks": 1080, "impressions": 4537},
-        {"date": "2026-06-30", "clicks": 900, "impressions": 0},
-    ]
+def test_merge_days_normalizes_timestamp_keys():
+    # ключ дня стабилен и для YYYY-MM-DD, и для RFC3339-таймстампа
+    assert merge_days([{"2026-08-03T00:00:00Z": 5}, {"2026-08-03": 2}]) == {"2026-08-03": 7}
 
 
-def test_aggregate_seo_weekly_sums_brand_only_by_week():
-    rows = [
-        {"query": "lime", "date": "2025-06-02", "clicks": 50, "impressions": 500},   # Пн
-        {"query": "лайм купить", "date": "2025-06-03", "clicks": 10, "impressions": 100},  # Вт → та же неделя
-        {"query": "туфли", "date": "2025-06-03", "clicks": 99, "impressions": 999},  # не бренд
-        {"query": "lime", "date": "2025-06-09", "clicks": 5, "impressions": 50},     # след. неделя
-    ]
-    out = aggregate_seo_weekly(rows)
-    assert out == {
-        "2025-06-02": {"clicks": 60, "impressions": 600},
-        "2025-06-09": {"clicks": 5, "impressions": 50},
-    }
+def test_weekly_sums_groups_by_iso_monday():
+    days = {"2026-08-03": 10, "2026-08-09": 4, "2026-08-10": 7}  # Пн..Вс + след. Пн
+    assert weekly_sums(days) == {"2026-08-03": 14, "2026-08-10": 7}
 
 
-def test_aggregate_seo_daily_sums_brand_only_by_day():
-    # запросы × хосты одного дня суммируются; не-бренд отфильтрован
-    rows = [
-        {"query": "lime", "date": "2026-08-03", "clicks": 50, "impressions": 500},
-        {"query": "лайм купить", "date": "2026-08-03", "clicks": 10, "impressions": 100},  # тот же день
-        {"query": "туфли", "date": "2026-08-03", "clicks": 99, "impressions": 999},  # не бренд
-        {"query": "lime", "date": "2026-08-04", "clicks": 5, "impressions": 50},
-    ]
-    assert aggregate_seo_daily(rows) == {
-        "2026-08-03": {"clicks": 60, "impressions": 600},
-        "2026-08-04": {"clicks": 5, "impressions": 50},
-    }
+def test_drop_leading_partial_week_guards_api_depth_boundary():
+    """Сводка отдаёт ~447 дней: самая старая неделя приходит без первых дней —
+    её нельзя записывать усечённой (класс бага «граница окна», 2026-08-19).
+    Текущая (правый край) остаётся: каждый прогон её дорисовывает."""
+    days = {"2026-08-05": 3, "2026-08-06": 4, "2026-08-10": 9}  # ряд начался в среду
+    weekly = weekly_sums(days)
+    out = drop_leading_partial_week(weekly, days)
+    assert "2026-08-03" not in out  # усечена слева → не трогаем сохранённое (file)
+    assert out == {"2026-08-10": 9}
 
 
-def test_aggregate_seo_daily_no_monday_collapse():
-    # дни одной недели остаются отдельными точками (в отличие от aggregate_seo_weekly)
-    rows = [
-        {"query": "lime", "date": "2026-08-03", "clicks": 1, "impressions": 10},  # Пн
-        {"query": "lime", "date": "2026-08-04", "clicks": 2, "impressions": 20},  # Вт
-    ]
-    out = aggregate_seo_daily(rows)
-    assert sorted(out) == ["2026-08-03", "2026-08-04"]
-    assert aggregate_seo_weekly(rows) == {"2026-08-03": {"clicks": 3, "impressions": 30}}
+def test_drop_leading_partial_week_keeps_full_weeks():
+    days = {"2026-08-03": 1, "2026-08-10": 2}  # ряд начался с понедельника
+    weekly = weekly_sums(days)
+    assert drop_leading_partial_week(weekly, days) == weekly
+    assert drop_leading_partial_week({}, {}) == {}
 
 
-def test_aggregate_seo_daily_truncates_timestamp_and_handles_empty():
-    # ключ дня стабилен к таймстампу; пусто/не-бренд → {}
-    rows = [{"query": "lime", "date": "2026-08-03T00:00:00Z", "clicks": 5, "impressions": 50}]
-    assert aggregate_seo_daily(rows) == {"2026-08-03": {"clicks": 5, "impressions": 50}}
-    assert aggregate_seo_daily([]) == {}
-    assert aggregate_seo_daily(
-        [{"query": "платье", "date": "2026-08-03", "clicks": 9, "impressions": 9}]
-    ) == {}
+def test_drop_trailing_zero_days_cuts_immature_tail_only():
+    """Хвостовые нули = «ещё не собрано» (лаг ~2 дня) — срезаются;
+    ноль в середине ряда — честный ноль, остаётся."""
+    days = {"2026-08-15": 5, "2026-08-16": 0, "2026-08-17": 7,
+            "2026-08-18": 0, "2026-08-19": 0}
+    assert drop_trailing_zero_days(days) == {"2026-08-15": 5, "2026-08-16": 0, "2026-08-17": 7}
+    assert drop_trailing_zero_days({}) == {}
 
 
-def test_seo_daily_fresh_target_is_today_minus_three():
-    # лаг Вебмастера ~2 дня → «свежо», когда есть день вчера-2 (today-3)
-    assert seo_daily_fresh_target(dt.date(2026, 8, 8)) == "2026-08-05"
-
-def test_drop_leading_partial_weeks_guards_sliding_window():
-    """Окно API скользит: неделя без своих первых дней не должна перезаписываться.
-
-    Порча 2026-08: закрытые недели в lime_brand_seo деградировали до суммы одного
-    последнего дня (5107 кликов вместо ~40000), потому что upsert писал усечённую
-    слева сумму. Неделя пишется, только если её понедельник внутри окна."""
-    from sync.webmaster import drop_leading_partial_weeks
-
-    # окно среда 06-25 … среда 07-08: неделя 06-23 усечена, 06-30 полная, 07-07 текущая
-    rows = [
-        {"query": "lime", "date": "2025-06-25", "clicks": 5, "impressions": 50},
-        {"query": "lime", "date": "2025-06-30", "clicks": 7, "impressions": 70},
-        {"query": "lime", "date": "2025-07-08", "clicks": 3, "impressions": 30},
-    ]
-    weekly = aggregate_seo_weekly(rows)
-    out = drop_leading_partial_weeks(weekly, rows)
-    assert "2025-06-23" not in out          # усечена слева → не трогаем сохранённое
-    assert out["2025-06-30"] == {"clicks": 7, "impressions": 70}
-    assert out["2025-07-07"] == {"clicks": 3, "impressions": 30}  # правый край растёт — ок
-
-
-def test_drop_leading_partial_weeks_empty_rows_noop():
-    from sync.webmaster import drop_leading_partial_weeks
-
-    assert drop_leading_partial_weeks({}, []) == {}
-    assert drop_leading_partial_weeks({"2025-06-23": {"clicks": 1, "impressions": 1}}, []) == {
-        "2025-06-23": {"clicks": 1, "impressions": 1}
-    }
+def test_seo_daily_fresh_target_is_two_days_lag():
+    assert seo_daily_fresh_target(dt.date(2026, 8, 21)) == "2026-08-18"
