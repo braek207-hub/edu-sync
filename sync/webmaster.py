@@ -105,29 +105,6 @@ def _fetch_all(indicator: str) -> dict[str, int]:
     )
 
 
-def seo_daily_fresh_target(today: dt.date | None = None) -> str:
-    """Дата, наличие которой в дневной таблице означает «SEO свеж» — вчера-2.
-    Вебмастер отдаёт статистику с лагом ~2 дня; ориентир — today-3."""
-    d = today or dt.date.today()
-    return (d - dt.timedelta(days=3)).isoformat()
-
-
-def seo_daily_up_to_date(today: dt.date | None = None) -> bool:
-    """True, если в lime_brand_seo_daily уже есть день за вчера-2 → синк можно пропустить.
-
-    ВАЖНО: пропускается только ДНЕВНОЙ синк. Недельный гоняем каждый прогон —
-    он же дозаливает закрытые недели (клики дорастают до ~2 недель задним числом)."""
-    from sync.db import get_connection
-
-    target = seo_daily_fresh_target(today)
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT max(day) FROM lime_brand_seo_daily")
-            row = cur.fetchone()
-    mx = row[0] if row and row[0] else None
-    return mx is not None and mx.isoformat() >= target
-
-
 def sync_brand_seo() -> int:
     """Синк недельных SEO-кликов (сводка, оба хоста, вся глубина API). Число недель."""
     clicks = _fetch_all("TOTAL_CLICKS")

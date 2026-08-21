@@ -7,10 +7,8 @@ from sync.webmaster import (
     drop_leading_partial_week,
     drop_trailing_zero_days,
     merge_days,
-    seo_daily_fresh_target,
     weekly_sums,
 )
-import datetime as dt
 
 
 def test_merge_days_sums_hosts():
@@ -54,7 +52,3 @@ def test_drop_trailing_zero_days_cuts_immature_tail_only():
             "2026-08-18": 0, "2026-08-19": 0}
     assert drop_trailing_zero_days(days) == {"2026-08-15": 5, "2026-08-16": 0, "2026-08-17": 7}
     assert drop_trailing_zero_days({}) == {}
-
-
-def test_seo_daily_fresh_target_is_two_days_lag():
-    assert seo_daily_fresh_target(dt.date(2026, 8, 21)) == "2026-08-18"
