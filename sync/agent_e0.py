@@ -31,6 +31,7 @@ from sync.agent.objects import build_object_rows, top_queries_by_cost
 from sync.agent.power import power_report
 from sync.agent.profile import build_profile, campaign_quality, distance_to_profile
 from sync.agent.segments import (
+    fetch_account_goal_ids,
     fetch_campaign_ids,
     fetch_objects,
     fetch_search_queries,
@@ -84,6 +85,38 @@ def _direct_clients() -> List[Dict[str, Any]]:
             return out
     login = agent_db.normalize_login(os.environ.get("DIRECT_CLIENT_LOGIN"))
     return [{"login": login, "goal_ids": []}] if login else []
+
+
+def resolve_goal_ids(client: Dict[str, Any]) -> List[str]:
+    """Цели кабинета: явно указанные оператором, иначе выведенные из кабинета.
+
+    Без целей Reports API не отдаёт Conversions, а без Conversions сегментный
+    расчёт отказывается работать целиком — на прогоне 32406152097 так отказали
+    все двенадцать срезов, и применять автопилоту было нечего. Единственным
+    источником целей был секрет DIRECT_CLIENTS_JSON: не проставил руками —
+    агент слеп, и заметить это можно было только по причине отказа.
+
+    Поэтому источник по умолчанию — сам кабинет: цели, на которые настроены
+    стратегии его кампаний. Значение из секрета остаётся главнее — это явное
+    решение оператора сузить набор, и молча подменять его нельзя.
+    """
+    explicit = [str(g) for g in (client.get("goal_ids") or [])]
+    if explicit:
+        return explicit
+    login = client["login"]
+    try:
+        found = fetch_account_goal_ids(login)
+    except Exception as e:
+        # Отказ здесь не должен ронять весь прогон: остальные шаги Э0 (факты,
+        # объекты, майнинг) от целей не зависят и обязаны отработать.
+        print(f"  [agent_e0] цели кабинета {login} не получены: {e}")
+        return []
+    if not found:
+        print(f"  [agent_e0] у кампаний кабинета {login} не задано ни одной цели "
+              f"оптимизации — конверсии по срезам считаться не будут")
+    else:
+        print(f"  [agent_e0] цели кабинета {login} из стратегий кампаний: {len(found)}")
+    return [str(g) for g in found]
 
 
 def computed_rows_for_job(job: Dict[str, Any]) -> tuple:
@@ -178,7 +211,7 @@ def main() -> int:
     # одновременно формируемых отчётов на кабинет.
     jobs: List[Dict[str, Any]] = []
     for client in clients:
-        login, goals = client["login"], client["goal_ids"]
+        login, goals = client["login"], resolve_goal_ids(client)
         # Расписания здесь нет: HourOfDay отвергается Reports API (probe 31781715471),
         # почасовой профиль приходит из Метрики (шаг 9).
         #

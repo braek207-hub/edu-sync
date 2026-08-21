@@ -241,6 +241,83 @@ def fetch_campaign_ids(login: str) -> List[int]:
     return out
 
 
+# Ключи, под которыми в блоке стратегии лежит цель оптимизации. PriorityGoals —
+# список (у кампании их бывает несколько), GoalId — одиночная цель у стратегий
+# вида MaximumConversionRate / PayForConversion.
+_STRATEGY_CHANNELS = ("Search", "Network")
+_CAMPAIGN_TYPES = ("TextCampaign", "UnifiedCampaign", "MobileAppCampaign")
+
+
+def goal_ids_from_campaign(campaign: Dict[str, Any]) -> List[int]:
+    """Цели оптимизации кампании из её блока стратегии.
+
+    Почему цели вообще нужны здесь: метрика Conversions в Reports API доступна
+    ТОЛЬКО вместе с параметром Goals (без него запрос отвергается ошибкой 8000).
+    Нет целей — нет конверсий — сегментный расчёт отказывается работать, и
+    автопилоту нечего применять. Раньше цели приходили только из секрета
+    DIRECT_CLIENTS_JSON: не проставил руками — агент молча оставался слепым.
+    """
+    out: List[int] = []
+    for type_key in _CAMPAIGN_TYPES:
+        strategy = (campaign.get(type_key) or {}).get("BiddingStrategy") or {}
+        for channel in _STRATEGY_CHANNELS:
+            block = strategy.get(channel)
+            if not isinstance(block, dict):
+                continue
+            for value in block.values():
+                if not isinstance(value, dict):
+                    continue
+                for goal in (value.get("PriorityGoals") or []):
+                    if isinstance(goal, dict) and goal.get("GoalId") is not None:
+                        out.append(int(goal["GoalId"]))
+                if value.get("GoalId") is not None:
+                    out.append(int(value["GoalId"]))
+    # Порядок стабилен и не зависит от порядка ключей в ответе: цели уходят в
+    # параметр запроса, а от него зависит имя отчёта и его кеш на стороне API.
+    return sorted(set(out))
+
+
+def fetch_account_goal_ids(login: str) -> List[int]:
+    """Цели, на которые реально оптимизируются кампании кабинета.
+
+    Форма запроса взята из рабочего sync/edu_direct_settings.py (кампании трёх
+    типов запрашиваются тремя *FieldNames одновременно) — гадать про неё уже
+    стоило восьми упавших прогонов.
+
+    Метода /v5/goals у Директа не существует (отдаёт 404), а имена целей живут
+    в Метрике; здесь нужны только идентификаторы, и они есть в стратегии.
+    """
+    type_fields = ["BiddingStrategy"]
+    found: List[int] = []
+    offset = 0
+    while True:
+        result = _api_post(
+            CAMPAIGNS_URL,
+            login,
+            {
+                "method": "get",
+                "params": {
+                    "SelectionCriteria": {},
+                    "FieldNames": ["Id"],
+                    "TextCampaignFieldNames": type_fields,
+                    "UnifiedCampaignFieldNames": type_fields,
+                    "MobileAppCampaignFieldNames": type_fields,
+                    "Page": {"Limit": PAGE_LIMIT, "Offset": offset},
+                },
+            },
+            "campaigns.get:goals",
+        )
+        items = result.get("Campaigns") or []
+        for campaign in items:
+            found += goal_ids_from_campaign(campaign)
+        if len(items) < PAGE_LIMIT:
+            break
+        offset += PAGE_LIMIT
+        if offset >= MAX_OFFSET:
+            break
+    return sorted(set(found))
+
+
 def fetch_objects(login: str, object_level: str, campaign_ids: List[int]) -> List[Dict[str, Any]]:
     """Объекты уровня по кампаниям.
 

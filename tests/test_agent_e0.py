@@ -266,3 +266,73 @@ def test_main_reports_degenerate_slice(monkeypatch, capsys):
                for s in report["computed_settings_skipped"]}
     assert skipped[("acc-1", "device")] == DEGENERATE_REASON
     assert skipped[("acc-2", "device")] == DEGENERATE_REASON
+
+
+# --------------- цели кабинета выводятся из кабинета, а не только из секрета
+
+def test_goals_come_from_the_account_when_the_secret_is_silent(monkeypatch):
+    # Прогон 32406152097: секрет без goal_ids → Conversions не запрашивалась →
+    # все двенадцать срезов отказали, применять было нечего. Молчание секрета
+    # обязано означать «спроси кабинет», а не «работай вслепую».
+    monkeypatch.setattr(agent_e0, "fetch_account_goal_ids", lambda login: [111, 222])
+
+    assert agent_e0.resolve_goal_ids({"login": "cab", "goal_ids": []}) == ["111", "222"]
+
+
+def test_explicit_goals_win_over_the_account(monkeypatch):
+    # Значение в секрете — явное решение оператора сузить набор целей.
+    # Подменять его выводом из кабинета нельзя: это тихая отмена его решения.
+    def boom(login):
+        raise AssertionError("кабинет спрашивать не нужно — цели заданы явно")
+
+    monkeypatch.setattr(agent_e0, "fetch_account_goal_ids", boom)
+
+    assert agent_e0.resolve_goal_ids({"login": "cab", "goal_ids": [7]}) == ["7"]
+
+
+def test_failure_to_read_goals_does_not_kill_the_run(monkeypatch, capsys):
+    # Факты, объекты и майнинг от целей не зависят: отказ одного кабинета не
+    # повод потерять весь прогон Э0.
+    def boom(login):
+        raise RuntimeError("API недоступен")
+
+    monkeypatch.setattr(agent_e0, "fetch_account_goal_ids", boom)
+
+    assert agent_e0.resolve_goal_ids({"login": "cab", "goal_ids": []}) == []
+    assert "не получены" in capsys.readouterr().out
+
+
+def test_account_without_goals_is_named_in_the_log(monkeypatch, capsys):
+    # Пустой ответ и сбой запроса — разные диагнозы, и различать их должен лог:
+    # в первом случае чинят кабинет, во втором — доступ.
+    monkeypatch.setattr(agent_e0, "fetch_account_goal_ids", lambda login: [])
+
+    assert agent_e0.resolve_goal_ids({"login": "cab", "goal_ids": []}) == []
+    assert "не задано ни одной цели" in capsys.readouterr().out
+
+
+def test_main_sends_account_goals_into_the_report_request(monkeypatch, capsys):
+    """Сквозная половина: цели кабинета обязаны доехать до запроса отчёта.
+
+    Проверять resolve_goal_ids отдельно недостаточно — ровно так уже выживал
+    дефект: чистая функция считала верно, а тело main() продолжало брать
+    старое значение. Здесь фиксируются аргументы самого fetch_segment_report.
+    """
+    import json as _json
+
+    seen_goals = []
+    _patch_e0_run(monkeypatch)
+    # Секрет молчит про цели — кабинет обязан быть спрошен.
+    monkeypatch.setenv("DIRECT_CLIENTS_JSON", _json.dumps([{"login": "acc-1"}]))
+    monkeypatch.setattr(agent_e0, "fetch_account_goal_ids", lambda login: [555, 666])
+    monkeypatch.setattr(
+        agent_e0, "fetch_segment_report",
+        lambda login, kind, date_from, date_to, by_campaign=False, goals=():
+            seen_goals.append(list(goals)) or [])
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+
+    assert seen_goals, "отчёты не запрашивались вовсе"
+    # Ни одного запроса без целей: без них Reports API не отдаёт Conversions.
+    assert all(g == ["555", "666"] for g in seen_goals), seen_goals
