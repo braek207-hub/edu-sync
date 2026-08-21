@@ -96,3 +96,32 @@ def test_aggregate_seo_daily_truncates_timestamp_and_handles_empty():
 def test_seo_daily_fresh_target_is_today_minus_three():
     # лаг Вебмастера ~2 дня → «свежо», когда есть день вчера-2 (today-3)
     assert seo_daily_fresh_target(dt.date(2026, 8, 8)) == "2026-08-05"
+
+def test_drop_leading_partial_weeks_guards_sliding_window():
+    """Окно API скользит: неделя без своих первых дней не должна перезаписываться.
+
+    Порча 2026-08: закрытые недели в lime_brand_seo деградировали до суммы одного
+    последнего дня (5107 кликов вместо ~40000), потому что upsert писал усечённую
+    слева сумму. Неделя пишется, только если её понедельник внутри окна."""
+    from sync.webmaster import drop_leading_partial_weeks
+
+    # окно среда 06-25 … среда 07-08: неделя 06-23 усечена, 06-30 полная, 07-07 текущая
+    rows = [
+        {"query": "lime", "date": "2025-06-25", "clicks": 5, "impressions": 50},
+        {"query": "lime", "date": "2025-06-30", "clicks": 7, "impressions": 70},
+        {"query": "lime", "date": "2025-07-08", "clicks": 3, "impressions": 30},
+    ]
+    weekly = aggregate_seo_weekly(rows)
+    out = drop_leading_partial_weeks(weekly, rows)
+    assert "2025-06-23" not in out          # усечена слева → не трогаем сохранённое
+    assert out["2025-06-30"] == {"clicks": 7, "impressions": 70}
+    assert out["2025-07-07"] == {"clicks": 3, "impressions": 30}  # правый край растёт — ок
+
+
+def test_drop_leading_partial_weeks_empty_rows_noop():
+    from sync.webmaster import drop_leading_partial_weeks
+
+    assert drop_leading_partial_weeks({}, []) == {}
+    assert drop_leading_partial_weeks({"2025-06-23": {"clicks": 1, "impressions": 1}}, []) == {
+        "2025-06-23": {"clicks": 1, "impressions": 1}
+    }
