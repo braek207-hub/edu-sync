@@ -63,6 +63,21 @@ def aggregate_seo_weekly(rows: list[dict], region: str = "ru") -> dict[str, dict
     return out
 
 
+def drop_leading_partial_weeks(weekly: dict[str, dict], rows: list[dict]) -> dict[str, dict]:
+    """Убрать недели, начавшиеся раньше окна API, — их сумма усечена слева.
+
+    query-analytics отдаёт скользящее окно ~2 недель. Прошлая неделя, начавшаяся
+    до начала окна, приходит без своих первых дней, и upsert перезаписывал её
+    полное значение усечённой суммой — в пределе одним последним днём (порча
+    2026-06-29…07-27 обнаружена 2026-08-19: недельные клики упали до дневных).
+    Неделя пишется, только если её понедельник внутри окна; текущая (правый край)
+    остаётся — каждый следующий прогон её только дорисовывает."""
+    if not rows:
+        return weekly
+    min_day = min(r["date"][:10] for r in rows)
+    return {wk: v for wk, v in weekly.items() if wk >= min_day}
+
+
 def aggregate_seo_daily(rows: list[dict], region: str = "ru") -> dict[str, dict]:
     """[{query,date,clicks,impressions}] → {day: {clicks, impressions}} (только бренд).
 
@@ -152,7 +167,7 @@ def sync_brand_seo() -> int:
     all_rows: list[dict] = []
     for host in HOSTS:
         all_rows += fetch_host_brand(host)
-    weekly = aggregate_seo_weekly(all_rows)
+    weekly = drop_leading_partial_weeks(aggregate_seo_weekly(all_rows), all_rows)
     if not weekly:
         return 0
     from sync.db import get_connection  # ленивый импорт psycopg2

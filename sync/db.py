@@ -534,32 +534,6 @@ def upsert_monthly_plans(rows: List[Dict[str, Any]]) -> int:
     return replace_monthly_plans(rows)
 
 
-def upsert_strategy_snapshots(rows: List[Dict[str, Any]]) -> int:
-    if not rows:
-        return 0
-    sql = """
-        INSERT INTO strategy_snapshots (
-            date, campaign_id, campaign_name, weekly_budget, target_cpa, state, status, serving
-        )
-        VALUES (
-            %(date)s, %(campaign_id)s, %(campaign_name)s, %(weekly_budget)s,
-            %(target_cpa)s, %(state)s, %(status)s, %(serving)s
-        )
-        ON CONFLICT (date, campaign_id) DO UPDATE SET
-            campaign_name = EXCLUDED.campaign_name,
-            weekly_budget = EXCLUDED.weekly_budget,
-            target_cpa    = EXCLUDED.target_cpa,
-            state         = EXCLUDED.state,
-            status        = EXCLUDED.status,
-            serving       = EXCLUDED.serving
-    """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
-        conn.commit()
-    return len(rows)
-
-
 def ensure_dashboard_extras_table() -> None:
     ddl = """
         CREATE TABLE IF NOT EXISTS dashboard_extras (
