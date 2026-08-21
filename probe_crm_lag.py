@@ -56,6 +56,22 @@ def main() -> int:
         """
     )
 
+    # 0b. ГЛАВНЫЙ РИСК: дни, где расход уже приехал, а лидов ещё нет вовсе.
+    #     Такой день попадает в витрину как cost>0, eff_leads=0 — и наблюдаемый
+    #     CPA взлетает не потому, что изменение вредно, а потому что CRM
+    #     отстаёт. Сторож судит именно по CPA, и это прямой путь к откату
+    #     здорового изменения.
+    out["cost_without_leads"] = _fetch_dicts(
+        """
+        SELECT fact_date, ROUND(SUM(cost)::numeric, 0) AS cost,
+               SUM(leads) AS leads, SUM(eff_leads) AS eff_leads,
+               COUNT(*) AS campaigns
+        FROM edu_agent_facts
+        WHERE fact_date >= CURRENT_DATE - 21
+        GROUP BY fact_date ORDER BY fact_date
+        """
+    )
+
     # 1. Кривая дозревания: какая доля лидов дня видна через k суток.
     out["maturity_curve"] = _fetch_dicts(
         """
