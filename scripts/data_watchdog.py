@@ -33,13 +33,17 @@ def _fetch_state(cur, source: Source, today: date) -> SourceState:
     since = today - timedelta(days=WINDOW_DAYS)
     # Имена таблиц и колонок — из реестра в коде, не из ввода; подставляем как есть,
     # параметризовать идентификаторы psycopg2 всё равно не умеет.
-    cur.execute(f"SELECT max({col})::date FROM {source.table}")  # noqa: S608
+    slice_and = f" AND {source.where}" if source.where else ""
+    cur.execute(  # noqa: S608
+        f"SELECT max({col})::date FROM {source.table}"
+        + (f" WHERE {source.where}" if source.where else "")
+    )
     row = cur.fetchone()
     max_date = row[0] if row else None
 
     cur.execute(  # noqa: S608
         f"SELECT {col}::date AS d, count(*) FROM {source.table} "
-        f"WHERE {col} >= %s GROUP BY 1",
+        f"WHERE {col} >= %s{slice_and} GROUP BY 1",
         (since,),
     )
     rows_by_day = {r[0]: int(r[1]) for r in cur.fetchall()}
@@ -75,7 +79,7 @@ def main() -> int:
         lag = "—" if state.max_date is None else f"{(today - state.max_date).days} дн."
         yesterday = state.rows_by_day.get(today - timedelta(days=1), 0)
         print(
-            f"{src.dashboard:<12} {src.table:<28} "
+            f"{src.dashboard:<12} {src.name:<28} "
             f"{str(state.max_date or '—'):<12} {lag:>10} {yesterday:>8}"
         )
 
@@ -87,7 +91,7 @@ def main() -> int:
     print("")
     for f in findings:
         mark = "СТОП" if f.is_critical else "ВНИМАНИЕ"
-        print(f"{mark}: {f.source.dashboard}/{f.source.table} — {f.message}")
+        print(f"{mark}: {f.source.dashboard}/{f.source.name} — {f.message}")
 
     critical = [f for f in findings if f.is_critical]
     if not critical:
