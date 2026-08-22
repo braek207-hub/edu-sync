@@ -56,14 +56,16 @@ from sync.agent import db as agent_db
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import apply_actions
 from sync.agent.writer.client import WriteClient, journal_writes_allowed
-from sync.agent.writer.diff import diff_modifiers
+from sync.agent.writer.diff import diff_modifiers, diff_schedule
 from sync.agent.writer.guardrails import (
     MAX_ACTIONS_PER_RUN,
     cap_actions,
     check_action,
     check_holdout,
 )
-from sync.agent.writer.plan import plan_bid_modifiers
+from sync.agent.writer.plan import plan_bid_modifiers, plan_schedule
+from sync.agent.writer.schedule import describe as describe_schedule
+from sync.agent.writer.schedule import schedule_changed, schedule_items
 from sync.agent.writer.risk import action_risk, fit_into_budget, median, week_start
 from sync.agent.writer.rollback import red_line_for
 from sync.agent.writer.units import api_to_delta
@@ -780,6 +782,61 @@ def _actual_modifiers(client: WriteClient, campaign_id: str) -> List[Dict[str, A
     return out
 
 
+def _actual_time_targeting(
+    client: WriteClient, campaign_ids: List[int]
+) -> Dict[str, Dict[str, Any]]:
+    """Текущее расписание кампаний — ОДНИМ запросом на кабинет, не по кампании.
+
+    Расписание живёт в самой кампании, поэтому читается через campaigns.get, а
+    не через bidmodifiers. Постранично, как и остальные чтения: страница
+    короче лимита — конец.
+
+    Кампания без блока TimeTargeting в ответе — это «ровные сотни», а не
+    «данных нет»: пустой словарь так и трактуется построителем расписания.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    ids = [int(c) for c in campaign_ids]
+    if not ids:
+        return out
+    for start in range(0, len(ids), CAMPAIGN_PAGE_LIMIT):
+        chunk = ids[start:start + CAMPAIGN_PAGE_LIMIT]
+        result = client.get("campaigns", {
+            "SelectionCriteria": {"Ids": chunk},
+            "FieldNames": ["Id", "TimeTargeting"],
+        })
+        for item in result.get("Campaigns") or []:
+            out[str(item.get("Id"))] = item.get("TimeTargeting") or {}
+    return out
+
+
+def _schedule_report(
+    hours: List[Dict[str, Any]], items: List[str],
+    targeting_by_campaign: Dict[str, Dict[str, Any]], campaign_ids: List[int],
+) -> Dict[str, Any]:
+    """Что прогон решил про почасовое расписание.
+
+    Различать нужно три состояния, которые иначе сливаются в тишину: профиля
+    нет вовсе (порогов не прошёл ни один час), профиль есть и где-то отличается
+    от кабинета, профиль есть и везде уже стоит.
+    """
+    if not items:
+        return {"significant_hours": 0,
+                "reason": "ни один час не прошёл пороги значимости — расписание не трогаем"}
+
+    up, down, neutral = describe_schedule(items)
+    differs = sum(1 for cid in campaign_ids
+                  if schedule_changed(targeting_by_campaign.get(str(cid)) or {}, items))
+    return {
+        "significant_hours": len(hours),
+        "hours_up": up,
+        "hours_down": down,
+        "hours_neutral": neutral,
+        "campaigns_differing": differs,
+        "campaigns_already_matching": len(campaign_ids) - differs,
+        "sample": items[0] if items else None,
+    }
+
+
 def run_account(
     login: str, sandbox: bool, dry_run: bool, today: str, ctx: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -820,7 +877,19 @@ def run_account(
     # чужой тип корректировки и не роняют применение — но и не пропадают
     # молча: причина видна в отчёте прогона.
     unsupported = _unsupported_report(plan["unsupported"])
-    if not desired:
+
+    # Расписание считается ДО раннего выхода. Стой этот расчёт ниже, кабинет
+    # без значимых корректировок возвращал бы «нечего делать» и молча уносил
+    # с собой посчитанный почасовой профиль: у расписания свой механизм, и
+    # отсутствие корректировок ничего о нём не говорит.
+    #
+    # Устаревшие настройки блокируют его так же, как корректировки: профиль
+    # посчитан по тем же данным, и «данные протухли» не перестаёт быть правдой
+    # оттого, что механизм применения другой.
+    schedule_hours = plan_schedule(computed) if not stale_computed else []
+    desired_items = schedule_items(schedule_hours) if schedule_hours else []
+
+    if not desired and not desired_items:
         if stale_computed:
             verdict, reason = "STALE_COMPUTED_SETTINGS", stale_computed
         elif not computed:
@@ -833,6 +902,11 @@ def run_account(
             "reason": reason,
             "computed_settings": len(computed),
             "computed_age_days": computed_age_days(computed, date.fromisoformat(today)),
+            # Расписание — и в коротком отчёте тоже: причина, по которой прогон
+            # ничего не делает, обязана быть видна целиком. Без этого поля
+            # «профиль не прошёл пороги» и «профиль есть, но корректировок нет»
+            # выглядели бы одинаково.
+            "schedule": _schedule_report(schedule_hours, desired_items, {}, []),
             "unsupported": unsupported,
             # Ни одной кампании не тронуто — и это сказано явно тем же полем,
             # что и в полном отчёте, а не отсутствием поля.
@@ -852,6 +926,12 @@ def run_account(
     blocked: List[Dict[str, Any]] = []
     unusable_actual = 0
 
+    # Почасовой профиль общий для кабинета (Метрика даёт его по счётчикам, не
+    # по кампаниям), а вот текущее расписание у каждой кампании своё — поэтому
+    # план считается один раз, а сравнение идёт по каждой.
+    targeting_by_campaign = (_actual_time_targeting(client, campaign_ids)
+                             if desired_items else {})
+
     for campaign_id in campaign_ids:
         # Самая длинная часть прогона: чтение состояния по каждой кампании, с
         # ретраями и таймаутом в две минуты на запрос. Именно здесь прогон
@@ -861,7 +941,12 @@ def run_account(
             lease.guard()
         actual = _actual_modifiers(client, campaign_id)
         unusable_actual += sum(1 for a in actual if a.get("unusable"))
-        for action in diff_modifiers(desired, actual, campaign_id):
+        campaign_actions = list(diff_modifiers(desired, actual, campaign_id))
+        if desired_items:
+            campaign_actions += diff_schedule(
+                desired_items, targeting_by_campaign.get(str(campaign_id)) or {},
+                campaign_id)
+        for action in campaign_actions:
             ok, reason = check_action(action)
             if not ok:
                 blocked.append({**action, "blocked_reason": reason})
@@ -947,6 +1032,12 @@ def run_account(
         "campaigns_touched": len({str(a["object_id"]) for a in prepared}),
         "computed_settings": len(computed),
         "computed_age_days": computed_age_days(computed, date.fromisoformat(today)),
+        # Почасовое расписание — отдельной строкой: оно не корректировка и в
+        # счётчики desired/unsupported не попадает. Без этого «профиля нет» и
+        # «профиль посчитан, но во всех кампаниях уже стоит» выглядели бы
+        # одинаково — как молчание.
+        "schedule": _schedule_report(schedule_hours, desired_items,
+                                     targeting_by_campaign, campaign_ids),
         "desired": len(desired),
         "unsupported": unsupported,
         # Записи факта без коэффициента: по ним не строится ни одно действие,

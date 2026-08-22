@@ -1619,3 +1619,140 @@ def test_stuck_row_does_not_eat_the_cap_on_the_run_that_finds_it(monkeypatch, ca
     report = _reports(capsys)[0]
     assert report["skipped_already_final"]["count"] == 1
     assert report["stale_planned"]["count"] == 1
+
+
+# --------------------------------- почасовое расписание доезжает до кабинета
+
+
+class _ScheduleClient:
+    """Кампания 111 с ровным расписанием: профиль обязан дать одно действие."""
+
+    instances = []
+
+    def __init__(self, login, sandbox=True, dry_run=True):
+        self.login = login
+        self.units_left = None
+        self.sent = []
+        self.reads = []
+        _ScheduleClient.instances.append(self)
+
+    def get(self, service, params):
+        self.reads.append((service, params))
+        if service == "campaigns":
+            # Читается двумя разными запросами: список кампаний и расписание.
+            if "TimeTargeting" in (params.get("FieldNames") or []):
+                return {"Campaigns": [{"Id": 111, "TimeTargeting": {
+                    "Schedule": {"Items": ["1," + ",".join(["100"] * 24)]},
+                    "ConsiderWorkingWeekends": "YES"}}]}
+            return {"Campaigns": [{"Id": 111}]}
+        if service == "bidmodifiers":
+            return {"BidModifiers": []}
+        raise AssertionError(f"неожиданный сервис: {service}")
+
+    def mutate(self, service, method, params):
+        self.sent.append((service, method, params))
+        return {"dry_run": True}
+
+
+def _patch_schedule_run(monkeypatch, settings):
+    _ScheduleClient.instances = []
+    monkeypatch.setattr(agent_e1, "_clients", lambda: [{"login": "acc-1"}])
+    monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables", lambda: None)
+    monkeypatch.setattr(agent_e1.agent_db, "load_latest_computed_settings",
+                        lambda *_: settings)
+    monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", lambda: [])
+    monkeypatch.setattr(agent_e1.agent_db, "load_daily_cost_by_campaign",
+                        lambda *_: {"111": 500.0})
+    monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa", lambda *_: {"111": 1000.0})
+    monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
+    monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
+    monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: [])
+    monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
+    monkeypatch.setattr(agent_e1.writer_db, "insert_action", lambda action: 1)
+    monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: True)
+    monkeypatch.setattr(agent_e1.writer_db, "mark_unknown_outcome", lambda *a, **k: True)
+    monkeypatch.setattr(agent_e1, "WriteClient", _ScheduleClient)
+    _patch_infra(monkeypatch)
+
+
+def test_schedule_reaches_the_cabinet(monkeypatch, capsys):
+    """Сквозная половина: посчитанный профиль обязан дойти до запроса.
+
+    Проверять один plan_schedule недостаточно — ровно так дефект и выживал
+    бы: ветка написана, протестирована и никем не вызывается. Здесь
+    фиксируется сам запрос к API.
+    """
+    _patch_schedule_run(monkeypatch, [_setting("schedule:hour", "3", -40.0)])
+
+    assert agent_e1.main() == 0
+    capsys.readouterr()
+
+    sent = [s for c in _ScheduleClient.instances for s in c.sent]
+    campaigns_calls = [s for s in sent if s[0] == "campaigns"]
+    assert campaigns_calls, "расписание не ушло в кабинет"
+
+    service, method, params = campaigns_calls[0]
+    assert (service, method) == ("campaigns", "update")
+    targeting = params["Campaigns"][0]["TimeTargeting"]
+    # Ночной час опущен, шкала 100-базная, кратность десяти соблюдена.
+    assert targeting["Schedule"]["Items"][0].split(",")[1 + 3] == "60"
+    # Соседнее поле кабинета перенесено, а не сброшено.
+    assert targeting["ConsiderWorkingWeekends"] == "YES"
+
+
+def test_schedule_is_reported_even_when_it_changes_nothing(monkeypatch, capsys):
+    # «Профиля нет» и «профиль есть, но в кабинете уже стоит» обязаны
+    # различаться: иначе оба выглядят как молчание прогона.
+    _patch_schedule_run(monkeypatch, [_setting("schedule:hour", "3", 1.0)])
+
+    assert agent_e1.main() == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["schedule"]["significant_hours"] == 0
+    assert "пороги значимости" in report["schedule"]["reason"]
+
+
+def test_schedule_alone_is_enough_to_work(monkeypatch, capsys):
+    """Кабинет без значимых корректировок, но со значимым профилем.
+
+    Ранний выход «нечего делать» стоял ДО расчёта расписания и молча уносил
+    посчитанный профиль с собой: у расписания свой механизм, и отсутствие
+    корректировок ничего о нём не говорит.
+    """
+    _patch_schedule_run(monkeypatch, [_setting("schedule:hour", "3", -40.0)])
+
+    assert agent_e1.main() == 0
+    report = json.loads(capsys.readouterr().out)
+
+    # Полный отчёт (а не короткий с verdict) — прогон нашёл, что делать.
+    assert "verdict" not in report
+    assert report["schedule"]["campaigns_differing"] == 1
+    assert report["desired"] == 0, "корректировок нет, работа только по расписанию"
+
+
+def test_stale_settings_block_the_schedule_too(monkeypatch, capsys):
+    # Профиль посчитан по тем же данным, что и корректировки: «данные
+    # протухли» не перестаёт быть правдой оттого, что механизм другой.
+    old = (date.today() - timedelta(days=30)).isoformat()
+    _patch_schedule_run(monkeypatch, [_setting("schedule:hour", "3", -40.0, calc_date=old)])
+
+    assert agent_e1.main() == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["verdict"] == "STALE_COMPUTED_SETTINGS"
+    sent = [s for c in _ScheduleClient.instances for s in c.sent]
+    assert sent == [], "устаревший профиль ушёл в кабинет"
+
+
+def test_schedule_is_not_read_when_there_is_nothing_to_apply(monkeypatch, capsys):
+    # Чтение расписания — лишний запрос к API на каждую кампанию кабинета.
+    # Профиля нет — запроса быть не должно.
+    _patch_schedule_run(monkeypatch, [_setting("bid_modifier:device", "MOBILE", 30.0)])
+
+    agent_e1.main()
+    capsys.readouterr()
+
+    reads = [r for c in _ScheduleClient.instances for r in c.reads]
+    targeting_reads = [r for r in reads
+                       if r[0] == "campaigns" and "TimeTargeting" in (r[1].get("FieldNames") or [])]
+    assert targeting_reads == []
