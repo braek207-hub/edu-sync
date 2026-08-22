@@ -76,11 +76,8 @@ ads = call(
             "BusinessId",
             "PreferVCardOverBusiness",
             "ButtonExtension",
-            "TrackingParams",
-            "Carousel",
-            "LogoExtensionHash",
         ],
-        "TextImageAdFieldNames": ["AdImageHash", "Href", "TurboPageId", "TrackingParams"],
+        "TextImageAdFieldNames": ["AdImageHash", "Href", "TurboPageId"],
         "Page": {"Limit": 40},
     },
 )
@@ -145,6 +142,24 @@ if not err(uc):
         counters.update(((c.get("UnifiedCampaign") or {}).get("CounterIds") or {}).get("Items") or [])
 print("  counters:", sorted(counters))
 if counters:
+    # Раунд 2: /json/v5/goals отдал 404 (не JSON). Пробуем оба хоста и обе версии —
+    # edu-sync ходит на api.direct.yandex.com, но там сервиса может не быть.
+    for base in (V5, V501, "https://api.direct.yandex.ru/json/v5"):
+        raw = requests.post(
+            f"{base}/goals",
+            headers={
+                "Authorization": f"Bearer {TOKEN}",
+                "Client-Login": LOGIN,
+                "Accept-Language": "ru",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            data=json.dumps(
+                {"method": "get", "params": {"SelectionCriteria": {"CounterIds": sorted(counters)[:10]}, "FieldNames": ["Id", "Name", "Type"]}},
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            timeout=60,
+        )
+        print(f"  goals [{base}]: HTTP {raw.status_code} {raw.text[:200]}")
     g = call(V5, "goals", {"SelectionCriteria": {"CounterIds": sorted(counters)[:10]}, "FieldNames": ["Id", "Name", "Type"]})
     if err(g):
         print("  goals v5:", err(g))
