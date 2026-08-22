@@ -59,8 +59,34 @@ def _python_files(paths):
                     yield item
 
 
+def _rel(path: pathlib.Path) -> str:
+    """Путь для человека. Вне репозитория (временный файл теста) — как есть."""
+    try:
+        return str(path.relative_to(REPO)).replace("\\", "/")
+    except ValueError:
+        return path.name
+
+
+class UnparsableFile(Exception):
+    """Файл не разбирается — обычно маркеры конфликта после rebase."""
+
+
 def _parse(path: pathlib.Path) -> ast.AST:
-    return ast.parse(path.read_text(encoding="utf-8"))
+    """Разбор с внятным отказом.
+
+    Молча пропустить нечитаемый файл нельзя: если единственный вызов сироты
+    живёт именно в нём, гейт объявит сироту сиротой и соврёт. Считать его
+    «без вызовов» — тоже враньё, только в другую сторону. Поэтому — остановка
+    с именем файла, а не сырой SyntaxError на полтора экрана.
+    """
+    try:
+        return ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        raise UnparsableFile(
+            f"{_rel(path)}: файл не разбирается ({exc.msg}, строка "
+            f"{exc.lineno}). Гейт не может судить о вызовах, пока файл сломан — "
+            "чаще всего это незакрытые маркеры конфликта после rebase."
+        ) from None
 
 
 def _defined_in_agent() -> Dict[str, str]:
@@ -186,3 +212,22 @@ def test_tests_do_not_count_as_callers():
     # попадать в множество «вызывается».
     marker = "_orphan_gate_marker_that_lives_only_in_this_test"
     assert marker not in _used_names()
+
+
+def test_broken_file_names_itself_instead_of_a_raw_traceback(tmp_path):
+    """Нечитаемый файл обязан назваться.
+
+    Поймано на живом дереве: чужой файл с маркерами конфликта после rebase
+    ронял гейт сырым SyntaxError, и по выводу нельзя было понять ни что
+    сломано, ни что гейт вообще ни при чём.
+    """
+    broken = tmp_path / "broken.py"
+    broken.write_text("<<<<<<< HEAD\ndef f():\n    pass\n", encoding="utf-8")
+
+    try:
+        _parse(broken)
+    except UnparsableFile as exc:
+        assert "broken.py" in str(exc)
+        assert "конфликт" in str(exc)
+    else:
+        raise AssertionError("сломанный файл разобрался — так не бывает")
