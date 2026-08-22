@@ -34,7 +34,10 @@ import requests
 from sync.db import get_connection
 
 METRICA_COUNTER_ID = "82116769"
-METRICA_ATTRIBUTION = "lastsign"
+# Автоматическая (кросс-девайс) атрибуция — как в интерфейсе Метрики, чтобы числа
+# дашборда сходились с ним 1в1. Кросс-девайс дозревает задним числом (~2 недели) —
+# ежедневный delete-from+upsert на окно синка переписывает историю сам.
+METRICA_ATTRIBUTION = "cross_device_last_significant"
 DEFAULT_SYNC_DAYS = 60
 
 DIRECT_CLIENT_LOGIN = "meshnflesh"
@@ -185,11 +188,11 @@ def fetch_metrica_sources(token: str, date_from: str, date_to: str) -> list[dict
     dimensions = ",".join(
         [
             "ym:s:date",
-            "ym:s:lastSignTrafficSource",
-            "ym:s:lastsignSourceEngineName",
-            "ym:s:lastSignUTMSource",
-            "ym:s:lastSignUTMMedium",
-            "ym:s:lastSignUTMCampaign",
+            "ym:s:<attribution>TrafficSource",
+            "ym:s:<attribution>SourceEngineName",
+            "ym:s:<attribution>UTMSource",
+            "ym:s:<attribution>UTMMedium",
+            "ym:s:<attribution>UTMCampaign",
         ]
     )
     metrics = ",".join(
@@ -277,10 +280,10 @@ def fetch_metrica_purchases(token: str, date_from: str, date_to: str) -> list[di
             "ym:s:date",
             "ym:s:purchaseID",
             "ym:s:clientID",
-            "ym:s:lastSignTrafficSource",
-            "ym:s:lastSignUTMSource",
-            "ym:s:lastSignUTMMedium",
-            "ym:s:lastSignUTMCampaign",
+            "ym:s:<attribution>TrafficSource",
+            "ym:s:<attribution>UTMSource",
+            "ym:s:<attribution>UTMMedium",
+            "ym:s:<attribution>UTMCampaign",
         ]
     )
     by_order: dict[str, dict[str, Any]] = {}
