@@ -1,25 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-probe_device_conflict.py — DESKTOP и TABLET в Директе несовместимы.
+probe_device_conflict.py — можно ли задать несколько корректировок устройств.
 
-Установлено экспериментом, вопреки документации:
+Что уже установлено:
+  · 32559366898 — TABLET поверх только что созданного DESKTOP отвергнут:
+    Code 6000 «Условия в корректировках пересекаются»;
+  · 32561294615 — TABLET отвергнут и в паре с нейтральным MOBILE (DESKTOP при
+    этом УЖЕ СТОЯЛ в кампании отдельно), MOBILE в том же запросе принят;
+  · 32561534117 — TABLET в кампанию БЕЗ десктопной корректировки принят.
 
-  · первая боевая запись (32559366898): TABLET отвергнут с Code 6000 «Условия
-    в корректировках пересекаются» — в кампании уже стоял DESKTOP;
-  · 32561294615: гипотеза «набор устройств надо слать целиком» ОПРОВЕРГНУТА —
-    TABLET отвергнут и в паре с нейтральным MOBILE, причём MOBILE приняли;
-  · 32561534117: тот же TABLET в кампанию БЕЗ DESKTOP-корректировки — ПРИНЯТ.
+Слабое место этих опытов: во всех случаях десктопная корректировка либо уже
+существовала, либо отсутствовала — но ни разу DESKTOP и TABLET не отправлялись
+ВМЕСТЕ, одним запросом, в чистую кампанию. Именно это и надо проверить, прежде
+чем утверждать «одновременно нельзя»: возможно, нельзя лишь ДОБАВЛЯТЬ вторую
+к существующей, а согласованный набор проходит.
 
-Вывод: пересекается TABLET именно с DESKTOP. Справочник Яндекса утверждает
-обратное («компьютеры, Smart TV» против «планшеты» — разные категории), но
-кабинет отвечает иначе, и прав кабинет.
+Опыт: кампания без корректировок устройств, нейтральные значения (100 — ставок
+не меняют), три варианта по возрастанию:
+  A) DESKTOP + TABLET одним запросом;
+  B) MOBILE + DESKTOP + TABLET одним запросом;
+  C) те же по одной, последовательно — контроль.
+После каждого варианта состояние перечитывается и всё созданное удаляется:
+Id в ответе add приходит пустым (побочная находка 32561534117), поэтому уборка
+идёт только перечитыванием.
 
-Побочная находка: bidmodifiers.add вернул успех с Id = null. Уборка по Id из
-ответа поэтому не сработала — след эксперимента пришлось искать перечитыванием.
-Тот же дефект отмечен в движке записи как отложенный (read-back после
-неизвестного исхода): полагаться на Id из ответа add нельзя.
-
-Режим по умолчанию — уборка: найти нейтральные TABLET-корректировки и удалить.
+Без --apply ничего не отправляет.
 Запуск: python probe_device_conflict.py [--apply]
 ENV: DIRECT_TOKEN, DIRECT_CLIENTS_JSON
 """
@@ -35,6 +40,10 @@ CAMPAIGNS_URL = "https://api.direct.yandex.com/json/v5/campaigns"
 
 ACCOUNT = "account10-506462-fqs4"
 NEUTRAL = 100
+DEVICE_TYPES = ("MOBILE_ADJUSTMENT", "DESKTOP_ADJUSTMENT", "TABLET_ADJUSTMENT")
+FIELD = {"MOBILE_ADJUSTMENT": "MobileAdjustment",
+         "DESKTOP_ADJUSTMENT": "DesktopAdjustment",
+         "TABLET_ADJUSTMENT": "TabletAdjustment"}
 
 
 def _post(url, login, payload):
@@ -63,73 +72,96 @@ def _verdict(result, collection="AddResults"):
     for element in items:
         errors = element.get("Errors") or []
         if errors:
-            out.append("ОТКАЗ: " + "; ".join(
+            out.append("ОТКАЗ " + "; ".join(
                 f"{e.get('Code')} {e.get('Details') or e.get('Message')}" for e in errors))
         else:
-            out.append(f"ПРИНЯТО, Id={element.get('Id')}")
+            out.append("ПРИНЯТО")
     return " | ".join(out) or json.dumps(result, ensure_ascii=False)[:300]
 
 
 def _campaign_ids(login, limit=100):
-    """Только НЕ заархивированные: архив править запрещено (ошибка 8300)."""
     result = _post(CAMPAIGNS_URL, login, {
         "method": "get",
-        "params": {
-            "SelectionCriteria": {"States": ["ON", "OFF", "SUSPENDED"]},
-            "FieldNames": ["Id"],
-            "Page": {"Limit": limit, "Offset": 0},
-        },
+        "params": {"SelectionCriteria": {"States": ["ON", "OFF", "SUSPENDED"]},
+                   "FieldNames": ["Id"], "Page": {"Limit": limit, "Offset": 0}},
     })
     return [int(c["Id"]) for c in (result.get("result") or {}).get("Campaigns", [])]
 
 
-def _tablet_modifiers(login, campaign_ids):
-    """Планшетные корректировки с их значениями — для поиска следов probe."""
+def _device_state(login, campaign_ids):
+    """Корректировки устройств по кампаниям: {campaign_id: {type: id}}."""
     result = _post(BIDMODIFIERS_URL, login, {
         "method": "get",
         "params": {
             "SelectionCriteria": {"CampaignIds": campaign_ids, "Levels": ["CAMPAIGN"]},
             "FieldNames": ["Id", "CampaignId", "Type"],
-            "TabletAdjustmentFieldNames": ["BidModifier"],
         },
     })
-    out = []
+    out = {}
     for item in (result.get("result") or {}).get("BidModifiers", []):
-        if item.get("Type") == "TABLET_ADJUSTMENT":
-            out.append({
-                "Id": item.get("Id"),
-                "CampaignId": item.get("CampaignId"),
-                "BidModifier": (item.get("TabletAdjustment") or {}).get("BidModifier"),
-            })
+        if item.get("Type") in DEVICE_TYPES:
+            out.setdefault(int(item["CampaignId"]), {})[item["Type"]] = item.get("Id")
     return out
+
+
+def _cleanup(login, campaign_id):
+    """Удаляет ВСЕ корректировки устройств кампании — по перечитыванию, а не по
+    Id из ответа add: тот приходит пустым."""
+    state = _device_state(login, [campaign_id]).get(campaign_id, {})
+    ids = [i for i in state.values() if i]
+    if not ids:
+        return "убирать нечего"
+    result = _post(BIDMODIFIERS_URL, login, {
+        "method": "delete", "params": {"SelectionCriteria": {"Ids": ids}}})
+    return f"удалено {ids}: {_verdict(result, 'DeleteResults')}"
+
+
+def _item(campaign_id, direct_type):
+    return {"CampaignId": campaign_id, FIELD[direct_type]: {"BidModifier": NEUTRAL}}
 
 
 def main() -> int:
     apply = "--apply" in sys.argv
 
     ids = _campaign_ids(ACCOUNT)
-    tablets = _tablet_modifiers(ACCOUNT, ids)
-    print(f"кампаний не в архиве: {len(ids)}; планшетных корректировок: {len(tablets)}")
-    for item in tablets:
-        print("  " + json.dumps(item, ensure_ascii=False))
-
-    # Нейтральная планшетная корректировка ставок не меняет, но это след
-    # эксперимента в боевом кабинете, и его надо убрать.
-    litter = [t for t in tablets if t["BidModifier"] == NEUTRAL and t["Id"]]
-    if not litter:
-        print("следов probe не найдено — убирать нечего")
+    state = _device_state(ACCOUNT, ids)
+    clean = [cid for cid in ids if not state.get(cid)]
+    print(f"кампаний не в архиве: {len(ids)}; без корректировок устройств: {len(clean)}")
+    if not clean:
+        print("нет чистой кампании — опыт невозможен")
         return 0
 
-    print(f"\nк удалению: {[t['Id'] for t in litter]}")
+    target = clean[0]
+    print(f"подопытная кампания: {target} (значения нейтральные, ставок не меняют)")
     if not apply:
-        print("(репетиция, ничего не удалено — нужен --apply)")
+        print("\nРепетиция: ничего не отправлено. Нужен --apply.")
         return 0
 
-    deleted = _post(BIDMODIFIERS_URL, ACCOUNT, {
-        "method": "delete",
-        "params": {"SelectionCriteria": {"Ids": [t["Id"] for t in litter]}},
-    })
-    print("  " + _verdict(deleted, "DeleteResults"))
+    print(f"\n--- A: DESKTOP + TABLET одним запросом")
+    res = _post(BIDMODIFIERS_URL, ACCOUNT, {"method": "add", "params": {"BidModifiers": [
+        _item(target, "DESKTOP_ADJUSTMENT"), _item(target, "TABLET_ADJUSTMENT")]}})
+    print("  " + _verdict(res))
+    print("  состояние после: " + json.dumps(
+        _device_state(ACCOUNT, [target]).get(target, {}), ensure_ascii=False))
+    print("  " + _cleanup(ACCOUNT, target))
+
+    print(f"\n--- B: MOBILE + DESKTOP + TABLET одним запросом")
+    res = _post(BIDMODIFIERS_URL, ACCOUNT, {"method": "add", "params": {"BidModifiers": [
+        _item(target, t) for t in DEVICE_TYPES]}})
+    print("  " + _verdict(res))
+    print("  состояние после: " + json.dumps(
+        _device_state(ACCOUNT, [target]).get(target, {}), ensure_ascii=False))
+    print("  " + _cleanup(ACCOUNT, target))
+
+    print(f"\n--- C: по одной, последовательно (контроль)")
+    for direct_type in ("DESKTOP_ADJUSTMENT", "TABLET_ADJUSTMENT"):
+        res = _post(BIDMODIFIERS_URL, ACCOUNT, {
+            "method": "add", "params": {"BidModifiers": [_item(target, direct_type)]}})
+        print(f"  {direct_type}: {_verdict(res)}")
+    print("  состояние после: " + json.dumps(
+        _device_state(ACCOUNT, [target]).get(target, {}), ensure_ascii=False))
+    print("  " + _cleanup(ACCOUNT, target))
+
     return 0
 
 
