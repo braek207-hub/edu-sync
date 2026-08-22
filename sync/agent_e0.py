@@ -36,7 +36,7 @@ from sync.agent.metrika import (
     fetch_campaign_behavior,
     fetch_counter_goal_ids,
     fetch_hourly_profile,
-    merge_hourly,
+    resolve_counter_account,
 )
 from sync.agent.mining import mine_quasi_experiments
 from sync.agent.objects import (
@@ -343,12 +343,18 @@ def main() -> int:
                       if f["fact_date"] >= slice_from and (f["cost"] > 0 or f["leads"] > 0)}
     object_rows: List[Dict[str, Any]] = []
     query_rows: List[Dict[str, Any]] = []
+    login_by_campaign_id: Dict[str, str] = {}
     for client in clients:
         login, goals = client["login"], client["goal_ids"]
+        account_campaigns = fetch_campaign_ids(login)
+        # Архивные кампании здесь нужны: справочник «кампания → кабинет»
+        # тем точнее, чем шире, а Метрика показывает и то, что уже выключено.
+        for cid in account_campaigns:
+            login_by_campaign_id[str(cid)] = login
         # Только ЖИВЫЕ кампании окна, а не весь кабинет за всю историю:
         # fetch_campaign_ids отдавал все 163+ кампании включая архивные, и снимок
         # структуры раздувался до 367k строк / 378 МБ (прогон 31785888375).
-        campaign_ids = [cid for cid in fetch_campaign_ids(login) if str(cid) in live_campaigns]
+        campaign_ids = [cid for cid in account_campaigns if str(cid) in live_campaigns]
         for level in ("adgroup", "keyword", "ad"):
             object_rows += build_object_rows(
                 fetch_objects(login, level, campaign_ids), level, seen_on=today_iso)
@@ -401,10 +407,22 @@ def main() -> int:
 
     # 9. Обогащение Метрикой: почасовой профиль (Директ HourOfDay не отдаёт) и
     # поведение по кампаниям — ранний сигнал качества до созревания оплат.
+    #
+    # Метрика отдаёт имя кампании, а не Id (probe 31788247020) — резолвим по
+    # фактам. Справочник нужен здесь дважды: привязать счётчик к кабинету и
+    # привязать поведение к кампании.
+    id_by_name = {str(f.get("campaign_name") or "").strip(): f["campaign_id"]
+                  for f in facts if f.get("campaign_name")}
+    login_by_campaign_name = {
+        name: login_by_campaign_id[str(cid)]
+        for name, cid in id_by_name.items() if str(cid) in login_by_campaign_id
+    }
     hourly_rows: List[Dict[str, Any]] = []
     hourly_skipped: List[Dict[str, Any]] = []
     hourly_numerator: List[Dict[str, Any]] = []
     behavior_rows: List[Dict[str, Any]] = []
+    profile_by_counter: Dict[int, List[Dict[str, Any]]] = {}
+    names_by_counter: Dict[int, set] = {}
     if not skip_direct and os.environ.get("YM_TOKEN"):
         for counter in EDU_COUNTERS:
             try:
@@ -417,49 +435,53 @@ def main() -> int:
                     rows, chosen = fetch_hourly_profile(counter, cutoff, date_to,
                                                         counter_goals)
                     hourly_rows += rows
+                    profile_by_counter[counter] = rows
                     # Чем именно считали — в отчёт. «Самая массовая колонка»
                     # без имени рядом уже приводила сюда микроцель прокрутки.
                     hourly_numerator.append({"counter": counter, **chosen})
                 else:
                     hourly_skipped.append(
                         {"counter": counter, "reason": "целей Директа нет на счётчике"})
-                behavior_rows += fetch_campaign_behavior(counter, slice_from, date_to)
+                counter_behavior = fetch_campaign_behavior(counter, slice_from, date_to)
+                behavior_rows += counter_behavior
+                names_by_counter[counter] = {r["campaign_name"] for r in counter_behavior}
             except Exception as exc:  # счётчик может быть недоступен токену
                 agent_db.insert_guard_checks([{
                     "check_name": f"metrika:{counter}", "status": "FAIL",
                     "detail": {"error": f"{type(exc).__name__}: {exc}"[:300]},
                 }])
 
-    if hourly_rows:
-        # Счётчиков у EDU три, и их строки надо СЛОЖИТЬ по часу, а не просто
-        # склеить: иначе база считается по всем счётчикам сразу, а каждая
-        # строка — по своему, и профиль счётчика с конверсией ниже общей
-        # опускает у себя все двадцать четыре часа (см. metrika.merge_hourly).
-        hourly_rows = merge_hourly(hourly_rows)
+    # Расписание считается ПО СЧЁТЧИКУ и пишется кабинету, которому счётчик
+    # принадлежит. Раньше профили трёх счётчиков складывались в один и
+    # раскатывались на все кабинеты — а счётчики о сутках не согласны: проба
+    # 32579085232 дала у 98627983 часы 02-05 на уровне 130, у 96526110 те же
+    # часы на уровне 90. Кампания ведёт на ОДИН сайт, и профиль чужого сайта
+    # для неё — та же ошибка «величина посчитана по чужой популяции», что уже
+    # чинилась в этом файле дважды.
+    for counter, rows in profile_by_counter.items():
+        login = resolve_counter_account(names_by_counter.get(counter) or set(),
+                                        login_by_campaign_name)
+        if not login:
+            # Привязки нет — расписание применять некуда. Записать его «всем»
+            # значило бы вернуть исходный дефект под другим именем.
+            hourly_skipped.append(
+                {"counter": counter, "reason": "счётчик не привязан к кабинету"})
+            continue
         # База считается внутри compute_schedule по тем же строкам: внешняя база
         # в чужих единицах — та самая ошибка, что вырождала сегментные корректировки.
-        schedule_rows, schedule_reason = compute_schedule(hourly_rows)
+        schedule_rows, schedule_reason = compute_schedule(rows)
         if schedule_reason:
             computed_skipped.append(
-                {"account": "*", "slice": "hour", "reason": schedule_reason})
+                {"account": login, "slice": "hour", "reason": schedule_reason})
             agent_db.insert_guard_checks([{
-                "check_name": "computed:*:hour", "status": "SKIP",
-                "detail": {"reason": schedule_reason},
+                "check_name": f"computed:{login}:hour", "status": "SKIP",
+                "detail": {"reason": schedule_reason, "counter": counter},
             }])
-        # Почасовой профиль посчитан по счётчикам Метрики всего EDU, а не
-        # по одному кабинету, но применяется в каждом — пишем его под
-        # каждым логином. Хранить его под общим «ничьим» идентификатором
-        # нельзя: тогда загрузчик, который читает настройки строго по
-        # кабинету, не найдёт расписание ни для одного из них.
         if schedule_rows:
-            for client in clients:
-                agent_db.upsert_computed_settings(
-                    schedule_rows, calc_date=today_iso, object_id=client["login"])
-                computed_count += len(schedule_rows)
+            agent_db.upsert_computed_settings(
+                schedule_rows, calc_date=today_iso, object_id=login)
+            computed_count += len(schedule_rows)
 
-    # Метрика отдаёт имя кампании, а не Id (probe 31788247020) — резолвим по фактам.
-    id_by_name = {str(f.get("campaign_name") or "").strip(): f["campaign_id"]
-                  for f in facts if f.get("campaign_name")}
     resolved_behavior = []
     unresolved = 0
     for row in behavior_rows:

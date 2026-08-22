@@ -264,33 +264,43 @@ def fetch_hourly_profile(counter_id: int, date_from: str, date_to: str,
     }
 
 
-def merge_hourly(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Почасовые строки НЕСКОЛЬКИХ счётчиков → один профиль, сложенный по часу.
+MIN_COUNTER_ACCOUNT_SHARE = 0.5
 
-    Дефект, который это закрывает (сухой прогон 32568178620): строки трёх
-    счётчиков EDU просто складывались в один список, и для каждого часа
-    оказывалось три отдельные строки. Конверсионность у счётчиков разная —
-    0.385, 0.340 и 0.285 на замере 22.08.2026, — а база считается по сумме
-    ВСЕХ строк. В итоге у счётчика с конверсией ниже общей ВСЕ 24 часа
-    уходили вниз (0.285 / 0.36 ≈ 0.79), у счётчика выше — все вверх, а при
-    записи по ключу (кабинет, вид, час) последний перетирал остальные.
-    Расписание получалось «22 часа из 24 опустить» — то есть профилем
-    счётчика, а не профилем суток.
 
-    Правильная величина — конверсионность ЧАСА ПО ВСЕМУ EDU: визиты и
-    достижения целей складываются, и только потом считается отношение.
+def resolve_counter_account(campaign_names: Any,
+                            login_by_campaign_name: Dict[str, str],
+                            min_share: float = MIN_COUNTER_ACCOUNT_SHARE) -> Any:
+    """Кабинет Директа, которому принадлежит счётчик. None — привязки нет.
+
+    Зачем. Почасовой профиль накладывается на TimeTargeting КАМПАНИИ, а
+    кампания ведёт на ОДИН сайт. Раньше профили трёх счётчиков складывались в
+    один и раскатывались на все кабинеты — а счётчики о сутках не согласны:
+    проба 32579085232 дала у 98627983 часы 02-05 на уровне 130, у 96526110 те
+    же часы на уровне 90. Слитый профиль решал спор объёмом, и кампаниям
+    меньшего счётчика доставалось расписание чужого сайта.
+
+    Проба 32579931952 показала, что связь счётчик↔кабинет однозначная:
+    98627983 → 93 % имён кампаний одного кабинета, 96526110 → 90 % другого,
+    95348914 → 75 % третьего, а четвёртый кабинет (5 кампаний) не принадлежит
+    ни одному счётчику. Поэтому привязка выводится из данных каждый прогон, а
+    не задаётся константой: кампании переезжают, кабинеты добавляются.
+
+    Порог доли обязателен. Без него кабинет, поймавший одно случайное совпадение
+    имени, получил бы чужое расписание — а это ровно тот отказ, который надо
+    видеть, а не сглаживать.
     """
-    merged: Dict[str, Dict[str, Any]] = {}
-    for row in rows or []:
-        key = str(row.get("segment_key"))
-        slot = merged.setdefault(key, {
-            "segment_kind": "hour", "segment_key": key,
-            "clicks": 0, "leads": 0, "sum_p_pay": 0.0,
-        })
-        slot["clicks"] += int(row.get("clicks") or 0)
-        slot["leads"] += int(row.get("leads") or 0)
-        slot["sum_p_pay"] += float(row.get("sum_p_pay") or 0.0)
-    return sorted(merged.values(), key=lambda r: int(r["segment_key"]))
+    names = [str(n).strip() for n in campaign_names if str(n).strip()]
+    if not names:
+        return None
+    hits: Dict[str, int] = {}
+    for name in names:
+        login = login_by_campaign_name.get(name)
+        if login:
+            hits[login] = hits.get(login, 0) + 1
+    if not hits:
+        return None
+    best = max(hits, key=lambda k: (hits[k], k))
+    return best if hits[best] / len(names) >= min_share else None
 
 
 def fetch_campaign_behavior(counter_id: int, date_from: str, date_to: str) -> List[Dict[str, Any]]:

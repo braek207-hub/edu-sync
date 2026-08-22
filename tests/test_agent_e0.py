@@ -18,6 +18,7 @@ tests/test_agent_e0.py — тесты расчётной стороны Э0.
 """
 
 import json as _json
+from datetime import date
 
 import sync.agent_e0 as agent_e0
 from sync.agent.guard import check_freshness as real_check_freshness
@@ -126,6 +127,10 @@ _REPORTS_DEGENERATE = {
     "acc-1": _segment_rows(("MOBILE", 50000, 1000), ("DESKTOP", 10000, 200)),
     "acc-2": _segment_rows(("TABLET", 50000, 1000), ("DESKTOP", 10000, 200)),
 }
+
+
+def _today():
+    return date.today().isoformat()
 
 
 def _fact(today):
@@ -418,87 +423,69 @@ def test_direct_keeps_the_strict_threshold(monkeypatch, capsys):
 
 # --------------- почасовой профиль: счётчики складываются, а не склеиваются
 
-def test_hourly_rows_of_several_counters_are_summed_per_hour():
-    """Дефект прогона 32568178620: расписание опускало 22 часа из 24.
+def test_counter_is_bound_to_the_account_that_owns_its_campaigns():
+    """Профиль накладывается на TimeTargeting КАМПАНИИ, а кампания ведёт на
+    ОДИН сайт. Значит счётчик обязан быть привязан к своему кабинету.
 
-    Строки трёх счётчиков EDU складывались в один список, и на каждый час
-    приходилось три отдельные строки. Конверсионность у счётчиков разная
-    (0.385 / 0.340 / 0.285 на замере 22.08.2026), а база считается по сумме
-    ВСЕХ строк — поэтому у счётчика ниже общей базы все часы уходили вниз,
-    у счётчика выше — все вверх, а запись по ключу (кабинет, вид, час)
-    оставляла профиль последнего.
+    Проба 32579931952: связь однозначная — 98627983 узнаётся по 93 % имён
+    кампаний одного кабинета, 96526110 по 90 % другого, 95348914 по 75 %
+    третьего.
     """
-    from sync.agent.metrika import merge_hourly
+    from sync.agent.metrika import resolve_counter_account
 
-    rows = [
-        {"segment_kind": "hour", "segment_key": "9", "clicks": 100, "leads": 40,
-         "sum_p_pay": 40.0},
-        {"segment_kind": "hour", "segment_key": "9", "clicks": 300, "leads": 60,
-         "sum_p_pay": 60.0},
-    ]
-    merged = merge_hourly(rows)
+    login_by_name = {"к1": "acc-1", "к2": "acc-1", "к3": "acc-2"}
 
-    assert len(merged) == 1
-    assert merged[0]["clicks"] == 400
-    assert merged[0]["sum_p_pay"] == 100.0
-    # Конверсионность часа по ВСЕМУ EDU — 100/400, а не 0.4 и не 0.2 по
-    # отдельности: это и есть величина, которую сравнивают с базой.
+    assert resolve_counter_account({"к1", "к2"}, login_by_name) == "acc-1"
+    assert resolve_counter_account({"к3"}, login_by_name) == "acc-2"
 
 
-def test_merged_profile_keeps_half_the_hours_above_base():
-    """Сквозная проверка здравого смысла: коэффициент — отношение часа к базе
-    ИЗ ТЕХ ЖЕ строк, поэтому примерно половина часов обязана быть выше неё.
+def test_one_stray_campaign_name_does_not_hand_over_the_schedule():
+    """Порог доли обязателен: кабинет, поймавший одно случайное совпадение
+    имени, получил бы расписание чужого сайта — а это ровно тот отказ, который
+    надо видеть, а не сглаживать.
 
-    Именно это утверждение и нарушалось: 22 часа из 24 внизу — признак того,
-    что база и часы считаются по разным множествам.
+    В пробе такие совпадения и были: 1/42 и 1/30 у постороннего кабинета.
     """
-    from sync.agent.metrika import merge_hourly
-    from sync.agent.computed import compute_schedule
+    from sync.agent.metrika import resolve_counter_account
 
-    rows = []
-    for counter_conv, visits in ((0.40, 1000), (0.20, 1000)):
-        for hour in range(24):
-            # Внутри счётчика часы слегка разные, между счётчиками — разный
-            # уровень: ровно та картина, что была в бою.
-            conv = counter_conv * (0.9 + 0.2 * (hour % 2))
-            rows.append({"segment_kind": "hour", "segment_key": str(hour),
-                         "clicks": visits, "leads": int(visits * conv),
-                         "sum_p_pay": visits * conv})
+    names = {"чужая-%d" % i for i in range(41)} | {"к1"}
 
-    out, reason = compute_schedule(merge_hourly(rows))
-
-    assert reason is None
-    above = sum(1 for r in out if r["value"] > 0)
-    below = sum(1 for r in out if r["value"] < 0)
-    assert above > 0 and below > 0, "все часы уехали в одну сторону"
-    assert abs(above - below) <= 2, f"перекос: вверх {above}, вниз {below}"
+    assert resolve_counter_account(names, {"к1": "acc-1"}) is None
 
 
-def test_merge_hourly_is_noop_for_single_counter():
-    from sync.agent.metrika import merge_hourly
+def test_counter_without_any_known_campaign_has_no_account():
+    from sync.agent.metrika import resolve_counter_account
 
-    rows = [{"segment_kind": "hour", "segment_key": str(h), "clicks": 10,
-             "leads": 1, "sum_p_pay": 1.0} for h in range(24)]
-    merged = merge_hourly(rows)
-
-    assert len(merged) == 24
-    assert [int(r["segment_key"]) for r in merged] == list(range(24))
+    assert resolve_counter_account(set(), {"к1": "acc-1"}) is None
+    assert resolve_counter_account({"неизвестная"}, {"к1": "acc-1"}) is None
 
 
-def test_main_merges_hourly_counters_before_computing_schedule(monkeypatch, capsys):
-    """Сквозная половина: слияние счётчиков обязано СЛУЧИТЬСЯ в прогоне.
+def test_each_counter_profile_goes_to_its_own_account_only(monkeypatch, capsys):
+    """Сквозная половина: разделение обязано СЛУЧИТЬСЯ в прогоне.
 
-    Проверять один merge_hourly недостаточно — ровно так дефект и выживал бы:
-    функция написана, покрыта тестами и никем не вызвана. Здесь фиксируется
-    то, что уходит в расчёт расписания.
+    Раньше профили трёх счётчиков складывались в один и писались под каждым
+    логином. Счётчики о сутках не согласны — проба 32579085232 дала у 98627983
+    часы 02-05 на уровне 130, у 96526110 те же часы на уровне 90, — поэтому
+    слитый профиль решал спор объёмом, и кампаниям меньшего счётчика
+    доставалось расписание чужого сайта.
     """
-    seen = {}
-    _patch_e0_run(monkeypatch)
+    seen = []
+    calls = _patch_e0_run(monkeypatch)
     monkeypatch.setenv("YM_TOKEN", "test-token")
     monkeypatch.setattr(agent_e0, "EDU_COUNTERS", [111, 222])
-    monkeypatch.setattr(agent_e0, "fetch_campaign_behavior", lambda *a, **k: [])
+    # Счётчик 111 видит кампанию acc-1, счётчик 222 — кампанию acc-2.
+    monkeypatch.setattr(agent_e0, "fetch_campaign_ids",
+                        lambda login: [111] if login == "acc-1" else [222])
+    monkeypatch.setattr(agent_e0, "assemble_facts", lambda *a, **k: [
+        dict(_fact(_today()), campaign_id="111", campaign_name="к1"),
+        dict(_fact(_today()), campaign_id="222", campaign_name="к2"),
+    ])
+    monkeypatch.setattr(
+        agent_e0, "fetch_campaign_behavior",
+        lambda counter, *a, **k: [{"campaign_name": "к1" if counter == 111 else "к2",
+                                   "visits": 10, "bounces": 1, "pageviews": 20,
+                                   "visit_seconds": 100}])
 
-    # Два счётчика с РАЗНЫМ уровнем конверсии — та самая боевая картина.
     def fake_hourly(counter, *_args, **_kwargs):
         conv = 0.40 if counter == 111 else 0.20
         rows = [{"segment_kind": "hour", "segment_key": str(h), "clicks": 1000,
@@ -506,19 +493,59 @@ def test_main_merges_hourly_counters_before_computing_schedule(monkeypatch, caps
                 for h in range(24)]
         return rows, {"goal_id": 1, "reaches": int(24 * 1000 * conv), "goals_offered": 2}
 
-    # Обе цели Директа заведены на обоих счётчиках — профиль считается по ним.
     monkeypatch.setattr(agent_e0, "fetch_counter_goal_ids", lambda counter: [1, 2])
     monkeypatch.setattr(agent_e0, "fetch_hourly_profile", fake_hourly)
-    monkeypatch.setattr(agent_e0, "compute_schedule",
-                        lambda rows: seen.update({"rows": list(rows)}) or ([], None))
+    monkeypatch.setattr(
+        agent_e0, "compute_schedule",
+        lambda rows: (seen.append(list(rows)) or
+                      [{"setting_kind": "schedule:hour", "setting_key": str(h),
+                        "value": 0.0, "support_n": 1000, "raw_value": 1.0}
+                       for h in range(24)], None))
 
     assert agent_e0.main() == 0
     capsys.readouterr()
 
-    rows = seen.get("rows") or []
-    assert len(rows) == 24, f"счётчики не сложены: строк {len(rows)} вместо 24"
-    # Час получил визиты ОБОИХ счётчиков — значит складывали, а не перезаписывали.
-    assert rows[0]["clicks"] == 2000
+    # Каждый счётчик посчитан ОТДЕЛЬНО: два вызова по 24 строки, а не один.
+    assert [len(rows) for rows in seen] == [24, 24]
+    assert seen[0][0]["clicks"] == 1000, "счётчики снова сложены в один профиль"
+
+    schedule_owners = [c["object_id"] for c in calls
+                       if any(r["setting_kind"] == "schedule:hour" for r in c["rows"])]
+    assert sorted(schedule_owners) == ["acc-1", "acc-2"]
+
+
+def test_counter_without_an_account_is_reported_not_broadcast(monkeypatch, capsys):
+    """Привязки нет — применять расписание некуда, и это видно в отчёте.
+
+    Записать его «всем» значило бы вернуть исходный дефект под другим именем:
+    в пробе 32579931952 четвёртый кабинет (5 кампаний) не принадлежит ни
+    одному счётчику EDU.
+    """
+    calls = _patch_e0_run(monkeypatch)
+    monkeypatch.setenv("YM_TOKEN", "test-token")
+    monkeypatch.setattr(agent_e0, "EDU_COUNTERS", [111])
+    monkeypatch.setattr(agent_e0, "fetch_campaign_ids", lambda login: [])
+    monkeypatch.setattr(agent_e0, "fetch_campaign_behavior",
+                        lambda *a, **k: [{"campaign_name": "ничья", "visits": 10,
+                                          "bounces": 1, "pageviews": 20,
+                                          "visit_seconds": 100}])
+    monkeypatch.setattr(agent_e0, "fetch_counter_goal_ids", lambda counter: [1, 2])
+    monkeypatch.setattr(
+        agent_e0, "fetch_hourly_profile",
+        lambda *a, **k: ([{"segment_kind": "hour", "segment_key": str(h), "clicks": 1000,
+                           "leads": 40, "sum_p_pay": 40.0} for h in range(24)],
+                         {"goal_id": 1, "reaches": 960, "goals_offered": 2}))
+    monkeypatch.setattr(agent_e0, "compute_schedule",
+                        lambda rows: (_ for _ in ()).throw(
+                            AssertionError("расчёт без кабинета-владельца")))
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    assert {"counter": 111, "reason": "счётчик не привязан к кабинету"} in \
+        report["metrika_hourly_skipped"]
+    assert not [c for c in calls
+                if any(r["setting_kind"] == "schedule:hour" for r in c["rows"])]
 
 
 # --------------- кандидаты в минус-слова: расчёт обязан СЛУЧИТЬСЯ
