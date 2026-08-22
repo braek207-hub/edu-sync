@@ -1,23 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-probe_device_conflict.py — с чем именно пересекается TABLET_ADJUSTMENT.
+probe_device_conflict.py — DESKTOP и TABLET в Директе несовместимы.
 
-Первая боевая запись (32559366898): шесть корректировок применились, седьмая —
-TABLET — отвергнута с Code 6000 «Условия в корректировках пересекаются».
-Документация Яндекса утверждает, что DESKTOP (компьютеры + Smart TV) и TABLET
-не взаимоисключающие. Практика говорит иначе; верим кабинету.
+Установлено экспериментом, вопреки документации:
 
-Прогон 32561294615 ОПРОВЕРГ первую гипотезу («набор устройств надо слать
-целиком»): TABLET отвергнут и в паре с нейтральным MOBILE, причём сам MOBILE
-в том же запросе был принят. Значит пересечение — именно с DESKTOP,
-единственной корректировкой устройств, которая в кампании уже стоит.
+  · первая боевая запись (32559366898): TABLET отвергнут с Code 6000 «Условия
+    в корректировках пересекаются» — в кампании уже стоял DESKTOP;
+  · 32561294615: гипотеза «набор устройств надо слать целиком» ОПРОВЕРГНУТА —
+    TABLET отвергнут и в паре с нейтральным MOBILE, причём MOBILE приняли;
+  · 32561534117: тот же TABLET в кампанию БЕЗ DESKTOP-корректировки — ПРИНЯТ.
 
-Проверка чистая и обратимая: добавить НЕЙТРАЛЬНЫЙ TABLET (100 — ставок не
-меняет) в кампанию того же кабинета, где DESKTOP-корректировки НЕТ, и сразу
-удалить. Пройдёт — конфликт именно с DESKTOP подтверждён, и трогать боевую
-кампанию для этого не потребовалось.
+Вывод: пересекается TABLET именно с DESKTOP. Справочник Яндекса утверждает
+обратное («компьютеры, Smart TV» против «планшеты» — разные категории), но
+кабинет отвечает иначе, и прав кабинет.
 
-Без --apply ничего не отправляет.
+Побочная находка: bidmodifiers.add вернул успех с Id = null. Уборка по Id из
+ответа поэтому не сработала — след эксперимента пришлось искать перечитыванием.
+Тот же дефект отмечен в движке записи как отложенный (read-back после
+неизвестного исхода): полагаться на Id из ответа add нельзя.
+
+Режим по умолчанию — уборка: найти нейтральные TABLET-корректировки и удалить.
 Запуск: python probe_device_conflict.py [--apply]
 ENV: DIRECT_TOKEN, DIRECT_CLIENTS_JSON
 """
@@ -68,76 +70,66 @@ def _verdict(result, collection="AddResults"):
     return " | ".join(out) or json.dumps(result, ensure_ascii=False)[:300]
 
 
-def _campaign_ids(login, limit=40):
-    """Только НЕ заархивированные: архив править запрещено (ошибка 8300),
-    и такая кампания сорвала бы эксперимент, ничего не сказав о корректировках."""
+def _campaign_ids(login, limit=100):
+    """Только НЕ заархивированные: архив править запрещено (ошибка 8300)."""
     result = _post(CAMPAIGNS_URL, login, {
         "method": "get",
         "params": {
             "SelectionCriteria": {"States": ["ON", "OFF", "SUSPENDED"]},
-            "FieldNames": ["Id", "State", "Status"],
+            "FieldNames": ["Id"],
             "Page": {"Limit": limit, "Offset": 0},
         },
     })
-    campaigns = (result.get("result") or {}).get("Campaigns", [])
-    print(f"  кампаний не в архиве: {len(campaigns)}")
-    return [int(c["Id"]) for c in campaigns]
+    return [int(c["Id"]) for c in (result.get("result") or {}).get("Campaigns", [])]
 
 
-def _device_modifiers(login, campaign_ids):
-    """Какие корректировки устройств стоят у кампаний."""
+def _tablet_modifiers(login, campaign_ids):
+    """Планшетные корректировки с их значениями — для поиска следов probe."""
     result = _post(BIDMODIFIERS_URL, login, {
         "method": "get",
         "params": {
             "SelectionCriteria": {"CampaignIds": campaign_ids, "Levels": ["CAMPAIGN"]},
             "FieldNames": ["Id", "CampaignId", "Type"],
+            "TabletAdjustmentFieldNames": ["BidModifier"],
         },
     })
-    by_campaign = {}
+    out = []
     for item in (result.get("result") or {}).get("BidModifiers", []):
-        by_campaign.setdefault(int(item["CampaignId"]), set()).add(item.get("Type"))
-    return by_campaign
+        if item.get("Type") == "TABLET_ADJUSTMENT":
+            out.append({
+                "Id": item.get("Id"),
+                "CampaignId": item.get("CampaignId"),
+                "BidModifier": (item.get("TabletAdjustment") or {}).get("BidModifier"),
+            })
+    return out
 
 
 def main() -> int:
     apply = "--apply" in sys.argv
-    if not apply:
-        print("Репетиция: ничего не отправлено. Нужен --apply.")
-        return 0
 
     ids = _campaign_ids(ACCOUNT)
-    types = _device_modifiers(ACCOUNT, ids)
+    tablets = _tablet_modifiers(ACCOUNT, ids)
+    print(f"кампаний не в архиве: {len(ids)}; планшетных корректировок: {len(tablets)}")
+    for item in tablets:
+        print("  " + json.dumps(item, ensure_ascii=False))
 
-    clean = [cid for cid in ids
-             if "DESKTOP_ADJUSTMENT" not in types.get(cid, set())
-             and "TABLET_ADJUSTMENT" not in types.get(cid, set())]
-    withdesktop = [cid for cid in ids if "DESKTOP_ADJUSTMENT" in types.get(cid, set())]
-    print(f"кампаний просмотрено: {len(ids)}; "
-          f"без DESKTOP-корректировки: {len(clean)}; с DESKTOP: {len(withdesktop)}")
-
-    if not clean:
-        print("не нашлось кампании без DESKTOP-корректировки — эксперимент невозможен")
+    # Нейтральная планшетная корректировка ставок не меняет, но это след
+    # эксперимента в боевом кабинете, и его надо убрать.
+    litter = [t for t in tablets if t["BidModifier"] == NEUTRAL and t["Id"]]
+    if not litter:
+        print("следов probe не найдено — убирать нечего")
         return 0
 
-    target = clean[0]
-    print(f"\n--- нейтральный TABLET (100) в кампанию {target} БЕЗ DESKTOP-корректировки")
-    added = _post(BIDMODIFIERS_URL, ACCOUNT, {"method": "add", "params": {"BidModifiers": [
-        {"CampaignId": target, "TabletAdjustment": {"BidModifier": NEUTRAL}}]}})
-    print("  " + _verdict(added))
+    print(f"\nк удалению: {[t['Id'] for t in litter]}")
+    if not apply:
+        print("(репетиция, ничего не удалено — нужен --apply)")
+        return 0
 
-    # Убираем за собой независимо от исхода: корректировка нейтральная, но
-    # оставлять после себя следы эксперимента в боевом кабинете нельзя.
-    new_id = None
-    for element in ((added.get("result") or {}).get("AddResults") or []):
-        if not element.get("Errors"):
-            new_id = element.get("Id")
-    if new_id:
-        deleted = _post(BIDMODIFIERS_URL, ACCOUNT, {
-            "method": "delete", "params": {"SelectionCriteria": {"Ids": [new_id]}}})
-        print(f"  уборка: удаление Id={new_id} → {_verdict(deleted, 'DeleteResults')}")
-    else:
-        print("  уборка не нужна: корректировка не создана")
-
+    deleted = _post(BIDMODIFIERS_URL, ACCOUNT, {
+        "method": "delete",
+        "params": {"SelectionCriteria": {"Ids": [t["Id"] for t in litter]}},
+    })
+    print("  " + _verdict(deleted, "DeleteResults"))
     return 0
 
 
