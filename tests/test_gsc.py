@@ -111,12 +111,14 @@ def test_sync_gsc_seo_requests_from_monday(monkeypatch):
     # 2026-06-24 — среда; пустой ответ → weekly пуст → до БД не доходит
     n = gsc.sync_gsc_seo("2026-06-24", "2026-08-19", "kz")
     assert n == 0
-    assert [b["startDate"] for b in captured] == ["2026-06-22"]  # понедельник той недели
+    assert [b["startDate"] for b in captured] == ["2026-06-22", "2026-06-22"]  # тотал + небренд
 
 
-def test_sync_gsc_seo_kz_filters_country_gcc_does_not(monkeypatch):
-    """KZ обязан слать гео-фильтр kaz (общий с RU хост), GCC — без фильтров вовсе,
-    и оба — БЕЗ измерения query (иначе GSC прячет анонимные и клики теряются)."""
+def test_sync_gsc_seo_quality_brand_two_queries(monkeypatch):
+    """«Качественный бренд» = тотал − excludingRegex(бренд), оба dims=[date]
+    (анонимные остаются в разности — они выпадают из любой query-выборки).
+    KZ дополнительно шлёт гео-фильтр kaz в ОБА запроса (общий с RU хост),
+    GCC — без гео (страна строки = витрина)."""
     import sync.gsc as gsc
 
     kz_bodies = []
@@ -125,10 +127,16 @@ def test_sync_gsc_seo_kz_filters_country_gcc_does_not(monkeypatch):
         lambda: _fake_service(kz_bodies, ["https://limestore.com/"]),
     )
     gsc.sync_gsc_seo("2026-06-22", "2026-08-19", "kz")
-    assert len(kz_bodies) == 1
-    assert kz_bodies[0]["dimensions"] == ["date"]
-    fil = kz_bodies[0]["dimensionFilterGroups"][0]["filters"]
-    assert fil == [{"dimension": "country", "operator": "equals", "expression": "kaz"}]
+    assert len(kz_bodies) == 2  # тотал + видимый небренд
+    total_b, nb_b = kz_bodies
+    assert total_b["dimensions"] == ["date"] and nb_b["dimensions"] == ["date"]
+    assert total_b["dimensionFilterGroups"][0]["filters"] == [
+        {"dimension": "country", "operator": "equals", "expression": "kaz"}
+    ]
+    nb_filters = nb_b["dimensionFilterGroups"][0]["filters"]
+    assert {"dimension": "country", "operator": "equals", "expression": "kaz"} in nb_filters
+    assert any(f["dimension"] == "query" and f["operator"] == "excludingRegex"
+               for f in nb_filters)
 
     gcc_bodies = []
     monkeypatch.setattr(
@@ -136,7 +144,24 @@ def test_sync_gsc_seo_kz_filters_country_gcc_does_not(monkeypatch):
         lambda: _fake_service(gcc_bodies, list(gsc.REGIONS["gcc"]["sites"])),
     )
     gsc.sync_gsc_seo("2026-06-22", "2026-08-19", "gcc")
-    assert len(gcc_bodies) == 6  # по запросу на витрину
-    for b in gcc_bodies:
-        assert b["dimensions"] == ["date"]
-        assert "dimensionFilterGroups" not in b
+    assert len(gcc_bodies) == 12  # 6 витрин × (тотал + небренд)
+    totals = [b for b in gcc_bodies if "dimensionFilterGroups" not in b]
+    nbs = [b for b in gcc_bodies if "dimensionFilterGroups" in b]
+    assert len(totals) == 6 and len(nbs) == 6
+    for b in nbs:
+        fil = b["dimensionFilterGroups"][0]["filters"]
+        assert fil[0]["operator"] == "excludingRegex"
+        assert "لايم" in fil[0]["expression"]  # арабские написания в GCC-регексе
+
+
+def test_subtract_days_clamps_negative():
+    from sync.gsc import subtract_days
+
+    total = [{"date": "2026-08-10", "clicks": 100, "impressions": 1000},
+             {"date": "2026-08-11", "clicks": 5, "impressions": 50}]
+    nonbrand = [{"date": "2026-08-10", "clicks": 30, "impressions": 400},
+                {"date": "2026-08-11", "clicks": 7, "impressions": 60}]  # рассинхрон выборок
+    assert subtract_days(total, nonbrand) == [
+        {"date": "2026-08-10", "clicks": 70, "impressions": 600},
+        {"date": "2026-08-11", "clicks": 0, "impressions": 0},
+    ]

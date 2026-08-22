@@ -5,17 +5,18 @@
 Google доминирует). ОТДЕЛЬНО от Яндекс.Вебмастера (lime_brand_seo, RU): другая выдача,
 другой регион — не суммировать.
 
-МЕТОДИКА = ручные листы Павла «Брендовые запросы LIMÉ (KZ)/(UAE)» 1-в-1
-(решение Павла 2026-08-20, сверено по живому API бит-в-бит, неделя 33):
-- KZ: limestore.com, страна пользователя Казахстан, БЕЗ фильтра по запросам
-  (все запросы, включая анонимные, которые GSC прячет при группировке по query).
-  Замер нед. 33: 2 101 клик, из них брендовых 1 728 (82%), небрендовых видимых 33.
-- GCC: каждая витрина ЦЕЛИКОМ, без фильтров вовсе — все запросы, все страны
-  пользователей; «страна» строки = страна витрины (ae → ОАЭ), а не гео пользователя.
-  Замер ae нед. 33: 2 028 кликов = бренд-ОАЭ 555 + бренд из других стран 909
-  (Ирак 178, Сауд 79, Россия 68…) + анонимные 451 + небрендовых 113 (6%).
-Прежняя брендовая методика (регекс написаний + гео пользователя) — в git-истории
-до 2026-08-20 и в отчёте panda-bi /reports/lime-brand-method-kz-gcc.
+МЕТОДИКА = «качественный бренд»: бренд + анонимные = тотал − видимый небренд
+(решение Павла 2026-08-21; замеры недели 33 — в докстринге fetch_site_totals):
+- KZ: limestore.com, страна пользователя Казахстан (общий с RU хост — без гео там
+  Россия, ~119 тыс кликов/нед). Небренда в KZ мало (34 клика, 3,5 тыс показов).
+- GCC: каждая витрина, «страна» строки = страна витрины (ae → ОАЭ), пользователи
+  любых стран. Небренд у ae — 53% показов при CTR 0,5% (категорийная выдача
+  «tank top»/«blazer»/«linen pants» на поз. 2–12) — он и раздувал «спрос» до
+  44,6 тыс показов при 2 тыс кликов; вычитается excludingRegex написаний бренда.
+Анонимные (GSC прячет редкие запросы) остаются В ряду: по поведению это бренд
+(CTR 5,4% против 0,5% у небренда — редкие длинные вариации написаний).
+Прежние методики — в git-истории (бренд+гео до 20.08; тоталы листов 20–21.08)
+и в отчёте panda-bi /reports/lime-brand-method-kz-gcc.
 
 Корневой limestore.com в GCC не входит (решение 18.07): его клики ведут на глобальный
 сайт, а не в магазин; для ОАЭ он мал (199 кликов/нед против 2 028 у витрины).
@@ -30,6 +31,8 @@ Auth: сервис-аккаунт добавлен пользователем р
 import datetime as dt
 import json
 import os
+
+from sync.brand_terms import brand_regex
 
 SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 ROW_LIMIT = 25000
@@ -114,13 +117,7 @@ def aggregate_weekly(rows: list[dict]) -> dict[tuple, dict]:
     return out
 
 
-def fetch_site_totals(service, site: str, country_filter: str | None,
-                      start: str, end: str) -> list[dict]:
-    """Дневные тоталы ресурса (все запросы, вкл. анонимные) → [{date,clicks,impressions}].
-
-    dims=[date] без query — иначе GSC прячет анонимные запросы и клики теряются
-    (у ae это 451 из 2 028 за неделю). country_filter — гео пользователя (только KZ).
-    """
+def _daily_query(service, site: str, start: str, end: str, filters: list[dict]) -> list[dict]:
     body = {
         "startDate": start,
         "endDate": end,
@@ -128,12 +125,52 @@ def fetch_site_totals(service, site: str, country_filter: str | None,
         "rowLimit": ROW_LIMIT,
         "type": "web",
     }
-    if country_filter:
-        body["dimensionFilterGroups"] = [{"filters": [
-            {"dimension": "country", "operator": "equals", "expression": country_filter},
-        ]}]
+    if filters:
+        body["dimensionFilterGroups"] = [{"filters": filters}]
     resp = service.searchanalytics().query(siteUrl=site, body=body).execute()
     return parse_daily_totals(resp)
+
+
+def subtract_days(total: list[dict], nonbrand: list[dict]) -> list[dict]:
+    """«Качественный бренд» = тотал − видимый небренд, по дням.
+
+    Отрицательные значения клампятся в 0: выборки total и nonbrand снимаются двумя
+    запросами, и на дне с досчитывающейся статистикой разность может мигнуть ниже нуля.
+    """
+    nb = {r["date"]: r for r in nonbrand}
+    out: list[dict] = []
+    for r in total:
+        n = nb.get(r["date"], {})
+        out.append({
+            "date": r["date"],
+            "clicks": max(0, int(r.get("clicks", 0)) - int(n.get("clicks", 0) or 0)),
+            "impressions": max(0, int(r.get("impressions", 0)) - int(n.get("impressions", 0) or 0)),
+        })
+    return out
+
+
+def fetch_site_totals(service, site: str, country_filter: str | None,
+                      start: str, end: str, region: str) -> list[dict]:
+    """Дневной «качественный бренд» ресурса = тотал − видимый небренд →
+    [{date,clicks,impressions}].
+
+    Два запроса dims=[date] (решение Павла 2026-08-21, замер недели 33):
+    - тотал без query-фильтра: бренд + анонимные + небренд (у ae небренд — 53%
+      показов при CTR 0,5%: категорийная выдача «tank top»/«blazer» на поз. 2–12);
+    - excludingRegex(написания бренда): ВИДИМЫЙ небренд (анонимные при любом
+      query-фильтре из выборки выпадают, поэтому в разности они остаются).
+    Разность = бренд + анонимные. Анонимные по поведению — бренд (CTR 5,4% против
+    0,5% у небренда): редкие длинные вариации, которые GSC прячет.
+    Замер ae нед.33: 44 614 − 23 807 = 20 807 показов, 2 038 − 113 = 1 925 кликов.
+    country_filter — гео пользователя (только KZ: общий с RU хост).
+    """
+    country = ([{"dimension": "country", "operator": "equals", "expression": country_filter}]
+               if country_filter else [])
+    total = _daily_query(service, site, start, end, country)
+    nonbrand = _daily_query(service, site, start, end, country + [
+        {"dimension": "query", "operator": "excludingRegex", "expression": brand_regex(region)},
+    ])
+    return subtract_days(total, nonbrand)
 
 
 def sync_gsc_seo(from_date: str, to_date: str, region: str = "kz") -> int:
@@ -153,7 +190,7 @@ def sync_gsc_seo(from_date: str, to_date: str, region: str = "kz") -> int:
         if site not in have:
             print(f"gsc[{region}]: пропуск {site} — нет доступа сервис-аккаунта")
             continue
-        batch = fetch_site_totals(service, site, cfg["country_filter"], from_date, to_date)
+        batch = fetch_site_totals(service, site, cfg["country_filter"], from_date, to_date, region)
         for r in batch:
             r["country"] = country_name
         all_rows += batch
