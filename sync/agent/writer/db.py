@@ -973,10 +973,44 @@ def spent_risk(week_start: str) -> float:
     кабинет, изменение с высокой вероятностью живое, и не списывать за него
     риск значит выдавать бюджет, которого нет. Неделя берётся по applied_at,
     который для такой строки равен моменту отправки (см. MARK_STALE_SQL).
+
+    Считается МАКСИМУМ по объекту, а не сумма его строк. Цена ошибки — расход
+    кампании за горизонт замера; этот расход у кампании ОДИН, сколько бы правок
+    ей ни сделали за неделю и в скольких прогонах. Ровно этот довод уже записан
+    в risk.fit_into_budget, но действовал он только внутри одного прогона:
+    множество оплаченных объектов создавалось заново на каждый запуск. На
+    неделе 2026-08-17 это стоило так: прогон 32559366898 списал 38 876 ₽ за
+    кампанию 114057545 (5 554 ₽/день × 7), и следующая правка ТОЙ ЖЕ кампании
+    требовала ещё 38 876 при остатке 11 124 — расписание не проходило вовсе.
+    Одна кампания съедала 78 % недельного бюджета за одно касание.
     """
     rows = _fetch(
         """
-        SELECT COALESCE(SUM(risk_rub), 0) AS spent
+        SELECT COALESCE(SUM(per_object), 0) AS spent
+        FROM (
+            SELECT MAX(risk_rub) AS per_object
+            FROM edu_agent_actions
+            WHERE status IN (__LIVE_STATUSES__)
+              AND rolled_back_at IS NULL
+              AND applied_at >= %s
+            GROUP BY object_level, object_id
+        ) AS by_object
+        """.replace("__LIVE_STATUSES__", _sql_literals(LIVE_STATUSES)),
+        (week_start,),
+    )
+    return float(rows[0]["spent"]) if rows else 0.0
+
+
+def charged_objects_this_week(week_start: str) -> Set[str]:
+    """Объекты, риск которых на этой неделе уже оплачен: {'level:id'}.
+
+    Форма ключа — та же, что у risk.risk_object; расхождение здесь означало бы
+    тихое повторное списание, то есть ровно тот дефект, против которого это и
+    сделано.
+    """
+    rows = _fetch(
+        """
+        SELECT DISTINCT object_level, object_id
         FROM edu_agent_actions
         WHERE status IN (__LIVE_STATUSES__)
           AND rolled_back_at IS NULL
@@ -984,7 +1018,7 @@ def spent_risk(week_start: str) -> float:
         """.replace("__LIVE_STATUSES__", _sql_literals(LIVE_STATUSES)),
         (week_start,),
     )
-    return float(rows[0]["spent"]) if rows else 0.0
+    return {f"{r['object_level']}:{r['object_id']}" for r in rows}
 
 
 def risk_limit(week_start: str, default_rub: float) -> float:

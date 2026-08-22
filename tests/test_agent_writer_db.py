@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import pytest
 
 import sync.agent.writer.db as writer_db
+from sync.agent.writer import risk
 from sync.agent.writer.db import WRITER_DDL, ensure_writer_tables, spent_risk
 from sync.db import get_connection
 
@@ -241,6 +242,46 @@ def test_spent_risk_charges_every_live_status(monkeypatch):
 
     expected = ", ".join("'%s'" % x for x in writer_db.LIVE_STATUSES)
     assert "status IN (%s)" % expected in sql
+
+
+def test_spent_risk_charges_an_object_once_not_once_per_row(monkeypatch):
+    # Цена ошибки по кампании — её расход за горизонт замера, и он ОДИН,
+    # сколько бы правок кампании ни сделали за неделю и в скольких прогонах.
+    # Сумма строк вместо максимума по объекту в августе 2026 заперла запись:
+    # кампания 114057545 стоила 38 876 ₽ за касание при недельном лимите
+    # 50 000 ₽, и второе касание не проходило вовсе.
+    sql, _ = _captured_sql(monkeypatch, lambda: writer_db.spent_risk("2026-08-17"))
+
+    assert "MAX(risk_rub)" in sql
+    assert "GROUP BY object_level, object_id" in sql
+
+
+def test_charged_objects_key_matches_the_key_risk_model_uses(monkeypatch):
+    # Форма ключа здесь и в risk.risk_object обязана совпадать: разъедутся —
+    # прогон не узнает свой же оплаченный объект и спишет за него второй раз,
+    # то есть ровно тот дефект, против которого эта функция и сделана.
+    monkeypatch.setattr(
+        writer_db, "_fetch",
+        lambda sql, params=(): [{"object_level": "campaign", "object_id": "114057545"}],
+    )
+
+    got = writer_db.charged_objects_this_week("2026-08-17")
+
+    expected = risk.risk_object({"object_level": "campaign", "object_id": "114057545"})
+    assert got == {expected}
+
+
+def test_charged_objects_ignore_rolled_back_changes(monkeypatch):
+    # Откатанное изменение в кабинете не живёт — значит и оплаченным объект
+    # не считается: следующая правка обязана снова пройти через бюджет.
+    sql, params = _captured_sql(
+        monkeypatch, lambda: writer_db.charged_objects_this_week("2026-08-17")
+    )
+
+    assert "rolled_back_at IS NULL" in sql
+    assert "status IN (%s)" % ", ".join("'%s'" % x for x in writer_db.LIVE_STATUSES) in sql
+    assert "applied_at >= %s" in sql
+    assert params == ("2026-08-17",)
 
 
 def test_mark_stale_sql_marks_only_rows_past_threshold():
