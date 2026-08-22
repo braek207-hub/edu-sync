@@ -295,6 +295,8 @@ def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeyp
     monkeypatch.setattr(agent_e1.agent_db, "load_daily_cost_by_campaign",
                          lambda *_: {"111": 500.0})
     monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa", lambda *_: {})
+    monkeypatch.setattr(agent_e1.agent_db, "crm_maturity_date",
+                        lambda: date.today() - timedelta(days=3))
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
     monkeypatch.setattr(agent_e1.writer_db, "charged_objects_this_week", lambda *_: set())
@@ -359,6 +361,8 @@ def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatc
     monkeypatch.setattr(agent_e1.agent_db, "load_daily_cost_by_campaign",
                          lambda *_: {"111": 500.0})
     monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa", lambda *_: {"111": 1000.0})
+    monkeypatch.setattr(agent_e1.agent_db, "crm_maturity_date",
+                        lambda: date.today() - timedelta(days=3))
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
     monkeypatch.setattr(agent_e1.writer_db, "charged_objects_this_week", lambda *_: set())
@@ -478,6 +482,8 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
     monkeypatch.setattr(agent_e1.agent_db, "load_daily_cost_by_campaign", lambda *_: daily_cost)
     monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa",
                         lambda *_: dict(baseline_cpa or {c: 1000.0 for c in daily_cost}))
+    monkeypatch.setattr(agent_e1.agent_db, "crm_maturity_date",
+                        lambda: date.today() - timedelta(days=3))
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
     monkeypatch.setattr(agent_e1.writer_db, "charged_objects_this_week", lambda *_: set())
@@ -720,6 +726,79 @@ def test_charged_objects_are_read_for_the_same_week_as_the_budget(monkeypatch, c
     assert agent_e1.main() == 0
 
     assert seen["charged"] == seen["spent"] == seen["limit"]
+
+
+def test_baseline_cpa_stops_at_crm_maturity_not_at_today(monkeypatch, capsys):
+    # Расход Директа приезжает вовремя, лиды CRM — с отставанием 2-4 дня, и
+    # день приходит целиком либо не приходит вовсе. Окно до сегодня делит
+    # расход тридцати полных дней на лиды двадцати шести — база завышена, и
+    # всегда в одну сторону. Из базы растёт порог отката (×1.4): завышение
+    # делает сторож мягче ровно там, где он единственная защита кабинета.
+    seen = {}
+    crm_through = date.today() - timedelta(days=4)
+
+    def _baseline(d_from, d_to):
+        seen["window"] = (d_from, d_to)
+        return {"111": 1000.0}
+
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+    )
+    monkeypatch.setattr(agent_e1.agent_db, "crm_maturity_date", lambda: crm_through)
+    monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa", _baseline)
+
+    assert agent_e1.main() == 0
+
+    assert seen["window"][1] == crm_through.isoformat()
+
+
+def test_cost_window_is_not_trimmed_by_crm_lag(monkeypatch, capsys):
+    # Обратная сторона: обрезать по зрелости CRM надо ТОЛЬКО базу CPA.
+    # Дневной расход — источник цены риска, он приезжает вовремя, и урезание
+    # его окна занизило бы риск, то есть ослабило бы тормоз перед кабинетом.
+    seen = {}
+
+    def _cost(d_from, d_to):
+        seen["window"] = (d_from, d_to)
+        return {"111": 10.0}
+
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+    )
+    monkeypatch.setattr(agent_e1.agent_db, "crm_maturity_date",
+                        lambda: date.today() - timedelta(days=4))
+    monkeypatch.setattr(agent_e1.agent_db, "load_daily_cost_by_campaign", _cost)
+
+    assert agent_e1.main() == 0
+
+    assert seen["window"][1] == date.today().isoformat()
+
+
+def test_no_mature_crm_day_means_no_baseline_not_a_stale_one(monkeypatch, capsys):
+    # Лидов нет вовсе — базы не существует. Подставлять сюда окно до сегодня
+    # значило бы считать базу по дням с расходом и нулём лидов: CPA
+    # бесконечен, и красная линия оказалась бы пробита на ровном месте.
+    called = []
+
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 10.0},
+    )
+    monkeypatch.setattr(agent_e1.agent_db, "crm_maturity_date", lambda: None)
+    monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa",
+                        lambda *a: called.append(a) or {"111": 1000.0})
+
+    assert agent_e1.main() == 0
+
+    assert called == []
 
 # ------------------------- дефект 6: репетиция показывает, что было бы записано
 
@@ -1755,6 +1834,8 @@ def _patch_schedule_run(monkeypatch, settings):
     monkeypatch.setattr(agent_e1.agent_db, "load_daily_cost_by_campaign",
                         lambda *_: {"111": 500.0})
     monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa", lambda *_: {"111": 1000.0})
+    monkeypatch.setattr(agent_e1.agent_db, "crm_maturity_date",
+                        lambda: date.today() - timedelta(days=3))
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
     monkeypatch.setattr(agent_e1.writer_db, "charged_objects_this_week", lambda *_: set())

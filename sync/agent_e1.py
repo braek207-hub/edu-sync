@@ -1174,7 +1174,21 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     holdout_ids = set(agent_db.load_holdout_ids())
     cutoff = (date.today() - timedelta(days=30)).isoformat()
     daily_cost = agent_db.load_daily_cost_by_campaign(cutoff, today)
-    baseline_cpa = agent_db.load_baseline_cpa(cutoff, today)
+    # База CPA обязана кончаться на границе зрелости CRM, а не сегодня.
+    # Расход Директа приезжает вовремя, лиды — с отставанием 2-4 дня, и день
+    # приходит целиком либо не приходит вовсе (agent_db.crm_maturity_date).
+    # Считать базу до сегодня значит делить расход тридцати полных дней на
+    # лиды двадцати шести-двадцати восьми: база завышена примерно на десятую
+    # часть, и всегда в одну сторону. Из неё растёт порог отката (×1.4) —
+    # то есть завышение делает сторож мягче ровно там, где он единственная
+    # защита боевого кабинета. Наблюдаемый CPA сторож при этом считает по
+    # обрезанному окну (agent_e1_watchdog.observation_window), так что
+    # сравнивались величины разной полноты.
+    crm_through = agent_db.crm_maturity_date()
+    baseline_cpa = (
+        agent_db.load_baseline_cpa(cutoff, crm_through.isoformat())
+        if crm_through else {}
+    )
     wk = week_start(today)
 
     # Абсолютный аварийный порог красной линии считается один раз на весь
