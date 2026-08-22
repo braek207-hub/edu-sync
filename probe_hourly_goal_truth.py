@@ -90,7 +90,10 @@ def _night_vs_day(profile):
     day = [v for h, v in profile.items() if 10 <= h <= 20]
     if not night or not day:
         return None
-    return round(sum(night) / len(night) / (sum(day) / len(day)), 3)
+    day_mean = sum(day) / len(day)
+    if not day_mean:          # редкая цель без дневных достижений
+        return None
+    return round(sum(night) / len(night) / day_mean, 3)
 
 
 def main() -> int:
