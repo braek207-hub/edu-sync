@@ -21,6 +21,7 @@ from sync.agent.computed import (
     bid_modifier_percent,
     compute_schedule,
     compute_segment_modifiers,
+    prior_trials,
     shrink_ratio,
 )
 
@@ -28,6 +29,45 @@ from sync.agent.computed import (
 def _seg(key, clicks, conversions):
     return {"segment_kind": "device", "segment_key": key,
             "clicks": clicks, "conversions": conversions}
+
+
+def test_prior_is_measured_in_events_not_in_trials():
+    """Единица наблюдения у срезов разная: клик Директа у корректировок,
+    визит сайта у расписания. Постоянный вес в наблюдениях нёс бы в этих
+    срезах разный объём информации.
+
+    При базовой конверсии 4 % — порядок величины кабинетов EDU (37 252
+    достижения на 1 010 261 визит) — сохраняются прежние 50 наблюдений.
+    """
+    assert prior_trials(0.04) == 50.0
+    # Срез с конверсией вдесятеро ниже требует вдесятеро больше наблюдений,
+    # чтобы получить тот же вес: событий за ними столько же.
+    assert prior_trials(0.004) == 500.0
+
+
+def test_hour_with_few_events_is_shrunk_even_with_thousands_of_visits():
+    """Час суток набирает визиты тысячами, и вес n/(n+50) давал 0.999 —
+    сжатие было выключено там, где достижений меньше десятка.
+
+    Проба 32579085232: у счётчика 95348914 самый слабый час даёт около
+    девяти достижений при сотнях визитов, а коэффициент прыгал до 60-130.
+    """
+    weak = shrink_ratio(segment_conv=0.03, segment_n=600, base_conv=0.015)
+    strong = shrink_ratio(segment_conv=0.03, segment_n=60_000, base_conv=0.015)
+    # Как считалось раньше: априор в наблюдениях, независимо от конверсии.
+    old_weak = shrink_ratio(segment_conv=0.03, segment_n=600, base_conv=0.015,
+                            prior_weight=50.0)
+
+    assert weak < old_weak     # слабый час сжимается сильнее, чем сжимался
+    assert weak < strong       # и сильнее, чем час с сотнями достижений
+    assert strong > 1.9        # объёмный час почти не сжат — так и должно быть
+
+
+def test_explicit_prior_weight_still_wins():
+    """Явно переданный вес остаётся главнее — на нём держатся разовые
+    расчёты, где априор задан снаружи."""
+    got = shrink_ratio(0.06, 50, 0.02, prior_weight=50.0)
+    assert abs(got - 2.0) < 1e-9
 
 
 def test_shrink_pulls_small_sample_to_base():

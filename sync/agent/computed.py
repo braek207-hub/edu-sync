@@ -35,7 +35,10 @@ sync/agent/computed.py — вычисляемые настройки (корре
 from math import isclose
 from typing import Any, Dict, List, Optional, Tuple
 
-PRIOR_WEIGHT = 50.0       # эквивалентное число наблюдений у априорного значения
+# Априорный вес в СОБЫТИЯХ (достижениях цели), а не в наблюдениях: единица
+# наблюдения у срезов разная — клик Директа у корректировок, визит сайта у
+# расписания. Перевод в наблюдения делает prior_trials по базовой конверсии.
+PRIOR_EVENTS = 2.0
 # ДОЛЯ, а не проценты: 0.5 = ±50 %. Имя несёт единицу измерения намеренно —
 # рядом живёт одноимённый по смыслу потолок в ПРОЦЕНТАХ
 # (writer/guardrails.py::MODIFIER_CAP = 50), и одинаковые имена в разных
@@ -61,13 +64,37 @@ DEGENERATE_REASON = (
 )
 
 
+def prior_trials(base_conv: float, prior_events: float = PRIOR_EVENTS) -> float:
+    """Априорный вес в наблюдениях среза — из веса в СОБЫТИЯХ и базовой конверсии.
+
+    Точность оценки конверсии определяется числом СОБЫТИЙ, а не числом попыток:
+    при p ≈ 1 % и n = 550 ожидается пять достижений, и это шум, сколько бы
+    визитов за ними ни стояло. Априорный вес, заданный сразу в попытках,
+    несёт разный объём информации в срезах с разной базовой конверсией — а
+    срезы здесь именно разные: у корректировок ставок наблюдение это КЛИК
+    Директа, у расписания — ВИЗИТ сайта, и час суток набирает их тысячами.
+    Постоянные 50 попыток давали часу вес 0.999, то есть сжатие к базе было
+    выключено ровно там, где достижений могло быть меньше десятка.
+
+    PRIOR_EVENTS = 2 выбран так, чтобы при базовой конверсии 4 % (порядок
+    величины кабинетов EDU: 37 252 достижения на 1 010 261 визит) получались
+    прежние 50 попыток — то есть поведение корректировок на сегодняшней
+    калибровке не меняется, а расходится там, где конверсия среза другая.
+    """
+    if base_conv <= 0:
+        return float("inf")
+    return prior_events / base_conv
+
+
 def shrink_ratio(
-    segment_conv: float, segment_n: int, base_conv: float, prior_weight: float = PRIOR_WEIGHT
+    segment_conv: float, segment_n: int, base_conv: float,
+    prior_weight: Optional[float] = None
 ) -> float:
     """Отношение конверсии сегмента к базовой, сжатое к 1 при малом объёме."""
     if segment_n <= 0 or base_conv <= 0:
         return 1.0
-    weight = segment_n / (segment_n + prior_weight)
+    weight_trials = prior_trials(base_conv) if prior_weight is None else prior_weight
+    weight = segment_n / (segment_n + weight_trials)
     shrunk = weight * segment_conv + (1.0 - weight) * base_conv
     return shrunk / base_conv
 
