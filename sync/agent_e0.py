@@ -25,7 +25,12 @@ from sync.agent.computed import compute_schedule, compute_segment_modifiers
 from sync.agent.facts import assemble_facts
 from sync.agent.guard import check_continuity, check_freshness, verdict
 from sync.agent.holdout import select_holdout
-from sync.agent.metrika import EDU_COUNTERS, fetch_campaign_behavior, fetch_hourly_profile
+from sync.agent.metrika import (
+    EDU_COUNTERS,
+    fetch_campaign_behavior,
+    fetch_hourly_profile,
+    merge_hourly,
+)
 from sync.agent.mining import mine_quasi_experiments
 from sync.agent.objects import build_object_rows, top_queries_by_cost
 from sync.agent.power import power_report
@@ -352,6 +357,11 @@ def main() -> int:
                 }])
 
     if hourly_rows:
+        # Счётчиков у EDU три, и их строки надо СЛОЖИТЬ по часу, а не просто
+        # склеить: иначе база считается по всем счётчикам сразу, а каждая
+        # строка — по своему, и профиль счётчика с конверсией ниже общей
+        # опускает у себя все двадцать четыре часа (см. metrika.merge_hourly).
+        hourly_rows = merge_hourly(hourly_rows)
         # База считается внутри compute_schedule по тем же строкам: внешняя база
         # в чужих единицах — та самая ошибка, что вырождала сегментные корректировки.
         schedule_rows, schedule_reason = compute_schedule(hourly_rows)

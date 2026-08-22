@@ -402,3 +402,105 @@ def test_direct_keeps_the_strict_threshold(monkeypatch, capsys):
     # пройдёт незамеченным целую неделю.
     assert agent_e0.DIRECT_MAX_AGE_HOURS == 72
     assert agent_e0.CRM_MAX_AGE_HOURS > agent_e0.DIRECT_MAX_AGE_HOURS
+
+
+# --------------- почасовой профиль: счётчики складываются, а не склеиваются
+
+def test_hourly_rows_of_several_counters_are_summed_per_hour():
+    """Дефект прогона 32568178620: расписание опускало 22 часа из 24.
+
+    Строки трёх счётчиков EDU складывались в один список, и на каждый час
+    приходилось три отдельные строки. Конверсионность у счётчиков разная
+    (0.385 / 0.340 / 0.285 на замере 22.08.2026), а база считается по сумме
+    ВСЕХ строк — поэтому у счётчика ниже общей базы все часы уходили вниз,
+    у счётчика выше — все вверх, а запись по ключу (кабинет, вид, час)
+    оставляла профиль последнего.
+    """
+    from sync.agent.metrika import merge_hourly
+
+    rows = [
+        {"segment_kind": "hour", "segment_key": "9", "clicks": 100, "leads": 40,
+         "sum_p_pay": 40.0},
+        {"segment_kind": "hour", "segment_key": "9", "clicks": 300, "leads": 60,
+         "sum_p_pay": 60.0},
+    ]
+    merged = merge_hourly(rows)
+
+    assert len(merged) == 1
+    assert merged[0]["clicks"] == 400
+    assert merged[0]["sum_p_pay"] == 100.0
+    # Конверсионность часа по ВСЕМУ EDU — 100/400, а не 0.4 и не 0.2 по
+    # отдельности: это и есть величина, которую сравнивают с базой.
+
+
+def test_merged_profile_keeps_half_the_hours_above_base():
+    """Сквозная проверка здравого смысла: коэффициент — отношение часа к базе
+    ИЗ ТЕХ ЖЕ строк, поэтому примерно половина часов обязана быть выше неё.
+
+    Именно это утверждение и нарушалось: 22 часа из 24 внизу — признак того,
+    что база и часы считаются по разным множествам.
+    """
+    from sync.agent.metrika import merge_hourly
+    from sync.agent.computed import compute_schedule
+
+    rows = []
+    for counter_conv, visits in ((0.40, 1000), (0.20, 1000)):
+        for hour in range(24):
+            # Внутри счётчика часы слегка разные, между счётчиками — разный
+            # уровень: ровно та картина, что была в бою.
+            conv = counter_conv * (0.9 + 0.2 * (hour % 2))
+            rows.append({"segment_kind": "hour", "segment_key": str(hour),
+                         "clicks": visits, "leads": int(visits * conv),
+                         "sum_p_pay": visits * conv})
+
+    out, reason = compute_schedule(merge_hourly(rows))
+
+    assert reason is None
+    above = sum(1 for r in out if r["value"] > 0)
+    below = sum(1 for r in out if r["value"] < 0)
+    assert above > 0 and below > 0, "все часы уехали в одну сторону"
+    assert abs(above - below) <= 2, f"перекос: вверх {above}, вниз {below}"
+
+
+def test_merge_hourly_is_noop_for_single_counter():
+    from sync.agent.metrika import merge_hourly
+
+    rows = [{"segment_kind": "hour", "segment_key": str(h), "clicks": 10,
+             "leads": 1, "sum_p_pay": 1.0} for h in range(24)]
+    merged = merge_hourly(rows)
+
+    assert len(merged) == 24
+    assert [int(r["segment_key"]) for r in merged] == list(range(24))
+
+
+def test_main_merges_hourly_counters_before_computing_schedule(monkeypatch, capsys):
+    """Сквозная половина: слияние счётчиков обязано СЛУЧИТЬСЯ в прогоне.
+
+    Проверять один merge_hourly недостаточно — ровно так дефект и выживал бы:
+    функция написана, покрыта тестами и никем не вызвана. Здесь фиксируется
+    то, что уходит в расчёт расписания.
+    """
+    seen = {}
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setenv("YM_TOKEN", "test-token")
+    monkeypatch.setattr(agent_e0, "EDU_COUNTERS", [111, 222])
+    monkeypatch.setattr(agent_e0, "fetch_campaign_behavior", lambda *a, **k: [])
+
+    # Два счётчика с РАЗНЫМ уровнем конверсии — та самая боевая картина.
+    def fake_hourly(counter, *_args, **_kwargs):
+        conv = 0.40 if counter == 111 else 0.20
+        return [{"segment_kind": "hour", "segment_key": str(h), "clicks": 1000,
+                 "leads": int(1000 * conv), "sum_p_pay": 1000 * conv * (0.9 + 0.2 * (h % 2))}
+                for h in range(24)]
+
+    monkeypatch.setattr(agent_e0, "fetch_hourly_profile", fake_hourly)
+    monkeypatch.setattr(agent_e0, "compute_schedule",
+                        lambda rows: seen.update({"rows": list(rows)}) or ([], None))
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+
+    rows = seen.get("rows") or []
+    assert len(rows) == 24, f"счётчики не сложены: строк {len(rows)} вместо 24"
+    # Час получил визиты ОБОИХ счётчиков — значит складывали, а не перезаписывали.
+    assert rows[0]["clicks"] == 2000

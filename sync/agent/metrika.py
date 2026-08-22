@@ -127,6 +127,35 @@ def fetch_hourly_profile(counter_id: int, date_from: str, date_to: str) -> List[
     return parse_hourly(_metrica_get(params, os.environ["YM_TOKEN"]))
 
 
+def merge_hourly(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Почасовые строки НЕСКОЛЬКИХ счётчиков → один профиль, сложенный по часу.
+
+    Дефект, который это закрывает (сухой прогон 32568178620): строки трёх
+    счётчиков EDU просто складывались в один список, и для каждого часа
+    оказывалось три отдельные строки. Конверсионность у счётчиков разная —
+    0.385, 0.340 и 0.285 на замере 22.08.2026, — а база считается по сумме
+    ВСЕХ строк. В итоге у счётчика с конверсией ниже общей ВСЕ 24 часа
+    уходили вниз (0.285 / 0.36 ≈ 0.79), у счётчика выше — все вверх, а при
+    записи по ключу (кабинет, вид, час) последний перетирал остальные.
+    Расписание получалось «22 часа из 24 опустить» — то есть профилем
+    счётчика, а не профилем суток.
+
+    Правильная величина — конверсионность ЧАСА ПО ВСЕМУ EDU: визиты и
+    достижения целей складываются, и только потом считается отношение.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        key = str(row.get("segment_key"))
+        slot = merged.setdefault(key, {
+            "segment_kind": "hour", "segment_key": key,
+            "clicks": 0, "leads": 0, "sum_p_pay": 0.0,
+        })
+        slot["clicks"] += int(row.get("clicks") or 0)
+        slot["leads"] += int(row.get("leads") or 0)
+        slot["sum_p_pay"] += float(row.get("sum_p_pay") or 0.0)
+    return sorted(merged.values(), key=lambda r: int(r["segment_key"]))
+
+
 def fetch_campaign_behavior(counter_id: int, date_from: str, date_to: str) -> List[Dict[str, Any]]:
     """Поведение по кампаниям Директа: отказы, глубина, время."""
     params = {
