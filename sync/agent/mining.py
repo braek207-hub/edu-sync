@@ -16,7 +16,7 @@ sync/agent/mining.py — квазиэксперименты из истории 
 import hashlib
 from datetime import date
 from statistics import mean
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 MIN_SIDE_DAYS = 7          # минимум дней с каждой стороны точки изменения
 QUASI_CI_WIDTH = 0.5       # ширина интервала для квазиоценки (доля от эффекта + запас)
@@ -86,6 +86,20 @@ def _quality(rows: List[Dict[str, Any]]) -> float:
     return cost / expected if expected > 0 else 0.0
 
 
+def _window_dates(
+    rows: List[Dict[str, Any]], change_date: str, window: int, before: bool
+) -> Set[str]:
+    """window суток обработанной кампании по одну сторону от точки перелома.
+
+    Уникальные даты, а не строки: у контроля на ту же дату приходится по строке
+    на кампанию, и сравнивать надо календарные окна, а не длины списков.
+    """
+    side = [r["fact_date"] for r in rows
+            if (r["fact_date"] < change_date) == before]
+    days = sorted(set(side))
+    return set(days[-window:] if before else days[:window])
+
+
 def _experiment_id(campaign_id: str, change_date: str) -> str:
     raw = f"quasi:{campaign_id}:{change_date}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
@@ -99,14 +113,22 @@ def mine_quasi_experiments(facts: List[Dict[str, Any]], window: int = 14) -> Lis
 
     out: List[Dict[str, Any]] = []
     for campaign_id, rows in sorted(by_campaign.items()):
+        control_rows = [f for f in facts if str(f["campaign_id"]) != campaign_id]
         series = [{"date": r["fact_date"], "value": float(r.get("cost") or 0.0)} for r in rows]
         for point in detect_change_points(series):
             change_date = point["date"]
-            treated_before = [r for r in rows if r["fact_date"] < change_date][-window:]
-            treated_after = [r for r in rows if r["fact_date"] >= change_date][:window]
-            control_rows = [f for f in facts if str(f["campaign_id"]) != campaign_id]
-            control_before = [r for r in control_rows if r["fact_date"] < change_date][-window:]
-            control_after = [r for r in control_rows if r["fact_date"] >= change_date][:window]
+            # Окно задают ДАТЫ, а не число строк. Обработанная кампания даёт одну
+            # строку в день, контроль — по строке на каждую из десятков кампаний,
+            # поэтому срез «последние window строк» брал у контроля примерно
+            # window/N суток (при 84 кампаниях — шестую часть одного дня) и всегда
+            # одни и те же кампании с наибольшими id. DiD сравнивал две недели
+            # обработанной с четвертью суток чужой выборки.
+            before_dates = _window_dates(rows, change_date, window, before=True)
+            after_dates = _window_dates(rows, change_date, window, before=False)
+            treated_before = [r for r in rows if r["fact_date"] in before_dates]
+            treated_after = [r for r in rows if r["fact_date"] in after_dates]
+            control_before = [r for r in control_rows if r["fact_date"] in before_dates]
+            control_after = [r for r in control_rows if r["fact_date"] in after_dates]
             if not (treated_before and treated_after and control_before and control_after):
                 continue
 
