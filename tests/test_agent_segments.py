@@ -242,8 +242,9 @@ def test_segment_report_carries_real_conversions_end_to_end(monkeypatch):
     )
     monkeypatch.setattr(segments, "_run_report", lambda login, payload: tsv)
 
-    rows = segments.fetch_segment_report("cab", "device", "2026-08-06", "2026-08-20",
-                                         goals=["330070378", "338972879"])
+    rows, goal = segments.fetch_segment_report(
+        "cab", "device", "2026-08-06", "2026-08-20",
+        goals=["330070378", "338972879"])
 
     by_key = {r["segment_key"]: r for r in rows}
     # Победила 338972879 (442 + 2354 = 2796 против 2723) — и она же применена
@@ -253,6 +254,10 @@ def test_segment_report_carries_real_conversions_end_to_end(monkeypatch):
     # «--» это ноль, а не падение и не потеря строки.
     assert by_key["SMART_TV"]["conversions"] == 0
     assert by_key["MOBILE"]["clicks"] == 76719
+    # Выбор цели обязан быть ВИДЕН: идентификатор и объём — единственный способ
+    # заметить, что корректировки посчитаны не по заявке.
+    assert goal == {"goal_column": "Conversions_338972879_LSCCD",
+                    "conversions": 2796, "columns_offered": 2}
 
 
 def test_search_queries_carry_real_conversions_too(monkeypatch):
@@ -266,9 +271,11 @@ def test_search_queries_carry_real_conversions_too(monkeypatch):
     )
     monkeypatch.setattr(segments, "_run_report", lambda login, payload: tsv)
 
-    rows = segments.fetch_search_queries("cab", "2026-08-06", "2026-08-20",
-                                         goals=["111"])
+    rows, goal = segments.fetch_search_queries("cab", "2026-08-06", "2026-08-20",
+                                               goals=["111"])
 
     by_query = {r["query"]: r for r in rows}
     assert by_query["купить диплом"]["conversions"] == 7
     assert by_query["что такое вуз"]["conversions"] == 0
+    assert goal == {"goal_column": "Conversions_111_LSCCD",
+                    "conversions": 7, "columns_offered": 1}

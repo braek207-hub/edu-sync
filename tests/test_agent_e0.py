@@ -185,15 +185,18 @@ def _patch_e0_run(monkeypatch, reports=None):
     monkeypatch.setattr(agent_e0, "power_report", lambda *a, **k: {})
     monkeypatch.setattr(agent_e0, "fetch_campaign_ids", lambda *a, **k: [])
     monkeypatch.setattr(agent_e0, "fetch_objects", lambda *a, **k: [])
-    monkeypatch.setattr(agent_e0, "fetch_search_queries", lambda *a, **k: [])
+    monkeypatch.setattr(agent_e0, "fetch_search_queries",
+                        lambda *a, **k: ([], {"goal_column": None, "conversions": 0, "columns_offered": 0}))
     by_login = _REPORTS_BY_LOGIN if reports is None else reports
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
         # Числа отдаёт только срез по устройствам: пол и возраст оставлены
         # пустыми, чтобы разбивка отчёта читалась однозначно.
         lambda login, kind, date_from, date_to, by_campaign=False, goals=():
-            [] if (by_campaign or kind != "device")
-            else list(by_login.get(login, [])),
+            ([] if (by_campaign or kind != "device")
+             else list(by_login.get(login, [])),
+             {"goal_column": "Conversions_111_LSCCD", "conversions": 1,
+              "columns_offered": 1}),
     )
     return calls
 
@@ -344,7 +347,7 @@ def test_main_sends_account_goals_into_the_report_request(monkeypatch, capsys):
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
         lambda login, kind, date_from, date_to, by_campaign=False, goals=():
-            seen_goals.append(list(goals)) or [])
+            (seen_goals.append(list(goals)) or [], {"goal_column": None, "conversions": 0, "columns_offered": 0}))
 
     assert agent_e0.main() == 0
     capsys.readouterr()
@@ -565,9 +568,10 @@ def test_minus_word_candidates_land_in_the_report(monkeypatch, capsys):
     monkeypatch.setattr(agent_e0.agent_db, "load_baseline_cpa",
                         lambda *a, **k: {"111": 1000.0, "222": 2000.0, "333": 9000.0})
     monkeypatch.setattr(agent_e0, "fetch_search_queries", lambda login, *a, **k:
-                        _queries(("дорогой мусор", 7000.0, 0),
-                                 ("дешёвый мусор", 500.0, 0),
-                                 ("дорогой рабочий", 7000.0, 3)) if login == "acc-1" else [])
+                        (_queries(("дорогой мусор", 7000.0, 0),
+                                  ("дешёвый мусор", 500.0, 0),
+                                  ("дорогой рабочий", 7000.0, 3)) if login == "acc-1"
+                         else [], {"goal_column": None, "conversions": 0, "columns_offered": 0}))
 
     assert agent_e0.main() == 0
     report = _json.loads(capsys.readouterr().out)["minus_word_candidates"]
@@ -580,6 +584,31 @@ def test_minus_word_candidates_land_in_the_report(monkeypatch, capsys):
     assert report["cost_burned"] == 7000.0
 
 
+def test_run_report_names_the_goal_behind_every_slice(monkeypatch, capsys):
+    """Выбор цели обязан быть ВИДЕН, а не только правильно сделан.
+
+    Конверсионность каждого среза, а значит и каждая корректировка ставки,
+    считается по ОДНОЙ колонке цели. Колонку выбирает код — самую массовую из
+    переданных, — а имён целей Директ в отчёте не отдаёт, только
+    идентификаторы. Молчаливый выбор значит, что «корректировки посчитаны по
+    прокрутке страницы» и «по заявке» выглядят в прогоне одинаково.
+    """
+    _patch_e0_run(monkeypatch)
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    chosen = report["segment_goal_columns"]
+    assert chosen, "выбранная цель не видна в отчёте прогона"
+    assert {g["account"] for g in chosen} == {"acc-1", "acc-2"}
+    assert {g["purpose"] for g in chosen} == {"computed", "sliced"}
+    assert all(g["goal_column"] == "Conversions_111_LSCCD" for g in chosen)
+    assert all(g["columns_offered"] == 1 for g in chosen)
+
+    # По этой же цели отбираются кандидаты в минус-слова — она тоже названа.
+    assert [g["account"] for g in report["query_goal_columns"]] == ["acc-1", "acc-2"]
+
+
 def test_no_baseline_means_no_threshold_not_a_zero_one(monkeypatch, capsys):
     """Пустой справочник — «считать не от чего», а не порог 0.
 
@@ -589,7 +618,8 @@ def test_no_baseline_means_no_threshold_not_a_zero_one(monkeypatch, capsys):
     _patch_e0_run(monkeypatch)
     monkeypatch.setattr(agent_e0.agent_db, "load_baseline_cpa", lambda *a, **k: {})
     monkeypatch.setattr(agent_e0, "fetch_search_queries", lambda login, *a, **k:
-                        _queries(("копеечный мусор", 3.0, 0)) if login == "acc-1" else [])
+                        (_queries(("копеечный мусор", 3.0, 0)) if login == "acc-1"
+                         else [], {"goal_column": None, "conversions": 0, "columns_offered": 0}))
 
     assert agent_e0.main() == 0
     report = _json.loads(capsys.readouterr().out)["minus_word_candidates"]

@@ -17,7 +17,7 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -221,12 +221,32 @@ def primary_goal_column(records: List[Dict[str, str]]) -> Optional[str]:
     return sorted(c for c in columns if totals[c] == best)[0]
 
 
+def chosen_goal(records: List[Dict[str, str]], goal_column: Optional[str]) -> Dict[str, Any]:
+    """Паспорт выбранной цели — чтобы выбор был ВИДЕН в отчёте прогона.
+
+    По этой одной колонке считается вся конверсионность среза, а значит и все
+    корректировки ставок. Выбор автоматический (самая массовая цель кабинета),
+    имён целей у Директа в отчёте нет — только идентификаторы, — поэтому
+    единственная защита от «корректировки посчитаны по прокрутке страницы» это
+    возможность сверить идентификатор глазами. Молчаливый выбор такой
+    возможности не даёт.
+    """
+    return {
+        "goal_column": goal_column,
+        "conversions": (sum(_cell_int(r.get(goal_column)) for r in records)
+                        if goal_column else 0),
+        "columns_offered": len(conversion_columns(records)),
+    }
+
+
 def fetch_segment_report(
     login: str, segment_kind: str, date_from: str, date_to: str,
     by_campaign: bool = False, goals: List[str] = (),
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Срез за окно. by_campaign=True добавляет разрез по кампаниям и датам —
-    для edu_agent_facts_sliced; без него агрегат по аккаунту для корректировок."""
+    для edu_agent_facts_sliced; без него агрегат по аккаунту для корректировок.
+
+    Возвращает (строки, паспорт выбранной цели) — см. chosen_goal."""
     field = SEGMENT_FIELDS[segment_kind]
     fields = [field, "Clicks", "Cost", "Impressions"]
     if goals:
@@ -267,7 +287,7 @@ def fetch_segment_report(
             row["campaign_id"] = rec.get("CampaignId", "")
             row["date"] = rec.get("Date", "")
         rows.append(row)
-    return rows
+    return rows, chosen_goal(records, goal_column)
 
 
 def _api_post(url: str, login: str, payload: Dict[str, Any], what: str) -> Dict[str, Any]:
@@ -439,7 +459,7 @@ def fetch_objects(login: str, object_level: str, campaign_ids: List[int]) -> Lis
 
 def fetch_search_queries(
     login: str, date_from: str, date_to: str, goals: List[str] = ()
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Поисковые запросы за окно, агрегат без дат. Только строки с кликами:
     показы без кликов дают миллионы строк и ничего не решают.
 
@@ -483,4 +503,4 @@ def fetch_search_queries(
             "conversions": _cell_int(rec.get(goal_column)) if goal_column else 0,
         }
         for rec in records
-    ]
+    ], chosen_goal(records, goal_column)

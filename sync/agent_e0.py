@@ -294,11 +294,11 @@ def main() -> int:
                          "kind": kind, "date_from": slice_from, "by_campaign": True})
 
     def _run_job(job: Dict[str, Any]) -> Dict[str, Any]:
-        rows = fetch_segment_report(
+        rows, goal = fetch_segment_report(
             job["login"], job["kind"], job["date_from"], date_to,
             by_campaign=job["by_campaign"], goals=job["goals"],
         )
-        return {**job, "rows": rows}
+        return {**job, "rows": rows, "goal": goal}
 
     # Вычисленные настройки копятся ПО КАБИНЕТАМ: числа посчитаны по аудитории
     # конкретного кабинета и записываются под его логином (object_id). Общий
@@ -309,10 +309,18 @@ def main() -> int:
     # неотличим от «данных нет» — а именно так и выглядел дефект размазывания.
     computed_skipped: List[Dict[str, Any]] = []
     sliced_rows: List[Dict[str, Any]] = []
+    # По ОДНОЙ цели считается конверсионность каждого среза, а значит и все
+    # корректировки ставок. Цель выбирается автоматически — самая массовая из
+    # переданных, — а имён целей Директ в отчёте не отдаёт, только
+    # идентификаторы. Единственная защита от «корректировки посчитаны по
+    # прокрутке страницы» — видеть выбор в отчёте прогона и сверять глазами.
+    segment_goals: List[Dict[str, Any]] = []
     if jobs:
         with ThreadPoolExecutor(max_workers=REPORT_WORKERS) as pool:
             for done in as_completed([pool.submit(_run_job, j) for j in jobs]):
                 job = done.result()
+                segment_goals.append({"account": job["login"], "slice": job["kind"],
+                                      "purpose": job["purpose"], **job["goal"]})
                 if job["purpose"] == "computed":
                     login, rows, reason = computed_rows_for_job(job)
                     if reason:
@@ -343,6 +351,9 @@ def main() -> int:
                       if f["fact_date"] >= slice_from and (f["cost"] > 0 or f["leads"] > 0)}
     object_rows: List[Dict[str, Any]] = []
     query_rows: List[Dict[str, Any]] = []
+    # Та же цена ошибки, что и у сегментов: по этой цели отбираются кандидаты
+    # в минус-слова.
+    query_goals: List[Dict[str, Any]] = []
     login_by_campaign_id: Dict[str, str] = {}
     for client in clients:
         login, goals = client["login"], client["goal_ids"]
@@ -358,7 +369,10 @@ def main() -> int:
         for level in ("adgroup", "keyword", "ad"):
             object_rows += build_object_rows(
                 fetch_objects(login, level, campaign_ids), level, seen_on=today_iso)
-        query_rows += fetch_search_queries(login, queries_from, date_to, goals=goals)
+        rows_for_login, query_goal = fetch_search_queries(
+            login, queries_from, date_to, goals=goals)
+        query_rows += rows_for_login
+        query_goals.append({"account": login, **query_goal})
     agent_db.upsert_objects(object_rows)
     query_rows = top_queries_by_cost(query_rows)
     agent_db.upsert_search_queries(query_rows)
@@ -529,6 +543,9 @@ def main() -> int:
         "computed_settings": computed_count,
         "computed_settings_by_account": {k: len(v) for k, v in computed_by_account.items()},
         "computed_settings_skipped": computed_skipped,
+        "segment_goal_columns": sorted(
+            segment_goals, key=lambda g: (g["account"], g["purpose"], g["slice"])),
+        "query_goal_columns": sorted(query_goals, key=lambda g: g["account"]),
         "profile_rows": len(profile_rows),
         "metrika_hourly": len(hourly_rows),
         "metrika_hourly_numerator": hourly_numerator,
