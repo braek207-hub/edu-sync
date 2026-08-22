@@ -182,3 +182,126 @@ def test_describe_counts_raised_and_lowered_hours():
     up, down, neutral = schedule.describe(items)
 
     assert (up, down, neutral) == (2, 1, 21)
+
+
+# --------------- рельсы: расписание правит кампанию целиком
+
+from sync.agent.writer.diff import diff_schedule
+from sync.agent.writer.guardrails import check_action, check_rollback
+from sync.agent.writer.rollback import rollback_payload
+
+
+def _action(items=None, previous=None):
+    # Пустой список — валидный вход теста (проверка рельсы), поэтому подмена
+    # дефолтом только для None: `items or ...` съедал бы именно этот случай.
+    if items is None:
+        items = schedule_items([_hour(3, -40)])
+    return {
+        "action_kind": "schedule.set",
+        "object_id": "111",
+        "payload": {"CampaignId": 111,
+                    "TimeTargeting": {"Schedule": {"Items": items}}},
+        "previous_state": {"TimeTargeting": previous if previous is not None else {}},
+    }
+
+
+def test_correct_schedule_passes_the_rail():
+    ok, reason = check_action(_action())
+    assert ok, reason
+
+
+def test_zero_hour_is_refused_by_the_rail():
+    """Ноль в расписании — не «ставка ниже», а «показов в этот час нет».
+
+    Ошибка построителя обернулась бы выключенным трафиком, поэтому рельса
+    считает независимо от него: проверка, доверяющая тому, кого проверяет,
+    не проверка.
+    """
+    broken = ["1," + ",".join(["0"] + ["100"] * 23)]
+    ok, reason = check_action(_action(items=broken))
+
+    assert not ok
+    assert "выключает показы" in reason
+
+
+def test_non_multiple_of_ten_is_refused():
+    broken = ["1," + ",".join(["122"] + ["100"] * 23)]
+    ok, reason = check_action(_action(items=broken))
+
+    assert not ok
+    assert "кратен" in reason
+
+
+def test_out_of_range_coefficient_is_refused():
+    broken = ["1," + ",".join(["300"] + ["100"] * 23)]
+    assert check_action(_action(items=broken))[0] is False
+
+
+def test_short_row_is_refused():
+    assert check_action(_action(items=["1,100,100"]))[0] is False
+
+
+def test_empty_schedule_is_refused():
+    assert check_action(_action(items=[]))[0] is False
+
+
+def test_bad_weekday_is_refused():
+    broken = ["9," + ",".join(["100"] * 24)]
+    assert check_action(_action(items=broken))[0] is False
+
+
+# --------------- действие создаётся только при реальном отличии
+
+def test_no_action_when_cabinet_already_matches():
+    items = schedule_items([_hour(3, -40)])
+    assert diff_schedule(items, {"Schedule": {"Items": items}}, "111") == []
+
+
+def test_action_carries_the_whole_previous_block():
+    """previous_state несёт ВЕСЬ прежний TimeTargeting, а не только часы.
+
+    Вместе с расписанием в блоке живут праздничный режим и учёт рабочих
+    выходных, настроенные человеком. Сохрани мы одни часы — откат собрал бы
+    блок заново и стёр бы их, то есть сам стал бы правкой.
+    """
+    current = {"Schedule": {"Items": ["1," + ",".join(["100"] * 24)]},
+               "HolidaysSchedule": {"SuspendOnHolidays": "YES"},
+               "ConsiderWorkingWeekends": "YES"}
+    actions = diff_schedule(schedule_items([_hour(3, -40)]), current, "111")
+
+    assert len(actions) == 1
+    assert actions[0]["previous_state"]["TimeTargeting"] == current
+    assert actions[0]["direct_type"] == "TIME_TARGETING"
+
+
+def test_idempotency_key_follows_the_profile():
+    # Ключ от содержимого: пересчитал Э0 хоть один час — это другое действие,
+    # и закрытый ключ прошлого прогона его не отсечёт.
+    first = diff_schedule(schedule_items([_hour(3, -40)]), {}, "111")[0]
+    second = diff_schedule(schedule_items([_hour(3, -30)]), {}, "111")[0]
+
+    assert first["idempotency_key"] != second["idempotency_key"]
+
+
+# --------------- откат возвращает прежний блок целиком
+
+def test_rollback_restores_the_previous_block():
+    previous = {"Schedule": {"Items": ["1," + ",".join(["100"] * 24)]},
+                "HolidaysSchedule": {"SuspendOnHolidays": "YES"}}
+    service, method, params = rollback_payload(_action(previous=previous))
+
+    assert (service, method) == ("campaigns", "update")
+    assert params["Campaigns"][0]["TimeTargeting"] == previous
+    assert params["Campaigns"][0]["Id"] == 111
+
+
+def test_rollback_is_refused_without_known_previous_state():
+    # Вслепую не пишем — то же правило, что у корректировки без Id.
+    action = _action()
+    action["previous_state"] = {}
+    assert rollback_payload(action) is None
+
+
+def test_rollback_of_schedule_passes_its_rail():
+    ok, reason = check_rollback({"action_kind": "schedule.set"})
+    assert ok, reason

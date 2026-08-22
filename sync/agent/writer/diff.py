@@ -15,10 +15,61 @@ previous_state заполняется ДО применения: без него
 import hashlib
 from typing import Any, Dict, List
 
+from sync.agent.writer import schedule
+
 
 def _idempotency_key(campaign_id: str, direct_type: str, key: str, percent: int) -> str:
     raw = f"bidmod:{campaign_id}:{direct_type}:{key}:{percent}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _schedule_idempotency_key(campaign_id: str, items: List[str]) -> str:
+    """Ключ действия по расписанию — от СОДЕРЖИМОГО, как у корректировок.
+
+    В ключе корректировки лежит процент, здесь — весь набор часов: расписание
+    применяется целиком, и «то же действие» означает «ровно тот же профиль».
+    Пересчитал Э0 хоть один час — это уже другое действие, и закрытый ключ
+    прошлого прогона его не отсечёт.
+    """
+    raw = "schedule:" + str(campaign_id) + ":" + "|".join(items)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def diff_schedule(
+    desired_items: List[str], time_targeting: Dict[str, Any], campaign_id: str
+) -> List[Dict[str, Any]]:
+    """Действие по расписанию, если оно отличается от стоящего в кабинете.
+
+    Список из нуля или одного элемента: у Директа нет способа поменять один
+    час — Schedule принимается целиком, поэтому и действие ровно одно.
+
+    previous_state несёт ВЕСЬ прежний блок TimeTargeting, а не только Items:
+    откат обязан вернуть кампанию туда, откуда её вывели, вместе с праздничным
+    режимом и учётом рабочих выходных. Сохрани мы одни часы — откат собрал бы
+    блок заново и стёр бы соседние поля, которые настроил человек.
+    """
+    if not desired_items:
+        return []
+    if not schedule.schedule_changed(time_targeting, desired_items):
+        return []
+
+    payload = {
+        "CampaignId": int(campaign_id),
+        "TimeTargeting": schedule.time_targeting_payload(time_targeting, desired_items),
+    }
+    return [{
+        "action_kind": "schedule.set",
+        "object_level": "campaign",
+        "object_id": str(campaign_id),
+        # Тип и ключ заполнены и здесь: по ним адресуются кулдаун после отката
+        # и счётчик попыток. Без них расписание жило бы вне этих механизмов —
+        # то есть переотправлялось бы вечно и после вредного вердикта.
+        "direct_type": "TIME_TARGETING",
+        "key": "schedule",
+        "payload": payload,
+        "previous_state": {"TimeTargeting": time_targeting or {}},
+        "idempotency_key": _schedule_idempotency_key(campaign_id, desired_items),
+    }]
 
 
 def diff_modifiers(

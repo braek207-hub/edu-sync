@@ -148,4 +148,19 @@ def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[st
             "BidModifiers": [{"Id": modifier_id, "BidModifier": delta_to_api(0)}]
         }
 
+    if kind == "schedule.set":
+        # Возвращается ВЕСЬ прежний блок TimeTargeting, а не только часы:
+        # вместе с расписанием в нём живут праздничный режим и учёт рабочих
+        # выходных, настроенные человеком. Собери мы блок заново из одних
+        # часов — откат стёр бы чужие настройки, то есть сам стал бы правкой.
+        previous_targeting = previous.get("TimeTargeting")
+        campaign_id = (action.get("payload") or {}).get("CampaignId") or action.get("object_id")
+        if previous_targeting is None or campaign_id is None:
+            # Прежнее состояние неизвестно — вслепую не пишем, по тому же
+            # правилу, что и у корректировки без Id.
+            return None
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(campaign_id), "TimeTargeting": previous_targeting}]
+        }
+
     return None

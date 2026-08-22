@@ -35,12 +35,20 @@ MAX_ACTIONS_PER_RUN = 50
 # словам — тот пропускает любой ещё не придуманный вид действия (purge,
 # campaign.archive, adgroups.suspend, ...) молча, а рельса обязана держать
 # "никогда", а не эвристику по подстроке.
-ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set"}
+ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set"}
+
+# Границы почасового расписания — СВОИ, независимые от writer/schedule.py.
+# Дублирование намеренное: рельса обязана считать сама, иначе она проверяет
+# построитель его же формулой и пропустит любую его ошибку.
+SCHEDULE_NUMBERS_PER_ROW = 25   # день недели + 24 часа
+SCHEDULE_MIN = 10               # ноль запрещён отдельно: он выключает показы
+SCHEDULE_MAX = 200
+SCHEDULE_STEP = 10
 
 # Путь ВОЗВРАТА — только set: он переписывает уже существующий объект в его
 # прежнее значение. add на этом пути означал бы создание НОВОГО объекта вместо
 # восстановления старого, то есть ещё одно изменение кабинета под видом отмены.
-ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set"}
+ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set", "schedule.set"}
 
 # Куда обязан возвращать откат, в зависимости от вида ИСХОДНОГО действия.
 # Отмена добавления — нейтраль (объекта до действия не было), отмена
@@ -73,6 +81,51 @@ def check_action(action: Dict[str, Any]) -> Tuple[bool, str]:
     if percent is not None:
         if abs(int(percent)) > MODIFIER_CAP:
             return False, f"потолок корректировки ±{MODIFIER_CAP}%, получено {percent}%"
+
+    if kind == "schedule.set":
+        ok, reason = _check_schedule(action)
+        if not ok:
+            return False, reason
+    return True, ""
+
+
+def _check_schedule(action: Dict[str, Any]) -> Tuple[bool, str]:
+    """Рельса расписания: цена ошибки здесь выше, чем у корректировки сегмента.
+
+    Расписание правит кампанию ЦЕЛИКОМ, и ноль в нём — это не «ставка ниже», а
+    «показов в этот час нет». Ошибка в построении обернулась бы не потерей
+    эффективности, а выключенным трафиком, поэтому проверка стоит отдельно от
+    построителя (writer/schedule.py) и считает независимо от него: рельса,
+    доверяющая тому, кого проверяет, не рельса.
+    """
+    items = (((action.get("payload") or {}).get("TimeTargeting") or {})
+             .get("Schedule") or {}).get("Items")
+    if not items:
+        return False, "расписание без часов: пустой Schedule.Items"
+
+    for item in items:
+        parts = [p.strip() for p in str(item).split(",")]
+        if len(parts) != SCHEDULE_NUMBERS_PER_ROW:
+            return False, (f"строка расписания обязана нести день недели и 24 часа, "
+                           f"получено полей: {len(parts)}")
+        try:
+            numbers = [int(p) for p in parts]
+        except ValueError:
+            return False, f"нечисловое значение в расписании: {item!r}"
+
+        day, hours = numbers[0], numbers[1:]
+        if not 1 <= day <= 7:
+            return False, f"день недели вне 1..7: {day}"
+        for hour_value in hours:
+            if hour_value == 0:
+                return False, ("ноль в расписании выключает показы в этот час — "
+                               "остановку трафика агент не назначает")
+            if not SCHEDULE_MIN <= hour_value <= SCHEDULE_MAX:
+                return False, (f"коэффициент расписания вне {SCHEDULE_MIN}..{SCHEDULE_MAX}: "
+                               f"{hour_value}")
+            if hour_value % SCHEDULE_STEP:
+                return False, (f"коэффициент расписания обязан быть кратен "
+                               f"{SCHEDULE_STEP}: {hour_value}")
     return True, ""
 
 
@@ -156,6 +209,15 @@ def check_rollback(request: Dict[str, Any]) -> Tuple[bool, str]:
 
     if kind not in ROLLBACK_ALLOWED_ACTION_KINDS:
         return False, f"вид действия вне allow-листа возврата: {kind}"
+
+    if kind == "schedule.set":
+        # У расписания возврат не описывается одним коэффициентом: назад едет
+        # весь блок TimeTargeting. Сверять его с прошлым состоянием здесь
+        # незачем — строитель возврата (rollback_payload) берёт блок прямо из
+        # журнала и не собирает его заново, поэтому «вернуть не туда» тут
+        # невозможно по построению. Требовать api_coefficient — значит
+        # запретить откат расписания вовсе.
+        return True, ""
 
     coefficient = request.get("api_coefficient")
     if coefficient is None:
