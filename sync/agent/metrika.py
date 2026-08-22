@@ -32,6 +32,8 @@ METRICA_API_URL = "https://api-metrika.yandex.net/stat/v1/data"
 GOALS_API_URL = "https://api-metrika.yandex.net/management/v1/counter/{counter}/goals"
 ATTRIBUTION = "lastsign"
 ROW_LIMIT = 10_000
+# Метрика берёт не больше 20 метрик на запрос (код 4015). Одну занимают визиты.
+MAX_GOALS_PER_REQUEST = 19
 # Счётчики EDU по проектам (vuz/vse/provuz) — те же, что в sync/edu_direct_settings.py.
 EDU_COUNTERS = [98627983, 96526110, 95348914]
 
@@ -136,6 +138,38 @@ def hourly_metrics(goal_ids: List[int]) -> str:
     return ",".join(["ym:s:visits"] + [f"ym:s:goal{g}reaches" for g in ordered])
 
 
+def goal_batches(goal_ids: List[int], size: int = MAX_GOALS_PER_REQUEST) -> List[List[int]]:
+    """Цели порциями под лимит Метрики в 20 метрик на запрос.
+
+    Опыт 32577516946: счётчик 98627983 имеет 90 целей, и запрос всех сразу
+    отвергается целиком — «Exceeded number of metrics in request, value: 90,
+    limit: 20, code 4015». Молча срезать хвост нельзя: это тот же класс дефекта,
+    что профиль по «любой цели» — считается не то, а выглядит посчитанным.
+    """
+    ordered = sorted({int(g) for g in goal_ids})
+    return [ordered[i:i + size] for i in range(0, len(ordered), size)]
+
+
+def sum_profiles(parts: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Профили от нескольких порций целей → один, сложенный по часу.
+
+    Визиты в каждой порции ОДНИ И ТЕ ЖЕ (это метрика часа, а не цели), поэтому
+    складываются только достижения: сложить визиты значило бы раздуть
+    знаменатель во столько раз, сколько было порций.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    for part in parts:
+        for row in part or []:
+            key = str(row.get("segment_key"))
+            slot = merged.get(key)
+            if slot is None:
+                merged[key] = dict(row)
+                continue
+            slot["leads"] += int(row.get("leads") or 0)
+            slot["sum_p_pay"] += float(row.get("sum_p_pay") or 0.0)
+    return sorted(merged.values(), key=lambda r: int(r["segment_key"]))
+
+
 def fetch_hourly_profile(counter_id: int, date_from: str, date_to: str,
                          goal_ids: List[int]) -> List[Dict[str, Any]]:
     """Визиты и достижения ЦЕЛЕВЫХ целей по часам суток.
@@ -158,17 +192,20 @@ def fetch_hourly_profile(counter_id: int, date_from: str, date_to: str,
             "fetch_hourly_profile без целей: считать расписание не по чему. "
             "Профиль по «любой цели» — это профиль прокрутки, а не лидов."
         )
-    params = {
-        "ids": counter_id,
-        "metrics": hourly_metrics(goal_ids),
-        "dimensions": "ym:s:hour",
-        "date1": date_from,
-        "date2": date_to,
-        "attribution": ATTRIBUTION,
-        "limit": ROW_LIMIT,
-        "accuracy": "full",
-    }
-    return parse_hourly(_metrica_get(params, os.environ["YM_TOKEN"]))
+    token = os.environ["YM_TOKEN"]
+    parts = []
+    for batch in goal_batches(goal_ids):
+        parts.append(parse_hourly(_metrica_get({
+            "ids": counter_id,
+            "metrics": hourly_metrics(batch),
+            "dimensions": "ym:s:hour",
+            "date1": date_from,
+            "date2": date_to,
+            "attribution": ATTRIBUTION,
+            "limit": ROW_LIMIT,
+            "accuracy": "full",
+        }, token)))
+    return sum_profiles(parts)
 
 
 def merge_hourly(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

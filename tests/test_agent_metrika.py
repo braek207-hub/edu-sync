@@ -137,3 +137,71 @@ def test_all_goal_columns_are_summed_not_just_the_first():
 
     assert out[0]["sum_p_pay"] == 12.0
     assert out[0]["leads"] == 12
+
+
+# --------------- лимит Метрики: 20 метрик на запрос (код 4015)
+# Опыт 32577516946: у счётчика 98627983 девяносто целей, запрос всех сразу
+# отвергается целиком. Срезать хвост нельзя — это тот же класс дефекта, что
+# профиль по «любой цели»: считается не то, а выглядит посчитанным.
+
+from sync.agent.metrika import MAX_GOALS_PER_REQUEST, goal_batches, sum_profiles
+
+
+def test_batches_fit_the_api_limit():
+    batches = goal_batches(list(range(1, 91)))
+
+    assert all(len(b) <= MAX_GOALS_PER_REQUEST for b in batches)
+    # Одну метрику из двадцати занимают визиты.
+    assert MAX_GOALS_PER_REQUEST == 19
+    assert max(len(hourly_metrics(b).split(",")) for b in batches) <= 20
+
+
+def test_no_goal_is_dropped_by_batching():
+    goals = list(range(1, 91))
+    assert sorted(g for b in goal_batches(goals) for g in b) == goals
+
+
+def test_single_batch_when_goals_fit():
+    assert goal_batches([3, 1, 2]) == [[1, 2, 3]]
+
+
+def test_visits_are_not_multiplied_across_batches():
+    """Визиты в каждой порции ОДНИ И ТЕ ЖЕ — это метрика часа, не цели.
+
+    Сложить их значило бы раздуть знаменатель во столько раз, сколько было
+    порций, и конверсионность часа упала бы кратно — молча и правдоподобно.
+    """
+    part = [{"segment_kind": "hour", "segment_key": "9",
+             "clicks": 1000, "leads": 3, "sum_p_pay": 3.0}]
+    other = [{"segment_kind": "hour", "segment_key": "9",
+              "clicks": 1000, "leads": 4, "sum_p_pay": 4.0}]
+
+    out = sum_profiles([part, other])
+
+    assert len(out) == 1
+    assert out[0]["clicks"] == 1000       # не 2000
+    assert out[0]["leads"] == 7           # достижения складываются
+    assert out[0]["sum_p_pay"] == 7.0
+
+
+def test_hours_present_only_in_one_batch_survive():
+    a = [{"segment_kind": "hour", "segment_key": "3", "clicks": 10, "leads": 1, "sum_p_pay": 1.0}]
+    b = [{"segment_kind": "hour", "segment_key": "21", "clicks": 20, "leads": 2, "sum_p_pay": 2.0}]
+
+    assert [r["segment_key"] for r in sum_profiles([a, b])] == ["3", "21"]
+
+
+def test_ninety_goals_go_out_in_five_requests(monkeypatch):
+    """Сквозная половина: порции обязаны реально уйти отдельными запросами."""
+    sent = []
+    monkeypatch.setenv("YM_TOKEN", "t")
+    monkeypatch.setattr(metrika, "_metrica_get", lambda params, token: sent.append(
+        params["metrics"]) or {"data": [{"dimensions": [{"name": "09"}],
+                                         "metrics": [100.0, 1.0]}]})
+
+    out = metrika.fetch_hourly_profile(1, "2026-01-01", "2026-03-31", list(range(1, 91)))
+
+    assert len(sent) == 5
+    assert all(len(m.split(",")) <= 20 for m in sent)
+    # Час один, визиты не размножились, достижения сложились по всем порциям.
+    assert len(out) == 1 and out[0]["clicks"] == 100 and out[0]["leads"] == 5
