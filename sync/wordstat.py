@@ -1,20 +1,25 @@
 """Yandex Cloud Search API (Wordstat) → lime_wordstat_demand (+ _daily).
 
-Брендовый спрос (Σ 5 фраз, регион Россия=225, широкое соответствие) в двух зернах:
+Брендовый спрос (Σ 5 фраз, БЕЗ фильтра региона, широкое соответствие) в двух зернах:
 недельном (вся история) и дневном (Wordstat хранит дневную детализацию только
 за последние 60 дней — глубже дневного ряда не будет, это ок).
 Старый api.wordstat.yandex.net закрыт — используем Search API.
+
+Без региона — потому что так собирает ручной канон Павла (таблица «Частотность
+брендовых запросов»): сверка 2026-08-20 по неделе 10.08 дала бит-в-бит совпадение
+с его цифрами (Σ=183767), а прежний фильтр «Россия=225» давал стабильно −3%
+(−5.3 тыс/нед), почти весь зазор — в латинской фразе «lime».
 
 Auth: сервисный аккаунт (роль search-api.webSearch.user) → API-ключ.
 Env: YANDEX_SEARCHAPI_KEY, YANDEX_CLOUD_FOLDER_ID, DATABASE_URL.
 """
 import datetime as dt
 import os
+import time
 
 import requests
 
 WORDSTAT_URL = "https://searchapi.api.cloud.yandex.net/v2/wordstat/dynamics"
-RUSSIA_REGION = "225"  # регион Wordstat «Россия»
 BRAND_PHRASES = ["lime", "лайм интернет", "лайм купить", "лайм магазин", "лайм одежда"]
 # Глубина дневной детализации Wordstat: «в дневном отображении данные показываются
 # за последние 60 дней» (справка Wordstat). Граница у API СТРОГАЯ: from ровно 60 дней
@@ -103,16 +108,27 @@ def aggregate_weekly(responses: list[dict]) -> dict[str, int]:
 
 
 def _post_dynamics(body: dict) -> dict:
-    """POST GetDynamics с авторизацией. Общий транспорт weekly- и daily-запросов."""
+    """POST GetDynamics с авторизацией. Общий транспорт weekly- и daily-запросов.
+
+    Ретрай с бэкоффом на 429 (rate limit Search API): объединённый ecom-синк дёргает
+    много фраз подряд по нескольким проектам и упирается в лимит — без ретрая наборы
+    падали целиком (последний, meshnflesh, страдал больше всех). Уважаем Retry-After,
+    иначе экспонента 2^n (кап 30с), до 6 попыток.
+    """
     api_key = os.environ["YANDEX_SEARCHAPI_KEY"]
     folder_id = os.environ.get("YANDEX_CLOUD_FOLDER_ID")  # опц.: ключ привязан к каталогу СА
     if folder_id:
         body["folderId"] = folder_id
-    r = requests.post(
-        WORDSTAT_URL, json=body, timeout=60,
-        headers={"Authorization": f"Api-Key {api_key}", "Content-Type": "application/json"},
-    )
-    r.raise_for_status()
+    headers = {"Authorization": f"Api-Key {api_key}", "Content-Type": "application/json"}
+    for attempt in range(6):
+        r = requests.post(WORDSTAT_URL, json=body, timeout=60, headers=headers)
+        if r.status_code == 429 and attempt < 5:
+            wait = float(r.headers.get("Retry-After") or 0) or min(2**attempt, 30)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()  # недостижимо: цикл всегда вернул или бросил — для полноты типов
     return r.json()
 
 
@@ -132,15 +148,18 @@ def aggregate_daily(responses: list[dict]) -> dict[str, int]:
 
 
 def fetch_phrase(phrase: str, from_date: str, to_date: str, regions: list[str] | None = None) -> dict:
-    """GetDynamics по одной фразе за период (weekly). regions — список region-id (дефолт РФ)."""
+    """GetDynamics по одной фразе за период (weekly). regions=None — без фильтра
+    (все регионы, как в ручном каноне Павла — см. докстринг модуля)."""
     # API требует fromDate=понедельник, toDate=воскресенье (граница недели) для PERIOD_WEEKLY.
-    return _post_dynamics({
+    body = {
         "phrase": phrase,
         "period": "PERIOD_WEEKLY",
         "fromDate": f"{_monday(from_date)}T00:00:00Z",
         "toDate": f"{_sunday(to_date)}T23:59:59Z",
-        "regions": regions or [RUSSIA_REGION],
-    })
+    }
+    if regions:
+        body["regions"] = regions
+    return _post_dynamics(body)
 
 
 def fetch_phrase_daily(phrase: str, from_date: str, to_date: str, regions: list[str] | None = None) -> dict:
@@ -149,14 +168,18 @@ def fetch_phrase_daily(phrase: str, from_date: str, to_date: str, regions: list[
     В отличие от weekly края периода НЕ выравниваются: границу требует только
     weekly (toDate=воскресенье) и monthly (toDate=последний день месяца),
     дневные даты идут как есть. Глубже 60 дней API дневных точек не отдаёт.
+    regions=None — без фильтра (та же методика, что у недельного ряда,
+    иначе разъедется масштаб).
     """
-    return _post_dynamics({
+    body = {
         "phrase": phrase,
         "period": "PERIOD_DAILY",
         "fromDate": f"{from_date[:10]}T00:00:00Z",
         "toDate": f"{to_date[:10]}T23:59:59Z",
-        "regions": regions or [RUSSIA_REGION],
-    })
+    }
+    if regions:
+        body["regions"] = regions
+    return _post_dynamics(body)
 
 
 def sync_wordstat_demand(from_date: str, to_date: str) -> int:
