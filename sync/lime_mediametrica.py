@@ -2,33 +2,62 @@
 """
 sync/lime_mediametrica.py — синк Медиаметрики (AdMetrica, post-view) → lime_media_stats.
 
-У AdMetrica документированный API только за «Метрика Про» (её нет). Внутренний API кабинета
-media.metrika.yandex.ru работает по сохранённой сессии Яндекса БЕЗ «Про» — это те же запросы,
-что делает сам сайт при отрисовке отчётов. Ходим headless-браузером (см. lime_media_session):
-  - GET /api/v1/campaign/list — кампании рекламодателя Lime (promoterId 17618).
-  - GET /api/v1/report/table-data?group=day&goal_id=<покупка> — дневной отчёт:
-      renders(показы), users(охват), clicks, goal<ID>Reaches(пост-вью конверсии по цели).
+ПРЯМОЙ ОФИЦИАЛЬНЫЙ API (переезд 2026-08-20 с headless-обхода). Хост
+api.media.metrika.yandex.net/v1, OAuth-токен. Доход/охват/воронка/видео берутся
+документированными метриками БЕЗ «Метрики Про» — раньше их гейтил внутренний API кабинета
+(имена вроде am:e:postViewRevenue → 4002), а официальный принимает правильные имена:
+  - am:e:ecommerce<currency>RevenuePostView — ПОСТ-ВЬЮ ДОХОД (раньше был 0/оценка);
+  - am:e:goal<id>Reaches — пост-вью конверсии по цели (покупка/корзина/оформление);
+  - am:e:renders(показы) / am:e:users(охват) / am:e:clicks;
+  - am:e:videoComplete — досмотры видео.
+Всё одним запросом /stat/data на кампанию с dimensions=am:e:date (дневной грейн).
 
-Пишем в lime_media_stats source='mediametrica'. cost тут 0 — расход медийки берётся из
-Директа/Urban; ценность Медиаметрики = ОХВАТ + POST-VIEW конверсии.
+⚠️ ids в stat/data = campaign_id из /management/campaigns (внутренний AdMetrica id,
+НЕ counter, НЕ Директ id). Со counter возвращались нули.
+
+Пишем в lime_media_stats source='mediametrica'. cost=0 — расход медийки берётся из
+Директа/Urban; ценность Медиаметрики = ОХВАТ + POST-VIEW доход/конверсии + досмотры.
 
 Запуск:  python -m sync.lime_mediametrica     (DRY: MEDIA_DRY=1 — печать без записи в БД)
-ENV: DATABASE_URL, YANDEX_STORAGE_STATE, LIME_MM_DAYS_BACK (14), LIME_MM_PURCHASE_GOAL (3023504302)
+ENV: DATABASE_URL, LIME_MM_OAUTH_TOKEN, LIME_MM_DAYS_BACK (14),
+     LIME_MM_PURCHASE_GOAL (3023504302), LIME_MM_CART_GOAL (194380276),
+     LIME_MM_CHECKOUT_GOAL (340817822), LIME_MM_CURRENCY (RUB)
 """
 import os
 import json
 import traceback
 from datetime import date, timedelta
 
-from sync.lime_media_session import yandex_page, page_fetch_json, FETCH_JS
+import requests
 
-ORIGIN = "https://media.metrika.yandex.ru/"
-PROMOTER_ID = 17618          # рекламодатель Lime
+BASE = "https://api.media.metrika.yandex.net/v1"
 ADVERTISER_NAME = "Lime"
-PURCHASE_GOAL = os.environ.get("LIME_MM_PURCHASE_GOAL", "3023504302")  # цель «Покупка» (клад METRIKA_GOALS)
-# Доп. пост-вью цели воронки (клад METRIKA_GOALS): корзина и начало оформления.
-CART_GOAL = os.environ.get("LIME_MM_CART_GOAL", "194380276")
-CHECKOUT_GOAL = os.environ.get("LIME_MM_CHECKOUT_GOAL", "340817822")
+CURRENCY = os.environ.get("LIME_MM_CURRENCY", "RUB")
+PURCHASE_GOAL = os.environ.get("LIME_MM_PURCHASE_GOAL", "3023504302")  # цель «Покупка»
+CART_GOAL = os.environ.get("LIME_MM_CART_GOAL", "194380276")           # «Добавление в корзину»
+CHECKOUT_GOAL = os.environ.get("LIME_MM_CHECKOUT_GOAL", "340817822")   # «Начало оформления»
+
+_TOKEN = os.environ.get("LIME_MM_OAUTH_TOKEN", "")
+
+
+def _headers() -> dict:
+    if not _TOKEN:
+        raise RuntimeError("LIME_MM_OAUTH_TOKEN не задан — нужен OAuth-токен Яндекса с доступом к AdMetrica")
+    return {"Authorization": f"OAuth {_TOKEN}", "Content-Type": "application/x-yametrika+json"}
+
+
+# Метрики одного запроса (порядок = порядок индексов в ответе).
+def _metrics() -> str:
+    return ",".join([
+        "am:e:renders",                                   # 0 показы
+        "am:e:users",                                     # 1 охват
+        "am:e:clicks",                                    # 2 клики
+        f"am:e:ecommerce{CURRENCY}RevenuePostView",       # 3 пост-вью доход
+        f"am:e:goal{PURCHASE_GOAL}Reaches",               # 4 пост-вью покупки
+        f"am:e:goal{CART_GOAL}Reaches",                   # 5 пост-вью корзина
+        f"am:e:goal{CHECKOUT_GOAL}Reaches",               # 6 пост-вью оформление
+        "am:e:videoComplete",                             # 7 досмотры видео (0 на не-видео)
+    ])
 
 
 def _media_type(name: str) -> str:
@@ -42,232 +71,6 @@ def _media_type(name: str) -> str:
     return ""
 
 
-def fetch_campaigns(page) -> list:
-    data = page_fetch_json(page, "/api/v1/campaign/list?limit=200&offset=0")
-    camps = data.get("result", {}).get("campaigns", [])
-    return [c for c in camps if str(c.get("advertiserName", "")).strip() == ADVERTISER_NAME]
-
-
-def fetch_daily(page, campaign_id, date1: str, date2: str, goal_id: str = PURCHASE_GOAL) -> list:
-    # Литеральный <goal_id> — сервер подставляет из параметра goal_id (иначе HTTP 400).
-    metrics = ("am:e:renders,am:e:clicks,am:e:ctr,am:e:users,am:e:renderFrequency,"
-               "am:e:goal<goal_id>Reaches,am:e:goal<goal_id>Conversion")
-    path = (
-        "/api/v1/report/table-data?limit=400&offset=1"
-        f"&ids={campaign_id}&metrics={metrics}"
-        "&dimensions=am:e:datePeriod<group>&group=day"
-        f"&date1={date1}&date2={date2}&goal_id={goal_id}"
-        "&filters=&sort=am:e:datePeriodday"
-    )
-    data = page_fetch_json(page, path)
-    return data.get("result", {}).get("data", [])
-
-
-def fetch_goal_reaches_by_day(page, campaign_id, date1: str, date2: str, goal_id: str) -> dict:
-    """Пост-вью конверсии по ОДНОЙ доп. цели → {дата: reaches}. Защищённо: сбой корзины/
-    оформления НЕ должен ронять основную «Покупку» — при ошибке возвращаем пусто."""
-    out: dict[str, int] = {}
-    try:
-        for r in fetch_daily(page, campaign_id, date1, date2, goal_id):
-            dims = r.get("dimensions", [{}])
-            d = (dims[0].get("name") or dims[0].get("id") or "")[:10] if dims else ""
-            if len(d) == 10:
-                m = r.get("metrics", [])
-                out[d] = int(_num(m[5])) if len(m) > 5 else 0
-    except Exception as e:
-        print(f"[mm] доп. цель {goal_id} у {campaign_id}: {e}")
-    return out
-
-
-# DISCOVERY: internal table-data отверг am:e:postViewRevenue (код 4002). Внутренний API
-# использует goal<goal_id>Reaches (не документированный postViewGoalReaches) → доход,
-# вероятно, goal<goal_id>ReachesRevenue. Пробуем список кандидатов, первый принятый (200 +
-# ненулевая сумма) — рабочий. MM_REVENUE_PROBE=1 печатает вердикт по каждому кандидату.
-_REVENUE_METRIC_CANDIDATES = [
-    "am:e:goal<goal_id>ReachesRevenue",
-    "am:e:goal<goal_id>Revenue",
-    "am:e:goal<goal_id>ReachesPrice",
-    "am:e:goal<goal_id>Price",
-    "am:e:postViewGoal<goal_id>Revenue",
-    "am:e:ecommerceRevenue",
-    "am:e:revenue",
-]
-# Метрика дохода. Разведка 2026-07-25 (MM_REVENUE_PROBE=1): внутренний API кабинета БЕЗ
-# «Про» отвергает ВСЕ варианты дохода (am:e:postViewRevenue/goal<id>*Revenue/Price → 400
-# код 4002), metadata-каталог не отдаётся (404), UI не шлёт report/table-data. Значит
-# post-view ДОХОД — гейт «Метрика Про». Пусто = запрос не шлём (нет ежедневных 400).
-# Если появится «Про»/найдётся имя — задать LIME_MM_REVENUE_METRIC и доход поедет сам.
-REVENUE_METRIC = os.environ.get("LIME_MM_REVENUE_METRIC", "")
-
-
-def _try_revenue_metric(page, campaign_id, date1, date2, metric):
-    """Один запрос дохода по конкретной метрике → {дата: revenue} или None при 400."""
-    path = (
-        "/api/v1/report/table-data?limit=400&offset=1"
-        f"&ids={campaign_id}&metrics={metric}"
-        "&dimensions=am:e:datePeriod<group>&group=day"
-        f"&date1={date1}&date2={date2}&goal_id={PURCHASE_GOAL}"
-        "&filters=&sort=am:e:datePeriodday"
-    )
-    try:
-        data = page_fetch_json(page, path)
-    except Exception:
-        return None  # 400 invalid_parameter — метрика не существует
-    out: dict[str, float] = {}
-    for r in data.get("result", {}).get("data", []):
-        dims = r.get("dimensions", [{}])
-        d = (dims[0].get("name") or dims[0].get("id") or "")[:10] if dims else ""
-        if len(d) == 10:
-            m = r.get("metrics", [])
-            out[d] = round(_num(m[0]), 2) if m else 0.0
-    return out
-
-
-def discover_available_metrics(page) -> None:
-    """Разведка: спросить у внутреннего API каталог доступных метрик и напечатать все,
-    что похожи на доход/цену/выручку (revenue/price/cost/sum). Пробуем известные пути
-    metadata Метрики/AdMetrica — какой отдаст 200, из того вытащим реальные am:e:-имена."""
-    import json as _json
-    import re as _re
-    endpoints = [
-        "/api/v1/report/available-parameters",
-        "/api/v1/report/parameters",
-        "/api/v1/report/available-metrics",
-        "/api/v1/report/metrics",
-        "/api/v1/report/metadata",
-        "/api/v1/metrics",
-        "/api/v1/metadata",
-        "/api/v1/constructor/available-metrics",
-        "/api/v1/constructor/metadata",
-        f"/api/v1/campaign/{{cid}}",  # заполним первым id ниже
-    ]
-    # добавим per-campaign путь с реальным id
-    try:
-        camps = fetch_campaigns(page)
-        if camps:
-            cid = camps[0].get("campaignId")
-            endpoints = [e.replace("{cid}", str(cid)) for e in endpoints]
-            endpoints.append(f"/api/v1/campaign/{cid}/goals")
-            endpoints.append(f"/api/v1/campaign/{cid}/available-metrics")
-    except Exception as e:
-        print(f"[mm][meta] fetch_campaigns для per-camp путей: {e}")
-    for ep in endpoints:
-        try:
-            res = page.evaluate(FETCH_JS, ep)
-        except Exception as e:
-            print(f"[mm][meta] {ep}: evaluate err {e}")
-            continue
-        st = res.get("status")
-        body = res.get("body", "")
-        toks = sorted(set(_re.findall(r'am:e:[A-Za-z0-9<>_]+', body)))
-        moneyish = [t for t in toks if _re.search(r'(?i)revenue|price|cost|profit|sum|amount', t)]
-        print(f"[mm][meta] {ep}: status={st} len={len(body)} метрик={len(toks)} денежные={moneyish}")
-        if st == 200 and body and (toks or "revenue" in body.lower() or "amount" in body.lower()):
-            print(f"[mm][meta] {ep}: HEAD {body[:600]}")
-    print("[mm][meta] разведка каталога завершена")
-
-
-def capture_ui_report_metrics(page) -> None:
-    """Разведка XHR: поймать запрос report/table-data, который шлёт сам UI кабинета при
-    отрисовке отчёта кампании (там метрики видимых колонок, включая доход, если он виден
-    без «Про»). Переходим на страницу статистики и логируем metrics= пойманных запросов."""
-    captured: list[str] = []
-
-    def _on_response(resp):
-        try:
-            url = resp.url
-            if "report/table-data" in url and "metrics=" in url:
-                import urllib.parse as _u
-                q = _u.parse_qs(_u.urlparse(url).query)
-                m = q.get("metrics", [""])[0]
-                if m and m not in captured:
-                    captured.append(m)
-        except Exception:
-            pass
-
-    page.on("response", _on_response)
-    # SPA-маршрут кабинета рекламодателя Lime — статистика кампаний.
-    for route in (
-        f"https://media.metrika.yandex.ru/statistics?advertiser_id={PROMOTER_ID}",
-        f"https://media.metrika.yandex.ru/?advertiser_id={PROMOTER_ID}",
-        "https://media.metrika.yandex.ru/statistics",
-    ):
-        try:
-            print(f"[mm][ui] переход {route}")
-            page.goto(route, wait_until="networkidle", timeout=45000)
-            page.wait_for_timeout(4000)
-        except Exception as e:
-            print(f"[mm][ui] {route}: {e}")
-    for m in captured:
-        print(f"[mm][ui] пойман metrics= {m}")
-    if not captured:
-        print("[mm][ui] запросов report/table-data от UI не поймано")
-
-
-def probe_revenue_metric(page, campaign_id, date1, date2) -> str:
-    """Discovery: перебрать кандидатов, вернуть первую метрику, что даёт ненулевую сумму."""
-    for metric in _REVENUE_METRIC_CANDIDATES:
-        res = _try_revenue_metric(page, campaign_id, date1, date2, metric)
-        total = sum(res.values()) if res else 0.0
-        status = "400" if res is None else f"sum={total:.0f}"
-        print(f"[mm][probe] {metric}: {status}")
-        if res and total > 0:
-            print(f"[mm][probe] ПОБЕДИТЕЛЬ: {metric} (пример {list(res.items())[:2]})")
-            return metric
-    print("[mm][probe] ни один кандидат не дал доход")
-    return ""
-
-
-def fetch_postview_revenue_by_day(page, campaign_id, date1: str, date2: str) -> dict:
-    """Пост-вью ДОХОД (сумма покупок после показа без клика) → {дата: revenue}.
-    REVENUE_METRIC пуст (доход гейтится «Про», см. выше) → запрос не шлём. Защищённо."""
-    if not REVENUE_METRIC:
-        return {}
-    res = _try_revenue_metric(page, campaign_id, date1, date2, REVENUE_METRIC)
-    return res or {}
-
-
-# Кандидаты метрики ДОСМОТРОВ видео (VTR/CPV в дашборде считаются от video_completes).
-# У Urban поле watchedVideo100; во внутреннем API AdMetrica нейминг иной — перебираем.
-_VIDEO_METRIC_CANDIDATES = [
-    "am:e:watchedVideo100",
-    "am:e:sumWatchedVideo100",
-    "am:e:videoComplete",
-    "am:e:videoCompletions",
-    "am:e:completedVideo",
-    "am:e:videoView100",
-    "am:e:sumVideoComplete",
-    "am:e:renderViewabilityRate",
-    "am:e:vtr",
-    "am:e:videoStarts",
-    "am:e:videoViews",
-]
-# Метрика досмотров, подтверждённая probe (задать после MM_VIDEO_PROBE=1). Пусто → не шлём.
-VIDEO_METRIC = os.environ.get("LIME_MM_VIDEO_METRIC", "")
-
-
-def probe_video_metric(page, campaign_id, date1, date2) -> str:
-    """Discovery досмотров видео: первый кандидат с ненулевой суммой на видео-кампании."""
-    for metric in _VIDEO_METRIC_CANDIDATES:
-        res = _try_revenue_metric(page, campaign_id, date1, date2, metric)  # тот же GET-механизм
-        total = sum(res.values()) if res else 0.0
-        status = "400" if res is None else f"sum={total:.0f}"
-        print(f"[mm][vprobe] {metric}: {status}")
-        if res and total > 0:
-            print(f"[mm][vprobe] ПОБЕДИТЕЛЬ: {metric} (пример {list(res.items())[:2]})")
-            return metric
-    print("[mm][vprobe] ни один кандидат не дал досмотры")
-    return ""
-
-
-def fetch_video_completes_by_day(page, campaign_id, date1: str, date2: str) -> dict:
-    """Досмотры видео по дням. VIDEO_METRIC пуст → запрос не шлём. Защищённо."""
-    if not VIDEO_METRIC:
-        return {}
-    res = _try_revenue_metric(page, campaign_id, date1, date2, VIDEO_METRIC)
-    return res or {}
-
-
 def _num(v):
     try:
         return float(v)
@@ -275,51 +78,74 @@ def _num(v):
         return 0.0
 
 
-def build_rows(campaigns: list, page, date1: str, date2: str) -> list:
+def fetch_campaigns() -> list:
+    """Список кампаний рекламодателя Lime из официального management API."""
+    r = requests.get(f"{BASE}/management/campaigns", headers=_headers(), timeout=30)
+    r.raise_for_status()
+    camps = r.json().get("campaigns", [])
+    return [c for c in camps if str(c.get("advertiser_name", "")).strip() == ADVERTISER_NAME]
+
+
+def fetch_daily(campaign_id, date1: str, date2: str) -> list:
+    """Дневной отчёт по кампании: /stat/data с dimensions=am:e:date. Возвращает data[]."""
+    params = {
+        "ids": campaign_id,
+        "date1": date1,
+        "date2": date2,
+        "metrics": _metrics(),
+        "dimensions": "am:e:date",
+        "limit": 1000,
+        "sort": "am:e:date",
+    }
+    r = requests.get(f"{BASE}/stat/data", headers=_headers(), params=params, timeout=45)
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+
+def build_rows(campaigns: list, date1: str, date2: str) -> list:
     rows = []
     for c in campaigns:
-        cid = c.get("campaignId")
+        cid = c.get("campaign_id")
         name = str(c.get("name", "")).strip()
         # пропускаем кампании, чей флайт не пересекается с окном
-        if c.get("dateEnd") and c["dateEnd"] < date1:
+        if c.get("date_end") and c["date_end"] < date1:
             continue
-        if c.get("dateStart") and c["dateStart"] > date2:
+        if c.get("date_start") and c["date_start"] > date2:
             continue
         try:
-            daily = fetch_daily(page, cid, date1, date2)
+            daily = fetch_daily(cid, date1, date2)
         except Exception as e:
             print(f"[mm] кампания {cid} '{name}': {e}")
             continue
-        # Доп. цели воронки (корзина/оформление) — отдельными запросами (API берёт одну цель
-        # за раз). Защищённо: их сбой не роняет «Покупку» (fetch_goal_reaches_by_day → {}).
-        cart_by_day = fetch_goal_reaches_by_day(page, cid, date1, date2, CART_GOAL)
-        checkout_by_day = fetch_goal_reaches_by_day(page, cid, date1, date2, CHECKOUT_GOAL)
-        revenue_by_day = fetch_postview_revenue_by_day(page, cid, date1, date2)
         mtype = _media_type(name)
-        # Досмотры видео — только для видео-кампаний (VTR/CPV в дашборде). VIDEO_METRIC пуст → {}.
-        video_by_day = fetch_video_completes_by_day(page, cid, date1, date2) if mtype == "Видео" else {}
         for r in daily:
             dims = r.get("dimensions", [{}])
             d = (dims[0].get("name") or dims[0].get("id") or "")[:10] if dims else ""
             if len(d) != 10:
                 continue
             m = r.get("metrics", [])
-            renders = int(_num(m[0])) if len(m) > 0 else 0
-            clicks  = int(_num(m[1])) if len(m) > 1 else 0
-            users   = int(_num(m[3])) if len(m) > 3 else 0   # охват
-            reaches = int(_num(m[5])) if len(m) > 5 else 0   # пост-вью конверсии по цели «Покупка»
+            def g(i):  # безопасный доступ к метрике по индексу
+                return _num(m[i]) if len(m) > i else 0.0
+            renders = int(g(0))
+            users = int(g(1))          # охват
+            clicks = int(g(2))
+            pv_revenue = round(g(3), 2)   # пост-вью доход (реальный!)
+            pv_purchase = int(g(4))
+            pv_cart = int(g(5))
+            pv_checkout = int(g(6))
+            video_completes = int(g(7))
             rows.append({
                 "date": d, "region": "ru", "source": "mediametrica",
                 "campaign_group": name, "media_type": mtype,
                 "campaign_id": str(cid),
                 "impressions": renders, "reach": users, "clicks": clicks,
-                "cost": 0.0, "currency": "RUB",
-                "video_completes": int(_num(video_by_day.get(d, 0))), "vtr": None, "cpv": None,
+                "cost": 0.0, "currency": CURRENCY,
+                "video_completes": video_completes, "vtr": None, "cpv": None,
                 "conversions": json.dumps({
-                    "pv_purchase": reaches,
-                    "pv_cart": cart_by_day.get(d, 0),
-                    "pv_checkout": checkout_by_day.get(d, 0),
-                    "pv_revenue": revenue_by_day.get(d, 0.0),
+                    "pv_purchase": pv_purchase,
+                    "pv_cart": pv_cart,
+                    "pv_checkout": pv_checkout,
+                    "pv_revenue": pv_revenue,
                 }, ensure_ascii=False),
             })
     return rows
@@ -330,51 +156,18 @@ def main() -> None:
     date_to = date.today() - timedelta(days=1)
     date_from = date_to - timedelta(days=days_back - 1)
     d1, d2 = date_from.isoformat(), date_to.isoformat()
-    print(f"[mm] период {d1}..{d2}, цель покупки={PURCHASE_GOAL}")
+    print(f"[mm] период {d1}..{d2}, цель покупки={PURCHASE_GOAL}, валюта={CURRENCY}")
 
-    # DISCOVERY-режим: найти рабочий нейминг метрики дохода (одноразово), без записи.
-    if os.environ.get("MM_REVENUE_PROBE") == "1":
-        with yandex_page(ORIGIN) as page:
-            # 1) каталог метрик внутреннего API (если отдаёт metadata)
-            discover_available_metrics(page)
-            # 2) XHR самого UI при отрисовке отчёта (метрики видимых колонок)
-            capture_ui_report_metrics(page)
-            # 3) перебор кандидатов на реальных кампаниях
-            campaigns = fetch_campaigns(page)
-            for c in campaigns[:8]:
-                cid = c.get("campaignId")
-                print(f"[mm][probe] кампания {cid} '{c.get('name')}'")
-                winner = probe_revenue_metric(page, cid, d1, d2)
-                if winner:
-                    print(f"[mm][probe] ИТОГ: рабочая метрика дохода = {winner}")
-                    return
-        print("[mm][probe] рабочей метрики среди кандидатов нет")
-        return
-
-    # DISCOVERY-режим: нейминг метрики ДОСМОТРОВ видео (на видео-кампаниях), без записи.
-    if os.environ.get("MM_VIDEO_PROBE") == "1":
-        with yandex_page(ORIGIN) as page:
-            campaigns = fetch_campaigns(page)
-            vids = [c for c in campaigns if _media_type(str(c.get("name", ""))) == "Видео"]
-            print(f"[mm][vprobe] видео-кампаний: {len(vids)}")
-            for c in vids[:6]:
-                cid = c.get("campaignId")
-                print(f"[mm][vprobe] кампания {cid} '{c.get('name')}'")
-                winner = probe_video_metric(page, cid, d1, d2)
-                if winner:
-                    print(f"[mm][vprobe] ИТОГ: рабочая метрика досмотров = {winner}")
-                    return
-        print("[mm][vprobe] рабочей метрики досмотров среди кандидатов нет")
-        return
-
-    with yandex_page(ORIGIN) as page:
-        campaigns = fetch_campaigns(page)
-        print(f"[mm] кампаний Lime: {len(campaigns)}")
-        rows = build_rows(campaigns, page, d1, d2)
+    campaigns = fetch_campaigns()
+    print(f"[mm] кампаний Lime: {len(campaigns)}")
+    rows = build_rows(campaigns, d1, d2)
 
     print(f"[mm] строк к записи: {len(rows)}")
-    if rows[:2]:
+    if rows[:1]:
         print(f"[mm] пример: {rows[0]}")
+    rev = sum(json.loads(r["conversions"]).get("pv_revenue", 0) for r in rows)
+    pur = sum(json.loads(r["conversions"]).get("pv_purchase", 0) for r in rows)
+    print(f"[mm] итог за окно: пост-вью доход={rev:,.0f} ₽, покупки={pur}, охват-сумма={sum(r['reach'] for r in rows):,}")
 
     if os.environ.get("MEDIA_DRY") == "1":
         print("[mm] DRY — в БД не пишу")
