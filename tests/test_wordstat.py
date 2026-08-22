@@ -54,3 +54,19 @@ def test_aggregate_daily_truncates_rfc3339_to_day():
 
 def test_aggregate_daily_empty():
     assert aggregate_daily([{"results": []}]) == {}
+
+def test_fetch_omits_region_filter_by_default(monkeypatch):
+    """Ручной канон Павла собирается БЕЗ фильтра региона: сверка 2026-08-20 по неделе
+    10.08 совпала бит-в-бит (Σ=183767), «Россия=225» давала стабильно −3%.
+    Дефолт обеих выборок — без поля regions; явный список продолжает передаваться."""
+    import sync.wordstat as ws
+
+    captured = []
+    monkeypatch.setattr(ws, "_post_dynamics", lambda body: captured.append(body) or {})
+
+    ws.fetch_phrase("lime", "2026-08-10", "2026-08-16")
+    ws.fetch_phrase_daily("lime", "2026-08-10", "2026-08-16")
+    assert all("regions" not in b for b in captured)
+
+    ws.fetch_phrase("lime", "2026-08-10", "2026-08-16", regions=["225"])
+    assert captured[-1]["regions"] == ["225"]
