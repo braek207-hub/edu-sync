@@ -47,6 +47,10 @@ class Source:
         volume_floor: пока медиана недели ниже этого числа строк, объёмная проверка
             молчит. Малообъёмные витрины шумят: у Google Ads и товарных строк BJORN
             это единицы строк в день, где «минус половина» — обычное колебание.
+        where: SQL-условие среза внутри таблицы (литерал из реестра, не ввод).
+            Нужен, когда одну таблицу наполняют НЕЗАВИСИМЫЕ потоки: max(date) по всей
+            lime_google_ads_stats был свежим за счёт KZ-скрипта, пока GCC-скрипт стоял
+            месяц (встал ~2026-07-18, заметили 2026-08-19).
     """
 
     dashboard: str
@@ -54,6 +58,12 @@ class Source:
     date_column: str = "date"
     max_lag_days: int = 1
     volume_floor: int = 20
+    where: str = ""
+
+    @property
+    def name(self) -> str:
+        """Имя витрины в отчёте: таблица + срез, если следим за частью таблицы."""
+        return f"{self.table} [{self.where}]" if self.where else self.table
 
 
 @dataclass(frozen=True)
@@ -163,7 +173,10 @@ SOURCES: list[Source] = [
     Source("lime", "lime_metrika_campaign_ru"),
     Source("lime", "lime_vk_ads_stats"),
     # Google Ads на 2026-08-02 отдавал максимум за вчера, не за сегодня.
-    Source("lime", "lime_google_ads_stats", max_lag_days=2),
+    # KZ и GCC пишут РАЗНЫЕ Ads-скрипты из разных кабинетов → следим за каждым срезом,
+    # иначе свежий KZ маскирует мёртвый GCC (см. docstring поля where).
+    Source("lime", "lime_google_ads_stats", max_lag_days=2, where="region = 'kz'"),
+    Source("lime", "lime_google_ads_stats", max_lag_days=2, where="region = 'gcc'"),
     # AppMetrica приезжает кроном 07:30 МСК.
     Source("lime", "lime_app_installs", max_lag_days=2),
     # EDU. Директ едет по API, CRM — через Google-таблицу (та самая, что встала).
