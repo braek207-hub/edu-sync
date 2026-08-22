@@ -1,0 +1,38 @@
+name: "PROBE: Traffic management план (разовый)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tab:
+        description: "Вкладка книги"
+        required: false
+        default: "Traffic management 25 KZ NEW"
+      sheet_id:
+        description: "ID книги (пусто = книга Roistat-отчёта)"
+        required: false
+        default: ""
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Write Google service-account key
+        env:
+          GSC_SA_KEY: ${{ secrets.GSC_SA_KEY }}
+        run: |
+          if [ -z "$GSC_SA_KEY" ]; then echo "GSC_SA_KEY пуст" && exit 1; fi
+          printf '%s' "$GSC_SA_KEY" > sa.json
+      - name: Probe
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          PROBE_TAB: ${{ github.event.inputs.tab }}
+          LIME_REPORT_SHEET_ID: ${{ github.event.inputs.sheet_id }}
+          PYTHONIOENCODING: "utf-8"
+        run: python probe_traffic_mgmt.py
