@@ -1,0 +1,20 @@
+name: probe-time-targeting
+# Разовый: настоящая форма TimeTargeting в кабинете, перед тем как писать
+# применение почасового расписания.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Probe временного таргетинга
+        env:
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+        run: python probe_time_targeting.py
