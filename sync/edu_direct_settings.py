@@ -1467,6 +1467,45 @@ def _list_campaigns_for_login() -> Dict[str, str]:
     return {str(c["Id"]): c.get("Name", "") for c in items}
 
 
+# Дневной снапшот стратегий из свежих настроек API (замена мёртвого Google Sheets
+# strategies_daily: лист заполнял GAS-скрипт, закрытый 2026-06). Дата — московский
+# день: Директ живёт по МСК, и снапшот «на сегодня» осмыслен именно в его сутках.
+_SNAPSHOT_STRATEGIES_SQL = """
+    INSERT INTO strategy_snapshots (
+        date, campaign_id, campaign_name, weekly_budget, target_cpa, state, status, strategy_type
+    )
+    SELECT (now() AT TIME ZONE 'Europe/Moscow')::date,
+           campaign_id,
+           COALESCE(campaign_name, ''),
+           COALESCE((settings #>> '{strategy,search,weeklyBudget}')::numeric,
+                    (settings #>> '{strategy,network,weeklyBudget}')::numeric),
+           COALESCE((settings #>> '{strategy,search,targetCpa}')::numeric,
+                    (settings #>> '{strategy,network,targetCpa}')::numeric),
+           COALESCE(settings #>> '{meta,state}', ''),
+           COALESCE(settings #>> '{meta,status}', ''),
+           COALESCE(settings #>> '{strategy,search,biddingStrategyType}',
+                    settings #>> '{strategy,network,biddingStrategyType}', '')
+    FROM edu_campaign_settings
+    ON CONFLICT (date, campaign_id) DO UPDATE SET
+        campaign_name = EXCLUDED.campaign_name,
+        weekly_budget = EXCLUDED.weekly_budget,
+        target_cpa    = EXCLUDED.target_cpa,
+        state         = EXCLUDED.state,
+        status        = EXCLUDED.status,
+        strategy_type = EXCLUDED.strategy_type
+"""
+
+
+def _snapshot_strategies() -> int:
+    with psycopg2.connect(_pg_url()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(_SNAPSHOT_STRATEGIES_SQL)
+            n = cur.rowcount
+        conn.commit()
+    print(f"[edu_direct_settings] снапшот стратегий: {n} строк в strategy_snapshots")
+    return n
+
+
 def sync_edu_campaign_settings() -> int:
     global _CURRENT_LOGIN
     from sync.direct import _direct_clients
@@ -1487,6 +1526,11 @@ def sync_edu_campaign_settings() -> int:
         except Exception as e:
             print(f"[edu_direct_settings] {login}: WARN настройки не синхронизированы: {e}")
     print(f"[edu_direct_settings] ИТОГО upsert {total}")
+    if total:
+        try:
+            _snapshot_strategies()
+        except Exception as e:
+            print(f"[edu_direct_settings] WARN снапшот стратегий не записан: {e}")
     return total
 
 

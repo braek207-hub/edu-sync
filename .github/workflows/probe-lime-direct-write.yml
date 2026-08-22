@@ -1,0 +1,28 @@
+name: probe-lime-direct-write
+on:
+  workflow_dispatch:
+    inputs:
+      real_write:
+        description: "no-op запись в реальную кампанию (только если safe дал UNKNOWN)"
+        required: false
+        type: boolean
+        default: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Probe LIME write access
+        env:
+          DIRECT_TOKEN: ${{ secrets.LIME_DIRECT_TOKEN }}
+          DIRECT_CLIENT_LOGIN: ${{ secrets.LIME_DIRECT_CLIENT_LOGIN }}
+        run: |
+          if [ "${{ github.event.inputs.real_write }}" = "true" ]; then
+            python probe_direct_write_access.py --real
+          else
+            python probe_direct_write_access.py
+          fi
