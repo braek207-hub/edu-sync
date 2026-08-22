@@ -186,7 +186,7 @@ def _patch_e0_run(monkeypatch, reports=None):
     monkeypatch.setattr(agent_e0, "fetch_campaign_ids", lambda *a, **k: [])
     monkeypatch.setattr(agent_e0, "fetch_objects", lambda *a, **k: [])
     monkeypatch.setattr(agent_e0, "fetch_search_queries",
-                        lambda *a, **k: ([], {"goal_column": None, "conversions": 0, "columns_offered": 0}))
+                        lambda *a, **k: ([], {"goal_column": "Conversions_111_LSCCD", "conversions": 7, "columns_offered": 1}))
     by_login = _REPORTS_BY_LOGIN if reports is None else reports
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
@@ -347,7 +347,7 @@ def test_main_sends_account_goals_into_the_report_request(monkeypatch, capsys):
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
         lambda login, kind, date_from, date_to, by_campaign=False, goals=():
-            (seen_goals.append(list(goals)) or [], {"goal_column": None, "conversions": 0, "columns_offered": 0}))
+            (seen_goals.append(list(goals)) or [], {"goal_column": "Conversions_111_LSCCD", "conversions": 7, "columns_offered": 1}))
 
     assert agent_e0.main() == 0
     capsys.readouterr()
@@ -571,7 +571,7 @@ def test_minus_word_candidates_land_in_the_report(monkeypatch, capsys):
                         (_queries(("дорогой мусор", 7000.0, 0),
                                   ("дешёвый мусор", 500.0, 0),
                                   ("дорогой рабочий", 7000.0, 3)) if login == "acc-1"
-                         else [], {"goal_column": None, "conversions": 0, "columns_offered": 0}))
+                         else [], {"goal_column": "Conversions_111_LSCCD", "conversions": 7, "columns_offered": 1}))
 
     assert agent_e0.main() == 0
     report = _json.loads(capsys.readouterr().out)["minus_word_candidates"]
@@ -582,6 +582,62 @@ def test_minus_word_candidates_land_in_the_report(monkeypatch, capsys):
     assert report["sample"] == ["дорогой мусор"]
     assert report["count"] == 1
     assert report["cost_burned"] == 7000.0
+
+
+def test_query_report_asks_for_the_same_goals_as_the_slices(monkeypatch, capsys):
+    """Цели решаются ОДИН РАЗ на кабинет и достаются обоим отчётам.
+
+    Отчёт запросов читал сырое поле секрета client["goal_ids"], а срезы —
+    resolve_goal_ids, который при молчащем секрете спрашивает сам кабинет.
+    У кабинетов EDU поле пустое, поэтому запросы уходили в Директ БЕЗ Goals:
+    в ответе нет ни одной колонки Conversions, у каждого запроса ноль, и
+    правило «дорого и без конверсий» объявляло мусором рабочее ядро.
+    """
+    seen_goals = []
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setenv("DIRECT_CLIENTS_JSON", _json.dumps([{"login": "acc-1"}]))
+    monkeypatch.setattr(agent_e0, "fetch_account_goal_ids", lambda login: [555, 666])
+    monkeypatch.setattr(
+        agent_e0, "fetch_search_queries",
+        lambda login, *a, goals=(), **k: (
+            seen_goals.append(list(goals)) or [],
+            {"goal_column": "Conversions_555_LSCCD", "conversions": 1,
+             "columns_offered": 2}))
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+
+    assert seen_goals == [["555", "666"]]
+
+
+def test_query_report_without_conversion_columns_yields_no_minus_words(
+        monkeypatch, capsys):
+    """Ноль конверсий у КАЖДОГО запроса — это «конверсии не спрошены».
+
+    На таких данных правило «дорого и без конверсий» выносит приговор всему
+    кабинету: на прогоне 32580972099 в кандидаты попали «колледжи москвы»,
+    «мти», «мед колледж» — 31 запрос на 271 975 ₽. Слепой кабинет обязан
+    выпадать из расчёта С НАЗВАННОЙ ПРИЧИНОЙ: молчаливый пропуск неотличим
+    от «кандидатов не нашлось».
+    """
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0.agent_db, "load_baseline_cpa",
+                        lambda *a, **k: {"111": 1000.0, "222": 2000.0})
+    monkeypatch.setattr(
+        agent_e0, "fetch_search_queries",
+        lambda login, *a, **k: (
+            _queries(("колледжи москвы", 90000.0, 0)) if login == "acc-1" else [],
+            {"goal_column": None, "conversions": 0, "columns_offered": 0}
+            if login == "acc-1"
+            else {"goal_column": "Conversions_2_LSCCD", "conversions": 5,
+                  "columns_offered": 1}))
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)["minus_word_candidates"]
+
+    assert report["blind_accounts"] == ["acc-1"]
+    assert report["count"] == 0
+    assert report["sample"] == []
 
 
 def test_run_report_names_the_goal_behind_every_slice(monkeypatch, capsys):
@@ -619,7 +675,7 @@ def test_no_baseline_means_no_threshold_not_a_zero_one(monkeypatch, capsys):
     monkeypatch.setattr(agent_e0.agent_db, "load_baseline_cpa", lambda *a, **k: {})
     monkeypatch.setattr(agent_e0, "fetch_search_queries", lambda login, *a, **k:
                         (_queries(("копеечный мусор", 3.0, 0)) if login == "acc-1"
-                         else [], {"goal_column": None, "conversions": 0, "columns_offered": 0}))
+                         else [], {"goal_column": "Conversions_111_LSCCD", "conversions": 7, "columns_offered": 1}))
 
     assert agent_e0.main() == 0
     report = _json.loads(capsys.readouterr().out)["minus_word_candidates"]

@@ -277,8 +277,17 @@ def main() -> int:
     # Те же цели нужны шагу 9: почасовой профиль обязан считаться по лидам, а не
     # по «любой цели» счётчика (там 70 % — прокрутка и время на сайте).
     lead_goal_ids: set = set()
+    # Цели решаются ОДИН РАЗ на кабинет и дальше берутся отсюда. Отчёт запросов
+    # читал сырое client["goal_ids"] — поле секрета, которое у кабинетов EDU
+    # пустое, — и уходил в Директ без Goals. Без Goals в ответе нет ни одной
+    # колонки Conversions, поэтому у КАЖДОГО запроса стояло ноль конверсий, и
+    # правило «дорого и без конверсий» объявляло мусором рабочее ядро:
+    # на прогоне 32580972099 в кандидаты попали «колледжи москвы», «мти»,
+    # «мед колледж» — 31 запрос на 271 975 ₽.
+    goals_by_login: Dict[str, List[str]] = {}
     for client in clients:
         login, goals = client["login"], resolve_goal_ids(client)
+        goals_by_login[login] = goals
         lead_goal_ids.update(int(g) for g in goals if str(g).isdigit())
         # Расписания здесь нет: HourOfDay отвергается Reports API (probe 31781715471),
         # почасовой профиль приходит из Метрики (шаг 9).
@@ -350,13 +359,17 @@ def main() -> int:
     live_campaigns = {str(f["campaign_id"]) for f in facts
                       if f["fact_date"] >= slice_from and (f["cost"] > 0 or f["leads"] > 0)}
     object_rows: List[Dict[str, Any]] = []
-    query_rows: List[Dict[str, Any]] = []
+    # Запросы копятся ПО КАБИНЕТАМ: пригодность отчёта к расчёту минус-слов
+    # решается на уровне кабинета, а после слияния в общий список принадлежность
+    # строки кабинету восстановить уже нечем.
+    queries_by_login: Dict[str, List[Dict[str, Any]]] = {}
     # Та же цена ошибки, что и у сегментов: по этой цели отбираются кандидаты
     # в минус-слова.
     query_goals: List[Dict[str, Any]] = []
     login_by_campaign_id: Dict[str, str] = {}
     for client in clients:
-        login, goals = client["login"], client["goal_ids"]
+        login = client["login"]
+        goals = goals_by_login.get(login, [])
         account_campaigns = fetch_campaign_ids(login)
         # Архивные кампании здесь нужны: справочник «кампания → кабинет»
         # тем точнее, чем шире, а Метрика показывает и то, что уже выключено.
@@ -371,10 +384,11 @@ def main() -> int:
                 fetch_objects(login, level, campaign_ids), level, seen_on=today_iso)
         rows_for_login, query_goal = fetch_search_queries(
             login, queries_from, date_to, goals=goals)
-        query_rows += rows_for_login
+        queries_by_login[login] = rows_for_login
         query_goals.append({"account": login, **query_goal})
     agent_db.upsert_objects(object_rows)
-    query_rows = top_queries_by_cost(query_rows)
+    query_rows = top_queries_by_cost(
+        [q for rows in queries_by_login.values() for q in rows])
     agent_db.upsert_search_queries(query_rows)
 
     # Запросы, сжигающие втрое больше целевого CPA без единой конверсии.
@@ -389,7 +403,17 @@ def main() -> int:
     # константу здесь нельзя.
     baselines = sorted(agent_db.load_baseline_cpa(date_from, date_to).values())
     cpa_limit = baselines[len(baselines) // 2] if baselines else 0.0
-    minus_candidates = (minus_word_candidates(query_rows, cpa_limit=cpa_limit)
+    # Кабинет, чей отчёт запросов не отдал ни одной колонки конверсий, из
+    # расчёта исключается целиком. Ноль конверсий у каждого запроса такого
+    # отчёта не значит «запросы бесполезны» — он значит «конверсии не
+    # спрошены», а правило «дорого и без конверсий» на таких данных выносит
+    # приговор всему кабинету. Причина обязана быть в отчёте: молчаливый
+    # пропуск неотличим от «кандидатов не нашлось».
+    blind_accounts = sorted(g["account"] for g in query_goals if not g["goal_column"])
+    scored_queries = top_queries_by_cost(
+        [q for login, rows in queries_by_login.items() if login not in set(blind_accounts)
+         for q in rows])
+    minus_candidates = (minus_word_candidates(scored_queries, cpa_limit=cpa_limit)
                         if cpa_limit > 0 else [])
 
     # 9. Снимок настроек.
@@ -536,6 +560,7 @@ def main() -> int:
             "cost_burned": round(sum(float(q.get("cost") or 0.0)
                                      for q in minus_candidates), 2),
             "sample": [q.get("query") for q in minus_candidates[:10]],
+            "blind_accounts": blind_accounts,
         },
         "settings_snapshots": len(snapshot_rows),
         "holdout": len(holdout),
