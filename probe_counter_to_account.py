@@ -31,12 +31,13 @@ def account_campaign_names(login: str):
     out = {}
     limit, offset = 10_000, 0
     while True:
+        # client.get уже отдаёт result, а не конверт (см. agent_e1._campaign_ids).
         resp = client.get("campaigns", {
             "SelectionCriteria": {},
-            "FieldNames": ["Id", "Name", "Status"],
+            "FieldNames": ["Id", "Name"],
             "Page": {"Limit": limit, "Offset": offset},
         })
-        items = (resp.get("result") or {}).get("Campaigns") or []
+        items = resp.get("Campaigns") or []
         for c in items:
             out[str(c["Name"]).strip()] = str(c["Id"])
         if len(items) < limit:
