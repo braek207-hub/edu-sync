@@ -34,7 +34,22 @@ def main() -> int:
     open_rows = writer_db.open_actions()
     budget = writer_db._fetch("SELECT * FROM edu_agent_risk_budget ORDER BY week_start DESC LIMIT 5")
 
+    # Отклонённые элементы: САМ ТЕКСТ ошибки API. В отчёте прогона его нет —
+    # там только счётчик rejected, — а без причины непонятно, чинить настройку,
+    # справочник значений или права токена.
+    rejected = writer_db._fetch(
+        """
+        SELECT account, object_id, direct_type, setting_key,
+               created_at::date AS day, response
+        FROM edu_agent_actions
+        WHERE status = 'rejected'
+        ORDER BY created_at DESC
+        LIMIT 20
+        """
+    )
+
     print(json.dumps({
+        "rejected_recent": rejected,
         "journal_by_status_account": rows,
         "open_actions_count": len(open_rows),
         "open_actions_sample": [
