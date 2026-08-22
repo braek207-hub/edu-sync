@@ -1,0 +1,22 @@
+name: probe-counter-to-account
+# Разовый: счётчик Метрики соответствует кабинету Директа один-к-одному
+# или нет. От этого зависит, по какому профилю считать расписание кампании.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Probe соответствия счётчик-кабинет
+        env:
+          YM_TOKEN: ${{ secrets.YM_TOKEN }}
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+          DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
+        run: python probe_counter_to_account.py
