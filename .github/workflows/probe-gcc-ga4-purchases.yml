@@ -1,0 +1,27 @@
+name: Probe GCC GA4 purchases (temp)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Write GA4 service account key
+        env:
+          GSC_SA_KEY: ${{ secrets.GSC_SA_KEY }}
+        run: |
+          if [ -z "$GSC_SA_KEY" ]; then echo "GSC_SA_KEY пуст" && exit 1; fi
+          printf '%s' "$GSC_SA_KEY" > sa.json
+      - name: Probe GA4 ecommerce purchases (property 417919368)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          PYTHONIOENCODING: "utf-8"
+        run: python scripts/probe_gcc_ga4_purchases.py

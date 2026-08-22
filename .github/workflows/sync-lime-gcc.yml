@@ -75,3 +75,17 @@ jobs:
           LIME_GCC_DRY_RUN: ${{ github.event.inputs.dry_run }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_gcc
+
+      # Сверочная витрина счётчиков (Метрика 98232701 визиты/пользователи + GA4-заказы) —
+      # после основного синка; падение сверки не валит главные данные (continue-on-error).
+      - name: Run GCC counters compare
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          GCC_METRICA_TOKEN: ${{ secrets.GCC_METRICA_TOKEN }}
+          LIME_GCC_COUNTERS_DAYS: ${{ github.event.inputs.sync_days || '7' }}
+          LIME_GCC_COUNTERS_FROM: ${{ github.event.inputs.sync_from }}
+          LIME_GCC_COUNTERS_TO: ${{ github.event.inputs.sync_to }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_gcc_counters

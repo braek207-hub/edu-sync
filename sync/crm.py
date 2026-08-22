@@ -684,10 +684,34 @@ def _parse_payments_sheet(
     return agg
 
 
+def _meta_from_direct_stats() -> Dict[str, Dict[str, str]]:
+    """campaign_id -> {project, direction, campaign_name} из последнего синка Direct.
+
+    Жил в sync/crm_lite.py; модуль удалён вместе с dashboard_extras (аудит 2026-08-21) —
+    хелпер переехал сюда, к единственному потребителю."""
+    from sync.db import get_connection
+
+    meta: Dict[str, Dict[str, str]] = {}
+    sql = """
+        SELECT DISTINCT ON (campaign_id)
+            campaign_id, campaign_name, project, direction
+        FROM direct_stats
+        ORDER BY campaign_id, date DESC
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            for cid, cname, proj, direc in cur.fetchall():
+                meta[str(cid)] = {
+                    "campaign_name": str(cname or ""),
+                    "project": str(proj or "unknown"),
+                    "direction": str(direc or "other"),
+                }
+    return meta
+
+
 def _enrich_project_from_direct(agg: Dict[str, Dict[str, Any]]) -> None:
     try:
-        from sync.crm_lite import _meta_from_direct_stats
-
         meta = _meta_from_direct_stats()
         for bucket in agg.values():
             m = meta.get(bucket["campaign_id"])

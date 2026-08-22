@@ -51,7 +51,9 @@ def main() -> None:
             )
 
             # Лаг дневного Wordstat 1-3 дня: пока «вчера-1» нет — дёргаем API, появился — отдыхаем.
-            if daily_demand_up_to_date("lime_wordstat_demand_daily"):
+            # WORDSTAT_FROM (бэкфилл/смена методики) перезаписывает и дневное окно:
+            # свежесть не гарантирует, что старые дни сняты той же методикой, что недельный ряд.
+            if not os.environ.get("WORDSTAT_FROM") and daily_demand_up_to_date("lime_wordstat_demand_daily"):
                 print("wordstat-daily: свежие дни уже есть — пропуск (до нового отставания)")
             else:
                 # Всё доступное окно (60 дней): upsert идемпотентен, поэтому первый запуск —
@@ -76,17 +78,16 @@ def main() -> None:
             print(f"ОШИБКА webmaster: {e}")
             errors.append(f"webmaster: {e}")
 
-        # Дневной SEO-срез — отдельный try (по образцу wordstat-daily): ошибка
-        # дневного не мешает уже записанному недельному (и наоборот).
+        # Дневной SEO-срез — отдельный try: ошибка дневного не мешает уже
+        # записанному недельному (и наоборот). Гоняем КАЖДЫЙ прогон, без
+        # skip-гарда по свежести: сводка дозаливает дни до ~2 недель задним
+        # числом, а прежний гард замораживал недозревшие дни (снят 2026-08-21
+        # при переводе на TOTAL_CLICKS; синк — 4 GET, дёшево).
         try:
-            from sync.webmaster import seo_daily_up_to_date, sync_brand_seo_daily
+            from sync.webmaster import sync_brand_seo_daily
 
-            # Лаг Вебмастера ~2 дня: пока «вчера-2» нет — дёргаем API, появился — отдыхаем.
-            if seo_daily_up_to_date():
-                print("webmaster-daily: свежие дни уже есть — пропуск (до нового отставания)")
-            else:
-                n = sync_brand_seo_daily()
-                print(f"webmaster-daily: {n} дней")
+            n = sync_brand_seo_daily()
+            print(f"webmaster-daily: {n} дней")
         except Exception as e:
             print(f"ОШИБКА webmaster-daily: {e}")
             errors.append(f"webmaster-daily: {e}")
