@@ -5,6 +5,7 @@ from sync.agent.writer.plan import (
     desired_bid_modifiers,
     direct_type_for,
     plan_bid_modifiers,
+    plan_schedule,
 )
 
 
@@ -63,15 +64,15 @@ def test_ignores_unknown_setting_kinds():
 def test_unknown_setting_kind_is_reported_as_unsupported():
     # Прежде вид настройки, которого нет ни в одном справочнике, выпадал
     # МОЛЧА: строка не попадала ни в desired, ни в unsupported, и отчёт
-    # прогона был неотличим от «таких данных нет». Так исчезал не только
-    # schedule:* (его пауза осознанна), но и bid_modifier:network —
-    # посчитанный, значимый и никем не замеченный. Отказ обязан быть громким.
-    report = plan_bid_modifiers([_row("schedule:hour", "9", 30.0)])
+    # прогона был неотличим от «таких данных нет». Так исчезал и
+    # bid_modifier:network — посчитанный, значимый и никем не замеченный.
+    # Отказ обязан быть громким.
+    report = plan_bid_modifiers([_row("bid_modifier:placement", "SEARCH_TOP", 30.0)])
 
     assert report["desired"] == []
     assert len(report["unsupported"]) == 1
-    assert report["unsupported"][0]["kind"] == "schedule:hour"
-    assert "schedule:hour" in report["unsupported"][0]["reason"]
+    assert report["unsupported"][0]["kind"] == "bid_modifier:placement"
+    assert "bid_modifier:placement" in report["unsupported"][0]["reason"]
 
 
 def test_unknown_bid_modifier_kind_is_not_lost_silently():
@@ -243,3 +244,44 @@ def test_single_device_is_planned_as_before():
 
     assert [r["key"] for r in plan["desired"]] == ["TABLET"]
     assert plan["unsupported"] == []
+
+
+# --------------- расписание идёт своим путём, а не в «неподдерживаемые»
+
+def test_schedule_is_not_reported_as_unsupported_anymore():
+    """У расписания свой механизм (TimeTargeting кампании), и он реализован.
+
+    Держать его в unsupported значило бы докладывать «применить не умеем»
+    про то, что умеет применять соседняя ветка плана.
+    """
+    report = plan_bid_modifiers([_row("schedule:hour", "9", 30.0)])
+
+    assert report["desired"] == []
+    assert report["unsupported"] == []
+
+
+def test_significant_hours_reach_the_schedule_plan():
+    hours = plan_schedule([
+        _row("schedule:hour", "2", -40.0),
+        _row("schedule:hour", "9", 30.0),
+    ])
+
+    assert [h["setting_key"] for h in hours] == ["2", "9"]
+    assert [h["value"] for h in hours] == [-40, 30]
+
+
+def test_weak_hours_do_not_trigger_a_schedule_change():
+    # Ни объёма, ни отклонения — трогать расписание не за чем: это запрос,
+    # риск и сброс обучения стратегии на стороне Директа.
+    assert plan_schedule([_row("schedule:hour", "9", 2.0)]) == []
+    assert plan_schedule([_row("schedule:hour", "9", 30.0, support=10)]) == []
+
+
+def test_one_significant_hour_is_enough_to_act():
+    # Расписание применяется целиком, поэтому решение принимается по набору;
+    # но одного часа с ночным провалом уже достаточно, чтобы он был не зря.
+    assert len(plan_schedule([_row("schedule:hour", "3", -45.0)])) == 1
+
+
+def test_schedule_plan_ignores_other_kinds():
+    assert plan_schedule([_row("bid_modifier:device", "MOBILE", 30.0)]) == []

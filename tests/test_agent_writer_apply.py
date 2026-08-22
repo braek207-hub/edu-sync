@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import pytest
 import requests
 
+import sync.agent.writer.apply as apply_mod
 import sync.agent.writer.db as writer_db
 from sync.agent.writer.apply import _element_errors, apply_actions, to_api_call
 from sync.agent.writer.client import DirectWriteError, is_outcome_unknown
@@ -758,3 +759,55 @@ def test_demographic_field_map_matches_the_planning_lists():
 
     assert {k for k, v in DEMOGRAPHIC_FIELD.items() if v == "Gender"} == set(GENDER_KEYS)
     assert {k for k, v in DEMOGRAPHIC_FIELD.items() if v == "Age"} == set(AGE_KEYS)
+
+
+# --------------- расписание: другой сервис, другой метод, другая коллекция
+
+def test_schedule_goes_through_campaigns_update():
+    """Расписание применяется через кампанию, а не через корректировки.
+
+    У Директа нет способа поменять один час: Schedule принимается целиком,
+    и живёт он внутри campaigns.update. Отправь мы его в bidmodifiers —
+    получили бы отказ на каждом прогоне.
+    """
+    service, method, params = to_api_call({
+        "action_kind": "schedule.set",
+        "payload": {"CampaignId": "114057545",
+                    "TimeTargeting": {"Schedule": {"Items": ["1,100"]}}},
+    })
+
+    assert (service, method) == ("campaigns", "update")
+    assert params["Campaigns"][0]["Id"] == 114057545
+    assert params["Campaigns"][0]["TimeTargeting"] == {"Schedule": {"Items": ["1,100"]}}
+
+
+def test_update_results_collection_is_known():
+    """У campaigns.update своя коллекция результатов — UpdateResults.
+
+    Не знай её разбор, отказ уровня элемента прочитался бы как успех:
+    коллекция не нашлась бы, а «ошибок нет» означает «принято».
+    """
+    errors = _element_errors("update", {"UpdateResults": [
+        {"Errors": [{"Code": 6000, "Details": "нельзя"}]}]})
+
+    assert errors and errors[0]["Code"] == 6000
+
+
+def test_update_success_is_read_as_success():
+    # Ошибок нет — None, а не пустой список: вызывающий код различает
+    # «разобрали, чисто» и «разбирать было нечего».
+    assert _element_errors("update", {"UpdateResults": [{"Id": 1}]}) is None
+
+
+def test_schedule_payload_keeps_neighbour_fields():
+    # Праздничный режим и учёт рабочих выходных настроены человеком: тело
+    # уходит ровно таким, каким его собрал план, без досборки здесь.
+    targeting = {"Schedule": {"Items": ["1,100"]},
+                 "HolidaysSchedule": {"SuspendOnHolidays": "YES"},
+                 "ConsiderWorkingWeekends": "YES"}
+    _, _, params = to_api_call({
+        "action_kind": "schedule.set",
+        "payload": {"CampaignId": 1, "TimeTargeting": targeting},
+    })
+
+    assert params["Campaigns"][0]["TimeTargeting"] == targeting

@@ -198,6 +198,12 @@ def plan_bid_modifiers(
 
     for row in computed:
         kind = str(row.get("setting_kind") or "")
+        # Расписание идёт своим путём (plan_schedule → TimeTargeting кампании),
+        # а не через корректировки: у него другой механизм в API. В unsupported
+        # ему тоже не место — иначе отчёт говорит «применить не умеем» про то,
+        # что умеет применять соседняя ветка.
+        if kind == SCHEDULE_KIND:
+            continue
         # Отбор по виду настройки СНЯТ намеренно. Прежде незнакомый вид
         # (schedule:*, bid_modifier:network) выпадал здесь молча: строка не
         # попадала ни в desired, ни в unsupported, и отчёт прогона был
@@ -257,6 +263,44 @@ def _resolve_device_exclusion(
     kept = [r for r in desired if r is not loser]
     return kept, [{"kind": loser["kind"], "key": loser["key"],
                    "percent": loser["percent"], "reason": DEVICE_EXCLUSIVE_REASON}]
+
+
+SCHEDULE_KIND = "schedule:hour"
+# Часов в профиле 24, и порог значимости у каждого свой. Но само расписание —
+# ОДНО действие на кампанию: Директ принимает Schedule целиком, а не по часу.
+# Поэтому решение «менять ли расписание» принимается по набору: хотя бы один
+# час должен пройти пороги, иначе запрос не стоит риска.
+SCHEDULE_MIN_HOURS = 1
+
+
+def plan_schedule(
+    computed: List[Dict[str, Any]],
+    min_support: int = MIN_SUPPORT,
+    min_abs_percent: int = MIN_ABS_PERCENT,
+) -> List[Dict[str, Any]]:
+    """Часы профиля, прошедшие пороги значимости.
+
+    Пустой список значит «расписание не трогаем»: либо наблюдений мало, либо
+    отклонения в пределах шума. Незначимые часы отбрасываются ЗДЕСЬ, а не
+    внутри построения строк, — там час без данных обязан остаться нейтральным,
+    и отличить «нет данных» от «данные есть, но слабые» уже было бы нельзя.
+    """
+    out: List[Dict[str, Any]] = []
+    for row in computed:
+        if str(row.get("setting_kind") or "") != SCHEDULE_KIND:
+            continue
+        if int(row.get("support_n") or 0) < min_support:
+            continue
+        percent = int(round(float(row.get("value") or 0.0)))
+        if abs(percent) < min_abs_percent:
+            continue
+        out.append({"setting_kind": SCHEDULE_KIND,
+                    "setting_key": str(row.get("setting_key")),
+                    "value": percent,
+                    "support_n": int(row.get("support_n") or 0)})
+    if len(out) < SCHEDULE_MIN_HOURS:
+        return []
+    return sorted(out, key=lambda r: int(r["setting_key"]))
 
 
 def desired_bid_modifiers(

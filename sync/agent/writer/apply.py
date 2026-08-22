@@ -99,7 +99,12 @@ _DEVICE_ADJUSTMENT_FIELD = {
 }
 
 # API-метод → имя коллекции результатов по элементам в ответе.
-_RESULT_COLLECTION = {"add": "AddResults", "set": "SetResults"}
+# У campaigns.update своя коллекция (UpdateResults) — не «SetResults», как у
+# bidmodifiers.set. Ошибись здесь, и отказ уровня элемента прочитался бы как
+# успех: список результатов просто не нашёлся бы, а пустой список ошибок
+# означает «принято».
+_RESULT_COLLECTION = {"add": "AddResults", "set": "SetResults",
+                      "update": "UpdateResults"}
 
 
 def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
@@ -141,6 +146,16 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
         else:
             raise ValueError(f"неизвестный тип корректировки: {direct_type}")
         return "bidmodifiers", "add", {"BidModifiers": [item]}
+
+    if kind == "schedule.set":
+        # Расписание применяется ЦЕЛИКОМ и через саму кампанию: у Директа нет
+        # способа поменять один час. Тело собрано планом (writer/schedule.py),
+        # включая перенос соседних полей блока — праздничного режима и учёта
+        # рабочих выходных, которые настроены человеком.
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(payload["CampaignId"]),
+                           "TimeTargeting": payload["TimeTargeting"]}]
+        }
 
     raise ValueError(f"неизвестный вид действия: {kind}")
 
