@@ -1,0 +1,19 @@
+name: probe-hourly-goal-truth
+# Разовый: на что на самом деле оптимизируется почасовое расписание —
+# «любая цель» (микроцели) или лиды.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Probe целей почасового профиля
+        env:
+          YM_TOKEN: ${{ secrets.YM_TOKEN }}
+        run: python probe_hourly_goal_truth.py
