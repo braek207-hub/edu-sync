@@ -110,18 +110,15 @@ def main() -> None:
         print(f"ОШИБКА plan: {e}")
         errors.append(f"plan: {e}")
 
-    try:
-        from sync.strategies import sync_strategies_daily
-
-        sync_strategies_daily()
-    except Exception as e:
-        print(f"ОШИБКА strategies: {e}")
-        errors.append(f"strategies: {e}")
+    # Стратегии УБРАНЫ из daily: Sheets-лист strategies_daily умер вместе с GAS
+    # (последние данные 2026-06-03). Снапшот стратегий теперь пишет
+    # sync.edu_direct_settings из API Директа (workflow sync-edu-direct-settings).
 
     # CRM lite УБРАН: считал когортный fallback по всем годам (174k лидов, тяжёлый
     # JSONB ~минуты) — был сломан (orders=0) и больше не нужен. Источник оплат и
     # выручки от лидов — колонки crm_leads.payments_from_leads / revenue_from_leads.
-    # Модуль sync/crm_lite.py оставлен на случай возврата.
+    # Модуль sync/crm_lite.py и таблица dashboard_extras удалены (аудит 2026-08-21):
+    # «случай возврата» за 2.5 месяца не наступил, приложение таблицу не читало.
 
     # Офлайн-конверсии в Я.Метрику (если задан YM_TOKEN). Дедуп через журнал.
     try:
