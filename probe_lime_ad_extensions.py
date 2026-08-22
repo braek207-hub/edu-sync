@@ -1,5 +1,6 @@
-# Проба Ф6: что реально приходит у объявлений ЕПК LIME сверх Title/Text и какие
-# справочники дают им человеческие имена. Read-only (только get). Печатает сырые записи.
+# Проба Ф6 (раунд 2): что реально приходит у объявлений ЕПК LIME сверх Title/Text
+# и какие справочники дают им человеческие имена. Read-only (только get).
+# Формы полей взяты из ответа API раунда 1 (bogus-трюк), не из догадок.
 import json
 import os
 
@@ -23,7 +24,10 @@ def call(base: str, service: str, params: dict, method: str = "get") -> dict:
         data=json.dumps({"method": method, "params": params}, ensure_ascii=False).encode("utf-8"),
         timeout=120,
     )
-    return resp.json()
+    try:
+        return resp.json()
+    except Exception:
+        return {"error": {"error_code": resp.status_code, "error_string": "не JSON", "error_detail": resp.text[:200]}}
 
 
 def err(body: dict) -> str | None:
@@ -33,102 +37,131 @@ def err(body: dict) -> str | None:
     return f"ERROR {e.get('error_code')} {e.get('error_string')}: {e.get('error_detail')}"
 
 
-print("=== 1. Допустимые FieldNames сервиса ads (bogus-трюк) ===")
-for key in ("FieldNames", "TextAdFieldNames", "TextImageAdFieldNames"):
-    body = call(V501, "ads", {"SelectionCriteria": {}, key: ["Bogus"], "Page": {"Limit": 1}})
-    print(f"  {key}: {err(body)}")
-
-print("\n=== 2. Активные ЕПК: берём 2 кампании с объявлениями ===")
+print("=== 1. Активные ЕПК ===")
 camps = call(
     V501,
     "campaigns",
     {
         "SelectionCriteria": {"Types": ["UNIFIED_CAMPAIGN"], "States": ["ON"]},
         "FieldNames": ["Id", "Name"],
-        "Page": {"Limit": 5},
+        "Page": {"Limit": 6},
     },
 )
 if err(camps):
     print("  ", err(camps))
     raise SystemExit(1)
 camp_ids = [c["Id"] for c in camps["result"]["Campaigns"]]
-print("  campaigns:", [(c["Id"], c["Name"]) for c in camps["result"]["Campaigns"]])
+print("  ", [(c["Id"], c["Name"]) for c in camps["result"]["Campaigns"]])
 
-print("\n=== 3. ads.get с РАСШИРЕННЫМИ FieldNames ===")
-ads_params = {
-    "SelectionCriteria": {"CampaignIds": camp_ids},
-    "FieldNames": ["Id", "AdGroupId", "CampaignId", "Type", "Subtype", "Status", "State"],
-    "TextAdFieldNames": [
-        "Title",
-        "Title2",
-        "Text",
-        "Href",
-        "Mobile",
-        "DisplayDomain",
-        "DisplayUrlPath",
-        "SitelinkSetId",
-        "AdImageHash",
-        "VCardId",
-        "AdExtensionIds",
-        "TurboPageId",
-        "PriceExtension",
-        "BusinessId",
-        "PreferVCardOverBusiness",
-    ],
-    "TextImageAdFieldNames": ["AdImageHash", "Href", "TurboPageId"],
-    "Page": {"Limit": 20},
-}
-ads = call(V501, "ads", ads_params)
+print("\n=== 2. ads.get, ПОЛНЫЙ набор полей TextAd (список выдал сам API) ===")
+ads = call(
+    V501,
+    "ads",
+    {
+        "SelectionCriteria": {"CampaignIds": camp_ids},
+        "FieldNames": ["Id", "AdGroupId", "CampaignId", "Type", "Subtype", "Status", "State"],
+        "TextAdFieldNames": [
+            "Title",
+            "Title2",
+            "Text",
+            "Href",
+            "Mobile",
+            "DisplayDomain",
+            "DisplayUrlPath",
+            "SitelinkSetId",
+            "AdImageHash",
+            "VCardId",
+            "AdExtensions",
+            "TurboPageId",
+            "BusinessId",
+            "PreferVCardOverBusiness",
+            "ButtonExtension",
+            "TrackingParams",
+            "Carousel",
+            "LogoExtensionHash",
+        ],
+        "TextImageAdFieldNames": ["AdImageHash", "Href", "TurboPageId", "TrackingParams"],
+        "Page": {"Limit": 40},
+    },
+)
+sitelink_ids: set[int] = set()
+vcard_ids: set[int] = set()
+ext_ids: set[int] = set()
 if err(ads):
     print("  ", err(ads))
 else:
     items = ads["result"].get("Ads", [])
     print(f"  ads={len(items)}")
-    seen_types: dict[str, int] = {}
+    per_type: dict[str, int] = {}
     for a in items:
         t = a.get("Type", "?")
-        seen_types[t] = seen_types.get(t, 0) + 1
-        if seen_types[t] <= 2:
-            print("   ", json.dumps(a, ensure_ascii=False)[:700])
-    print("  типы:", seen_types)
+        per_type[t] = per_type.get(t, 0) + 1
+        if per_type[t] <= 2:
+            print("   ", json.dumps(a, ensure_ascii=False)[:900])
+        ta = a.get("TextAd") or {}
+        if ta.get("SitelinkSetId"):
+            sitelink_ids.add(ta["SitelinkSetId"])
+        if ta.get("VCardId"):
+            vcard_ids.add(ta["VCardId"])
+        for ext in ta.get("AdExtensions") or []:
+            if ext.get("AdExtensionId"):
+                ext_ids.add(ext["AdExtensionId"])
+    print("  типы:", per_type)
+    print("  найдено SitelinkSetId:", sorted(sitelink_ids)[:5], "VCardId:", sorted(vcard_ids)[:5], "AdExtensionId:", sorted(ext_ids)[:5])
 
-print("\n=== 4. Справочники расширений ===")
-sl = call(V501, "sitelinks", {"SelectionCriteria": {}, "FieldNames": ["Id", "Sitelinks"], "Page": {"Limit": 3}})
-print("  sitelinks:", err(sl) or json.dumps(sl["result"], ensure_ascii=False)[:700])
+print("\n=== 3. Справочники по найденным Ids ===")
+if sitelink_ids:
+    sl = call(V501, "sitelinks", {"SelectionCriteria": {"Ids": sorted(sitelink_ids)[:3]}, "FieldNames": ["Id", "Sitelinks"]})
+    print("  sitelinks:", err(sl) or json.dumps(sl["result"], ensure_ascii=False)[:900])
+else:
+    print("  sitelinks: у объявлений нет SitelinkSetId")
+
+if vcard_ids:
+    vc = call(V501, "vcards", {"SelectionCriteria": {"Ids": sorted(vcard_ids)[:2]}, "FieldNames": ["Id", "CompanyName", "Phone", "Country", "City"]})
+    print("  vcards:", err(vc) or json.dumps(vc["result"], ensure_ascii=False)[:500])
+else:
+    print("  vcards: у объявлений нет VCardId")
 
 ax = call(
     V501,
     "adextensions",
-    {"SelectionCriteria": {}, "FieldNames": ["Id", "Type", "State", "Status"], "CalloutFieldNames": ["CalloutText"], "Page": {"Limit": 5}},
+    {"SelectionCriteria": {}, "FieldNames": ["Id", "Type", "State", "Status"], "CalloutFieldNames": ["CalloutText"], "Page": {"Limit": 20}},
 )
-print("  adextensions:", err(ax) or json.dumps(ax["result"], ensure_ascii=False)[:700])
+print("  adextensions (все аккаунта):", err(ax) or json.dumps(ax["result"], ensure_ascii=False)[:900])
 
-vc = call(V501, "vcards", {"SelectionCriteria": {}, "FieldNames": ["Id", "CompanyName", "Phone"], "Page": {"Limit": 2}})
-print("  vcards:", err(vc) or json.dumps(vc["result"], ensure_ascii=False)[:400])
-
-print("\n=== 5. Цели по счётчикам кампаний (goals.get) ===")
+print("\n=== 4. Цели: goals.get только на v5 (на v501 сервиса нет) ===")
 uc = call(
     V501,
     "campaigns",
     {
-        "SelectionCriteria": {"Ids": camp_ids[:2]},
-        "FieldNames": ["Id", "Name"],
-        "UnifiedCampaignFieldNames": ["CounterIds", "PriorityGoals", "Settings", "BiddingStrategy"],
+        "SelectionCriteria": {"Ids": camp_ids[:3]},
+        "FieldNames": ["Id"],
+        "UnifiedCampaignFieldNames": ["CounterIds"],
     },
 )
-if err(uc):
-    print("  ", err(uc))
-else:
-    counters: set[int] = set()
+counters: set[int] = set()
+if not err(uc):
     for c in uc["result"]["Campaigns"]:
-        u = c.get("UnifiedCampaign") or {}
-        ids = (u.get("CounterIds") or {}).get("Items") or []
-        counters.update(ids)
-        print("   camp", c["Id"], "counters", ids)
-        print("     PriorityGoals:", json.dumps(u.get("PriorityGoals"), ensure_ascii=False)[:300])
-        print("     Settings:", json.dumps(u.get("Settings"), ensure_ascii=False)[:400])
-        print("     BiddingStrategy:", json.dumps(u.get("BiddingStrategy"), ensure_ascii=False)[:500])
-    if counters:
-        for base, name in ((V501, "v501"), (V5, "v5")):
-            g = call(base, "goals", {"SelectionCriteria": {"CounterIds": sorted(counters)[:10]}, "FieldNames": ["Id", "Name", "Type"]})
-            print(f"  goals [{name}]:", err(g) or json.dumps(g["result"], ensure_ascii=False)[:600])
+        counters.update(((c.get("UnifiedCampaign") or {}).get("CounterIds") or {}).get("Items") or [])
+print("  counters:", sorted(counters))
+if counters:
+    g = call(V5, "goals", {"SelectionCriteria": {"CounterIds": sorted(counters)[:10]}, "FieldNames": ["Id", "Name", "Type"]})
+    if err(g):
+        print("  goals v5:", err(g))
+    else:
+        goals = g["result"].get("Goals", [])
+        print(f"  goals v5: {len(goals)} целей")
+        for go in goals[:10]:
+            print("   ", json.dumps(go, ensure_ascii=False))
+        for want in (3023504302, 1900016999, 1900017000):
+            hit = next((x for x in goals if x.get("Id") == want), None)
+            print(f"   искомая {want}:", json.dumps(hit, ensure_ascii=False) if hit else "НЕТ в ответе")
+
+print("\n=== 5. Формы записи: bogus по ads.add (какие поля принимает TextAd на запись) ===")
+add_probe = call(
+    V501,
+    "ads",
+    {"Ads": [{"AdGroupId": 1, "TextAd": {"Bogus": 1, "Title": "t", "Text": "x", "Href": "https://limestore.com"}}]},
+    method="add",
+)
+print("  ads.add bogus:", json.dumps(add_probe.get("error", add_probe), ensure_ascii=False)[:900])
