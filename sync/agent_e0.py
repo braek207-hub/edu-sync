@@ -38,6 +38,7 @@ from sync.agent.metrika import (
     fetch_hourly_profile,
     resolve_counter_account,
 )
+from sync.agent.ladder import ladder_report
 from sync.agent.mining import mine_quasi_experiments
 from sync.agent.objects import (
     build_object_rows,
@@ -161,6 +162,108 @@ def _daily_cost(direct_rows: List[Dict[str, Any]]) -> List[tuple]:
     for row in direct_rows:
         by_day[str(row["date"])] = by_day.get(str(row["date"]), 0.0) + float(row.get("cost") or 0.0)
     return sorted(by_day.items())
+
+
+# Окно лестницы: 90 дней зрелых данных. Длиннее — глубокие ступени набираются
+# лучше, но оценка тянет прошлый сезон; 90 совпадает с SLICE_WINDOW_DAYS срезов.
+LADDER_WINDOW_DAYS = 90
+# Перцентиль лага оплаты, после которого когорта считается созревшей. По замеру
+# probe_economics (прогон 32590373892): p90 = 33 дня, к 30-му дню видно 88 %
+# выручки когорты. Значение НЕ константа — каждый прогон выводит его из данных.
+LADDER_MATURITY_PERCENTILE = 0.90
+
+_LADDER_FIELDS = {
+    "paid": "payments_fact", "deals": "deals", "connected": "connected_leads",
+    "eff": "eff_leads", "leads": "leads", "clicks": "clicks",
+}
+
+
+def _lag_percentile(lead_rows: List[Dict[str, Any]], q: float) -> int:
+    def _as_date(value):
+        if value is None or isinstance(value, date):
+            return value
+        return date.fromisoformat(str(value)[:10])
+
+    lags = []
+    for r in lead_rows:
+        paid_on, created = _as_date(r.get("payment_date")), _as_date(r.get("created_date"))
+        if r.get("is_paid") and paid_on and created:
+            lags.append((paid_on - created).days)
+    if not lags:
+        return 0
+    ordered = sorted(lags)
+    return int(ordered[min(int(q * len(ordered)), len(ordered) - 1)])
+
+
+def funnel_ladder_section(
+    facts: List[Dict[str, Any]],
+    lead_rows: List[Dict[str, Any]],
+    today: date = None,
+) -> Dict[str, Any]:
+    """Лестница воронки по кампаниям (Э2.1) — на ЗРЕЛОМ окне.
+
+    Окно сдвинуто в прошлое на p90 лага оплаты, выведенный из данных прогона:
+    у свежих недель глубокие ступени (оплаты, сделки) ещё не доехали, и лестница
+    выбирала бы мелкую ступень не потому, что данных нет, а потому что они не
+    созрели. Средний чек — по направлению из зрелых оплат: покампанийный чек на
+    единичных оплатах — шум.
+    """
+    today = today or date.today()
+    maturity_days = _lag_percentile(lead_rows, LADDER_MATURITY_PERCENTILE)
+    window_to = (today - timedelta(days=maturity_days)).isoformat()
+    window_from = (today - timedelta(days=maturity_days + LADDER_WINDOW_DAYS)).isoformat()
+
+    def _zero() -> Dict[str, float]:
+        return {step: 0.0 for step in _LADDER_FIELDS}
+
+    by_campaign: Dict[str, Dict[str, float]] = {}
+    by_direction: Dict[str, Dict[str, float]] = {}
+    account = _zero()
+    direction_of: Dict[str, str] = {}
+    for f in facts:
+        fact_date = str(f["fact_date"])[:10]
+        if not (window_from <= fact_date <= window_to):
+            continue
+        campaign_id = str(f["campaign_id"])
+        direction = f.get("direction") or "БЕЗ_НАПРАВЛЕНИЯ"
+        direction_of[campaign_id] = direction
+        camp = by_campaign.setdefault(campaign_id, _zero())
+        direct = by_direction.setdefault(direction, _zero())
+        for step, field in _LADDER_FIELDS.items():
+            value = float(f.get(field) or 0.0)
+            camp[step] += value
+            direct[step] += value
+            account[step] += value
+
+    # Средний чек направления — только зрелые оплаты.
+    check_sum: Dict[str, float] = {}
+    check_n: Dict[str, int] = {}
+    for r in lead_rows:
+        if not r.get("is_paid") or str(r.get("created_date"))[:10] > window_to:
+            continue
+        direction = r.get("direction") or "БЕЗ_НАПРАВЛЕНИЯ"
+        check_sum[direction] = check_sum.get(direction, 0.0) + float(r.get("revenue") or 0.0)
+        check_n[direction] = check_n.get(direction, 0) + 1
+    avg_check = {d: check_sum[d] / check_n[d] for d in check_n if check_n[d] > 0}
+
+    pools = {
+        campaign_id: (
+            (f"direction:{direction_of[campaign_id]}",
+             by_direction[direction_of[campaign_id]]),
+            ("account", account),
+        )
+        for campaign_id in by_campaign
+    }
+    checks = {
+        campaign_id: avg_check[direction_of[campaign_id]]
+        for campaign_id in by_campaign
+        if direction_of[campaign_id] in avg_check
+    }
+    report = ladder_report(by_campaign, pools, avg_check_by_object=checks)
+    report["maturity_days"] = maturity_days
+    report["window_from"] = window_from
+    report["window_to"] = window_to
+    return report
 
 
 def computed_rows_for_job(job: Dict[str, Any]) -> tuple:
@@ -536,8 +639,9 @@ def main() -> int:
         }])
     agent_db.upsert_behavior(resolved_behavior, window_from=slice_from, window_to=date_to)
 
-    # 11. Отчёт мощности и фактический объём таблиц.
+    # 11. Отчёт мощности, лестница воронки и фактический объём таблиц.
     report = power_report(list(aggregates.values()))
+    ladder_section = funnel_ladder_section(facts, lead_rows)
     sizes = agent_db.table_sizes()
     total_mb = round(sum(int(s["size_bytes"] or 0) for s in sizes) / 1024 / 1024, 1)
 
@@ -578,6 +682,7 @@ def main() -> int:
         "metrika_hourly_skipped": hourly_skipped,
         "metrika_behavior": len(resolved_behavior),
         "power": report,
+        "funnel_ladder": ladder_section,
         "db_total_mb": total_mb,
         "db_tables": [{"t": s["table_name"], "size": s["size"]} for s in sizes],
     }, ensure_ascii=False, indent=2))

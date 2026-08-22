@@ -759,3 +759,83 @@ def test_counter_without_direct_goals_is_reported_not_guessed(monkeypatch, capsy
         {"counter": 333, "reason": "целей Директа нет на счётчике"}]
     # Цели кабинетов в отчёте — иначе «почему профиль пуст» не разобрать.
     assert report["metrika_hourly_goals"] == [1, 2]
+
+
+# ---------------------------------------------------------- лестница воронки
+
+
+def _ladder_fact(fact_date, campaign_id, direction, **counts):
+    base = {"fact_date": fact_date, "campaign_id": campaign_id,
+            "direction": direction, "payments_fact": 0, "deals": 0,
+            "connected_leads": 0, "eff_leads": 0, "leads": 0, "clicks": 0}
+    base.update(counts)
+    return base
+
+
+def _ladder_lead(created, direction, paid_on=None, revenue=0.0):
+    return {"created_date": created, "payment_date": paid_on,
+            "is_paid": paid_on is not None, "revenue": revenue,
+            "direction": direction}
+
+
+def test_ladder_section_shifts_window_by_maturity_from_data():
+    """Окно решений сдвигается на p90 лага оплаты, выведенный из лидов прогона."""
+    today = date(2026, 8, 22)
+    # Десять оплат: девять с лагом 0 дней, одна с лагом 20 → p90 = 20.
+    leads = [_ladder_lead("2026-05-01", "spo", paid_on="2026-05-01")] * 9
+    leads += [_ladder_lead("2026-05-01", "spo", paid_on="2026-05-21")]
+    section = agent_e0.funnel_ladder_section([], leads, today=today)
+    assert section["maturity_days"] == 20
+    assert section["window_to"] == "2026-08-02"      # 22.08 − 20 дней
+    assert section["window_from"] == "2026-05-04"    # ещё −90 дней
+
+
+def test_ladder_section_excludes_immature_facts():
+    """Свежие дни (незрелые оплаты) в счётчики лестницы не входят."""
+    today = date(2026, 8, 22)
+    leads = [_ladder_lead("2026-05-01", "spo", paid_on="2026-05-31")]  # лаг 30
+    facts = [
+        _ladder_fact("2026-07-01", "c1", "spo", eff_leads=30),   # зрелый день
+        _ladder_fact("2026-08-20", "c1", "spo", eff_leads=500),  # ещё не дозрел
+    ]
+    section = agent_e0.funnel_ladder_section(facts, leads, today=today)
+    assert section["by_object"]["c1"]["events_by_step"]["eff"] == 30
+
+
+def test_ladder_section_pools_direction_then_account():
+    """Коэффициенты кампания занимает у своего направления, не у всего кабинета."""
+    today = date(2026, 8, 22)
+    leads = [_ladder_lead("2026-05-01", "spo", paid_on="2026-05-01")]
+    facts = [
+        # Направление spo: сделки → оплаты = 30/100.
+        _ladder_fact("2026-07-01", "c1", "spo", eff_leads=300, connected_leads=200,
+                     deals=100, payments_fact=30),
+        # Направление dist: конверсия хуже на порядок — не должна подмешаться.
+        _ladder_fact("2026-07-01", "c2", "dist", eff_leads=3000, connected_leads=2000,
+                     deals=1000, payments_fact=30),
+    ]
+    section = agent_e0.funnel_ladder_section(facts, leads, today=today)
+    c1 = section["by_object"]["c1"]
+    assert c1["step"] == "paid"  # своих оплат хватает
+    assert all(r["source"].startswith("direction:") for r in c1["rates"])
+
+
+def test_ladder_section_avg_check_comes_from_direction():
+    today = date(2026, 8, 22)
+    leads = [
+        _ladder_lead("2026-05-01", "spo", paid_on="2026-05-01", revenue=100000),
+        _ladder_lead("2026-05-02", "spo", paid_on="2026-05-02", revenue=200000),
+    ]
+    facts = [_ladder_fact("2026-07-01", "c1", "spo", payments_fact=25, deals=50,
+                          connected_leads=100, eff_leads=200)]
+    section = agent_e0.funnel_ladder_section(facts, leads, today=today)
+    # Чек spo = (100000 + 200000) / 2; ожидаемая выручка = 25 оплат × чек.
+    assert section["by_object"]["c1"]["expected_revenue"] == 25 * 150000
+
+
+def test_ladder_section_distribution_names_campaigns_without_step():
+    today = date(2026, 8, 22)
+    facts = [_ladder_fact("2026-07-01", "thin", "spo", clicks=10)]
+    section = agent_e0.funnel_ladder_section(facts, [], today=today)
+    assert section["distribution"] == {"нет_ступени": 1}
+    assert section["without_step"] == ["thin"]
