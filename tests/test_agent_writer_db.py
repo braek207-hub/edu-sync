@@ -153,23 +153,53 @@ def test_insert_action_resets_stale_response_and_status():
 
 
 def test_stale_planned_finds_rows_stuck_in_intermediate_status():
-    sql = " ".join(writer_db.STALE_PLANNED_SQL.split())
+    # Читающий дубль (stale_planned) удалён: он ничего не делал, а пометку и
+    # так возвращает mark_stale_planned одним UPDATE ... RETURNING. Условие
+    # поиска зависших строк живёт теперь в одном месте.
+    sql = " ".join(writer_db.MARK_STALE_SQL.split())
     assert "status = 'planned'" in sql
     assert "created_at < now() - make_interval(mins => %s)" in sql
 
 
 def test_stale_planned_passes_threshold_and_account(monkeypatch):
+    # mark_stale_planned ходит в БД не через _fetch, а своим соединением
+    # (UPDATE ... RETURNING обязан быть атомарным), поэтому перехватывается
+    # курсор, а не хелпер чтения.
     captured = {}
-    monkeypatch.setattr(
-        writer_db, "_fetch",
-        lambda sql, params=(): captured.update(sql=sql, params=params) or [],
-    )
 
-    writer_db.stale_planned(60, account="acc-1")
+    class _Cursor:
+        def execute(self, sql, params=()):
+            captured.update(sql=sql, params=params)
 
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Conn:
+        def cursor(self, **kwargs):
+            return _Cursor()
+
+        def commit(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(writer_db, "get_connection", lambda: _Conn())
+
+    writer_db.mark_stale_planned(60, account="acc-1")
     assert captured["params"] == (60, "acc-1", "acc-1")
+
     # Без кабинета — все зависшие строки, фильтр отключается значением NULL.
-    writer_db.stale_planned(30)
+    writer_db.mark_stale_planned(30)
     assert captured["params"] == (30, None, None)
 
 

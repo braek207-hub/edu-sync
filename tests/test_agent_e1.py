@@ -739,17 +739,16 @@ def test_stuck_rows_are_marked_not_only_printed(monkeypatch, capsys):
         daily_cost={"111": 10.0},
         prod_apply=True,
     )
-    marked, read_only = [], []
+    marked = []
     monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned",
                         lambda minutes, account=None: marked.append(account) or list(stuck))
-    monkeypatch.setattr(agent_e1.writer_db, "stale_planned",
-                        lambda *a, **k: read_only.append(1) or [])
 
     assert agent_e1.main() == 0
 
     assert marked == ["acc-1"]
-    # Чтения без пометки достаточно не было: находка бесконечно повторялась бы.
-    assert read_only == []
+    # Чтения без пометки было недостаточно: находка повторялась бы вечно.
+    # Читающий-без-пометки вариант удалён — вернуть его молча уже нельзя.
+    assert not hasattr(agent_e1.writer_db, "stale_planned")
     report = _reports(capsys)[0]
     assert report["stale_planned"]["count"] == 1
     assert report["stale_planned"]["marked_status"] == "stale"

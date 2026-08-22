@@ -301,12 +301,3 @@ def plan_schedule(
     if len(out) < SCHEDULE_MIN_HOURS:
         return []
     return sorted(out, key=lambda r: int(r["setting_key"]))
-
-
-def desired_bid_modifiers(
-    computed: List[Dict[str, Any]],
-    min_support: int = MIN_SUPPORT,
-    min_abs_percent: int = MIN_ABS_PERCENT,
-) -> List[Dict[str, Any]]:
-    """Только применимая часть плана. Причины отказов — в plan_bid_modifiers."""
-    return plan_bid_modifiers(computed, min_support, min_abs_percent)["desired"]

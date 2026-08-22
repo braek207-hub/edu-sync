@@ -17,6 +17,8 @@ tests/test_agent_e0.py — тесты расчётной стороны Э0.
 корректировок не даёт вовсе и называет причину в отчёте прогона.
 """
 
+import json as _json
+
 import sync.agent_e0 as agent_e0
 from sync.agent.guard import check_freshness as real_check_freshness
 from sync.agent.guard import verdict as real_verdict
@@ -151,6 +153,13 @@ def _patch_e0_run(monkeypatch, reports=None):
         monkeypatch.setattr(agent_e0.agent_db, name, lambda *a, **k: [])
     # Снимок настроек читается словарём кампания → сырые настройки, не списком.
     monkeypatch.setattr(agent_e0.agent_db, "load_campaign_settings_raw", lambda *a, **k: {})
+    # Сверка сумм гейта ходит в витрину: без подмены тест падал бы на
+    # отсутствии DATABASE_URL, а не на своём утверждении.
+    monkeypatch.setattr(agent_e0.agent_db, "mart_cost_total", lambda *a, **k: 0.0)
+    # Справочник базового CPA — источник порога для кандидатов в минус-слова.
+    # Пусто = порога нет, кандидаты не считаются: это штатное состояние
+    # кабинета без истории, а не повод падать.
+    monkeypatch.setattr(agent_e0.agent_db, "load_baseline_cpa", lambda *a, **k: {})
     monkeypatch.setattr(
         agent_e0.agent_db, "upsert_computed_settings",
         # Значения по умолчанию намеренно: на коде ДО правки вызов идёт без
@@ -348,6 +357,9 @@ def _fresh_direct(monkeypatch, today):
     monkeypatch.setattr(agent_e0.agent_db, "load_direct_rows",
                         lambda *a, **k: [{"date": today.isoformat(), "campaign_id": "111",
                                           "cost": 100.0, "clicks": 10, "impressions": 100}])
+    # Витрина сходится с источником — иначе сверка сумм гейта краснеет, и тест
+    # падал бы не на своём утверждении. Это и есть штатное состояние.
+    monkeypatch.setattr(agent_e0.agent_db, "mart_cost_total", lambda *a, **k: 100.0)
 
 
 def test_normal_crm_lag_does_not_kill_the_run(monkeypatch, capsys):
@@ -504,3 +516,52 @@ def test_main_merges_hourly_counters_before_computing_schedule(monkeypatch, caps
     assert len(rows) == 24, f"счётчики не сложены: строк {len(rows)} вместо 24"
     # Час получил визиты ОБОИХ счётчиков — значит складывали, а не перезаписывали.
     assert rows[0]["clicks"] == 2000
+
+
+# --------------- кандидаты в минус-слова: расчёт обязан СЛУЧИТЬСЯ
+
+def _queries(*rows):
+    return [{"query": q, "cost": cost, "conversions": conv, "clicks": 10,
+             "campaign_id": "111", "account": "acc-1"} for q, cost, conv in rows]
+
+
+def test_minus_word_candidates_land_in_the_report(monkeypatch, capsys):
+    """Данные для минус-слов собирались каждый прогон, а расчёт не вызывался.
+
+    Тест держит именно вызов: порог берётся из справочника базового CPA, и в
+    отчёт попадают запросы, сжёгшие втрое больше без единой конверсии.
+    """
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0.agent_db, "load_baseline_cpa",
+                        lambda *a, **k: {"111": 1000.0, "222": 2000.0, "333": 9000.0})
+    monkeypatch.setattr(agent_e0, "fetch_search_queries", lambda login, *a, **k:
+                        _queries(("дорогой мусор", 7000.0, 0),
+                                 ("дешёвый мусор", 500.0, 0),
+                                 ("дорогой рабочий", 7000.0, 3)) if login == "acc-1" else [])
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)["minus_word_candidates"]
+
+    # Порог — МЕДИАНА справочника (2000), а не среднее (4000): среднее тянет
+    # вверх единичная дорогая кампания, и «втрое дороже» перестаёт значить.
+    assert report["cpa_limit"] == 2000.0
+    assert report["sample"] == ["дорогой мусор"]
+    assert report["count"] == 1
+    assert report["cost_burned"] == 7000.0
+
+
+def test_no_baseline_means_no_threshold_not_a_zero_one(monkeypatch, capsys):
+    """Пустой справочник — «считать не от чего», а не порог 0.
+
+    Порог 0 сделал бы кандидатом ЛЮБОЙ запрос без конверсий, включая
+    копеечные, — и отчёт превратился бы в шум на весь кабинет.
+    """
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0.agent_db, "load_baseline_cpa", lambda *a, **k: {})
+    monkeypatch.setattr(agent_e0, "fetch_search_queries", lambda login, *a, **k:
+                        _queries(("копеечный мусор", 3.0, 0)) if login == "acc-1" else [])
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)["minus_word_candidates"]
+
+    assert report["count"] == 0

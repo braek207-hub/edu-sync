@@ -438,29 +438,6 @@ def open_actions() -> List[Dict[str, Any]]:
 # diff следующего прогона новых действий не предложит, потому что факт в
 # кабинете уже совпал с планом. Расхождение не всплывает нигде — поэтому
 # ищем его явно и показываем в отчёте прогона.
-STALE_PLANNED_SQL = """
-    SELECT action_id, idempotency_key, account, object_level, object_id,
-           action_kind, created_at
-    FROM edu_agent_actions
-    WHERE status = 'planned'
-      AND created_at < now() - make_interval(mins => %s)
-      AND (%s IS NULL OR account = %s)
-    ORDER BY created_at
-"""
-
-
-def stale_planned(older_than_minutes: int, account: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Действия, застрявшие в статусе planned дольше разумного времени.
-
-    Порог в минутах, а не в днях: прогон живёт минуты, и всё, что старше
-    порога, к текущему прогону отношения не имеет — это след прошлого обрыва,
-    который надо разобрать руками (сверить кабинет с журналом), а не автоматом:
-    достоверно отличить «запрос ушёл и применился» от «запрос не ушёл» по
-    самой строке невозможно.
-
-    Только чтение: перевод строки в статус 'stale' делает mark_stale_planned.
-    """
-    return _fetch(STALE_PLANNED_SQL, (int(older_than_minutes), account, account))
 
 
 # Перевод зависшей строки в терминальный статус 'stale' — единственным

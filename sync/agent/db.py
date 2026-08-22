@@ -415,6 +415,22 @@ def load_daily_facts(
     )
 
 
+def mart_cost_total(date_from: str, date_to: str) -> float:
+    """Суммарный расход, лежащий в витрине фактов за окно.
+
+    Сверяется с суммой по источнику (гейт check_sum_reconciliation). Расхождение
+    значит, что витрина собрана не из тех строк, которые сейчас отдаёт источник:
+    часть кампаний потерялась при сборке, или прогон писал по другому окну.
+    Свежесть и непрерывность такого не видят — даты у битой витрины в порядке.
+    """
+    rows = _fetch_dicts(
+        "SELECT COALESCE(SUM(cost), 0) AS total FROM edu_agent_facts "
+        "WHERE fact_date BETWEEN %s AND %s",
+        (date_from, date_to),
+    )
+    return float(rows[0]["total"] or 0.0) if rows else 0.0
+
+
 def crm_maturity_date() -> Optional[date]:
     """Последний день, за который лиды в CRM РЕАЛЬНО есть. Граница зрелости.
 

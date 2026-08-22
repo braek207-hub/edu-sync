@@ -23,7 +23,13 @@ from typing import Any, Dict, List
 from sync.agent import db as agent_db
 from sync.agent.computed import compute_schedule, compute_segment_modifiers
 from sync.agent.facts import assemble_facts
-from sync.agent.guard import check_continuity, check_freshness, verdict
+from sync.agent.guard import (
+    check_continuity,
+    check_freshness,
+    check_sum_reconciliation,
+    check_volume_anomaly,
+    verdict,
+)
 from sync.agent.holdout import select_holdout
 from sync.agent.metrika import (
     EDU_COUNTERS,
@@ -32,7 +38,11 @@ from sync.agent.metrika import (
     merge_hourly,
 )
 from sync.agent.mining import mine_quasi_experiments
-from sync.agent.objects import build_object_rows, top_queries_by_cost
+from sync.agent.objects import (
+    build_object_rows,
+    minus_word_candidates,
+    top_queries_by_cost,
+)
 from sync.agent.power import power_report
 from sync.agent.profile import build_profile, campaign_quality, distance_to_profile
 from sync.agent.segments import (
@@ -139,6 +149,19 @@ def resolve_goal_ids(client: Dict[str, Any]) -> List[str]:
     return [str(g) for g in found]
 
 
+def _daily_cost(direct_rows: List[Dict[str, Any]]) -> List[tuple]:
+    """Расход по дням, по возрастанию даты: [(дата, сумма), ...].
+
+    Последний день — «сегодняшний» для проверки аномалии, предыдущие — история.
+    Дни считаются по строкам источника, а не по витрине: гейт стоит ДО сборки
+    фактов и обязан судить о том, что пришло, а не о том, что мы записали.
+    """
+    by_day: Dict[str, float] = {}
+    for row in direct_rows:
+        by_day[str(row["date"])] = by_day.get(str(row["date"]), 0.0) + float(row.get("cost") or 0.0)
+    return sorted(by_day.items())
+
+
 def computed_rows_for_job(job: Dict[str, Any]) -> tuple:
     """Результат одного отчёта → (кабинет, строки настроек, причина отказа).
 
@@ -187,6 +210,21 @@ def main() -> int:
         now_iso=now_iso,
         max_age_hours=CRM_MAX_AGE_HOURS,
     )
+    # Аномалия дневного объёма и сверка сумм — два слоя гейта, которые до сих
+    # пор существовали, но НЕ ВЫЗЫВАЛИСЬ: написаны, покрыты тестами, зелёные и
+    # ни разу не отработавшие. Гейт проверял только свежесть и непрерывность,
+    # то есть обвал объёма вдвое проходил насквозь, если даты на месте.
+    daily_cost = _daily_cost(direct_rows)
+    if daily_cost:
+        history = [cost for _, cost in daily_cost[:-1]]
+        checks.append(check_volume_anomaly(history, daily_cost[-1][1]))
+        # Расход по источнику против расхода, уже лежащего в витрине за то же
+        # окно: расхождение означает, что витрина собрана не из этих строк.
+        checks.append(check_sum_reconciliation(
+            sum(cost for _, cost in daily_cost),
+            agent_db.mart_cost_total(date_from, date_to),
+        ))
+
     checks.append(check_continuity(
         sorted({str(r["date"]) for r in direct_rows}),
         expected_last=latest_direct or date_to,
@@ -314,6 +352,21 @@ def main() -> int:
     query_rows = top_queries_by_cost(query_rows)
     agent_db.upsert_search_queries(query_rows)
 
+    # Запросы, сжигающие втрое больше целевого CPA без единой конверсии.
+    # Расчёт существовал, но НЕ ВЫЗЫВАЛСЯ ни разу: кандидаты в минус-слова не
+    # считались вообще, хотя данные для них собирались каждый прогон. Пока это
+    # только счёт и отчёт — минусовать кабинет Э1a не умеет, и молчаливо
+    # применять такое нельзя. Но «сколько денег уходит в запросы без
+    # конверсий» обязано быть видно.
+    # Порог — МЕДИАННЫЙ базовый CPA кабинета: среднее тянут вверх единичные
+    # дорогие кампании, и от него порог «втрое дороже» перестал бы что-либо
+    # значить. Нет базы — нет и порога: считать не от чего, и выдумывать
+    # константу здесь нельзя.
+    baselines = sorted(agent_db.load_baseline_cpa(date_from, date_to).values())
+    cpa_limit = baselines[len(baselines) // 2] if baselines else 0.0
+    minus_candidates = (minus_word_candidates(query_rows, cpa_limit=cpa_limit)
+                        if cpa_limit > 0 else [])
+
     # 9. Снимок настроек.
     snapshot_rows = build_snapshot_rows(agent_db.load_campaign_settings_raw(), seen_on=today_iso)
     agent_db.upsert_settings_snapshot(snapshot_rows)
@@ -420,6 +473,13 @@ def main() -> int:
         "sliced_rows": len(sliced_rows),
         "objects": len(object_rows),
         "search_queries": len(query_rows),
+        "minus_word_candidates": {
+            "cpa_limit": round(cpa_limit, 2),
+            "count": len(minus_candidates),
+            "cost_burned": round(sum(float(q.get("cost") or 0.0)
+                                     for q in minus_candidates), 2),
+            "sample": [q.get("query") for q in minus_candidates[:10]],
+        },
         "settings_snapshots": len(snapshot_rows),
         "holdout": len(holdout),
         "quasi_experiments": len(quasi),
