@@ -1,0 +1,29 @@
+name: probe-device-conflict
+# Разовый: почему TABLET_ADJUSTMENT отвергается после DESKTOP.
+# Без apply=true ничего не отправляет.
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "РЕАЛЬНАЯ отправка в кабинет (иначе только печать тел запросов)"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Probe конфликта корректировок устройств
+        env:
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.apply }}" = "true" ]; then ARGS="--apply"; fi
+          python probe_device_conflict.py $ARGS
