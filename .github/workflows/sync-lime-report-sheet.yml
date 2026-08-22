@@ -1,0 +1,56 @@
+name: LIME weekly report → Google Sheets
+
+# Вторник 10:00 МСК — после 09:00 МСК, к которому по правилу docs/CRONS.md должны
+# завершиться все LIME-синки (последний по расписанию — 05:40 МСК). Отчёт читает
+# уже готовую витрину через Panda-BI, поэтому не участвует в ночной цепочке синков
+# и не обязан укладываться в дедлайн 09:00 — наоборот, должен стартовать после него.
+on:
+  schedule:
+    - cron: "0 7 * * 2" # вторник 10:00 МСК
+  workflow_dispatch:
+    inputs:
+      week:
+        description: "ISO-неделя (2026-W33), пусто = прошлая"
+        required: false
+
+concurrency:
+  group: lime-report-sheet
+  cancel-in-progress: false
+
+jobs:
+  push-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Дёрнуть /api/lime/report-sheet
+        env:
+          LIME_REPORT_SHEET_TOKEN: ${{ secrets.LIME_REPORT_SHEET_TOKEN }}
+          WEEK_INPUT: ${{ github.event.inputs.week }}
+        run: |
+          # Секрет заводится отдельно владельцем (см. задачу) — до этого крон должен
+          # падать понятно, а не слать пустой заголовок токена на публичный роут.
+          if [ -z "$LIME_REPORT_SHEET_TOKEN" ]; then
+            echo "::error::Секрет LIME_REPORT_SHEET_TOKEN не заведён — прогон невозможен."
+            exit 1
+          fi
+
+          URL="https://panda-bi.vercel.app/api/lime/report-sheet"
+          [ -n "$WEEK_INPUT" ] && URL="$URL?week=$WEEK_INPUT"
+
+          # До 3 попыток на транзиентный сбой (БД/Google API) — тело ответа печатаем
+          # при каждой неудаче: секретов в нём нет (route.ts отдаёт только error/week/tabs),
+          # а без него нечем отлаживать падение крона.
+          for attempt in 1 2 3; do
+            echo "=== попытка $attempt/3 ==="
+            code=$(curl -s -o resp.json -w "%{http_code}" --max-time 300 \
+              -X POST -H "x-report-token: $LIME_REPORT_SHEET_TOKEN" "$URL")
+            cat resp.json
+            if [ "$code" = "200" ]; then
+              echo "=== успех с попытки $attempt ==="
+              exit 0
+            fi
+            echo "=== попытка $attempt упала (HTTP $code), пауза 60с ==="
+            sleep 60
+          done
+          echo "=== все 3 попытки легли ==="
+          exit 1
