@@ -136,3 +136,139 @@ def test_account_goals_walk_all_pages(monkeypatch):
     monkeypatch.setattr(segments, "_api_post", fake_post)
     assert segments.fetch_account_goal_ids("cab") == [10, 20]
     assert calls == [0, segments.PAGE_LIMIT]
+
+
+# --------------- колонки конверсий: их имена не «Conversions»
+# Боевой отчёт 32556586408 (кабинет account10, 06-20.08):
+#   Clicks  Cost  Conversions_330070378_LSCCD  Conversions_330389387_LSCCD ...
+#   95515   6041988.26   2753   60   2826   2753
+# Парсер читал rec["Conversions"], получал None → 0, и расчёт докладывал «в
+# срезе нет ни одной конверсии» при 2826 конверсиях в том же ответе. Так на
+# прогоне 32469160289 отказали ВСЕ двенадцать срезов четырёх кабинетов.
+
+def _rec(device, clicks, **conv):
+    row = {"Device": device, "Clicks": str(clicks), "Cost": "100.0"}
+    row.update({k: str(v) for k, v in conv.items()})
+    return row
+
+
+def test_conversion_columns_are_found_by_prefix():
+    records = [_rec("MOBILE", 10, Conversions_111_LSCCD=5, Conversions_222_LSCCD=3)]
+    assert segments.conversion_columns(records) == [
+        "Conversions_111_LSCCD", "Conversions_222_LSCCD"]
+
+
+def test_bare_conversions_column_is_not_mistaken_for_a_goal():
+    # Колонки с голым именем в ответе не бывает; появись она — это не цель.
+    assert segments.conversion_columns([{"Conversions": "7"}]) == []
+
+
+def test_primary_goal_is_the_most_massive_one():
+    # Самая массовая цель кабинета — основное целевое действие, то есть заявка.
+    records = [_rec("MOBILE", 100, Conversions_111_LSCCD=2271, Conversions_222_LSCCD=23),
+               _rec("DESKTOP", 50, Conversions_111_LSCCD=452, Conversions_222_LSCCD=31)]
+    assert segments.primary_goal_column(records) == "Conversions_111_LSCCD"
+
+
+def test_goals_are_not_summed_because_they_overlap():
+    """Суммировать колонки нельзя: цели пересекаются.
+
+    В боевом отчёте 330070378 и 369313502 дали ОДИНАКОВЫЕ числа во всех трёх
+    моделях атрибуции — одно целевое действие под двумя идентификаторами.
+    Сумма учла бы его дважды и раздула конверсионность.
+    """
+    records = [_rec("MOBILE", 100, Conversions_330070378_LSCCD=2753,
+                    Conversions_369313502_LSCCD=2753, Conversions_338972879_LSCCD=2826)]
+    rows_conv = segments._cell_int(
+        records[0][segments.primary_goal_column(records)])
+
+    assert rows_conv == 2826
+    assert rows_conv < 2753 + 2753 + 2826
+
+
+def test_primary_goal_is_picked_once_for_the_whole_slice():
+    # Построчный выбор сравнивал бы сегменты по РАЗНЫМ целям, и «мобильные
+    # конверсионнее» означало бы всего лишь «у них другая цель».
+    records = [_rec("MOBILE", 100, Conversions_111_LSCCD=10, Conversions_222_LSCCD=900),
+               _rec("DESKTOP", 100, Conversions_111_LSCCD=800, Conversions_222_LSCCD=5)]
+    column = segments.primary_goal_column(records)
+
+    # 111 в сумме 810, 222 в сумме 905 — побеждает 222 для ОБОИХ сегментов.
+    assert column == "Conversions_222_LSCCD"
+
+
+def test_tie_is_broken_deterministically():
+    # Имя отчёта и его кеш на стороне API зависят от параметров запроса:
+    # плавающий выбор дал бы разные числа на одинаковых данных.
+    records = [_rec("MOBILE", 10, Conversions_999_LSCCD=5, Conversions_111_LSCCD=5)]
+    assert segments.primary_goal_column(records) == "Conversions_111_LSCCD"
+
+
+def test_no_data_dashes_are_zero_not_a_crash():
+    # «Нет данных» Директ пишет двумя дефисами: SMART_TV в боевом ответе шёл
+    # строкой «--». int("--") — исключение, и весь срез потерялся бы.
+    assert segments._cell_int("--") == 0
+    assert segments._cell_int("") == 0
+    assert segments._cell_int(None) == 0
+    assert segments._cell_int("2753") == 2753
+
+
+def test_slice_without_any_conversion_columns_yields_zero():
+    # Целей не передали — колонок нет. Это ноль, а не падение.
+    assert segments.primary_goal_column([_rec("MOBILE", 10)]) is None
+
+
+def test_all_zero_conversions_mean_no_primary_goal():
+    # Колонки есть, но пустые: выбирать нечего, и нули не должны выглядеть
+    # как осмысленный выбор цели.
+    assert segments.primary_goal_column(
+        [_rec("MOBILE", 10, Conversions_111_LSCCD=0)]) is None
+
+
+def test_segment_report_carries_real_conversions_end_to_end(monkeypatch):
+    """Сквозная половина: конверсии обязаны доехать до строк среза.
+
+    Проверять только primary_goal_column недостаточно — ровно так дефект и
+    выживал: разбор считал верно, а тело fetch_segment_report продолжало
+    читать несуществующую колонку "Conversions". Здесь подменяется сырой TSV
+    боевого вида, а утверждения — о возвращённых строках.
+    """
+    tsv = (
+        "Device\tClicks\tCost\tImpressions"
+        "\tConversions_330070378_LSCCD\tConversions_338972879_LSCCD\n"
+        "DESKTOP\t17158\t1091405.31\t200000\t452\t442\n"
+        "MOBILE\t76719\t4859450.90\t900000\t2271\t2354\n"
+        "SMART_TV\t5\t83.57\t50\t--\t--\n"
+    )
+    monkeypatch.setattr(segments, "_run_report", lambda login, payload: tsv)
+
+    rows = segments.fetch_segment_report("cab", "device", "2026-08-06", "2026-08-20",
+                                         goals=["330070378", "338972879"])
+
+    by_key = {r["segment_key"]: r for r in rows}
+    # Победила 338972879 (442 + 2354 = 2796 против 2723) — и она же применена
+    # к ОБОИМ сегментам, иначе сравнение шло бы по разным целям.
+    assert by_key["MOBILE"]["conversions"] == 2354
+    assert by_key["DESKTOP"]["conversions"] == 442
+    # «--» это ноль, а не падение и не потеря строки.
+    assert by_key["SMART_TV"]["conversions"] == 0
+    assert by_key["MOBILE"]["clicks"] == 76719
+
+
+def test_search_queries_carry_real_conversions_too(monkeypatch):
+    # По этим числам отбираются кандидаты в минус-слова: нули у всех запросов
+    # означали бы «весь расход бесполезен», то есть предложение отминусовать
+    # работающую семантику.
+    tsv = (
+        "CampaignId\tQuery\tCriteria\tCost\tClicks\tConversions_111_LSCCD\n"
+        "555\tкупить диплом\tдиплом\t1000.0\t50\t7\n"
+        "555\tчто такое вуз\tвуз\t900.0\t40\t--\n"
+    )
+    monkeypatch.setattr(segments, "_run_report", lambda login, payload: tsv)
+
+    rows = segments.fetch_search_queries("cab", "2026-08-06", "2026-08-20",
+                                         goals=["111"])
+
+    by_query = {r["query"]: r for r in rows}
+    assert by_query["купить диплом"]["conversions"] == 7
+    assert by_query["что такое вуз"]["conversions"] == 0

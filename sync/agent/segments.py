@@ -17,7 +17,7 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -157,6 +157,70 @@ def _parse_tsv(text: str) -> List[Dict[str, str]]:
     return out
 
 
+# Reports API не отдаёт колонку с именем "Conversions". Он отдаёт ПО КОЛОНКЕ НА
+# ЦЕЛЬ с суффиксом модели атрибуции: Conversions_330070378_LSCCD. Запрошенная
+# нами модель LSC в имени превращается в LSCCD (last significant click,
+# cross-device) — тот же сдвиг имён, что уже ловили в витрине LIME.
+#
+# Пока парсер читал rec["Conversions"], он получал None → 0, и расчёт честно
+# докладывал «в срезе нет ни одной конверсии». Так на боевом прогоне
+# 32469160289 отказали ВСЕ двенадцать срезов при живых данных: в том же отчёте
+# лежало 2753, 60, 2826 и 2753 конверсии по четырём целям.
+CONVERSIONS_PREFIX = "Conversions"
+# «Нет данных» Директ пишет двумя дефисами, а не нулём и не пустой строкой.
+# Проверка на них избыточна — except ValueError ниже поймал бы то же самое, —
+# но оставлена намеренно: она называет формат ответа. Мутация, снимающая эту
+# ветку, тестами не ловится и не должна: поведение от неё не меняется.
+NO_DATA = "--"
+
+
+def conversion_columns(records: List[Dict[str, str]]) -> List[str]:
+    """Имена колонок конверсий в ответе — по одной на цель."""
+    seen: List[str] = []
+    for rec in records:
+        for key in rec:
+            if key.startswith(CONVERSIONS_PREFIX + "_") and key not in seen:
+                seen.append(key)
+    return sorted(seen)
+
+
+def _cell_int(value: Any) -> int:
+    text = str(value or "").strip()
+    if not text or text == NO_DATA:
+        return 0
+    try:
+        return int(float(text))
+    except ValueError:
+        return 0
+
+
+def primary_goal_column(records: List[Dict[str, str]]) -> Optional[str]:
+    """Колонка ОДНОЙ цели, по которой считается конверсионность среза.
+
+    Суммировать колонки нельзя: цели пересекаются. В боевом отчёте
+    330070378 и 369313502 дали одинаковые числа во всех трёх моделях
+    атрибуции (2753/2753, 2654/2654, 2213/2213) — это одно и то же целевое
+    действие под двумя идентификаторами. Сумма учла бы его дважды и раздула
+    конверсионность втрое.
+
+    Выбирается самая массовая цель кабинета — основное целевое действие,
+    то есть заявка. Выбор делается ОДИН РАЗ на весь срез, а не построчно:
+    иначе сегменты сравнивались бы по разным целям, и «мобильные
+    конверсионнее десктопа» означало бы всего лишь «у них разные цели».
+
+    При равенстве побеждает меньший идентификатор — выбор обязан быть
+    детерминированным, иначе имя отчёта и его кеш на стороне API поплывут.
+    """
+    columns = conversion_columns(records)
+    if not columns:
+        return None
+    totals = {c: sum(_cell_int(r.get(c)) for r in records) for c in columns}
+    best = max(totals.values())
+    if best <= 0:
+        return None
+    return sorted(c for c in columns if totals[c] == best)[0]
+
+
 def fetch_segment_report(
     login: str, segment_kind: str, date_from: str, date_to: str,
     by_campaign: bool = False, goals: List[str] = (),
@@ -183,15 +247,20 @@ def fetch_segment_report(
         }, list(goals))
     }
 
+    records = _parse_tsv(_run_report(login, payload))
+    # Одна цель на весь срез: см. primary_goal_column. Выбор построчно сравнивал
+    # бы сегменты по разным целям.
+    goal_column = primary_goal_column(records)
+
     rows: List[Dict[str, Any]] = []
-    for rec in _parse_tsv(_run_report(login, payload)):
+    for rec in records:
         row = {
             "segment_kind": segment_kind,
             "segment_key": rec.get(field, ""),
             "slice_key": rec.get(field, ""),
-            "clicks": int(rec.get("Clicks") or 0),
-            "impressions": int(rec.get("Impressions") or 0),
-            "conversions": int(rec.get("Conversions") or 0),
+            "clicks": _cell_int(rec.get("Clicks")),
+            "impressions": _cell_int(rec.get("Impressions")),
+            "conversions": _cell_int(rec.get(goal_column)) if goal_column else 0,
             "cost": float(rec.get("Cost") or 0.0),
         }
         if by_campaign:
@@ -395,6 +464,13 @@ def fetch_search_queries(
             "IncludeDiscount": "NO",
         }, list(goals))
     }
+    records = _parse_tsv(_run_report(login, payload))
+    # Та же история с именами колонок, что и у сегментных срезов: "Conversions"
+    # в ответе нет, есть Conversions_<цель>_<атрибуция>. Здесь цена ошибки
+    # другая, но не меньше: по этим числам отбираются кандидаты в минус-слова,
+    # и нулевые конверсии у всех запросов означают «весь расход бесполезен» —
+    # то есть предложение отминусовать работающую семантику.
+    goal_column = primary_goal_column(records)
     return [
         {
             "window_from": date_from,
@@ -403,8 +479,8 @@ def fetch_search_queries(
             "query": rec.get("Query", ""),
             "matched_key": rec.get("Criteria"),
             "cost": float(rec.get("Cost") or 0.0),
-            "clicks": int(rec.get("Clicks") or 0),
-            "conversions": int(rec.get("Conversions") or 0),
+            "clicks": _cell_int(rec.get("Clicks")),
+            "conversions": _cell_int(rec.get(goal_column)) if goal_column else 0,
         }
-        for rec in _parse_tsv(_run_report(login, payload))
+        for rec in records
     ]
