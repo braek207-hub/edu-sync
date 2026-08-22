@@ -170,3 +170,76 @@ def test_refusal_always_carries_a_reason():
         direct_type, _, reason = direct_type_for(kind, key)
         assert direct_type is None, (kind, key)
         assert reason, (kind, key)
+
+
+# --------------- DESKTOP и TABLET несовместимы в одной кампании
+# Установлено экспериментом (32559366898 → 32561294615 → 32561534117), вопреки
+# справочнику Яндекса: планшет поверх десктопной корректировки отвергается с
+# Code 6000 «Условия в корректировках пересекаются», а он же в кампанию без
+# десктопной — принимается. Гипотеза «слать набор одним запросом» проверена и
+# опровергнута: планшет отвергли и в паре с мобильным, мобильный приняли.
+
+def test_desktop_and_tablet_are_never_planned_together():
+    plan = plan_bid_modifiers([
+        _row("bid_modifier:device", "DESKTOP", -12.0, support=5000),
+        _row("bid_modifier:device", "TABLET", -38.0, support=800),
+    ])
+    keys = {r["key"] for r in plan["desired"]}
+
+    assert keys == {"DESKTOP"}, "обе корректировки сразу Директ не принимает"
+
+
+def test_crowded_out_device_is_named_not_dropped_silently():
+    # «Планшет не нужен» и «планшет вытеснен» обязаны различаться в отчёте:
+    # иначе исчезновение сегмента выглядит как отсутствие данных по нему.
+    plan = plan_bid_modifiers([
+        _row("bid_modifier:device", "DESKTOP", -12.0, support=5000),
+        _row("bid_modifier:device", "TABLET", -38.0, support=800),
+    ])
+    out = [r for r in plan["unsupported"] if r["key"] == "TABLET"]
+
+    assert len(out) == 1
+    assert "несовместим" in out[0]["reason"]
+    assert out[0]["percent"] == -38
+
+
+def test_larger_sample_wins_the_device_slot():
+    # Выигрывает сегмент с бОльшим объёмом наблюдений: там оценка надёжнее.
+    plan = plan_bid_modifiers([
+        _row("bid_modifier:device", "DESKTOP", -12.0, support=300),
+        _row("bid_modifier:device", "TABLET", -38.0, support=9000),
+    ])
+
+    assert {r["key"] for r in plan["desired"]} == {"TABLET"}
+    assert [r["key"] for r in plan["unsupported"]] == ["DESKTOP"]
+
+
+def test_tie_keeps_desktop_deterministically():
+    # При равном объёме — DESKTOP: он покрывает больше трафика. Выбор обязан
+    # быть детерминированным, иначе один расчёт даёт разные планы.
+    plan = plan_bid_modifiers([
+        _row("bid_modifier:device", "DESKTOP", -12.0, support=1000),
+        _row("bid_modifier:device", "TABLET", -38.0, support=1000),
+    ])
+
+    assert {r["key"] for r in plan["desired"]} == {"DESKTOP"}
+
+
+def test_mobile_is_not_touched_by_the_exclusion():
+    # Мобильный с этой парой не конфликтует: в опыте 32561294615 его приняли
+    # тем же запросом, которым отвергли планшет.
+    plan = plan_bid_modifiers([
+        _row("bid_modifier:device", "DESKTOP", -12.0, support=5000),
+        _row("bid_modifier:device", "TABLET", -38.0, support=800),
+        _row("bid_modifier:device", "MOBILE", 19.0, support=9000),
+    ])
+
+    assert {r["key"] for r in plan["desired"]} == {"DESKTOP", "MOBILE"}
+
+
+def test_single_device_is_planned_as_before():
+    # Пары нет — вытеснять нечего, поведение прежнее.
+    plan = plan_bid_modifiers([_row("bid_modifier:device", "TABLET", -38.0)])
+
+    assert [r["key"] for r in plan["desired"]] == ["TABLET"]
+    assert plan["unsupported"] == []

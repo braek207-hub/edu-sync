@@ -82,6 +82,27 @@ DEVICE_TYPE_MAP: Dict[str, str] = {
     "TABLET": "TABLET_ADJUSTMENT",
 }
 
+# DESKTOP и TABLET в одной кампании НЕСОВМЕСТИМЫ. Установлено экспериментом
+# (прогоны 32559366898 → 32561294615 → 32561534117), вопреки справочнику
+# Яндекса, где это разные категории устройств: планшет поверх десктопной
+# корректировки отвергается с Code 6000 «Условия в корректировках
+# пересекаются», а он же в кампанию без десктопной — принимается.
+#
+# Гипотеза «набор устройств надо слать одним запросом» проверена и опровергнута:
+# планшет отвергли и в паре с мобильным, причём мобильный в том же запросе
+# приняли. Дело именно в паре DESKTOP+TABLET.
+#
+# Раз применить обе нельзя, выбор делается по объёму наблюдений: у сегмента с
+# бОльшим support_n оценка надёжнее. Проигравший уходит в unsupported с
+# причиной — молча терять его нельзя, иначе «планшет не нужен» и «планшет
+# отвалился» снова станут неотличимы.
+DEVICE_EXCLUSIVE_PAIR = ("DESKTOP", "TABLET")
+DEVICE_EXCLUSIVE_REASON = (
+    "DESKTOP и TABLET в одной кампании несовместимы (Директ отвечает Code 6000 "
+    "«условия в корректировках пересекаются»): применён сегмент с бОльшим "
+    "объёмом наблюдений, этот вытеснен"
+)
+
 MIN_SUPPORT = 100        # ниже — не трогаем, даже если сжатие дало заметное значение
 MIN_ABS_PERCENT = 5      # корректировка меньше ±5% не стоит запроса и риска
 
@@ -195,12 +216,42 @@ def plan_bid_modifiers(
             "direct_type": direct_type,
             "key": key,
             "percent": percent,
+            "support_n": int(row.get("support_n") or 0),
         })
+
+    desired, crowded_out = _resolve_device_exclusion(desired)
+    unsupported += crowded_out
 
     return {
         "desired": sorted(desired, key=lambda r: (r["kind"], r["key"])),
         "unsupported": sorted(unsupported, key=lambda r: (r["kind"], r["key"])),
     }
+
+
+def _resolve_device_exclusion(
+    desired: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Оставляет из пары DESKTOP/TABLET один сегмент — тот, где данных больше.
+
+    Директ принимает только одну корректировку из этой пары (см.
+    DEVICE_EXCLUSIVE_PAIR). Раньше движок планировал обе, вторая получала отказ
+    уровня элемента и переотправлялась каждый прогон, пока не упиралась в
+    счётчик попыток. Теперь конфликт разрешается ДО отправки.
+    """
+    by_key = {r["key"]: r for r in desired
+              if r["kind"] == DEVICE_KIND and r["key"] in DEVICE_EXCLUSIVE_PAIR}
+    if len(by_key) < 2:
+        return desired, []
+
+    first, second = (by_key[k] for k in DEVICE_EXCLUSIVE_PAIR)
+    # Больший объём наблюдений выигрывает; при равенстве — DESKTOP, он покрывает
+    # больше трафика. Выбор обязан быть детерминированным: иначе один и тот же
+    # расчёт давал бы разные планы от прогона к прогону.
+    loser = second if first["support_n"] >= second["support_n"] else first
+
+    kept = [r for r in desired if r is not loser]
+    return kept, [{"kind": loser["kind"], "key": loser["key"],
+                   "percent": loser["percent"], "reason": DEVICE_EXCLUSIVE_REASON}]
 
 
 def desired_bid_modifiers(
