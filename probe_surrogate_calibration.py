@@ -21,12 +21,12 @@
 """
 
 import json
-import os
 from collections import defaultdict
 from datetime import date, timedelta
 
-import psycopg2
 import psycopg2.extras
+
+from sync.db import get_connection
 
 LOOKBACK_DAYS = 540
 MATURITY_PERCENTILE = 0.90
@@ -35,7 +35,7 @@ MIN_GROUP_LEADS = 30
 
 
 def _fetch(sql, params):
-    with psycopg2.connect(os.environ["DATABASE_URL"]) as conn:
+    with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)
             return [dict(r) for r in cur.fetchall()]
