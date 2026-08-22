@@ -34,6 +34,7 @@ from sync.agent.holdout import select_holdout
 from sync.agent.metrika import (
     EDU_COUNTERS,
     fetch_campaign_behavior,
+    fetch_counter_goal_ids,
     fetch_hourly_profile,
     merge_hourly,
 )
@@ -273,8 +274,12 @@ def main() -> int:
     # висел 25+ минут и был отменён). Воркеров немного: Директ ограничивает число
     # одновременно формируемых отчётов на кабинет.
     jobs: List[Dict[str, Any]] = []
+    # Те же цели нужны шагу 9: почасовой профиль обязан считаться по лидам, а не
+    # по «любой цели» счётчика (там 70 % — прокрутка и время на сайте).
+    lead_goal_ids: set = set()
     for client in clients:
         login, goals = client["login"], resolve_goal_ids(client)
+        lead_goal_ids.update(int(g) for g in goals if str(g).isdigit())
         # Расписания здесь нет: HourOfDay отвергается Reports API (probe 31781715471),
         # почасовой профиль приходит из Метрики (шаг 9).
         #
@@ -397,11 +402,22 @@ def main() -> int:
     # 9. Обогащение Метрикой: почасовой профиль (Директ HourOfDay не отдаёт) и
     # поведение по кампаниям — ранний сигнал качества до созревания оплат.
     hourly_rows: List[Dict[str, Any]] = []
+    hourly_skipped: List[Dict[str, Any]] = []
     behavior_rows: List[Dict[str, Any]] = []
     if not skip_direct and os.environ.get("YM_TOKEN"):
         for counter in EDU_COUNTERS:
             try:
-                hourly_rows += fetch_hourly_profile(counter, cutoff, date_to)
+                # Цель принадлежит ОДНОМУ счётчику: чужой идентификатор в metrics
+                # Метрика отвергает целиком, обнуляя профиль всего счётчика.
+                # Поэтому спрашиваем только пересечение целей Директа с целями
+                # этого счётчика; пусто — считать нечего, и это не отказ.
+                counter_goals = sorted(lead_goal_ids & set(fetch_counter_goal_ids(counter)))
+                if counter_goals:
+                    hourly_rows += fetch_hourly_profile(counter, cutoff, date_to,
+                                                        counter_goals)
+                else:
+                    hourly_skipped.append(
+                        {"counter": counter, "reason": "целей Директа нет на счётчике"})
                 behavior_rows += fetch_campaign_behavior(counter, slice_from, date_to)
             except Exception as exc:  # счётчик может быть недоступен токену
                 agent_db.insert_guard_checks([{
@@ -488,6 +504,8 @@ def main() -> int:
         "computed_settings_skipped": computed_skipped,
         "profile_rows": len(profile_rows),
         "metrika_hourly": len(hourly_rows),
+        "metrika_hourly_goals": sorted(lead_goal_ids),
+        "metrika_hourly_skipped": hourly_skipped,
         "metrika_behavior": len(resolved_behavior),
         "power": report,
         "db_total_mb": total_mb,

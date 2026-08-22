@@ -29,6 +29,7 @@ from typing import Any, Dict, List
 import requests
 
 METRICA_API_URL = "https://api-metrika.yandex.net/stat/v1/data"
+GOALS_API_URL = "https://api-metrika.yandex.net/management/v1/counter/{counter}/goals"
 ATTRIBUTION = "lastsign"
 ROW_LIMIT = 10_000
 # Счётчики EDU по проектам (vuz/vse/provuz) — те же, что в sync/edu_direct_settings.py.
@@ -65,7 +66,9 @@ def parse_hourly(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw_hour = str(dims[0].get("name") or dims[0].get("id") or "").strip()
         hour = raw_hour.split(":")[0].lstrip("0") or "0"
         visits = float(metrics[0] or 0.0)
-        goals = float(metrics[1] or 0.0) if len(metrics) > 1 else 0.0
+        # Целей в запросе несколько (по одной колонке на цель) — складываем ВСЕ,
+        # а не берём первую: расписание считается по сумме лидов часа.
+        goals = sum(float(m or 0.0) for m in metrics[1:])
         out.append({
             "segment_kind": "hour",
             "segment_key": hour,
@@ -112,11 +115,52 @@ def parse_campaign_behavior(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return sorted(out, key=lambda r: r["campaign_name"])
 
 
-def fetch_hourly_profile(counter_id: int, date_from: str, date_to: str) -> List[Dict[str, Any]]:
-    """Визиты и достижения целей по часам суток."""
+def fetch_counter_goal_ids(counter_id: int) -> List[int]:
+    """Идентификаторы целей, заведённых на счётчике.
+
+    Нужны, чтобы спрашивать почасовые достижения только по тем целям, которые
+    у счётчика есть: `ym:s:goal<чужой id>reaches` Метрика отвергает целиком, и
+    один лишний идентификатор обнулил бы профиль всего счётчика.
+    """
+    headers = {"Authorization": f"OAuth {os.environ['YM_TOKEN']}"}
+    resp = requests.get(GOALS_API_URL.format(counter=counter_id),
+                        headers=headers, timeout=120)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Metrica goals {resp.status_code}: {resp.text[:300]}")
+    return [int(g["id"]) for g in (resp.json().get("goals") or []) if g.get("id")]
+
+
+def hourly_metrics(goal_ids: List[int]) -> str:
+    """Строка metrics: визиты плюс отдельная колонка на каждую цель."""
+    ordered = sorted({int(g) for g in goal_ids})
+    return ",".join(["ym:s:visits"] + [f"ym:s:goal{g}reaches" for g in ordered])
+
+
+def fetch_hourly_profile(counter_id: int, date_from: str, date_to: str,
+                         goal_ids: List[int]) -> List[Dict[str, Any]]:
+    """Визиты и достижения ЦЕЛЕВЫХ целей по часам суток.
+
+    goal_ids обязателен и обязан быть непустым. Раньше здесь стояла
+    `ym:s:sumGoalReachesAny` — сумма достижений ЛЮБОЙ цели счётчика, и это
+    оказалось не про лиды: на замере 22.08.2026 (счётчик 98627983, окно 90
+    дней) 0.38 достижения на визит складывались на ~70 % из микроцелей
+    «2 минуты на сайте», «глубина прокрутки», «прокрутка: середина блока»,
+    а заявки давали 2 %. Микроцели и заявки расходятся по суткам ПРОТИВОПОЛОЖНО:
+    прокрутка ночью 1.17–1.49 к дню, «CRM: новая заявка» — 0.45, «новая сделка» —
+    0.41. Расписание, посчитанное по Any, поднимало ставку на 3:00–7:00 (+13,
+    +27, +21 %) — то есть на часы, где заявок вдвое меньше.
+
+    Пересечение с целями счётчика делает вызывающий: цель принадлежит одному
+    счётчику, и чужой идентификатор в metrics отвергается Метрикой целиком.
+    """
+    if not goal_ids:
+        raise ValueError(
+            "fetch_hourly_profile без целей: считать расписание не по чему. "
+            "Профиль по «любой цели» — это профиль прокрутки, а не лидов."
+        )
     params = {
         "ids": counter_id,
-        "metrics": "ym:s:visits,ym:s:sumGoalReachesAny",
+        "metrics": hourly_metrics(goal_ids),
         "dimensions": "ym:s:hour",
         "date1": date_from,
         "date2": date_to,

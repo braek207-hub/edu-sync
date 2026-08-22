@@ -68,3 +68,72 @@ def test_behavior_skips_incomplete_rows():
 def test_empty_response():
     assert parse_hourly({}) == []
     assert parse_campaign_behavior({}) == []
+
+
+# --------------- расписание считается по ЛИДАМ, а не по «любой цели»
+# Замер 22.08.2026 (счётчик 98627983, окно 90 дней) показал, что
+# ym:s:sumGoalReachesAny — это не заявки: 0.38 достижения на визит складывались
+# на ~70 % из микроцелей «2 минуты на сайте», «глубина прокрутки», «прокрутка:
+# середина блока», а заявки давали 2 %. По суткам они расходятся ПРОТИВОПОЛОЖНО:
+# прокрутка ночью 1.17–1.49 к дню, «CRM: новая заявка» — 0.45, «новая сделка» —
+# 0.41. Расписание по Any поднимало ставку на 3:00–7:00 (+13, +27, +21 %) — на
+# часы, где заявок вдвое меньше. Тесты ниже держат метрику на месте.
+
+import pytest
+
+import sync.agent.metrika as metrika
+from sync.agent.metrika import hourly_metrics
+
+
+def test_request_asks_for_goals_and_never_for_any_goal(monkeypatch):
+    """Проверка по УХОДЯЩЕМУ ЗАПРОСУ, а не по тексту файла.
+
+    Тест «в исходнике нет sumGoalReachesAny» был бы беззубым: в модуле эта
+    строка законно живёт в объяснении «почему так больше нельзя», и отличить её
+    от вернувшейся боевой строки по тексту нельзя. Смотрим на то, что реально
+    уходит в Метрику.
+    """
+    sent = {}
+    monkeypatch.setenv("YM_TOKEN", "t")
+    monkeypatch.setattr(metrika, "_metrica_get",
+                        lambda params, token: sent.update(params) or {"data": []})
+
+    metrika.fetch_hourly_profile(98627983, "2026-01-01", "2026-03-31", [317, 42])
+
+    assert "sumGoalReachesAny" not in sent["metrics"]
+    assert sent["metrics"] == "ym:s:visits,ym:s:goal42reaches,ym:s:goal317reaches"
+    assert sent["dimensions"] == "ym:s:hour"
+    assert sent["ids"] == 98627983
+
+
+def test_metrics_ask_one_column_per_goal():
+    assert hourly_metrics([17, 5]) == "ym:s:visits,ym:s:goal5reaches,ym:s:goal17reaches"
+
+
+def test_metrics_are_stable_regardless_of_input_order_and_duplicates():
+    # Один и тот же набор целей обязан давать один и тот же запрос: иначе
+    # два прогона подряд дают разные колонки и профиль «дрожит» без причины.
+    assert hourly_metrics([5, 17, 5]) == hourly_metrics([17, 5])
+
+
+def test_profile_without_goals_is_refused_not_silently_any():
+    """Нет целей — отказ, а не тихий откат к «любой цели».
+
+    Тихий откат и был исходным дефектом: расписание считалось, выглядело
+    правдоподобно и было посчитано не по тому.
+    """
+    with pytest.raises(ValueError, match="целей"):
+        metrika.fetch_hourly_profile(1, "2026-01-01", "2026-01-02", [])
+
+
+def test_all_goal_columns_are_summed_not_just_the_first():
+    """Целей в запросе несколько — час обязан получить их СУММУ.
+
+    Взять metrics[1] значило бы считать расписание по одной цели из четырёх,
+    молча и без следа в отчёте.
+    """
+    data = {"data": [{"dimensions": [{"name": "09"}], "metrics": [100.0, 3.0, 4.0, 5.0]}]}
+    out = parse_hourly(data)
+
+    assert out[0]["sum_p_pay"] == 12.0
+    assert out[0]["leads"] == 12

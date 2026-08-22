@@ -505,6 +505,8 @@ def test_main_merges_hourly_counters_before_computing_schedule(monkeypatch, caps
                  "leads": int(1000 * conv), "sum_p_pay": 1000 * conv * (0.9 + 0.2 * (h % 2))}
                 for h in range(24)]
 
+    # Обе цели Директа заведены на обоих счётчиках — профиль считается по ним.
+    monkeypatch.setattr(agent_e0, "fetch_counter_goal_ids", lambda counter: [1, 2])
     monkeypatch.setattr(agent_e0, "fetch_hourly_profile", fake_hourly)
     monkeypatch.setattr(agent_e0, "compute_schedule",
                         lambda rows: seen.update({"rows": list(rows)}) or ([], None))
@@ -565,3 +567,56 @@ def test_no_baseline_means_no_threshold_not_a_zero_one(monkeypatch, capsys):
     report = _json.loads(capsys.readouterr().out)["minus_word_candidates"]
 
     assert report["count"] == 0
+
+
+# --------------- почасовой профиль считается по ЛИДАМ, а не по «любой цели»
+
+def test_hourly_profile_asks_only_for_this_counters_lead_goals(monkeypatch, capsys):
+    """Цель принадлежит ОДНОМУ счётчику.
+
+    Отправить чужой идентификатор нельзя: Метрика отвергает запрос целиком, и
+    профиль всего счётчика обнулился бы — молча, потому что отказ ловится в
+    guard_checks, а расписание просто считается по оставшимся строкам.
+    """
+    asked = []
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setenv("YM_TOKEN", "test-token")
+    monkeypatch.setattr(agent_e0, "EDU_COUNTERS", [111, 222])
+    monkeypatch.setattr(agent_e0, "fetch_campaign_behavior", lambda *a, **k: [])
+    # acc-1 оптимизируется на цель 1, acc-2 — на цель 2 (см. _patch_e0_run).
+    monkeypatch.setattr(agent_e0, "fetch_counter_goal_ids",
+                        lambda counter: [1, 999] if counter == 111 else [2])
+    monkeypatch.setattr(agent_e0, "fetch_hourly_profile",
+                        lambda counter, *a, **k: asked.append((counter, a[-1])) or [])
+    monkeypatch.setattr(agent_e0, "compute_schedule", lambda rows: ([], None))
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+
+    # 999 — цель счётчика, но НЕ цель Директа: в запрос не идёт.
+    assert asked == [(111, [1]), (222, [2])]
+
+
+def test_counter_without_direct_goals_is_reported_not_guessed(monkeypatch, capsys):
+    """Нет пересечения — считать нечего, и это видно в отчёте.
+
+    Молчаливый пропуск здесь неотличим от «профиль посчитан»: ровно так
+    расписание и оказалось построено не по тем целям.
+    """
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setenv("YM_TOKEN", "test-token")
+    monkeypatch.setattr(agent_e0, "EDU_COUNTERS", [333])
+    monkeypatch.setattr(agent_e0, "fetch_campaign_behavior", lambda *a, **k: [])
+    monkeypatch.setattr(agent_e0, "fetch_counter_goal_ids", lambda counter: [77])
+    monkeypatch.setattr(agent_e0, "fetch_hourly_profile",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("запрос без целей Директа")))
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    assert report["metrika_hourly"] == 0
+    assert report["metrika_hourly_skipped"] == [
+        {"counter": 333, "reason": "целей Директа нет на счётчике"}]
+    # Цели кабинетов в отчёте — иначе «почему профиль пуст» не разобрать.
+    assert report["metrika_hourly_goals"] == [1, 2]
