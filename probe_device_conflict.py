@@ -69,12 +69,19 @@ def _verdict(result, collection="AddResults"):
 
 
 def _campaign_ids(login, limit=40):
+    """Только НЕ заархивированные: архив править запрещено (ошибка 8300),
+    и такая кампания сорвала бы эксперимент, ничего не сказав о корректировках."""
     result = _post(CAMPAIGNS_URL, login, {
         "method": "get",
-        "params": {"SelectionCriteria": {}, "FieldNames": ["Id"],
-                   "Page": {"Limit": limit, "Offset": 0}},
+        "params": {
+            "SelectionCriteria": {"States": ["ON", "OFF", "SUSPENDED"]},
+            "FieldNames": ["Id", "State", "Status"],
+            "Page": {"Limit": limit, "Offset": 0},
+        },
     })
-    return [int(c["Id"]) for c in (result.get("result") or {}).get("Campaigns", [])]
+    campaigns = (result.get("result") or {}).get("Campaigns", [])
+    print(f"  кампаний не в архиве: {len(campaigns)}")
+    return [int(c["Id"]) for c in campaigns]
 
 
 def _device_modifiers(login, campaign_ids):
