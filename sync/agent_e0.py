@@ -38,6 +38,7 @@ from sync.agent.metrika import (
     fetch_hourly_profile,
     resolve_counter_account,
 )
+from sync.agent.hierarchy import hierarchical_modifiers
 from sync.agent.ladder import ladder_report
 from sync.agent.mining import mine_quasi_experiments
 from sync.agent.objects import (
@@ -343,6 +344,12 @@ def main() -> int:
     facts = assemble_facts(direct_rows, lead_rows, score_rows)
     agent_db.upsert_facts(facts)
 
+    # Направление кампании — для иерархии пулинга (Э2.2) и лестницы (Э2.1).
+    direction_by_campaign: Dict[str, str] = {}
+    for f in facts:
+        if f.get("direction"):
+            direction_by_campaign[str(f["campaign_id"])] = f["direction"]
+
     # 3. Агрегаты последних 30 дней — для заповедника и отчёта мощности.
     cutoff = (date.today() - timedelta(days=30)).isoformat()
     recent = [f for f in facts if f["fact_date"] >= cutoff]
@@ -421,6 +428,9 @@ def main() -> int:
     # неотличим от «данных нет» — а именно так и выглядел дефект размазывания.
     computed_skipped: List[Dict[str, Any]] = []
     sliced_rows: List[Dict[str, Any]] = []
+    # Э2.2: покампанийные device-корректировки по кабинетам (и отказы с причиной).
+    campaign_modifiers_by_login: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    campaign_modifiers_skipped: List[Dict[str, Any]] = []
     # По ОДНОЙ цели считается конверсионность каждого среза, а значит и все
     # корректировки ставок. Цель выбирается автоматически — самая массовая из
     # переданных, — а имён целей Директ в отчёте не отдаёт, только
@@ -441,7 +451,19 @@ def main() -> int:
                     if rows:
                         computed_by_account.setdefault(login, []).extend(rows)
                 else:
-                    sliced_rows += collapse_tail(build_sliced_facts(job["rows"], job["kind"]))
+                    weekly = collapse_tail(build_sliced_facts(job["rows"], job["kind"]))
+                    sliced_rows += weekly
+                    # Э2.2: покампанийные корректировки — только device, это
+                    # единственный срез с рабочим рычагом записи. Region мёртв
+                    # (RegionId), network корректировкой ставки не является.
+                    if job["kind"] == "device":
+                        camp_rows, camp_reason = hierarchical_modifiers(
+                            weekly, direction_by_campaign, "device")
+                        if camp_reason:
+                            campaign_modifiers_skipped.append(
+                                {"account": job["login"], "reason": camp_reason})
+                        else:
+                            campaign_modifiers_by_login[job["login"]] = camp_rows
 
     if computed_skipped:
         agent_db.insert_guard_checks([
@@ -455,6 +477,39 @@ def main() -> int:
         agent_db.upsert_computed_settings(rows, calc_date=today_iso, object_id=login)
         computed_count += len(rows)
     agent_db.upsert_sliced_facts(sliced_rows)
+
+    # Э2.2: покампанийные строки — под object_level='campaign'. Движок записи их
+    # пока НЕ читает (применяется кабинетный уровень): сначала видимость и сверка
+    # на бою, потом переключение применения — и только оно снимает max_campaigns=1.
+    campaign_modifier_count = 0
+    campaign_modifier_summary: Dict[str, Any] = {}
+    for login, by_camp in campaign_modifiers_by_login.items():
+        account_values = {
+            (r["setting_kind"], r["setting_key"]): r["value"]
+            for r in computed_by_account.get(login, [])}
+        deltas: List[Dict[str, Any]] = []
+        for campaign_id, rows in by_camp.items():
+            agent_db.upsert_computed_settings(
+                rows, calc_date=today_iso,
+                object_id=campaign_id, object_level="campaign")
+            campaign_modifier_count += len(rows)
+            for r in rows:
+                account_value = account_values.get(
+                    (r["setting_kind"], r["setting_key"]))
+                if account_value is not None:
+                    deltas.append({
+                        "campaign_id": campaign_id, "segment": r["setting_key"],
+                        "campaign": r["value"], "account": account_value,
+                        "delta": round(r["value"] - account_value, 1),
+                    })
+        deltas.sort(key=lambda d: -abs(d["delta"]))
+        campaign_modifier_summary[login] = {
+            "campaigns": len(by_camp),
+            "rows": sum(len(v) for v in by_camp.values()),
+            # Насколько личные значения расходятся с кабинетным, которое сейчас
+            # раскатывается на всех: величина этого разрыва и есть цена Э2.2.
+            "top_deltas_vs_account": deltas[:5],
+        }
 
     # 8. Структура кабинета и поисковые запросы. Только по живым кампаниям окна.
     if "--rebuild-bulk" in sys.argv:
@@ -672,6 +727,9 @@ def main() -> int:
         "computed_settings": computed_count,
         "computed_settings_by_account": {k: len(v) for k, v in computed_by_account.items()},
         "computed_settings_skipped": computed_skipped,
+        "campaign_modifiers": campaign_modifier_summary,
+        "campaign_modifiers_rows": campaign_modifier_count,
+        "campaign_modifiers_skipped": campaign_modifiers_skipped,
         "segment_goal_columns": sorted(
             segment_goals, key=lambda g: (g["account"], g["purpose"], g["slice"])),
         "query_goal_columns": sorted(query_goals, key=lambda g: g["account"]),

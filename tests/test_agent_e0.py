@@ -170,7 +170,8 @@ def _patch_e0_run(monkeypatch, reports=None):
         # Значения по умолчанию намеренно: на коде ДО правки вызов идёт без
         # object_id, и тест обязан упасть на утверждении о ключе, а не на TypeError.
         lambda rows, calc_date=None, object_id=None, object_level="account":
-            calls.append({"rows": list(rows), "object_id": object_id}) or len(rows),
+            calls.append({"rows": list(rows), "object_id": object_id,
+                          "object_level": object_level}) or len(rows),
     )
 
     today = _date.today().isoformat()
@@ -839,3 +840,42 @@ def test_ladder_section_distribution_names_campaigns_without_step():
     section = agent_e0.funnel_ladder_section(facts, [], today=today)
     assert section["distribution"] == {"нет_ступени": 1}
     assert section["without_step"] == ["thin"]
+
+
+def test_main_writes_campaign_level_device_modifiers(monkeypatch, capsys):
+    """Э2.2: покампанийные device-строки едут под object_level='campaign'."""
+    calls = _patch_e0_run(monkeypatch)
+    week = "2026-08-17"
+    campaign_rows = [
+        {"date": week, "campaign_id": "111", "slice_key": "MOBILE",
+         "clicks": 20000, "conversions": 2000, "cost": 1.0, "impressions": 1},
+        {"date": week, "campaign_id": "111", "slice_key": "DESKTOP",
+         "clicks": 20000, "conversions": 500, "cost": 1.0, "impressions": 1},
+    ]
+    monkeypatch.setattr(
+        agent_e0, "fetch_segment_report",
+        lambda login, kind, date_from, date_to, by_campaign=False, goals=():
+            ((list(campaign_rows) if (by_campaign and kind == "device"
+                                      and login == "acc-1") else [])
+             if by_campaign else
+             (list(_REPORTS_BY_LOGIN.get(login, [])) if kind == "device" else []),
+             {"goal_column": "Conversions_111_LSCCD", "conversions": 1,
+              "columns_offered": 1}),
+    )
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    campaign_calls = [c for c in calls if c["object_level"] == "campaign"]
+    assert campaign_calls, "покампанийная запись не случилась"
+    assert campaign_calls[0]["object_id"] == "111"
+    kinds = {r["setting_kind"] for c in campaign_calls for r in c["rows"]}
+    assert kinds == {"bid_modifier:device"}
+
+    summary = report["campaign_modifiers"]["acc-1"]
+    assert summary["campaigns"] == 1
+    # Сверка с кабинетным уровнем — в отчёте: без неё цену Э2.2 не увидеть.
+    assert summary["top_deltas_vs_account"]
+    # Кабинет без покампанийных данных честно назван с причиной, а не молчит.
+    assert any(sk["account"] == "acc-2"
+               for sk in report["campaign_modifiers_skipped"])
