@@ -136,9 +136,17 @@ def test_registry_covers_all_four_dashboards():
     assert {s.dashboard for s in SOURCES} == {"lime", "edunetwork", "bjorn", "polinarepik"}
 
 
-def test_registry_has_no_duplicate_tables():
-    tables = [s.table for s in SOURCES]
-    assert len(tables) == len(set(tables))
+def test_registry_has_no_duplicate_slices():
+    """Уникальность по (таблица, срез): одну таблицу можно слушать по разным where
+    (lime_google_ads_stats: KZ и GCC пишут разные Ads-скрипты), но не дважды одинаково."""
+    names = [s.name for s in SOURCES]
+    assert len(names) == len(set(names))
+
+
+def test_google_ads_watched_per_region():
+    """Свежий KZ-скрипт не должен маскировать мёртвый GCC (встал 2026-07-18)."""
+    slices = {s.where for s in SOURCES if s.table == "lime_google_ads_stats"}
+    assert slices == {"region = 'kz'", "region = 'gcc'"}
 
 
 def test_finding_level_drives_criticality():
