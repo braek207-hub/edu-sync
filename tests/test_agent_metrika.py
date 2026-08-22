@@ -1,4 +1,16 @@
-from sync.agent.metrika import parse_campaign_behavior, parse_hourly
+from sync.agent.metrika import (
+    parse_campaign_behavior,
+    parse_hourly_by_goal,
+    pick_lead_goal,
+    profile_rows,
+)
+
+
+def _hourly(data, goal_ids=(1,)):
+    """Разбор + сборка строк по ведущей цели — путь fetch_hourly_profile."""
+    visits, reaches = parse_hourly_by_goal(data, list(goal_ids))
+    goal = pick_lead_goal(reaches)
+    return profile_rows(visits, reaches[goal] if goal is not None else {})
 
 
 def test_hourly_parses_hour_and_metrics():
@@ -6,7 +18,7 @@ def test_hourly_parses_hour_and_metrics():
         {"dimensions": [{"name": "09:00"}], "metrics": [1000.0, 25.0]},
         {"dimensions": [{"name": "10:00"}], "metrics": [1500.0, 45.0]},
     ]}
-    out = parse_hourly(data)
+    out = _hourly(data)
     assert [r["segment_key"] for r in out] == ["9", "10"]
     assert out[0]["clicks"] == 1000
     assert out[0]["sum_p_pay"] == 25.0
@@ -18,7 +30,7 @@ def test_hourly_handles_midnight_and_plain_numbers():
         {"dimensions": [{"name": "00"}], "metrics": [10.0, 1.0]},
         {"dimensions": [{"name": "23"}], "metrics": [20.0, 2.0]},
     ]}
-    out = parse_hourly(data)
+    out = _hourly(data)
     assert [r["segment_key"] for r in out] == ["0", "23"]
 
 
@@ -27,12 +39,12 @@ def test_hourly_sorted_numerically_not_lexically():
         {"dimensions": [{"name": "21"}], "metrics": [1.0, 0.0]},
         {"dimensions": [{"name": "3"}], "metrics": [1.0, 0.0]},
     ]}
-    assert [r["segment_key"] for r in parse_hourly(data)] == ["3", "21"]
+    assert [r["segment_key"] for r in _hourly(data)] == ["3", "21"]
 
 
 def test_hourly_skips_rows_without_metrics():
     data = {"data": [{"dimensions": [{"name": "09"}], "metrics": []}]}
-    assert parse_hourly(data) == []
+    assert _hourly(data) == []
 
 
 def test_behavior_converts_rates_to_counts():
@@ -66,7 +78,7 @@ def test_behavior_skips_incomplete_rows():
 
 
 def test_empty_response():
-    assert parse_hourly({}) == []
+    assert _hourly({}) == []
     assert parse_campaign_behavior({}) == []
 
 
@@ -126,17 +138,56 @@ def test_profile_without_goals_is_refused_not_silently_any():
         metrika.fetch_hourly_profile(1, "2026-01-01", "2026-01-02", [])
 
 
-def test_all_goal_columns_are_summed_not_just_the_first():
-    """Целей в запросе несколько — час обязан получить их СУММУ.
+def test_goal_columns_are_not_summed_because_goals_duplicate_each_other():
+    """Целей в запросе несколько — но складывать их колонки нельзя.
 
-    Взять metrics[1] значило бы считать расписание по одной цели из четырёх,
-    молча и без следа в отчёте.
+    Проба 32579085232: у счётчика 96526110 «Страница "Спасибо" VseKolledzhi» и
+    «Страницы спасибо» дали ПОБУКВЕННО совпадающие векторы 24 часов
+    (37 252 = 37 252) — одно действие под двумя идентификаторами. Рядом
+    «Автоцель: отправил контактные данные» — тот же поступок третьим способом.
+    Сумма считает одну заявку дважды, а на счётчике 98627983 подмешивает к ней
+    ступенчатую «CRM: Заказ оплачен».
     """
     data = {"data": [{"dimensions": [{"name": "09"}], "metrics": [100.0, 3.0, 4.0, 5.0]}]}
-    out = parse_hourly(data)
+    out = _hourly(data, goal_ids=(1, 2, 3))
 
-    assert out[0]["sum_p_pay"] == 12.0
-    assert out[0]["leads"] == 12
+    # Ведущая цель — третья колонка (5.0), а не сумма 12.0.
+    assert out[0]["sum_p_pay"] == 5.0
+    assert out[0]["leads"] == 5
+
+
+def test_identical_goals_give_the_same_answer_whichever_wins():
+    """Дубли неразличимы по построению — выбор между ними обязан быть
+    воспроизводим, иначе профиль дрожит от прогона к прогону."""
+    data = {"data": [
+        {"dimensions": [{"name": "09"}], "metrics": [100.0, 7.0, 7.0]},
+        {"dimensions": [{"name": "10"}], "metrics": [100.0, 9.0, 9.0]},
+    ]}
+    visits, reaches = parse_hourly_by_goal(data, [369313502, 330070378])
+
+    assert pick_lead_goal(reaches) == 330070378   # меньший идентификатор
+    assert reaches[330070378] == reaches[369313502]
+
+
+def test_stepped_goal_loses_to_the_application_it_belongs_to():
+    """«Заказ оплачен» — подмножество заявки. Числителем обязана быть заявка:
+    иначе расписание считается по оплатам, которых в разы меньше и которые
+    созревают позже."""
+    data = {"data": [
+        {"dimensions": [{"name": "09"}], "metrics": [100.0, 33.0, 4.0]},
+    ]}
+    _visits, reaches = parse_hourly_by_goal(data, [349122551, 541664135])
+
+    assert pick_lead_goal(reaches) == 349122551
+
+
+def test_no_reaches_at_all_is_none_not_an_arbitrary_goal():
+    """Ни одного достижения — считать не по чему. Вернуть первую попавшуюся
+    цель значило бы построить расписание на двадцати четырёх нулях."""
+    _visits, reaches = parse_hourly_by_goal(
+        {"data": [{"dimensions": [{"name": "09"}], "metrics": [100.0, 0.0, 0.0]}]}, [1, 2])
+
+    assert pick_lead_goal(reaches) is None
 
 
 # --------------- лимит Метрики: 20 метрик на запрос (код 4015)
@@ -144,7 +195,7 @@ def test_all_goal_columns_are_summed_not_just_the_first():
 # отвергается целиком. Срезать хвост нельзя — это тот же класс дефекта, что
 # профиль по «любой цели»: считается не то, а выглядит посчитанным.
 
-from sync.agent.metrika import MAX_GOALS_PER_REQUEST, goal_batches, sum_profiles
+from sync.agent.metrika import MAX_GOALS_PER_REQUEST, goal_batches
 
 
 def test_batches_fit_the_api_limit():
@@ -165,30 +216,94 @@ def test_single_batch_when_goals_fit():
     assert goal_batches([3, 1, 2]) == [[1, 2, 3]]
 
 
-def test_visits_are_not_multiplied_across_batches():
+def test_visits_are_not_multiplied_across_batches(monkeypatch):
     """Визиты в каждой порции ОДНИ И ТЕ ЖЕ — это метрика часа, не цели.
 
     Сложить их значило бы раздуть знаменатель во столько раз, сколько было
     порций, и конверсионность часа упала бы кратно — молча и правдоподобно.
     """
-    part = [{"segment_kind": "hour", "segment_key": "9",
-             "clicks": 1000, "leads": 3, "sum_p_pay": 3.0}]
-    other = [{"segment_kind": "hour", "segment_key": "9",
-              "clicks": 1000, "leads": 4, "sum_p_pay": 4.0}]
+    monkeypatch.setenv("YM_TOKEN", "t")
+    monkeypatch.setattr(metrika, "_metrica_get", lambda params, token: {
+        "data": [{"dimensions": [{"name": "09"}], "metrics": [1000.0] + [7.0] * (
+            len(params["metrics"].split(",")) - 1)}]})
 
-    out = sum_profiles([part, other])
+    rows, chosen = metrika.fetch_hourly_profile(
+        1, "2026-01-01", "2026-03-31", list(range(1, 41)))
 
-    assert len(out) == 1
-    assert out[0]["clicks"] == 1000       # не 2000
-    assert out[0]["leads"] == 7           # достижения складываются
-    assert out[0]["sum_p_pay"] == 7.0
+    assert len(rows) == 1
+    assert rows[0]["clicks"] == 1000       # не 3000 на трёх порциях
+    assert chosen["goals_offered"] == 40
 
 
-def test_hours_present_only_in_one_batch_survive():
-    a = [{"segment_kind": "hour", "segment_key": "3", "clicks": 10, "leads": 1, "sum_p_pay": 1.0}]
-    b = [{"segment_kind": "hour", "segment_key": "21", "clicks": 20, "leads": 2, "sum_p_pay": 2.0}]
+def test_goal_from_a_later_batch_can_win(monkeypatch):
+    """Ведущая цель ищется по ВСЕМ порциям, а не внутри первой: иначе набор
+    из сорока целей молча считался бы по девятнадцати."""
+    monkeypatch.setenv("YM_TOKEN", "t")
 
-    assert [r["segment_key"] for r in sum_profiles([a, b])] == ["3", "21"]
+    def _get(params, token):
+        goals = [int(m.split("goal")[1].split("reaches")[0])
+                 for m in params["metrics"].split(",")[1:]]
+        return {"data": [{"dimensions": [{"name": "09"}],
+                          "metrics": [1000.0] + [100.0 if g == 40 else 1.0 for g in goals]}]}
+
+    monkeypatch.setattr(metrika, "_metrica_get", _get)
+
+    _rows, chosen = metrika.fetch_hourly_profile(
+        1, "2026-01-01", "2026-03-31", list(range(1, 41)))
+
+    assert chosen["goal_id"] == 40
+
+
+def test_profile_is_counted_on_advertising_traffic_only(monkeypatch):
+    """Результат накладывается на показы Директа — считать его по всему сайту
+    значит выдавать за ценность часа состав его источников.
+
+    Замер 32579085232: доля рекламы в визитах ночью 0.956-0.984 против
+    0.976-0.983 днём. Примесь мала, но смещена в одну сторону, и соседняя
+    fetch_campaign_behavior фильтр ставила с самого начала.
+    """
+    sent = {}
+    monkeypatch.setenv("YM_TOKEN", "t")
+    monkeypatch.setattr(metrika, "_metrica_get",
+                        lambda params, token: sent.update(params) or {"data": []})
+
+    metrika.fetch_hourly_profile(1, "2026-01-01", "2026-03-31", [317])
+
+    assert sent["filters"] == metrika.AD_FILTER
+    assert "lastTrafficSource" in sent["filters"]
+
+
+def test_profile_carries_the_winning_goal_alone_not_the_sum(monkeypatch):
+    """Сквозная проверка числителя.
+
+    Тесты pick_lead_goal по отдельности зелёные и на сумме тоже: мутация
+    «вернуть сумму всех колонок» их пережила. Здесь смотрим на то, что
+    fetch_hourly_profile реально кладёт в строку часа.
+    """
+    monkeypatch.setenv("YM_TOKEN", "t")
+    monkeypatch.setattr(metrika, "_metrica_get", lambda params, token: {
+        "data": [{"dimensions": [{"name": "09"}], "metrics": [1000.0, 5.0, 40.0]}]})
+
+    rows, chosen = metrika.fetch_hourly_profile(1, "2026-01-01", "2026-03-31", [11, 22])
+
+    assert chosen["goal_id"] == 22
+    # 40 — достижения ведущей цели. 45 означало бы, что дубль сложен с ней.
+    assert rows[0]["sum_p_pay"] == 40.0
+    assert rows[0]["leads"] == 40
+
+
+def test_chosen_goal_is_reported_not_silent(monkeypatch):
+    """«Самая массовая колонка» без имени рядом — тот же приём, каким сюда
+    однажды пролезла микроцель прокрутки. Выбор обязан быть виден в отчёте."""
+    monkeypatch.setenv("YM_TOKEN", "t")
+    monkeypatch.setattr(metrika, "_metrica_get", lambda params, token: {
+        "data": [{"dimensions": [{"name": "09"}], "metrics": [1000.0, 5.0, 40.0]}]})
+
+    _rows, chosen = metrika.fetch_hourly_profile(1, "2026-01-01", "2026-03-31", [11, 22])
+
+    assert chosen["goal_id"] == 22
+    assert chosen["reaches"] == 40
+    assert chosen["goals_offered"] == 2
 
 
 def test_ninety_goals_go_out_in_five_requests(monkeypatch):
@@ -199,9 +314,11 @@ def test_ninety_goals_go_out_in_five_requests(monkeypatch):
         params["metrics"]) or {"data": [{"dimensions": [{"name": "09"}],
                                          "metrics": [100.0, 1.0]}]})
 
-    out = metrika.fetch_hourly_profile(1, "2026-01-01", "2026-03-31", list(range(1, 91)))
+    rows, chosen = metrika.fetch_hourly_profile(
+        1, "2026-01-01", "2026-03-31", list(range(1, 91)))
 
     assert len(sent) == 5
     assert all(len(m.split(",")) <= 20 for m in sent)
-    # Час один, визиты не размножились, достижения сложились по всем порциям.
-    assert len(out) == 1 and out[0]["clicks"] == 100 and out[0]["leads"] == 5
+    # Час один, визиты не размножились, ни одна цель не потеряна по дороге.
+    assert len(rows) == 1 and rows[0]["clicks"] == 100
+    assert chosen["goals_offered"] == 90

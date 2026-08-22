@@ -403,6 +403,7 @@ def main() -> int:
     # поведение по кампаниям — ранний сигнал качества до созревания оплат.
     hourly_rows: List[Dict[str, Any]] = []
     hourly_skipped: List[Dict[str, Any]] = []
+    hourly_numerator: List[Dict[str, Any]] = []
     behavior_rows: List[Dict[str, Any]] = []
     if not skip_direct and os.environ.get("YM_TOKEN"):
         for counter in EDU_COUNTERS:
@@ -413,8 +414,12 @@ def main() -> int:
                 # этого счётчика; пусто — считать нечего, и это не отказ.
                 counter_goals = sorted(lead_goal_ids & set(fetch_counter_goal_ids(counter)))
                 if counter_goals:
-                    hourly_rows += fetch_hourly_profile(counter, cutoff, date_to,
+                    rows, chosen = fetch_hourly_profile(counter, cutoff, date_to,
                                                         counter_goals)
+                    hourly_rows += rows
+                    # Чем именно считали — в отчёт. «Самая массовая колонка»
+                    # без имени рядом уже приводила сюда микроцель прокрутки.
+                    hourly_numerator.append({"counter": counter, **chosen})
                 else:
                     hourly_skipped.append(
                         {"counter": counter, "reason": "целей Директа нет на счётчике"})
@@ -504,6 +509,7 @@ def main() -> int:
         "computed_settings_skipped": computed_skipped,
         "profile_rows": len(profile_rows),
         "metrika_hourly": len(hourly_rows),
+        "metrika_hourly_numerator": hourly_numerator,
         "metrika_hourly_goals": sorted(lead_goal_ids),
         "metrika_hourly_skipped": hourly_skipped,
         "metrika_behavior": len(resolved_behavior),

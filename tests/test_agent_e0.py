@@ -501,9 +501,10 @@ def test_main_merges_hourly_counters_before_computing_schedule(monkeypatch, caps
     # Два счётчика с РАЗНЫМ уровнем конверсии — та самая боевая картина.
     def fake_hourly(counter, *_args, **_kwargs):
         conv = 0.40 if counter == 111 else 0.20
-        return [{"segment_kind": "hour", "segment_key": str(h), "clicks": 1000,
+        rows = [{"segment_kind": "hour", "segment_key": str(h), "clicks": 1000,
                  "leads": int(1000 * conv), "sum_p_pay": 1000 * conv * (0.9 + 0.2 * (h % 2))}
                 for h in range(24)]
+        return rows, {"goal_id": 1, "reaches": int(24 * 1000 * conv), "goals_offered": 2}
 
     # Обе цели Директа заведены на обоих счётчиках — профиль считается по ним.
     monkeypatch.setattr(agent_e0, "fetch_counter_goal_ids", lambda counter: [1, 2])
@@ -586,8 +587,9 @@ def test_hourly_profile_asks_only_for_this_counters_lead_goals(monkeypatch, caps
     # acc-1 оптимизируется на цель 1, acc-2 — на цель 2 (см. _patch_e0_run).
     monkeypatch.setattr(agent_e0, "fetch_counter_goal_ids",
                         lambda counter: [1, 999] if counter == 111 else [2])
-    monkeypatch.setattr(agent_e0, "fetch_hourly_profile",
-                        lambda counter, *a, **k: asked.append((counter, a[-1])) or [])
+    monkeypatch.setattr(
+        agent_e0, "fetch_hourly_profile",
+        lambda counter, *a, **k: (asked.append((counter, a[-1])) or [], {"goal_id": None}))
     monkeypatch.setattr(agent_e0, "compute_schedule", lambda rows: ([], None))
 
     assert agent_e0.main() == 0
@@ -595,6 +597,30 @@ def test_hourly_profile_asks_only_for_this_counters_lead_goals(monkeypatch, caps
 
     # 999 — цель счётчика, но НЕ цель Директа: в запрос не идёт.
     assert asked == [(111, [1]), (222, [2])]
+
+
+def test_report_names_the_goal_the_schedule_was_counted_on(monkeypatch, capsys):
+    """Чем считали расписание — обязано быть видно в отчёте прогона.
+
+    Числитель выбирается как самая массовая цель Директа (metrika.pick_lead_goal),
+    и без имени рядом этот выбор неотличим от подмены: ровно так сюда однажды
+    попала микроцель прокрутки вместо заявки.
+    """
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setenv("YM_TOKEN", "test-token")
+    monkeypatch.setattr(agent_e0, "EDU_COUNTERS", [111])
+    monkeypatch.setattr(agent_e0, "fetch_campaign_behavior", lambda *a, **k: [])
+    monkeypatch.setattr(agent_e0, "fetch_counter_goal_ids", lambda counter: [1, 2])
+    monkeypatch.setattr(
+        agent_e0, "fetch_hourly_profile",
+        lambda *a, **k: ([], {"goal_id": 2, "reaches": 4572, "goals_offered": 2}))
+    monkeypatch.setattr(agent_e0, "compute_schedule", lambda rows: ([], None))
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    assert report["metrika_hourly_numerator"] == [
+        {"counter": 111, "goal_id": 2, "reaches": 4572, "goals_offered": 2}]
 
 
 def test_counter_without_direct_goals_is_reported_not_guessed(monkeypatch, capsys):

@@ -52,7 +52,7 @@ def main() -> int:
             # Профиль считается по целям-лидам; какие из них есть у счётчика —
             # знает только сам счётчик (чужой id Метрика отвергает целиком).
             goals = fetch_counter_goal_ids(counter)
-            rows = fetch_hourly_profile(counter, date_from, date_to, goals)
+            rows, _chosen = fetch_hourly_profile(counter, date_from, date_to, goals)
         except Exception as exc:  # доступ к счётчику мог быть не выдан
             profiles[str(counter)] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
             continue

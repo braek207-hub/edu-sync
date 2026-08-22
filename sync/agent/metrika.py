@@ -24,13 +24,16 @@ visit_seconds), а не готовыми процентами: среднее п
 
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import requests
 
 METRICA_API_URL = "https://api-metrika.yandex.net/stat/v1/data"
 GOALS_API_URL = "https://api-metrika.yandex.net/management/v1/counter/{counter}/goals"
 ATTRIBUTION = "lastsign"
+# Профиль накладывается на показы Директа — считать его надо по рекламному
+# трафику, а не по всему сайту (тот же фильтр у fetch_campaign_behavior).
+AD_FILTER = "ym:s:lastTrafficSource=='ad'"
 ROW_LIMIT = 10_000
 # Метрика берёт не больше 20 метрик на запрос (код 4015). Одну занимают визиты.
 MAX_GOALS_PER_REQUEST = 19
@@ -54,12 +57,21 @@ def _metrica_get(params: Dict[str, Any], token: str) -> Dict[str, Any]:
     raise RuntimeError("Metrica API: max retries")
 
 
-def parse_hourly(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Ответ Метрики → почасовой профиль в формате среза slice_kind='hour'.
+def parse_hourly_by_goal(data: Dict[str, Any],
+                         goal_ids: List[int]) -> Tuple[Dict[str, float],
+                                                       Dict[int, Dict[str, float]]]:
+    """Ответ Метрики → визиты по часам и достижения по часам ОТДЕЛЬНО на цель.
+
+    Колонки metrics идут в том же порядке, в каком их запросили: нулевая —
+    визиты, дальше по одной на цель в порядке hourly_metrics (по возрастанию
+    идентификатора). Разделение по целям обязательно: складывать колонки
+    нельзя, см. pick_lead_goal.
 
     Час извлекается из измерения ym:s:hour (значение вида '13' или '13:00').
     """
-    out: List[Dict[str, Any]] = []
+    ordered = sorted({int(g) for g in goal_ids})
+    visits: Dict[str, float] = {}
+    reaches: Dict[int, Dict[str, float]] = {g: {} for g in ordered}
     for row in data.get("data") or []:
         dims = row.get("dimensions") or []
         metrics = row.get("metrics") or []
@@ -67,16 +79,51 @@ def parse_hourly(data: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         raw_hour = str(dims[0].get("name") or dims[0].get("id") or "").strip()
         hour = raw_hour.split(":")[0].lstrip("0") or "0"
-        visits = float(metrics[0] or 0.0)
-        # Целей в запросе несколько (по одной колонке на цель) — складываем ВСЕ,
-        # а не берём первую: расписание считается по сумме лидов часа.
-        goals = sum(float(m or 0.0) for m in metrics[1:])
+        visits[hour] = float(metrics[0] or 0.0)
+        for i, goal in enumerate(ordered, start=1):
+            reaches[goal][hour] = float(metrics[i] or 0.0) if i < len(metrics) else 0.0
+    return visits, reaches
+
+
+def pick_lead_goal(reaches: Dict[int, Dict[str, float]]) -> Any:
+    """Одна цель-числитель из набора целей Директа. None — достижений нет вовсе.
+
+    Почему НЕ сумма колонок. Цели Директа дублируют друг друга, и это измерено
+    здесь дважды. В отчёте Директа 330070378 и 369313502 дали одинаковые
+    2753/2753 — одно действие под двумя идентификаторами. Проба 32579085232
+    подтвердила то же в Метрике за 90 дней: у счётчика 96526110 «Страница
+    "Спасибо" VseKolledzhi» и «Страницы спасибо» дали ПОБУКВЕННО совпадающие
+    векторы 24 часов (37 252 = 37 252), а рядом «Автоцель: отправил контактные
+    данные» — тот же поступок третьим способом (корреляция 0.9995). У счётчика
+    98627983 к ним добавлена ступенчатая «CRM: Заказ оплачен» — подмножество
+    заявки. Сумма считает одну заявку дважды и подмешивает оплаты.
+
+    Берётся цель с наибольшим числом достижений: заявка всегда объёмнее своей
+    ступени (оплаты), а из дублей выбор безразличен — векторы совпадают.
+    Выбор не молчаливый: вызывающий возвращает его в отчёт прогона, потому что
+    «самая массовая колонка» без имени рядом — это тот же приём, каким сюда
+    однажды пролезла микроцель прокрутки.
+    """
+    totals = {g: sum(hours.values()) for g, hours in reaches.items()}
+    best = max(totals.values()) if totals else 0.0
+    if best <= 0:
+        return None
+    # Порядок по идентификатору — чтобы выбор был воспроизводим на дублях.
+    return min(g for g, t in totals.items() if t == best)
+
+
+def profile_rows(visits: Dict[str, float],
+                 reaches: Dict[str, float]) -> List[Dict[str, Any]]:
+    """Визиты и достижения по часам → строки среза slice_kind='hour'."""
+    out: List[Dict[str, Any]] = []
+    for hour, v in visits.items():
+        goals = float(reaches.get(hour) or 0.0)
         out.append({
             "segment_kind": "hour",
             "segment_key": hour,
             # Для corrections важна конверсионность: визиты играют роль кликов,
             # достижения цели — роль ожидаемых оплат.
-            "clicks": int(visits),
+            "clicks": int(v),
             "leads": int(goals),
             "sum_p_pay": goals,
         })
@@ -150,29 +197,10 @@ def goal_batches(goal_ids: List[int], size: int = MAX_GOALS_PER_REQUEST) -> List
     return [ordered[i:i + size] for i in range(0, len(ordered), size)]
 
 
-def sum_profiles(parts: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    """Профили от нескольких порций целей → один, сложенный по часу.
-
-    Визиты в каждой порции ОДНИ И ТЕ ЖЕ (это метрика часа, а не цели), поэтому
-    складываются только достижения: сложить визиты значило бы раздуть
-    знаменатель во столько раз, сколько было порций.
-    """
-    merged: Dict[str, Dict[str, Any]] = {}
-    for part in parts:
-        for row in part or []:
-            key = str(row.get("segment_key"))
-            slot = merged.get(key)
-            if slot is None:
-                merged[key] = dict(row)
-                continue
-            slot["leads"] += int(row.get("leads") or 0)
-            slot["sum_p_pay"] += float(row.get("sum_p_pay") or 0.0)
-    return sorted(merged.values(), key=lambda r: int(r["segment_key"]))
-
-
 def fetch_hourly_profile(counter_id: int, date_from: str, date_to: str,
-                         goal_ids: List[int]) -> List[Dict[str, Any]]:
-    """Визиты и достижения ЦЕЛЕВЫХ целей по часам суток.
+                         goal_ids: List[int]) -> Tuple[List[Dict[str, Any]],
+                                                       Dict[str, Any]]:
+    """Визиты и достижения ЦЕЛЕВОЙ цели по часам суток + чем именно считали.
 
     goal_ids обязателен и обязан быть непустым. Раньше здесь стояла
     `ym:s:sumGoalReachesAny` — сумма достижений ЛЮБОЙ цели счётчика, и это
@@ -184,6 +212,18 @@ def fetch_hourly_profile(counter_id: int, date_from: str, date_to: str,
     0.41. Расписание, посчитанное по Any, поднимало ставку на 3:00–7:00 (+13,
     +27, +21 %) — то есть на часы, где заявок вдвое меньше.
 
+    ФИЛЬТР РЕКЛАМНОГО ТРАФИКА. Знаменатель и числитель считаются по визитам из
+    рекламы, а не по всему сайту: результат накладывается на показы Директа.
+    Без фильтра час получал бы коэффициент состава источников — доля SEO и
+    прямых заходов ночью выше, потому что реклама в это время откручивается
+    меньше. Замер 32579085232: доля рекламы в визитах ночью 0.956–0.984 против
+    0.976–0.983 днём, то есть примесь мала, но она есть и смещена в одну
+    сторону — ровно как у соседней fetch_campaign_behavior, где фильтр стоял
+    с самого начала.
+
+    Числитель — ОДНА цель (pick_lead_goal), а не сумма колонок: цели Директа
+    дублируют друг друга, и сумма считает одну заявку дважды.
+
     Пересечение с целями счётчика делает вызывающий: цель принадлежит одному
     счётчику, и чужой идентификатор в metrics отвергается Метрикой целиком.
     """
@@ -193,19 +233,35 @@ def fetch_hourly_profile(counter_id: int, date_from: str, date_to: str,
             "Профиль по «любой цели» — это профиль прокрутки, а не лидов."
         )
     token = os.environ["YM_TOKEN"]
-    parts = []
+    visits: Dict[str, float] = {}
+    reaches: Dict[int, Dict[str, float]] = {}
     for batch in goal_batches(goal_ids):
-        parts.append(parse_hourly(_metrica_get({
+        part_visits, part_reaches = parse_hourly_by_goal(_metrica_get({
             "ids": counter_id,
             "metrics": hourly_metrics(batch),
             "dimensions": "ym:s:hour",
+            "filters": AD_FILTER,
             "date1": date_from,
             "date2": date_to,
             "attribution": ATTRIBUTION,
             "limit": ROW_LIMIT,
             "accuracy": "full",
-        }, token)))
-    return sum_profiles(parts)
+        }, token), batch)
+        # Визиты в каждой порции ОДНИ И ТЕ ЖЕ (это метрика часа, а не цели):
+        # сложить их значило бы раздуть знаменатель во столько раз, сколько
+        # было порций.
+        visits.update(part_visits)
+        reaches.update(part_reaches)
+
+    goal_id = pick_lead_goal(reaches)
+    if goal_id is None:
+        return [], {"goal_id": None, "reaches": 0,
+                    "reason": "ни одна цель Директа не достигнута в окне"}
+    return profile_rows(visits, reaches[goal_id]), {
+        "goal_id": goal_id,
+        "reaches": int(sum(reaches[goal_id].values())),
+        "goals_offered": len(reaches),
+    }
 
 
 def merge_hourly(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
