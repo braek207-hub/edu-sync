@@ -34,10 +34,11 @@ import requests
 from sync.db import get_connection
 
 METRICA_COUNTER_ID = "82116769"
-# Автоматическая (кросс-девайс) атрибуция — как в интерфейсе Метрики, чтобы числа
-# дашборда сходились с ним 1в1. Кросс-девайс дозревает задним числом (~2 недели) —
+# «Автоматическая атрибуция» интерфейса = именно automatic (проверено 22.08 живым
+# сравнением: automatic отдаёт заказ 3624 «Переходам по рекламе», cross_device_last_significant
+# оставляет в поиске — интерфейс показывает первое). Дозревает задним числом —
 # ежедневный delete-from+upsert на окно синка переписывает историю сам.
-METRICA_ATTRIBUTION = "cross_device_last_significant"
+METRICA_ATTRIBUTION = "automatic"
 DEFAULT_SYNC_DAYS = 60
 
 DIRECT_CLIENT_LOGIN = "meshnflesh"
