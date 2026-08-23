@@ -419,7 +419,7 @@ def test_live_mark_observation_closed_is_atomic_and_hides_row_from_watch():
     try:
         action_id = writer_db.insert_action(_journal_row(key, account))
         writer_db.mark_action(action_id, "applied", {"SetResults": [{"Id": 7}]})
-        assert any(a["action_id"] == action_id for a in open_actions())
+        assert any(a["action_id"] == action_id for a in writer_db.open_actions())
 
         assert writer_db.mark_observation_closed(action_id, "held") is True
         # Повторный захват — уже чужой: строка закрыта первым прогоном.
@@ -428,7 +428,7 @@ def test_live_mark_observation_closed_is_atomic_and_hides_row_from_watch():
         row = _read_row(key)
         assert row["observation_closed_at"] is not None
         assert row["observation_verdict"] == "held"
-        assert all(a["action_id"] != action_id for a in open_actions())
+        assert all(a["action_id"] != action_id for a in writer_db.open_actions())
     finally:
         _cleanup(key)
 
@@ -466,6 +466,9 @@ def test_live_repeat_of_applied_action_leaves_row_untouched():
 def test_live_stale_planned_finds_only_rows_older_than_threshold():
     # Обрыв ПОСЛЕ отправки: строка осталась planned. Свежая строка того же
     # прогона зависшей не считается — порог отделяет одно от другого.
+    # Читающий дубль stale_planned удалён: и находку, и пометку делает
+    # mark_stale_planned одним UPDATE ... RETURNING — живой тест проверяет
+    # то же условие через него.
     ensure_writer_tables()
     suffix = uuid.uuid4().hex[:8]
     stuck = "test-stuck-" + suffix
@@ -476,12 +479,16 @@ def test_live_stale_planned_finds_only_rows_older_than_threshold():
         writer_db.insert_action(_journal_row(fresh, account, object_id="222"))
         _backdate(stuck, minutes=90)
 
-        found = writer_db.stale_planned(60, account=account)
+        # Фильтр по кабинету: чужой кабинет зависшую строку не забирает.
+        assert writer_db.mark_stale_planned(60, account=account + "-other") == []
+        assert _read_row(stuck)["status"] == "planned"
+
+        found = writer_db.mark_stale_planned(60, account=account)
 
         assert [r["idempotency_key"] for r in found] == [stuck]
         assert found[0]["object_id"] == "111"
-        # Фильтр по кабинету работает: чужие зависшие строки в выборку не лезут.
-        assert writer_db.stale_planned(60, account=account + "-other") == []
+        # Свежая строка того же прогона не тронута порогом.
+        assert _read_row(fresh)["status"] == "planned"
     finally:
         _cleanup(stuck, fresh)
 
