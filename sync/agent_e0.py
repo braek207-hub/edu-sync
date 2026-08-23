@@ -26,6 +26,7 @@ from sync.agent.facts import assemble_facts
 from sync.agent.guard import (
     check_continuity,
     check_freshness,
+    check_funnel_depth,
     check_sum_reconciliation,
     check_volume_anomaly,
     verdict,
@@ -354,6 +355,12 @@ def main() -> int:
     checks.append(check_continuity(
         sorted({str(r["date"]) for r in direct_rows}),
         expected_last=latest_direct or date_to,
+    ))
+    # Глубина воронки: зрелые лиды (60 дней — 95 % оплат когорты уже видно)
+    # при живых сделках обязаны нести оплаты. Ловит обнуление is_paid синком.
+    checks.append(check_funnel_depth(
+        lead_rows,
+        mature_before=(date.today() - timedelta(days=60)).isoformat(),
     ))
     agent_db.insert_guard_checks(checks)
 

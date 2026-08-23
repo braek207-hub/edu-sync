@@ -1,6 +1,7 @@
 from sync.agent.guard import (
     check_continuity,
     check_freshness,
+    check_funnel_depth,
     check_sum_reconciliation,
     check_volume_anomaly,
     verdict,
@@ -80,3 +81,39 @@ def test_verdict_red_if_any_fail():
 def test_verdict_green_when_all_ok():
     checks = [{"check_name": "a", "status": "OK", "detail": {}}]
     assert verdict(checks) == "GREEN"
+
+
+# --------------------------------- funnel_depth (порча is_paid 23.08)
+
+
+def _lead(created, is_deal=False, is_paid=False):
+    return {"created_date": created, "is_deal": is_deal, "is_paid": is_paid}
+
+
+def test_funnel_depth_fails_on_zero_paid_with_live_deals():
+    rows = [_lead("2026-01-10", is_deal=(i % 10 == 0)) for i in range(2000)]
+    check = check_funnel_depth(rows, mature_before="2026-06-01")
+    assert check["status"] == "FAIL"
+    assert check["detail"]["paid"] == 0
+
+
+def test_funnel_depth_ok_when_payments_present():
+    rows = [_lead("2026-01-10", is_deal=True) for _ in range(1500)]
+    rows[0]["is_paid"] = True
+    check = check_funnel_depth(rows, mature_before="2026-06-01")
+    assert check["status"] == "OK"
+
+
+def test_funnel_depth_silent_on_small_or_dealless_volume():
+    few = [_lead("2026-01-10", is_deal=True) for _ in range(10)]
+    assert check_funnel_depth(few, mature_before="2026-06-01")["status"] == "OK"
+    no_deals = [_lead("2026-01-10") for _ in range(2000)]
+    assert check_funnel_depth(no_deals, mature_before="2026-06-01")["status"] == "OK"
+
+
+def test_funnel_depth_ignores_immature_leads():
+    # Свежие лиды без оплат — норма дозревания, не дыра в данных.
+    rows = [_lead("2026-07-20", is_deal=True) for _ in range(2000)]
+    check = check_funnel_depth(rows, mature_before="2026-06-01")
+    assert check["status"] == "OK"
+    assert check["detail"]["mature_leads"] == 0

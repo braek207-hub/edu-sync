@@ -100,6 +100,35 @@ def check_continuity(dates: List[str], expected_last: str) -> Dict[str, Any]:
     }
 
 
+def check_funnel_depth(
+    lead_rows: List[Dict[str, Any]], mature_before: str, min_leads: int = 1000
+) -> Dict[str, Any]:
+    """Глубокие ступени воронки не должны исчезать при живой верхней.
+
+    Порча 23.08: транзиентный 503 листа «Оплаты» обнулил is_paid всех лидов
+    2026 года, и гейт этого не видел — свежесть, объём и непрерывность были в
+    порядке, а агент полгода считал лестницу без ступени оплат. Проверка:
+    среди ЗРЕЛЫХ лидов (created_date < mature_before, чтобы дозревание оплат
+    не давало ложных срабатываний) при живых сделках обязана быть хоть одна
+    оплата. Ноль оплат на тысячах зрелых лидов со сделками — не «низкая
+    конверсия», а дыра в данных.
+    """
+    mature = [r for r in lead_rows if str(r.get("created_date"))[:10] < mature_before]
+    leads = len(mature)
+    deals = sum(1 for r in mature if r.get("is_deal"))
+    paid = sum(1 for r in mature if r.get("is_paid"))
+    if leads < min_leads or deals == 0:
+        return {"check_name": "funnel_depth", "status": "OK",
+                "detail": {"reason": "зрелого объёма мало для суждения",
+                           "mature_leads": leads, "deals": deals}}
+    return {
+        "check_name": "funnel_depth",
+        "status": "OK" if paid > 0 else "FAIL",
+        "detail": {"mature_before": mature_before, "mature_leads": leads,
+                   "deals": deals, "paid": paid},
+    }
+
+
 def verdict(checks: List[Dict[str, Any]]) -> str:
     """GREEN только если все проверки прошли."""
     return "RED" if any(c["status"] == "FAIL" for c in checks) else "GREEN"
