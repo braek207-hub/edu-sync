@@ -52,10 +52,16 @@ def _no_lock(lease=None):
     return _cm
 
 
-def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=None):
+def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=None,
+                 campaign_computed=None):
     """Общая подмена того, что прогон спрашивает у журнала помимо действий:
     аренда на прогон, история вредных сегментов, исчерпавшие попытки
-    сегменты, уже закрытые ключи."""
+    сегменты, уже закрытые ключи. campaign_computed — покампанийные строки
+    Э2.2 ({campaign_id: rows}); по умолчанию их нет, кабинетный уровень."""
+    monkeypatch.setattr(
+        agent_e1.agent_db, "load_latest_campaign_computed",
+        lambda ids: {str(k): list(v) for k, v in (campaign_computed or {}).items()
+                     if str(k) in {str(i) for i in ids}})
     monkeypatch.setattr(agent_e1.writer_db, "run_lock", _no_lock(lease))
     monkeypatch.setattr(agent_e1.writer_db, "harmful_segments",
                         lambda *a, **k: dict(cooled or {}))
@@ -387,6 +393,112 @@ def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatc
     item = sent[0][2]["BidModifiers"][0]
     assert item["DesktopAdjustment"]["BidModifier"] == 130   # дельта +30 → 100-база
     assert "MobileAdjustment" not in item
+
+
+# --------------------------------- Э2.2: личный план кампании поверх кабинетного
+
+
+def _patch_single_account(monkeypatch, computed, campaign_computed=None):
+    """Один кабинет acc-1 с кампанией 111 без текущих корректировок."""
+    _RecordingWriteClient.instances = []
+    monkeypatch.setattr(agent_e1, "_clients", lambda: [{"login": "acc-1"}])
+    monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables", lambda: None)
+    monkeypatch.setattr(agent_e1.agent_db, "load_latest_computed_settings",
+                        lambda *_: list(computed))
+    monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", lambda: [])
+    monkeypatch.setattr(agent_e1.agent_db, "load_daily_cost_by_campaign",
+                        lambda *_: {"111": 500.0})
+    monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpa", lambda *_: {"111": 1000.0})
+    monkeypatch.setattr(agent_e1.agent_db, "crm_maturity_date",
+                        lambda: date.today() - timedelta(days=3))
+    monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
+    monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
+    monkeypatch.setattr(agent_e1.writer_db, "charged_objects_this_week", lambda *_: set())
+    monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
+    monkeypatch.setattr(agent_e1.writer_db, "insert_action", lambda action: 1)
+    monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: True)
+    monkeypatch.setattr(agent_e1.writer_db, "mark_unknown_outcome", lambda *a, **k: True)
+    monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: [])
+    monkeypatch.setattr(agent_e1, "WriteClient", _RecordingWriteClient)
+    _patch_infra(monkeypatch, campaign_computed=campaign_computed)
+
+
+def test_campaign_with_own_values_gets_its_plan_not_the_accounts(monkeypatch, capsys):
+    # Кабинет держит DESKTOP +30, личный расчёт кампании 111 говорит −20
+    # (Э2.2: дельты до 76 п.п. с переворотом знака). Применяться обязан
+    # личный план, и отчёт обязан показать, что применялся именно он.
+    _patch_single_account(
+        monkeypatch,
+        computed=[_setting("bid_modifier:device", "DESKTOP", 30.0)],
+        campaign_computed={"111": [_setting("bid_modifier:device", "DESKTOP", -20.0)]},
+    )
+
+    assert agent_e1.main() == 0
+    report = json.loads(capsys.readouterr().out)
+
+    sent = _RecordingWriteClient.instances[0].sent
+    assert len(sent) == 1
+    item = sent[0][2]["BidModifiers"][0]
+    assert item["DesktopAdjustment"]["BidModifier"] == 80    # −20 → 100-база
+    assert report["campaign_level"] == {
+        "campaigns_with_own_values": 1, "fallback_account": 0, "stale_dropped": 0}
+
+
+def test_campaign_without_own_values_falls_back_to_account(monkeypatch, capsys):
+    _patch_single_account(
+        monkeypatch,
+        computed=[_setting("bid_modifier:device", "DESKTOP", 30.0)],
+        campaign_computed=None,
+    )
+
+    assert agent_e1.main() == 0
+    report = json.loads(capsys.readouterr().out)
+
+    item = _RecordingWriteClient.instances[0].sent[0][2]["BidModifiers"][0]
+    assert item["DesktopAdjustment"]["BidModifier"] == 130
+    assert report["campaign_level"] == {
+        "campaigns_with_own_values": 0, "fallback_account": 1, "stale_dropped": 0}
+
+
+def test_stale_campaign_rows_do_not_apply_and_are_counted(monkeypatch, capsys):
+    # Личные строки старше MAX_COMPUTED_AGE_DAYS не применяются — та же
+    # рельса свежести, что у кабинетных, — и отказ виден счётчиком, а не
+    # тихим откатом на кабинетный план.
+    old = (date.today() - timedelta(days=agent_e1.MAX_COMPUTED_AGE_DAYS + 1)).isoformat()
+    _patch_single_account(
+        monkeypatch,
+        computed=[_setting("bid_modifier:device", "DESKTOP", 30.0)],
+        campaign_computed={"111": [_setting("bid_modifier:device", "DESKTOP", -20.0,
+                                            calc_date=old)]},
+    )
+
+    assert agent_e1.main() == 0
+    report = json.loads(capsys.readouterr().out)
+
+    item = _RecordingWriteClient.instances[0].sent[0][2]["BidModifiers"][0]
+    assert item["DesktopAdjustment"]["BidModifier"] == 130   # кабинетный план
+    assert report["campaign_level"]["stale_dropped"] == 1
+    assert report["campaign_level"]["campaigns_with_own_values"] == 0
+
+
+def test_campaign_rows_alone_are_enough_without_account_plan(monkeypatch, capsys):
+    # У кабинета корректировок нет вовсе (например, срез выродился), а личный
+    # расчёт кампании есть. Прежний ранний выход «нет кабинетных настроек»
+    # молча прятал бы личные значения — теперь они применяются.
+    _patch_single_account(
+        monkeypatch,
+        computed=[],
+        campaign_computed={"111": [_setting("bid_modifier:device", "MOBILE", 25.0)]},
+    )
+
+    assert agent_e1.main() == 0
+    report = json.loads(capsys.readouterr().out)
+
+    item = _RecordingWriteClient.instances[0].sent[0][2]["BidModifiers"][0]
+    assert item["MobileAdjustment"]["BidModifier"] == 125
+    # Полный отчёт кампании, а не ранний выход NO_COMPUTED_SETTINGS.
+    assert report.get("verdict") is None
+    assert report["campaign_level"]["campaigns_with_own_values"] == 1
 
 
 # =========================================================================

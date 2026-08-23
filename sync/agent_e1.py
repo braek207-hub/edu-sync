@@ -873,10 +873,10 @@ def run_account(
                                                                    "unsupported": []}
     desired = plan["desired"]
     # Значимые настройки, которые агент применить не умеет (нечисловой ключ
-    # региона, устройство вне DESKTOP/MOBILE/TABLET). Они не подставляются в
-    # чужой тип корректировки и не роняют применение — но и не пропадают
+    # региона, устройство вне DESKTOP/MOBILE/TABLET), собираются с ОБОИХ
+    # уровней ниже, когда прочитаны покампанийные строки. Они не подставляются
+    # в чужой тип корректировки и не роняют применение — но и не пропадают
     # молча: причина видна в отчёте прогона.
-    unsupported = _unsupported_report(plan["unsupported"])
 
     # Расписание считается ДО раннего выхода. Стой этот расчёт ниже, кабинет
     # без значимых корректировок возвращал бы «нечего делать» и молча уносил
@@ -889,10 +889,48 @@ def run_account(
     schedule_hours = plan_schedule(computed) if not stale_computed else []
     desired_items = schedule_items(schedule_hours) if schedule_hours else []
 
-    if not desired and not desired_items:
+    # Рулинг 1: кампании только этого кабинета, не всего справочника расходов.
+    # Здесь же применяется ограничитель прогона (CampaignScope): дальше по
+    # течению про него никто не знает. Список читается ДО раннего выхода:
+    # покампанийные строки (Э2.2) лежат под object_id=кампания, и без списка
+    # кампаний кабинета их существование в принципе не проверить — ранний
+    # выход «у кабинета нет корректировок» молча прятал бы личные значения.
+    scope = ctx["campaign_scope"]
+    campaign_ids = own_campaign_ids(client, daily_cost, scope)
+
+    # Э2.2: личные значения кампаний. Приоритет — «кампания, если есть, иначе
+    # кабинет», по каждому виду настройки целиком: у кампании с личным набором
+    # кабинетные строки корректировок не применяются вовсе (набор считался тем
+    # же расчётом и уже содержит всё, что кампания заслуживает; смешение двух
+    # уровней дало бы кабинетный сегмент поверх личного). Свежесть личных
+    # строк проверяется той же рельсой, что у кабинетных: устаревший личный
+    # набор не «падает обратно» на свежий кабинетный молча — обе даты из
+    # одного прогона Э0, а разъехались они только если Э0 упал посередине,
+    # и тогда честнее применить кабинетный уровень с явным счётчиком отказов.
+    campaign_computed = agent_db.load_latest_campaign_computed(campaign_ids)
+    campaign_desired: Dict[str, List[Dict[str, Any]]] = {}
+    campaign_unsupported_rows: List[Dict[str, Any]] = []
+    campaign_stale_dropped = 0
+    for cid, rows in campaign_computed.items():
+        if computed_freshness_refusal(rows, date.fromisoformat(today)):
+            campaign_stale_dropped += 1
+            continue
+        camp_plan = plan_bid_modifiers(rows)
+        campaign_unsupported_rows += camp_plan["unsupported"]
+        if camp_plan["desired"]:
+            campaign_desired[str(cid)] = camp_plan["desired"]
+    unsupported = _unsupported_report(
+        plan["unsupported"] + campaign_unsupported_rows)
+    campaign_level_report = {
+        "campaigns_with_own_values": len(campaign_desired),
+        "fallback_account": len(campaign_ids) - len(campaign_desired),
+        "stale_dropped": campaign_stale_dropped,
+    }
+
+    if not desired and not desired_items and not campaign_desired:
         if stale_computed:
             verdict, reason = "STALE_COMPUTED_SETTINGS", stale_computed
-        elif not computed:
+        elif not computed and not campaign_computed:
             verdict, reason = "NO_COMPUTED_SETTINGS", NO_COMPUTED_REASON.format(login=login)
         else:
             verdict, reason = "NOTHING_TO_DO", "нет значимых корректировок"
@@ -908,19 +946,14 @@ def run_account(
             # выглядели бы одинаково.
             "schedule": _schedule_report(schedule_hours, desired_items, {}, []),
             "unsupported": unsupported,
+            "campaign_level": campaign_level_report,
             # Ни одной кампании не тронуто — и это сказано явно тем же полем,
             # что и в полном отчёте, а не отсутствием поля.
-            "campaign_scope": ctx["campaign_scope"].report(),
+            "campaign_scope": scope.report(),
             "campaigns_touched": 0,
             "stale_planned": _stale_report(mark_stale_rows(login, journal_ok),
                                            journal_ok),
         }
-
-    # Рулинг 1: кампании только этого кабинета, не всего справочника расходов.
-    # Здесь же применяется ограничитель прогона (CampaignScope): дальше по
-    # течению про него никто не знает.
-    scope = ctx["campaign_scope"]
-    campaign_ids = own_campaign_ids(client, daily_cost, scope)
 
     planned: List[Dict[str, Any]] = []
     blocked: List[Dict[str, Any]] = []
@@ -941,7 +974,11 @@ def run_account(
             lease.guard()
         actual = _actual_modifiers(client, campaign_id)
         unusable_actual += sum(1 for a in actual if a.get("unusable"))
-        campaign_actions = list(diff_modifiers(desired, actual, campaign_id))
+        # Личный план кампании, если есть, иначе кабинетный (Э2.2).
+        own_desired = campaign_desired.get(str(campaign_id))
+        campaign_actions = list(
+            diff_modifiers(own_desired if own_desired else desired,
+                           actual, campaign_id))
         if desired_items:
             campaign_actions += diff_schedule(
                 desired_items, targeting_by_campaign.get(str(campaign_id)) or {},
@@ -1039,6 +1076,8 @@ def run_account(
         "schedule": _schedule_report(schedule_hours, desired_items,
                                      targeting_by_campaign, campaign_ids),
         "desired": len(desired),
+        # Э2.2: скольким кампаниям применялся личный план, а не кабинетный.
+        "campaign_level": campaign_level_report,
         "unsupported": unsupported,
         # Записи факта без коэффициента: по ним не строится ни одно действие,
         # и это состояние обязано быть видно, а не выглядеть как «в кабинете

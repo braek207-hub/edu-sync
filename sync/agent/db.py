@@ -403,6 +403,42 @@ def load_latest_computed_settings(
     )
 
 
+def load_latest_campaign_computed(
+    campaign_ids: List[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Последний покампанийный расчёт (Э2.2) для НАЗВАННЫХ кампаний.
+
+    {campaign_id: строки} — кампании без строк в ответе отсутствуют, и это
+    штатный сигнал «личных значений нет, применяется кабинетный уровень».
+    MAX(calc_date) считается внутри каждой кампании по той же причине, что и
+    в load_latest_computed_settings: отставший объект не должен прятать или
+    подменять расчёт остальных. Возраст строк проверяет вызывающий
+    (agent_e1.computed_freshness_refusal) — «последний» не значит «свежий».
+    """
+    ids = sorted({str(c) for c in campaign_ids})
+    if not ids:
+        return {}
+    rows = _fetch_dicts(
+        """
+        SELECT s.object_id, s.calc_date, s.setting_kind, s.setting_key,
+               s.value, s.support_n, s.raw_value
+        FROM edu_agent_computed_settings s
+        JOIN (
+            SELECT object_id, MAX(calc_date) AS calc_date
+            FROM edu_agent_computed_settings
+            WHERE object_level = 'campaign' AND object_id = ANY(%s)
+            GROUP BY object_id
+        ) latest USING (object_id, calc_date)
+        WHERE s.object_level = 'campaign'
+        """,
+        (ids,),
+    )
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        out.setdefault(str(r.pop("object_id")), []).append(r)
+    return out
+
+
 def load_holdout_ids() -> List[str]:
     rows = _fetch_dicts(
         "SELECT campaign_id FROM edu_agent_holdout WHERE excluded_at IS NULL"
