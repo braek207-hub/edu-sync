@@ -9,10 +9,10 @@ is_paid. При этом probe_economics (540 дней до 20.07) оплаты 
 """
 
 import json
-import os
 
-import psycopg2
 import psycopg2.extras
+
+from sync.db import get_connection
 
 
 def q(cur, sql, params=()):
@@ -21,7 +21,11 @@ def q(cur, sql, params=()):
 
 
 def main() -> int:
-    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    with get_connection() as conn:
+        return _report(conn)
+
+
+def _report(conn) -> int:
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     monthly = q(cur, """
