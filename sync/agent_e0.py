@@ -42,6 +42,8 @@ from sync.agent.hierarchy import hierarchical_modifiers
 from sync.agent.ladder import ladder_report
 from sync.agent.history import budget_response
 from sync.agent.mining import mine_quasi_experiments
+from sync.agent.saturation import computed_rows as saturation_computed_rows
+from sync.agent.saturation import saturation_curves
 from sync.agent.objects import (
     build_object_rows,
     minus_word_candidates,
@@ -386,6 +388,19 @@ def main() -> int:
     agent_db.upsert_experiments(quasi)
     history = budget_response(
         quasi, {str(f["campaign_id"]): f.get("direction") for f in facts})
+
+    # Э3.1: кривые насыщения — эластичность из квазиэкспериментов плюс пары
+    # соседних недель (оба DiD — сезон вычтен), из неё β и предельная цена
+    # эфф. лида на текущем объёме. Граница зрелости — CRM: эффективные лиды
+    # свежих дней ещё едут, и хвостовые недели занизили бы лиды всем окнам.
+    saturation = saturation_curves(
+        facts, quasi, direction_by_campaign, latest_lead or date_to)
+    saturation_count = 0
+    for campaign_id, rows in saturation_computed_rows(saturation).items():
+        agent_db.upsert_computed_settings(
+            rows, calc_date=today_iso, object_id=campaign_id,
+            object_level="campaign")
+        saturation_count += len(rows)
 
     slice_from = (date.today() - timedelta(days=SLICE_WINDOW_DAYS)).isoformat()
     queries_from = (date.today() - timedelta(days=QUERY_WINDOW_DAYS)).isoformat()
@@ -767,6 +782,23 @@ def main() -> int:
                 )[:10] if row["verdict"] != "неопределённо"
             },
         },
+        # Э3.1: кривые насыщения. Покампанийный разрез целиком не влезает —
+        # печатаются направления и края шкалы предельной цены: самые дорогие
+        # предельные лиды — кандидаты на срезание, самые дешёвые — на долив.
+        "saturation": {
+            **{k: v for k, v in saturation.items() if k != "campaigns"},
+            "most_expensive_marginal": {
+                cid: row for cid, row in sorted(
+                    saturation["campaigns"].items(),
+                    key=lambda kv: -kv[1]["marginal_cpl"])[:5]
+            },
+            "cheapest_marginal": {
+                cid: row for cid, row in sorted(
+                    saturation["campaigns"].items(),
+                    key=lambda kv: kv[1]["marginal_cpl"])[:5]
+            },
+        },
+        "saturation_rows": saturation_count,
         "computed_settings": computed_count,
         "computed_settings_by_account": {k: len(v) for k, v in computed_by_account.items()},
         "computed_settings_skipped": computed_skipped,
