@@ -1,0 +1,17 @@
+name: probe-lime-camp-params
+on:
+  workflow_dispatch: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Probe LIME campaign params
+        env:
+          DIRECT_TOKEN: ${{ secrets.LIME_DIRECT_TOKEN }}
+          DIRECT_CLIENT_LOGIN: ${{ secrets.LIME_DIRECT_CLIENT_LOGIN }}
+        run: python probe_lime_camp_params.py
