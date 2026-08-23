@@ -4,6 +4,7 @@
 from sync.agent.portfolio import (
     MAX_STEP_DOWN,
     MAX_STEP_UP,
+    SWITCH_OFF_ROI_SHARE,
     computed_rows,
     portfolio_targets,
     solve_threshold,
@@ -159,3 +160,58 @@ def test_computed_rows_carry_both_sides_of_transfer():
     assert row["value"] == section["accounts"]["acc"]["moves"]["1"]["target_28d"]
     assert row["raw_value"] == 100000.0
     assert row["support_n"] == 100
+
+
+# --------------------------------- кандидаты на выключение (Э3.4)
+
+
+def _extreme_inputs():
+    # «poor» упирается в пол капа, и даже на полу её предельная окупаемость
+    # ничтожна против λ кабинета. «mid» — интерьерная (без капа): она и
+    # закрепляет λ; на двух кампаниях, упёршихся в противоположные капы,
+    # порог вырождается и сравнивать долю не с чем.
+    saturation = {"rich": _curve(), "mid": _curve(), "poor": _curve()}
+    ladder = {"rich": _ladder(revenue=500000.0 * 100),
+              "mid": _ladder(revenue=5000.0 * 100),
+              "poor": _ladder(revenue=50.0 * 100)}
+    return saturation, ladder
+
+
+def test_hopeless_campaign_marked_switch_off():
+    saturation, ladder = _extreme_inputs()
+    section = portfolio_targets(saturation, ladder,
+                                {"rich": "acc", "mid": "acc", "poor": "acc"})
+    account = section["accounts"]["acc"]
+    poor = account["moves"]["poor"]
+    assert abs(poor["ratio"] - MAX_STEP_DOWN) < 0.01
+    switch = poor["switch_off"]
+    assert switch["roi_share_of_lambda"] < SWITCH_OFF_ROI_SHARE
+    assert switch["roi_at_floor"] > 0
+    assert account["switch_off_candidates"] == 1
+    # Здоровой кампании пометки нет — ключ отсутствует, а не лежит с None.
+    assert "switch_off" not in account["moves"]["rich"]
+
+
+def test_campaign_above_floor_or_share_is_not_candidate():
+    # Обе кампании близки по ценности: пола капа никто не достигает.
+    saturation, ladder = _inputs()
+    section = portfolio_targets(saturation, ladder, {"1": "acc", "2": "acc"})
+    account = section["accounts"]["acc"]
+    assert account["switch_off_candidates"] == 0
+    assert all("switch_off" not in m for m in account["moves"].values())
+
+
+def test_computed_rows_add_campaign_switch_for_candidate():
+    saturation, ladder = _extreme_inputs()
+    section = portfolio_targets(saturation, ladder,
+                                {"rich": "acc", "mid": "acc", "poor": "acc"})
+    rows = computed_rows(section)
+    kinds_poor = [r["setting_kind"] for r in rows["poor"]]
+    assert kinds_poor == ["budget_target", "campaign_switch"]
+    switch_row = rows["poor"][1]
+    move = section["accounts"]["acc"]["moves"]["poor"]
+    assert switch_row["setting_key"] == "suspend"
+    assert switch_row["value"] == move["switch_off"]["roi_share_of_lambda"]
+    assert switch_row["raw_value"] == move["switch_off"]["roi_at_floor"]
+    assert switch_row["rel_error"] == move["rel_error"]
+    assert [r["setting_kind"] for r in rows["rich"]] == ["budget_target"]

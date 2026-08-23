@@ -38,6 +38,14 @@ MAX_STEP_UP = 1.5
 MAX_STEP_DOWN = 0.5
 _BISECT_ITERATIONS = 80
 
+# Насколько предельная окупаемость на полу капа должна не дотягивать до λ,
+# чтобы кампания стала кандидатом на выключение (Э3.4). Без запаса кандидатом
+# была бы любая кампания, чей целевой бюджет упёрся в кап вниз, — а это
+# штатная ситуация переноса, за такт-другой она рассасывается. Кандидат —
+# кампания, которой не помогает даже урезание вдвое: предельная окупаемость
+# на полу всё ещё ниже λ с запасом.
+SWITCH_OFF_ROI_SHARE = 0.75
+
 
 def value_per_lead(ladder_row: Dict[str, Any]) -> Optional[Dict[str, float]]:
     """Ожидаемая выручка на эффективный лид кампании из строки лестницы.
@@ -97,7 +105,38 @@ def solve_threshold(
     return lam, {c["campaign_id"]: _target_spend(c, lam) for c in campaigns}
 
 
-def _move_row(campaign: Dict[str, Any], target: float) -> Dict[str, Any]:
+def _switch_off_candidate(
+    campaign: Dict[str, Any], ratio: float, lam: float, rel: float,
+) -> Optional[Dict[str, Any]]:
+    """Кандидат на выключение (Э3.4), или None.
+
+    Кандидат — кампания, которой не помогает даже кап вниз: целевой бюджет
+    на полу, а предельная окупаемость НА ПОЛУ (вдоль кривой:
+    m(S) = m₀·(S/S₀)^(1−β), при β<1 урезание её улучшает) всё ещё ниже λ
+    с запасом SWITCH_OFF_ROI_SHARE. Вердикт — классом campaign_state
+    (0.97: остановка теряет обучение стратегии, эффект не отматывается);
+    гейт уверенности применяет писатель, здесь кандидат только размечается.
+    """
+    if ratio > MAX_STEP_DOWN + 1e-9:
+        return None
+    beta = campaign["beta"]
+    marginal_at_floor = (campaign["marginal_cpl"]
+                         * MAX_STEP_DOWN ** (1.0 - beta) if beta < 1.0
+                         else campaign["marginal_cpl"])
+    roi_at_floor = campaign["value"] / marginal_at_floor
+    roi_share = roi_at_floor / lam
+    if roi_share >= SWITCH_OFF_ROI_SHARE:
+        return None
+    verdict = assess(roi_share, rel, "campaign_state")
+    return {
+        "roi_at_floor": round(roi_at_floor, 4),
+        "roi_share_of_lambda": round(roi_share, 4),
+        "p_sign": verdict["p_sign"],
+        "confident": verdict["confident"] is True,
+    }
+
+
+def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, Any]:
     """Строка рекомендации: дельта, ожидаемый эффект, вердикт сдвига.
 
     Ожидаемые лиды — вдоль кривой: leads·((S*/S₀)^β − 1); выручка — через
@@ -114,7 +153,9 @@ def _move_row(campaign: Dict[str, Any], target: float) -> Dict[str, Any]:
         move = "hold"
     else:
         move = "up" if ratio > 1.0 else "down"
+    switch_off = _switch_off_candidate(campaign, ratio, lam, rel)
     return {
+        **({"switch_off": switch_off} if switch_off else {}),
         "direction": campaign["direction"],
         "leads_28d": campaign["leads"],
         "cost_28d": round(cost, 2),
@@ -174,10 +215,11 @@ def portfolio_targets(
         if budget <= 0:
             continue
         lam, targets = solve_threshold(campaigns, budget)
-        moves = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]])
+        moves = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam)
                  for c in campaigns}
         target_sum = sum(targets.values())
         confident = [m for m in moves.values() if m["confident"] and m["move"] != "hold"]
+        switch_off = [m for m in moves.values() if m.get("switch_off")]
         accounts[login] = {
             "lambda": round(lam, 4),
             "budget_28d": round(budget, 2),
@@ -189,6 +231,7 @@ def portfolio_targets(
             "moves_up": sum(1 for m in moves.values() if m["move"] == "up"),
             "moves_down": sum(1 for m in moves.values() if m["move"] == "down"),
             "moves_confident": len(confident),
+            "switch_off_candidates": len(switch_off),
             "expected_leads_delta": round(
                 sum(m["expected_leads_delta"] for m in moves.values()), 1),
             "expected_revenue_delta": round(
@@ -211,7 +254,7 @@ def computed_rows(section: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
     for account in section.get("accounts", {}).values():
         for campaign_id, m in account["moves"].items():
-            out[campaign_id] = [{
+            rows = [{
                 "setting_kind": "budget_target",
                 "setting_key": "target_28d",
                 "value": m["target_28d"],
@@ -219,4 +262,18 @@ def computed_rows(section: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
                 "support_n": m["leads_28d"],
                 "rel_error": m["rel_error"],
             }]
+            switch = m.get("switch_off")
+            if switch:
+                # value — доля предельной окупаемости на полу от λ (<0.75 по
+                # построению), raw_value — сама окупаемость. Писатель Э3.4
+                # пересчитает вердикт классом campaign_state из этих же чисел.
+                rows.append({
+                    "setting_kind": "campaign_switch",
+                    "setting_key": "suspend",
+                    "value": switch["roi_share_of_lambda"],
+                    "raw_value": switch["roi_at_floor"],
+                    "support_n": m["leads_28d"],
+                    "rel_error": m["rel_error"],
+                })
+            out[campaign_id] = rows
     return out

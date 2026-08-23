@@ -170,6 +170,18 @@ def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[st
             "Campaigns": [{"Id": int(campaign_id), "DailyBudget": previous_daily}]
         }
 
+    if kind == "campaign.suspend":
+        # Отмена паузы — resume, не update: состоянием показов Директ
+        # управляет отдельными методами. previous_state.State обязан быть ON —
+        # выключение строится только из него (guardrails._check_suspend), и
+        # возврат в любое другое состояние resume выразить не может.
+        campaign_id = (action.get("payload") or {}).get("CampaignId") or action.get("object_id")
+        if str(previous.get("State")) != "ON" or campaign_id is None:
+            return None
+        return "campaigns", "resume", {
+            "SelectionCriteria": {"Ids": [int(campaign_id)]}
+        }
+
     if kind == "schedule.set":
         # Возвращается ВЕСЬ прежний блок TimeTargeting, а не только часы:
         # вместе с расписанием в нём живут праздничный режим и учёт рабочих

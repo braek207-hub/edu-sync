@@ -54,6 +54,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent import db as agent_db
 from sync.agent.writer import budget
+from sync.agent.writer import switch
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import apply_actions
 from sync.agent.writer.client import WriteClient, journal_writes_allowed
@@ -545,6 +546,8 @@ def action_label(action: Dict[str, Any]) -> str:
         unit = "нед" if kind_full == "budget.set" else "день"
         return (f"{action.get('direct_type')}:{action.get('key')} "
                 f"→ {int(micros) // 1_000_000} ₽/{unit}")
+    if kind_full == "campaign.suspend":
+        return f"{action.get('direct_type')}:{action.get('key')} → пауза"
     percent = int(payload.get("BidModifier") or 0)
     kind = kind_full.split(".")[-1]
     return f"{action.get('direct_type')}:{action.get('key')} {percent:+d}% ({kind})"
@@ -597,6 +600,49 @@ def _budget_report(
         "low_confidence_sample": budget_plan["low_confidence"][:limit],
         "confidence_unknown": budget_plan["confidence_unknown"],
         "actions_planned": planned_count,
+    }
+    if refused is not None:
+        by_reason: Dict[str, int] = {}
+        for row in refused:
+            by_reason[row["reason"]] = by_reason.get(row["reason"], 0) + 1
+        out["refused"] = {"count": len(refused), "by_reason": by_reason,
+                          "sample": refused[:limit]}
+    if not_found:
+        out["not_in_cabinet"] = not_found[:limit]
+        out["not_in_cabinet_count"] = len(not_found)
+    return out
+
+
+def _switch_report(
+    switch_plan: Dict[str, Any], desired: Dict[str, Any],
+    refused: Optional[List[Dict[str, Any]]] = None,
+    planned_count: int = 0, not_found: Optional[List[str]] = None,
+    deferred_over_cap: int = 0,
+    limit: int = PREVIEW_SAMPLE_LIMIT,
+) -> Dict[str, Any]:
+    """Что прогон решил про выключения кампаний (Э3.4).
+
+    Кандидаты с их экономикой перечислены поимённо, а не счётчиком: их
+    единицы (потолок — одно применение за прогон), и решение «остановить
+    кампанию» человек обязан видеть с числами, по которым оно принято.
+    """
+    out = {
+        "desired": len(desired),
+        "candidates": [
+            {"campaign_id": cid,
+             "roi_share_of_lambda": round(m["roi_share"], 3),
+             "roi_at_floor": round(m["roi_at_floor"], 3),
+             "p_sign": m["p_sign"]}
+            for cid, m in sorted(desired.items(),
+                                 key=lambda kv: kv[1]["roi_share"])
+        ][:limit],
+        "low_confidence": len(switch_plan["low_confidence"]),
+        "low_confidence_sample": switch_plan["low_confidence"][:limit],
+        "confidence_unknown": switch_plan["confidence_unknown"],
+        "actions_planned": planned_count,
+        # Потолок выключений: сверх него — не отказ, ждёт следующего расчёта.
+        "deferred_over_cap": deferred_over_cap,
+        "max_per_run": switch.MAX_SUSPENDS_PER_RUN,
     }
     if refused is not None:
         by_reason: Dict[str, int] = {}
@@ -999,7 +1045,14 @@ def run_account(
     budget_desired = {cid: m for cid, m in budget_plan["desired"].items()
                       if cid in scoped_ids}
 
-    if not desired and not desired_items and not campaign_desired and not budget_desired:
+    # Э3.4: кандидаты на выключение — тем же правилом, что бюджет: план ДО
+    # раннего выхода, ограничитель прогона уже в scoped_ids.
+    switch_plan = switch.plan_switch_offs(fresh_campaign_computed)
+    switch_desired = {cid: m for cid, m in switch_plan["desired"].items()
+                      if cid in scoped_ids}
+
+    if (not desired and not desired_items and not campaign_desired
+            and not budget_desired and not switch_desired):
         if stale_computed:
             verdict, reason = "STALE_COMPUTED_SETTINGS", stale_computed
         elif not computed and not campaign_computed:
@@ -1018,6 +1071,7 @@ def run_account(
             # выглядели бы одинаково.
             "schedule": _schedule_report(schedule_hours, desired_items, {}, []),
             "budget": _budget_report(budget_plan, budget_desired),
+            "switch": _switch_report(switch_plan, switch_desired),
             "unsupported": unsupported,
             "campaign_level": campaign_level_report,
             "confidence": confidence_report,
@@ -1084,6 +1138,24 @@ def run_account(
             blocked.append({**action, "blocked_reason": reason})
             continue
         budget_planned_count += 1
+        planned.append({**action, "account": login})
+
+    # Э3.4: выключения. Состояние (State) читается свежим; потолок — своя
+    # рельса ДО общего конвейера: пропущенное сверх него не «заблокировано»,
+    # а отложено до следующего расчёта (пересчёт портфеля без выключенной
+    # кампании может снять кандидатуру с остальных).
+    switch_states = (switch.fetch_campaign_states(client, sorted(switch_desired))
+                     if switch_desired else {})
+    switch_actions, switch_refused = switch.diff_switch(switch_desired, switch_states)
+    switch_not_found = sorted(c for c in switch_desired if c not in switch_states)
+    switch_actions, switch_deferred = switch.cap_suspends(switch_actions)
+    switch_planned_count = 0
+    for action in switch_actions:
+        ok, reason = check_action(action)
+        if not ok:
+            blocked.append({**action, "blocked_reason": reason})
+            continue
+        switch_planned_count += 1
         planned.append({**action, "account": login})
 
     allowed, in_holdout = check_holdout(planned, holdout_ids)
@@ -1173,6 +1245,9 @@ def run_account(
                                      targeting_by_campaign, campaign_ids),
         "budget": _budget_report(budget_plan, budget_desired, budget_refused,
                                  budget_planned_count, budget_not_found),
+        "switch": _switch_report(switch_plan, switch_desired, switch_refused,
+                                 switch_planned_count, switch_not_found,
+                                 deferred_over_cap=len(switch_deferred)),
         "desired": len(desired),
         # Э2.2: скольким кампаниям применялся личный план, а не кабинетный.
         "campaign_level": campaign_level_report,

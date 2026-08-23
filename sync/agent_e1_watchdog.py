@@ -624,7 +624,15 @@ def rollback_guard_form(action: Dict[str, Any], service: str, method: str,
         # полю журнала»: если построитель соберёт не тот блок, allow-лист
         # увидит не тот вид и отклонит.
         campaign = ((params.get("Campaigns") or [{}])[0]) or {}
-        if "TimeTargeting" in campaign:
+        if (str(method) == "resume"
+                and (params.get("SelectionCriteria") or {}).get("Ids")):
+            # Возврат выключения (Э3.4): у resume нет Campaigns, кампании
+            # адресуются SelectionCriteria. suspend сюда не попадает — из
+            # него вывелся бы вид "campaigns.suspend", и рельса возврата
+            # отклонила бы его: повторное выключение — не отмена.
+            kind = "campaign.suspend"
+            campaign = {"Id": (params["SelectionCriteria"]["Ids"] or [None])[0]}
+        elif "TimeTargeting" in campaign:
             kind = "schedule.set"
         elif "DailyBudget" in campaign:
             kind = "budget.set_daily"
@@ -798,7 +806,11 @@ def rollback_one(client, action: Dict[str, Any], db_module,
         return _fail(db_module, action, NO_ID_REASON, True, journal_ok)
 
     service, method, params = request
-    if str(service) == "campaigns":
+    if str(service) == "campaigns" and str(method) == "resume":
+        # Возврат выключения (Э3.4): полнота — непустой список Ids.
+        if not (params.get("SelectionCriteria") or {}).get("Ids"):
+            return _fail(db_module, action, INCOMPLETE_REASON, True, journal_ok)
+    elif str(service) == "campaigns":
         # Возврат через campaigns.update (расписание, бюджет): полнота — это
         # Id кампании и хотя бы один возвращаемый блок. Проверка по
         # BidModifiers здесь хоронила такие откаты как «тело неполное».

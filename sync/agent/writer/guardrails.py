@@ -36,7 +36,7 @@ MAX_ACTIONS_PER_RUN = 50
 # campaign.archive, adgroups.suspend, ...) молча, а рельса обязана держать
 # "никогда", а не эвристику по подстроке.
 ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set",
-                        "budget.set", "budget.set_daily"}
+                        "budget.set", "budget.set_daily", "campaign.suspend"}
 
 # Коридор нового лимита ОТНОСИТЕЛЬНО ПРЕЖНЕГО РАСХОДА кампании (не прежнего
 # лимита: тот бывает в разы выше расхода — 5 млн/нед при расходе 616 тыс. —
@@ -59,7 +59,8 @@ SCHEDULE_STEP = 10
 # прежнее значение. add на этом пути означал бы создание НОВОГО объекта вместо
 # восстановления старого, то есть ещё одно изменение кабинета под видом отмены.
 ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set", "schedule.set",
-                                 "budget.set", "budget.set_daily"}
+                                 "budget.set", "budget.set_daily",
+                                 "campaign.suspend"}
 
 # Куда обязан возвращать откат, в зависимости от вида ИСХОДНОГО действия.
 # Отмена добавления — нейтраль (объекта до действия не было), отмена
@@ -102,6 +103,32 @@ def check_action(action: Dict[str, Any]) -> Tuple[bool, str]:
         ok, reason = _check_budget(action)
         if not ok:
             return False, reason
+
+    if kind == "campaign.suspend":
+        ok, reason = _check_suspend(action)
+        if not ok:
+            return False, reason
+    return True, ""
+
+
+def _check_suspend(action: Dict[str, Any]) -> Tuple[bool, str]:
+    """Рельса выключения: пауза только из ПРОЧИТАННОГО состояния ON.
+
+    previous_state.State — не формальность: откат выключения — это resume,
+    и он вернёт кампанию в показы. Если бы действие строилось по кампании,
+    которую человек уже остановил (SUSPENDED/OFF), откат «вернул» бы её в
+    состояние, в котором она не была, — то есть сам стал бы правкой.
+    Построитель (switch.diff_switch) это гарантирует; рельса проверяет
+    независимо, по своему полю.
+    """
+    payload = action.get("payload") or {}
+    if payload.get("CampaignId") is None:
+        return False, "в действии выключения нет CampaignId"
+    previous = action.get("previous_state") or {}
+    if str(previous.get("State")) != "ON":
+        return False, (f"выключение построено не из состояния ON "
+                       f"(previous_state.State={previous.get('State')!r}): "
+                       f"откат вернул бы кампанию не туда")
     return True, ""
 
 
@@ -278,6 +305,13 @@ def check_rollback(request: Dict[str, Any]) -> Tuple[bool, str]:
         # и не собирает его заново, поэтому «вернуть не туда» тут невозможно
         # по построению. Требовать api_coefficient — значит запретить такой
         # откат вовсе.
+        return True, ""
+
+    if kind == "campaign.suspend":
+        # Возврат выключения — campaigns.resume: он бинарен и не несёт
+        # значения, в которое можно вернуть «не туда». Что кампания была
+        # включена (previous_state.State == ON) — гарантия рельсы назначения
+        # (_check_suspend), без неё действие не применялось.
         return True, ""
 
     coefficient = request.get("api_coefficient")

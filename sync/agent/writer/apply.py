@@ -104,7 +104,8 @@ _DEVICE_ADJUSTMENT_FIELD = {
 # успех: список результатов просто не нашёлся бы, а пустой список ошибок
 # означает «принято».
 _RESULT_COLLECTION = {"add": "AddResults", "set": "SetResults",
-                      "update": "UpdateResults"}
+                      "update": "UpdateResults", "suspend": "SuspendResults",
+                      "resume": "ResumeResults"}
 
 
 def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
@@ -162,6 +163,13 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
         return "campaigns", "update", {
             "Campaigns": [{"Id": int(payload["CampaignId"]),
                            "DailyBudget": payload["DailyBudget"]}]
+        }
+
+    if kind == "campaign.suspend":
+        # Пауза — отдельный метод API с SelectionCriteria, а не поле update:
+        # состоянием показов Директ управляет только так.
+        return "campaigns", "suspend", {
+            "SelectionCriteria": {"Ids": [int(payload["CampaignId"])]}
         }
 
     if kind == "schedule.set":
