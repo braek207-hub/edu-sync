@@ -134,6 +134,22 @@ WRITER_DDL: List[str] = [
       ON edu_agent_actions (harmful_verdict_at)
       WHERE harmful_verdict_at IS NOT NULL
     """,
+    # ЗАКРЫТИЕ НАБЛЮДЕНИЯ С ВЕРДИКТОМ «выдержало» (Э2.4, петля обучения).
+    #
+    # Действие, пережившее весь горизонт без пробоя, раньше не выходило из
+    # open_actions никогда: сторож пересчитывал по нему одно и то же каждый
+    # прогон, а исход «изменение выдержало» не записывался нигде — петля
+    # «применили → понаблюдали → выучили» обрывалась на последнем шаге.
+    #
+    #   observation_closed_at — момент закрытия наблюдения (только для чистого
+    #                           исхода: пробой закрывается через rolled_back_at,
+    #                           неисполнимый откат — через rollback_failed_at);
+    #   observation_verdict   — итог наблюдения словом, для отчёта и разбора.
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS observation_closed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS observation_verdict   TEXT
+    """,
     # Аренда на прогон: два одновременных прогона на одном ключе создают в
     # кабинете ДВА объекта, и Id первого теряется навсегда — без строки
     # журнала и без красной линии. Таблица, а не pg_advisory_lock: сессионная
@@ -420,13 +436,61 @@ def open_actions() -> List[Dict[str, Any]]:
     возврат, исчерпаны попытки отправки). Держать их в наблюдении значило бы
     отправлять один и тот же обречённый запрос каждый прогон. Потерянными они
     не становятся: их считает failed_rollbacks_count и разбирает человек.
+
+    Строки с observation_closed_at исключены по той же логике с другого конца:
+    наблюдение честно закончилось вердиктом «выдержало», исход записан в
+    историю экспериментов — пересчитывать по ним окно каждый прогон незачем.
     """
     return _fetch(
         "SELECT * FROM edu_agent_actions "
         "WHERE status IN (__LIVE_STATUSES__) AND rolled_back_at IS NULL "
-        "AND rollback_failed_at IS NULL".replace(
+        "AND rollback_failed_at IS NULL "
+        "AND observation_closed_at IS NULL".replace(
             "__LIVE_STATUSES__", _sql_literals(LIVE_STATUSES))
     )
+
+
+# Закрытие наблюдения — атомарный захват строки (UPDATE ... RETURNING с
+# проверкой, что строка ещё открыта): из двух параллельных сторожей закрыть и
+# записать эксперимент должен ровно один. Захват — ДО записи эксперимента:
+# upsert идемпотентен по experiment_id, но порядок «сначала претензия, потом
+# запись» не полагается на это.
+MARK_OBSERVATION_CLOSED_SQL = """
+    UPDATE edu_agent_actions
+       SET observation_closed_at = now(),
+           observation_verdict   = %(verdict)s
+     WHERE action_id = %(action_id)s
+       AND observation_closed_at IS NULL
+       AND rolled_back_at IS NULL
+       AND rollback_failed_at IS NULL
+    RETURNING action_id
+"""
+
+
+def mark_observation_closed(action_id: str, verdict: str) -> bool:
+    """Закрывает наблюдение действия с вердиктом. True — строка была наша."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(MARK_OBSERVATION_CLOSED_SQL, {
+                "action_id": action_id,
+                "verdict": str(verdict)[:200],
+            })
+            landed = cur.fetchone() is not None
+        conn.commit()
+    return landed
+
+
+def record_experiments(rows: List[Dict[str, Any]]) -> int:
+    """Исходы действий → история экспериментов (edu_agent_experiments).
+
+    Тонкая переадресация в sync/agent/db: сторож оставляет ВСЕ отметки через
+    свой модуль журнала, и тестовые двойники перехватывают запись исходов тем
+    же протоколом, что и остальные отметки, — а не через живую базу.
+    Импорт внутри: границу «writer не тянет расчётный слой при импорте»
+    ломать незачем ради одной переадресации.
+    """
+    from sync.agent import db as agent_db
+    return agent_db.upsert_experiments(rows)
 
 
 # Строка, застрявшая в промежуточном статусе, — след обрыва ПОСЛЕ отправки

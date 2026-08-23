@@ -85,18 +85,30 @@ class _FakeClient:
 
 
 class _FakeDb:
-    def __init__(self, failed_at=None, rolled_back_taken=False):
+    def __init__(self, failed_at=None, rolled_back_taken=False,
+                 observation_taken=False):
         self.rolled_back = []
         self.failed = []
         self.harmful = []
+        self.observation_closed = []
+        self.experiments = []
         self._failed_at = failed_at
         # True — строку журнала между вердиктом и отметкой забрал другой
         # контур: реальный UPDATE с гардом её не тронет и вернёт False.
         self._rolled_back_taken = rolled_back_taken
+        self._observation_taken = observation_taken
 
     def mark_rolled_back(self, action_id):
         self.rolled_back.append(action_id)
         return not self._rolled_back_taken
+
+    def mark_observation_closed(self, action_id, verdict):
+        self.observation_closed.append((action_id, verdict))
+        return not self._observation_taken
+
+    def record_experiments(self, rows):
+        self.experiments.extend(rows)
+        return len(rows)
 
     def mark_harmful_verdict(self, action_id, reason):
         self.harmful.append({"action_id": action_id, "reason": reason})
@@ -1167,6 +1179,100 @@ def test_breach_carried_by_two_expensive_days_survives_the_filter():
 
     assert report["states"] == {watchdog.STATE_BREACHED: 1}
     assert report["rolled_back"] == 1
+
+
+# =========================================================================
+# Э2.4: петля обучения — исход действия уходит в историю экспериментов
+# =========================================================================
+
+
+def _held_facts():
+    """Полное окно горизонта: линия не пробита, лидов больше минимума.
+
+    Окно действия — 02.08–15.08 (горизонт 14 дней), сегодня 01.09: горизонт
+    закрыт. CPA наблюдения 350 при базе 714 и пределе 1000.
+    """
+    return {"111": _facts("111", date(2026, 8, 2), 14, cost=700.0, leads=2)}
+
+
+def test_held_action_at_closed_horizon_becomes_experiment_and_leaves_watch():
+    report, client, db = _run(_action(), _held_facts(), today=date(2026, 9, 1))
+
+    assert report["states"] == {watchdog.STATE_WATCHED: 1}
+    assert report["closed_held"] == 1
+    assert report["closed_held_sample"][0]["object_id"] == "111"
+    assert db.observation_closed == [("act-1", "held")]
+    assert db.failed == [] and db.rolled_back == []
+    assert client.calls == []          # закрытие — не запись в кабинет
+
+    exp = db.experiments[0]
+    assert exp["source"] == "action"
+    assert exp["verdict"] == "held"
+    assert exp["metric"] == "eff_cpl"
+    assert exp["mechanism"] == "before_after"
+    # Без контроля сезон не вычтен — класс B, не A.
+    assert exp["reliability_class"] == "B"
+    assert abs(exp["effect"] - (350.0 - 714.0) / 714.0) < 1e-3
+    assert exp["params"]["rel_error_floor"] is True
+
+
+def test_held_closure_is_deferred_on_red_gate():
+    # Вердикт «выдержало» по мёртвой витрине не выносится: нули неотличимы
+    # от здоровья — та же логика, что у закрытия строк без вердикта.
+    report, client, db = _run(_action(), _held_facts(), today=date(2026, 9, 1),
+                              gate=RED_GATE)
+
+    assert report["closed_held"] == 0
+    assert report["closing_deferred"] == 1
+    assert db.observation_closed == []
+    assert db.experiments == []
+
+
+def test_rehearsal_reports_would_close_but_does_not_touch_journal():
+    report, client, db = _run(_action(), _held_facts(), today=date(2026, 9, 1),
+                              client=_FakeClient(dry_run=True))
+
+    assert report["would_close_held"] == 1
+    assert report["closed_held"] == 0
+    assert db.observation_closed == []
+    assert db.experiments == []
+
+
+def test_row_taken_by_another_watchdog_does_not_emit_second_experiment():
+    report, client, db = _run(_action(), _held_facts(), today=date(2026, 9, 1),
+                              db=_FakeDb(observation_taken=True))
+
+    assert report["closed_held"] == 0
+    assert db.experiments == []
+
+
+def test_rolled_back_action_writes_breached_experiment():
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    report, client, db = _run(_action(), facts)
+
+    assert report["rolled_back"] == 1
+    assert len(db.experiments) == 1
+    assert db.experiments[0]["source"] == "action"
+    assert db.experiments[0]["verdict"] == "breached"
+    assert db.experiments[0]["object_id"] == "111"
+
+
+def test_action_experiment_id_is_deterministic_and_effect_needs_baseline():
+    window = (date(2026, 8, 2), date(2026, 8, 15), True)
+    observed = {"cpa": 350.0, "leads": 28}
+    a = watchdog.action_experiment(_action(), observed, window, "held")
+    b = watchdog.action_experiment(_action(), observed, window, "held")
+    assert a["experiment_id"] == b["experiment_id"]
+
+    # Красная линия без базы (has_baseline=False): сравнивать не с чем,
+    # эффект честно пуст, но исход всё равно записан.
+    no_base = watchdog.action_experiment(
+        _action(red_line={"metric": "cpa", "max_value": 3000.0,
+                          "min_leads": 20, "baseline_cpa": 0.0,
+                          "has_baseline": False}),
+        observed, window, "held")
+    assert no_base["effect"] is None
+    assert no_base["verdict"] == "held"
 
 
 # =========================================================================

@@ -41,6 +41,7 @@ sync/agent_e1_watchdog.py — сторож красных линий: наблю
 ENV: DATABASE_URL, DIRECT_TOKEN
 """
 
+import hashlib
 import json
 import math
 from statistics import median
@@ -462,6 +463,62 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
     return {**verdict, "state": STATE_WATCHED, "reason": reason or ""}
 
 
+def action_experiment(action: Dict[str, Any], observed: Dict[str, Any],
+                      window: Tuple[date, date, bool], verdict: str) -> Dict[str, Any]:
+    """Исход собственного действия — строкой истории экспериментов (Э2.4).
+
+    Замыкает петлю «применили → понаблюдали → выучили»: до этого закрытые
+    действия не оставляли в edu_agent_experiments ничего, и читатель истории
+    видел только чужие скачки бюджета, но не опыт самого агента.
+
+    Класс надёжности — B, а не A, сознательно: сравнение «наблюдение против
+    базы до изменения» не вычитает сезон (контроля у него нет, в отличие от
+    DiD квазиэкспериментов). A появится, когда исход будет меряться против
+    заповедника за то же окно. Ошибка оценки — только из счётчика лидов окна
+    наблюдения: объём базы в красной линии не записан, поэтому rel_error —
+    нижняя граница, и это отмечено полем rel_error_floor.
+    """
+    red = action.get("red_line") or {}
+    base = float(red.get("baseline_cpa") or 0.0)
+    cpa = float((observed or {}).get("cpa") or 0.0)
+    leads = int((observed or {}).get("leads") or 0)
+    rel = math.sqrt(1.0 / max(leads, 1))
+    effect = effect_lo = effect_hi = None
+    if base > 0 and cpa > 0:
+        effect = round((cpa - base) / base, 4)
+        effect_lo = round(effect - rel, 4)
+        effect_hi = round(effect + rel, 4)
+    start, end, _ = window
+    applied = _as_date(action.get("applied_at")) or _as_date(action.get("created_at"))
+    raw = f"action:{action.get('action_id')}"
+    return {
+        "experiment_id": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24],
+        "hypothesis_type": str(action.get("action_kind") or "unknown"),
+        "object_level": str(action.get("object_level") or "campaign"),
+        "object_id": str(action.get("object_id")),
+        "params": {
+            "action_id": action.get("action_id"),
+            "direct_type": action.get("direct_type"),
+            "setting_key": action.get("setting_key"),
+            "baseline_cpa": base or None,
+            "observed_cpa": cpa or None,
+            "leads": leads,
+            "rel_error": round(rel, 4),
+            "rel_error_floor": True,
+        },
+        "mechanism": "before_after",
+        "started_on": (applied or start).isoformat(),
+        "measured_on": end.isoformat(),
+        "effect": effect,
+        "effect_lo": effect_lo,
+        "effect_hi": effect_hi,
+        "metric": "eff_cpl",
+        "verdict": verdict,
+        "reliability_class": "B",
+        "source": "action",
+    }
+
+
 def facts_gate(mart: Dict[str, Any], today: date,
                max_age_days: int = FACTS_MAX_AGE_DAYS) -> Dict[str, Any]:
     """Гейт качества витрины фактов ВНУТРИ сторожевого прогона.
@@ -789,6 +846,8 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
     would_roll_back: List[Dict[str, Any]] = []
     needs_review: List[Dict[str, Any]] = []
     deferred_closing: List[Dict[str, Any]] = []
+    closed_held: List[Dict[str, Any]] = []
+    would_close_held: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
     rollback_allowed = gate_allows_rollback(data_gate)
     conflicted: List[Dict[str, Any]] = []
@@ -834,6 +893,51 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
             try:
                 needs_review.append(close_unverified(
                     db_module, action, state, reason, journal_allowed(client)))
+            except Exception as exc:
+                errors.append({"action_id": action.get("action_id"),
+                               "object_id": action.get("object_id"),
+                               "error": f"{type(exc).__name__}: {exc}"[:200]})
+            continue
+
+        if state == STATE_WATCHED and (verdict.get("window") or {}).get("closed"):
+            # Горизонт закрыт, линия не пробита: изменение ВЫДЕРЖАЛО. Исход
+            # уходит в историю экспериментов, строка — из наблюдения (Э2.4).
+            # До этой ветки чистый исход не записывался никуда, и действие
+            # пересчитывалось сторожем вечно.
+            if not rollback_allowed:
+                # Вердикт «выдержало» по красному гейту не выносится: нули
+                # мёртвой витрины неотличимы от здоровья — та же логика, что
+                # у отложенного закрытия строк без вердикта.
+                deferred_closing.append({
+                    "action_id": action.get("action_id"),
+                    "object_id": action.get("object_id"),
+                    "state": "held",
+                    "reason": GATE_DEFERS_CLOSING_REASON,
+                    "gate": (data_gate or {}).get("reason"),
+                })
+                continue
+            if not journal_allowed(client):
+                # Репетиция и песочница журнал не трогают — но исход виден.
+                would_close_held.append({
+                    "action_id": action.get("action_id"),
+                    "object_id": action.get("object_id"),
+                    "observed": verdict.get("observed"),
+                })
+                continue
+            try:
+                window = observation_window(action, today, crm_through)
+                # Захват строки — до записи эксперимента: из двух параллельных
+                # сторожей исход записывает тот, чья пометка легла.
+                if window is not None and db_module.mark_observation_closed(
+                        action["action_id"], "held"):
+                    db_module.record_experiments([action_experiment(
+                        action, verdict.get("observed") or {}, window, "held")])
+                    closed_held.append({
+                        "action_id": action.get("action_id"),
+                        "object_id": action.get("object_id"),
+                        "action_kind": action.get("action_kind"),
+                        "observed": verdict.get("observed"),
+                    })
             except Exception as exc:
                 errors.append({"action_id": action.get("action_id"),
                                "object_id": action.get("object_id"),
@@ -893,6 +997,19 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
             continue
         if outcome["result"] == "rolled_back":
             rolled_back += 1
+            # Пробой — тоже исход, и он тоже пополняет историю: без этой
+            # записи агент учился бы только на выдержавших изменениях.
+            if journal_allowed(client):
+                try:
+                    window = observation_window(action, today, crm_through)
+                    if window is not None:
+                        db_module.record_experiments([action_experiment(
+                            action, verdict.get("observed") or {},
+                            window, "breached")])
+                except Exception as exc:
+                    errors.append({"action_id": action.get("action_id"),
+                                   "object_id": action.get("object_id"),
+                                   "error": f"{type(exc).__name__}: {exc}"[:200]})
         elif outcome["result"] == "rollback_failed":
             failures.append(outcome)
         elif outcome["result"] == "blocked_holdout":
@@ -924,6 +1041,12 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
         # неотличимо от «всё хорошо».
         "blocked_data_gate": len(blocked_by_gate),
         "blocked_data_gate_sample": blocked_by_gate[:PREVIEW_SAMPLE_LIMIT],
+        # Чистый исход (Э2.4): горизонт закрыт, линия не пробита — изменение
+        # выдержало, записано в историю экспериментов и снято с наблюдения.
+        "closed_held": len(closed_held),
+        "closed_held_sample": closed_held[:PREVIEW_SAMPLE_LIMIT],
+        # То же в репетиции: закрыл бы, но журнал репетиции недоступен.
+        "would_close_held": len(would_close_held),
         # Строки, снятые с наблюдения без вердикта: горизонт истёк или красной
         # линии не было вовсе. Изменение живёт в кабинете непроверенным и ждёт
         # человека — молчать о таких нельзя.

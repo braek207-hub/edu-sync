@@ -235,6 +235,27 @@ def test_open_actions_covers_every_live_status(monkeypatch):
     assert "rolled_back" not in writer_db.LIVE_STATUSES
 
 
+def test_open_actions_exclude_closed_observation(monkeypatch):
+    # Действие, чьё наблюдение закрыто вердиктом «выдержало», из-под сторожа
+    # уходит: пересчитывать закрытое окно каждый прогон незачем (Э2.4).
+    sql, _ = _captured_sql(monkeypatch, writer_db.open_actions)
+    assert "observation_closed_at IS NULL" in sql
+
+
+def test_mark_observation_closed_sql_claims_only_open_rows():
+    # Захват атомарный и только своей строки: уже закрытую, откатанную или
+    # неоткатываемую строку повторное закрытие не трогает — из двух
+    # параллельных сторожей эксперимент записывает ровно один.
+    sql = " ".join(writer_db.MARK_OBSERVATION_CLOSED_SQL.split())
+    assert sql.startswith("UPDATE edu_agent_actions")
+    assert "observation_closed_at = now()" in sql
+    assert "WHERE action_id = %(action_id)s" in sql
+    assert "AND observation_closed_at IS NULL" in sql
+    assert "AND rolled_back_at IS NULL" in sql
+    assert "AND rollback_failed_at IS NULL" in sql
+    assert "RETURNING" in sql
+
+
 def test_spent_risk_charges_every_live_status(monkeypatch):
     # Зависшее изменение живо в кабинете и обязано занимать риск-бюджет:
     # иначе прогон выдаёт лимит, которого нет.
@@ -385,6 +406,29 @@ def test_live_repeat_of_unapplied_action_refreshes_state_risk_and_red_line():
         # Прошлая ошибка не должна выглядеть ответом на новую попытку.
         assert row["status"] == "planned"
         assert row["response"] == {}
+    finally:
+        _cleanup(key)
+
+
+@live_db
+def test_live_mark_observation_closed_is_atomic_and_hides_row_from_watch():
+    ensure_writer_tables()
+    suffix = uuid.uuid4().hex[:8]
+    key = "test-obs-closed-" + suffix
+    account = "test-" + suffix
+    try:
+        action_id = writer_db.insert_action(_journal_row(key, account))
+        writer_db.mark_action(action_id, "applied", {"SetResults": [{"Id": 7}]})
+        assert any(a["action_id"] == action_id for a in open_actions())
+
+        assert writer_db.mark_observation_closed(action_id, "held") is True
+        # Повторный захват — уже чужой: строка закрыта первым прогоном.
+        assert writer_db.mark_observation_closed(action_id, "held") is False
+
+        row = _read_row(key)
+        assert row["observation_closed_at"] is not None
+        assert row["observation_verdict"] == "held"
+        assert all(a["action_id"] != action_id for a in open_actions())
     finally:
         _cleanup(key)
 
