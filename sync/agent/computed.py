@@ -32,7 +32,7 @@ sync/agent/computed.py — вычисляемые настройки (корре
      о сегментах (сигнатура дефекта выше).
 """
 
-from math import isclose
+from math import isclose, sqrt
 from typing import Any, Dict, List, Optional, Tuple
 
 # Априорный вес в СОБЫТИЯХ (достижениях цели), а не в наблюдениях: единица
@@ -99,6 +99,22 @@ def shrink_ratio(
     return shrunk / base_conv
 
 
+def ratio_rel_error(segment_events: float, base_events: float) -> Optional[float]:
+    """Относительная ошибка отношения «конверсия сегмента / база».
+
+    Пуассоновский счёт: относительные дисперсии числителя и знаменателя
+    складываются — √(1/n_сегмента + 1/n_базы), та же механика, что у лестницы
+    (ladder.py). Ноль событий в сегменте — реальный сигнал (сегмент не
+    конвертит), его ошибка оценивается сверху как одно событие, а не как
+    бесконечность: иначе самые убедительные минус-сегменты объявлялись бы
+    «неизвестными». Считается ДО сжатия: сжатие уменьшает дисперсию, поэтому
+    ошибка сырой оценки — честная верхняя граница ошибки сжатой.
+    """
+    if base_events <= 0:
+        return None
+    return sqrt(1.0 / max(segment_events, 1.0) + 1.0 / base_events)
+
+
 def bid_modifier_percent(ratio: float, cap: float = MODIFIER_CAP_RATIO) -> int:
     """Отношение → процент корректировки ставки, ограниченный потолком.
 
@@ -147,12 +163,16 @@ def _emit(
     for row, conv in zip(supported, conv_rates):
         clicks = int(row["clicks"])
         ratio = shrink_ratio(conv, clicks, base_conv)
+        rel = ratio_rel_error(float(row.get(conv_key) or 0.0), total_conv)
         out.append({
             "setting_kind": f"{kind_prefix}:{row['segment_kind']}",
             "setting_key": str(row["segment_key"]),
             "value": float(bid_modifier_percent(ratio)),
             "support_n": clicks,
             "raw_value": round(ratio, 4),
+            # Ошибка оценки едет со строкой до самого применения: слой
+            # уверенности (Э2.3) решает по ней, применять ли действие.
+            "rel_error": round(rel, 4) if rel is not None else None,
         })
     return out, None
 

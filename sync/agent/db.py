@@ -192,8 +192,16 @@ AGENT_DDL: List[str] = [
       value         DOUBLE PRECISION NOT NULL,
       support_n     INTEGER NOT NULL,
       raw_value     DOUBLE PRECISION NOT NULL,
+      rel_error     DOUBLE PRECISION,
       PRIMARY KEY (calc_date, object_level, object_id, setting_kind, setting_key)
     )
+    """,
+    # Прод-таблица создана до Э2.3 — колонка ошибки добавляется идемпотентно.
+    # NULL = «ошибка неизвестна» (строки старого формата); слой уверенности
+    # обязан отличать это от «ошибка мала».
+    """
+    ALTER TABLE edu_agent_computed_settings
+      ADD COLUMN IF NOT EXISTS rel_error DOUBLE PRECISION
     """,
     # Профиль успеха и дистанция каждой кампании до него.
     """
@@ -391,7 +399,8 @@ def load_latest_computed_settings(
     object_id = normalize_login(object_id)
     return _fetch_dicts(
         """
-        SELECT calc_date, setting_kind, setting_key, value, support_n, raw_value
+        SELECT calc_date, setting_kind, setting_key, value, support_n,
+               raw_value, rel_error
         FROM edu_agent_computed_settings
         WHERE object_level = %s AND object_id = %s
           AND calc_date = (
@@ -421,7 +430,7 @@ def load_latest_campaign_computed(
     rows = _fetch_dicts(
         """
         SELECT s.object_id, s.calc_date, s.setting_kind, s.setting_key,
-               s.value, s.support_n, s.raw_value
+               s.value, s.support_n, s.raw_value, s.rel_error
         FROM edu_agent_computed_settings s
         JOIN (
             SELECT object_id, MAX(calc_date) AS calc_date
@@ -795,21 +804,24 @@ def upsert_computed_settings(
     таблицы, а не на дисциплине каждого разборщика конфигурации.
     """
     object_id = normalize_login(object_id)
-    payload = [{**r, "calc_date": calc_date, "object_level": object_level, "object_id": object_id}
+    payload = [{"rel_error": None, **r, "calc_date": calc_date,
+                "object_level": object_level, "object_id": object_id}
                for r in rows]
     return _batch(
         """
         INSERT INTO edu_agent_computed_settings (
             calc_date, object_level, object_id, setting_kind, setting_key,
-            value, support_n, raw_value
+            value, support_n, raw_value, rel_error
         ) VALUES (
             %(calc_date)s, %(object_level)s, %(object_id)s, %(setting_kind)s,
-            %(setting_key)s, %(value)s, %(support_n)s, %(raw_value)s
+            %(setting_key)s, %(value)s, %(support_n)s, %(raw_value)s,
+            %(rel_error)s
         )
         ON CONFLICT (calc_date, object_level, object_id, setting_kind, setting_key)
         DO UPDATE SET value = EXCLUDED.value,
                       support_n = EXCLUDED.support_n,
-                      raw_value = EXCLUDED.raw_value
+                      raw_value = EXCLUDED.raw_value,
+                      rel_error = EXCLUDED.rel_error
         """,
         payload,
     )

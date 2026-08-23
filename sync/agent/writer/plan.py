@@ -29,6 +29,8 @@ DESKTOP_ADJUSTMENT, TABLET_ADJUSTMENT (образец разбора: sync/edu_d
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from sync.agent.confidence import assess
+
 # Вид вычисленной настройки → тип корректировки в API Директа. Устройства
 # сюда не входят: у них тип зависит от ключа, см. DEVICE_TYPE_MAP.
 SETTING_KIND_MAP: Dict[str, str] = {
@@ -186,15 +188,25 @@ def plan_bid_modifiers(
     computed: List[Dict[str, Any]],
     min_support: int = MIN_SUPPORT,
     min_abs_percent: int = MIN_ABS_PERCENT,
-) -> Dict[str, List[Dict[str, Any]]]:
-    """План корректировок: {"desired": [...], "unsupported": [...]}.
+) -> Dict[str, Any]:
+    """План корректировок:
+    {"desired": [...], "unsupported": [...], "low_confidence": [...],
+     "confidence_unknown": N}.
 
     unsupported — строки, прошедшие пороги значимости, но которые агент
     применить не умеет. Они не выбрасываются молча: без явного списка
     невозможно отличить «регион не нужен» от «регион отвалился».
+
+    low_confidence (Э2.3) — строки, у которых вероятность, что знак эффекта
+    верен, ниже порога класса bid_modifier: применять такое — монетка, а не
+    решение. confidence_unknown — строки БЕЗ rel_error (расчёт старого
+    формата): для обратимого класса они применяются как раньше, но их число
+    видно — молчаливое «неизвестно = уверены» недопустимо.
     """
     desired: List[Dict[str, Any]] = []
     unsupported: List[Dict[str, Any]] = []
+    low_confidence: List[Dict[str, Any]] = []
+    confidence_unknown = 0
 
     for row in computed:
         kind = str(row.get("setting_kind") or "")
@@ -214,6 +226,22 @@ def plan_bid_modifiers(
             continue
         percent = int(round(float(row.get("value") or 0.0)))
         if abs(percent) < min_abs_percent:
+            continue
+
+        # Э2.3: уверенность в знаке против порога класса. Гейт стоит ПОСЛЕ
+        # порогов значимости (незначимое и так не действие) и ДО разбора типа:
+        # неуверенная строка не должна занимать место в desired независимо от
+        # того, умеет ли движок её применять.
+        verdict = assess(float(row.get("raw_value") or 0.0),
+                         row.get("rel_error"), "bid_modifier")
+        if verdict["confident"] is None:
+            confidence_unknown += 1
+        elif not verdict["confident"]:
+            low_confidence.append({
+                "kind": kind, "key": str(row.get("setting_key")),
+                "percent": percent, "p_sign": verdict["p_sign"],
+                "min_p_sign": verdict["min_p_sign"],
+            })
             continue
 
         direct_type, key, reason = direct_type_for(kind, str(row.get("setting_key")))
@@ -236,6 +264,9 @@ def plan_bid_modifiers(
     return {
         "desired": sorted(desired, key=lambda r: (r["kind"], r["key"])),
         "unsupported": sorted(unsupported, key=lambda r: (r["kind"], r["key"])),
+        "low_confidence": sorted(low_confidence,
+                                 key=lambda r: (r["kind"], r["key"])),
+        "confidence_unknown": confidence_unknown,
     }
 
 

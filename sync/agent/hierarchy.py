@@ -32,6 +32,7 @@ from sync.agent.computed import (
     NO_CONVERSIONS_REASON,
     bid_modifier_percent,
     prior_trials,
+    ratio_rel_error,
 )
 
 # Ключ хвоста из collapse_tail: агрегат мелких сегментов, корректировку на него
@@ -145,6 +146,7 @@ def hierarchical_modifiers(
         prior_base, _ = _base(by_direction.get(direction, {}))
         if prior_base <= 0:
             prior_base = account_base
+        c_conv_total = sum(s["conversions"] for s in segments.values())
         rows_out: List[Dict[str, Any]] = []
         for segment, counts in segments.items():
             if counts["clicks"] < MIN_SUPPORT:
@@ -155,6 +157,10 @@ def hierarchical_modifiers(
             obs = counts["conversions"] / counts["clicks"]
             est = shrink_toward(obs, counts["clicks"], target, prior_base)
             ratio = est / c_base
+            # Ошибка — по СВОИМ событиям кампании (сегмент против её базы):
+            # занятая у родителя часть оценки надёжнее собственной, поэтому
+            # это верхняя граница, согласованная с computed.ratio_rel_error.
+            rel = ratio_rel_error(counts["conversions"], c_conv_total)
             rows_out.append({
                 "setting_kind": f"bid_modifier:{slice_kind}",
                 "setting_key": segment,
@@ -162,6 +168,7 @@ def hierarchical_modifiers(
                 "support_n": int(counts["clicks"]),
                 "raw_value": round(ratio, 4),
                 "pool_weight": round(_own_weight(counts["clicks"], prior_base), 3),
+                "rel_error": round(rel, 4) if rel is not None else None,
             })
         if rows_out:
             out[campaign_id] = rows_out

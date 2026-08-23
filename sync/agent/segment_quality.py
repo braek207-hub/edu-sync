@@ -24,6 +24,7 @@ sync/agent/segment_quality.py — Э2.2b: качество лида по сег�
 отсутствие данных не должно тихо обнулять корректировку.
 """
 
+from math import sqrt
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.computed import bid_modifier_percent
@@ -122,5 +123,13 @@ def apply_quality_to_modifiers(
         r["quality_ratio"] = q["ratio"]
         r["raw_value"] = round(combined, 4)
         r["value"] = float(bid_modifier_percent(combined))
+        # Ошибка произведения независимых оценок: относительные дисперсии
+        # складываются. Если у конверсионной части ошибки нет — комбинированная
+        # тоже неизвестна: качество не делает неизвестную оценку известной.
+        conv_rel, q_rel = r.get("rel_error"), q.get("rel_error")
+        if conv_rel is not None and q_rel is not None:
+            r["rel_error"] = round(sqrt(float(conv_rel) ** 2 + float(q_rel) ** 2), 4)
+        else:
+            r["rel_error"] = None
         adjusted += 1
     return adjusted

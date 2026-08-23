@@ -869,8 +869,9 @@ def run_account(
     # месячные коэффициенты хуже, чем не применить ничего.
     stale_computed = (computed_freshness_refusal(computed, date.fromisoformat(today))
                       if computed else None)
-    plan = plan_bid_modifiers(computed) if not stale_computed else {"desired": [],
-                                                                   "unsupported": []}
+    plan = (plan_bid_modifiers(computed) if not stale_computed
+            else {"desired": [], "unsupported": [],
+                  "low_confidence": [], "confidence_unknown": 0})
     desired = plan["desired"]
     # Значимые настройки, которые агент применить не умеет (нечисловой ключ
     # региона, устройство вне DESKTOP/MOBILE/TABLET), собираются с ОБОИХ
@@ -911,16 +912,31 @@ def run_account(
     campaign_desired: Dict[str, List[Dict[str, Any]]] = {}
     campaign_unsupported_rows: List[Dict[str, Any]] = []
     campaign_stale_dropped = 0
+    # Э2.3: неуверенные строки обоих уровней — счётчик и образцы в отчёт.
+    low_confidence_rows: List[Dict[str, Any]] = list(plan["low_confidence"])
+    confidence_unknown = int(plan["confidence_unknown"])
     for cid, rows in campaign_computed.items():
         if computed_freshness_refusal(rows, date.fromisoformat(today)):
             campaign_stale_dropped += 1
             continue
         camp_plan = plan_bid_modifiers(rows)
         campaign_unsupported_rows += camp_plan["unsupported"]
+        low_confidence_rows += [{**r, "campaign_id": str(cid)}
+                                for r in camp_plan["low_confidence"]]
+        confidence_unknown += int(camp_plan["confidence_unknown"])
         if camp_plan["desired"]:
             campaign_desired[str(cid)] = camp_plan["desired"]
     unsupported = _unsupported_report(
         plan["unsupported"] + campaign_unsupported_rows)
+    confidence_report = {
+        # Отсеянные по уверенности — решения «не делать», и они такие же
+        # видимые, как сделанные: корректировки-монетки не применяются.
+        "low_confidence": len(low_confidence_rows),
+        "sample": low_confidence_rows[:5],
+        # Строки без rel_error (расчёт до Э2.3): применяются как раньше,
+        # но их количество обязано быть на виду до следующего прогона Э0.
+        "unknown": confidence_unknown,
+    }
     campaign_level_report = {
         "campaigns_with_own_values": len(campaign_desired),
         "fallback_account": len(campaign_ids) - len(campaign_desired),
@@ -947,6 +963,7 @@ def run_account(
             "schedule": _schedule_report(schedule_hours, desired_items, {}, []),
             "unsupported": unsupported,
             "campaign_level": campaign_level_report,
+            "confidence": confidence_report,
             # Ни одной кампании не тронуто — и это сказано явно тем же полем,
             # что и в полном отчёте, а не отсутствием поля.
             "campaign_scope": scope.report(),
@@ -1078,6 +1095,8 @@ def run_account(
         "desired": len(desired),
         # Э2.2: скольким кампаниям применялся личный план, а не кабинетный.
         "campaign_level": campaign_level_report,
+        # Э2.3: отсев по уверенности в знаке эффекта.
+        "confidence": confidence_report,
         "unsupported": unsupported,
         # Записи факта без коэффициента: по ним не строится ни одно действие,
         # и это состояние обязано быть видно, а не выглядеть как «в кабинете
