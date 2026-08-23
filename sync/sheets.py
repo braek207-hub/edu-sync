@@ -36,5 +36,9 @@ def read_sheet(
     }
     if value_render_option:
         kwargs["valueRenderOption"] = value_render_option
-    result = service.spreadsheets().values().get(**kwargs).execute()
+    # Sheets API регулярно отдаёт транзиентные 503/429. Встроенный ретрай
+    # googleapiclient (экспоненциальный бэкофф на 5xx/429) снимает почти все:
+    # без него единичный 503 на листе «Оплаты» 23.08 обнулил is_paid у всех
+    # лидов 2026 года (см. sync/crm.py::_load_paid_by_lead_id).
+    result = service.spreadsheets().values().get(**kwargs).execute(num_retries=4)
     return result.get("values", [])

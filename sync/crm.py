@@ -501,11 +501,9 @@ def _load_all_lead_dims(
 ) -> Dict[str, Dims]:
     lead_dims_by_id: Dict[str, Dims] = {}
     for sheet_name in crm_leads_sheets():
-        try:
-            values = read_sheet(service, spreadsheet_id, sheet_name)
-        except Exception as e:
-            print(f"CRM Лиды [{sheet_name}]: пропуск lead_dims — {e}")
-            continue
+        # Фатально по той же причине, что в _load_paid_by_lead_id: пустые
+        # dims уводят атрибуцию всех оплат в unknown, и replace их затирает.
+        values = read_sheet(service, spreadsheet_id, sheet_name)
         if len(values) < 2:
             continue
         try:
@@ -527,11 +525,12 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, A
     """
     paid: Dict[str, Dict[str, Any]] = {}
     for sheet_name in crm_payments_sheets():
-        try:
-            values = read_sheet(service, spreadsheet_id, sheet_name)
-        except Exception as e:
-            print(f"CRM Оплаты [{sheet_name}]: пропуск paid_by_lead — {e}")
-            continue
+        # Ошибка чтения листа оплат ФАТАЛЬНА, а не «пропуск»: пустой словарь
+        # оплат дальше уходит в upsert crm_lead_details и проставляет
+        # is_paid=false всем лидам читаемых листов. Ровно так 23.08 один
+        # транзиентный 503 (прогон 32613839112) обнулил оплаты всего 2026
+        # года. Упавший синк лучше тихо испорченных данных.
+        values = read_sheet(service, spreadsheet_id, sheet_name)
         if len(values) < 2:
             continue
         headers = [str(x) for x in values[0]]
@@ -743,11 +742,10 @@ def sync_crm_leads() -> int:
     lead_details: List[Dict[str, Any]] = []
 
     for sheet_name in sheet_names:
-        try:
-            values = read_sheet(service, spreadsheet_id, sheet_name)
-        except Exception as e:
-            print(f"CRM Лиды [{sheet_name}]: ошибка чтения — {e}")
-            continue
+        # Та же дисциплина, что у оплат: crm_leads пишется через replace
+        # (полная замена), и «пропуск» упавшего листа в full-режиме молча
+        # выкинул бы весь его год из витрины. Ошибка чтения — фатальна.
+        values = read_sheet(service, spreadsheet_id, sheet_name)
         if len(values) < 2:
             print(f"CRM Лиды [{sheet_name}]: пустой лист или только заголовок")
             continue
@@ -835,11 +833,9 @@ def sync_crm_payments() -> int:
     agg: Dict[str, Dict[str, Any]] = {}
 
     for sheet_name in sheet_names:
-        try:
-            values = read_sheet(service, spreadsheet_id, sheet_name)
-        except Exception as e:
-            print(f"CRM Оплаты [{sheet_name}]: ошибка чтения — {e}")
-            continue
+        # Фатально: crm_payments пишется через replace, «пропуск» листа =
+        # потеря его строк из витрины (см. _load_paid_by_lead_id).
+        values = read_sheet(service, spreadsheet_id, sheet_name)
         if len(values) < 2:
             print(f"CRM Оплаты [{sheet_name}]: пустой лист")
             continue
