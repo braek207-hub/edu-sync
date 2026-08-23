@@ -53,6 +53,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent import db as agent_db
+from sync.agent.writer import budget
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import apply_actions
 from sync.agent.writer.client import WriteClient, journal_writes_allowed
@@ -537,8 +538,15 @@ def _unsupported_report(unsupported: List[Dict[str, Any]]) -> Dict[str, Any]:
 def action_label(action: Dict[str, Any]) -> str:
     """Короткая подпись действия: что и на сколько правится."""
     payload = action.get("payload") or {}
+    kind_full = str(action.get("action_kind") or "")
+    if kind_full.startswith("budget."):
+        micros = (payload.get("WeeklySpendLimit")
+                  or (payload.get("DailyBudget") or {}).get("Amount") or 0)
+        unit = "нед" if kind_full == "budget.set" else "день"
+        return (f"{action.get('direct_type')}:{action.get('key')} "
+                f"→ {int(micros) // 1_000_000} ₽/{unit}")
     percent = int(payload.get("BidModifier") or 0)
-    kind = str(action.get("action_kind") or "").split(".")[-1]
+    kind = kind_full.split(".")[-1]
     return f"{action.get('direct_type')}:{action.get('key')} {percent:+d}% ({kind})"
 
 
@@ -567,6 +575,39 @@ def actions_preview(
                    for a in actions[:limit]],
         "sample_truncated": len(actions) > limit,
     }
+
+
+def _budget_report(
+    budget_plan: Dict[str, Any], desired: Dict[str, Any],
+    refused: Optional[List[Dict[str, Any]]] = None,
+    planned_count: int = 0, not_found: Optional[List[str]] = None,
+    limit: int = PREVIEW_SAMPLE_LIMIT,
+) -> Dict[str, Any]:
+    """Что прогон решил про целевые бюджеты (Э3.3).
+
+    Различаются четыре молчания, которые иначе неотличимы: сдвигов нет в
+    расчёте, сдвиги есть но неуверенные/мелкие, сдвиг есть но рычага нет
+    (пакетная стратегия, несвязывающий лимит), действие построено и пошло
+    по конвейеру рельс.
+    """
+    out = {
+        "desired": len(desired),
+        "small_shift": budget_plan["small_shift"],
+        "low_confidence": len(budget_plan["low_confidence"]),
+        "low_confidence_sample": budget_plan["low_confidence"][:limit],
+        "confidence_unknown": budget_plan["confidence_unknown"],
+        "actions_planned": planned_count,
+    }
+    if refused is not None:
+        by_reason: Dict[str, int] = {}
+        for row in refused:
+            by_reason[row["reason"]] = by_reason.get(row["reason"], 0) + 1
+        out["refused"] = {"count": len(refused), "by_reason": by_reason,
+                          "sample": refused[:limit]}
+    if not_found:
+        out["not_in_cabinet"] = not_found[:limit]
+        out["not_in_cabinet_count"] = len(not_found)
+    return out
 
 
 def mark_stale_rows(login: str, journal_ok: bool) -> List[Dict[str, Any]]:
@@ -912,6 +953,10 @@ def run_account(
     campaign_desired: Dict[str, List[Dict[str, Any]]] = {}
     campaign_unsupported_rows: List[Dict[str, Any]] = []
     campaign_stale_dropped = 0
+    # Свежие покампанийные строки целиком — вход рычага бюджета (Э3.3):
+    # budget_target лежит в тех же строках, что и корректировки, и той же
+    # рельсой свежести отсеивается.
+    fresh_campaign_computed: Dict[str, List[Dict[str, Any]]] = {}
     # Э2.3: неуверенные строки обоих уровней — счётчик и образцы в отчёт.
     low_confidence_rows: List[Dict[str, Any]] = list(plan["low_confidence"])
     confidence_unknown = int(plan["confidence_unknown"])
@@ -919,6 +964,7 @@ def run_account(
         if computed_freshness_refusal(rows, date.fromisoformat(today)):
             campaign_stale_dropped += 1
             continue
+        fresh_campaign_computed[str(cid)] = rows
         camp_plan = plan_bid_modifiers(rows)
         campaign_unsupported_rows += camp_plan["unsupported"]
         low_confidence_rows += [{**r, "campaign_id": str(cid)}
@@ -943,7 +989,17 @@ def run_account(
         "stale_dropped": campaign_stale_dropped,
     }
 
-    if not desired and not desired_items and not campaign_desired:
+    # Э3.3: целевые бюджеты. План считается ДО раннего выхода тем же доводом,
+    # что расписание: у кампании может не быть ни одной значимой корректировки
+    # и при этом быть уверенный сдвиг бюджета — «нечего делать» по
+    # корректировкам ничего не говорит о бюджете. Ограничитель прогона уже
+    # применён к campaign_ids, и сдвиги за его пределами не планируются.
+    budget_plan = budget.plan_budget_moves(fresh_campaign_computed)
+    scoped_ids = {str(c) for c in campaign_ids}
+    budget_desired = {cid: m for cid, m in budget_plan["desired"].items()
+                      if cid in scoped_ids}
+
+    if not desired and not desired_items and not campaign_desired and not budget_desired:
         if stale_computed:
             verdict, reason = "STALE_COMPUTED_SETTINGS", stale_computed
         elif not computed and not campaign_computed:
@@ -961,6 +1017,7 @@ def run_account(
             # «профиль не прошёл пороги» и «профиль есть, но корректировок нет»
             # выглядели бы одинаково.
             "schedule": _schedule_report(schedule_hours, desired_items, {}, []),
+            "budget": _budget_report(budget_plan, budget_desired),
             "unsupported": unsupported,
             "campaign_level": campaign_level_report,
             "confidence": confidence_report,
@@ -1006,6 +1063,28 @@ def run_account(
                 blocked.append({**action, "blocked_reason": reason})
                 continue
             planned.append({**action, "account": login})
+
+    # Э3.3: действия по бюджету. Состояние читается СВЕЖИМ (между прогонами
+    # лимиты правят руками), previous_state берётся из этого чтения. Дальше
+    # действия идут общим конвейером рельс: заповедник, кулдаун, потолок
+    # попыток, закрытые ключи, лимит действий, красная линия, риск-бюджет.
+    budget_state = (budget.fetch_budget_state(client, sorted(budget_desired))
+                    if budget_desired else {})
+    budget_spend_no_vat = {
+        cid: m["cost_28d"] / budget.WEEKS_IN_WINDOW / budget.VAT
+        for cid, m in budget_desired.items()
+    }
+    budget_actions, budget_refused = budget.diff_budget(
+        budget_desired, budget_state, budget_spend_no_vat)
+    budget_not_found = sorted(c for c in budget_desired if c not in budget_state)
+    budget_planned_count = 0
+    for action in budget_actions:
+        ok, reason = check_action(action)
+        if not ok:
+            blocked.append({**action, "blocked_reason": reason})
+            continue
+        budget_planned_count += 1
+        planned.append({**action, "account": login})
 
     allowed, in_holdout = check_holdout(planned, holdout_ids)
     blocked += [{**a, "blocked_reason": "заповедник"} for a in in_holdout]
@@ -1092,6 +1171,8 @@ def run_account(
         # одинаково — как молчание.
         "schedule": _schedule_report(schedule_hours, desired_items,
                                      targeting_by_campaign, campaign_ids),
+        "budget": _budget_report(budget_plan, budget_desired, budget_refused,
+                                 budget_planned_count, budget_not_found),
         "desired": len(desired),
         # Э2.2: скольким кампаниям применялся личный план, а не кабинетный.
         "campaign_level": campaign_level_report,

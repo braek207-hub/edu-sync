@@ -147,6 +147,23 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
             raise ValueError(f"неизвестный тип корректировки: {direct_type}")
         return "bidmodifiers", "add", {"BidModifiers": [item]}
 
+    if kind == "budget.set":
+        # Блок BiddingStrategy собран планом (writer/budget.py) из
+        # ПРОЧИТАННОГО состояния с заменой одного лишь WeeklySpendLimit:
+        # структура в API заменяется целиком, и пересборка потеряла бы
+        # соседние поля стратегии.
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(payload["CampaignId"]),
+                           "TextCampaign": {
+                               "BiddingStrategy": payload["BiddingStrategy"]}}]
+        }
+
+    if kind == "budget.set_daily":
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(payload["CampaignId"]),
+                           "DailyBudget": payload["DailyBudget"]}]
+        }
+
     if kind == "schedule.set":
         # Расписание применяется ЦЕЛИКОМ и через саму кампанию: у Директа нет
         # способа поменять один час. Тело собрано планом (writer/schedule.py),

@@ -35,7 +35,17 @@ MAX_ACTIONS_PER_RUN = 50
 # словам — тот пропускает любой ещё не придуманный вид действия (purge,
 # campaign.archive, adgroups.suspend, ...) молча, а рельса обязана держать
 # "никогда", а не эвристику по подстроке.
-ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set"}
+ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set",
+                        "budget.set", "budget.set_daily"}
+
+# Коридор нового лимита ОТНОСИТЕЛЬНО ПРЕЖНЕГО РАСХОДА кампании (не прежнего
+# лимита: тот бывает в разы выше расхода — 5 млн/нед при расходе 616 тыс. —
+# и легитимный перенос к целевому расходу вылетал бы за любой коридор).
+# Портфель капит сдвиг ×0.5–1.5 (portfolio.py); коридор чуть шире, потому что
+# рельса ловит не политику, а слом конверсии единиц: недели вместо дней (×7),
+# микрорубли вместо рублей (×10⁶) — всё это выносит соотношение за края.
+BUDGET_RATIO_MIN = 0.4
+BUDGET_RATIO_MAX = 1.6
 
 # Границы почасового расписания — СВОИ, независимые от writer/schedule.py.
 # Дублирование намеренное: рельса обязана считать сама, иначе она проверяет
@@ -48,7 +58,8 @@ SCHEDULE_STEP = 10
 # Путь ВОЗВРАТА — только set: он переписывает уже существующий объект в его
 # прежнее значение. add на этом пути означал бы создание НОВОГО объекта вместо
 # восстановления старого, то есть ещё одно изменение кабинета под видом отмены.
-ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set", "schedule.set"}
+ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set", "schedule.set",
+                                 "budget.set", "budget.set_daily"}
 
 # Куда обязан возвращать откат, в зависимости от вида ИСХОДНОГО действия.
 # Отмена добавления — нейтраль (объекта до действия не было), отмена
@@ -86,6 +97,55 @@ def check_action(action: Dict[str, Any]) -> Tuple[bool, str]:
         ok, reason = _check_schedule(action)
         if not ok:
             return False, reason
+
+    if kind in ("budget.set", "budget.set_daily"):
+        ok, reason = _check_budget(action)
+        if not ok:
+            return False, reason
+    return True, ""
+
+
+# Конверсии рельсы бюджета — СВОИ, не импорт из writer/budget.py: рельса,
+# считающая формулой построителя, пропустит любую его ошибку. Тот же довод,
+# что у границ расписания выше.
+_BUDGET_VAT = 1.2
+_BUDGET_WEEKS = 4.0
+_BUDGET_MICROS = 1_000_000
+
+
+def _check_budget(action: Dict[str, Any]) -> Tuple[bool, str]:
+    """Рельса бюджета: новый лимит против прежнего РАСХОДА кампании.
+
+    payload.Cost28dVat — расход 28 дней с НДС из той же строки budget_target,
+    по которой построено действие. Лимит, пересчитанный в расход того же окна
+    (×недели×НДС), обязан отличаться от прежнего расхода не более чем в
+    коридор: портфель капит сдвиг ×0.5–1.5, а слом конверсии единиц (недели
+    вместо дней — ×7, микрорубли вместо рублей — ×10⁶) выносит соотношение
+    за края немедленно.
+    """
+    payload = action.get("payload") or {}
+    if str(action.get("action_kind")) == "budget.set":
+        micros = payload.get("WeeklySpendLimit")
+        per_window = _BUDGET_WEEKS
+    else:
+        micros = (payload.get("DailyBudget") or {}).get("Amount")
+        per_window = 28.0
+    cost_28d = payload.get("Cost28dVat")
+    try:
+        micros_v = int(micros)
+        cost_v = float(cost_28d)
+    except (TypeError, ValueError):
+        return False, (f"поля рельсы бюджета нечитаемы: лимит {micros!r}, "
+                       f"расход Cost28dVat {cost_28d!r}")
+    if micros_v <= 0 or cost_v <= 0:
+        return False, (f"лимит и расход обязаны быть положительными: "
+                       f"лимит {micros_v}, расход {cost_v}")
+    implied_28d = micros_v / _BUDGET_MICROS * per_window * _BUDGET_VAT
+    ratio = implied_28d / cost_v
+    if not (BUDGET_RATIO_MIN <= ratio <= BUDGET_RATIO_MAX):
+        return False, (f"целевой бюджет ×{ratio:.2f} от прежнего расхода — вне "
+                       f"коридора {BUDGET_RATIO_MIN}–{BUDGET_RATIO_MAX}: похоже "
+                       f"на слом конверсии единиц, а не на решение")
     return True, ""
 
 
@@ -210,13 +270,14 @@ def check_rollback(request: Dict[str, Any]) -> Tuple[bool, str]:
     if kind not in ROLLBACK_ALLOWED_ACTION_KINDS:
         return False, f"вид действия вне allow-листа возврата: {kind}"
 
-    if kind == "schedule.set":
-        # У расписания возврат не описывается одним коэффициентом: назад едет
-        # весь блок TimeTargeting. Сверять его с прошлым состоянием здесь
-        # незачем — строитель возврата (rollback_payload) берёт блок прямо из
-        # журнала и не собирает его заново, поэтому «вернуть не туда» тут
-        # невозможно по построению. Требовать api_coefficient — значит
-        # запретить откат расписания вовсе.
+    if kind in ("schedule.set", "budget.set", "budget.set_daily"):
+        # У расписания и бюджета возврат не описывается одним коэффициентом:
+        # назад едет весь прежний блок (TimeTargeting / BiddingStrategy /
+        # DailyBudget). Сверять его с прошлым состоянием здесь незачем —
+        # строитель возврата (rollback_payload) берёт блок прямо из журнала
+        # и не собирает его заново, поэтому «вернуть не туда» тут невозможно
+        # по построению. Требовать api_coefficient — значит запретить такой
+        # откат вовсе.
         return True, ""
 
     coefficient = request.get("api_coefficient")

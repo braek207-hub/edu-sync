@@ -617,6 +617,31 @@ def rollback_guard_form(action: Dict[str, Any], service: str, method: str,
     обязан вернуть откат, сама и сверяет с тем, что построил rollback_payload.
     Посчитай ожидание здесь — сверка проверяла бы построитель им же самим.
     """
+    if str(service) == "campaigns":
+        # У campaigns.update вид не выводится из пары сервис+метод: одним
+        # методом возвращаются и расписание, и бюджет. Вид выводится из
+        # СОДЕРЖИМОГО фактического запроса — по тому же принципу «не верить
+        # полю журнала»: если построитель соберёт не тот блок, allow-лист
+        # увидит не тот вид и отклонит.
+        campaign = ((params.get("Campaigns") or [{}])[0]) or {}
+        if "TimeTargeting" in campaign:
+            kind = "schedule.set"
+        elif "DailyBudget" in campaign:
+            kind = "budget.set_daily"
+        elif (campaign.get("TextCampaign") or {}).get("BiddingStrategy"):
+            kind = "budget.set"
+        else:
+            kind = f"campaigns.{method}"  # неизвестный блок — рельса отклонит
+        return {
+            "action_kind": kind,
+            "object_level": action.get("object_level"),
+            "object_id": action.get("object_id"),
+            "api_coefficient": None,
+            "origin_action_kind": action.get("action_kind"),
+            "previous_state": action.get("previous_state") or {},
+            "payload": {"Id": campaign.get("Id")},
+        }
+
     prefix = _SERVICE_KIND_PREFIX.get(str(service), str(service))
     item = ((params.get("BidModifiers") or [{}])[0]) or {}
     return {
@@ -773,9 +798,18 @@ def rollback_one(client, action: Dict[str, Any], db_module,
         return _fail(db_module, action, NO_ID_REASON, True, journal_ok)
 
     service, method, params = request
-    item = ((params.get("BidModifiers") or [{}])[0]) or {}
-    if item.get("Id") is None or item.get("BidModifier") is None:
-        return _fail(db_module, action, INCOMPLETE_REASON, True, journal_ok)
+    if str(service) == "campaigns":
+        # Возврат через campaigns.update (расписание, бюджет): полнота — это
+        # Id кампании и хотя бы один возвращаемый блок. Проверка по
+        # BidModifiers здесь хоронила такие откаты как «тело неполное».
+        campaign = ((params.get("Campaigns") or [{}])[0]) or {}
+        has_block = any(k for k in campaign if k != "Id")
+        if campaign.get("Id") is None or not has_block:
+            return _fail(db_module, action, INCOMPLETE_REASON, True, journal_ok)
+    else:
+        item = ((params.get("BidModifiers") or [{}])[0]) or {}
+        if item.get("Id") is None or item.get("BidModifier") is None:
+            return _fail(db_module, action, INCOMPLETE_REASON, True, journal_ok)
 
     ok, reason = check_rollback(rollback_guard_form(action, service, method, params))
     if not ok:

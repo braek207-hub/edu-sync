@@ -1,0 +1,333 @@
+# -*- coding: utf-8 -*-
+"""
+tests/test_agent_writer_budget.py — тесты рычага бюджетов (Э3.3):
+план сдвигов, чтение/замена лимита, diff, рельсы, путь возврата.
+"""
+
+import copy
+
+from sync.agent.writer.apply import to_api_call
+from sync.agent.writer.budget import (
+    NO_LIMIT_REASON,
+    NOT_APPLICABLE_UP_REASON,
+    PACKAGE_REASON,
+    TWO_CHANNEL_REASON,
+    desired_weekly_micros,
+    diff_budget,
+    plan_budget_moves,
+    read_weekly_limit,
+    strategy_with_limit,
+)
+from sync.agent.writer.guardrails import check_action, check_rollback
+from sync.agent.writer.rollback import rollback_payload
+from sync.agent_e1_watchdog import rollback_guard_form
+
+M = 1_000_000
+
+
+def _target_row(target, current, rel_error=0.1):
+    return {"setting_kind": "budget_target", "setting_key": "target_28d",
+            "value": target, "raw_value": current, "support_n": 100,
+            "rel_error": rel_error}
+
+
+def _strategy(weekly_micros, channel="Search"):
+    """Блок BiddingStrategy формы campaigns.get: лимит в одном канале."""
+    other = "Network" if channel == "Search" else "Search"
+    return {
+        channel: {
+            "BiddingStrategyType": "AVERAGE_CPA",
+            "AverageCpa": {"AverageCpa": 3000 * M, "GoalId": 42,
+                           "WeeklySpendLimit": weekly_micros},
+        },
+        other: {"BiddingStrategyType": "SERVING_OFF"},
+    }
+
+
+# ------------------------------------------------------------- конверсия
+
+
+def test_weekly_micros_strips_vat_and_weeks():
+    # 480 000 ₽ с НДС за 28 дней → 120 000/нед с НДС → 100 000/нед без НДС.
+    assert desired_weekly_micros(480_000.0) == 100_000 * M
+
+
+def test_weekly_micros_rounds_to_whole_rubles():
+    micros = desired_weekly_micros(100_000.0)
+    assert micros % M == 0
+
+
+# ----------------------------------------------------------------- план
+
+
+def test_plan_takes_confident_shift():
+    plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=0.05)]})
+    assert "1" in plan["desired"]
+    assert plan["desired"]["1"]["ratio"] == 1.5
+
+
+def test_plan_rejects_low_confidence():
+    # Ошибка решения такого размера не даёт p_sign>=0.90 для сдвига ×1.2.
+    plan = plan_budget_moves({"1": [_target_row(120_000, 100_000, rel_error=0.9)]})
+    assert not plan["desired"]
+    assert len(plan["low_confidence"]) == 1
+
+
+def test_plan_skips_small_shift():
+    plan = plan_budget_moves({"1": [_target_row(104_000, 100_000, rel_error=0.01)]})
+    assert not plan["desired"]
+    assert plan["small_shift"] == 1
+
+
+def test_plan_counts_unknown_confidence():
+    plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=None)]})
+    # Нет rel_error — уверенность неизвестна; для бюджета это НЕ допуск:
+    # сдвиг без ошибки решения не планируется, но и не теряется молча.
+    assert plan["confidence_unknown"] == 1
+    assert "1" in plan["desired"]
+
+
+# ------------------------------------------------------- чтение лимита
+
+
+def test_read_limit_single_channel():
+    channel, micros, reason = read_weekly_limit(_strategy(200_000 * M))
+    assert (channel, micros, reason) == ("Search", 200_000 * M, "")
+
+
+def test_read_limit_two_channels_refused():
+    strategy = _strategy(200_000 * M)
+    strategy["Network"] = {"BiddingStrategyType": "WB_MAXIMUM_CONVERSION_RATE",
+                           "WbMaximumConversionRate": {"WeeklySpendLimit": 50_000 * M}}
+    channel, _, reason = read_weekly_limit(strategy)
+    assert channel is None
+    assert reason == TWO_CHANNEL_REASON
+
+
+def test_read_limit_absent():
+    strategy = {"Search": {"BiddingStrategyType": "HIGHEST_POSITION"},
+                "Network": {"BiddingStrategyType": "SERVING_OFF"}}
+    channel, _, reason = read_weekly_limit(strategy)
+    assert channel is None
+    assert reason == NO_LIMIT_REASON
+
+
+def test_strategy_with_limit_preserves_siblings_and_source():
+    strategy = _strategy(200_000 * M)
+    before = copy.deepcopy(strategy)
+    out = strategy_with_limit(strategy, "Search", 90_000 * M)
+    assert out["Search"]["AverageCpa"]["WeeklySpendLimit"] == 90_000 * M
+    # Соседние поля стратегии не тронуты, исходный блок не мутирован.
+    assert out["Search"]["AverageCpa"]["GoalId"] == 42
+    assert strategy == before
+
+
+# ------------------------------------------------------------------ diff
+
+
+def _move(target, current):
+    return {"target_28d": target, "cost_28d": current,
+            "ratio": round(target / current, 4), "p_sign": 0.99}
+
+
+def _state(weekly_micros=None, daily_micros=None, package_id=None,
+           campaign_type="TEXT_CAMPAIGN"):
+    return {
+        "campaign_type": campaign_type,
+        "strategy": _strategy(weekly_micros) if weekly_micros else {
+            "Search": {"BiddingStrategyType": "HIGHEST_POSITION"},
+            "Network": {"BiddingStrategyType": "SERVING_OFF"}},
+        "daily_budget": ({"Amount": daily_micros, "Mode": "STANDARD"}
+                         if daily_micros else None),
+        "package_id": package_id,
+    }
+
+
+def test_down_move_builds_action_with_previous_state():
+    # Расход 480 000/28д с НДС (100 000/нед без НДС), лимит висит на 5 млн.
+    actions, refused = diff_budget(
+        {"1": _move(240_000, 480_000)},
+        {"1": _state(weekly_micros=5_000_000 * M)},
+        {"1": 100_000.0})
+    assert not refused
+    assert len(actions) == 1
+    a = actions[0]
+    assert a["action_kind"] == "budget.set"
+    assert a["payload"]["WeeklySpendLimit"] == 50_000 * M
+    assert a["previous_state"]["WeeklySpendLimit"] == 5_000_000 * M
+    # Блок previous — целиком, для отката.
+    assert "Search" in a["previous_state"]["BiddingStrategy"]
+
+
+def test_up_move_on_loose_limit_refused():
+    actions, refused = diff_budget(
+        {"1": _move(720_000, 480_000)},
+        {"1": _state(weekly_micros=5_000_000 * M)},
+        {"1": 100_000.0})
+    assert not actions
+    assert refused[0]["reason"] == NOT_APPLICABLE_UP_REASON.format(share=0.9)
+
+
+def test_up_move_on_binding_limit_builds_action():
+    # Лимит 100 000/нед, расход 100 000/нед — упирается; цель ×1.5.
+    actions, refused = diff_budget(
+        {"1": _move(720_000, 480_000)},
+        {"1": _state(weekly_micros=100_000 * M)},
+        {"1": 100_000.0})
+    assert not refused
+    assert actions[0]["payload"]["WeeklySpendLimit"] == 150_000 * M
+
+
+def test_already_set_produces_nothing():
+    actions, refused = diff_budget(
+        {"1": _move(240_000, 480_000)},
+        {"1": _state(weekly_micros=50_000 * M)},   # уже стоит целевой
+        {"1": 100_000.0})
+    assert not actions and not refused
+
+
+def test_package_strategy_refused():
+    actions, refused = diff_budget(
+        {"1": _move(240_000, 480_000)},
+        {"1": _state(weekly_micros=100_000 * M, package_id=708062738)},
+        {"1": 100_000.0})
+    assert not actions
+    assert refused[0]["reason"] == PACKAGE_REASON.format(strategy_id=708062738)
+
+
+def test_daily_budget_branch_for_manual_strategy():
+    # HIGHEST_POSITION: лимита в стратегии нет, есть DailyBudget 30 000 ₽.
+    actions, refused = diff_budget(
+        {"1": _move(240_000, 480_000)},
+        {"1": _state(daily_micros=30_000 * M)},
+        {"1": 100_000.0})
+    assert not refused
+    a = actions[0]
+    assert a["action_kind"] == "budget.set_daily"
+    # 50 000/нед → 7143 ₽/день, округление до рубля.
+    assert a["payload"]["DailyBudget"]["Amount"] == 7143 * M
+    assert a["payload"]["DailyBudget"]["Mode"] == "STANDARD"
+    assert a["previous_state"]["DailyBudget"]["Amount"] == 30_000 * M
+
+
+def test_no_limit_no_daily_refused():
+    actions, refused = diff_budget(
+        {"1": _move(240_000, 480_000)},
+        {"1": _state()},
+        {"1": 100_000.0})
+    assert not actions
+    assert refused[0]["reason"] == NO_LIMIT_REASON
+
+
+def test_unknown_campaign_type_refused():
+    actions, refused = diff_budget(
+        {"1": _move(240_000, 480_000)},
+        {"1": _state(weekly_micros=100_000 * M, campaign_type="UNIFIED_CAMPAIGN")},
+        {"1": 100_000.0})
+    assert not actions
+    assert len(refused) == 1
+
+
+def test_missing_campaign_neither_action_nor_refusal():
+    actions, refused = diff_budget({"1": _move(240_000, 480_000)}, {}, {})
+    assert not actions and not refused
+
+
+# ------------------------------------------------------------ API-формы
+
+
+def _sample_action():
+    actions, _ = diff_budget(
+        {"1": _move(240_000, 480_000)},
+        {"1": _state(weekly_micros=5_000_000 * M)},
+        {"1": 100_000.0})
+    return actions[0]
+
+
+def test_to_api_call_sends_strategy_only():
+    service, method, params = to_api_call(_sample_action())
+    assert (service, method) == ("campaigns", "update")
+    campaign = params["Campaigns"][0]
+    assert campaign["Id"] == 1
+    assert "BiddingStrategy" in campaign["TextCampaign"]
+    # Служебные поля рельсы в API не уезжают.
+    assert "Cost28dVat" not in str(params)
+
+
+def test_to_api_call_daily():
+    actions, _ = diff_budget(
+        {"1": _move(240_000, 480_000)},
+        {"1": _state(daily_micros=30_000 * M)},
+        {"1": 100_000.0})
+    service, method, params = to_api_call(actions[0])
+    assert (service, method) == ("campaigns", "update")
+    assert params["Campaigns"][0]["DailyBudget"]["Amount"] == 7143 * M
+
+
+# ---------------------------------------------------------------- рельсы
+
+
+def test_check_action_passes_valid_budget():
+    ok, reason = check_action(_sample_action())
+    assert ok, reason
+
+
+def test_check_action_catches_unit_break():
+    action = _sample_action()
+    # Слом конверсии: недельный лимит посчитан как дневной ×7.
+    action["payload"]["WeeklySpendLimit"] *= 7
+    ok, reason = check_action(action)
+    assert not ok
+    assert "коридора" in reason
+
+
+def test_check_action_requires_cost_field():
+    action = _sample_action()
+    del action["payload"]["Cost28dVat"]
+    ok, _ = check_action(action)
+    assert not ok
+
+
+# ------------------------------------------------------------------ откат
+
+
+def test_rollback_restores_whole_strategy():
+    request = rollback_payload(_sample_action())
+    assert request is not None
+    service, method, params = request
+    assert (service, method) == ("campaigns", "update")
+    strategy = params["Campaigns"][0]["TextCampaign"]["BiddingStrategy"]
+    assert strategy["Search"]["AverageCpa"]["WeeklySpendLimit"] == 5_000_000 * M
+
+
+def test_rollback_without_previous_state_is_none():
+    action = _sample_action()
+    action["previous_state"] = {}
+    assert rollback_payload(action) is None
+
+
+def test_rollback_daily():
+    actions, _ = diff_budget(
+        {"1": _move(240_000, 480_000)},
+        {"1": _state(daily_micros=30_000 * M)},
+        {"1": 100_000.0})
+    service, method, params = rollback_payload(actions[0])
+    assert (service, method) == ("campaigns", "update")
+    assert params["Campaigns"][0]["DailyBudget"]["Amount"] == 30_000 * M
+
+
+def test_rollback_passes_return_guard():
+    action = _sample_action()
+    service, method, params = rollback_payload(action)
+    form = rollback_guard_form(action, service, method, params)
+    # Вид выведен из СОДЕРЖИМОГО запроса, не из журнала.
+    assert form["action_kind"] == "budget.set"
+    ok, reason = check_rollback(form)
+    assert ok, reason
+
+
+def test_guard_form_distinguishes_schedule_from_budget():
+    form = rollback_guard_form(
+        {"object_id": "1"}, "campaigns", "update",
+        {"Campaigns": [{"Id": 1, "TimeTargeting": {"Schedule": {"Items": []}}}]})
+    assert form["action_kind"] == "schedule.set"

@@ -216,6 +216,12 @@ def plan_bid_modifiers(
         # что умеет применять соседняя ветка.
         if kind == SCHEDULE_KIND:
             continue
+        # Целевой бюджет (Э3.2) — тоже свой путь (plan_budget_moves →
+        # campaigns.update), не корректировка. Без скипа строка budget_target
+        # шла бы в unsupported, и отчёт говорил бы «применить не умеем» про
+        # то, что применяет соседний рычаг.
+        if kind == BUDGET_TARGET_KIND:
+            continue
         # Отбор по виду настройки СНЯТ намеренно. Прежде незнакомый вид
         # (schedule:*, bid_modifier:network) выпадал здесь молча: строка не
         # попадала ни в desired, ни в unsupported, и отчёт прогона был
@@ -297,6 +303,8 @@ def _resolve_device_exclusion(
 
 
 SCHEDULE_KIND = "schedule:hour"
+# Вид строк Э3.2 (portfolio.computed_rows): их применяет рычаг бюджета.
+BUDGET_TARGET_KIND = "budget_target"
 # Часов в профиле 24, и порог значимости у каждого свой. Но само расписание —
 # ОДНО действие на кампанию: Директ принимает Schedule целиком, а не по часу.
 # Поэтому решение «менять ли расписание» принимается по набору: хотя бы один

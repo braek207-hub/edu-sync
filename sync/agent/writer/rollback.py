@@ -148,6 +148,28 @@ def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[st
             "BidModifiers": [{"Id": modifier_id, "BidModifier": delta_to_api(0)}]
         }
 
+    if kind == "budget.set":
+        # Назад едет ВЕСЬ прежний блок BiddingStrategy из журнала — тем же
+        # правилом, что у расписания ниже: пересборка из одного лимита стёрла
+        # бы соседние поля стратегии (цель, BidCeiling), настроенные человеком.
+        previous_strategy = previous.get("BiddingStrategy")
+        campaign_id = (action.get("payload") or {}).get("CampaignId") or action.get("object_id")
+        if previous_strategy is None or campaign_id is None:
+            return None
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(campaign_id),
+                           "TextCampaign": {"BiddingStrategy": previous_strategy}}]
+        }
+
+    if kind == "budget.set_daily":
+        previous_daily = previous.get("DailyBudget")
+        campaign_id = (action.get("payload") or {}).get("CampaignId") or action.get("object_id")
+        if previous_daily is None or campaign_id is None:
+            return None
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(campaign_id), "DailyBudget": previous_daily}]
+        }
+
     if kind == "schedule.set":
         # Возвращается ВЕСЬ прежний блок TimeTargeting, а не только часы:
         # вместе с расписанием в нём живут праздничный режим и учёт рабочих
