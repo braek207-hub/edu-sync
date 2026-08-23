@@ -13,6 +13,7 @@ DDL идемпотентен: ensure_agent_tables() безопасно вызы�
 """
 
 import json
+from collections import Counter, defaultdict
 from datetime import date
 from typing import Any, Dict, List, Optional
 
@@ -250,6 +251,48 @@ def load_lead_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
         """,
         (date_from, date_to),
     )
+
+
+def load_device_bridge(date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    """Мост «лид → устройство»: crm_lead_details.client_id × визиты Метрики.
+
+    Устройство клиента — самое частое по его визитам (клиент мог ходить с двух).
+    JOIN LATERAL по client_id здесь нельзя: у edu_visit_behavior нет индекса по
+    client_id, per-lead lookup превращается в seq scan на каждый лид. Таблица
+    визитов ограничена клиентами-лидами по построению синка, поэтому две
+    агрегатные выборки + склейка в питоне — секунды (замер probe 32622086445).
+    Покрытие ~56 % лидов (client_id есть только у веб-лидов vuz) — потребитель
+    обязан переносить ОТНОШЕНИЯ сегментов, не уровни.
+    """
+    leads = _fetch_dicts(
+        """
+        SELECT client_id, is_eff, is_connected, is_deal, is_paid, amount,
+               direction
+        FROM crm_lead_details
+        WHERE created_date BETWEEN %s AND %s AND client_id IS NOT NULL
+        """,
+        (date_from, date_to),
+    )
+    votes = _fetch_dicts(
+        """
+        SELECT client_id, device_category, COUNT(*) AS n
+        FROM edu_visit_behavior
+        WHERE device_category IS NOT NULL
+        GROUP BY client_id, device_category
+        """,
+        (),
+    )
+    tally: Dict[str, Counter] = defaultdict(Counter)
+    for v in votes:
+        tally[str(v["client_id"])][v["device_category"]] += int(v["n"])
+    device_of = {cid: c.most_common(1)[0][0] for cid, c in tally.items()}
+
+    out: List[Dict[str, Any]] = []
+    for r in leads:
+        device = device_of.get(str(r["client_id"]))
+        if device is not None:
+            out.append({**r, "device": device})
+    return out
 
 
 def load_score_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
