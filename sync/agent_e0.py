@@ -48,6 +48,10 @@ from sync.agent.objects import (
 )
 from sync.agent.power import power_report
 from sync.agent.profile import build_profile, campaign_quality, distance_to_profile
+from sync.agent.segment_quality import (
+    apply_quality_to_modifiers,
+    device_quality_ratios,
+)
 from sync.agent.segments import (
     fetch_account_goal_ids,
     fetch_campaign_ids,
@@ -172,6 +176,10 @@ LADDER_WINDOW_DAYS = 90
 # probe_economics (прогон 32590373892): p90 = 33 дня, к 30-му дню видно 88 %
 # выручки когорты. Значение НЕ константа — каждый прогон выводит его из данных.
 LADDER_MATURITY_PERCENTILE = 0.90
+# Мост «лид → устройство» для качества сегментов (Э2.2b): окно длинное, потому
+# что глубокие ступени (сделки, оплаты) редкие — за квартал планшеты не набирают
+# даже соединений. 540 дней = окно probe 32622086445, на котором мера доказана.
+BRIDGE_LOOKBACK_DAYS = 540
 
 _LADDER_FIELDS = {
     "paid": "payments_fact", "deals": "deals", "connected": "connected_leads",
@@ -465,6 +473,26 @@ def main() -> int:
                         else:
                             campaign_modifiers_by_login[job["login"]] = camp_rows
 
+    # Э2.2b: качество лида по устройствам. Конверсия клик→лид сегмента — только
+    # половина правды: замер по мосту (прогон 32622086445) показал, что
+    # планшетный лид приносит 792 ₽ против 1625 ₽ у ПК и соединяется на
+    # 8–15 п.п. хуже. Поэтому device-корректировки (и кабинетные, и
+    # покампанийные Э2.2) домножаются на отношение ожидаемой выручки на лид
+    # сегмента к базе моста. Окно моста — зрелое: свежие лиды ещё не доехали
+    # до глубоких ступеней и занижали бы качество всем сегментам разом.
+    quality_adjusted = 0
+    bridge_maturity = _lag_percentile(lead_rows, LADDER_MATURITY_PERCENTILE)
+    bridge_to = (date.today() - timedelta(days=bridge_maturity)).isoformat()
+    bridge_from = (date.today() - timedelta(days=BRIDGE_LOOKBACK_DAYS)).isoformat()
+    bridge_rows = agent_db.load_device_bridge(bridge_from, bridge_to)
+    device_quality, quality_reason = device_quality_ratios(bridge_rows)
+    if device_quality:
+        for rows in computed_by_account.values():
+            quality_adjusted += apply_quality_to_modifiers(rows, device_quality)
+        for by_camp in campaign_modifiers_by_login.values():
+            for rows in by_camp.values():
+                quality_adjusted += apply_quality_to_modifiers(rows, device_quality)
+
     if computed_skipped:
         agent_db.insert_guard_checks([
             {"check_name": f"computed:{sk['account']}:{sk['slice']}", "status": "SKIP",
@@ -727,6 +755,13 @@ def main() -> int:
         "computed_settings": computed_count,
         "computed_settings_by_account": {k: len(v) for k, v in computed_by_account.items()},
         "computed_settings_skipped": computed_skipped,
+        "device_quality": {
+            "bridge_leads": len(bridge_rows),
+            "bridge_window": [bridge_from, bridge_to],
+            "ratios": device_quality,
+            "reason": quality_reason,
+            "modifiers_adjusted": quality_adjusted,
+        },
         "campaign_modifiers": campaign_modifier_summary,
         "campaign_modifiers_rows": campaign_modifier_count,
         "campaign_modifiers_skipped": campaign_modifiers_skipped,

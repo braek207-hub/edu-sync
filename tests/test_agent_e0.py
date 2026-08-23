@@ -105,7 +105,7 @@ _DB_NOOPS = (
 
 _DB_EMPTY_LOADERS = (
     "load_direct_rows", "load_lead_rows", "load_score_rows",
-    "load_campaign_features", "table_sizes",
+    "load_campaign_features", "load_device_bridge", "table_sizes",
 )
 
 # Отчёты Директа по кабинетам: у каждого свои сегменты и своя конверсионность —
@@ -237,6 +237,64 @@ def test_main_writes_different_modifiers_for_different_segments(monkeypatch, cap
     value = {r["setting_key"]: r["value"] for r in written}
     # Клики у сегментов равные — разъехаться они могут только по конверсиям.
     assert value["MOBILE"] > 0 > value["DESKTOP"]
+
+
+def _bridge_leads(device, n, eff=1.0, conn=1.0, deal=1.0, paid=0.0):
+    n_eff, n_conn = int(n * eff), int(n * eff * conn)
+    n_deal = int(n * eff * conn * deal)
+    n_paid = int(n * eff * conn * deal * paid)
+    return [{"device": device, "is_eff": i < n_eff, "is_connected": i < n_conn,
+             "is_deal": i < n_deal, "is_paid": i < n_paid,
+             "amount": 100000.0 if i < n_paid else None} for i in range(n)]
+
+
+def test_main_multiplies_device_modifiers_by_lead_quality(monkeypatch, capsys):
+    """Э2.2b сквозняком: сегмент с лучшей конверсией в лид, но плохим качеством
+    лида (соединение/деньги из моста) не получает плюс по одной конверсии."""
+    import json as _json
+
+    calls = _patch_e0_run(monkeypatch)
+    # ПК доводит лиды до денег, смартфоны — вдвое хуже по соединению и оплате.
+    bridge = (_bridge_leads("ПК", 700, eff=0.9, conn=0.5, deal=0.5, paid=0.5)
+              + _bridge_leads("Смартфоны", 800, eff=0.9, conn=0.2, deal=0.5, paid=0.2))
+    monkeypatch.setattr(agent_e0.agent_db, "load_device_bridge",
+                        lambda *a, **k: bridge)
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    written = [r for call in calls if call["object_id"] == "acc-1" for r in call["rows"]]
+    mobile = next(r for r in written if r["setting_key"] == "MOBILE")
+    # По конверсии в лид MOBILE упирался в потолок +50; качество лида ~0.6
+    # обязано срезать корректировку, и обе компоненты остаются видимыми.
+    assert mobile["quality_ratio"] < 1.0
+    assert mobile["conv_ratio"] > 1.0
+    assert mobile["value"] < 50.0
+
+    # Планшетов в мосте нет — TABLET (acc-2) остаётся на чистой конверсии,
+    # отсутствие данных о качестве не обнуляет корректировку молча.
+    tablet = next(r for call in calls if call["object_id"] == "acc-2"
+                  for r in call["rows"] if r["setting_key"] == "TABLET")
+    assert "quality_ratio" not in tablet
+
+    quality = report["device_quality"]
+    assert quality["reason"] is None
+    assert set(quality["ratios"]) == {"DESKTOP", "MOBILE"}
+    assert quality["modifiers_adjusted"] >= 2
+
+
+def test_main_without_bridge_keeps_pure_conversion_and_names_reason(monkeypatch, capsys):
+    import json as _json
+
+    calls = _patch_e0_run(monkeypatch)  # мост пуст по умолчанию
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    written = [r for call in calls for r in call["rows"]]
+    assert written and all("quality_ratio" not in r for r in written)
+    assert report["device_quality"]["modifiers_adjusted"] == 0
+    assert report["device_quality"]["reason"]
 
 
 def test_main_reports_computed_settings_per_account(monkeypatch, capsys):
