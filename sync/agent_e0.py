@@ -42,6 +42,8 @@ from sync.agent.hierarchy import hierarchical_modifiers
 from sync.agent.ladder import ladder_report
 from sync.agent.history import budget_response
 from sync.agent.mining import mine_quasi_experiments
+from sync.agent.portfolio import computed_rows as portfolio_computed_rows
+from sync.agent.portfolio import portfolio_targets
 from sync.agent.saturation import computed_rows as saturation_computed_rows
 from sync.agent.saturation import saturation_curves
 from sync.agent.objects import (
@@ -276,6 +278,14 @@ def funnel_ladder_section(
     report["window_from"] = window_from
     report["window_to"] = window_to
     return report
+
+
+def _top_confident_moves(moves: Dict[str, Dict[str, Any]], limit: int = 5) -> Dict[str, Any]:
+    """Топ уверенных сдвигов бюджета по модулю переноса — для отчёта прогона."""
+    confident = [(cid, m) for cid, m in moves.items()
+                 if m["confident"] and m["move"] != "hold"]
+    confident.sort(key=lambda kv: -abs(kv[1]["target_28d"] - kv[1]["cost_28d"]))
+    return dict(confident[:limit])
 
 
 def computed_rows_for_job(job: Dict[str, Any]) -> tuple:
@@ -744,6 +754,19 @@ def main() -> int:
     # 11. Отчёт мощности, лестница воронки и фактический объём таблиц.
     report = power_report(list(aggregates.values()))
     ladder_section = funnel_ladder_section(facts, lead_rows)
+
+    # Э3.2: единый порог предельной окупаемости и целевые бюджеты — после
+    # лестницы (оттуда ценность лида) и после справочника «кампания →
+    # кабинет» (сумма переноса сходится на уровне кабинета). Расчётный слой:
+    # запись бюджетов в Директ — Э3.3.
+    budget_threshold = portfolio_targets(
+        saturation["campaigns"], ladder_section["by_object"], login_by_campaign_id)
+    budget_target_count = 0
+    for campaign_id, rows in portfolio_computed_rows(budget_threshold).items():
+        agent_db.upsert_computed_settings(
+            rows, calc_date=today_iso, object_id=campaign_id,
+            object_level="campaign")
+        budget_target_count += len(rows)
     sizes = agent_db.table_sizes()
     total_mb = round(sum(int(s["size_bytes"] or 0) for s in sizes) / 1024 / 1024, 1)
 
@@ -799,6 +822,19 @@ def main() -> int:
             },
         },
         "saturation_rows": saturation_count,
+        # Э3.2: порог и перенос бюджетов. Полные moves не влезают — по
+        # кабинету сводка и топ уверенных сдвигов по модулю переноса.
+        "budget_threshold": {
+            "campaigns_no_value": budget_threshold["campaigns_no_value"],
+            "accounts": {
+                login: {
+                    **{k: v for k, v in acc.items() if k != "moves"},
+                    "top_confident_moves": _top_confident_moves(acc["moves"]),
+                }
+                for login, acc in budget_threshold["accounts"].items()
+            },
+        },
+        "budget_target_rows": budget_target_count,
         "computed_settings": computed_count,
         "computed_settings_by_account": {k: len(v) for k, v in computed_by_account.items()},
         "computed_settings_skipped": computed_skipped,
