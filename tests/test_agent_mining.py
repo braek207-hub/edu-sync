@@ -1,4 +1,9 @@
-from sync.agent.mining import detect_change_points, did_effect, mine_quasi_experiments
+from sync.agent.mining import (
+    detect_change_points,
+    did_effect,
+    did_rel_error,
+    mine_quasi_experiments,
+)
 
 
 def test_detects_step_change():
@@ -22,57 +27,87 @@ def test_ignores_change_without_enough_history():
 def test_did_subtracts_control_movement():
     # Обработанная улучшилась на 20%, контроль — на 5%. Заслуга = 15 п.п.
     out = did_effect(treated_before=100.0, treated_after=80.0,
-                     control_before=100.0, control_after=95.0)
+                     control_before=100.0, control_after=95.0, rel_error=0.1)
     assert abs(out["effect"] - (-0.15)) < 1e-9
 
 
 def test_did_returns_none_on_zero_base():
-    out = did_effect(0.0, 80.0, 100.0, 95.0)
+    out = did_effect(0.0, 80.0, 100.0, 95.0, rel_error=0.1)
     assert out["effect"] is None
 
 
-def test_did_confidence_interval_is_wide_for_quasi():
-    out = did_effect(100.0, 80.0, 100.0, 95.0)
-    assert out["effect_lo"] < out["effect"] < out["effect_hi"]
+def test_did_interval_comes_from_lead_counts_not_from_effect_size():
+    # Прежний интервал был долей от эффекта: нулевой эффект получал почти
+    # нулевой интервал независимо от объёма данных. Теперь ширина задаётся
+    # счётчиками лидов и одинакова для большого и нулевого эффекта.
+    rel = did_rel_error(25, 25, 1000, 1000)
+    wide = did_effect(100.0, 100.0, 100.0, 100.0, rel)
+    assert abs((wide["effect_hi"] - wide["effect_lo"]) / 2 - rel) < 1e-4
 
 
-def test_mine_emits_class_b_rows():
+def test_rel_error_is_driven_by_smallest_window():
+    # Контроль с тысячами лидов почти не добавляет ошибки — её задают окна
+    # обработанной кампании.
+    assert did_rel_error(25, 25, 10000, 10000) < did_rel_error(25, 25, 30, 30)
+    assert did_rel_error(400, 400, 10000, 10000) < did_rel_error(25, 25, 10000, 10000)
+
+
+def test_zero_lead_window_counts_as_one_event_upper_bound():
+    assert did_rel_error(0, 10, 10, 10) == did_rel_error(1, 10, 10, 10)
+
+
+def _facts_row(day, campaign_id, cost, eff_leads):
+    return {"fact_date": f"2026-06-{day:02d}", "campaign_id": campaign_id,
+            "cost": cost, "eff_leads": eff_leads}
+
+
+def test_mine_emits_class_b_rows_in_eff_cpl_currency():
     facts = []
     for d in range(1, 29):
-        for cid, cost in (("111", 1000.0 if d < 15 else 2000.0), ("222", 1000.0)):
-            facts.append({
-                "fact_date": f"2026-06-{d:02d}",
-                "campaign_id": cid,
-                "cost": cost,
-                "sum_p_pay": 10.0,
-            })
+        facts.append(_facts_row(d, "111", 1000.0 if d < 15 else 2000.0, 5))
+        facts.append(_facts_row(d, "222", 1000.0, 5))
     rows = mine_quasi_experiments(facts, window=7)
     assert rows, "изменение бюджета кампании 111 должно быть найдено"
     assert all(r["reliability_class"] == "B" for r in rows)
     assert all(r["source"] == "quasi" for r in rows)
     assert all(r["mechanism"] == "did" for r in rows)
-    assert all(r["experiment_id"] for r in rows)
+    # Валюта — цена эффективного лида, не p_pay: Э2.0 закрыл sum_p_pay
+    # для агрегатных решений.
+    assert all(r["metric"] == "eff_cpl" for r in rows)
+    assert all(r["params"]["rel_error"] > 0 for r in rows)
+    assert all(set(r["params"]["leads"]) == {
+        "treated_before", "treated_after", "control_before", "control_after",
+    } for r in rows)
+
+
+def test_mine_skips_change_with_leadless_window():
+    # После скачка лидов нет вовсе — конечной цены лида не существует,
+    # эксперимент не эмитится (а не эмитится с нулём в знаменателе).
+    facts = []
+    for d in range(1, 29):
+        facts.append(_facts_row(d, "111", 1000.0 if d < 15 else 2000.0,
+                                5 if d < 15 else 0))
+        facts.append(_facts_row(d, "222", 1000.0, 5))
+    assert mine_quasi_experiments(facts, window=7) == []
 
 
 def _quasi_facts(n_control):
     """Кампания 111 удвоила бюджет 15-го; n_control ровных контрольных кампаний.
 
-    Качество контроля меняется ото дня ко дню (sum_p_pay = номер дня), поэтому
+    Цена лида контроля меняется ото дня ко дню (лидов = номер дня), поэтому
     «последние window СТРОК» и «последние window СУТОК» дают разные числа —
     на этом расхождении и ловится подмена окна.
 
-    У обработанной кампании ранняя история (1–7) намеренно другого качества, чем
-    окно 8–14: иначе окно можно было бы расширить на всю историю до перелома, и
-    ни один тест этого не заметил бы.
+    У обработанной кампании ранняя история (1–7) намеренно другого качества,
+    чем окно 8–14: иначе окно можно было бы расширить на всю историю до
+    перелома, и ни один тест этого не заметил бы.
     """
     facts = []
     for d in range(1, 29):
-        facts.append({"fact_date": f"2026-06-{d:02d}", "campaign_id": "111",
-                      "cost": 1000.0 if d < 15 else 2000.0,
-                      "sum_p_pay": 40.0 if d < 8 else 10.0})
+        facts.append(_facts_row(d, "111", 1000.0 if d < 15 else 2000.0,
+                                40 if d < 8 else 10))
         for i in range(n_control):
-            facts.append({"fact_date": f"2026-06-{d:02d}", "campaign_id": f"{200 + i}",
-                          "cost": 100.0, "sum_p_pay": float(d)})
+            facts.append(_facts_row(d, f"{200 + i}", 100.0, d))
     return facts
 
 
@@ -84,9 +119,9 @@ def test_control_window_is_measured_in_days_not_in_rows():
     """
     rows = mine_quasi_experiments(_quasi_facts(20), window=7)
     assert len(rows) == 1
-    # Контроль за те же семь суток: 08–14 → 14000/1540, 15–21 → 14000/2520,
-    # то есть −38.89 %. У обработанной +100 %. DiD = 1.3889.
-    # Обрезка по строкам брала только 14-е и 15-е числа и давала 1.0667.
+    # Обработанная: CPL 7000/70 → 14000/70, +100 %. Контроль за те же сутки:
+    # дни 08–14 CPL = 14000/(77·20)·20 = 700/77, дни 15–21 = 700/126,
+    # то есть −38.89 %. DiD = 1.0 − (−0.3889) = 1.3889.
     assert abs(rows[0]["effect"] - 1.3889) < 1e-4
 
 
@@ -99,6 +134,5 @@ def test_control_window_does_not_shrink_as_the_cabinet_grows():
 
 
 def test_mine_returns_empty_on_flat_history():
-    facts = [{"fact_date": f"2026-06-{d:02d}", "campaign_id": "111", "cost": 1000.0, "sum_p_pay": 10.0}
-             for d in range(1, 29)]
+    facts = [_facts_row(d, "111", 1000.0, 5) for d in range(1, 29)]
     assert mine_quasi_experiments(facts, window=7) == []

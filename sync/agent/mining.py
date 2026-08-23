@@ -14,12 +14,12 @@ sync/agent/mining.py — квазиэксперименты из истории 
 """
 
 import hashlib
+import math
 from datetime import date
 from statistics import mean
 from typing import Any, Dict, List, Optional, Set
 
 MIN_SIDE_DAYS = 7          # минимум дней с каждой стороны точки изменения
-QUASI_CI_WIDTH = 0.5       # ширина интервала для квазиоценки (доля от эффекта + запас)
 
 
 def detect_change_points(series: List[Dict[str, Any]], min_jump: float = 0.3) -> List[Dict[str, Any]]:
@@ -63,27 +63,51 @@ def detect_change_points(series: List[Dict[str, Any]], min_jump: float = 0.3) ->
     return deduped
 
 
+def did_rel_error(*lead_counts: int) -> float:
+    """Относительная ошибка DiD-оценки из счётчиков лидов четырёх окон.
+
+    Каждое из четырёх окон (обработанная/контроль × до/после) вносит
+    пуассоновскую дисперсию своего счётчика; дисперсии складываются, потому
+    что окна независимы. У контроля лидов тысячи и его вклад мал — ошибку
+    задают окна обработанной кампании.
+    """
+    return math.sqrt(sum(1.0 / max(int(n), 1) for n in lead_counts))
+
+
 def did_effect(
-    treated_before: float, treated_after: float, control_before: float, control_after: float
+    treated_before: float, treated_after: float,
+    control_before: float, control_after: float,
+    rel_error: float,
 ) -> Dict[str, Optional[float]]:
-    """Difference-in-differences: изменение у обработанной минус изменение у контроля."""
+    """Difference-in-differences: изменение у обработанной минус изменение у контроля.
+
+    Интервал — из пуассоновской ошибки счётчиков лидов (did_rel_error), одна
+    сигма. Прежний фиктивный интервал «доля от эффекта + запас» не имел
+    источника и делал уверенные оценки неотличимыми от шумных.
+    """
     if treated_before <= 0 or control_before <= 0:
         return {"effect": None, "effect_lo": None, "effect_hi": None}
     treated_delta = (treated_after - treated_before) / treated_before
     control_delta = (control_after - control_before) / control_before
     effect = treated_delta - control_delta
-    margin = abs(effect) * QUASI_CI_WIDTH + 0.05
     return {
         "effect": round(effect, 4),
-        "effect_lo": round(effect - margin, 4),
-        "effect_hi": round(effect + margin, 4),
+        "effect_lo": round(effect - rel_error, 4),
+        "effect_hi": round(effect + rel_error, 4),
     }
 
 
-def _quality(rows: List[Dict[str, Any]]) -> float:
+def _window_metrics(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Расход, эффективные лиды и цена лида окна.
+
+    Валюта — eff_leads, как у красных линий сторожа и базового CPA: Э2.0
+    закрыл дорогу sum_p_pay на агрегатном уровне (по направлениям хуже наивной
+    оценки на 23 %), а квазиэксперименты читаются именно агрегатно.
+    """
     cost = sum(float(r.get("cost") or 0.0) for r in rows)
-    expected = sum(float(r.get("sum_p_pay") or 0.0) for r in rows)
-    return cost / expected if expected > 0 else 0.0
+    leads = sum(int(r.get("eff_leads") or 0) for r in rows)
+    return {"cost": cost, "leads": leads,
+            "cpl": cost / leads if leads > 0 else 0.0}
 
 
 def _window_dates(
@@ -132,9 +156,23 @@ def mine_quasi_experiments(facts: List[Dict[str, Any]], window: int = 14) -> Lis
             if not (treated_before and treated_after and control_before and control_after):
                 continue
 
+            windows = {
+                "treated_before": _window_metrics(treated_before),
+                "treated_after": _window_metrics(treated_after),
+                "control_before": _window_metrics(control_before),
+                "control_after": _window_metrics(control_after),
+            }
+            if any(w["leads"] == 0 for w in windows.values()):
+                # Окно без единого лида не даёт конечной цены лида: ноль лидов
+                # после скачка бюджета — сигнал сам по себе, но мерить его как
+                # «CPL вырос на X %» нельзя. Такой скачок эксперимента не даёт.
+                continue
+
+            rel = did_rel_error(*(w["leads"] for w in windows.values()))
             measured = did_effect(
-                _quality(treated_before), _quality(treated_after),
-                _quality(control_before), _quality(control_after),
+                windows["treated_before"]["cpl"], windows["treated_after"]["cpl"],
+                windows["control_before"]["cpl"], windows["control_after"]["cpl"],
+                rel,
             )
             if measured["effect"] is None:
                 continue
@@ -144,11 +182,15 @@ def mine_quasi_experiments(facts: List[Dict[str, Any]], window: int = 14) -> Lis
                 "hypothesis_type": "budget_change",
                 "object_level": "campaign",
                 "object_id": campaign_id,
-                "params": {"jump": point["jump"], "before": point["before"], "after": point["after"]},
+                "params": {
+                    "jump": point["jump"], "before": point["before"], "after": point["after"],
+                    "rel_error": round(rel, 4),
+                    "leads": {k: w["leads"] for k, w in windows.items()},
+                },
                 "mechanism": "did",
                 "started_on": change_date,
                 "measured_on": change_date,
-                "metric": "cost_per_expected_payment",
+                "metric": "eff_cpl",
                 "verdict": "improved" if measured["effect"] < 0 else "worsened",
                 "reliability_class": "B",
                 "source": "quasi",

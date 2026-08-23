@@ -40,6 +40,7 @@ from sync.agent.metrika import (
 )
 from sync.agent.hierarchy import hierarchical_modifiers
 from sync.agent.ladder import ladder_report
+from sync.agent.history import budget_response
 from sync.agent.mining import mine_quasi_experiments
 from sync.agent.objects import (
     build_object_rows,
@@ -379,9 +380,12 @@ def main() -> int:
     holdout = select_holdout(list(aggregates.values()))
     agent_db.upsert_holdout(holdout, included_on=today_iso)
 
-    # 5. Квазиэксперименты → блокнот.
+    # 5. Квазиэксперименты → блокнот; тут же — их чтение (Э2.4): сигнал
+    # насыщения по кампаниям и направлениям, вход кривых Э3.1.
     quasi = mine_quasi_experiments(facts)
     agent_db.upsert_experiments(quasi)
+    history = budget_response(
+        quasi, {str(f["campaign_id"]): f.get("direction") for f in facts})
 
     slice_from = (date.today() - timedelta(days=SLICE_WINDOW_DAYS)).isoformat()
     queries_from = (date.today() - timedelta(days=QUERY_WINDOW_DAYS)).isoformat()
@@ -752,6 +756,17 @@ def main() -> int:
         "settings_snapshots": len(snapshot_rows),
         "holdout": len(holdout),
         "quasi_experiments": len(quasi),
+        # Э2.4: чтение истории. Полный покампанийный разрез в отчёт не влезает —
+        # печатаются направления целиком и только уверенные кампании.
+        "history": {
+            **{k: v for k, v in history.items() if k != "campaigns"},
+            "campaigns_confident_sample": {
+                cid: row for cid, row in sorted(
+                    history["campaigns"].items(),
+                    key=lambda kv: -(kv[1]["p_sign"] or 0.0),
+                )[:10] if row["verdict"] != "неопределённо"
+            },
+        },
         "computed_settings": computed_count,
         "computed_settings_by_account": {k: len(v) for k, v in computed_by_account.items()},
         "computed_settings_skipped": computed_skipped,
