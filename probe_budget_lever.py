@@ -62,10 +62,23 @@ def _report(conn) -> int:
                (settings #>> '{strategy,search,weeklyBudget}')::float  AS weekly_search,
                (settings #>> '{strategy,network,weeklyBudget}')::float AS weekly_network,
                (settings #>> '{strategy,dailyBudget}')::float AS daily_budget,
-               settings #> '{strategy,package}' IS NOT NULL AS is_package
+               settings #> '{strategy,package}' IS NOT NULL AS is_package,
+               settings #>> '{strategy,package,id}'   AS package_id,
+               settings #>> '{strategy,package,name}' AS package_name,
+               settings #>> '{strategy,package,type}' AS package_type,
+               (settings #>> '{strategy,package,weeklyBudget}')::float AS package_weekly
         FROM edu_campaign_settings
     """)
     by_id = {str(r["campaign_id"]): r for r in settings}
+
+    # Расход 28 зрелых дней ВСЕХ кампаний (не только целевых): кампании без
+    # budget_target, сидящие на том же пакете, тратят тот же общий лимит.
+    spend = {str(r["campaign_id"]): float(r["cost"] or 0) for r in q(cur, """
+        SELECT campaign_id, SUM(cost) AS cost
+        FROM edu_agent_facts
+        WHERE fact_date >= CURRENT_DATE - 28
+        GROUP BY campaign_id
+    """)}
 
     out = []
     counters = {"total": 0, "no_settings_row": 0, "package": 0,
@@ -91,6 +104,7 @@ def _report(conn) -> int:
             "search_type": s["search_type"], "network_type": s["network_type"],
             "weekly_search": s["weekly_search"], "weekly_network": s["weekly_network"],
             "daily_budget": s["daily_budget"], "package": bool(s["is_package"]),
+            "package_id": s["package_id"],
         })
         key = f"{s['campaign_type']}/{s['search_type']}/{s['network_type']}"
         strategy_types[key] = strategy_types.get(key, 0) + 1
@@ -107,9 +121,43 @@ def _report(conn) -> int:
             counters["binding" if row["binding"] else "not_binding"] += 1
         out.append(row)
 
+    # Карта пакетов: кто ещё делит пакет с целевыми кампаниями, суммарный
+    # расход участников против недельного лимита пакета.
+    target_ids = {str(t["campaign_id"]) for t in targets}
+    packages: dict = {}
+    for r in settings:
+        pid = r["package_id"]
+        if not pid:
+            continue
+        p = packages.setdefault(str(pid), {
+            "name": r["package_name"], "type": r["package_type"],
+            "weekly_budget": r["package_weekly"],
+            "members": [], "target_members": [],
+            "members_spend_28d": 0.0,
+        })
+        cid = str(r["campaign_id"])
+        p["members"].append(cid)
+        if cid in target_ids:
+            p["target_members"].append(cid)
+        p["members_spend_28d"] += spend.get(cid, 0.0)
+    shared = {pid: p for pid, p in packages.items() if p["target_members"]}
+    for p in shared.values():
+        p["members"] = len(p["members"])
+        p["members_spend_28d"] = round(p["members_spend_28d"])
+        wl = p["weekly_budget"]
+        p["binding"] = (bool(wl)
+                        and p["members_spend_28d"] / 4 / VAT >= BINDING_SHARE * wl)
+
     print(json.dumps({
         "counters": counters,
         "strategy_types": strategy_types,
+        "packages_of_targets": {
+            "count": len(shared),
+            "single_member": sum(1 for p in shared.values() if p["members"] == 1),
+            "multi_member": sum(1 for p in shared.values() if p["members"] > 1),
+            "detail": dict(sorted(shared.items(),
+                                  key=lambda kv: -kv[1]["members_spend_28d"])),
+        },
         "campaigns": sorted(out, key=lambda r: -r["cost_28d"]),
     }, ensure_ascii=False, indent=2))
     return 0
