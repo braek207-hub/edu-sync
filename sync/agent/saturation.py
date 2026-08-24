@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.confidence import assess
 from sync.agent.history import MIN_LOG_JUMP, combine, elasticity
-from sync.agent.mining import did_effect, did_rel_error
+from sync.agent.mining import RTM_SIGMA_THRESHOLD, did_effect, did_rel_error
 
 # Границы β. Ниже 0.15 предельная цена взлетает в десятки средних CPL — на
 # наших ошибках (rel_error свода ≥ 0.2) такая крутизна неотличима от шума и
@@ -74,7 +74,8 @@ def weekly_pair_observations(
     """
     quasi_dates_by_campaign = quasi_dates_by_campaign or {}
     if not facts:
-        return {}, {"pairs_checked": 0, "pairs_used": 0, "pairs_quasi_overlap": 0}
+        return {}, {"pairs_checked": 0, "pairs_used": 0,
+                    "pairs_quasi_overlap": 0, "pairs_rtm_suspect": 0}
 
     min_date = min(str(f["fact_date"])[:10] for f in facts)
     # Первый понедельник не раньше начала окна и последнее зрелое воскресенье.
@@ -101,7 +102,8 @@ def weekly_pair_observations(
         total["leads"] += leads
 
     out: Dict[str, List[Dict[str, float]]] = {}
-    stats = {"pairs_checked": 0, "pairs_used": 0, "pairs_quasi_overlap": 0}
+    stats = {"pairs_checked": 0, "pairs_used": 0, "pairs_quasi_overlap": 0,
+             "pairs_rtm_suspect": 0}
     for campaign_id, by_week in sorted(weekly.items()):
         weeks = sorted(by_week)
         quasi_dates = quasi_dates_by_campaign.get(campaign_id, [])
@@ -123,6 +125,14 @@ def weekly_pair_observations(
             pair_end = (date.fromisoformat(w2) + timedelta(days=6)).isoformat()
             if any(w1 <= d <= pair_end for d in quasi_dates):
                 stats["pairs_quasi_overlap"] += 1
+                continue
+            # Та же ловушка возврата к среднему, что у квазиэкспериментов
+            # (mining.pre_trend_check): бюджет меняют В ОТВЕТ на всплеск цены
+            # лида, и DiD припишет возвращение всплеска заслуге правки. Если
+            # неделя «до» сама выбивается из предыдущих недель кампании
+            # больше чем на RTM_SIGMA_THRESHOLD сигм — пара не наблюдение.
+            if _week_is_rtm_suspect(by_week, weeks, index - 1):
+                stats["pairs_rtm_suspect"] += 1
                 continue
             # Контроль = кабинет минус кампания за те же две недели.
             c1 = {"cost": totals[w1]["cost"] - t1["cost"],
@@ -152,6 +162,41 @@ def weekly_pair_observations(
                 "rel_error": rel / abs(log_jump),
             })
     return out, stats
+
+
+def _week_is_rtm_suspect(by_week: Dict[str, Dict[str, float]],
+                         weeks: List[str], w1_index: int,
+                         baseline_weeks: int = 2) -> bool:
+    """Выбивается ли неделя «до» из собственной истории кампании перед ней.
+
+    База — baseline_weeks недель прямо перед w1 (только соседние, без
+    пропусков: разрыв в ряду означает другую жизнь кампании). Сравнение в
+    логарифмах и сигмах пуассоновского счёта лидов обоих окон, порог тот же,
+    что у квазиэкспериментов. Базы нет или в ней нет лидов — судить не о чем,
+    пара остаётся наблюдением: молчаливое «подозрительно» на нехватке данных
+    выбросило бы всю раннюю историю.
+    """
+    if w1_index <= 0:
+        return False
+    w1 = weeks[w1_index]
+    base_cost = base_leads = 0.0
+    day = date.fromisoformat(w1)
+    for step in range(1, baseline_weeks + 1):
+        want = (day - timedelta(days=7 * step)).isoformat()
+        cell = by_week.get(want)
+        if cell is None:
+            break
+        base_cost += cell["cost"]
+        base_leads += cell["leads"]
+    pre = by_week[w1]
+    if base_leads <= 0 or pre["leads"] <= 0 or base_cost <= 0 or pre["cost"] <= 0:
+        return False
+    pre_cpl = pre["cost"] / pre["leads"]
+    base_cpl = base_cost / base_leads
+    sigma = math.sqrt(1.0 / pre["leads"] + 1.0 / base_leads)
+    if sigma <= 0:
+        return False
+    return abs(math.log(pre_cpl / base_cpl)) / sigma > RTM_SIGMA_THRESHOLD
 
 
 def _pooled_eps(

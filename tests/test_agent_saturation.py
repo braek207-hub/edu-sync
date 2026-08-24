@@ -201,10 +201,40 @@ def test_weekly_pairs_do_not_share_a_week():
     # свод дважды, а свод считает их независимыми и фиктивно сужает ошибку.
     # Использованная пара забирает свои недели: следующая начинается с w3.
     facts = _stable_control(weeks=5)
-    for week, cost in enumerate((100.0, 300.0, 100.0, 300.0, 100.0)):
-        facts += _facts("111", week, cost, 2)
+    # Лиды меняются вместе с расходом: цена лида ровная, и фильтр возврата к
+    # среднему (_week_is_rtm_suspect) в этот тест не вмешивается — проверяется
+    # только то, что пары не делят неделю.
+    for week, (cost, leads) in enumerate(
+            ((100.0, 2), (300.0, 6), (100.0, 2), (300.0, 6), (100.0, 2))):
+        facts += _facts("111", week, cost, leads)
     obs, stats = weekly_pair_observations(facts, _sunday(4))
     # Пять недель со скачком в каждой паре: непересекающихся пар две
     # (w0–w1 и w2–w3), а не четыре.
     assert stats["pairs_used"] == 2
     assert len(obs["111"]) == 2
+
+
+def test_weekly_pair_after_a_cpl_spike_is_skipped_as_rtm():
+    # Та же ловушка, что у квазиэкспериментов (mining.pre_trend_check): пара
+    # недель, у которой неделя «до» сама выбивается из истории кампании,
+    # меряет возврат к среднему, а не эффект бюджета.
+    facts = _stable_control(weeks=5)
+    facts += _facts("111", 0, 1000.0, 20)      # спокойная база: CPL 50
+    facts += _facts("111", 1, 1000.0, 20)
+    facts += _facts("111", 2, 1000.0, 5)       # всплеск CPL 200
+    facts += _facts("111", 3, 500.0, 10)       # срезали бюджет, CPL вернулся
+    facts += _facts("111", 4, 500.0, 10)
+    obs, stats = weekly_pair_observations(facts, _sunday(4))
+    assert stats["pairs_rtm_suspect"] >= 1
+    assert "111" not in obs
+
+
+def test_weekly_pair_on_calm_history_is_used():
+    facts = _stable_control(weeks=5)
+    for week in range(3):
+        facts += _facts("111", week, 1000.0, 20)
+    facts += _facts("111", 3, 2000.0, 30)      # скачок бюджета на ровной истории
+    facts += _facts("111", 4, 2000.0, 30)
+    obs, stats = weekly_pair_observations(facts, _sunday(4))
+    assert stats["pairs_rtm_suspect"] == 0
+    assert obs.get("111")
