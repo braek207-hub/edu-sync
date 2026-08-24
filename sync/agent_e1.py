@@ -56,6 +56,7 @@ from sync.agent import db as agent_db
 from sync.agent.gate import data_gate
 from sync.agent.writer import budget
 from sync.agent.writer import switch
+from sync.agent.writer import negatives
 from sync.agent.writer import tcpa
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import apply_actions
@@ -1115,6 +1116,13 @@ def run_account(
     # Э3.5: цели CPA — план ДО раннего выхода, тем же правилом, что бюджет.
     tcpa_plan = tcpa.plan_tcpa_moves(fresh_campaign_computed)
 
+    # Э3.6: минус-фразы. Кандидатов посчитал Э0 и разложил по кампаниям
+    # строками computed; здесь они собираются обратно в фразы и режутся
+    # капом такта: отсечённый трафик не вернуть, и такт обязан оставаться
+    # различимым в наблюдении.
+    negatives_plan = negatives.plan_negatives(
+        negatives.candidates_from_computed(fresh_campaign_computed))
+
     # Э3.4: кандидаты на выключение — тем же правилом, что бюджет: план ДО
     # раннего выхода, ограничитель прогона уже в scoped_ids.
     switch_plan = switch.plan_switch_offs(fresh_campaign_computed)
@@ -1144,6 +1152,11 @@ def run_account(
                                      cooled=budget_cooled),
             "switch": _switch_report(switch_plan, switch_desired),
             "tcpa": _tcpa_report(tcpa_plan, {}),
+            "negatives": {"campaigns": 0, "phrases": 0,
+                          "over_cap": negatives_plan["over_cap"],
+                          "invalid": len(negatives_plan["invalid"]),
+                          "cost_covered": negatives_plan["cost_covered"],
+                          "refused": 0, "not_found": 0, "actions_planned": 0},
             "unsupported": unsupported,
             "campaign_level": campaign_level_report,
             "confidence": confidence_report,
@@ -1236,6 +1249,27 @@ def run_account(
             blocked.append({**action, "blocked_reason": reason})
             continue
         tcpa_planned_count += 1
+        planned.append({**action, "account": login})
+
+    # Э3.6: применение минус-фраз. Список читается СВЕЖИМ и заменяется
+    # целиком объединением прежних и новых фраз: между прогонами его правят
+    # руками, и затирать чужие фразы рычаг не вправе.
+    negatives_desired = {cid: phrases
+                         for cid, phrases in negatives_plan["desired"].items()
+                         if cid in scoped_ids}
+    negatives_state = (negatives.fetch_negatives(client, sorted(negatives_desired))
+                       if negatives_desired else {})
+    negatives_actions, negatives_refused = negatives.diff_negatives(
+        negatives_desired, negatives_state)
+    negatives_not_found = sorted(c for c in negatives_desired
+                                 if c not in negatives_state)
+    negatives_planned_count = 0
+    for action in negatives_actions:
+        ok, reason = check_action(action)
+        if not ok:
+            blocked.append({**action, "blocked_reason": reason})
+            continue
+        negatives_planned_count += 1
         planned.append({**action, "account": login})
 
     # Э3.4: выключения. Состояние (State) читается свежим; потолок — своя
@@ -1351,6 +1385,18 @@ def run_account(
         "tcpa": _tcpa_report(tcpa_plan, tcpa_desired, tcpa_refused,
                              tcpa_planned_count, tcpa_not_found,
                              cooled=tcpa_cooled),
+        "negatives": {
+            "campaigns": len(negatives_desired),
+            "phrases": sum(len(v) for v in negatives_desired.values()),
+            # Сколько кандидатов отложено капом такта и сколько отвергнуто
+            # формой: молчание рычага обязано быть объяснимым.
+            "over_cap": negatives_plan["over_cap"],
+            "invalid": len(negatives_plan["invalid"]),
+            "cost_covered": negatives_plan["cost_covered"],
+            "refused": len(negatives_refused),
+            "not_found": len(negatives_not_found),
+            "actions_planned": negatives_planned_count,
+        },
         "desired": len(desired),
         # Э2.2: скольким кампаниям применялся личный план, а не кабинетный.
         "campaign_level": campaign_level_report,

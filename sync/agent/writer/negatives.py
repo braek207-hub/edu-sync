@@ -1,0 +1,284 @@
+# -*- coding: utf-8 -*-
+"""
+sync/agent/writer/negatives.py — Э3.6 (запись): минус-фразы кампании.
+
+Самый дешёвый по риску рычаг из денежных: он не разгоняет ставки и не двигает
+бюджет, а только отсекает трафик, который уже доказал, что не окупается
+(agent/objects.minus_word_candidates). И самый неприятный при ошибке: цена
+промаха здесь не «ставка выше», а «показов по фразе нет вовсе» — причём
+навсегда, пока человек не вычистит список руками.
+
+Отсюда устройство:
+
+  * ФРАЗ ЗА ТАКТ НЕМНОГО. Список отсекает трафик мгновенно, а обратная связь
+    (упал ли поток лидов) приходит через дни. Добавляя по горсти самых дорогих
+    фраз, мы всегда можем связать провал с конкретным тактом.
+  * СПИСОК ЗАМЕНЯЕТСЯ ЦЕЛИКОМ. В API NegativeKeywords — массив, а не набор
+    операций «добавить»: действие обязано нести ОБЪЕДИНЕНИЕ прежнего списка и
+    новых фраз, иначе правка стёрла бы то, что настроил человек.
+  * ЛИМИТЫ КАБИНЕТА СЧИТАЮТСЯ ЗДЕСЬ. Директ ограничивает минус-фразу семью
+    словами по 35 символов, а суммарную длину списка — 20 000 символов.
+    Превышение — не ошибка одной фразы, а отказ всего запроса, поэтому
+    бюджет символов проверяется до отправки.
+  * ОПЕРАТОРЫ ЗАПРЕЩЕНЫ. Кавычки, «!», «+», квадратные скобки меняют смысл
+    фразы, и в автоматическом рычаге им не место: агент отсекает то, что
+    видел в отчёте, а не то, что «похоже».
+"""
+
+import hashlib
+import re
+from typing import Any, Dict, List, Tuple
+
+NEGATIVE_KIND = "negative.add"
+
+# Ограничения Директа (ref-v5/campaigns/update): не больше 7 слов во фразе,
+# 35 символов в слове, 20 000 символов суммарно на кампанию.
+MAX_WORDS_PER_PHRASE = 7
+MAX_WORD_CHARS = 35
+MAX_TOTAL_CHARS = 20_000
+
+# Сколько фраз добавляется за один такт. Меньше, чем хочется: обратная связь
+# по отсечённому трафику приходит через дни, и такт обязан оставаться
+# различимым в наблюдении.
+MAX_PHRASES_PER_TICK = 10
+
+# Операторы языка запросов Директа. Во фразе, пришедшей из отчёта поисковых
+# запросов, их быть не может — значит это чужая правка или битые данные.
+OPERATOR_CHARS = set('"!+[]<>|')
+
+_SPACES = re.compile(r"\s+")
+
+DISPLAY_CAMPAIGN_REASON = (
+    "минус-фразы недоступны для этого типа кампании (не текстовая)"
+)
+
+
+def normalize_phrase(phrase: str) -> str:
+    """Фраза в каноническом виде: нижний регистр, одиночные пробелы."""
+    return _SPACES.sub(" ", str(phrase or "").strip()).lower()
+
+
+def phrase_is_valid(phrase: str) -> Tuple[bool, str]:
+    """Проходит ли фраза ограничения Директа и правила рычага."""
+    normalized = normalize_phrase(phrase)
+    if not normalized:
+        return False, "пустая фраза"
+    if OPERATOR_CHARS & set(normalized):
+        return False, ("во фразе есть операторы языка запросов — "
+                       "автоматический рычаг такие не ставит")
+    words = normalized.split(" ")
+    if len(words) > MAX_WORDS_PER_PHRASE:
+        return False, (f"во фразе {len(words)} слов при пределе "
+                       f"{MAX_WORDS_PER_PHRASE}")
+    for word in words:
+        if len(word) > MAX_WORD_CHARS:
+            return False, (f"слово длиннее {MAX_WORD_CHARS} символов: "
+                           f"{word[:40]}")
+    return True, ""
+
+
+def plan_negatives(
+    candidates: List[Dict[str, Any]],
+    max_per_tick: int = MAX_PHRASES_PER_TICK,
+) -> Dict[str, Any]:
+    """Кандидаты расчёта → фразы к добавлению по кампаниям.
+
+    Кандидат несёт список кампаний, в которых фраза жгла деньги: минусуется
+    она именно там, а не по всему кабинету — в соседней кампании та же фраза
+    может работать.
+
+    Отбор — по расходу: за такт добавляются самые дорогие фразы, остальные
+    ждут следующего. Счётчик over_cap показывает, сколько отложено, — иначе
+    «добавили десять» неотличимо от «больше и не нашлось».
+    """
+    valid: List[Dict[str, Any]] = []
+    invalid: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        phrase = normalize_phrase(candidate.get("query"))
+        ok, reason = phrase_is_valid(phrase)
+        if not ok:
+            invalid.append({"query": candidate.get("query"), "reason": reason})
+            continue
+        valid.append({**candidate, "phrase": phrase})
+
+    valid.sort(key=lambda c: -float(c.get("cost") or 0.0))
+    taken = valid[:max_per_tick]
+    over_cap = len(valid) - len(taken)
+
+    desired: Dict[str, List[str]] = {}
+    for candidate in taken:
+        for campaign_id in candidate.get("campaigns") or []:
+            if not campaign_id:
+                continue
+            phrases = desired.setdefault(str(campaign_id), [])
+            if candidate["phrase"] not in phrases:
+                phrases.append(candidate["phrase"])
+    for phrases in desired.values():
+        phrases.sort()
+
+    return {
+        "desired": desired,
+        "over_cap": over_cap,
+        "invalid": invalid,
+        "cost_covered": round(sum(float(c.get("cost") or 0.0) for c in taken), 2),
+    }
+
+
+def merge_phrases(existing: List[str], added: List[str],
+                  max_total_chars: int = MAX_TOTAL_CHARS) -> List[str]:
+    """Объединение прежнего списка и новых фраз в пределах бюджета символов.
+
+    Прежние фразы неприкосновенны: их ставил человек, и вытеснять их ради
+    своих — не право рычага. Не поместившиеся новые фразы просто не едут:
+    следующий такт добавит их, когда место освободится.
+    """
+    merged = [normalize_phrase(p) for p in (existing or [])]
+    used = sum(len(p) for p in merged)
+    for phrase in added or []:
+        normalized = normalize_phrase(phrase)
+        if not normalized or normalized in merged:
+            continue
+        if used + len(normalized) > max_total_chars:
+            continue
+        merged.append(normalized)
+        used += len(normalized)
+    return sorted(merged)
+
+
+def _idempotency_key(campaign_id: str, phrases: List[str]) -> str:
+    raw = "negatives:" + str(campaign_id) + ":" + "|".join(sorted(phrases))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def diff_negatives(
+    desired: Dict[str, List[str]],
+    actual_by_campaign: Dict[str, Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Желаемые фразы × прочитанные списки кабинета → (действия, отказы).
+
+    actual_by_campaign — {campaign_id: {"negative_keywords": [...],
+    "campaign_type": ...}} из свежего чтения (fetch_negatives). Кампании без
+    записи не порождают ни действия, ни отказа: их не оказалось в кабинете.
+    """
+    actions: List[Dict[str, Any]] = []
+    refused: List[Dict[str, Any]] = []
+
+    for campaign_id in sorted(desired):
+        state = actual_by_campaign.get(str(campaign_id))
+        if state is None:
+            continue
+        if state.get("campaign_type") not in (None, "TEXT_CAMPAIGN"):
+            refused.append({"campaign_id": campaign_id,
+                            "reason": DISPLAY_CAMPAIGN_REASON})
+            continue
+
+        existing = [normalize_phrase(p)
+                    for p in (state.get("negative_keywords") or [])]
+        merged = merge_phrases(existing, desired[campaign_id])
+        if merged == sorted(existing):
+            continue
+
+        actions.append({
+            "action_kind": NEGATIVE_KIND,
+            "object_level": "campaign",
+            "object_id": str(campaign_id),
+            "direct_type": "NEGATIVE_KEYWORDS",
+            "key": "campaign",
+            "payload": {
+                "CampaignId": int(campaign_id),
+                "NegativeKeywords": {"Items": merged},
+                # Для рельсы и отчёта: что именно добавлено этим действием.
+                "AddedPhrases": [p for p in merged if p not in existing],
+            },
+            "previous_state": {
+                "NegativeKeywords": {"Items": sorted(existing)},
+            },
+            "idempotency_key": _idempotency_key(str(campaign_id), merged),
+        })
+    return actions, refused
+
+
+def fetch_negatives(client, campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Текущие минус-фразы кампаний — свежим чтением, не из витрины.
+
+    Между прогонами список правят руками, и previous_state обязан описывать
+    то, что стояло В МОМЕНТ применения, — тем же правилом, что
+    fetch_budget_state.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    ids = [int(c) for c in campaign_ids]
+    if not ids:
+        return out
+    page = 1000
+    for start in range(0, len(ids), page):
+        chunk = ids[start:start + page]
+        result = client.get("campaigns", {
+            "SelectionCriteria": {"Ids": chunk},
+            "FieldNames": ["Id", "Type", "NegativeKeywords"],
+        })
+        for item in result.get("Campaigns") or []:
+            out[str(item["Id"])] = {
+                "negative_keywords": ((item.get("NegativeKeywords") or {})
+                                      .get("Items") or []),
+                "campaign_type": item.get("Type"),
+            }
+    return out
+
+
+NEGATIVE_SETTING_KIND = "negative_phrase"
+
+
+def computed_rows(candidates: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Кандидаты расчёта → строки edu_agent_computed_settings по кампаниям.
+
+    Фраза попадает в строки КАЖДОЙ кампании, где она жгла деньги: минусовать
+    её надо там, а не по всему кабинету — в соседней кампании та же фраза
+    может работать. Расход в value, клики в raw_value: писателю нужны оба,
+    чтобы отсортировать кандидатов и объяснить решение в отчёте.
+    """
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for candidate in candidates:
+        phrase = normalize_phrase(candidate.get("query"))
+        if not phrase:
+            continue
+        for campaign_id in candidate.get("campaigns") or []:
+            if not campaign_id:
+                continue
+            out.setdefault(str(campaign_id), []).append({
+                "setting_kind": NEGATIVE_SETTING_KIND,
+                "setting_key": phrase,
+                "value": float(candidate.get("cost") or 0.0),
+                "raw_value": int(candidate.get("clicks") or 0),
+                "support_n": int(candidate.get("clicks") or 0),
+                "reason": candidate.get("reason"),
+            })
+    return out
+
+
+def candidates_from_computed(
+    computed_by_campaign: Dict[str, List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Строки computed → кандидаты в том виде, в каком их ждёт plan_negatives.
+
+    Расход фразы складывается по всем её кампаниям: отбор за такт идёт по
+    деньгам, и фраза, размазанная по трём кампаниям, стоит столько же,
+    сколько собранная в одной.
+    """
+    by_phrase: Dict[str, Dict[str, Any]] = {}
+    for campaign_id, rows in computed_by_campaign.items():
+        for row in rows:
+            if str(row.get("setting_kind")) != NEGATIVE_SETTING_KIND:
+                continue
+            phrase = normalize_phrase(row.get("setting_key"))
+            if not phrase:
+                continue
+            slot = by_phrase.setdefault(phrase, {
+                "query": phrase, "cost": 0.0, "clicks": 0,
+                "conversions": 0, "campaigns": [],
+                "reason": row.get("reason"),
+            })
+            slot["cost"] += float(row.get("value") or 0.0)
+            slot["clicks"] += int(row.get("raw_value") or 0)
+            if str(campaign_id) not in slot["campaigns"]:
+                slot["campaigns"].append(str(campaign_id))
+    return sorted(by_phrase.values(), key=lambda c: -c["cost"])

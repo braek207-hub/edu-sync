@@ -37,7 +37,7 @@ MAX_ACTIONS_PER_RUN = 50
 # "никогда", а не эвристику по подстроке.
 ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set",
                         "budget.set", "budget.set_daily", "campaign.suspend",
-                        "tcpa.set"}
+                        "tcpa.set", "negative.add"}
 
 # Коридор нового лимита ОТНОСИТЕЛЬНО ПРЕЖНЕГО РАСХОДА кампании (не прежнего
 # лимита: тот бывает в разы выше расхода — 5 млн/нед при расходе 616 тыс. —
@@ -56,6 +56,15 @@ BUDGET_RATIO_MAX = 1.6
 TCPA_RATIO_MIN = 0.25
 TCPA_RATIO_MAX = 4.0
 
+# Границы списка минус-фраз — СВОИ, независимые от writer/negatives.py: рельса,
+# считающая формулой построителя, пропустит любую его ошибку. Числа — из
+# ограничений Директа (ref-v5/campaigns/update) и из политики рычага.
+NEGATIVE_MAX_TOTAL_CHARS = 20_000
+NEGATIVE_MAX_WORDS = 7
+NEGATIVE_MAX_WORD_CHARS = 35
+NEGATIVE_MAX_ADDED_PER_ACTION = 10
+NEGATIVE_OPERATOR_CHARS = set('"!+[]<>|')
+
 # Границы почасового расписания — СВОИ, независимые от writer/schedule.py.
 # Дублирование намеренное: рельса обязана считать сама, иначе она проверяет
 # построитель его же формулой и пропустит любую его ошибку.
@@ -69,7 +78,8 @@ SCHEDULE_STEP = 10
 # восстановления старого, то есть ещё одно изменение кабинета под видом отмены.
 ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set", "schedule.set",
                                  "budget.set", "budget.set_daily",
-                                 "campaign.suspend", "tcpa.set"}
+                                 "campaign.suspend", "tcpa.set",
+                                 "negative.add"}
 
 # Куда обязан возвращать откат, в зависимости от вида ИСХОДНОГО действия.
 # Отмена добавления — нейтраль (объекта до действия не было), отмена
@@ -122,6 +132,11 @@ def check_action(action: Dict[str, Any],
 
     if kind == "tcpa.set":
         ok, reason = _check_tcpa(action)
+        if not ok:
+            return False, reason
+
+    if kind == "negative.add":
+        ok, reason = _check_negatives(action)
         if not ok:
             return False, reason
 
@@ -221,6 +236,50 @@ def _check_budget(action: Dict[str, Any],
         return False, (f"целевой бюджет ×{ratio:.2f} от прежнего расхода — вне "
                        f"коридора {BUDGET_RATIO_MIN}–{BUDGET_RATIO_MAX}: похоже "
                        f"на слом конверсии единиц, а не на решение")
+    return True, ""
+
+
+def _check_negatives(action: Dict[str, Any]) -> Tuple[bool, str]:
+    """Рельса минус-фраз: список целиком и то, что добавляется этим действием.
+
+    Цена ошибки здесь — не «ставка выше», а «показов по фразе нет вовсе», и
+    вернуть отсечённый трафик задним числом нельзя. Поэтому проверяется и
+    форма (операторы, длина слов и фраз, суммарный бюджет символов кабинета),
+    и ОБЪЁМ добавляемого за одно действие: даже если план сорвётся, за такт
+    не уйдёт больше горсти фраз.
+    """
+    payload = action.get("payload") or {}
+    items = ((payload.get("NegativeKeywords") or {}).get("Items"))
+    if not isinstance(items, list) or not items:
+        return False, "пустой список минус-фраз: действие без содержания"
+
+    added = payload.get("AddedPhrases")
+    added_list = added if isinstance(added, list) else items
+    if len(added_list) > NEGATIVE_MAX_ADDED_PER_ACTION:
+        return False, (f"за одно действие добавляется {len(added_list)} фраз при "
+                       f"пределе {NEGATIVE_MAX_ADDED_PER_ACTION}: отсечённый "
+                       f"трафик не вернуть, такт обязан оставаться различимым")
+
+    total = 0
+    for item in items:
+        phrase = str(item or "").strip()
+        if not phrase:
+            return False, "пустая минус-фраза в списке"
+        if NEGATIVE_OPERATOR_CHARS & set(phrase):
+            return False, (f"во фразе {phrase[:40]!r} есть операторы языка "
+                           f"запросов — автоматический рычаг такие не ставит")
+        words = phrase.split()
+        if len(words) > NEGATIVE_MAX_WORDS:
+            return False, (f"во фразе {phrase[:40]!r} {len(words)} слов при "
+                           f"пределе {NEGATIVE_MAX_WORDS}")
+        for word in words:
+            if len(word) > NEGATIVE_MAX_WORD_CHARS:
+                return False, (f"слово длиннее {NEGATIVE_MAX_WORD_CHARS} "
+                               f"символов: {word[:40]!r}")
+        total += len(phrase)
+    if total > NEGATIVE_MAX_TOTAL_CHARS:
+        return False, (f"суммарная длина списка {total} символов при пределе "
+                       f"{NEGATIVE_MAX_TOTAL_CHARS}: Директ отклонит весь запрос")
     return True, ""
 
 

@@ -174,6 +174,14 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
                                "BiddingStrategy": payload["BiddingStrategy"]}}]
         }
 
+    if kind == "negative.add":
+        # Список минус-фраз в API заменяется ЦЕЛИКОМ, и план (writer/negatives)
+        # уже собрал объединение прежних и новых: здесь только упаковка.
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(payload["CampaignId"]),
+                           "NegativeKeywords": payload["NegativeKeywords"]}]
+        }
+
     if kind == "budget.set_daily":
         return "campaigns", "update", {
             "Campaigns": [{"Id": int(payload["CampaignId"]),

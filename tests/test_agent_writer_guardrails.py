@@ -300,3 +300,55 @@ def test_tcpa_rail_catches_broken_units():
 def test_tcpa_rail_needs_a_fact_to_compare_with():
     ok, reason = check_action(_tcpa_action(1_300 * 1_000_000, cpa_fact=None))
     assert not ok
+
+
+# ------------------- рельса минус-фраз (Э3.6)
+
+
+def _neg_action(items, added=None):
+    return {
+        "action_kind": "negative.add",
+        "object_level": "campaign",
+        "object_id": "111",
+        "payload": {"CampaignId": 111,
+                    "NegativeKeywords": {"Items": items},
+                    "AddedPhrases": added if added is not None else items},
+    }
+
+
+def test_negative_kind_is_allowed_and_rollbackable():
+    from sync.agent.writer.guardrails import (ALLOWED_ACTION_KINDS,
+                                              ROLLBACK_ALLOWED_ACTION_KINDS)
+    assert "negative.add" in ALLOWED_ACTION_KINDS
+    assert "negative.add" in ROLLBACK_ALLOWED_ACTION_KINDS
+
+
+def test_negative_rail_passes_a_reasonable_list():
+    ok, reason = check_action(_neg_action(["мгсу", "мфюа"]))
+    assert ok, reason
+
+
+def test_negative_rail_refuses_operators_and_long_words():
+    ok, _ = check_action(_neg_action(["!мгсу"]))
+    assert not ok
+    ok, _ = check_action(_neg_action(["я" * 40]))
+    assert not ok
+
+
+def test_negative_rail_refuses_over_budget_list():
+    ok, reason = check_action(_neg_action([f"я{i:05d}" + "я" * 24
+                                           for i in range(1000)], added=[]))
+    assert not ok and "20000" in reason.replace(" ", "")
+
+
+def test_negative_rail_refuses_too_many_added_at_once():
+    # Рельса независима от построителя: даже если план сорвётся, за такт не
+    # уходит больше горсти фраз — отсечённый трафик не вернуть.
+    ok, reason = check_action(_neg_action([f"фраза {i}" for i in range(50)],
+                                          added=[f"фраза {i}" for i in range(50)]))
+    assert not ok
+
+
+def test_negative_rail_refuses_empty_list():
+    ok, _ = check_action(_neg_action([]))
+    assert not ok

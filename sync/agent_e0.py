@@ -45,6 +45,7 @@ from sync.agent.history import budget_response
 from sync.agent.mining import mine_quasi_experiments, placebo_sigma
 from sync.agent.portfolio import computed_rows as portfolio_computed_rows
 from sync.agent.portfolio import portfolio_targets
+from sync.agent.writer.negatives import computed_rows as negative_computed_rows
 from sync.agent.tcpa import (
     build_inputs as build_tcpa_inputs,
     computed_rows as tcpa_computed_rows,
@@ -688,6 +689,16 @@ def main() -> int:
                                               base_conversion=base_conversion)
                         if cpa_limit > 0 else [])
 
+    # Кандидаты в минус-фразы уезжают в computed по кампаниям: применяет их
+    # писатель Э3.6 в прогоне применения, и отчёт Э0 сам по себе действий не
+    # производит. Фраза попадает в строки каждой кампании, где жгла деньги.
+    negative_rows_written = 0
+    for campaign_id, rows in negative_computed_rows(minus_candidates).items():
+        agent_db.upsert_computed_settings(
+            rows, calc_date=today_iso, object_id=campaign_id,
+            object_level="campaign")
+        negative_rows_written += len(rows)
+
     # 9. Снимок настроек.
     snapshot_rows = build_snapshot_rows(agent_db.load_campaign_settings_raw(), seen_on=today_iso)
     agent_db.upsert_settings_snapshot(snapshot_rows)
@@ -870,6 +881,7 @@ def main() -> int:
             # Порог наблюдаемости, выведенный из данных прогона: столько
             # кликов без конверсий нужно, чтобы приговор был осмысленным.
             "base_conversion": round(base_conversion, 5),
+            "computed_rows": negative_rows_written,
             "sample": [q.get("query") for q in minus_candidates[:10]],
             "blind_accounts": blind_accounts,
         },
