@@ -32,10 +32,24 @@ sync/agent/writer/rollback.py — красные линии и автоотка�
 
 from typing import Any, Dict, Optional, Tuple
 
+from sync.agent.writer.risk import DEFAULT_DAYS_TO_MEASURE
 from sync.agent.writer.units import delta_to_api
 
 RED_LINE_TOLERANCE = 0.40      # +40% к базовой метрике
 MIN_LEADS_FOR_VERDICT = 20     # до этого объёма вывод делать нельзя
+
+# Объёмная красная линия. CPA-линия слепа к обвалу: вредная правка,
+# придушившая кампанию, не набирает ни расхода, ни лидов — CPA-порог молчит,
+# min_leads не достигается никогда, изменение живёт «под наблюдением» до
+# истечения горизонта. Ожидаемый дневной расход берётся из risk_rub самого
+# действия: риск и посчитан как расход за горизонт замера
+# (risk.DEFAULT_DAYS_TO_MEASURE) — отдельной оценки не нужно.
+SPEND_COLLAPSE_SHARE = 0.30    # дневной расход ниже этой доли ожидания — обвал
+MIN_DAYS_FOR_SPEND_VERDICT = 3 # раньше — колебания открутки, не вердикт
+
+# Виды действий, для которых обвал расхода — ИСПОЛНЕНИЕ решения, а не
+# деградация: suspend глушит кампанию намеренно.
+SPEND_COLLAPSE_EXEMPT_KINDS = ("campaign.suspend",)
 
 
 def red_line_for(
@@ -96,6 +110,33 @@ def is_breached(red_line: Dict[str, Any], observed: Dict[str, Any]) -> Tuple[boo
     limit = float(limit)
     if value > limit:
         return True, f"{metric} = {value:.0f} при пределе {limit:.0f}"
+    return False, ""
+
+
+def is_spend_collapsed(
+    action: Dict[str, Any], observed: Dict[str, Any],
+    days_to_measure: int = DEFAULT_DAYS_TO_MEASURE,
+) -> Tuple[bool, str]:
+    """Обвалился ли расход объекта после применения действия.
+
+    Сравнивается средний дневной расход окна с ожидаемым дневным
+    (risk_rub / days_to_measure). Средний, а не последний день: обвал —
+    состояние, а не событие, и один тихий день его не доказывает — как и
+    один шумный не опровергает.
+    """
+    if str(action.get("action_kind") or "") in SPEND_COLLAPSE_EXEMPT_KINDS:
+        return False, ""
+    days = int(observed.get("days") or 0)
+    if days < MIN_DAYS_FOR_SPEND_VERDICT:
+        return False, f"наблюдаемых дней {days} из {MIN_DAYS_FOR_SPEND_VERDICT}"
+    expected_daily = float(action.get("risk_rub") or 0.0) / days_to_measure
+    if expected_daily <= 0:
+        return False, "ожидаемый расход неизвестен (risk_rub пуст)"
+    actual_daily = float(observed.get("cost") or 0.0) / days
+    if actual_daily < SPEND_COLLAPSE_SHARE * expected_daily:
+        return True, (f"обвал расхода: {actual_daily:.0f} ₽/день при ожидании "
+                      f"{expected_daily:.0f} ₽/день — ниже доли "
+                      f"{SPEND_COLLAPSE_SHARE:.0%}")
     return False, ""
 
 

@@ -21,6 +21,7 @@ import pytest
 import sync.agent_e1_watchdog as watchdog
 import sync.agent.writer.db as writer_db
 from sync.agent.writer.db import ensure_writer_tables, open_actions, spent_risk
+from sync.agent.writer.rollback import is_spend_collapsed
 from sync.db import get_connection
 
 TODAY = date(2026, 8, 10)
@@ -1574,3 +1575,62 @@ def test_report_shows_how_far_crm_lags(monkeypatch, capsys):
     report = _json.loads(capsys.readouterr().out)
     assert report["crm_through"] == (real_today - timedelta(days=4)).isoformat()
     assert report["crm_lag_days"] == 4
+
+
+# ------------------------- объёмная красная линия: обвал расхода
+
+
+def test_spend_collapse_is_breach():
+    # Слепое пятно CPA-линии: вредная правка, придушившая кампанию, не
+    # набирает ни расхода, ни лидов — CPA-порог молчит, min_leads не
+    # достигается никогда, изменение живёт «под наблюдением» до истечения
+    # горизонта. Обвал расхода ниже 30 % от ожидаемого дневного (risk_rub —
+    # это и есть ожидаемый расход за горизонт замера) — сам по себе пробой.
+    action = _action(risk_rub=7000.0)  # ожидание 1000 ₽/день
+    observed = {"cost": 600.0, "leads": 0, "cpa": 0.0, "days": 3}  # 200 ₽/день
+    collapsed, reason = is_spend_collapsed(action, observed)
+    assert collapsed
+    assert "обвал" in reason
+
+
+def test_spend_collapse_needs_minimum_days():
+    action = _action(risk_rub=7000.0)
+    observed = {"cost": 200.0, "leads": 0, "cpa": 0.0, "days": 2}
+    collapsed, _ = is_spend_collapsed(action, observed)
+    assert not collapsed
+
+
+def test_spend_collapse_ignores_intentional_suspend():
+    # campaign.suspend глушит кампанию НАМЕРЕННО — нулевой расход после него
+    # это исполнение решения, а не деградация.
+    action = _action(action_kind="campaign.suspend", risk_rub=7000.0)
+    observed = {"cost": 0.0, "leads": 0, "cpa": 0.0, "days": 5}
+    collapsed, _ = is_spend_collapsed(action, observed)
+    assert not collapsed
+
+
+def test_spend_collapse_without_risk_baseline_is_silent():
+    # risk_rub нет или ноль — ожидаемого расхода нет, доли не от чего считать.
+    action = _action(risk_rub=0.0)
+    observed = {"cost": 0.0, "leads": 0, "cpa": 0.0, "days": 5}
+    collapsed, _ = is_spend_collapsed(action, observed)
+    assert not collapsed
+
+
+def test_healthy_spend_does_not_collapse():
+    action = _action(risk_rub=7000.0)
+    observed = {"cost": 2700.0, "leads": 1, "cpa": 2700.0, "days": 3}
+    collapsed, _ = is_spend_collapsed(action, observed)
+    assert not collapsed
+
+
+def test_judge_turns_spend_collapse_into_breach():
+    # Вайринг: judge выносит BREACHED по обвалу расхода ДО проверки
+    # min_leads — иначе обвал (мало лидов по построению) навсегда застревал
+    # бы в «наблюдений N из 20».
+    action = _action(risk_rub=7000.0)
+    facts = {"111": _facts("111", date(2026, 8, 2), 4, 100.0, 0)}
+    verdict = watchdog.judge(action, facts, date(2026, 8, 6), _mart(facts),
+                             date(2026, 8, 5))
+    assert verdict["state"] == watchdog.STATE_BREACHED
+    assert "обвал" in verdict["reason"]

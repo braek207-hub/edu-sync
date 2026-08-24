@@ -62,7 +62,8 @@ from sync.agent.writer.apply import _element_errors
 # программно (живой тест, разовый скрипт).
 from sync.agent.writer.client import WriteClient, journal_allowed
 from sync.agent.writer.guardrails import check_rollback
-from sync.agent.writer.rollback import rollback_payload, is_breached
+from sync.agent.writer.rollback import (rollback_payload, is_breached,
+                                        is_spend_collapsed)
 
 # Чтение корректировок кампании берётся у прогона применения, а не пишется
 # заново: форма запроса выверена пробой (Levels внутри SelectionCriteria), а
@@ -436,6 +437,14 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
                                f"это выброс, а не деградация")}
         return {**verdict, "state": STATE_BREACHED,
                 "reason": f"{reason}; держится и без самого дорогого дня окна"}
+
+    # Обвал расхода — ДО проверки min_leads: у придушенной кампании лидов
+    # мало по построению, и CPA-ветка навсегда оставляла бы её в
+    # «наблюдений N из 20». Фильтр пикового дня не применяется: обвал —
+    # среднее за ≥3 дня, разовый выброс его не создаёт.
+    collapsed, collapse_reason = is_spend_collapsed(action, observed)
+    if collapsed:
+        return {**verdict, "state": STATE_BREACHED, "reason": collapse_reason}
 
     min_leads = int(red_line.get("min_leads") or 0)
     if observed["leads"] < min_leads:
