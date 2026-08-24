@@ -105,7 +105,12 @@ def weekly_pair_observations(
     for campaign_id, by_week in sorted(weekly.items()):
         weeks = sorted(by_week)
         quasi_dates = quasi_dates_by_campaign.get(campaign_id, [])
-        for w1, w2 in zip(weeks, weeks[1:]):
+        index = 0
+        while index < len(weeks) - 1:
+            w1, w2 = weeks[index], weeks[index + 1]
+            # Шаг на следующую пару — по умолчанию на одну неделю вперёд:
+            # пара, не давшая наблюдения, недели не «расходует».
+            index += 1
             if (date.fromisoformat(w2) - date.fromisoformat(w1)).days != 7:
                 continue
             t1, t2 = by_week[w1], by_week[w2]
@@ -137,6 +142,11 @@ def weekly_pair_observations(
             if measured["effect"] is None:
                 continue
             stats["pairs_used"] += 1
+            # Использованная пара ЗАБИРАЕТ обе свои недели: следующая пара
+            # начинается после w2. Соседние пары (w1,w2) и (w2,w3) делят
+            # неделю — свод считал бы зависимые наблюдения независимыми и
+            # фиктивно сужал ошибку (аудит 2026-08-23).
+            index += 1
             out.setdefault(campaign_id, []).append({
                 "eps": float(measured["effect"]) / log_jump,
                 "rel_error": rel / abs(log_jump),

@@ -78,9 +78,10 @@ def test_pair_containing_quasi_experiment_is_skipped():
 
 
 def test_immature_tail_week_is_dropped():
+    # Скачки в непересекающихся парах (0,1) и (2,3): пары не делят недель.
     facts = (_stable_control()
-             + _facts("111", 0, 100.0, 2) + _facts("111", 1, 100.0, 2)
-             + _facts("111", 2, 200.0, 3) + _facts("111", 3, 400.0, 4))
+             + _facts("111", 0, 100.0, 2) + _facts("111", 1, 200.0, 3)
+             + _facts("111", 2, 100.0, 2) + _facts("111", 3, 400.0, 4))
     mature = weekly_pair_observations(facts, _sunday(3))[0]
     # Зрелость кончается в субботу последней недели — её пара исчезает.
     saturday = (MONDAY + timedelta(days=7 * 3 + 5)).isoformat()
@@ -193,3 +194,17 @@ def test_computed_rows_carry_beta_and_marginal_price():
     assert by_key["marginal_cpl"]["value"] == section["campaigns"]["111"]["marginal_cpl"]
     assert by_key["marginal_cpl"]["support_n"] == section["campaigns"]["111"]["leads_28d"]
     assert all(r["setting_kind"] == "saturation" for r in rows)
+
+
+def test_weekly_pairs_do_not_share_a_week():
+    # Пары (w1,w2) и (w2,w3) делят неделю: одно и то же наблюдение входит в
+    # свод дважды, а свод считает их независимыми и фиктивно сужает ошибку.
+    # Использованная пара забирает свои недели: следующая начинается с w3.
+    facts = _stable_control(weeks=5)
+    for week, cost in enumerate((100.0, 300.0, 100.0, 300.0, 100.0)):
+        facts += _facts("111", week, cost, 2)
+    obs, stats = weekly_pair_observations(facts, _sunday(4))
+    # Пять недель со скачком в каждой паре: непересекающихся пар две
+    # (w0–w1 и w2–w3), а не четыре.
+    assert stats["pairs_used"] == 2
+    assert len(obs["111"]) == 2
