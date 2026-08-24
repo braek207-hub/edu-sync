@@ -384,7 +384,8 @@ def _unverified(state: str, closed: bool) -> str:
 
 def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, Any]]],
           today: date, mart: Dict[str, Any],
-          crm_through: Optional[date]) -> Dict[str, Any]:
+          crm_through: Optional[date],
+          account_totals: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Вердикт по одному действию: состояние наблюдения и наблюдаемые метрики.
 
     Два источника данных, и они РАЗНЫЕ намеренно: наблюдаемые метрики берутся
@@ -422,6 +423,16 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
                            f"{(end - start).days + 1} — покрытие "
                            f"{coverage:.0%} при минимуме {MIN_WINDOW_COVERAGE:.0%}")}
 
+    # Сезонная поправка порога: если подорожал весь кабинет, пост-CPA вырос
+    # бы и у здоровой кампании. Порог двигается следом за контролем, зажато.
+    factor = seasonal_factor(account_totals, _baseline_window(red_line),
+                             (start, end))
+    verdict["seasonal_factor"] = round(factor, 3)
+    if factor != 1.0 and red_line.get("max_value") is not None:
+        red_line = {**red_line,
+                    "max_value": float(red_line["max_value"]) * factor}
+        verdict["seasonal_max_value"] = round(red_line["max_value"], 2)
+
     breached, reason = is_breached(red_line, observed)
     if breached:
         # Пробой засчитывается, только если переживает выброс: см.
@@ -454,6 +465,57 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
         return {**verdict, "state": _unverified(STATE_COLLECTING, closed),
                 "reason": f"наблюдений {observed['leads']} из {min_leads}"}
     return {**verdict, "state": STATE_WATCHED, "reason": reason or ""}
+
+
+def _totals_cpa(rows: Iterable[Dict[str, Any]],
+                window: Tuple[date, date]) -> Optional[float]:
+    """Кабинетный CPA за окно из дневных агрегатов витрины, или None."""
+    start, end = window
+    cost = 0.0
+    leads = 0
+    for row in rows or ():
+        day = _as_date(row.get("fact_date"))
+        if day is None or day < start or day > end:
+            continue
+        cost += float(row.get("cost") or 0.0)
+        leads += int(row.get("eff_leads") or 0)
+    if leads < SEASONAL_MIN_LEADS or cost <= 0:
+        return None
+    return cost / leads
+
+
+def seasonal_factor(account_totals: Iterable[Dict[str, Any]],
+                    baseline_window: Optional[Tuple[date, date]],
+                    observation: Optional[Tuple[date, date]]) -> float:
+    """Во сколько раз подорожал лид у КАБИНЕТА между базой и окном наблюдения.
+
+    Красная линия строится от базового CPA кампании, снятого до применения
+    изменения. Если за время наблюдения подорожал весь аукцион, пост-CPA
+    вырастет у всех — и у здоровых кампаний тоже. Поправка нормирует порог на
+    движение контроля за ТО ЖЕ окно (рекомендация аудита), зажатая
+    SEASONAL_CAP в обе стороны.
+
+    Контрольных данных не хватает (мало лидов, нет окна, нет базы у действия) —
+    поправки нет: 1.0. Молчаливое «наверное, сезон» ослабило бы защиту.
+    """
+    if not baseline_window or not observation:
+        return 1.0
+    base_cpa = _totals_cpa(account_totals, baseline_window)
+    now_cpa = _totals_cpa(account_totals, observation)
+    if not base_cpa or not now_cpa:
+        return 1.0
+    return min(max(now_cpa / base_cpa, 1.0 / SEASONAL_CAP), SEASONAL_CAP)
+
+
+def _baseline_window(red_line: Dict[str, Any]) -> Optional[Tuple[date, date]]:
+    """Окно базового CPA из красной линии, если оно там записано.
+
+    Действия, применённые до появления этих полей, поправки не получают —
+    судить о сезоне без базового окна не по чему.
+    """
+    start = _as_date(red_line.get("baseline_from"))
+    end = _as_date(red_line.get("baseline_to"))
+    return (start, end) if start and end else None
 
 
 def closing_verdict(observed: Dict[str, Any], action: Dict[str, Any]) -> str:
@@ -813,7 +875,8 @@ def rollback_one(client, action: Dict[str, Any], db_module,
 def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
           facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
           data_gate: Optional[Dict[str, Any]], crm_through: Optional[date],
-          lease: Any = None, mart: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+          lease: Any = None, mart: Optional[Dict[str, Any]] = None,
+          account_totals: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Наблюдение и откат по всем открытым действиям одного кабинета.
 
     crm_through — граница зрелости CRM (agent_db.crm_maturity_date). Как и
@@ -851,7 +914,8 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
         # ошибкой видна в отчёте и разбирается руками — но не молча, и не
         # ценой всех остальных.
         try:
-            verdict = judge(action, facts_by_campaign, today, mart or {}, crm_through)
+            verdict = judge(action, facts_by_campaign, today, mart or {},
+                            crm_through, account_totals)
         except Exception as exc:
             errors.append({"action_id": action.get("action_id"),
                            "object_id": action.get("object_id"),
@@ -1105,6 +1169,22 @@ def load_facts(actions: List[Dict[str, Any]], today: date,
     return out
 
 
+def load_account_totals(actions: List[Dict[str, Any]], today: date,
+                        crm_through: Optional[date]) -> List[Dict[str, Any]]:
+    """Дневные агрегаты ВСЕЙ витрины — контроль для сезонной поправки.
+
+    Охват шире окна наблюдений: базовый CPA красной линии снят до применения
+    действия (agent_e1.build_red_line), и его окно тоже должно попасть в
+    выборку. Запрос дешёвый — по одной строке на день, а не на кампанию.
+    """
+    span = facts_window(actions, today, crm_through)
+    if span is None:
+        return []
+    earliest = min(span[0], (today - timedelta(days=SEASONAL_LOOKBACK_DAYS)))
+    return agent_db.load_daily_account_totals(
+        earliest.isoformat(), today.isoformat())
+
+
 def load_mart_breadth(actions: List[Dict[str, Any]], today: date,
                       crm_through: Optional[date]) -> Dict[str, Any]:
     """Ширина витрины по дням — отдельным дешёвым запросом по ВСЕЙ витрине.
@@ -1181,6 +1261,23 @@ def main() -> int:
 # срока аренды: процесс, молчащий дольше, по общему критерию считается мёртвым.
 STALE_SWEEP_MINUTES = 60
 
+# Потолок сезонной поправки красной линии. Кабинет дорожает и дешевеет вместе
+# с рынком, и порог обязан двигаться следом — иначе перелом сезона устраивает
+# массовые ложные пробои и записывает «действия вредны» ровно там, где
+# подорожал аукцион (аудит 2026-08-23). Но безграничная нормировка позволила
+# бы «сезоном» оправдать любой рост: контроль сам дёргается, а красная линия —
+# последняя защита боевого кабинета.
+SEASONAL_CAP = 1.5
+
+# Минимум эффективных лидов в КАЖДОМ контрольном окне, чтобы поправка вообще
+# считалась: на десятке лидов кабинетный CPA — шум, и поправка по нему сдвинула
+# бы порог случайным образом.
+SEASONAL_MIN_LEADS = 20
+
+# На сколько дней назад заведомо хватает контроля: база красной линии снята за
+# 30 дней до применения (agent_e1), плюс горизонт наблюдения и лаг лидов.
+SEASONAL_LOOKBACK_DAYS = 75
+
 
 def alarm_reasons(out: Dict[str, Any]) -> List[str]:
     """Состояния прогона, требующие человека. Пусто — тревоги нет.
@@ -1230,6 +1327,10 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
     # Полнота данных — по витрине, наблюдаемые метрики — по кампаниям
     # действий. Два разных запроса намеренно: см. mart_filled_days.
     mart = load_mart_breadth(actions, today, crm_through)
+    # Кабинетный контроль для сезонной поправки красных линий: дневные
+    # агрегаты ВСЕЙ витрины за тот же охват, одним дешёвым запросом. Окно
+    # шире охвата наблюдений — базы линий лежат до применения действий.
+    account_totals = load_account_totals(actions, today, crm_through)
     # Поверх витринного гейта — сверка сумм источник↔витрина: битая
     # сборка не видна ни свежести, ни ширине. Аномалия объёма сторожа
     # НЕ гейтует (include_volume=False): обвал расхода — возможное
@@ -1245,7 +1346,8 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
     for login, account_actions in sorted(by_account.items()):
         client = WriteClient(login, sandbox=sandbox, dry_run=dry_run)
         report = watch(client, account_actions, writer_db, holdout_ids,
-                       facts_by_campaign, today, gate, crm_through, lease, mart)
+                       facts_by_campaign, today, gate, crm_through, lease, mart,
+                       account_totals)
         accounts.append({"account": login, **report, "units_left": client.units_left})
 
     out = {

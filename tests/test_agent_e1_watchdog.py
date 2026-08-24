@@ -1740,3 +1740,46 @@ def test_closed_action_experiment_carries_graded_verdict():
     # База 714, наблюдаемая 892.5 → +25 % при ошибке 0.1: вред, не «held».
     assert exp["verdict"] == "worsened"
     assert exp["effect"] > 0
+
+
+# ------------------- сезонный контроль красной линии
+
+
+def _totals(start, days, cost, leads):
+    return [{"fact_date": start + timedelta(days=i), "cost": cost,
+             "eff_leads": leads} for i in range(days)]
+
+
+def test_seasonal_factor_follows_the_control_and_is_capped():
+    # Кабинет в целом подорожал вдвое — это сезон, а не вред конкретной
+    # правки. Порог обязан подвинуться следом, но не безгранично: контроль
+    # сам дёргается, и без зажима «сезоном» оправдывался бы любой рост.
+    base = _totals(date(2026, 7, 1), 30, 1000.0, 20)      # CPA 50
+    window = _totals(date(2026, 8, 2), 14, 1000.0, 10)    # CPA 100
+    factor = watchdog.seasonal_factor(
+        base + window, (date(2026, 7, 1), date(2026, 7, 30)),
+        (date(2026, 8, 2), date(2026, 8, 15)))
+    assert factor == watchdog.SEASONAL_CAP
+
+
+def test_seasonal_factor_is_one_without_control_data():
+    assert watchdog.seasonal_factor([], (date(2026, 7, 1), date(2026, 7, 30)),
+                                    (date(2026, 8, 2), date(2026, 8, 15))) == 1.0
+
+
+def test_season_wide_cpa_rise_does_not_breach_the_red_line():
+    # У кампании CPA вырос на 40 % — ровно как у всего кабинета. Это перелом
+    # сезона, а не вредная правка: массовые откаты здоровых изменений на
+    # смене сезона — как раз то, чего красная линия без контроля не различает.
+    action = _action(red_line={"metric": "cpa", "max_value": 1000.0,
+                               "min_leads": 20, "baseline_cpa": 714.0,
+                               "has_baseline": True,
+                               "baseline_from": "2026-07-01",
+                               "baseline_to": "2026-07-30"})
+    facts = {"111": _facts("111", date(2026, 8, 2), 14, 1000.0, 1)}  # CPA 1000
+    totals = (_totals(date(2026, 7, 1), 30, 1000.0, 20)              # CPA 50
+              + _totals(date(2026, 8, 2), 14, 1400.0, 20))           # CPA 70 (+40%)
+    verdict = watchdog.judge(action, facts, date(2026, 8, 20), _mart(facts),
+                             date(2026, 8, 19), account_totals=totals)
+    assert verdict["state"] != watchdog.STATE_BREACHED
+    assert verdict["seasonal_factor"] > 1.0

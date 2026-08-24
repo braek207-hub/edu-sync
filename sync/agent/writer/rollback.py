@@ -72,6 +72,11 @@ def red_line_for(
     аргумент обязан уронить вызов, а не тихо подставить бессмысленное число.
     """
     base_cpa = float(baseline.get("cpa") or 0.0)
+    # Окно, на котором снята база, едет вместе с линией: сторож нормирует
+    # порог на движение КАБИНЕТА между этим окном и окном наблюдения
+    # (agent_e1_watchdog.seasonal_factor). Без окна сезон не отличить от вреда.
+    window = {"baseline_from": baseline.get("window_from"),
+              "baseline_to": baseline.get("window_to")}
     if base_cpa > 0:
         return {
             "metric": "cpa",
@@ -79,6 +84,7 @@ def red_line_for(
             "min_leads": MIN_LEADS_FOR_VERDICT,
             "baseline_cpa": base_cpa,
             "has_baseline": True,
+            **window,
         }
     return {
         "metric": "cpa",
@@ -86,6 +92,7 @@ def red_line_for(
         "min_leads": MIN_LEADS_FOR_VERDICT,
         "baseline_cpa": base_cpa,
         "has_baseline": False,
+        **window,
     }
 
 

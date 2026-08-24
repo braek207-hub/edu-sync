@@ -475,6 +475,27 @@ def load_baseline_cpa(date_from: str, date_to: str) -> Dict[str, float]:
     return {str(r["campaign_id"]): float(r["cpa"]) for r in rows}
 
 
+def load_daily_account_totals(date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    """Дневные агрегаты ВСЕЙ витрины: расход и эффективные лиды по дню.
+
+    Контроль для сезонной поправки красных линий (agent_e1_watchdog):
+    подорожал ли лид у кабинета в целом между базой действия и окном
+    наблюдения. По строке на день, а не на кампанию, — запрос дешёвый.
+    """
+    return _fetch_dicts(
+        """
+        SELECT fact_date,
+               SUM(cost)      AS cost,
+               SUM(eff_leads) AS eff_leads
+        FROM edu_agent_facts
+        WHERE fact_date BETWEEN %s AND %s
+        GROUP BY fact_date
+        ORDER BY fact_date
+        """,
+        (date_from, date_to),
+    )
+
+
 def load_daily_facts(
     campaign_ids: List[str], date_from: str, date_to: str
 ) -> List[Dict[str, Any]]:

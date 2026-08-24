@@ -827,6 +827,7 @@ def absolute_max_cpa_from_baseline(baseline_cpa: Dict[str, float]) -> Any:
 
 def build_red_line(
     action: Dict[str, Any], baseline_cpa: Dict[str, float], absolute_max_cpa: Any,
+    baseline_window: Any = None,
 ) -> Any:
     """Красная линия для действия, или None, если её посчитать не из чего.
 
@@ -845,6 +846,10 @@ def build_red_line(
     поэтому здесь всегда безопасно передать absolute_max_cpa как есть.
     """
     baseline = {"cpa": baseline_cpa.get(str(action["object_id"]), 0.0)}
+    if baseline_window:
+        # Границы окна базы едут в саму линию: по ним сторож считает сезонную
+        # поправку порога (agent_e1_watchdog.seasonal_factor).
+        baseline["window_from"], baseline["window_to"] = baseline_window
     if baseline["cpa"] <= 0 and absolute_max_cpa is None:
         return None
     return red_line_for(action, baseline, absolute_max_cpa)
@@ -940,6 +945,7 @@ def run_account(
     """
     daily_cost = ctx["daily_cost"]
     baseline_cpa = ctx["baseline_cpa"]
+    baseline_window = ctx.get("baseline_window")
     absolute_max_cpa = ctx["absolute_max_cpa"]
     holdout_ids = ctx["holdout_ids"]
     charged_objects = ctx["charged_objects"]
@@ -1218,7 +1224,8 @@ def run_account(
     with_red_line: List[Dict[str, Any]] = []
     no_red_line: List[Dict[str, Any]] = []
     for a in allowed:
-        red_line = build_red_line(a, baseline_cpa, absolute_max_cpa)
+        red_line = build_red_line(a, baseline_cpa, absolute_max_cpa,
+                                  baseline_window)
         if red_line is None:
             no_red_line.append({**a, "blocked_reason": NO_RED_LINE_REASON})
             continue
@@ -1470,6 +1477,9 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     ctx: Dict[str, Any] = {
         "daily_cost": daily_cost,
         "baseline_cpa": baseline_cpa,
+        # Окно, на котором снята база: едет в красную линию, по нему сторож
+        # считает сезонную поправку порога.
+        "baseline_window": (cutoff, crm_through.isoformat()) if crm_through else None,
         "absolute_max_cpa": absolute_max_cpa,
         "holdout_ids": holdout_ids,
         "charged_objects": charged_objects,
