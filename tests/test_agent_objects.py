@@ -136,3 +136,31 @@ def test_minus_candidates_keep_profitable_phrases():
     queries = [{"campaign_id": "1", "query": "хорошая", "cost": 30_000.0,
                 "clicks": 100, "conversions": 40}]
     assert minus_word_candidates(queries, cpa_limit=1000.0) == []
+
+
+# ------------------- площадки РСЯ: кандидаты на запрет
+
+
+def test_placement_candidates_reuse_the_minus_word_logic():
+    # Правило то же, что у фраз: ноль конверсий при достаточном объёме или
+    # конверсии дороже допустимого. Площадка агрегируется по всем кампаниям.
+    from sync.agent.objects import placement_candidates
+    rows = [
+        {"campaign_id": "1", "placement": "trash.site", "cost": 30_000.0,
+         "clicks": 300, "conversions": 0},
+        {"campaign_id": "2", "placement": "trash.site", "cost": 20_000.0,
+         "clicks": 200, "conversions": 0},
+        {"campaign_id": "1", "placement": "good.site", "cost": 30_000.0,
+         "clicks": 300, "conversions": 40},
+    ]
+    out = placement_candidates(rows, cpa_limit=1000.0, base_conversion=0.05)
+    assert [r["placement"] for r in out] == ["trash.site"]
+    assert out[0]["cost"] == 50_000.0
+    assert out[0]["campaigns"] == ["1", "2"]
+
+
+def test_placement_candidates_need_enough_clicks():
+    from sync.agent.objects import placement_candidates
+    rows = [{"campaign_id": "1", "placement": "rare.site", "cost": 9000.0,
+             "clicks": 5, "conversions": 0}]
+    assert placement_candidates(rows, cpa_limit=1000.0, base_conversion=0.05) == []

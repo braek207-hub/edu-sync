@@ -57,6 +57,7 @@ from sync.agent.gate import data_gate
 from sync.agent.writer import budget
 from sync.agent.writer import switch
 from sync.agent.writer import negatives
+from sync.agent.writer import placements
 from sync.agent.writer import tcpa
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import apply_actions
@@ -1123,6 +1124,10 @@ def run_account(
     negatives_plan = negatives.plan_negatives(
         negatives.candidates_from_computed(fresh_campaign_computed))
 
+    # Э3.7: площадки сети — тот же рычаг, что минус-фразы, на другом списке.
+    placements_plan = placements.plan_placements(
+        placements.candidates_from_computed(fresh_campaign_computed))
+
     # Э3.4: кандидаты на выключение — тем же правилом, что бюджет: план ДО
     # раннего выхода, ограничитель прогона уже в scoped_ids.
     switch_plan = switch.plan_switch_offs(fresh_campaign_computed)
@@ -1157,6 +1162,11 @@ def run_account(
                           "invalid": len(negatives_plan["invalid"]),
                           "cost_covered": negatives_plan["cost_covered"],
                           "refused": 0, "not_found": 0, "actions_planned": 0},
+            "placements": {"campaigns": 0, "sites": 0,
+                           "over_cap": placements_plan["over_cap"],
+                           "invalid": len(placements_plan["invalid"]),
+                           "cost_covered": placements_plan["cost_covered"],
+                           "refused": 0, "not_found": 0, "actions_planned": 0},
             "unsupported": unsupported,
             "campaign_level": campaign_level_report,
             "confidence": confidence_report,
@@ -1270,6 +1280,26 @@ def run_account(
             blocked.append({**action, "blocked_reason": reason})
             continue
         negatives_planned_count += 1
+        planned.append({**action, "account": login})
+
+    # Э3.7: применение запретов площадок — как минус-фразы: свежее чтение,
+    # объединение с прежним списком, кап такта.
+    placements_desired = {cid: sites
+                          for cid, sites in placements_plan["desired"].items()
+                          if cid in scoped_ids}
+    placements_state = (placements.fetch_excluded_sites(
+        client, sorted(placements_desired)) if placements_desired else {})
+    placements_actions, placements_refused = placements.diff_placements(
+        placements_desired, placements_state)
+    placements_not_found = sorted(c for c in placements_desired
+                                  if c not in placements_state)
+    placements_planned_count = 0
+    for action in placements_actions:
+        ok, reason = check_action(action)
+        if not ok:
+            blocked.append({**action, "blocked_reason": reason})
+            continue
+        placements_planned_count += 1
         planned.append({**action, "account": login})
 
     # Э3.4: выключения. Состояние (State) читается свежим; потолок — своя
@@ -1396,6 +1426,16 @@ def run_account(
             "refused": len(negatives_refused),
             "not_found": len(negatives_not_found),
             "actions_planned": negatives_planned_count,
+        },
+        "placements": {
+            "campaigns": len(placements_desired),
+            "sites": sum(len(v) for v in placements_desired.values()),
+            "over_cap": placements_plan["over_cap"],
+            "invalid": len(placements_plan["invalid"]),
+            "cost_covered": placements_plan["cost_covered"],
+            "refused": len(placements_refused),
+            "not_found": len(placements_not_found),
+            "actions_planned": placements_planned_count,
         },
         "desired": len(desired),
         # Э2.2: скольким кампаниям применялся личный план, а не кабинетный.

@@ -537,3 +537,57 @@ def fetch_search_queries(
         }
         for rec in records
     ], chosen_goal(records, goal_column)
+
+
+def fetch_placements(
+    login: str, date_from: str, date_to: str, goals: List[str] = ()
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Площадки сети за окно, агрегат без дат.
+
+    Отдельный отчёт (PLACEMENT_PERFORMANCE_REPORT): в сегментных срезах
+    площадок нет, а рычаг запрета площадок без них не построить. Строки
+    поисковой сети отбрасываются — «площадка» там означает саму выдачу
+    Яндекса, запрещать её нечем и незачем.
+
+    Без goals колонка конверсий недоступна, и правило «расход без конверсий»
+    вырождается ровно так же, как у поисковых запросов.
+    """
+    fields = ["CampaignId", "Placement", "AdNetworkType", "Cost", "Clicks",
+              "Impressions"]
+    if goals:
+        fields.append("Conversions")
+    payload = {
+        "params": _with_goals({
+            "SelectionCriteria": {
+                "DateFrom": date_from,
+                "DateTo": date_to,
+                "Filter": [{"Field": "Clicks", "Operator": "GREATER_THAN",
+                            "Values": ["0"]}],
+            },
+            "FieldNames": fields,
+            "ReportName": f"agent-placements-{date_from}-{date_to}",
+            "ReportType": "PLACEMENT_PERFORMANCE_REPORT",
+            "DateRangeType": "CUSTOM_DATE",
+            "Format": "TSV",
+            "IncludeVAT": "YES",
+            "IncludeDiscount": "NO",
+        }, list(goals))
+    }
+    records = _parse_tsv(_run_report(login, payload))
+    goal_column = primary_goal_column(records)
+    rows = [
+        {
+            "window_from": date_from,
+            "window_to": date_to,
+            "campaign_id": rec.get("CampaignId", ""),
+            "placement": rec.get("Placement", ""),
+            "cost": float(rec.get("Cost") or 0.0),
+            "clicks": _cell_int(rec.get("Clicks")),
+            "impressions": _cell_int(rec.get("Impressions")),
+            "conversions": _cell_int(rec.get(goal_column)) if goal_column else 0,
+        }
+        for rec in records
+        if str(rec.get("AdNetworkType") or "").upper() == "AD_NETWORK"
+        and rec.get("Placement")
+    ]
+    return rows, chosen_goal(records, goal_column)

@@ -325,3 +325,42 @@ def test_api_post_gives_up_after_the_last_attempt(monkeypatch):
 
     with pytest.raises(_requests.exceptions.ConnectionError):
         segments._api_post("http://x", "acc", {"method": "get"}, "test")
+
+
+# ------------------- площадки РСЯ (Э3.7)
+
+
+def test_fetch_placements_asks_for_the_right_report(monkeypatch):
+    # Площадки живут в отдельном отчёте (PLACEMENT_PERFORMANCE_REPORT): в
+    # сегментных срезах их нет, и рычаг запрета площадок без него не построить.
+    seen = {}
+
+    def _run_report(login, payload):
+        seen["payload"] = payload
+        return ("CampaignId\tPlacement\tAdNetworkType\tCost\tClicks\tImpressions\t"
+                "Conversions_360811375_LSCCD\n"
+                "111\tsome.site.ru\tAD_NETWORK\t9000\t120\t5000\t0\n"
+                "111\tanother.site\tAD_NETWORK\t500\t10\t900\t2\n")
+
+    monkeypatch.setattr(segments, "_run_report", _run_report)
+    rows, goal = segments.fetch_placements("acc", "2026-07-01", "2026-08-11",
+                                           goals=["360811375"])
+    params = seen["payload"]["params"]
+    assert params["ReportType"] == "PLACEMENT_PERFORMANCE_REPORT"
+    assert "Placement" in params["FieldNames"]
+    assert rows[0]["placement"] == "some.site.ru"
+    assert rows[0]["cost"] == 9000.0
+    assert rows[0]["conversions"] == 0
+    assert rows[1]["conversions"] == 2
+    assert goal["conversions"] == 2
+
+
+def test_fetch_placements_keeps_only_network_traffic(monkeypatch):
+    # Поисковые строки того же отчёта площадкой не являются: запрещать
+    # «поиск Яндекса» нечем и незачем.
+    monkeypatch.setattr(segments, "_run_report", lambda login, payload: (
+        "CampaignId\tPlacement\tAdNetworkType\tCost\tClicks\tImpressions\n"
+        "111\tyandex.ru\tSEARCH\t9000\t120\t5000\n"
+        "111\tsome.site.ru\tAD_NETWORK\t9000\t120\t5000\n"))
+    rows, _ = segments.fetch_placements("acc", "2026-07-01", "2026-08-11")
+    assert [r["placement"] for r in rows] == ["some.site.ru"]

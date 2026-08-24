@@ -37,7 +37,7 @@ MAX_ACTIONS_PER_RUN = 50
 # "никогда", а не эвристику по подстроке.
 ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set",
                         "budget.set", "budget.set_daily", "campaign.suspend",
-                        "tcpa.set", "negative.add"}
+                        "tcpa.set", "negative.add", "placement.exclude"}
 
 # Коридор нового лимита ОТНОСИТЕЛЬНО ПРЕЖНЕГО РАСХОДА кампании (не прежнего
 # лимита: тот бывает в разы выше расхода — 5 млн/нед при расходе 616 тыс. —
@@ -65,6 +65,12 @@ NEGATIVE_MAX_WORD_CHARS = 35
 NEGATIVE_MAX_ADDED_PER_ACTION = 10
 NEGATIVE_OPERATOR_CHARS = set('"!+[]<>|')
 
+# Границы списка запрещённых площадок — свои, как и у минус-фраз. Числа из
+# ref-v5/campaigns/update: 1000 элементов, 255 символов каждый.
+PLACEMENT_MAX_SITES = 1000
+PLACEMENT_MAX_SITE_CHARS = 255
+PLACEMENT_MAX_ADDED_PER_ACTION = 10
+
 # Границы почасового расписания — СВОИ, независимые от writer/schedule.py.
 # Дублирование намеренное: рельса обязана считать сама, иначе она проверяет
 # построитель его же формулой и пропустит любую его ошибку.
@@ -79,7 +85,7 @@ SCHEDULE_STEP = 10
 ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set", "schedule.set",
                                  "budget.set", "budget.set_daily",
                                  "campaign.suspend", "tcpa.set",
-                                 "negative.add"}
+                                 "negative.add", "placement.exclude"}
 
 # Куда обязан возвращать откат, в зависимости от вида ИСХОДНОГО действия.
 # Отмена добавления — нейтраль (объекта до действия не было), отмена
@@ -137,6 +143,11 @@ def check_action(action: Dict[str, Any],
 
     if kind == "negative.add":
         ok, reason = _check_negatives(action)
+        if not ok:
+            return False, reason
+
+    if kind == "placement.exclude":
+        ok, reason = _check_placements(action)
         if not ok:
             return False, reason
 
@@ -236,6 +247,40 @@ def _check_budget(action: Dict[str, Any],
         return False, (f"целевой бюджет ×{ratio:.2f} от прежнего расхода — вне "
                        f"коридора {BUDGET_RATIO_MIN}–{BUDGET_RATIO_MAX}: похоже "
                        f"на слом конверсии единиц, а не на решение")
+    return True, ""
+
+
+def _check_placements(action: Dict[str, Any]) -> Tuple[bool, str]:
+    """Рельса запрета площадок: список целиком и добавляемое этим действием.
+
+    Считает независимо от построителя (writer/placements.py) — та же причина,
+    что у минус-фраз: рельса, доверяющая тому, кого проверяет, не рельса. И
+    цена ошибки та же: запрещённую площадку трафик обходит навсегда.
+    """
+    payload = action.get("payload") or {}
+    items = ((payload.get("ExcludedSites") or {}).get("Items"))
+    if not isinstance(items, list) or not items:
+        return False, "пустой список запрещённых площадок: действие без содержания"
+
+    added = payload.get("AddedSites")
+    added_list = added if isinstance(added, list) else items
+    if len(added_list) > PLACEMENT_MAX_ADDED_PER_ACTION:
+        return False, (f"за одно действие запрещается {len(added_list)} площадок "
+                       f"при пределе {PLACEMENT_MAX_ADDED_PER_ACTION}: "
+                       f"отсечённый трафик не вернуть")
+    if len(items) > PLACEMENT_MAX_SITES:
+        return False, (f"в списке {len(items)} площадок при пределе "
+                       f"{PLACEMENT_MAX_SITES}: Директ отклонит весь запрос")
+    for item in items:
+        site = str(item or "").strip()
+        if not site:
+            return False, "пустое имя площадки в списке"
+        if len(site) > PLACEMENT_MAX_SITE_CHARS:
+            return False, (f"имя площадки длиннее {PLACEMENT_MAX_SITE_CHARS} "
+                           f"символов: {site[:40]}…")
+        if " " in site:
+            return False, (f"в имени площадки есть пробел: {site[:40]!r} — "
+                           f"это не домен и не идентификатор приложения")
     return True, ""
 
 

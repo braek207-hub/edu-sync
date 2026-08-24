@@ -158,6 +158,9 @@ def _patch_e0_run(monkeypatch, reports=None):
         monkeypatch.setattr(agent_e0.agent_db, name, lambda *a, **k: [])
     # Снимок настроек читается словарём кампания → сырые настройки, не списком.
     monkeypatch.setattr(agent_e0.agent_db, "load_campaign_settings_raw", lambda *a, **k: {})
+    # Отчёт по площадкам — отдельный поход в Директ; без подмены тесты
+    # расчёта падали бы на сети, а не на своих утверждениях.
+    monkeypatch.setattr(agent_e0, "fetch_placements", lambda *a, **k: ([], {}))
     # Сверка сумм гейта ходит в витрину: без подмены тест падал бы на
     # отсутствии DATABASE_URL, а не на своём утверждении.
     monkeypatch.setattr(agent_e0.agent_db, "mart_cost_total", lambda *a, **k: 0.0)

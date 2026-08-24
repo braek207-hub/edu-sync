@@ -169,3 +169,27 @@ def minus_word_candidates(
         })
     out.sort(key=lambda r: -r["cost"])
     return out
+
+
+def placement_candidates(
+    placements: List[Dict[str, Any]], cpa_limit: float,
+    multiplier: float = CPA_OVERSHOOT,
+    base_conversion: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Площадки сети, которые не окупаются, — тем же правилом, что фразы.
+
+    Экономика площадки и фразы устроена одинаково: это источник трафика,
+    который либо приносит конверсии по приемлемой цене, либо нет. Поэтому
+    и критерий один (minus_word_candidates): ноль конверсий при объёме,
+    достаточном чтобы это что-то значило, — или конверсии дороже допустимого.
+
+    Отличается только имя поля, поэтому строки переименовываются, а не
+    копируется логика: разойдясь, два одинаковых по смыслу правила начали бы
+    судить один и тот же трафик по-разному в зависимости от того, где он
+    показался.
+    """
+    as_queries = [{**row, "query": row.get("placement")} for row in placements]
+    out = minus_word_candidates(as_queries, cpa_limit=cpa_limit,
+                                multiplier=multiplier,
+                                base_conversion=base_conversion)
+    return [{**row, "placement": row.pop("query")} for row in out]

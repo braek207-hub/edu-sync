@@ -46,6 +46,7 @@ from sync.agent.mining import mine_quasi_experiments, placebo_sigma
 from sync.agent.portfolio import computed_rows as portfolio_computed_rows
 from sync.agent.portfolio import portfolio_targets
 from sync.agent.writer.negatives import computed_rows as negative_computed_rows
+from sync.agent.writer.placements import computed_rows as placement_computed_rows
 from sync.agent.tcpa import (
     build_inputs as build_tcpa_inputs,
     computed_rows as tcpa_computed_rows,
@@ -56,6 +57,7 @@ from sync.agent.saturation import saturation_curves
 from sync.agent.objects import (
     build_object_rows,
     minus_word_candidates,
+    placement_candidates,
     top_queries_by_cost,
 )
 from sync.agent.power import power_report
@@ -68,6 +70,7 @@ from sync.agent.segments import (
     fetch_account_goal_ids,
     fetch_campaign_ids,
     fetch_objects,
+    fetch_placements,
     fetch_search_queries,
     fetch_segment_report,
 )
@@ -699,6 +702,41 @@ def main() -> int:
             object_level="campaign")
         negative_rows_written += len(rows)
 
+    # Площадки сети — тем же правилом, что фразы, и тем же мостом в computed.
+    # Отдельный отчёт: в сегментных срезах площадок нет.
+    placement_rows_written = 0
+    placements_seen = 0
+    placement_errors: List[Dict[str, Any]] = []
+    placement_candidate_rows: List[Dict[str, Any]] = []
+    if cpa_limit > 0:
+        for login in sorted(queries_by_login):
+            if login in set(blind_accounts):
+                continue
+            try:
+                rows, _ = fetch_placements(login, slice_from, date_to,
+                                           goals=goals_by_login.get(login, []))
+            except Exception as exc:                     # noqa: BLE001
+                # Отчёт прогона — единственный JSON в выводе, и печатать в
+                # него посторонние строки нельзя: сбой одного кабинета едет
+                # полем отчёта, а не мусором в stdout.
+                placement_errors.append({"account": login,
+                                         "error": f"{type(exc).__name__}: {exc}"[:200]})
+                continue
+            placements_seen += len(rows)
+            placement_candidate_rows += rows
+        base_clicks_p = sum(int(r.get("clicks") or 0) for r in placement_candidate_rows)
+        base_conv_p = sum(int(r.get("conversions") or 0) for r in placement_candidate_rows)
+        placement_candidates_list = placement_candidates(
+            placement_candidate_rows, cpa_limit=cpa_limit,
+            base_conversion=(base_conv_p / base_clicks_p) if base_clicks_p else 0.0)
+        for campaign_id, rows in placement_computed_rows(placement_candidates_list).items():
+            agent_db.upsert_computed_settings(
+                rows, calc_date=today_iso, object_id=campaign_id,
+                object_level="campaign")
+            placement_rows_written += len(rows)
+    else:
+        placement_candidates_list = []
+
     # 9. Снимок настроек.
     snapshot_rows = build_snapshot_rows(agent_db.load_campaign_settings_raw(), seen_on=today_iso)
     agent_db.upsert_settings_snapshot(snapshot_rows)
@@ -884,6 +922,15 @@ def main() -> int:
             "computed_rows": negative_rows_written,
             "sample": [q.get("query") for q in minus_candidates[:10]],
             "blind_accounts": blind_accounts,
+        },
+        "placements": {
+            "rows_seen": placements_seen,
+            "candidates": len(placement_candidates_list),
+            "cost_burned": round(sum(float(c.get("cost") or 0.0)
+                                     for c in placement_candidates_list), 2),
+            "sample": [c.get("placement") for c in placement_candidates_list[:10]],
+            "computed_rows": placement_rows_written,
+            "errors": placement_errors,
         },
         "settings_snapshots": len(snapshot_rows),
         "holdout": len(holdout),
