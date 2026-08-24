@@ -151,3 +151,85 @@ def tcpa_targets(campaigns: List[Dict[str, Any]],
         "moves_confident": sum(1 for r in targets.values()
                                if r["confident"] and r["move"] != "hold"),
     }
+
+
+# Стратегии, у которых цель CPA вообще есть. Остальные (максимум кликов,
+# ручные, выключенные) этим рычагом не управляются — молчать о них нельзя,
+# но и подставлять им цель тоже.
+TCPA_STRATEGIES = ("AVERAGE_CPA", "AVERAGE_CPA_MULTIPLE_GOALS")
+
+
+def _search_strategy(settings: Dict[str, Any]) -> Dict[str, Any]:
+    strategy = (settings or {}).get("strategy") or {}
+    return (strategy.get("search") or {}) if isinstance(strategy, dict) else {}
+
+
+def build_inputs(
+    facts: List[Dict[str, Any]],
+    curves: Dict[str, Dict[str, Any]],
+    settings_by_campaign: Dict[str, Dict[str, Any]],
+    window_from: str,
+    window_to: str,
+) -> List[Dict[str, Any]]:
+    """Вход рычага: витрина фактов × кривая насыщения × цель из кабинета.
+
+    Окно — ЗРЕЛОЕ: выручка приписана дате создания лида, и свежие дни ещё не
+    дозрели (тот же довод, что у лестницы). Кампании на стратегиях без цели
+    CPA не попадают сюда вовсе: рычага у них нет.
+    """
+    totals: Dict[str, Dict[str, float]] = {}
+    for row in facts:
+        day = str(row.get("fact_date"))[:10]
+        if not (window_from <= day <= window_to):
+            continue
+        slot = totals.setdefault(str(row["campaign_id"]),
+                                 {"cost": 0.0, "conversions": 0.0, "revenue": 0.0})
+        slot["cost"] += float(row.get("cost") or 0.0)
+        slot["conversions"] += float(row.get("conversions") or 0.0)
+        slot["revenue"] += float(row.get("revenue") or 0.0)
+
+    out: List[Dict[str, Any]] = []
+    for campaign_id, slot in sorted(totals.items()):
+        search = _search_strategy(settings_by_campaign.get(campaign_id) or {})
+        if str(search.get("biddingStrategyType")) not in TCPA_STRATEGIES:
+            continue
+        curve = curves.get(campaign_id) or {}
+        out.append({
+            "campaign_id": campaign_id,
+            "cost": slot["cost"],
+            "conversions": slot["conversions"],
+            "revenue": slot["revenue"],
+            "beta": float(curve.get("beta") or 1.0),
+            # Ошибка предельной цены кривой — та же неопределённость, что
+            # входит множителем β в допустимый CPA.
+            "value_rel_error": float(curve.get("marginal_rel_error") or 0.0),
+            "tcpa_current": float(search.get("targetCpa") or 0.0),
+        })
+    return out
+
+
+def computed_rows(section: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """Строки edu_agent_computed_settings: целевой CPA по кампаниям.
+
+    Две строки на кампанию, как у бюджета: сама цель (value — новая,
+    raw_value — стоящая в кабинете) и экономическое отношение, по которому
+    писатель Э3.5 заново гейтует уверенность.
+    """
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for campaign_id, row in (section.get("targets") or {}).items():
+        out[campaign_id] = [{
+            "setting_kind": "tcpa_target",
+            "setting_key": "target",
+            "value": round(float(row["target"]), 2),
+            "raw_value": float(row["tcpa_current"]),
+            "support_n": int(row["conversions"]),
+            "rel_error": row["rel_error"],
+        }, {
+            "setting_kind": "tcpa_target",
+            "setting_key": "roi_vs_target",
+            "value": row["roi_vs_target"],
+            "raw_value": row["cpa_fact"],
+            "support_n": int(row["conversions"]),
+            "rel_error": row["rel_error"],
+        }]
+    return out

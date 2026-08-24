@@ -45,6 +45,11 @@ from sync.agent.history import budget_response
 from sync.agent.mining import mine_quasi_experiments, placebo_sigma
 from sync.agent.portfolio import computed_rows as portfolio_computed_rows
 from sync.agent.portfolio import portfolio_targets
+from sync.agent.tcpa import (
+    build_inputs as build_tcpa_inputs,
+    computed_rows as tcpa_computed_rows,
+    tcpa_targets,
+)
 from sync.agent.saturation import computed_rows as saturation_computed_rows
 from sync.agent.saturation import saturation_curves
 from sync.agent.objects import (
@@ -795,6 +800,20 @@ def main() -> int:
     # лестницы (оттуда ценность лида) и после справочника «кампания →
     # кабинет» (сумма переноса сходится на уровне кабинета). Расчётный слой:
     # запись бюджетов в Директ — Э3.3.
+    # Э3.5: экономически допустимая цель CPA. Окно то же зрелое, что у
+    # лестницы: выручка приписана дате создания лида. Настройки — из витрины
+    # кабинета (edu_campaign_settings), кампании на стратегиях без цели CPA
+    # рычагом не управляются и в расчёт не входят.
+    tcpa_section = tcpa_targets(build_tcpa_inputs(
+        facts, saturation["campaigns"], agent_db.load_campaign_settings_raw(),
+        ladder_section["window_from"], ladder_section["window_to"]))
+    tcpa_count = 0
+    for campaign_id, rows in tcpa_computed_rows(tcpa_section).items():
+        agent_db.upsert_computed_settings(
+            rows, calc_date=today_iso, object_id=campaign_id,
+            object_level="campaign")
+        tcpa_count += len(rows)
+
     budget_threshold = portfolio_targets(
         saturation["campaigns"], ladder_section["by_object"], login_by_campaign_id,
         # Заповедник вне солвера: агент его не двигает, и держать его внутри
@@ -905,6 +924,17 @@ def main() -> int:
         "metrika_behavior": len(resolved_behavior),
         "power": report,
         "funnel_ladder": ladder_section,
+        # Э3.5: целевой CPA. Отчёт показывает не только сдвиги, но и молчание:
+        # сколько кампаний рычагом не управляются и почему.
+        "tcpa": {
+            "target_romi": tcpa_section["target_romi"],
+            "campaigns": len(tcpa_section["targets"]),
+            "moves_up": tcpa_section["moves_up"],
+            "moves_down": tcpa_section["moves_down"],
+            "moves_confident": tcpa_section["moves_confident"],
+            "no_target": tcpa_section["no_target"],
+            "computed_rows": tcpa_count,
+        },
         "db_total_mb": total_mb,
         "db_tables": [{"t": s["table_name"], "size": s["size"]} for s in sizes],
     }, ensure_ascii=False, indent=2))

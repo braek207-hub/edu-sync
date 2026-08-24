@@ -85,3 +85,49 @@ def test_section_splits_confident_moves_and_reasons():
     assert set(section["targets"]) == {"1", "2"}
     assert section["no_target"] == 1
     assert section["moves_up"] >= 1
+
+
+# ------------------- сборка входа из витрины и настроек кабинета
+
+
+def test_inputs_join_mart_curve_and_cabinet_target():
+    from sync.agent.tcpa import build_inputs
+    facts = [
+        {"fact_date": "2026-07-01", "campaign_id": "111", "cost": 150_000.0,
+         "conversions": 100, "revenue": 400_000.0},
+        {"fact_date": "2026-07-02", "campaign_id": "111", "cost": 150_000.0,
+         "conversions": 100, "revenue": 500_000.0},
+        {"fact_date": "2026-05-01", "campaign_id": "111", "cost": 999.0,
+         "conversions": 9, "revenue": 1.0},          # вне окна
+    ]
+    curves = {"111": {"beta": 0.8, "marginal_rel_error": 0.2}}
+    settings = {"111": {"strategy": {"search": {"biddingStrategyType": "AVERAGE_CPA",
+                                                "targetCpa": 1000.0}}}}
+    rows = build_inputs(facts, curves, settings, "2026-07-01", "2026-07-02")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["cost"] == 300_000.0
+    assert row["conversions"] == 200.0
+    assert row["revenue"] == 900_000.0
+    assert row["beta"] == 0.8
+    assert row["tcpa_current"] == 1000.0
+
+
+def test_inputs_skip_campaigns_on_other_strategies():
+    from sync.agent.tcpa import build_inputs
+    facts = [{"fact_date": "2026-07-01", "campaign_id": "222", "cost": 1000.0,
+              "conversions": 100, "revenue": 5000.0}]
+    settings = {"222": {"strategy": {"search": {
+        "biddingStrategyType": "WB_MAXIMUM_CLICKS", "targetCpa": None}}}}
+    assert build_inputs(facts, {}, settings, "2026-07-01", "2026-07-02") == []
+
+
+def test_computed_rows_carry_target_and_edge():
+    from sync.agent.tcpa import computed_rows, tcpa_targets
+    section = tcpa_targets([_campaign()], target_romi=2.0)
+    rows = computed_rows(section)["111"]
+    kinds = [(r["setting_kind"], r["setting_key"]) for r in rows]
+    assert ("tcpa_target", "target") in kinds
+    assert ("tcpa_target", "roi_vs_target") in kinds
+    target_row = next(r for r in rows if r["setting_key"] == "target")
+    assert target_row["raw_value"] == 1000.0        # текущая цель кабинета
