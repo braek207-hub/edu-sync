@@ -56,6 +56,7 @@ from sync.agent import db as agent_db
 from sync.agent.gate import data_gate
 from sync.agent.writer import budget
 from sync.agent.writer import switch
+from sync.agent.writer import tcpa
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import apply_actions
 from sync.agent.writer.client import WriteClient, journal_writes_allowed
@@ -598,6 +599,34 @@ def actions_preview(
     }
 
 
+def _tcpa_report(
+    plan: Dict[str, Any], desired: Dict[str, Any],
+    refused: Optional[List[Dict[str, Any]]] = None,
+    planned_count: int = 0, not_found: Optional[List[str]] = None,
+    cooled: Optional[List[Dict[str, Any]]] = None,
+    limit: int = PREVIEW_SAMPLE_LIMIT,
+) -> Dict[str, Any]:
+    """Что прогон решил про цели CPA (Э3.5).
+
+    Различаются те же виды молчания, что у бюджета: целей нет в расчёте,
+    сдвиг мелкий, уверенность низкая или неизвестна, рычага у кампании нет
+    (пакетная стратегия, нет носителя цели), кампанию уже трогали бюджетом
+    или кулдауном.
+    """
+    return {
+        "desired": len(desired),
+        "small_shift": plan["small_shift"],
+        "low_confidence": len(plan["low_confidence"]),
+        "low_confidence_sample": plan["low_confidence"][:limit],
+        "confidence_unknown": plan["confidence_unknown"],
+        "refused": len(refused or []),
+        "refused_sample": (refused or [])[:limit],
+        "not_found": len(not_found or []),
+        "cooldown": {"count": len(cooled or []), "sample": (cooled or [])[:limit]},
+        "actions_planned": planned_count,
+    }
+
+
 def _budget_report(
     budget_plan: Dict[str, Any], desired: Dict[str, Any],
     refused: Optional[List[Dict[str, Any]]] = None,
@@ -1083,6 +1112,9 @@ def run_account(
             (budget.BUDGET_KIND, budget.BUDGET_DAILY_KIND),
             budget.BUDGET_COOLDOWN_DAYS, account=login))
 
+    # Э3.5: цели CPA — план ДО раннего выхода, тем же правилом, что бюджет.
+    tcpa_plan = tcpa.plan_tcpa_moves(fresh_campaign_computed)
+
     # Э3.4: кандидаты на выключение — тем же правилом, что бюджет: план ДО
     # раннего выхода, ограничитель прогона уже в scoped_ids.
     switch_plan = switch.plan_switch_offs(fresh_campaign_computed)
@@ -1111,6 +1143,7 @@ def run_account(
             "budget": _budget_report(budget_plan, budget_desired,
                                      cooled=budget_cooled),
             "switch": _switch_report(switch_plan, switch_desired),
+            "tcpa": _tcpa_report(tcpa_plan, {}),
             "unsupported": unsupported,
             "campaign_level": campaign_level_report,
             "confidence": confidence_report,
@@ -1177,6 +1210,32 @@ def run_account(
             blocked.append({**action, "blocked_reason": reason})
             continue
         budget_planned_count += 1
+        planned.append({**action, "account": login})
+
+    # Э3.5: цель CPA. Состояние берётся из ТОГО ЖЕ чтения, что бюджет
+    # (fetch_budget_state уже принёс BiddingStrategy) — второй поход в API за
+    # тем же был бы лишним. Кампания, у которой этим тактом уже двигали
+    # бюджет, целью не трогается: две денежные ручки разом делают исход
+    # неразличимым, и красная линия не скажет, какая из них навредила.
+    tcpa_desired = {cid: m for cid, m in tcpa_plan["desired"].items()
+                    if cid in scoped_ids and cid not in budget_desired}
+    # Кулдаун — общий механизм денежных ручек, живёт у бюджета: правило
+    # «не чаще раза в 14 дней» одно на обе, и второй копии ему не нужно.
+    tcpa_desired, tcpa_cooled = budget.apply_cooldown(
+        tcpa_desired,
+        writer_db.recent_action_objects((tcpa.TCPA_KIND,),
+                                        budget.BUDGET_COOLDOWN_DAYS, account=login))
+    tcpa_state = (budget.fetch_budget_state(client, sorted(tcpa_desired))
+                  if tcpa_desired else {})
+    tcpa_actions, tcpa_refused = tcpa.diff_tcpa(tcpa_desired, tcpa_state)
+    tcpa_not_found = sorted(c for c in tcpa_desired if c not in tcpa_state)
+    tcpa_planned_count = 0
+    for action in tcpa_actions:
+        ok, reason = check_action(action, cost_28d_by_campaign)
+        if not ok:
+            blocked.append({**action, "blocked_reason": reason})
+            continue
+        tcpa_planned_count += 1
         planned.append({**action, "account": login})
 
     # Э3.4: выключения. Состояние (State) читается свежим; потолок — своя
@@ -1289,6 +1348,9 @@ def run_account(
         "switch": _switch_report(switch_plan, switch_desired, switch_refused,
                                  switch_planned_count, switch_not_found,
                                  deferred_over_cap=len(switch_deferred)),
+        "tcpa": _tcpa_report(tcpa_plan, tcpa_desired, tcpa_refused,
+                             tcpa_planned_count, tcpa_not_found,
+                             cooled=tcpa_cooled),
         "desired": len(desired),
         # Э2.2: скольким кампаниям применялся личный план, а не кабинетный.
         "campaign_level": campaign_level_report,

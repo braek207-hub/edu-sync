@@ -164,6 +164,16 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
                                "BiddingStrategy": payload["BiddingStrategy"]}}]
         }
 
+    if kind == "tcpa.set":
+        # Цель CPA живёт внутри BiddingStrategy, и блок собран планом
+        # (writer/tcpa.py) из ПРОЧИТАННОГО состояния с заменой одного лишь
+        # AverageCpa: структура в API заменяется целиком.
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(payload["CampaignId"]),
+                           "TextCampaign": {
+                               "BiddingStrategy": payload["BiddingStrategy"]}}]
+        }
+
     if kind == "budget.set_daily":
         return "campaigns", "update", {
             "Campaigns": [{"Id": int(payload["CampaignId"]),

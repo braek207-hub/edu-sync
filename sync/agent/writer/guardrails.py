@@ -36,7 +36,8 @@ MAX_ACTIONS_PER_RUN = 50
 # campaign.archive, adgroups.suspend, ...) молча, а рельса обязана держать
 # "никогда", а не эвристику по подстроке.
 ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set",
-                        "budget.set", "budget.set_daily", "campaign.suspend"}
+                        "budget.set", "budget.set_daily", "campaign.suspend",
+                        "tcpa.set"}
 
 # Коридор нового лимита ОТНОСИТЕЛЬНО ПРЕЖНЕГО РАСХОДА кампании (не прежнего
 # лимита: тот бывает в разы выше расхода — 5 млн/нед при расходе 616 тыс. —
@@ -46,6 +47,14 @@ ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set",
 # микрорубли вместо рублей (×10⁶) — всё это выносит соотношение за края.
 BUDGET_RATIO_MIN = 0.4
 BUDGET_RATIO_MAX = 1.6
+
+# Коридор новой ЦЕЛИ CPA относительно ФАКТИЧЕСКОГО CPA окна. Рельса ловит не
+# политику (её капит writer/tcpa.clamp_step), а слом единиц: рубли вместо
+# микрорублей и наоборот выносят соотношение на шесть порядков. Границы шире
+# бюджетных, потому что цель законно ставится заметно ниже факта — стратегии
+# систематически недодерживают её (замер кабинета: цель 1200 → факт 1687).
+TCPA_RATIO_MIN = 0.25
+TCPA_RATIO_MAX = 4.0
 
 # Границы почасового расписания — СВОИ, независимые от writer/schedule.py.
 # Дублирование намеренное: рельса обязана считать сама, иначе она проверяет
@@ -60,7 +69,7 @@ SCHEDULE_STEP = 10
 # восстановления старого, то есть ещё одно изменение кабинета под видом отмены.
 ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set", "schedule.set",
                                  "budget.set", "budget.set_daily",
-                                 "campaign.suspend"}
+                                 "campaign.suspend", "tcpa.set"}
 
 # Куда обязан возвращать откат, в зависимости от вида ИСХОДНОГО действия.
 # Отмена добавления — нейтраль (объекта до действия не было), отмена
@@ -108,6 +117,11 @@ def check_action(action: Dict[str, Any],
 
     if kind in ("budget.set", "budget.set_daily"):
         ok, reason = _check_budget(action, cost_28d_by_campaign)
+        if not ok:
+            return False, reason
+
+    if kind == "tcpa.set":
+        ok, reason = _check_tcpa(action)
         if not ok:
             return False, reason
 
@@ -206,6 +220,34 @@ def _check_budget(action: Dict[str, Any],
     if not (BUDGET_RATIO_MIN <= ratio <= BUDGET_RATIO_MAX):
         return False, (f"целевой бюджет ×{ratio:.2f} от прежнего расхода — вне "
                        f"коридора {BUDGET_RATIO_MIN}–{BUDGET_RATIO_MAX}: похоже "
+                       f"на слом конверсии единиц, а не на решение")
+    return True, ""
+
+
+def _check_tcpa(action: Dict[str, Any]) -> Tuple[bool, str]:
+    """Рельса целевого CPA: новая цель против ФАКТИЧЕСКОГО CPA окна.
+
+    Считает независимо от построителя (writer/tcpa.py) — рельса, доверяющая
+    тому, кого проверяет, не рельса. Фактический CPA приходит в payload из
+    той же строки расчёта, что и цель; без него сравнивать не с чем, и это
+    отказ, а не молчаливый пропуск.
+    """
+    payload = action.get("payload") or {}
+    micros = payload.get("TargetCpa")
+    fact = payload.get("CpaFact")
+    try:
+        micros_v = int(micros)
+        fact_v = float(fact)
+    except (TypeError, ValueError):
+        return False, (f"поля рельсы цели CPA нечитаемы: цель {micros!r}, "
+                       f"фактический CPA {fact!r}")
+    if micros_v <= 0 or fact_v <= 0:
+        return False, (f"цель и фактический CPA обязаны быть положительными: "
+                       f"цель {micros_v}, факт {fact_v}")
+    ratio = micros_v / _BUDGET_MICROS / fact_v
+    if not (TCPA_RATIO_MIN <= ratio <= TCPA_RATIO_MAX):
+        return False, (f"новая цель ×{ratio:.2f} от фактического CPA — вне "
+                       f"коридора {TCPA_RATIO_MIN}–{TCPA_RATIO_MAX}: похоже "
                        f"на слом конверсии единиц, а не на решение")
     return True, ""
 

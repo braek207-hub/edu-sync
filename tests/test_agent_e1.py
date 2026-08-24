@@ -2113,3 +2113,42 @@ def test_known_flags_are_accepted():
         ["--prod", "--apply", "--campaigns=111,222", "--max-campaigns=3"])
     assert scope.only == {"111", "222"}
     assert scope.max_campaigns == 3
+
+
+# ------------------- Э3.5: рычаг целевого CPA в прогоне
+
+
+def test_tcpa_action_reaches_the_planner(monkeypatch):
+    # Сквозная проверка вайринга: строки Э3.5 из computed → действие tcpa.set
+    # с previous_state из СВЕЖЕГО чтения кабинета.
+    from sync.agent.writer import tcpa as tcpa_writer
+    computed = {"111": [
+        {"setting_kind": "tcpa_target", "setting_key": "target",
+         "value": 1300.0, "raw_value": 1000.0, "support_n": 200,
+         "rel_error": 0.05},
+        {"setting_kind": "tcpa_target", "setting_key": "roi_vs_target",
+         "value": 1.4, "raw_value": 1500.0, "support_n": 200, "rel_error": 0.05},
+    ]}
+    plan = tcpa_writer.plan_tcpa_moves(computed)
+    assert plan["desired"]["111"]["target"] == 1300.0
+
+    state = {"111": {"strategy": {"Search": {
+        "BiddingStrategyType": "AVERAGE_CPA",
+        "AverageCpa": {"AverageCpa": 1000 * 1_000_000,
+                       "WeeklySpendLimit": 350_000 * 1_000_000}}},
+        "package_id": None, "campaign_type": "TEXT_CAMPAIGN"}}
+    actions, refused = tcpa_writer.diff_tcpa(plan["desired"], state)
+    assert not refused
+    assert actions[0]["action_kind"] == tcpa_writer.TCPA_KIND
+    from sync.agent.writer.guardrails import check_action
+    ok, reason = check_action(actions[0])
+    assert ok, reason
+
+
+def test_budget_and_tcpa_do_not_touch_the_same_campaign_in_one_tick():
+    # Две денежные ручки разом делают исход неразличимым: красная линия не
+    # скажет, какая из них навредила. Кампания, которой этим тактом двигают
+    # бюджет, целью не трогается.
+    import inspect
+    source = inspect.getsource(agent_e1)
+    assert "cid not in budget_desired" in source

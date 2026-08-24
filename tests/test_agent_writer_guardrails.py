@@ -260,3 +260,43 @@ def test_budget_rail_passes_when_numbers_agree():
     action = _budget_action(100_000 * 1_000_000, cost_28d_in_payload=480_000.0)
     ok, reason = check_action(action, cost_28d_by_campaign={"111": 470_000.0})
     assert ok, reason
+
+
+# ------------------- рельса целевого CPA (Э3.5)
+
+
+def _tcpa_action(target_micros, cpa_fact=1500.0):
+    return {
+        "action_kind": "tcpa.set",
+        "object_level": "campaign",
+        "object_id": "111",
+        "payload": {"CampaignId": 111, "TargetCpa": target_micros,
+                    "CpaFact": cpa_fact,
+                    "BiddingStrategy": {"Search": {"AverageCpa": {
+                        "AverageCpa": target_micros}}}},
+    }
+
+
+def test_tcpa_action_kind_is_allowed_and_rollbackable():
+    from sync.agent.writer.guardrails import (ALLOWED_ACTION_KINDS,
+                                              ROLLBACK_ALLOWED_ACTION_KINDS)
+    assert "tcpa.set" in ALLOWED_ACTION_KINDS
+    assert "tcpa.set" in ROLLBACK_ALLOWED_ACTION_KINDS
+
+
+def test_tcpa_rail_passes_reasonable_target():
+    ok, reason = check_action(_tcpa_action(1_300 * 1_000_000))
+    assert ok, reason
+
+
+def test_tcpa_rail_catches_broken_units():
+    # Рубли вместо микрорублей (×10⁻⁶) и наоборот — самый вероятный слом.
+    ok, reason = check_action(_tcpa_action(1300))
+    assert not ok and "коридор" in reason
+    ok, reason = check_action(_tcpa_action(1_300 * 1_000_000 * 1_000_000))
+    assert not ok
+
+
+def test_tcpa_rail_needs_a_fact_to_compare_with():
+    ok, reason = check_action(_tcpa_action(1_300 * 1_000_000, cpa_fact=None))
+    assert not ok
