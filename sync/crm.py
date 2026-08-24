@@ -111,6 +111,7 @@ def _sync_leads_raw(
     headers: List[str],
     values: List[List[Any]],
     paid_by_lead_id: Dict[str, Dict[str, Any]] | None = None,
+    seen_lead_ids: set[str] | None = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, "Dims"], List[Dict[str, Any]]]:
     """Построчные лиды с сегментами — как GAS readCrmRawFromVals_.
 
@@ -119,6 +120,13 @@ def _sync_leads_raw(
          (поле payment_flag: "1"/"да" → 1, иначе 0);
       2) если передан paid_by_lead_id — join по leadId из листа «Оплаты» (orders==1);
       при наличии обоих источников суммируем (обычно одно из двух).
+
+    seen_lead_ids: сквозной по всем листам набор уже посчитанных lead_id. Строка с
+      повторным id пропускается целиком — агрегат складывает по строкам листа, поэтому
+      один лид, попавший в выгрузку дважды, иначе удваивает и лиды, и оплаты, и выручку
+      (ровно так витрина жила задвоенной 20.07–01.08.2026). Детализация от этого была
+      защищена БД (ON CONFLICT lead_id) — здесь тот же контракт для агрегата. Строки без
+      id считаются всегда: дедуплицировать их нечем, а терять нельзя.
 
     eff_leads: все лиды кроме junk-статусов (дубль/спам/тест/ошибка/повтор).
     audience: «Родитель» → "parent", «Школьник»/«Ученик» → "pupil", иначе "unknown".
@@ -188,6 +196,8 @@ def _sync_leads_raw(
     agg: Dict[str, Dict[str, Any]] = {}
     lead_dims_by_id: Dict[str, Dims] = {}
     lead_details: List[Dict[str, Any]] = []
+    seen: set[str] = seen_lead_ids if seen_lead_ids is not None else set()
+    dropped_dups = 0
 
     for row in values[1:]:
         date_iso = to_iso_date(_cell(row, li["date"]))
@@ -221,6 +231,10 @@ def _sync_leads_raw(
             normalize_campaign_id(_cell(row, li["id"])) if li["id"] != -1 else ""
         )
         if lead_id:
+            if lead_id in seen:
+                dropped_dups += 1
+                continue
+            seen.add(lead_id)
             lead_dims_by_id[lead_id] = (city, grad, edu)
 
         # audience — часть ключа сегмента
@@ -358,6 +372,9 @@ def _sync_leads_raw(
                 }
             )
 
+    if dropped_dups:
+        print(f"CRM Лиды: пропущено {dropped_dups} строк с уже посчитанным lead_id (дубли выгрузки)")
+
     return agg, lead_dims_by_id, lead_details
 
 
@@ -477,13 +494,16 @@ def _parse_leads_sheet(
     values: List[List[Any]],
     sheet_name: str,
     paid_by_lead_id: Dict[str, Dict[str, float]] | None = None,
+    seen_lead_ids: set[str] | None = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dims], List[Dict[str, Any]]]:
     print(f"CRM Лиды [{sheet_name}]: заголовки = {headers[:12]}")
     lead_dims_by_id: Dict[str, Dims] = {}
     agg: Dict[str, Dict[str, Any]] = {}
     lead_details: List[Dict[str, Any]] = []
     try:
-        agg, lead_dims_by_id, lead_details = _sync_leads_raw(headers, values, paid_by_lead_id)
+        agg, lead_dims_by_id, lead_details = _sync_leads_raw(
+            headers, values, paid_by_lead_id, seen_lead_ids
+        )
         if agg:
             print(f"CRM Лиды [{sheet_name}]: режим построчный (utm campaign + сегменты)")
             return agg, lead_dims_by_id, lead_details
@@ -740,6 +760,8 @@ def sync_crm_leads() -> int:
     lead_dims_by_id: Dict[str, Dims] = {}
     agg: Dict[str, Dict[str, Any]] = {}
     lead_details: List[Dict[str, Any]] = []
+    # Один набор на все листы: лид, попавший и в «Лиды», и в «Лиды 2025», считается один раз.
+    seen_lead_ids: set[str] = set()
 
     for sheet_name in sheet_names:
         # Та же дисциплина, что у оплат: crm_leads пишется через replace
@@ -751,7 +773,7 @@ def sync_crm_leads() -> int:
             continue
         headers = [str(x) for x in values[0]]
         sheet_agg, sheet_dims, sheet_details = _parse_leads_sheet(
-            headers, values, sheet_name, paid_by_lead_id
+            headers, values, sheet_name, paid_by_lead_id, seen_lead_ids
         )
         if not sheet_agg:
             continue
