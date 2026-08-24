@@ -69,3 +69,41 @@ def test_detect_direction_vpo():
 def test_detect_direction_other():
     assert detect_direction("") == "other"
     assert detect_direction("неизвестная_кампания") == "other"
+
+
+# ── Ленд школы (school.edunetwork.ru) — отдельный проект в кабинете vuz ──────
+
+
+def test_detect_project_eduschool_by_level_segment():
+    for name in (
+        "vuz / Онлайн-школа / Школа / Поиск / РФ (2026-08)",
+        "vuz / Онлайн-школа / Школа / РСЯ / РФ (2026-08)",
+        "vuz / Онлайн-школа / Школа / Конкуренты / Поиск / РФ (2026-08)",
+    ):
+        assert detect_project(name) == "eduschool"
+        assert detect_direction(name) == "school"
+
+
+def test_detect_project_school_substring_stays_vuz():
+    """Исторические кампании про онлайн-школу вели на ленд vuz — не трогаем."""
+    assert detect_project("vuz / Общее / Онлайн школа  / Поиск / РФ") == "vuz"
+    assert detect_project("vuz_new / Ретаргет Школьники / РСЯ / МСК") == "vuz"
+    assert detect_project("vsekolledzhi_postupi / Онлайн Школа / РФ / Поиск") == "vse"
+    assert detect_direction("vuz / Общее / Онлайн школа  / Поиск / РФ") == "dist"
+
+
+def test_map_crm_land_eduschool():
+    from sync.classify import map_crm_land, resolve_row_project
+
+    assert map_crm_land("eduschool") == "eduschool"
+    assert map_crm_land("EduSchool") == "eduschool"
+    # Ленд сильнее имени кампании: строка CRM знает лендинг точно.
+    assert resolve_row_project(None, "vuz / Общее / ВПО / Поиск", "eduschool") == "eduschool"
+
+
+def test_normalize_plan_keys_school():
+    from sync.classify import normalize_plan_direction, normalize_plan_project
+
+    assert normalize_plan_project("Онлайн-школа") == "eduschool"
+    assert normalize_plan_project("eduschool") == "eduschool"
+    assert normalize_plan_direction("Школа") == "school"

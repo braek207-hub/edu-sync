@@ -31,8 +31,33 @@ def project_from_client(login: str, item: dict) -> str | None:
     return None
 
 
+def _name_segments(campaign_name: str) -> list[str]:
+    """Сегменты имени кампании: «vuz / Онлайн-школа / Школа / Поиск / РФ» → 5 кусков."""
+    parts = str(campaign_name or "").lower().split("/")
+    out = []
+    for p in parts:
+        p = " ".join(p.split())
+        if p:
+            out.append(p)
+    return out
+
+
+def is_school_campaign(campaign_name: str) -> bool:
+    """Кампании ленда school.edunetwork.ru.
+
+    Маркер — сегмент уровня образования, равный ровно «школа» (в ряду СПО/ВПО/Школа):
+    «vuz / Онлайн-школа / Школа / Поиск / РФ (2026-08)». Подстрокой ловить нельзя —
+    исторические «vuz / Общее / Онлайн школа / Поиск / РФ» и «Ретаргет Школьники»
+    вели на ленд vuz, и их переклассификация развела бы расход с лидами.
+    """
+    return "школа" in _name_segments(campaign_name)
+
+
 def detect_project(campaign_name: str) -> str:
     s = str(campaign_name or "").lower()
+    # Школа живёт в кабинете vuz, но это отдельный ленд → проверяем до «vuz».
+    if is_school_campaign(s):
+        return "eduschool"
     # provuz раньше vuz (GAS detectProjectFromCampaign_)
     if "provuz" in s or "postupi_provuz" in s or "provuz_postupi" in s:
         return "provuz"
@@ -56,6 +81,8 @@ def normalize_plan_project(raw: str) -> str:
         return "provuz"
     if s in ("brand", "бренды", "бренд", "brands"):
         return "brand"
+    if s in ("eduschool", "школа", "онлайн-школа", "онлайн школа", "school"):
+        return "eduschool"
     return s
 
 
@@ -82,6 +109,8 @@ def normalize_plan_direction(raw: str) -> str:
         return "it"
     if s in ("other", "остальное"):
         return "other"
+    if s in ("school", "школа"):
+        return "school"
     return s
 
 
@@ -202,6 +231,8 @@ def map_crm_land(land: str) -> str:
     s = str(land or "").strip().lower()
     if not s:
         return "unknown"
+    if s == "eduschool":  # school.edunetwork.ru — отдельный ленд в кабинете vuz
+        return "eduschool"
     if s == "vuz":
         return "vuz"
     if s in ("vsekolledzhi_postupi", "vse", "postupi_vsekolledzhi"):
@@ -227,6 +258,10 @@ def resolve_row_project(
 
 def detect_direction(campaign_name: str) -> str:
     s = str(campaign_name or "").lower()
+    # Школа — свой уровень образования (в ряду СПО/ВПО), а не «Дистанс»:
+    # иначе «онлайн» в имени увело бы её в dist. Проверяем первой.
+    if is_school_campaign(s):
+        return "school"
     if "мти" in s or " mti " in s or "мти " in s or " mti" in s:
         return "mti"
     if "нтб" in s:
