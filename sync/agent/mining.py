@@ -259,8 +259,17 @@ def _experiment_id(campaign_id: str, change_date: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def mine_quasi_experiments(facts: List[Dict[str, Any]], window: int = 14) -> List[Dict[str, Any]]:
-    """Находит изменения бюджета в истории и меряет их эффект через DiD."""
+def mine_quasi_experiments(facts: List[Dict[str, Any]], window: int = 14,
+                           error_floor: Optional[float] = None,
+                           ) -> List[Dict[str, Any]]:
+    """Находит изменения бюджета в истории и меряет их эффект через DiD.
+
+    error_floor — уже посчитанный плацебо-разброс (placebo_sigma). Проход по
+    плацебо-точкам дорогой, а потребителей у него два (ещё пары недель в
+    saturation), поэтому прогон Э0 считает его один раз и передаёт сюда.
+    None — считаем сами: вызывающий код без пола не должен молча остаться
+    с пуассоновской недооценкой.
+    """
     by_campaign: Dict[str, List[Dict[str, Any]]] = {}
     for f in facts:
         by_campaign.setdefault(str(f["campaign_id"]), []).append(f)
@@ -268,7 +277,8 @@ def mine_quasi_experiments(facts: List[Dict[str, Any]], window: int = 14) -> Lis
     # Пол ошибки из плацебо-точек — один на прогон: шум «на пустом месте»
     # общий для кабинета, и мерить его по каждой кампании отдельно значило бы
     # оценивать разброс по трём точкам.
-    floor = placebo_sigma(facts, window=window) or 0.0
+    floor = (float(error_floor) if error_floor is not None
+             else (placebo_sigma(facts, window=window) or 0.0))
 
     out: List[Dict[str, Any]] = []
     for campaign_id, rows in sorted(by_campaign.items()):

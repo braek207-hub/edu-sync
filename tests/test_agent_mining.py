@@ -248,3 +248,17 @@ def test_experiment_error_is_never_below_the_placebo_floor():
         floor = r["params"].get("placebo_sigma")
         assert floor is not None
         assert r["params"]["rel_error"] >= floor - 1e-9
+
+
+def test_precomputed_placebo_floor_is_not_recomputed(monkeypatch):
+    # Плацебо-проход дорогой (DiD по всем кампаниям и точкам). Прогон Э0
+    # считает его один раз и передаёт обоим потребителям — квазиэкспериментам
+    # и парам недель.
+    monkeypatch.setattr(mining, "placebo_sigma", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("пол ошибки уже посчитан — пересчитывать нельзя")))
+    facts = []
+    for d in range(1, 29):
+        facts.append(_facts_row(d, "111", 1000.0 if d < 15 else 2000.0, 5))
+        facts.append(_facts_row(d, "222", 1000.0, 5))
+    rows = mine_quasi_experiments(facts, window=7, error_floor=0.33)
+    assert rows and all(r["params"]["placebo_sigma"] == 0.33 for r in rows)

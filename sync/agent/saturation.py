@@ -265,6 +265,7 @@ def saturation_curves(
     quasi_experiments: List[Dict[str, Any]],
     direction_by_campaign: Dict[str, Optional[str]],
     mature_through: str,
+    error_floor: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Кривые насыщения по кампаниям и направлениям.
 
@@ -285,7 +286,8 @@ def saturation_curves(
             quasi_obs.setdefault(campaign_id, []).append(obs)
 
     # Один пол ошибки на прогон — общий для обоих источников наблюдений.
-    floor = placebo_sigma(facts) or 0.0
+    floor = (float(error_floor) if error_floor is not None
+             else (placebo_sigma(facts) or 0.0))
     weekly_obs, weekly_stats = weekly_pair_observations(
         facts, mature_through, quasi_dates, error_floor=floor)
     weekly_stats["placebo_sigma"] = round(floor, 4)

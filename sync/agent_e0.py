@@ -42,7 +42,7 @@ from sync.agent.metrika import (
 from sync.agent.hierarchy import hierarchical_modifiers
 from sync.agent.ladder import ladder_report
 from sync.agent.history import budget_response
-from sync.agent.mining import mine_quasi_experiments
+from sync.agent.mining import mine_quasi_experiments, placebo_sigma
 from sync.agent.portfolio import computed_rows as portfolio_computed_rows
 from sync.agent.portfolio import portfolio_targets
 from sync.agent.saturation import computed_rows as saturation_computed_rows
@@ -425,7 +425,10 @@ def main() -> int:
 
     # 5. Квазиэксперименты → блокнот; тут же — их чтение (Э2.4): сигнал
     # насыщения по кампаниям и направлениям, вход кривых Э3.1.
-    quasi = mine_quasi_experiments(facts)
+    # Плацебо-разброс — один проход на прогон: его считают оба потребителя
+    # (квазиэксперименты и пары недель), а проход дорогой.
+    placebo_floor = placebo_sigma(facts) or 0.0
+    quasi = mine_quasi_experiments(facts, error_floor=placebo_floor)
     agent_db.upsert_experiments(quasi)
     history = budget_response(
         quasi, {str(f["campaign_id"]): f.get("direction") for f in facts})
@@ -435,7 +438,8 @@ def main() -> int:
     # эфф. лида на текущем объёме. Граница зрелости — CRM: эффективные лиды
     # свежих дней ещё едут, и хвостовые недели занизили бы лиды всем окнам.
     saturation = saturation_curves(
-        facts, quasi, direction_by_campaign, latest_lead or date_to)
+        facts, quasi, direction_by_campaign, latest_lead or date_to,
+        error_floor=placebo_floor)
     saturation_count = 0
     for campaign_id, rows in saturation_computed_rows(saturation).items():
         agent_db.upsert_computed_settings(
