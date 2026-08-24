@@ -961,6 +961,7 @@ def run_account(
     потому, что было нечего делать, а потому, что прогон умер.
     """
     daily_cost = ctx["daily_cost"]
+    cost_28d_by_campaign = ctx.get("cost_28d_by_campaign") or {}
     baseline_cpa = ctx["baseline_cpa"]
     baseline_window = ctx.get("baseline_window")
     absolute_max_cpa = ctx["absolute_max_cpa"]
@@ -1171,7 +1172,7 @@ def run_account(
     budget_not_found = sorted(c for c in budget_desired if c not in budget_state)
     budget_planned_count = 0
     for action in budget_actions:
-        ok, reason = check_action(action)
+        ok, reason = check_action(action, cost_28d_by_campaign)
         if not ok:
             blocked.append({**action, "blocked_reason": reason})
             continue
@@ -1493,6 +1494,12 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
 
     ctx: Dict[str, Any] = {
         "daily_cost": daily_cost,
+        # Независимый расход 28 дней по кампаниям — для рельсы бюджета:
+        # без него она проверяет арифметику построителя его же числом.
+        # Средний дневной × 28: то же окно, что у Cost28dVat построителя,
+        # и та же витрина, но своим путём.
+        "cost_28d_by_campaign": {cid: value * 28.0
+                                 for cid, value in daily_cost.items()},
         "baseline_cpa": baseline_cpa,
         # Окно, на котором снята база: едет в красную линию, по нему сторож
         # считает сезонную поправку порога.

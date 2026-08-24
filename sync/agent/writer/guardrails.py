@@ -75,8 +75,15 @@ def _is_delete(kind_lower: str) -> bool:
     return "delete" in kind_lower or "remove" in kind_lower
 
 
-def check_action(action: Dict[str, Any]) -> Tuple[bool, str]:
-    """Проверка одного действия. Возвращает (можно ли, причина отказа)."""
+def check_action(action: Dict[str, Any],
+                 cost_28d_by_campaign: Optional[Dict[str, float]] = None,
+                 ) -> Tuple[bool, str]:
+    """Проверка одного действия. Возвращает (можно ли, причина отказа).
+
+    cost_28d_by_campaign — независимый расход кампаний из витрины для рельсы
+    бюджета (см. _check_budget). Без него рельса вынуждена верить числу
+    построителя.
+    """
     kind = str(action.get("action_kind") or "")
     kind_lower = kind.lower()
 
@@ -100,7 +107,7 @@ def check_action(action: Dict[str, Any]) -> Tuple[bool, str]:
             return False, reason
 
     if kind in ("budget.set", "budget.set_daily"):
-        ok, reason = _check_budget(action)
+        ok, reason = _check_budget(action, cost_28d_by_campaign)
         if not ok:
             return False, reason
 
@@ -140,7 +147,15 @@ _BUDGET_WEEKS = 4.0
 _BUDGET_MICROS = 1_000_000
 
 
-def _check_budget(action: Dict[str, Any]) -> Tuple[bool, str]:
+# Допустимое расхождение расхода построителя с витриной. Окна считаются по
+# разным границам зрелости, поэтому точного равенства не бывает; расхождение
+# сверх этой доли означает, что построитель считает расход не тем, чем витрина.
+BUILDER_SPEND_TOLERANCE = 0.25
+
+
+def _check_budget(action: Dict[str, Any],
+                  cost_28d_by_campaign: Optional[Dict[str, float]] = None,
+                  ) -> Tuple[bool, str]:
     """Рельса бюджета: новый лимит против прежнего РАСХОДА кампании.
 
     payload.Cost28dVat — расход 28 дней с НДС из той же строки budget_target,
@@ -149,6 +164,14 @@ def _check_budget(action: Dict[str, Any]) -> Tuple[bool, str]:
     коридор: портфель капит сдвиг ×0.5–1.5, а слом конверсии единиц (недели
     вместо дней — ×7, микрорубли вместо рублей — ×10⁶) выносит соотношение
     за края немедленно.
+
+    cost_28d_by_campaign — НЕЗАВИСИМЫЙ расход из витрины. Без него рельса
+    сверяет лимит с числом, которое в payload положил сам построитель:
+    ошибись он окном или кампанией — рельса это одобрит, потому что проверяет
+    его же арифметику его же данными (аудит 2026-08-23). Со справочником
+    коридор считается по витрине, а расхождение самих чисел сверх
+    BUILDER_SPEND_TOLERANCE — отдельный отказ: это разошедшиеся источники, а
+    не решение.
     """
     payload = action.get("payload") or {}
     if str(action.get("action_kind")) == "budget.set":
@@ -167,6 +190,17 @@ def _check_budget(action: Dict[str, Any]) -> Tuple[bool, str]:
     if micros_v <= 0 or cost_v <= 0:
         return False, (f"лимит и расход обязаны быть положительными: "
                        f"лимит {micros_v}, расход {cost_v}")
+
+    mart_cost = (cost_28d_by_campaign or {}).get(str(action.get("object_id")))
+    if mart_cost is not None and float(mart_cost) > 0:
+        mart_v = float(mart_cost)
+        drift = abs(cost_v - mart_v) / mart_v
+        if drift > BUILDER_SPEND_TOLERANCE:
+            return False, (f"расход построителя {cost_v:.0f} ₽ расходится с "
+                           f"витриной {mart_v:.0f} ₽ на {drift:.0%} — источники "
+                           f"разошлись, решение считать не по чему")
+        cost_v = mart_v
+
     implied_28d = micros_v / _BUDGET_MICROS * per_window * _BUDGET_VAT
     ratio = implied_28d / cost_v
     if not (BUDGET_RATIO_MIN <= ratio <= BUDGET_RATIO_MAX):

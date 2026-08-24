@@ -218,3 +218,45 @@ def test_cap_keeps_all_when_under_limit():
     applied, deferred = cap_actions(actions, max_per_run=50)
     assert len(applied) == 3
     assert deferred == []
+
+
+# ------------------- рельса бюджета проверяет расход НЕЗАВИСИМО
+
+
+def _budget_action(weekly_micros, cost_28d_in_payload):
+    return {
+        "action_kind": "budget.set",
+        "object_level": "campaign",
+        "object_id": "111",
+        "payload": {"CampaignId": 111, "WeeklySpendLimit": weekly_micros,
+                    "Cost28dVat": cost_28d_in_payload},
+    }
+
+
+def test_budget_rail_uses_independent_spend_not_the_payload_number():
+    # Рельса сверялась с числом, которое в payload положил САМ построитель:
+    # ошибись он в окне или в кампании — рельса это одобрит. Коридор считается
+    # по витрине: тот же лимит проходит по числу построителя и не проходит по
+    # независимому расходу, хотя сами числа расходятся в пределах допуска.
+    action = _budget_action(100_000 * 1_000_000, cost_28d_in_payload=320_000.0)
+    ok, _ = check_action(action)
+    assert ok, "×1.5 от расхода построителя — внутри коридора"
+
+    ok, reason = check_action(action, cost_28d_by_campaign={"111": 265_000.0})
+    assert not ok
+    assert "коридор" in reason
+
+
+def test_budget_rail_flags_builder_spend_that_contradicts_the_mart():
+    # Даже если оба числа дают допустимое отношение, расхождение самих чисел
+    # означает, что построитель считает расход не тем, чем витрина.
+    action = _budget_action(100_000 * 1_000_000, cost_28d_in_payload=480_000.0)
+    ok, reason = check_action(action, cost_28d_by_campaign={"111": 700_000.0})
+    assert not ok
+    assert "витрин" in reason
+
+
+def test_budget_rail_passes_when_numbers_agree():
+    action = _budget_action(100_000 * 1_000_000, cost_28d_in_payload=480_000.0)
+    ok, reason = check_action(action, cost_28d_by_campaign={"111": 470_000.0})
+    assert ok, reason
