@@ -162,3 +162,46 @@ def test_did_returns_none_when_a_window_has_zero_level():
     # делает оценку невозможной, а не «эффект −100 %».
     assert did_effect(100.0, 0.0, 100.0, 95.0, rel_error=0.1)["effect"] is None
     assert did_effect(100.0, 80.0, 100.0, 0.0, rel_error=0.1)["effect"] is None
+
+
+# ------------------------- C5: возврат к среднему (RTM) в предыстории
+
+
+def test_change_after_cpl_spike_is_declassed_as_rtm_suspect():
+    # Бюджет режут ПОСЛЕ всплеска цены лида, а всплеск и сам откатывается к
+    # среднему. DiD припишет это возвращение заслуге правки: «срезали бюджет
+    # → CPL упал → кампания насыщалась». Такой скачок не даёт права двигать
+    # деньги — класс надёжности понижается, и в эластичность он не идёт.
+    facts = []
+    for d in range(1, 29):
+        if d < 8:
+            cost, leads = 1000.0, 20        # спокойная база: CPL 50
+        elif d < 15:
+            cost, leads = 1000.0, 5         # всплеск CPL 200 — на него и реагируют
+        else:
+            cost, leads = 500.0, 10         # бюджет срезали, CPL вернулся к 50
+        facts.append(_facts_row(d, "111", cost, leads))
+        facts.append(_facts_row(d, "222", 1000.0, 20))
+    rows = mine_quasi_experiments(facts, window=7)
+    assert rows, "скачок обязан быть найден — деклассируется, а не прячется"
+    assert all(r["reliability_class"] == "C" for r in rows)
+    assert all(r["params"]["pre_trend"]["rtm_suspect"] is True for r in rows)
+
+
+def test_change_on_a_calm_history_keeps_class_b():
+    facts = []
+    for d in range(1, 29):
+        facts.append(_facts_row(d, "111", 1000.0 if d < 15 else 2000.0, 5))
+        facts.append(_facts_row(d, "222", 1000.0, 5))
+    rows = mine_quasi_experiments(facts, window=7)
+    assert all(r["reliability_class"] == "B" for r in rows)
+    assert all(r["params"]["pre_trend"]["rtm_suspect"] is False for r in rows)
+
+
+def test_rtm_suspect_experiment_is_not_used_for_elasticity():
+    from sync.agent.history import elasticity
+    suspect = {"effect": -0.5, "reliability_class": "C",
+               "params": {"before": 1000.0, "after": 500.0, "rel_error": 0.2}}
+    trusted = {**suspect, "reliability_class": "B"}
+    assert elasticity(suspect) is None
+    assert elasticity(trusted) is not None

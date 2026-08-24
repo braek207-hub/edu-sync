@@ -43,6 +43,12 @@ def elasticity(experiment: Dict[str, Any]) -> Optional[Dict[str, float]]:
     формата с фиктивным интервалом не пересчитываются задним числом).
     """
     effect = experiment.get("effect")
+    # Класс C — RTM-подозрительная предыстория (mining.pre_trend_check):
+    # правку сделали В ОТВЕТ на всплеск, и возвращение всплеска к среднему
+    # DiD припишет заслуге правки. Смещение систематическое, а не шумовое —
+    # расширять интервал бесполезно, такое наблюдение в эластичность не идёт.
+    if str(experiment.get("reliability_class") or "B") not in ("A", "B"):
+        return None
     params = experiment.get("params") or {}
     before = float(params.get("before") or 0.0)
     after = float(params.get("after") or 0.0)

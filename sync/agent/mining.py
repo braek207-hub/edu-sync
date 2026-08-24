@@ -21,6 +21,18 @@ from typing import Any, Dict, List, Optional, Set
 
 MIN_SIDE_DAYS = 7          # минимум дней с каждой стороны точки изменения
 
+# Порог отклонения предыстории: во сколько СИГМ цена лида окна «до» отличается
+# от собственной базы кампании ДО него. Больше порога — правку, скорее всего,
+# сделали В ОТВЕТ на всплеск, а всплеск и сам возвращается к среднему
+# (regression to the mean): DiD припишет это возвращение заслуге правки.
+# Такое наблюдение не выбрасывается (сам факт изменения полезен), а
+# ДЕКЛАССИРУЕТСЯ: класс C в эластичность не идёт (history.elasticity).
+RTM_SIGMA_THRESHOLD = 1.0
+
+# Класс надёжности RTM-подозрительного наблюдения. Ниже B: «трогали то, что
+# болело» — общее смещение всех квазиэкспериментов; здесь оно ещё и измеримо.
+RTM_CLASS = "C"
+
 
 def detect_change_points(series: List[Dict[str, Any]], min_jump: float = 0.3) -> List[Dict[str, Any]]:
     """Точки скачка среднего уровня ряда: |после − до| / до ≥ min_jump."""
@@ -134,6 +146,39 @@ def _window_dates(
     return set(days[-window:] if before else days[:window])
 
 
+def pre_trend_check(
+    rows: List[Dict[str, Any]], before_dates: Set[str], window: int,
+) -> Dict[str, Any]:
+    """Отклонение цены лида окна «до» от собственной базы кампании перед ним.
+
+    База — те же window суток, что лежат ДО окна «до». Сравнение в логарифмах
+    и в сигмах пуассоновского счёта лидов обоих окон: z = |ln(cpl_до /
+    cpl_база)| / √(1/лиды_до + 1/лиды_база).
+
+    Базы нет (истории не хватает) или в окне нет лидов — судить не о чем:
+    rtm_suspect=False с указанной причиной. Молчаливое «подозрительно» на
+    нехватке данных деклассировало бы всю раннюю историю кабинета.
+    """
+    if not before_dates:
+        return {"rtm_suspect": False, "reason": "окно «до» пусто"}
+    baseline_days = sorted({r["fact_date"] for r in rows
+                            if r["fact_date"] < min(before_dates)})[-window:]
+    if len(baseline_days) < window:
+        return {"rtm_suspect": False, "reason": "истории до окна не хватает"}
+    pre = _window_metrics([r for r in rows if r["fact_date"] in before_dates])
+    base = _window_metrics([r for r in rows if r["fact_date"] in set(baseline_days)])
+    if pre["leads"] <= 0 or base["leads"] <= 0 or pre["cpl"] <= 0 or base["cpl"] <= 0:
+        return {"rtm_suspect": False, "reason": "в окне или базе нет лидов"}
+    sigma = math.sqrt(1.0 / pre["leads"] + 1.0 / base["leads"])
+    z = abs(math.log(pre["cpl"] / base["cpl"])) / sigma if sigma > 0 else 0.0
+    return {
+        "rtm_suspect": z > RTM_SIGMA_THRESHOLD,
+        "z": round(z, 2),
+        "cpl_before_window": round(pre["cpl"], 2),
+        "cpl_baseline": round(base["cpl"], 2),
+    }
+
+
 def _experiment_id(campaign_id: str, change_date: str) -> str:
     raw = f"quasi:{campaign_id}:{change_date}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
@@ -187,6 +232,7 @@ def mine_quasi_experiments(facts: List[Dict[str, Any]], window: int = 14) -> Lis
             if measured["effect"] is None:
                 continue
 
+            pre_trend = pre_trend_check(rows, before_dates, window)
             out.append({
                 "experiment_id": _experiment_id(campaign_id, change_date),
                 "hypothesis_type": "budget_change",
@@ -196,13 +242,14 @@ def mine_quasi_experiments(facts: List[Dict[str, Any]], window: int = 14) -> Lis
                     "jump": point["jump"], "before": point["before"], "after": point["after"],
                     "rel_error": round(rel, 4),
                     "leads": {k: w["leads"] for k, w in windows.items()},
+                    "pre_trend": pre_trend,
                 },
                 "mechanism": "did",
                 "started_on": change_date,
                 "measured_on": change_date,
                 "metric": "eff_cpl",
                 "verdict": "improved" if measured["effect"] < 0 else "worsened",
-                "reliability_class": "B",
+                "reliability_class": RTM_CLASS if pre_trend["rtm_suspect"] else "B",
                 "source": "quasi",
                 **measured,
             })
