@@ -1,5 +1,10 @@
 name: agent-e1-watchdog
 on:
+  schedule:
+    # 07:30 UTC = 10:30 МСК: после расчёта agent-e0 (09:30 МСК) и сторожа
+    # свежести данных (10:00 МСК). По крону — боевой откат с тревогами:
+    # --prod --apply --fail-on-alarm (см. шаг Run ниже).
+    - cron: "30 7 * * *"
   workflow_dispatch:
     inputs:
       prod:
@@ -15,6 +20,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,7 +48,15 @@ jobs:
             echo "Запрещено: apply без prod. Реальный откат — prod+apply; репетиция — без apply."
             exit 1
           fi
-          ARGS=""
-          if [ "${{ github.event.inputs.prod }}" = "true" ]; then ARGS="$ARGS --prod"; fi
-          if [ "${{ github.event.inputs.apply }}" = "true" ]; then ARGS="$ARGS --apply"; fi
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # Крон существует ради боевого отката: репетиция по расписанию
+            # ничего не защищает. --fail-on-alarm — чтобы тревоги (пробои,
+            # неудачные откаты, зависшие строки) приходили письмом GitHub
+            # о красном ране, а не лежали в логах зелёного.
+            ARGS="--prod --apply --fail-on-alarm"
+          else
+            ARGS=""
+            if [ "${{ github.event.inputs.prod }}" = "true" ]; then ARGS="$ARGS --prod"; fi
+            if [ "${{ github.event.inputs.apply }}" = "true" ]; then ARGS="$ARGS --apply"; fi
+          fi
           python -m sync.agent_e1_watchdog $ARGS

@@ -1,5 +1,10 @@
 name: agent-e0
 on:
+  schedule:
+    # 06:30 UTC = 09:30 МСК: после всех синков (последний — 05:40 МСК) с
+    # запасом на опоздание планировщика GitHub 1–3 ч. Красный гейт данных
+    # внутри agent_e0 даёт exit 1 → письмо GitHub о красном ране.
+    - cron: "30 6 * * *"
   workflow_dispatch:
     inputs:
       days:
@@ -24,6 +29,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
