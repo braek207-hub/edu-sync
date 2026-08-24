@@ -97,6 +97,47 @@ def transition_rate(
     return fallback
 
 
+def _pool_counts(pools: Sequence[Tuple[str, Dict[str, Any]]],
+                 name: str) -> Dict[str, Any]:
+    for pool_name, counts in pools:
+        if pool_name == name:
+            return counts
+    return {}
+
+
+def _chain_variance(rates: List[Dict[str, Any]],
+                    pools: Sequence[Tuple[str, Dict[str, Any]]]) -> float:
+    """Относительная дисперсия составного коэффициента перехода.
+
+    Коэффициенты ОДНОГО пула телескопируют: (paid/deals)·(deals/connected)·
+    (connected/eff) — это ровно paid/eff того же пула. Складывать их
+    относительные дисперсии как независимые нельзя: промежуточные счётчики
+    сокращаются, и прежняя сумма 1/paid + 1/deals + … завышала
+    неопределённость тем сильнее, чем ближе счётчики соседних ступеней —
+    на цепочке 25/30/35/40 больше чем вдвое (аудит 2026-08-23).
+
+    Поэтому подряд идущие пары одного пула схлопываются в одну долю
+    num_самой_глубокой / den_самой_мелкой с биномиальной дисперсией
+    (1−p)/num, а дисперсии РАЗНЫХ пулов складываются: пулы независимы.
+    """
+    variance = 0.0
+    index = 0
+    while index < len(rates):
+        source = rates[index]["source"]
+        end = index
+        while end + 1 < len(rates) and rates[end + 1]["source"] == source:
+            end += 1
+        counts = _pool_counts(pools, source)
+        num = _count(counts, rates[index]["num"])
+        den = _count(counts, rates[end]["den"])
+        if num <= 0 or den <= 0:
+            return float("inf")
+        share = min(num / den, 1.0)
+        variance += (1.0 - share) / num
+        index = end + 1
+    return variance
+
+
 def ladder(
     counts: Dict[str, Any],
     pools: Sequence[Tuple[str, Dict[str, Any]]],
@@ -125,12 +166,7 @@ def ladder(
         coeff *= rate["rate"]
 
     expected_payments = events * coeff
-    # Ошибка произведения независимых счётчиков: относительные дисперсии складываются.
-    error_terms = [1.0 / events] + [
-        (1.0 / r["num_events"]) if r["num_events"] > 0 else float("inf")
-        for r in rates
-    ]
-    rel_error = sqrt(sum(error_terms))
+    rel_error = sqrt(1.0 / events + _chain_variance(rates, pools))
 
     out: Dict[str, Any] = {
         "step": step,

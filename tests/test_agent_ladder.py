@@ -131,3 +131,35 @@ def test_report_passes_avg_check_per_object():
     report = ladder_report({"a": {"paid": 30}}, {"a": POOLS},
                            avg_check_by_object={"a": 50000})
     assert report["by_object"]["a"]["expected_revenue"] == 1500000
+
+
+# ------------------- ошибка составного коэффициента (телескопирование)
+
+
+def test_chain_from_one_pool_does_not_stack_its_own_errors():
+    # Коэффициенты одного пула телескопируют: (paid/deals)·(deals/connected)·
+    # (connected/eff) — это ровно paid/eff того же пула, и его ошибка
+    # биномиальная по paid, а не сумма 1/paid + 1/deals + 1/connected.
+    # Прежняя формула складывала ошибки счётчиков, которые сокращаются, и
+    # завышала неопределённость тем сильнее, чем ближе счётчики ступеней.
+    pool = {"clicks": 4000, "leads": 400, "eff": 40, "connected": 35,
+            "deals": 30, "paid": 25}
+    out = ladder({"eff": 100}, (("direction:spo", pool),))
+    assert out["step"] == "eff"
+    # 1/√100 от своей ступени плюс биномиальная ошибка paid/eff пула.
+    expected = (1.0 / 100 + (1 - 25 / 40) / 25) ** 0.5
+    assert isclose(out["rel_error"], round(expected, 3), abs_tol=0.002)
+    # Прежняя (сложенная) формула дала бы заметно больше.
+    stacked = (1.0 / 100 + 1 / 25 + 1 / 30 + 1 / 35) ** 0.5
+    assert out["rel_error"] < stacked * 0.75
+
+
+def test_chain_across_two_pools_adds_their_errors():
+    # Разные пулы независимы — их ошибки складываются, телескопирование
+    # работает только внутри пула.
+    thin_direction = {"clicks": 4000, "leads": 400, "eff": 300,
+                      "connected": 200, "deals": 100, "paid": 5}
+    pools = (("direction:spo", thin_direction), ("account", ACCOUNT_POOL))
+    out = ladder({"eff": 100}, pools)
+    single_pool = ladder({"eff": 100}, (("account", ACCOUNT_POOL),))
+    assert out["rel_error"] > single_pool["rel_error"]
