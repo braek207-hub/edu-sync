@@ -121,6 +121,25 @@ def main() -> None:
             for r in cross[:5]:
                 print("    ", r)
 
+        # Что вообще лежит в листе: только оплаты или все сделки. Нужно, чтобы отличить
+        # «у школы ещё нет оплат» от «выгрузка сделок не включает школьный ленд».
+        i_stage = pick_index_loose(headers, ["этап", "stage"])
+        i_created = pick_index_loose(headers, ["дата создания"])
+        orders_dist = Counter(
+            str(round(to_num(_cell(r, i_ord)))) if i_ord != -1 else "?" for r in values[1:]
+        )
+        print("  orders:", dict(orders_dist.most_common()))
+        if i_stage != -1:
+            print("  этапы:", dict(Counter(str(_cell(r, i_stage) or "").strip() for r in values[1:]).most_common(15)))
+        recent = [
+            r for r in values[1:]
+            if i_created != -1 and to_iso_date(_cell(r, i_created)) >= "2026-08-01"
+        ]
+        print(f"  строк с датой создания ≥ 2026-08-01: {len(recent)}")
+        print("    ленды:", dict(Counter(str(_cell(r, i_land)).strip().lower() for r in recent).most_common()))
+        if i_stage != -1:
+            print("    этапы:", dict(Counter(str(_cell(r, i_stage) or "").strip() for r in recent).most_common(10)))
+
 
 if __name__ == "__main__":
     main()
