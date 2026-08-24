@@ -1128,14 +1128,16 @@ def main() -> int:
 
     writer_db.ensure_writer_tables()
 
-    # Аренда на прогон — та же, что у прямого применения, и по той же причине.
-    # Имя сторожа лежало в реестре RUN_LOCK_NAMES с самого начала, но сам он
-    # аренду не брал: два одновременных сторожа откатывают одно действие
-    # дважды и дважды списывают попытки (MAX_ROLLBACK_ATTEMPTS = 3 — двух
-    # параллельных прогонов хватает, чтобы похоронить строку за один заход).
+    # Аренда на прогон — ОБЩАЯ с прямым применением ("agent_writer"): оба
+    # пишут в один кабинет и один журнал. Два одновременных сторожа
+    # откатывают одно действие дважды и дважды списывают попытки
+    # (MAX_ROLLBACK_ATTEMPTS = 3 — двух параллельных прогонов хватает,
+    # чтобы похоронить строку за один заход); e1, применяющий изменения,
+    # пока сторож их откатывает, — та же гонка с другого конца.
     try:
-        with writer_db.run_lock("agent_e1_watchdog") as lease:
-            return _run_all(sandbox, dry_run, today, lease)
+        with writer_db.run_lock("agent_writer") as lease:
+            return _run_all(sandbox, dry_run, today, lease,
+                            fail_on_alarm="--fail-on-alarm" in sys.argv)
     except writer_db.RunLockBusy as exc:
         print(json.dumps({"verdict": "RUN_LOCKED", "reason": str(exc)},
                          ensure_ascii=False, indent=2))
@@ -1146,7 +1148,49 @@ def main() -> int:
         return 1
 
 
-def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None) -> int:
+# Порог зависшей строки — тот же час, что у e1 (STALE_PLANNED_MINUTES) и у
+# срока аренды: процесс, молчащий дольше, по общему критерию считается мёртвым.
+STALE_SWEEP_MINUTES = 60
+
+
+def alarm_reasons(out: Dict[str, Any]) -> List[str]:
+    """Состояния прогона, требующие человека. Пусто — тревоги нет.
+
+    Крон-письмо GitHub приходит только на красный ран, поэтому каждая из
+    этих находок обязана уметь уронить прогон (--fail-on-alarm): тревога,
+    не влияющая на код выхода, — молчание.
+    """
+    reasons: List[str] = []
+    if int(out.get("needs_manual_rollback") or 0) > 0:
+        reasons.append(f"неоткатываемых вручную: {out['needs_manual_rollback']}")
+    if str((out.get("data_gate") or {}).get("status")) != "GREEN":
+        reasons.append("гейт данных не зелёный — откаты заморожены")
+    if int((out.get("stale_marked") or {}).get("count") or 0) > 0:
+        reasons.append(f"зависших строк помечено: {out['stale_marked']['count']}")
+    for account in out.get("accounts") or []:
+        login = account.get("account") or "?"
+        if int(account.get("rolled_back") or 0) > 0:
+            reasons.append(f"{login}: авто-откатов {account['rolled_back']}")
+        if int(account.get("rollback_failed") or 0) > 0:
+            reasons.append(f"{login}: неудачных откатов {account['rollback_failed']}")
+        if account.get("errors"):
+            reasons.append(f"{login}: ошибок наблюдения {len(account['errors'])}")
+        if int(account.get("needs_review") or 0) > 0:
+            reasons.append(f"{login}: строк без вердикта {account['needs_review']}")
+    return reasons
+
+
+def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
+             fail_on_alarm: bool = False) -> int:
+    # Уборка зависших — ГЛОБАЛЬНО и ДО чтения открытых действий: помечать
+    # их умел только e1, и только по своему логину — кабинет, по которому
+    # e1 больше не запускают, копил planned-строки вечно. Свежепомеченные
+    # ('stale') попадают под наблюдение этим же прогоном. Репетиция журнал
+    # не трогает.
+    stale_found: List[Dict[str, Any]] = []
+    if not dry_run:
+        stale_found = writer_db.mark_stale_planned(STALE_SWEEP_MINUTES)
+
     actions = writer_db.open_actions()
     holdout_ids = {str(h) for h in agent_db.load_holdout_ids()}
     # Граница зрелости CRM — один запрос на прогон. Дальше неё лежат дни, где
@@ -1175,7 +1219,7 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None) -> in
                        facts_by_campaign, today, gate, crm_through, lease, mart)
         accounts.append({"account": login, **report, "units_left": client.units_left})
 
-    print(json.dumps({
+    out = {
         "sandbox": sandbox,
         "dry_run": dry_run,
         "today": today.isoformat(),
@@ -1194,13 +1238,17 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None) -> in
             "mart_campaigns_total": (mart or {}).get("campaigns_total"),
         },
         "under_watch": len(actions),
+        "stale_marked": {"count": len(stale_found),
+                         "sample": stale_found[:PREVIEW_SAMPLE_LIMIT]},
         "accounts": accounts,
         # Изменения, живые в кабинете и неоткатываемые автоматически: их
         # разбирает человек. Число накопительное, а не за прогон, — иначе
         # находка прошлого прогона исчезала бы из виду.
         "needs_manual_rollback": writer_db.failed_rollbacks_count(),
-    }, ensure_ascii=False, indent=2))
-    return 0
+    }
+    out["alarms"] = alarm_reasons(out)
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 1 if fail_on_alarm and out["alarms"] else 0
 
 
 if __name__ == "__main__":

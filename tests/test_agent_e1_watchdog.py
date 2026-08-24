@@ -11,6 +11,7 @@ tests/test_agent_e1_watchdog.py — сторож красных линий: на
 """
 
 import inspect
+import json
 import os
 import sys
 import uuid
@@ -971,7 +972,9 @@ def test_watchdog_takes_the_run_lease_under_its_own_name(monkeypatch, capsys):
     assert watchdog.main() == 0
     capsys.readouterr()
 
-    assert lock.names == ["agent_e1_watchdog"], "аренда обязана быть ВЗЯТА, а не просто числиться в реестре"
+    assert lock.names == ["agent_writer"], (
+        "аренда обязана быть ВЗЯТА, под ОБЩИМ с прямым применением именем: "
+        "e1 и сторож пишут в один кабинет и не должны идти параллельно")
 
 
 def test_second_watchdog_does_not_start(monkeypatch, capsys):
@@ -1634,3 +1637,73 @@ def test_judge_turns_spend_collapse_into_breach():
                              date(2026, 8, 5))
     assert verdict["state"] == watchdog.STATE_BREACHED
     assert "обвал" in verdict["reason"]
+
+
+# ------------------- G: глобальная уборка зависших и --fail-on-alarm
+
+
+def test_boevoy_watchdog_sweeps_stale_globally(monkeypatch, capsys):
+    # Помечать зависшие строки умел только e1 — и только по СВОЕМУ логину.
+    # Кабинет, по которому e1 больше не запускают, копил planned-строки
+    # вечно. Боевой сторож (prod+apply) метёт ВЕСЬ журнал, без фильтра по
+    # аккаунту, до чтения open_actions — свежепомеченные строки попадают
+    # под наблюдение этим же прогоном.
+    calls = []
+    lock = _RecordingLock()
+    _patch_watchdog_main(monkeypatch, lock)
+    monkeypatch.setattr(sys, "argv", ["agent_e1_watchdog", "--prod", "--apply"])
+    monkeypatch.setattr(watchdog.writer_db, "mark_stale_planned",
+                        lambda minutes, account=None: calls.append(
+                            (minutes, account)) or [])
+
+    assert watchdog.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert calls == [(watchdog.STALE_SWEEP_MINUTES, None)]
+    assert out["stale_marked"] == {"count": 0, "sample": []}
+
+
+def test_rehearsal_watchdog_does_not_touch_the_journal(monkeypatch, capsys):
+    lock = _RecordingLock()
+    _patch_watchdog_main(monkeypatch, lock)  # argv без --apply: репетиция
+    monkeypatch.setattr(watchdog.writer_db, "mark_stale_planned",
+                        lambda *a, **k: pytest.fail(
+                            "репетиция не пишет в журнал"))
+    assert watchdog.main() == 0
+    capsys.readouterr()
+
+
+def test_alarm_reasons_cover_human_needed_states():
+    quiet = {"needs_manual_rollback": 0, "data_gate": {"status": "GREEN"},
+             "stale_marked": {"count": 0, "sample": []},
+             "accounts": [{"account": "a", "rolled_back": 0,
+                           "rollback_failed": 0, "errors": [],
+                           "needs_review": 0}]}
+    assert watchdog.alarm_reasons(quiet) == []
+
+    loud = {"needs_manual_rollback": 2, "data_gate": {"status": "RED"},
+            "stale_marked": {"count": 1, "sample": []},
+            "accounts": [{"account": "a", "rolled_back": 1,
+                          "rollback_failed": 1,
+                          "errors": [{"error": "x"}], "needs_review": 3}]}
+    reasons = watchdog.alarm_reasons(loud)
+    assert len(reasons) >= 5
+
+
+def test_fail_on_alarm_flag_turns_alarms_into_nonzero_exit(monkeypatch, capsys):
+    # Крон-письмо GitHub приходит только на КРАСНЫЙ ран: тревога без
+    # ненулевого выхода — молчание. Флаг явный: локальный запуск руками не
+    # должен становиться красным из-за старой накопительной находки.
+    lock = _RecordingLock()
+    _patch_watchdog_main(monkeypatch, lock)
+    monkeypatch.setattr(sys, "argv",
+                        ["agent_e1_watchdog", "--prod", "--fail-on-alarm"])
+    monkeypatch.setattr(watchdog.writer_db, "failed_rollbacks_count", lambda: 2)
+
+    assert watchdog.main() == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["alarms"]
+
+    _patch_watchdog_main(monkeypatch, lock)  # без флага — тот же прогон зелёный
+    monkeypatch.setattr(watchdog.writer_db, "failed_rollbacks_count", lambda: 2)
+    assert watchdog.main() == 0
+    capsys.readouterr()

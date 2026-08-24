@@ -1381,7 +1381,7 @@ def main() -> int:
     # Поэтому аренда продлевается по ходу прогона и перепроверяется перед
     # каждым изменяющим запросом (writer/db.py::RunLease).
     try:
-        with writer_db.run_lock("agent_e1") as lease:
+        with writer_db.run_lock("agent_writer") as lease:
             return _run_all(clients, sandbox, dry_run, today, lease,
                             campaign_scope)
     except writer_db.RunLockBusy as exc:

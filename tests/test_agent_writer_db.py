@@ -792,11 +792,11 @@ class _FakeConn:
 
 
 def test_lease_renew_reports_loss_instead_of_pretending_to_own():
-    alive = writer_db.RunLease(_FakeConn(("2026-08-20",)), "agent_e1", "me", 60)
+    alive = writer_db.RunLease(_FakeConn(("2026-08-20",)), "agent_writer", "me", 60)
     assert alive.renew() is True
     alive.guard()   # владение подтверждено — прогон продолжается
 
-    lost = writer_db.RunLease(_FakeConn(None), "agent_e1", "me", 60)
+    lost = writer_db.RunLease(_FakeConn(None), "agent_writer", "me", 60)
     assert lost.renew() is False
     with pytest.raises(writer_db.RunLeaseLost):
         lost.guard()
@@ -806,13 +806,13 @@ def test_lease_guard_renews_the_lease_it_checks():
     # Продление и перепроверка — один и тот же запрос: пока прогон работает,
     # аренда не протухает, а если она уже не наша, это видно сразу же.
     conn = _FakeConn(("2026-08-20",))
-    lease = writer_db.RunLease(conn, "agent_e1", "me", 60)
+    lease = writer_db.RunLease(conn, "agent_writer", "me", 60)
 
     lease.guard()
 
     assert len(conn.executed) == 1
     assert conn.executed[0][0] is writer_db.RENEW_RUN_LOCK_SQL
-    assert conn.executed[0][1] == {"name": "agent_e1", "holder": "me", "ttl": 60}
+    assert conn.executed[0][1] == {"name": "agent_writer", "holder": "me", "ttl": 60}
 
 
 def _lock_expires(name: str):
@@ -962,13 +962,13 @@ def test_live_rollback_outside_cooldown_window_does_not_block():
 def test_live_second_run_cannot_take_the_same_lock():
     # Два одновременных прогона на одном ключе создают в кабинете два объекта.
     ensure_writer_tables()
-    with writer_db.run_lock("agent_e1"):
+    with writer_db.run_lock("agent_writer"):
         with pytest.raises(writer_db.RunLockBusy):
-            with writer_db.run_lock("agent_e1"):
+            with writer_db.run_lock("agent_writer"):
                 pass  # pragma: no cover
 
     # Аренда снята по выходу — следующий прогон стартует штатно.
-    with writer_db.run_lock("agent_e1"):
+    with writer_db.run_lock("agent_writer"):
         pass
 
 
@@ -986,7 +986,7 @@ def test_live_expired_lease_is_taken_over():
             )
         conn.commit()
 
-    with writer_db.run_lock("agent_e1") as holder:
+    with writer_db.run_lock("agent_writer") as holder:
         assert holder != "dead-process"
 
 
@@ -996,14 +996,14 @@ def test_live_lease_is_renewable_while_the_run_is_alive():
     # теряет аренду, и второй прогон не стартует.
     ensure_writer_tables()
     with writer_db.run_lock("agent_e1", ttl_minutes=1) as lease:
-        before = _lock_expires("agent_e1")
+        before = _lock_expires("agent_writer")
         lease.ttl_minutes = 60
         assert lease.renew() is True
-        assert _lock_expires("agent_e1") > before
+        assert _lock_expires("agent_writer") > before
 
         # И чужой прогон по-прежнему не пройдёт.
         with pytest.raises(writer_db.RunLockBusy):
-            with writer_db.run_lock("agent_e1"):
+            with writer_db.run_lock("agent_writer"):
                 pass  # pragma: no cover
 
 
@@ -1012,12 +1012,12 @@ def test_live_lost_lease_is_not_silently_renewed():
     # Аренду перехватили — продлевать её нельзя ни в коем случае: иначе прогон
     # отобрал бы у живого владельца то, что тот успел взять.
     ensure_writer_tables()
-    with writer_db.run_lock("agent_e1") as lease:
+    with writer_db.run_lock("agent_writer") as lease:
         with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE edu_agent_run_lock SET holder = 'other-run' "
-                    "WHERE lock_name = 'agent_e1'"
+                    "WHERE lock_name = 'agent_writer'"
                 )
             conn.commit()
 
@@ -1028,17 +1028,16 @@ def test_live_lost_lease_is_not_silently_renewed():
     # Уборка: чужую аренду контекст не снимает, снимаем сами.
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM edu_agent_run_lock WHERE lock_name = 'agent_e1'")
+            cur.execute("DELETE FROM edu_agent_run_lock WHERE lock_name = 'agent_writer'")
         conn.commit()
 
 
-@live_db
-def test_live_watchdog_lock_is_independent_of_the_main_run():
-    # Прямое применение и откат друг другу не мешают: имена разные.
-    ensure_writer_tables()
-    with writer_db.run_lock("agent_e1"):
-        with writer_db.run_lock("agent_e1_watchdog"):
-            pass
+def test_writer_lock_is_single_and_shared():
+    # Прямое применение и сторож отката пишут в ОДИН кабинет: параллельный
+    # прогон e1 во время отката (или наоборот) — та же гонка, что два e1.
+    # Прежние независимые имена agent_e1/agent_e1_watchdog разрешали её
+    # молча. Аренда одна на всех пишущих.
+    assert writer_db.RUN_LOCK_NAMES == ("agent_writer",)
 
 
 # =========================================================================
