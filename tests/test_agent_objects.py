@@ -37,14 +37,17 @@ def test_build_object_rows_same_content_same_hash():
 
 
 def test_minus_candidates_flags_spend_without_conversions():
+    # Кликов у «вуз бесплатно» хватает, чтобы ноль конверсий что-то значил
+    # (правило трёх против базовой конверсии набора), а расход уже выше цены,
+    # которую мы согласны платить даже по верхней границе.
     queries = [
-        {"campaign_id": "1", "query": "вуз бесплатно", "cost": 5000.0, "clicks": 50, "conversions": 0},
-        {"campaign_id": "1", "query": "вуз москва", "cost": 5000.0, "clicks": 50, "conversions": 3},
+        {"campaign_id": "1", "query": "вуз бесплатно", "cost": 5000.0, "clicks": 300, "conversions": 0},
+        {"campaign_id": "1", "query": "вуз москва", "cost": 5000.0, "clicks": 500, "conversions": 30},
         {"campaign_id": "1", "query": "вуз отзывы", "cost": 100.0, "clicks": 2, "conversions": 0},
     ]
-    out = minus_word_candidates(queries, cpa_limit=1000.0, multiplier=3.0)
+    out = minus_word_candidates(queries, cpa_limit=1000.0)
     flagged = {r["query"] for r in out}
-    assert flagged == {"вуз бесплатно"}  # расход > 3 CPA и ноль конверсий
+    assert flagged == {"вуз бесплатно"}
 
 
 def test_minus_candidates_empty_when_nothing_qualifies():
@@ -82,3 +85,54 @@ def test_payload_has_no_duplicate_identifiers():
     assert "AdGroupId" not in payload
     assert payload["Keyword"] == "вуз"
     assert payload["State"] == "ON"
+
+
+# ------------------- минус-слова: агрегат по фразе и статистический критерий
+
+
+def test_minus_candidates_aggregate_a_phrase_across_rows():
+    # Правило применялось к СТРОКЕ «фраза × кампания × окно»: одна такая
+    # строка редко жжёт больше трёх CPA, и на бою кандидатов было ноль при
+    # 678 фразах без конверсий на 5,4 млн ₽. Фраза оценивается целиком.
+    from sync.agent.objects import minus_word_candidates
+    queries = [
+        {"campaign_id": "1", "query": "мгсу", "cost": 2000.0, "clicks": 20,
+         "conversions": 0},
+        {"campaign_id": "1", "query": "мгсу", "cost": 2000.0, "clicks": 20,
+         "conversions": 0},
+        {"campaign_id": "1", "query": "мгсу", "cost": 2000.0, "clicks": 20,
+         "conversions": 0},
+    ]
+    out = minus_word_candidates(queries, cpa_limit=1000.0, base_conversion=0.05)
+    assert len(out) == 1
+    assert out[0]["query"] == "мгсу"
+    assert out[0]["cost"] == 6000.0
+    assert out[0]["clicks"] == 60
+
+
+def test_minus_candidates_need_enough_clicks_to_judge():
+    # Ноль конверсий на трёх кликах — не приговор, а отсутствие наблюдений:
+    # верхняя граница конверсии при нуле успехов ≈ 3/N, и при малом N она
+    # выше средней конверсии кабинета.
+    from sync.agent.objects import minus_word_candidates
+    queries = [{"campaign_id": "1", "query": "редкий", "cost": 9000.0,
+                "clicks": 3, "conversions": 0}]
+    assert minus_word_candidates(queries, cpa_limit=1000.0) == []
+
+
+def test_minus_candidates_flag_expensive_converting_phrases_too():
+    # Фраза с конверсиями, но по цене вдвое выше допустимой, жжёт деньги не
+    # меньше нулевой: критерий экономический, а не «есть ли конверсия».
+    from sync.agent.objects import minus_word_candidates
+    queries = [{"campaign_id": "1", "query": "дорогая", "cost": 30_000.0,
+                "clicks": 100, "conversions": 3}]
+    out = minus_word_candidates(queries, cpa_limit=1000.0)
+    assert out and out[0]["cpa"] == 10_000.0
+    assert out[0]["reason"] == "cpa_above_limit"
+
+
+def test_minus_candidates_keep_profitable_phrases():
+    from sync.agent.objects import minus_word_candidates
+    queries = [{"campaign_id": "1", "query": "хорошая", "cost": 30_000.0,
+                "clicks": 100, "conversions": 40}]
+    assert minus_word_candidates(queries, cpa_limit=1000.0) == []

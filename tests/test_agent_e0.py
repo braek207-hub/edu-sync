@@ -613,7 +613,10 @@ def test_counter_without_an_account_is_reported_not_broadcast(monkeypatch, capsy
 # --------------- кандидаты в минус-слова: расчёт обязан СЛУЧИТЬСЯ
 
 def _queries(*rows):
-    return [{"query": q, "cost": cost, "conversions": conv, "clicks": 10,
+    # Кликов достаточно, чтобы отсутствие конверсий что-то значило: правило
+    # трёх против базовой конверсии набора (agent/objects.py). На десяти
+    # кликах «ноль конверсий» — отсутствие наблюдений, а не приговор.
+    return [{"query": q, "cost": cost, "conversions": conv, "clicks": 300,
              "campaign_id": "111", "account": "acc-1"} for q, cost, conv in rows]
 
 
@@ -629,7 +632,7 @@ def test_minus_word_candidates_land_in_the_report(monkeypatch, capsys):
     monkeypatch.setattr(agent_e0, "fetch_search_queries", lambda login, *a, **k:
                         (_queries(("дорогой мусор", 7000.0, 0),
                                   ("дешёвый мусор", 500.0, 0),
-                                  ("дорогой рабочий", 7000.0, 3)) if login == "acc-1"
+                                  ("дорогой рабочий", 7000.0, 30)) if login == "acc-1"
                          else [], {"goal_column": "Conversions_111_LSCCD", "conversions": 7, "columns_offered": 1}))
 
     assert agent_e0.main() == 0
@@ -641,6 +644,7 @@ def test_minus_word_candidates_land_in_the_report(monkeypatch, capsys):
     assert report["sample"] == ["дорогой мусор"]
     assert report["count"] == 1
     assert report["cost_burned"] == 7000.0
+    assert report["by_reason"] == {"zero_conversions": 1}
 
 
 def test_query_report_asks_for_the_same_goals_as_the_slices(monkeypatch, capsys):

@@ -238,6 +238,15 @@ def _lag_percentile(lead_rows: List[Dict[str, Any]], q: float,
     return int(ordered[min(int(q * len(ordered)), len(ordered) - 1)])
 
 
+def _count_by(rows, key):
+    """Счётчик значений поля — для отчётных разбивок."""
+    out = {}
+    for row in rows:
+        value = str(row.get(key) or "")
+        out[value] = out.get(value, 0) + 1
+    return dict(sorted(out.items()))
+
+
 def funnel_ladder_section(
     facts: List[Dict[str, Any]],
     lead_rows: List[Dict[str, Any]],
@@ -666,10 +675,17 @@ def main() -> int:
     # приговор всему кабинету. Причина обязана быть в отчёте: молчаливый
     # пропуск неотличим от «кандидатов не нашлось».
     blind_accounts = sorted(g["account"] for g in query_goals if not g["goal_column"])
-    scored_queries = top_queries_by_cost(
-        [q for login, rows in queries_by_login.items() if login not in set(blind_accounts)
-         for q in rows])
-    minus_candidates = (minus_word_candidates(scored_queries, cpa_limit=cpa_limit)
+    seeing_queries = [q for login, rows in queries_by_login.items()
+                      if login not in set(blind_accounts) for q in rows]
+    scored_queries = top_queries_by_cost(seeing_queries)
+    # Базовая конверсия — по ВСЕМУ набору запросов кабинета, а не по топу по
+    # расходу: топ смещён в сторону дорогих фраз, и порог «сколько кликов
+    # нужно, чтобы ноль конверсий что-то значил» поехал бы вместе с ним.
+    base_clicks = sum(int(q.get("clicks") or 0) for q in seeing_queries)
+    base_conversions = sum(int(q.get("conversions") or 0) for q in seeing_queries)
+    base_conversion = (base_conversions / base_clicks) if base_clicks else 0.0
+    minus_candidates = (minus_word_candidates(scored_queries, cpa_limit=cpa_limit,
+                                              base_conversion=base_conversion)
                         if cpa_limit > 0 else [])
 
     # 9. Снимок настроек.
@@ -847,6 +863,13 @@ def main() -> int:
             "count": len(minus_candidates),
             "cost_burned": round(sum(float(q.get("cost") or 0.0)
                                      for q in minus_candidates), 2),
+            # Разбивка по причине: «нет конверсий при достаточном объёме» и
+            # «конверсии есть, но дороже допустимого» — разные решения, и
+            # смешивать их в одном счётчике значит прятать половину.
+            "by_reason": _count_by(minus_candidates, "reason"),
+            # Порог наблюдаемости, выведенный из данных прогона: столько
+            # кликов без конверсий нужно, чтобы приговор был осмысленным.
+            "base_conversion": round(base_conversion, 5),
             "sample": [q.get("query") for q in minus_candidates[:10]],
             "blind_accounts": blind_accounts,
         },
