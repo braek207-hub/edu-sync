@@ -53,6 +53,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent import db as agent_db
+from sync.agent.gate import data_gate
 from sync.agent.writer import budget
 from sync.agent.writer import switch
 from sync.agent.writer import db as writer_db
@@ -1384,6 +1385,29 @@ def main() -> int:
 def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
              today: str, lease: Any = None,
              campaign_scope: Optional[CampaignScope] = None) -> int:
+
+    # Гейт данных — ДО первого обращения к журналу и загрузок планирования:
+    # e1 пишет в кабинет, а его оценка риска (дневной расход) и красная линия
+    # (базовый CPA) считаны по витрине и источнику, которые до этой проверки
+    # никто не проверял. Красный гейт запрещает ЗАПИСЬ, но не репетицию:
+    # смотреть на плохие данные можно, писать по ним — нет. Отказ красным
+    # кодом — чтобы кроновый прогон стал красным и дошёл письмом.
+    gate = data_gate(date.fromisoformat(today))
+    if gate["status"] != "GREEN":
+        if not dry_run:
+            print(json.dumps({"verdict": "DATA_GATE_RED", "data_gate": gate},
+                             ensure_ascii=False, indent=2))
+            return 1
+        # Репетиция продолжается — но красный гейт обязан быть виден и в ней:
+        # «ноль находок по плохим данным» и «данные в порядке» — разные
+        # состояния. Зелёный гейт не печатается — тем же правилом, что и
+        # уборка репетиционных строк ниже (шум без содержания).
+        print(json.dumps({
+            "verdict": "DATA_GATE",
+            "status": gate["status"],
+            "latest_fact_date": gate.get("latest_fact_date"),
+            "reason": gate.get("reason") or None,
+        }, ensure_ascii=False, indent=2))
 
     holdout_ids = set(agent_db.load_holdout_ids())
     cutoff = (date.today() - timedelta(days=30)).isoformat()

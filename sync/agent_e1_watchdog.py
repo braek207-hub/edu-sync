@@ -50,7 +50,8 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sync.agent import db as agent_db
-from sync.agent.guard import check_freshness, verdict as guard_verdict
+from sync.agent import gate as gate_module
+from sync.agent.gate import mart_gate, with_source_checks
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import _element_errors
 # journal_allowed — общее правило движка (writer/client.py), а не местное
@@ -96,27 +97,10 @@ OBSERVATION_HORIZON_DAYS = 14   # длина окна наблюдения, дн
 # кампании нельзя: см. mart_filled_days.
 MIN_WINDOW_COVERAGE = 0.8
 
-# Доля кампаний витрины, которую обязан покрывать день, считающийся «свежим».
-# Гейт свежести смотрел на максимум даты по ВСЕМ кампаниям сразу: одна живая
-# кампания красила его зелёным при мёртвых остальных. Обратная крайность —
-# требовать свежести от КАЖДОЙ кампании — воспроизводит ту же ошибку, что и
-# покрытие по дням кампании: у кампании, которую правка агента придушила до
-# нуля, свежих строк нет, и красный гейт запретил бы откат именно там, где он
-# нужен. Поэтому порог по ШИРИНЕ дня: свежий день — тот, за который витрина
-# наполнена по строгому большинству известных ей кампаний.
-# Доля от ТИПИЧНОГО дня витрины, ниже которой день считается неполным.
-# Не доля от объединения кампаний за окно: за две недели в витрине копятся все
-# кампании, которые хоть раз откручивались, а в отдельный день активна лишь
-# часть — кампании включают, выключают, у них кончается бюджет. Порог от
-# объединения недостижим ни в один день, и гейт вставал бы в вечный отказ:
-# сторож наблюдал бы и не откатывал никогда, а в отчёте это выглядело бы
-# штатным ожиданием данных.
-GATE_MIN_BREADTH = 0.5
-
-# Витрина фактов обязана быть свежее этого возраста, иначе сторож СМОТРИТ, но
-# НЕ ОТКАТЫВАЕТ. Порог в сутках, а не в часах: витрина дневная, и её последний
-# день при живом синке — вчерашний.
-FACTS_MAX_AGE_DAYS = 2
+# Пороги гейта витрины — общие для всех пишущих прогонов: sync/agent/gate.py
+# (там же — почему ширина дня и медианный эталон).
+GATE_MIN_BREADTH = gate_module.GATE_MIN_BREADTH
+FACTS_MAX_AGE_DAYS = gate_module.FACTS_MAX_AGE_DAYS
 
 PREVIEW_SAMPLE_LIMIT = 5
 
@@ -521,80 +505,15 @@ def action_experiment(action: Dict[str, Any], observed: Dict[str, Any],
 
 def facts_gate(mart: Dict[str, Any], today: date,
                max_age_days: int = FACTS_MAX_AGE_DAYS) -> Dict[str, Any]:
-    """Гейт качества витрины фактов ВНУТРИ сторожевого прогона.
+    """Гейт качества витрины ВНУТРИ сторожевого прогона.
 
-    Тот же гейт (agent/guard.py), что стоит перед расчётом, — но расчёт лишь
-    считает числа, а сторож МЕНЯЕТ КАБИНЕТ, и до этой правки единственный
-    прогон с правом записи шёл вообще без проверки данных, на которых судит.
-
-    Витрину фактов наполняет agent_e0, у которого нет расписания — только
-    ручной запуск. Перестанут запускать — сторож будет исправно отчитываться
-    о наблюдении по мёртвым данным: нули вместо лидов, завышенный CPA,
-    ложные откаты. Поэтому свежесть витрины проверяется на каждом прогоне, а
-    красный гейт запрещает откат, но не наблюдение: смотреть на плохие данные
-    можно, действовать по ним — нет.
-
-    Свежесть считается не по максимуму даты среди всех кампаний: одна живая
-    кампания красила бы гейт зелёным при мёртвых остальных. Свежим считается
-    последний день, за который витрина наполнена по БОЛЬШИНСТВУ известных ей
-    кампаний (GATE_MIN_BREADTH) — так виден и обрыв расчёта целиком, и его
-    частичный отказ, но остановка одной кампании гейт не роняет.
-
-    Ширина считается по ВСЕЙ витрине (agent_db.load_mart_day_breadth), а не по
-    кампаниям открытых действий. Прежде «большинство известных кампаний»
-    означало «большинство из тех двух-трёх, по которым сейчас есть открытые
-    действия», — то есть на первом боевом прогоне гейт судил о здоровье
-    расчёта по одной кампании и молча становился её термометром.
+    Тонкая обёртка над общим гейтом пишущих прогонов (sync/agent/gate.py,
+    mart_gate) — там же вся логика ширины дня и медианного эталона. Расчёт
+    лишь считает числа, а сторож МЕНЯЕТ КАБИНЕТ: красный гейт запрещает
+    откат, но не наблюдение — смотреть на плохие данные можно, действовать
+    по ним нельзя.
     """
-    days_raw = (mart or {}).get("days") or {}
-    breadth: Dict[date, int] = {}
-    for raw, count in days_raw.items():
-        day = _as_date(raw)
-        if day is not None:
-            breadth[day] = int(count or 0)
-    known = int((mart or {}).get("campaigns_total") or 0)
-    newest_any: Optional[date] = max(breadth) if breadth else None
-
-    # Эталон — МЕДИАННЫЙ день окна, а не объединение кампаний за окно.
-    # Медиана устойчива к краям: единичный битый день её не сдвигает, а
-    # обрыв расчёта роняет её вместе со всеми днями, и гейт краснеет.
-    typical = int(median(sorted(breadth.values()))) if breadth else 0
-    need = max(1, math.floor(typical * GATE_MIN_BREADTH)) if typical else 0
-    wide = [day for day, count in breadth.items() if count >= need] if need else []
-    latest: Optional[date] = max(wide) if wide else None
-
-    checks = check_freshness(
-        {"edu_agent_facts": f"{latest.isoformat()}T00:00:00+00:00" if latest else None},
-        now_iso=f"{today.isoformat()}T00:00:00+00:00",
-        max_age_hours=max_age_days * 24,
-    )
-    status = guard_verdict(checks)
-    if status == "GREEN":
-        reason = ""
-    elif latest is None:
-        reason = ("витрина фактов пуста за окно наблюдения"
-                  if newest_any is None else
-                  f"ни один день витрины не наполнен по {need} кампаниям при "
-                  f"типичном дне в {typical}: последняя строка есть за "
-                  f"{newest_any.isoformat()}, "
-                  f"но она одиночная — прогон расчёта (agent_e0) отработал не весь")
-    else:
-        reason = (f"последний широкий день витрины {latest.isoformat()} при пороге "
-                  f"{max_age_days} дн. — прогон расчёта (agent_e0) не идёт")
-    return {
-        "status": status,
-        "latest_fact_date": latest.isoformat() if latest else None,
-        # Максимум по всем кампаниям сохранён отдельным полем: именно им гейт
-        # судил раньше, и расхождение двух дат — прямая улика частичного
-        # отказа расчёта, а не повод считать витрину свежей.
-        "latest_any_fact_date": newest_any.isoformat() if newest_any else None,
-        "campaigns_in_mart": known,
-        "campaigns_typical_per_day": typical,
-        "campaigns_required_per_day": need,
-        "max_age_days": max_age_days,
-        "reason": reason,
-        "checks": checks,
-    }
+    return mart_gate(mart, today, max_age_days)
 
 
 def gate_allows_rollback(gate: Optional[Dict[str, Any]]) -> bool:
@@ -1229,7 +1148,12 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None) -> in
     # Полнота данных — по витрине, наблюдаемые метрики — по кампаниям
     # действий. Два разных запроса намеренно: см. mart_filled_days.
     mart = load_mart_breadth(actions, today, crm_through)
-    gate = facts_gate(mart, today)
+    # Поверх витринного гейта — сверка сумм источник↔витрина: битая
+    # сборка не видна ни свежести, ни ширине. Аномалия объёма сторожа
+    # НЕ гейтует (include_volume=False): обвал расхода — возможное
+    # следствие вредного изменения, откат по нему замораживать нельзя.
+    gate = with_source_checks(facts_gate(mart, today),
+                              include_volume=False)
 
     by_account: Dict[str, List[Dict[str, Any]]] = {}
     for action in actions:

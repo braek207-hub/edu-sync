@@ -70,6 +70,9 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
     monkeypatch.setattr(agent_e1.writer_db, "final_status_keys",
                         lambda keys: set(final_keys))
     monkeypatch.setattr(agent_e1.writer_db, "purge_dry_run_actions", lambda *a, **k: 0)
+    monkeypatch.setattr(agent_e1, "data_gate",
+                        lambda today: {"status": "GREEN", "reason": "",
+                                       "checks": []})
 
 
 class _FakeCampaignsClient:
@@ -2041,3 +2044,28 @@ def test_schedule_is_not_read_when_there_is_nothing_to_apply(monkeypatch, capsys
     targeting_reads = [r for r in reads
                        if r[0] == "campaigns" and "TimeTargeting" in (r[1].get("FieldNames") or [])]
     assert targeting_reads == []
+
+
+# --------------------------- гейт данных перед пишущим прогоном
+
+
+def test_data_gate_red_blocks_apply_run_before_any_journal_io(monkeypatch, capsys):
+    # e1 — пишущий прогон: красный гейт данных запрещает применение ДО
+    # первого обращения к журналу и загрузок планирования. Репетиция гейтом
+    # не блокируется (смотреть на плохие данные можно, писать по ним — нет),
+    # это отдельный путь.
+    monkeypatch.setattr(agent_e1, "data_gate",
+                        lambda today: {"status": "RED", "reason": "тест",
+                                       "checks": []})
+
+    def _boom(*a, **k):
+        raise AssertionError("при красном гейте журнал и БД трогать нельзя")
+
+    monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", _boom)
+    monkeypatch.setattr(agent_e1.writer_db, "purge_dry_run_actions", _boom)
+
+    rc = agent_e1._run_all([{"login": "acc"}], sandbox=False, dry_run=False,
+                           today="2026-08-24")
+
+    assert rc == 1
+    assert "DATA_GATE_RED" in capsys.readouterr().out
