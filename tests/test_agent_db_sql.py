@@ -287,3 +287,18 @@ def test_maturity_takes_the_last_full_day(monkeypatch):
     days = [{"d": _date(2026, 8, 1 + i), "n": 100} for i in range(19)]
     monkeypatch.setattr(agent_db, "_fetch_dicts", lambda sql, params=(): days)
     assert agent_db.crm_maturity_date() == _date(2026, 8, 19)
+
+
+def test_direct_rows_carry_conversions(monkeypatch):
+    # Конверсии целей Директа нужны рычагу целевого CPA (Э3.5) — они лежат в
+    # том же источнике, что расход, и обязаны ехать одним запросом.
+    seen = {}
+    monkeypatch.setattr(agent_db, "_fetch_dicts",
+                        lambda sql, params=(): seen.update({"sql": sql}) or [])
+    agent_db.load_direct_rows("2026-08-01", "2026-08-07")
+    assert "conversions" in seen["sql"]
+
+
+def test_facts_upsert_writes_conversions():
+    assert "conversions" in agent_db.UPSERT_FACTS_SQL
+    assert "conversions = EXCLUDED.conversions" in agent_db.UPSERT_FACTS_SQL

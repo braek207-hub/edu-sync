@@ -64,9 +64,18 @@ AGENT_DDL: List[str] = [
       days_to_pay_sum          DOUBLE PRECISION NOT NULL DEFAULT 0,
       days_to_pay_count        INTEGER NOT NULL DEFAULT 0,
       revenue                  DOUBLE PRECISION NOT NULL DEFAULT 0,
+      conversions              INTEGER NOT NULL DEFAULT 0,
       collected_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
       PRIMARY KEY (fact_date, campaign_id)
     )
+    """,
+    # Конверсии ЦЕЛЕЙ Директа — отдельно от лидов CRM. Цель CPA в кабинете
+    # назначается за конверсию цели (страница «Спасибо»), а не за
+    # эффективный лид: рычаг целевого CPA (Э3.5) без этого счётчика не
+    # построить. Отдельным ALTER — таблица давно создана в бою.
+    """
+    ALTER TABLE edu_agent_facts
+      ADD COLUMN IF NOT EXISTS conversions INTEGER NOT NULL DEFAULT 0
     """,
     # Срезы: НЕДЕЛЬНАЯ грань и три отдельных двумерных разреза вместо декартова
     # произведения. slice_kind ∈ region|network|device|gender|age|hour.
@@ -240,7 +249,8 @@ def load_direct_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
     return _fetch_dicts(
         """
         SELECT date, campaign_id, campaign_name, project, direction,
-               cost, clicks, impressions, w_avg_impr_pos, w_auction_win_share
+               cost, clicks, impressions, conversions,
+               w_avg_impr_pos, w_auction_win_share
         FROM direct_stats
         WHERE date BETWEEN %s AND %s
         """,
@@ -677,22 +687,20 @@ def _batch(sql: str, rows: List[Dict[str, Any]], page_size: int = 500) -> int:
     return len(rows)
 
 
-def upsert_facts(rows: List[Dict[str, Any]]) -> int:
-    return _batch(
-        """
+UPSERT_FACTS_SQL = """
         INSERT INTO edu_agent_facts (
             fact_date, campaign_id, campaign_name, project, direction,
             cost, clicks, impressions, leads, eff_leads, sum_p_pay,
             payments_fact, avg_impr_pos, auction_win_share,
             connected_leads, deals, mins_to_connection_sum, mins_to_connection_count,
-            days_to_pay_sum, days_to_pay_count, revenue
+            days_to_pay_sum, days_to_pay_count, revenue, conversions
         ) VALUES (
             %(fact_date)s, %(campaign_id)s, %(campaign_name)s, %(project)s, %(direction)s,
             %(cost)s, %(clicks)s, %(impressions)s, %(leads)s, %(eff_leads)s, %(sum_p_pay)s,
             %(payments_fact)s, %(avg_impr_pos)s, %(auction_win_share)s,
             %(connected_leads)s, %(deals)s, %(mins_to_connection_sum)s,
             %(mins_to_connection_count)s, %(days_to_pay_sum)s, %(days_to_pay_count)s,
-            %(revenue)s
+            %(revenue)s, %(conversions)s
         )
         ON CONFLICT (fact_date, campaign_id) DO UPDATE SET
             campaign_name = EXCLUDED.campaign_name,
@@ -714,11 +722,13 @@ def upsert_facts(rows: List[Dict[str, Any]]) -> int:
             days_to_pay_sum = EXCLUDED.days_to_pay_sum,
             days_to_pay_count = EXCLUDED.days_to_pay_count,
             revenue = EXCLUDED.revenue,
+            conversions = EXCLUDED.conversions,
             collected_at = now()
-        """,
-        rows,
-        page_size=1000,
-    )
+"""
+
+
+def upsert_facts(rows: List[Dict[str, Any]]) -> int:
+    return _batch(UPSERT_FACTS_SQL, rows, page_size=1000)
 
 
 def upsert_sliced_facts(rows: List[Dict[str, Any]]) -> int:

@@ -60,6 +60,7 @@ def assemble_facts(
                 "days_to_pay_sum": 0.0,
                 "days_to_pay_count": 0,
                 "revenue": 0.0,
+                "conversions": 0,
             }
         return facts[key]
 
@@ -70,6 +71,10 @@ def assemble_facts(
         slot["direction"] = r.get("direction")
         slot["cost"] += float(r.get("cost") or 0.0)
         slot["clicks"] += int(r.get("clicks") or 0)
+        # Конверсии ЦЕЛЕЙ Директа — валюта целевого CPA (Э3.5), отдельная от
+        # лидов CRM: цель в кабинете назначается за конверсию цели, а не за
+        # эффективный лид, и коэффициент между ними у кампаний разный.
+        slot["conversions"] += int(r.get("conversions") or 0)
         slot["impressions"] += int(r.get("impressions") or 0)
         slot["avg_impr_pos"] = float(r.get("w_avg_impr_pos") or 0.0)
         slot["auction_win_share"] = float(r.get("w_auction_win_share") or 0.0)

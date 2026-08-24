@@ -103,3 +103,18 @@ def test_sums_not_averages_are_stored():
     row = assemble_facts([], leads, [])[0]
     assert row["mins_to_connection_sum"] == 10.0 + 20.0 + 30.0
     assert row["mins_to_connection_count"] == 3
+
+
+def test_conversions_of_direct_goals_reach_the_mart():
+    # Цель CPA в Директе назначается за КОНВЕРСИЮ ЦЕЛИ (страница «Спасибо»),
+    # а не за эффективный лид CRM. Рычаг целевого CPA (Э3.5) не построить, не
+    # зная, сколько таких конверсий было и сколько они стоили: витрина обязана
+    # нести их наравне с кликами.
+    direct = [{**DIRECT[0], "conversions": 12}]
+    rows = assemble_facts(direct, LEADS, SCORES)
+    assert rows[0]["conversions"] == 12
+
+
+def test_missing_conversions_are_zero_not_absent():
+    rows = assemble_facts(DIRECT, LEADS, SCORES)
+    assert rows[0]["conversions"] == 0
