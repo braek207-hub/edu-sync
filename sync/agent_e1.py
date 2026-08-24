@@ -585,6 +585,7 @@ def _budget_report(
     budget_plan: Dict[str, Any], desired: Dict[str, Any],
     refused: Optional[List[Dict[str, Any]]] = None,
     planned_count: int = 0, not_found: Optional[List[str]] = None,
+    cooled: Optional[List[Dict[str, Any]]] = None,
     limit: int = PREVIEW_SAMPLE_LIMIT,
 ) -> Dict[str, Any]:
     """Что прогон решил про целевые бюджеты (Э3.3).
@@ -598,6 +599,8 @@ def _budget_report(
         "desired": len(desired),
         "small_shift": budget_plan["small_shift"],
         "low_confidence": len(budget_plan["low_confidence"]),
+        "cooldown": {"count": len(cooled or []),
+                     "sample": (cooled or [])[:limit]},
         "low_confidence_sample": budget_plan["low_confidence"][:limit],
         "confidence_unknown": budget_plan["confidence_unknown"],
         "actions_planned": planned_count,
@@ -1045,6 +1048,16 @@ def run_account(
     scoped_ids = {str(c) for c in campaign_ids}
     budget_desired = {cid: m for cid, m in budget_plan["desired"].items()
                       if cid in scoped_ids}
+    # Кулдаун бюджета: кампании, чей лимит трогали за последние 14 дней, в
+    # этот такт не трогаются. Правило «не больше ±20 % за 14 дней» держится
+    # двумя рельсами: капом шага на записи (budget.clamp_write_step в
+    # diff_budget) и этим кулдауном — по журналу применённых действий, а не
+    # по расчёту.
+    budget_desired, budget_cooled = budget.apply_cooldown(
+        budget_desired,
+        writer_db.recent_action_objects(
+            (budget.BUDGET_KIND, budget.BUDGET_DAILY_KIND),
+            budget.BUDGET_COOLDOWN_DAYS, account=login))
 
     # Э3.4: кандидаты на выключение — тем же правилом, что бюджет: план ДО
     # раннего выхода, ограничитель прогона уже в scoped_ids.
@@ -1071,7 +1084,8 @@ def run_account(
             # «профиль не прошёл пороги» и «профиль есть, но корректировок нет»
             # выглядели бы одинаково.
             "schedule": _schedule_report(schedule_hours, desired_items, {}, []),
-            "budget": _budget_report(budget_plan, budget_desired),
+            "budget": _budget_report(budget_plan, budget_desired,
+                                     cooled=budget_cooled),
             "switch": _switch_report(switch_plan, switch_desired),
             "unsupported": unsupported,
             "campaign_level": campaign_level_report,
@@ -1245,7 +1259,8 @@ def run_account(
         "schedule": _schedule_report(schedule_hours, desired_items,
                                      targeting_by_campaign, campaign_ids),
         "budget": _budget_report(budget_plan, budget_desired, budget_refused,
-                                 budget_planned_count, budget_not_found),
+                                 budget_planned_count, budget_not_found,
+                                 cooled=budget_cooled),
         "switch": _switch_report(switch_plan, switch_desired, switch_refused,
                                  switch_planned_count, switch_not_found,
                                  deferred_over_cap=len(switch_deferred)),

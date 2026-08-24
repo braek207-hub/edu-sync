@@ -56,6 +56,26 @@ MIN_SHIFT = 0.10
 # «Уже стоит»: расхождение факта с планом меньше этого — не действие.
 ALREADY_SET_TOLERANCE = 0.05
 
+# Кап шага НА ЗАПИСИ: бюджет кампании меняется не больше чем на ±20 % за
+# один такт. Портфель (Э3.2) зажат капом ×1.5/×0.5, но это кап РАСЧЁТА;
+# без капа записи одна строка компьютеда двигала бы лимит сразу на треть,
+# и автостратегии жили бы в вечном переобучении. База капа — РАСХОД
+# кампании, а не текущий лимит: лимит, висящий в разы выше расхода, —
+# декорация, и ±20 % от него не ограничивают ничего; менять «бюджет»
+# кампании значит менять её расход.
+MAX_WRITE_STEP = 0.20
+
+# Вторая половина того же правила: кампания, чей бюджет трогали за
+# последние 14 дней (по ЖУРНАЛУ применённых действий, а не по расчёту —
+# расчёт передумывает каждый такт), в этот такт не трогается вовсе.
+BUDGET_COOLDOWN_DAYS = 14
+
+BUDGET_COOLDOWN_REASON = (
+    "бюджет кампании уже меняли за последние {days} дн. — кулдаун по "
+    "журналу применённых действий: автостратегии не переобучаются каждый "
+    "такт, шаг за {days} дн. ограничен ±{step:.0%}"
+)
+
 # Лимит связывает расход, если расход добирает до него хотя бы столько.
 # Порог из replикации ручного правила «кампания упирается в бюджет»: недельный
 # расход колеблется, и требовать 100 % — значит не признать связывающим даже
@@ -110,6 +130,35 @@ def desired_weekly_micros(target_28d_with_vat: float) -> int:
     """
     rub = float(target_28d_with_vat) / WEEKS_IN_WINDOW / VAT
     return int(round(rub)) * MICROS
+
+
+def clamp_write_step(target_micros: int, base_rub: float,
+                     max_step: float = MAX_WRITE_STEP) -> int:
+    """Целевой лимит, дожатый до ±max_step от базового РАСХОДА (₽ без НДС).
+
+    Округление до целого рубля — тем же правилом, что desired_weekly_micros:
+    лимит — управляющая ручка, ключ идемпотентности не должен дрожать от
+    хвостов плавающей точки.
+    """
+    lo = int(round(float(base_rub) * (1.0 - max_step))) * MICROS
+    hi = int(round(float(base_rub) * (1.0 + max_step))) * MICROS
+    return min(max(int(target_micros), lo), hi)
+
+
+def apply_cooldown(desired, touched):
+    """Сдвиги, очищенные от кампаний под кулдауном, и список отведённых.
+
+    touched — object_id кампаний с применённым бюджетным действием за окно
+    кулдауна (writer_db.recent_action_objects): кулдаун считается по факту
+    журнала, а не по расчёту.
+    """
+    touched = {str(t) for t in (touched or ())}
+    reason = BUDGET_COOLDOWN_REASON.format(days=BUDGET_COOLDOWN_DAYS,
+                                           step=MAX_WRITE_STEP)
+    cooled = [{"campaign_id": str(cid), "reason": reason}
+              for cid in sorted(set(desired) & touched)]
+    kept = {cid: m for cid, m in desired.items() if str(cid) not in touched}
+    return kept, cooled
 
 
 def plan_budget_moves(
@@ -272,8 +321,13 @@ def diff_budget(
             _refuse(cid, NOT_TEXT_REASON)
             continue
 
-        target_micros = desired_weekly_micros(move["target_28d"])
         spend = float(weekly_spend_no_vat.get(str(cid)) or 0.0)
+        target_micros = desired_weekly_micros(move["target_28d"])
+        if spend > 0:
+            # Кап записи ±MAX_WRITE_STEP от недельного РАСХОДА — до проверки
+            # «уже стоит»: судить, стоит ли лимит, надо о том значении,
+            # которое реально поедет в кабинет.
+            target_micros = clamp_write_step(target_micros, spend)
         strategy = state.get("strategy")
         channel, current_micros, reason = (
             read_weekly_limit(strategy) if isinstance(strategy, dict)
@@ -322,6 +376,9 @@ def diff_budget(
         daily_micros = daily.get("Amount")
         if daily_micros:
             target_daily_micros = int(round(target_micros / 7 / MICROS)) * MICROS
+            if spend > 0:
+                target_daily_micros = clamp_write_step(
+                    target_daily_micros, spend / 7.0)
             up = move["ratio"] > 1.0
             if up and spend * MICROS / 7 < binding_share * int(daily_micros):
                 _refuse(cid, NOT_APPLICABLE_UP_REASON.format(share=binding_share))

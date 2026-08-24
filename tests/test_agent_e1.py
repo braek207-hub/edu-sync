@@ -73,6 +73,8 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
     monkeypatch.setattr(agent_e1, "data_gate",
                         lambda today: {"status": "GREEN", "reason": "",
                                        "checks": []})
+    monkeypatch.setattr(agent_e1.writer_db, "recent_action_objects",
+                        lambda *a, **k: set())
 
 
 class _FakeCampaignsClient:

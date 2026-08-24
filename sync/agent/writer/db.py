@@ -1109,6 +1109,29 @@ def charged_objects(week_start: str,
     return {f"{r['object_level']}:{r['object_id']}" for r in rows}
 
 
+def recent_action_objects(action_kinds, days, account=None):
+    """object_id кампаний, по которым за окно применялись действия видов.
+
+    Кулдаун рычага по журналу: считаются только строки, чьё изменение
+    (вероятно) дошло до кабинета, — те же статусы, что списывают риск
+    (RISK_CHARGED_STATUSES): откатанное изменение тоже трогало кампанию,
+    и автостратегия его видела.
+    """
+    rows = _fetch(
+        """
+        SELECT DISTINCT object_id
+        FROM edu_agent_actions
+        WHERE action_kind = ANY(%s)
+          AND status IN (__RISK_CHARGED_STATUSES__)
+          AND applied_at >= now() - make_interval(days => %s)
+          AND (%s IS NULL OR account = %s)
+        """.replace("__RISK_CHARGED_STATUSES__",
+                    _sql_literals(RISK_CHARGED_STATUSES)),
+        (list(action_kinds), int(days), account, account),
+    )
+    return {str(r["object_id"]) for r in rows}
+
+
 def risk_limit(week_start: str, default_rub: float) -> float:
     rows = _fetch(
         "SELECT limit_rub FROM edu_agent_risk_budget WHERE week_start = %s", (week_start,)

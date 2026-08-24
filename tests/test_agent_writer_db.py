@@ -1273,3 +1273,19 @@ def test_charged_objects_matches_spent_risk_filter(monkeypatch):
     assert "status IN (%s)" % expected in sql
     assert "make_interval(days => %s)" in sql
     assert params == ("2026-08-17", risk.DEFAULT_DAYS_TO_MEASURE)
+
+
+def test_recent_action_objects_filters_kind_status_window_account(monkeypatch):
+    # Кулдаун бюджета: трогали лимит кампании за последние N дней — в этот
+    # такт не трогаем. Считаются только строки, чьё изменение (вероятно)
+    # дошло до кабинета, — те же статусы, что списывают риск.
+    sql, params = _captured_sql(
+        monkeypatch,
+        lambda: writer_db.recent_action_objects(
+            ("budget.set", "budget.set_daily"), 14, account="acc"))
+
+    assert "action_kind = ANY(%s)" in sql
+    expected = ", ".join("'%s'" % x for x in writer_db.RISK_CHARGED_STATUSES)
+    assert "status IN (%s)" % expected in sql
+    assert "applied_at >= now() - make_interval(days => %s)" in sql
+    assert params == (["budget.set", "budget.set_daily"], 14, "acc", "acc")

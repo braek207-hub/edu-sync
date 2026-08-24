@@ -8,6 +8,7 @@ import copy
 
 from sync.agent.writer.apply import to_api_call
 from sync.agent.writer.budget import (
+    apply_cooldown,
     NO_LIMIT_REASON,
     NOT_APPLICABLE_UP_REASON,
     PACKAGE_REASON,
@@ -154,6 +155,9 @@ def _state(weekly_micros=None, daily_micros=None, package_id=None,
 
 def test_down_move_builds_action_with_previous_state():
     # Расход 480 000/28д с НДС (100 000/нед без НДС), лимит висит на 5 млн.
+    # Цель ×0.5 дожимается капом записи до −20% от РАСХОДА (80 000/нед):
+    # лимит 5 млн — декорация, менять «бюджет» кампании значит менять её
+    # расход, и правило спеки ±20%/14 дней меряется от него.
     actions, refused = diff_budget(
         {"1": _move(240_000, 480_000)},
         {"1": _state(weekly_micros=5_000_000 * M)},
@@ -162,7 +166,7 @@ def test_down_move_builds_action_with_previous_state():
     assert len(actions) == 1
     a = actions[0]
     assert a["action_kind"] == "budget.set"
-    assert a["payload"]["WeeklySpendLimit"] == 50_000 * M
+    assert a["payload"]["WeeklySpendLimit"] == 80_000 * M
     assert a["previous_state"]["WeeklySpendLimit"] == 5_000_000 * M
     # Блок previous — целиком, для отката.
     assert "Search" in a["previous_state"]["BiddingStrategy"]
@@ -178,19 +182,23 @@ def test_up_move_on_loose_limit_refused():
 
 
 def test_up_move_on_binding_limit_builds_action():
-    # Лимит 100 000/нед, расход 100 000/нед — упирается; цель ×1.5.
+    # Лимит 100 000/нед, расход 100 000/нед — упирается; цель ×1.5
+    # дожимается капом записи до +20% от расхода.
     actions, refused = diff_budget(
         {"1": _move(720_000, 480_000)},
         {"1": _state(weekly_micros=100_000 * M)},
         {"1": 100_000.0})
     assert not refused
-    assert actions[0]["payload"]["WeeklySpendLimit"] == 150_000 * M
+    assert actions[0]["payload"]["WeeklySpendLimit"] == 120_000 * M
 
 
 def test_already_set_produces_nothing():
+    # Цель 50к/нед дожата капом записи до −20 % от расхода 100к → 80к;
+    # «уже стоит» проверяется о значении ПОСЛЕ капа — том, что реально
+    # поехало бы в кабинет.
     actions, refused = diff_budget(
         {"1": _move(240_000, 480_000)},
-        {"1": _state(weekly_micros=50_000 * M)},   # уже стоит целевой
+        {"1": _state(weekly_micros=80_000 * M)},   # уже стоит целевой
         {"1": 100_000.0})
     assert not actions and not refused
 
@@ -213,8 +221,9 @@ def test_daily_budget_branch_for_manual_strategy():
     assert not refused
     a = actions[0]
     assert a["action_kind"] == "budget.set_daily"
-    # 50 000/нед → 7143 ₽/день, округление до рубля.
-    assert a["payload"]["DailyBudget"]["Amount"] == 7143 * M
+    # Цель 50 000/нед → 7143 ₽/день, но кап записи −20% от дневного
+    # расхода (100 000/нед → 14 286/день): пол 11 429 ₽, округление до рубля.
+    assert a["payload"]["DailyBudget"]["Amount"] == 11_429 * M
     assert a["payload"]["DailyBudget"]["Mode"] == "STANDARD"
     assert a["previous_state"]["DailyBudget"]["Amount"] == 30_000 * M
 
@@ -270,7 +279,9 @@ def test_to_api_call_daily():
         {"1": 100_000.0})
     service, method, params = to_api_call(actions[0])
     assert (service, method) == ("campaigns", "update")
-    assert params["Campaigns"][0]["DailyBudget"]["Amount"] == 7143 * M
+    # Сырой дневной таргет 50к/7 ≈ 7 143 дожат капом до −20 % от
+    # дневного расхода 100к/7 ≈ 14 286 → 11 429.
+    assert params["Campaigns"][0]["DailyBudget"]["Amount"] == 11_429 * M
 
 
 # ---------------------------------------------------------------- рельсы
@@ -374,3 +385,20 @@ def test_plan_without_roi_row_is_unknown_confidence():
                                                 rel_error=0.05)]})
     assert plan["desired"] == {}
     assert plan["confidence_unknown"] == 1
+
+
+# --------------------------- кулдаун бюджета: правило ±20% за 14 дней
+
+
+def test_apply_cooldown_removes_recently_touched_campaigns():
+    desired = {"1": {"target_28d": 1.0}, "2": {"target_28d": 2.0}}
+    kept, cooled = apply_cooldown(desired, {"1", "9"})
+    assert set(kept) == {"2"}
+    assert cooled[0]["campaign_id"] == "1"
+    assert "14" in cooled[0]["reason"]
+
+
+def test_apply_cooldown_without_touched_is_passthrough():
+    desired = {"1": {"target_28d": 1.0}}
+    kept, cooled = apply_cooldown(desired, set())
+    assert kept == desired and cooled == []
