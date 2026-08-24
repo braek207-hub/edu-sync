@@ -81,15 +81,25 @@ def did_effect(
 ) -> Dict[str, Optional[float]]:
     """Difference-in-differences: изменение у обработанной минус изменение у контроля.
 
+    Шкала ЛОГАРИФМИЧЕСКАЯ: ln(после/до) обработанной минус то же у контроля.
+    Эффект уходит дальше в эластичность делением на ЛОГАРИФМ скачка бюджета
+    (history.elasticity, saturation.weekly_pair_observations), и прежняя
+    арифметическая разность долей делилась на логарифмическую величину —
+    несовместимые шкалы раздували |eps| тем сильнее, чем крупнее скачок
+    (аудит 2026-08-23). На малых изменениях обе шкалы совпадают, на
+    двукратных расходятся в полтора раза.
+
     Интервал — из пуассоновской ошибки счётчиков лидов (did_rel_error), одна
     сигма. Прежний фиктивный интервал «доля от эффекта + запас» не имел
     источника и делал уверенные оценки неотличимыми от шумных.
+
+    Нулевой уровень в любом из четырёх окон делает оценку невозможной:
+    логарифма нуля нет, и «эффект −100 %» здесь был бы выдумкой.
     """
-    if treated_before <= 0 or control_before <= 0:
+    if min(treated_before, treated_after, control_before, control_after) <= 0:
         return {"effect": None, "effect_lo": None, "effect_hi": None}
-    treated_delta = (treated_after - treated_before) / treated_before
-    control_delta = (control_after - control_before) / control_before
-    effect = treated_delta - control_delta
+    effect = (math.log(treated_after / treated_before)
+              - math.log(control_after / control_before))
     return {
         "effect": round(effect, 4),
         "effect_lo": round(effect - rel_error, 4),

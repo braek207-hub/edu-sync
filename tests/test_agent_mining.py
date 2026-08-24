@@ -1,3 +1,5 @@
+import math
+
 from sync.agent.mining import (
     detect_change_points,
     did_effect,
@@ -25,10 +27,11 @@ def test_ignores_change_without_enough_history():
 
 
 def test_did_subtracts_control_movement():
-    # Обработанная улучшилась на 20%, контроль — на 5%. Заслуга = 15 п.п.
+    # Обработанная улучшилась на 20%, контроль — на 5%. Заслуга — разность
+    # ЛОГАРИФМОВ (шкала эластичности): ln(0.8) − ln(0.95) = −0.1719.
     out = did_effect(treated_before=100.0, treated_after=80.0,
                      control_before=100.0, control_after=95.0, rel_error=0.1)
-    assert abs(out["effect"] - (-0.15)) < 1e-9
+    assert abs(out["effect"] - (math.log(0.8) - math.log(0.95))) < 1e-4
 
 
 def test_did_returns_none_on_zero_base():
@@ -122,7 +125,7 @@ def test_control_window_is_measured_in_days_not_in_rows():
     # Обработанная: CPL 7000/70 → 14000/70, +100 %. Контроль за те же сутки:
     # дни 08–14 CPL = 14000/(77·20)·20 = 700/77, дни 15–21 = 700/126,
     # то есть −38.89 %. DiD = 1.0 − (−0.3889) = 1.3889.
-    assert abs(rows[0]["effect"] - 1.3889) < 1e-4
+    assert abs(rows[0]["effect"] - 1.1856) < 1e-4   # шкала логарифмическая
 
 
 def test_control_window_does_not_shrink_as_the_cabinet_grows():
@@ -136,3 +139,26 @@ def test_control_window_does_not_shrink_as_the_cabinet_grows():
 def test_mine_returns_empty_on_flat_history():
     facts = [_facts_row(d, "111", 1000.0, 5) for d in range(1, 29)]
     assert mine_quasi_experiments(facts, window=7) == []
+
+
+# ------------------------- DiD в логарифмической шкале
+
+
+def test_did_effect_is_measured_in_logs():
+    # Эффект уходит в эластичность делением на ЛОГАРИФМ скачка бюджета
+    # (history.elasticity, saturation), поэтому и сам обязан быть логарифмом
+    # отношения — иначе на крупных скачках делится арифметическая величина на
+    # логарифмическую и |eps| раздут. На малых изменениях обе шкалы совпадают.
+    out = did_effect(treated_before=100.0, treated_after=50.0,
+                     control_before=100.0, control_after=100.0, rel_error=0.1)
+    assert abs(out["effect"] - math.log(0.5)) < 1e-4
+
+    small = did_effect(100.0, 99.0, 100.0, 100.0, rel_error=0.1)
+    assert abs(small["effect"] - (-0.01)) < 1e-3   # ≈ арифметическая шкала
+
+
+def test_did_returns_none_when_a_window_has_zero_level():
+    # Логарифм нуля не существует: нулевая цена лида в любом из четырёх окон
+    # делает оценку невозможной, а не «эффект −100 %».
+    assert did_effect(100.0, 0.0, 100.0, 95.0, rel_error=0.1)["effect"] is None
+    assert did_effect(100.0, 80.0, 100.0, 0.0, rel_error=0.1)["effect"] is None
