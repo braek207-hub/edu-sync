@@ -69,7 +69,9 @@ def test_rate_none_when_denominator_empty_everywhere():
 
 def test_ladder_translates_step_to_expected_payments():
     # Ступень eff: коэффициент = (30/200)·(200/400)·(400/900) = 1/30.
-    result = ladder({"eff": 300, "connected": 20, "deals": 5, "paid": 1}, POOLS)
+    # Собственных счётчиков глубже ступени у объекта нет — коэффициент
+    # целиком пуловый (подмешивание своих проверяют тесты частичного пулинга).
+    result = ladder({"eff": 300}, POOLS)
     assert result["step"] == "eff"
     assert isclose(result["expected_payments"], 300 / 30, rel_tol=1e-6)
     assert result["weak_rates"] == 0
@@ -163,3 +165,34 @@ def test_chain_across_two_pools_adds_their_errors():
     out = ladder({"eff": 100}, pools)
     single_pool = ladder({"eff": 100}, (("account", ACCOUNT_POOL),))
     assert out["rel_error"] > single_pool["rel_error"]
+
+
+# ------------------- частичный пулинг: свои данные объекта не выбрасываются
+
+
+def test_own_counts_pull_the_coefficient_toward_the_object():
+    # Кампания на ступени leads получала коэффициент направления ЦЕЛИКОМ —
+    # мусорная кампания с дешёвым кликом выглядела как средняя и доливалась.
+    # Свои события объекта (пусть их мало для самостоятельной оценки) обязаны
+    # тянуть коэффициент к себе пропорционально своему объёму.
+    own = {"clicks": 2000, "leads": 200, "eff": 20, "connected": 4,
+           "deals": 2, "paid": 0}          # своя воронка вдвое хуже пула
+    pooled = ladder({"leads": 200}, POOLS)
+    mixed = ladder({"leads": 200, **{k: v for k, v in own.items()
+                                     if k != "leads"}}, POOLS)
+    assert mixed["expected_payments"] < pooled["expected_payments"]
+    assert any(r["own_weight"] > 0 for r in mixed["rates"])
+
+
+def test_object_without_own_data_stays_on_the_pool():
+    out = ladder({"leads": 200}, POOLS)
+    assert all(r["own_weight"] == 0 for r in out["rates"])
+    assert out["pool_share"] == 1.0
+
+
+def test_pool_share_is_reported():
+    own = {"clicks": 2000, "leads": 200, "eff": 100, "connected": 40,
+           "deals": 20, "paid": 2}
+    out = ladder({"leads": 200, **{k: v for k, v in own.items() if k != "leads"}},
+                 POOLS)
+    assert 0.0 <= out["pool_share"] < 1.0

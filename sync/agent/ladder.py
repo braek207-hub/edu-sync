@@ -71,6 +71,7 @@ def choose_step(counts: Dict[str, Any]) -> Optional[str]:
 
 def transition_rate(
     num: str, den: str, pools: Sequence[Tuple[str, Dict[str, Any]]],
+    own_counts: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Коэффициент перехода den → num из первого пула, где он надёжен.
 
@@ -92,9 +93,40 @@ def transition_rate(
             "weak": n_num < MIN_RATE_EVENTS,
         }
         if not candidate["weak"]:
-            return candidate
+            return _with_own(candidate, num, den, own_counts)
         fallback = candidate  # пулы идут от частного к общему — берём последний
-    return fallback
+    return _with_own(fallback, num, den, own_counts) if fallback else None
+
+
+def _with_own(pool_rate: Dict[str, Any], num: str, den: str,
+              own_counts: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Пуловый коэффициент, подтянутый к собственным данным объекта.
+
+    Объект на мелкой ступени получал коэффициент пула ЦЕЛИКОМ: мусорная
+    кампания с дешёвым кликом внутри направления выглядела средней и
+    доливалась (аудит 2026-08-23, разброс выручки на лид внутри направления
+    117–5831 ₽). Своих событий у неё для самостоятельной оценки не хватает —
+    иначе лестница выбрала бы более глубокую ступень, — но они не ноль и
+    обязаны тянуть коэффициент к себе.
+
+    Вес собственных данных — n/(n + MIN_RATE_EVENTS): приор ровно в тот
+    объём событий, начиная с которого коэффициент считается надёжным сам по
+    себе. Свой знаменатель нулевой — веса нет, коэффициент остаётся пуловым.
+    """
+    own_num = _count(own_counts or {}, num)
+    own_den = _count(own_counts or {}, den)
+    if own_den <= 0:
+        return {**pool_rate, "own_weight": 0.0, "own_num": 0.0, "own_den": 0.0}
+    weight = own_num / (own_num + MIN_RATE_EVENTS)
+    own_rate = own_num / own_den
+    return {
+        **pool_rate,
+        "rate": weight * own_rate + (1.0 - weight) * pool_rate["rate"],
+        "pool_rate": pool_rate["rate"],
+        "own_weight": weight,
+        "own_num": own_num,
+        "own_den": own_den,
+    }
 
 
 def _pool_counts(pools: Sequence[Tuple[str, Dict[str, Any]]],
@@ -123,6 +155,19 @@ def _chain_variance(rates: List[Dict[str, Any]],
     variance = 0.0
     index = 0
     while index < len(rates):
+        # Звено с подмешанными собственными данными не телескопирует: его
+        # числитель и знаменатель больше не сокращаются с соседями. Считаем
+        # его отдельно, складывая доли дисперсии по весам.
+        own_weight = float(rates[index].get("own_weight") or 0.0)
+        if own_weight > 0:
+            rate = rates[index]
+            pool_num = float(rate.get("num_events") or 0.0)
+            own_num = float(rate.get("own_num") or 0.0)
+            pool_var = (1.0 / pool_num) if pool_num > 0 else float("inf")
+            own_var = (1.0 / own_num) if own_num > 0 else float("inf")
+            variance += (own_weight ** 2) * own_var                 + ((1.0 - own_weight) ** 2) * pool_var
+            index += 1
+            continue
         source = rates[index]["source"]
         end = index
         while end + 1 < len(rates) and rates[end + 1]["source"] == source:
@@ -155,7 +200,7 @@ def ladder(
     rates: List[Dict[str, Any]] = []
     coeff = 1.0
     for num, den in RATE_PAIRS[:depth]:
-        rate = transition_rate(num, den, pools)
+        rate = transition_rate(num, den, pools, own_counts=counts)
         if rate is None:
             return {
                 "step": step, "events": events, "events_by_step": events_by_step,
@@ -177,6 +222,12 @@ def ladder(
         "rel_error": round(rel_error, 3) if rel_error != float("inf") else None,
         "rates": rates,
         "weak_rates": sum(1 for r in rates if r["weak"]),
+        # Доля оценки, взятая у пула, а не у самого объекта. 1.0 значит, что
+        # объект целиком описан чужими коэффициентами — решение по нему
+        # держится на предположении «кампания как её направление в среднем».
+        "pool_share": round(
+            sum(1.0 - float(r.get("own_weight") or 0.0) for r in rates)
+            / len(rates), 3) if rates else 1.0,
     }
     if avg_check is not None:
         out["expected_revenue"] = round(expected_payments * avg_check)
