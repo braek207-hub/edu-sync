@@ -120,3 +120,40 @@ def test_direction_pools_across_campaigns_sharper_than_each():
     assert all(row["verdict"] == "неопределённо"
                for row in out["campaigns"].values())
     assert out["directions"]["med"]["verdict"] == "насыщается"
+
+
+# ------------------- свод со случайными эффектами (овердисперсия)
+
+
+def test_disagreeing_observations_widen_the_pooled_error():
+    # Пуассоновский счёт — нижняя граница неопределённости: реальные недели
+    # различаются сезоном, конкурентами, качеством трафика. Когда наблюдения
+    # спорят между собой сильнее, чем позволяют их собственные ошибки, свод
+    # обязан расшириться (DerSimonian–Laird τ²), а не отчитаться о точности,
+    # которой нет.
+    agree = combine([{"eps": 0.50, "rel_error": 0.10},
+                     {"eps": 0.52, "rel_error": 0.10},
+                     {"eps": 0.48, "rel_error": 0.10}])
+    disagree = combine([{"eps": 0.10, "rel_error": 0.10},
+                        {"eps": 0.90, "rel_error": 0.10},
+                        {"eps": 0.50, "rel_error": 0.10}])
+    assert disagree["rel_error"] > 3 * agree["rel_error"]
+    assert disagree["scale"] > 1
+    assert agree["scale"] == 1
+
+
+def test_single_observation_is_unchanged_by_random_effects():
+    # Гетерогенность на одном наблюдении не оценивается: τ² = 0, свод равен
+    # самому наблюдению — иначе одиночные квазиэксперименты молча раздувались.
+    pooled = combine([{"eps": 0.3, "rel_error": 0.2}])
+    assert abs(pooled["eps"] - 0.3) < 1e-12
+    assert abs(pooled["rel_error"] - 0.2) < 1e-12
+    assert pooled["scale"] == 1
+
+
+def test_consistent_observations_still_sharpen_the_estimate():
+    # Обратная половина: согласные наблюдения обязаны по-прежнему сужать
+    # ошибку — случайные эффекты не должны выключать сведение вовсе.
+    pooled = combine([{"eps": 0.5, "rel_error": 0.3},
+                      {"eps": 0.5, "rel_error": 0.3}])
+    assert pooled["rel_error"] < 0.3

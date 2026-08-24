@@ -183,6 +183,9 @@ def _curve(eps: Dict[str, float], cost: float, leads: int) -> Dict[str, Any]:
     return {
         "eps": round(eps["eps"], 4),
         "eps_rel_error": round(eps["rel_error"], 4),
+        # Множитель разброса свода (history.combine): >1 значит, что
+        # наблюдения кампании спорят сильнее собственных ошибок.
+        "eps_scale": eps.get("scale", 1.0),
         "beta": round(beta, 4),
         "beta_clamped": beta != beta_raw,
         "observations": int(eps.get("n") or 0),
