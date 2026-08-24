@@ -11,6 +11,7 @@ sync/agent/objects.py — снимок структуры кабинета и п
 """
 
 import hashlib
+import re
 import json
 from typing import Any, Dict, List, Optional
 
@@ -193,3 +194,72 @@ def placement_candidates(
                                 multiplier=multiplier,
                                 base_conversion=base_conversion)
     return [{**row, "placement": row.pop("query")} for row in out]
+
+
+# Минимальная длина слова-кандидата. Предлоги и союзы («в», «на», «и») в
+# минус-слова не годятся: они встречаются везде, и запрет выкосил бы вместе с
+# мусором всю работающую семантику.
+MIN_WORD_CHARS = 3
+
+# Сколько РАЗНЫХ фраз должно содержать слово, чтобы судить его отдельно.
+# Слово из одной фразы — это та же фраза, и отдельный приговор ему был бы
+# обходом порога наблюдаемости через переименование.
+MIN_PHRASES_PER_WORD = 3
+
+_WORD_RE = re.compile(r"[а-яёa-z0-9]+")
+
+
+def word_minus_candidates(
+    queries: List[Dict[str, Any]], cpa_limit: float,
+    multiplier: float = CPA_OVERSHOOT,
+    base_conversion: Optional[float] = None,
+    min_phrases: int = MIN_PHRASES_PER_WORD,
+) -> List[Dict[str, Any]]:
+    """Кандидаты в минус-СЛОВА: слово судится по всем фразам, где встретилось.
+
+    Отдельная фраза почти никогда не набирает объём для приговора: при базовой
+    конверсии в несколько процентов сотня кликов без единой конверсии —
+    редкость, а хвост из фраз по десять кликов судить нечем. Слово, общее для
+    полусотни фраз, объём набирает — и гасит всё семейство разом. Это и есть
+    минусация в исходном смысле, а не удаление отдельных запросов.
+
+    Правило то же, что у фраз (minus_word_candidates): слово, у которого по
+    всем его фразам НЕТ конверсий при достаточном объёме, или есть, но дороже
+    допустимого. Слово, встречающееся хотя бы в одной конверсионной фразе,
+    кандидатом не станет — его конверсии войдут в агрегат.
+    """
+    if cpa_limit <= 0:
+        return []
+
+    by_word: Dict[str, Dict[str, Any]] = {}
+    for q in queries:
+        phrase = str(q.get("query") or "").lower()
+        cost = float(q.get("cost") or 0.0)
+        clicks = int(q.get("clicks") or 0)
+        conversions = int(q.get("conversions") or 0)
+        campaign_id = str(q.get("campaign_id") or "")
+        for word in set(_WORD_RE.findall(phrase)):
+            if len(word) < MIN_WORD_CHARS:
+                continue
+            slot = by_word.setdefault(word, {
+                "query": word, "cost": 0.0, "clicks": 0, "conversions": 0,
+                "phrases": 0, "campaigns": set(),
+            })
+            slot["cost"] += cost
+            slot["clicks"] += clicks
+            slot["conversions"] += conversions
+            slot["phrases"] += 1
+            if campaign_id:
+                slot["campaigns"].add(campaign_id)
+
+    ready = [{**slot, "campaigns": sorted(slot["campaigns"])}
+             for slot in by_word.values() if slot["phrases"] >= min_phrases]
+    judged = minus_word_candidates(ready, cpa_limit=cpa_limit,
+                                   multiplier=multiplier,
+                                   base_conversion=base_conversion)
+    phrases_by_word = {slot["query"]: slot["phrases"] for slot in ready}
+    campaigns_by_word = {slot["query"]: slot["campaigns"] for slot in ready}
+    return [{**row,
+             "phrases": phrases_by_word.get(row["query"], 0),
+             "campaigns": campaigns_by_word.get(row["query"], row.get("campaigns", []))}
+            for row in judged]

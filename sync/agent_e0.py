@@ -58,6 +58,7 @@ from sync.agent.objects import (
     build_object_rows,
     minus_word_candidates,
     placement_candidates,
+    word_minus_candidates,
     top_queries_by_cost,
 )
 from sync.agent.power import power_report
@@ -691,12 +692,21 @@ def main() -> int:
     minus_candidates = (minus_word_candidates(scored_queries, cpa_limit=cpa_limit,
                                               base_conversion=base_conversion)
                         if cpa_limit > 0 else [])
+    # Минус-СЛОВА поверх минус-фраз: отдельная фраза почти никогда не набирает
+    # объём для приговора (при базовой конверсии в проценты сотня кликов без
+    # конверсий — редкость), а слово, общее для полусотни фраз, набирает и
+    # гасит всё семейство разом. Считаются по ВСЕМ запросам кабинета, не по
+    # топу: слово живёт как раз в хвосте, который топ отсекает.
+    word_candidates = (word_minus_candidates(seeing_queries, cpa_limit=cpa_limit,
+                                             base_conversion=base_conversion)
+                       if cpa_limit > 0 else [])
 
     # Кандидаты в минус-фразы уезжают в computed по кампаниям: применяет их
     # писатель Э3.6 в прогоне применения, и отчёт Э0 сам по себе действий не
     # производит. Фраза попадает в строки каждой кампании, где жгла деньги.
     negative_rows_written = 0
-    for campaign_id, rows in negative_computed_rows(minus_candidates).items():
+    for campaign_id, rows in negative_computed_rows(
+            minus_candidates + word_candidates).items():
         agent_db.upsert_computed_settings(
             rows, calc_date=today_iso, object_id=campaign_id,
             object_level="campaign")
@@ -920,6 +930,15 @@ def main() -> int:
             # кликов без конверсий нужно, чтобы приговор был осмысленным.
             "base_conversion": round(base_conversion, 5),
             "computed_rows": negative_rows_written,
+            # Слова считаются и применяются тем же рычагом, что фразы, но
+            # отчитываются отдельно: одно слово гасит десятки фраз, и мерить
+            # их одним счётчиком значит прятать разницу в цене решения.
+            "words": {
+                "count": len(word_candidates),
+                "cost_burned": round(sum(float(w.get("cost") or 0.0)
+                                         for w in word_candidates), 2),
+                "sample": [w.get("query") for w in word_candidates[:10]],
+            },
             "sample": [q.get("query") for q in minus_candidates[:10]],
             "blind_accounts": blind_accounts,
         },

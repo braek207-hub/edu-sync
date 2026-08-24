@@ -164,3 +164,45 @@ def test_placement_candidates_need_enough_clicks():
     rows = [{"campaign_id": "1", "placement": "rare.site", "cost": 9000.0,
              "clicks": 5, "conversions": 0}]
     assert placement_candidates(rows, cpa_limit=1000.0, base_conversion=0.05) == []
+
+
+# ------------------- минус-СЛОВА: одно слово гасит семейство фраз
+
+
+def test_word_candidates_aggregate_phrases_by_word():
+    # Отдельная фраза редко набирает объём для приговора, а слово, общее для
+    # полусотни фраз, — набирает. Слово «мгту» на живых данных: 43 фразы,
+    # 67 кликов, ноль конверсий, 11 506 ₽ за месяц.
+    from sync.agent.objects import word_minus_candidates
+    queries = [
+        {"campaign_id": "1", "query": f"мгту {i}", "cost": 1000.0,
+         "clicks": 20, "conversions": 0} for i in range(5)
+    ] + [
+        {"campaign_id": "1", "query": "колледж москва", "cost": 5000.0,
+         "clicks": 100, "conversions": 10},
+    ]
+    out = word_minus_candidates(queries, cpa_limit=1000.0, base_conversion=0.05)
+    words = {r["query"] for r in out}
+    assert "мгту" in words
+    assert "колледж" not in words          # слово работающих фраз не трогаем
+    mgtu = next(r for r in out if r["query"] == "мгту")
+    assert mgtu["cost"] == 5000.0
+    assert mgtu["phrases"] == 5
+
+
+def test_word_candidates_need_the_word_to_appear_in_several_phrases():
+    # Слово из одной-единственной фразы — это та же фраза, и судить его
+    # отдельно значит обходить порог наблюдаемости через переименование.
+    from sync.agent.objects import word_minus_candidates
+    queries = [{"campaign_id": "1", "query": "уникальный запрос", "cost": 9000.0,
+                "clicks": 300, "conversions": 0}]
+    assert word_minus_candidates(queries, cpa_limit=1000.0,
+                                 base_conversion=0.05) == []
+
+
+def test_word_candidates_skip_short_words():
+    from sync.agent.objects import word_minus_candidates
+    queries = [{"campaign_id": "1", "query": f"в мгту {i}", "cost": 1000.0,
+                "clicks": 50, "conversions": 0} for i in range(4)]
+    out = word_minus_candidates(queries, cpa_limit=1000.0, base_conversion=0.05)
+    assert {r["query"] for r in out} == {"мгту"}
