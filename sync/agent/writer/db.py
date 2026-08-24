@@ -875,6 +875,13 @@ def harmful_segments(
 #
 # COALESCE с payload — тот же, что в HARMFUL_SEGMENTS_SQL: у строк, записанных
 # до появления колонок direct_type/setting_key, сегмент лежал только в payload.
+# Окно памяти о неудачных попытках. Счётчик копился вечно: сегмент, чьи три
+# отказа случились полгода назад (кампанию с тех пор починили, ключ снова
+# валиден), оставался заблокированным навсегда — движок молча переставал его
+# трогать, и причина блокировки давно не существовала (аудит 2026-08-23).
+# 90 дней — тот же порядок, что окно наблюдения плюс квартал жизни кампании.
+EXHAUSTED_RETENTION_DAYS = 90
+
 EXHAUSTED_SEGMENTS_SQL = """
     SELECT account,
            object_id,
@@ -888,13 +895,15 @@ EXHAUSTED_SEGMENTS_SQL = """
       AND (%s IS NULL OR account = %s)
       AND COALESCE(direct_type, payload->>'Type') IS NOT NULL
       AND COALESCE(setting_key, payload->>'key') IS NOT NULL
+      AND created_at >= now() - make_interval(days => %s)
     GROUP BY 1, 2, 3, 4
     HAVING SUM(apply_attempts) >= %s
 """.replace("__REATTEMPTED_STATUSES__", _sql_literals(REATTEMPTED_STATUSES))
 
 
 def exhausted_segments(
-    max_attempts: int = MAX_APPLY_ATTEMPTS, account: Optional[str] = None
+    max_attempts: int = MAX_APPLY_ATTEMPTS, account: Optional[str] = None,
+    retention_days: int = EXHAUSTED_RETENTION_DAYS,
 ) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
     """Сегменты, которым движок больше не отправляет действия.
 
@@ -905,8 +914,14 @@ def exhausted_segments(
     Значение — число накопленных попыток и момент последней: отчёт прогона
     обязан показывать не только «заблокировано», но и на чём именно движок
     остановился, — эти строки разбирает человек.
+
+    Считаются только попытки за последние retention_days: блокировка не
+    вечная. Причина отказа (исчезнувший сегмент, устаревший ключ, сломанная
+    кампания) со временем чинится, а счётчик копился навсегда и молча
+    исключал сегмент из работы движка уже после починки.
     """
-    rows = _fetch(EXHAUSTED_SEGMENTS_SQL, (account, account, int(max_attempts)))
+    rows = _fetch(EXHAUSTED_SEGMENTS_SQL,
+                  (account, account, int(retention_days), int(max_attempts)))
     return {
         (str(r["object_id"]), str(r["direct_type"]), str(r["setting_key"])):
             {"attempts": int(r["attempts"] or 0),

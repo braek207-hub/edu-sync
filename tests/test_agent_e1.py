@@ -2091,3 +2091,25 @@ def test_data_gate_red_blocks_apply_run_before_any_journal_io(monkeypatch, capsy
 
     assert rc == 1
     assert "DATA_GATE_RED" in capsys.readouterr().out
+
+
+# ------------------- белый список аргументов прогона
+
+
+def test_unknown_flag_is_refused_not_ignored():
+    # Опечатка в ограничителе тише всего: «--max-campaign=5» (без s) прежде
+    # просто не распознавался, и оператор получал прогон БЕЗ ограничения,
+    # будучи уверенным в обратном. Любой неизвестный флаг — ошибка.
+    with pytest.raises(ValueError):
+        agent_e1.parse_campaign_scope(["--max-campaign=5"])
+    with pytest.raises(ValueError):
+        agent_e1.parse_campaign_scope(["--campaign=111"])
+    with pytest.raises(ValueError):
+        agent_e1.parse_campaign_scope(["--dry-run"])
+
+
+def test_known_flags_are_accepted():
+    scope = agent_e1.parse_campaign_scope(
+        ["--prod", "--apply", "--campaigns=111,222", "--max-campaigns=3"])
+    assert scope.only == {"111", "222"}
+    assert scope.max_campaigns == 3

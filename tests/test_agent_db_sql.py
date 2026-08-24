@@ -266,3 +266,24 @@ def test_live_maturity_is_not_ahead_of_the_facts_mart():
             facts_through = _date.fromisoformat(str(facts_through))
         assert maturity <= facts_through
     assert maturity <= _date.today()
+
+
+def test_maturity_needs_a_full_day_not_a_single_early_lead(monkeypatch):
+    # MAX(created_date) объявлял день зрелым по ОДНОМУ раннему лиду: граница
+    # уезжала вперёд, в окна наблюдения попадали дни, где CRM ещё почти
+    # пуста, и CPA этих дней завышен всегда в одну сторону. Зрелым считается
+    # последний день, набравший заметную долю типичного дня.
+    from datetime import date as _date
+
+    days = [{"d": _date(2026, 8, 1 + i), "n": 100} for i in range(18)]
+    days.append({"d": _date(2026, 8, 19), "n": 3})   # день пришёл едва начатым
+    monkeypatch.setattr(agent_db, "_fetch_dicts", lambda sql, params=(): days)
+    assert agent_db.crm_maturity_date() == _date(2026, 8, 18)
+
+
+def test_maturity_takes_the_last_full_day(monkeypatch):
+    from datetime import date as _date
+
+    days = [{"d": _date(2026, 8, 1 + i), "n": 100} for i in range(19)]
+    monkeypatch.setattr(agent_db, "_fetch_dicts", lambda sql, params=(): days)
+    assert agent_db.crm_maturity_date() == _date(2026, 8, 19)

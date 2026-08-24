@@ -15,6 +15,7 @@ DDL идемпотентен: ensure_agent_tables() безопасно вызы�
 import json
 from collections import Counter, defaultdict
 from datetime import date
+from statistics import median
 from typing import Any, Dict, List, Optional
 
 import psycopg2.extras
@@ -540,6 +541,16 @@ def mart_cost_total(date_from: str, date_to: str) -> float:
     return float(rows[0]["total"] or 0.0) if rows else 0.0
 
 
+# Доля типичного дня, ниже которой день CRM считается недобравшим. Тот же
+# приём, что у ширины витрины в gate.py: эталон — медиана окна, устойчивая
+# к единичному битому дню.
+CRM_MATURITY_MIN_SHARE = 0.5
+
+# Окно, по которому берётся типичный день. Достаточно двух недель: сезонный
+# уровень лидов внутри них не успевает уехать, а медиана уже устойчива.
+CRM_MATURITY_WINDOW_DAYS = 14
+
+
 def crm_maturity_date() -> Optional[date]:
     """Последний день, за который лиды в CRM РЕАЛЬНО есть. Граница зрелости.
 
@@ -559,14 +570,41 @@ def crm_maturity_date() -> Optional[date]:
     именно тогда, когда защита нужна. Константу заменяет факт: граница окна
     берётся из данных и двигается вместе с ними.
 
+    Зрелым считается последний день, набравший заметную долю ТИПИЧНОГО дня
+    окна (CRM_MATURITY_MIN_SHARE от медианы). Прежний MAX(created_date)
+    объявлял день зрелым по ОДНОМУ раннему лиду: граница уезжала вперёд, в
+    окна наблюдения попадал день, где CRM ещё почти пуста, и его CPA завышен
+    всегда в одну сторону — то есть ровно тот дефект, от которого граница и
+    защищает (аудит 2026-08-23).
+
     None — лидов нет вовсе. Это не «граница сегодня», а «наблюдать не по чему»:
     подставлять здесь сегодняшний день значило бы разрешить вердикт по пустоте.
     """
-    rows = _fetch_dicts("SELECT MAX(created_date) AS d FROM crm_lead_details")
-    raw = rows[0]["d"] if rows else None
-    if raw is None:
+    rows = _fetch_dicts(
+        """
+        SELECT created_date AS d, COUNT(*) AS n
+        FROM crm_lead_details
+        WHERE created_date >= (
+            SELECT MAX(created_date) FROM crm_lead_details
+        ) - make_interval(days => %s)
+        GROUP BY created_date
+        ORDER BY created_date
+        """,
+        (CRM_MATURITY_WINDOW_DAYS,),
+    )
+    days = []
+    for row in rows or ():
+        raw = row.get("d")
+        if raw is None:
+            continue
+        day = raw if isinstance(raw, date) else date.fromisoformat(str(raw)[:10])
+        days.append((day, int(row.get("n") or 0)))
+    if not days:
         return None
-    return raw if isinstance(raw, date) else date.fromisoformat(str(raw))
+    typical = median(sorted(n for _, n in days))
+    need = max(1.0, typical * CRM_MATURITY_MIN_SHARE)
+    full = [day for day, n in days if n >= need]
+    return max(full) if full else max(day for day, _ in days)
 
 
 def load_mart_day_breadth(date_from: str, date_to: str) -> Dict[str, Any]:

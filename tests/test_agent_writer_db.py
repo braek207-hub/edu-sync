@@ -1098,7 +1098,10 @@ def test_exhausted_segments_passes_account_and_threshold(monkeypatch):
 
     writer_db.exhausted_segments(account="cab")
 
-    assert seen["params"] == ("cab", "cab", writer_db.MAX_APPLY_ATTEMPTS)
+    # Окно памяти о неудачах едет третьим параметром: блокировка сегмента
+    # больше не вечная (EXHAUSTED_RETENTION_DAYS).
+    assert seen["params"] == ("cab", "cab", writer_db.EXHAUSTED_RETENTION_DAYS,
+                              writer_db.MAX_APPLY_ATTEMPTS)
 
 
 def test_apply_attempt_cap_matches_the_rollback_one():
@@ -1318,3 +1321,12 @@ def test_mark_stale_requires_sent_at_and_aborts_the_rest():
     assert "sent_at IS NULL" in writer_db.MARK_ABORTED_SQL
     assert "'aborted'" in writer_db.MARK_ABORTED_SQL
     assert "applied_at" not in writer_db.MARK_ABORTED_SQL
+
+
+def test_exhausted_segments_forget_old_failures():
+    # Счётчик попыток копится вечно: сегмент, у которого три отказа случились
+    # полгода назад (кампанию с тех пор починили), заблокирован навсегда.
+    # Считаются только попытки внутри окна retention.
+    assert "EXHAUSTED_RETENTION_DAYS" in dir(writer_db)
+    assert "created_at >= now() - make_interval(days => %s)" in \
+        writer_db.EXHAUSTED_SEGMENTS_SQL

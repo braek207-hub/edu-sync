@@ -93,6 +93,15 @@ CAMPAIGN_PAGE_LIMIT = 1000
 CAMPAIGNS_ARG = "--campaigns="
 MAX_CAMPAIGNS_ARG = "--max-campaigns="
 
+# Всё, что прогон понимает. Флаги режима (--prod/--apply) здесь тоже: их
+# читает main(), но проверяются они здесь, где разбираются аргументы.
+KNOWN_ARGS = ("--prod", "--apply", CAMPAIGNS_ARG, MAX_CAMPAIGNS_ARG)
+
+UNKNOWN_ARG_REASON = (
+    "неизвестный аргумент {arg}: прогон остановлен, потому что опечатка в "
+    "ограничителе даёт прогон ШИРЕ запрошенного. Понимаются: {known}"
+)
+
 BAD_CAMPAIGNS_ARG_REASON = (
     "{arg}: список кампаний пуст. Форма — --campaigns=123 или "
     "--campaigns=123,456; пустой список это не «все кампании», а опечатка"
@@ -170,6 +179,14 @@ def parse_campaign_scope(argv: List[str]) -> CampaignScope:
     only: Optional[List[str]] = None
     max_campaigns: Optional[int] = None
     for arg in argv:
+        if arg.startswith("--") and not any(
+                arg == known or arg.startswith(known)
+                for known in KNOWN_ARGS):
+            # Белый список, а не «разберём, что узнали»: неизвестный флаг —
+            # почти всегда опечатка в ОГРАНИЧИТЕЛЕ, и молча продолжать
+            # значит выполнить прогон шире, чем просил оператор.
+            raise ValueError(UNKNOWN_ARG_REASON.format(
+                arg=arg, known=", ".join(sorted(KNOWN_ARGS))))
         if arg.startswith(CAMPAIGNS_ARG):
             only = [p.strip() for p in arg[len(CAMPAIGNS_ARG):].split(",") if p.strip()]
             if not only:
