@@ -566,7 +566,12 @@ def fetch_placements(
             },
             "FieldNames": fields,
             "ReportName": f"agent-placements-{date_from}-{date_to}",
-            "ReportType": "PLACEMENT_PERFORMANCE_REPORT",
+            # CUSTOM_REPORT, а не выдуманный PLACEMENT_PERFORMANCE_REPORT:
+            # такого типа в API v5 нет (боевой прогон получил 8000
+            # «ReportType содержит неверное значение перечисления»). Поля
+            # Placement и AdNetworkType живут в CUSTOM_REPORT — там же, где
+            # их берут сегментные срезы.
+            "ReportType": "CUSTOM_REPORT",
             "DateRangeType": "CUSTOM_DATE",
             "Format": "TSV",
             "IncludeVAT": "YES",

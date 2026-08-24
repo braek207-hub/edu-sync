@@ -346,7 +346,9 @@ def test_fetch_placements_asks_for_the_right_report(monkeypatch):
     rows, goal = segments.fetch_placements("acc", "2026-07-01", "2026-08-11",
                                            goals=["360811375"])
     params = seen["payload"]["params"]
-    assert params["ReportType"] == "PLACEMENT_PERFORMANCE_REPORT"
+    # Тип отчёта — CUSTOM_REPORT: PLACEMENT_PERFORMANCE_REPORT в API v5 не
+    # существует, и боевой прогон получал 8000 «неверное значение перечисления».
+    assert params["ReportType"] == "CUSTOM_REPORT"
     assert "Placement" in params["FieldNames"]
     assert rows[0]["placement"] == "some.site.ru"
     assert rows[0]["cost"] == 9000.0
