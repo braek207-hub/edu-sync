@@ -1,5 +1,6 @@
 import math
 
+import sync.agent.mining as mining
 from sync.agent.mining import (
     detect_change_points,
     did_effect,
@@ -205,3 +206,45 @@ def test_rtm_suspect_experiment_is_not_used_for_elasticity():
     trusted = {**suspect, "reliability_class": "B"}
     assert elasticity(suspect) is None
     assert elasticity(trusted) is not None
+
+
+# ------------------- placebo-DiD: эмпирический пол ошибки
+
+
+def _noisy_facts(seed_shift=0):
+    """Кампании без единого изменения — только естественные колебания."""
+    facts = []
+    wobble = [0, 2, -1, 3, -2, 1, 4, -3, 2, 0, 1, -1, 3, -2,
+              2, -1, 0, 4, -3, 1, 2, -2, 3, 0, 1, -1, 2, -2]
+    for i, day in enumerate(range(1, 29)):
+        facts.append(_facts_row(day, "111", 1000.0,
+                                20 + wobble[(i + seed_shift) % len(wobble)]))
+        facts.append(_facts_row(day, "222", 1000.0,
+                                20 - wobble[(i + seed_shift) % len(wobble)]))
+    return facts
+
+
+def test_placebo_sigma_measures_noise_where_nothing_happened():
+    # DiD в точках БЕЗ изменений обязан давать ноль. Разброс этих «эффектов
+    # на пустом месте» и есть честный пол ошибки: пуассоновский счёт лидов
+    # его недооценивает, потому что не знает ни о сезоне, ни о конкурентах.
+    sigma = mining.placebo_sigma(_noisy_facts(), window=7)
+    assert sigma is not None and sigma > 0
+
+
+def test_placebo_sigma_is_none_without_enough_points():
+    assert mining.placebo_sigma([], window=7) is None
+
+
+def test_experiment_error_is_never_below_the_placebo_floor():
+    facts = []
+    for d in range(1, 29):
+        facts.append(_facts_row(d, "111", 1000.0 if d < 15 else 2000.0,
+                                5 if d % 2 else 9))
+        facts.append(_facts_row(d, "222", 1000.0, 7 if d % 3 else 12))
+    rows = mine_quasi_experiments(facts, window=7)
+    assert rows
+    for r in rows:
+        floor = r["params"].get("placebo_sigma")
+        assert floor is not None
+        assert r["params"]["rel_error"] >= floor - 1e-9

@@ -16,7 +16,7 @@ sync/agent/mining.py — квазиэксперименты из истории 
 import hashlib
 import math
 from datetime import date
-from statistics import mean
+from statistics import mean, pstdev
 from typing import Any, Dict, List, Optional, Set
 
 MIN_SIDE_DAYS = 7          # минимум дней с каждой стороны точки изменения
@@ -32,6 +32,14 @@ RTM_SIGMA_THRESHOLD = 1.0
 # Класс надёжности RTM-подозрительного наблюдения. Ниже B: «трогали то, что
 # болело» — общее смещение всех квазиэкспериментов; здесь оно ещё и измеримо.
 RTM_CLASS = "C"
+
+# Плацебо-DiD: минимум точек «где ничего не происходило», ниже которого
+# разброс не оценивается — на двух-трёх наблюдениях он сам шум.
+MIN_PLACEBO_POINTS = 5
+
+# Шаг между плацебо-точками в днях. Соседние точки делят почти все свои дни,
+# и их эффекты не были бы независимыми наблюдениями шума.
+PLACEBO_STEP_DAYS = 7
 
 
 def detect_change_points(series: List[Dict[str, Any]], min_jump: float = 0.3) -> List[Dict[str, Any]]:
@@ -179,6 +187,73 @@ def pre_trend_check(
     }
 
 
+def _did_at(rows: List[Dict[str, Any]], control_rows: List[Dict[str, Any]],
+            change_date: str, window: int) -> Optional[float]:
+    """DiD-эффект в названной точке, или None, если окна не полны."""
+    before_dates = _window_dates(rows, change_date, window, before=True)
+    after_dates = _window_dates(rows, change_date, window, before=False)
+    if len(before_dates) < window or len(after_dates) < window:
+        return None
+    windows = {
+        "tb": _window_metrics([r for r in rows if r["fact_date"] in before_dates]),
+        "ta": _window_metrics([r for r in rows if r["fact_date"] in after_dates]),
+        "cb": _window_metrics([r for r in control_rows
+                               if r["fact_date"] in before_dates]),
+        "ca": _window_metrics([r for r in control_rows
+                               if r["fact_date"] in after_dates]),
+    }
+    if any(w["leads"] == 0 for w in windows.values()):
+        return None
+    measured = did_effect(windows["tb"]["cpl"], windows["ta"]["cpl"],
+                          windows["cb"]["cpl"], windows["ca"]["cpl"], 0.0)
+    return measured["effect"]
+
+
+def placebo_sigma(facts: List[Dict[str, Any]], window: int = 14,
+                  step: int = PLACEBO_STEP_DAYS) -> Optional[float]:
+    """Разброс DiD-эффектов там, где НИЧЕГО не менялось.
+
+    В точке без изменения истинный эффект равен нулю, и всё, что DiD там
+    показывает, — шум: сезон, конкуренты, качество трафика, случайные
+    колебания конверсии. Пуассоновская ошибка счётчиков этого не знает и
+    систематически занижает неопределённость (аудит 2026-08-23: «DiD без
+    placebo»).
+
+    Поэтому разброс плацебо-эффектов становится ПОЛОМ ошибки любого
+    измеренного эффекта: реальная оценка не может быть точнее, чем шум на
+    пустом месте. Точек меньше MIN_PLACEBO_POINTS — оценка сама шум, и пола
+    нет (None), а не выдуманный ноль.
+
+    Точки берутся с шагом step и в стороне от найденных скачков: окно вокруг
+    настоящего изменения — не пустое место.
+    """
+    if not facts:
+        return None
+    by_campaign: Dict[str, List[Dict[str, Any]]] = {}
+    for f in facts:
+        by_campaign.setdefault(str(f["campaign_id"]), []).append(f)
+
+    effects: List[float] = []
+    for campaign_id, rows in sorted(by_campaign.items()):
+        control_rows = [f for f in facts if str(f["campaign_id"]) != campaign_id]
+        series = [{"date": r["fact_date"], "value": float(r.get("cost") or 0.0)}
+                  for r in rows]
+        change_days = {p["date"] for p in detect_change_points(series)}
+        days = sorted({r["fact_date"] for r in rows})
+        for i in range(window, len(days) - window + 1, step):
+            point = days[i]
+            if any(abs((date.fromisoformat(point)
+                        - date.fromisoformat(d)).days) <= window
+                   for d in change_days):
+                continue
+            effect = _did_at(rows, control_rows, point, window)
+            if effect is not None:
+                effects.append(effect)
+    if len(effects) < MIN_PLACEBO_POINTS:
+        return None
+    return pstdev(effects)
+
+
 def _experiment_id(campaign_id: str, change_date: str) -> str:
     raw = f"quasi:{campaign_id}:{change_date}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
@@ -189,6 +264,11 @@ def mine_quasi_experiments(facts: List[Dict[str, Any]], window: int = 14) -> Lis
     by_campaign: Dict[str, List[Dict[str, Any]]] = {}
     for f in facts:
         by_campaign.setdefault(str(f["campaign_id"]), []).append(f)
+
+    # Пол ошибки из плацебо-точек — один на прогон: шум «на пустом месте»
+    # общий для кабинета, и мерить его по каждой кампании отдельно значило бы
+    # оценивать разброс по трём точкам.
+    floor = placebo_sigma(facts, window=window) or 0.0
 
     out: List[Dict[str, Any]] = []
     for campaign_id, rows in sorted(by_campaign.items()):
@@ -223,7 +303,9 @@ def mine_quasi_experiments(facts: List[Dict[str, Any]], window: int = 14) -> Lis
                 # «CPL вырос на X %» нельзя. Такой скачок эксперимента не даёт.
                 continue
 
-            rel = did_rel_error(*(w["leads"] for w in windows.values()))
+            # Пуассоновский счёт — нижняя граница; плацебо показывает, какой
+            # разброс даёт DiD там, где эффекта нет вовсе. Берём большее.
+            rel = max(did_rel_error(*(w["leads"] for w in windows.values())), floor)
             measured = did_effect(
                 windows["treated_before"]["cpl"], windows["treated_after"]["cpl"],
                 windows["control_before"]["cpl"], windows["control_after"]["cpl"],
@@ -241,6 +323,7 @@ def mine_quasi_experiments(facts: List[Dict[str, Any]], window: int = 14) -> Lis
                 "params": {
                     "jump": point["jump"], "before": point["before"], "after": point["after"],
                     "rel_error": round(rel, 4),
+                    "placebo_sigma": round(floor, 4),
                     "leads": {k: w["leads"] for k, w in windows.items()},
                     "pre_trend": pre_trend,
                 },

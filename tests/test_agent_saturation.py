@@ -238,3 +238,15 @@ def test_weekly_pair_on_calm_history_is_used():
     obs, stats = weekly_pair_observations(facts, _sunday(4))
     assert stats["pairs_rtm_suspect"] == 0
     assert obs.get("111")
+
+
+def test_weekly_pairs_respect_the_placebo_error_floor():
+    # Тот же пол, что у квазиэкспериментов: пара недель не может быть точнее,
+    # чем разброс DiD там, где ничего не менялось.
+    facts = _stable_control(weeks=4)
+    facts += _facts("111", 0, 1000.0, 20) + _facts("111", 1, 3000.0, 30)
+    loose, _ = weekly_pair_observations(facts, _sunday(3))
+    tight, _ = weekly_pair_observations(facts, _sunday(3), error_floor=0.5)
+    log_jump = math.log(3.0)
+    assert tight["111"][0]["rel_error"] >= 0.5 / log_jump - 1e-9
+    assert tight["111"][0]["rel_error"] > loose["111"][0]["rel_error"]

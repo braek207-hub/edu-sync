@@ -41,7 +41,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.confidence import assess
 from sync.agent.history import MIN_LOG_JUMP, combine, elasticity
-from sync.agent.mining import RTM_SIGMA_THRESHOLD, did_effect, did_rel_error
+from sync.agent.mining import (RTM_SIGMA_THRESHOLD, did_effect,
+                               did_rel_error, placebo_sigma)
 
 # Границы β. Ниже 0.15 предельная цена взлетает в десятки средних CPL — на
 # наших ошибках (rel_error свода ≥ 0.2) такая крутизна неотличима от шума и
@@ -63,6 +64,7 @@ def weekly_pair_observations(
     facts: List[Dict[str, Any]],
     mature_through: str,
     quasi_dates_by_campaign: Optional[Dict[str, List[str]]] = None,
+    error_floor: float = 0.0,
 ) -> Tuple[Dict[str, List[Dict[str, float]]], Dict[str, int]]:
     """Наблюдения эластичности из пар соседних недель, по кампаниям.
 
@@ -143,7 +145,11 @@ def weekly_pair_observations(
             if any(c["leads"] <= 0 for c in cells) or c1["cost"] <= 0 or c2["cost"] <= 0:
                 # Окно без лидов конечной цены лида не даёт (см. mining).
                 continue
-            rel = did_rel_error(*(c["leads"] for c in cells))
+            # Пол ошибки из плацебо-точек (mining.placebo_sigma): пара недель
+            # не может быть точнее, чем разброс DiD там, где ничего не
+            # менялось. Пуассоновский счёт этого не знает.
+            rel = max(did_rel_error(*(c["leads"] for c in cells)),
+                      float(error_floor or 0.0))
             measured = did_effect(
                 t1["cost"] / t1["leads"], t2["cost"] / t2["leads"],
                 c1["cost"] / c1["leads"], c2["cost"] / c2["leads"],
@@ -278,7 +284,11 @@ def saturation_curves(
         if obs is not None:
             quasi_obs.setdefault(campaign_id, []).append(obs)
 
-    weekly_obs, weekly_stats = weekly_pair_observations(facts, mature_through, quasi_dates)
+    # Один пол ошибки на прогон — общий для обоих источников наблюдений.
+    floor = placebo_sigma(facts) or 0.0
+    weekly_obs, weekly_stats = weekly_pair_observations(
+        facts, mature_through, quasi_dates, error_floor=floor)
+    weekly_stats["placebo_sigma"] = round(floor, 4)
 
     all_obs: Dict[str, List[Dict[str, float]]] = {}
     for campaign_id in set(quasi_obs) | set(weekly_obs):
