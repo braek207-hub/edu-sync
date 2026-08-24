@@ -261,7 +261,7 @@ def test_spent_risk_charges_every_live_status(monkeypatch):
     # иначе прогон выдаёт лимит, которого нет.
     sql, _ = _captured_sql(monkeypatch, lambda: writer_db.spent_risk("2026-08-01"))
 
-    expected = ", ".join("'%s'" % x for x in writer_db.LIVE_STATUSES)
+    expected = ", ".join("'%s'" % x for x in writer_db.RISK_CHARGED_STATUSES)
     assert "status IN (%s)" % expected in sql
 
 
@@ -286,23 +286,10 @@ def test_charged_objects_key_matches_the_key_risk_model_uses(monkeypatch):
         lambda sql, params=(): [{"object_level": "campaign", "object_id": "114057545"}],
     )
 
-    got = writer_db.charged_objects_this_week("2026-08-17")
+    got = writer_db.charged_objects("2026-08-17")
 
     expected = risk.risk_object({"object_level": "campaign", "object_id": "114057545"})
     assert got == {expected}
-
-
-def test_charged_objects_ignore_rolled_back_changes(monkeypatch):
-    # Откатанное изменение в кабинете не живёт — значит и оплаченным объект
-    # не считается: следующая правка обязана снова пройти через бюджет.
-    sql, params = _captured_sql(
-        monkeypatch, lambda: writer_db.charged_objects_this_week("2026-08-17")
-    )
-
-    assert "rolled_back_at IS NULL" in sql
-    assert "status IN (%s)" % ", ".join("'%s'" % x for x in writer_db.LIVE_STATUSES) in sql
-    assert "applied_at >= %s" in sql
-    assert params == ("2026-08-17",)
 
 
 def test_mark_stale_sql_marks_only_rows_past_threshold():
@@ -1246,3 +1233,43 @@ def test_live_harmful_segments_ignores_rows_without_a_verdict():
         assert writer_db.harmful_segments(cooldown_days=14, account=account) == {}
     finally:
         _cleanup(key)
+
+
+def test_spent_risk_charges_rolled_back_rows_too(monkeypatch):
+    # Откат не возвращает деньги: экспозиция уже случилась, и худший недельный
+    # исход считается по ВСЕМ применённым изменениям недели. Освобождение
+    # бюджета откатом создавало насос: применили → пробили линию → откатили →
+    # бюджет свободен → применили следующее, и недельный лимит переставал
+    # ограничивать суммарный взятый риск.
+    sql, _ = _captured_sql(monkeypatch, lambda: writer_db.spent_risk("2026-08-17"))
+
+    assert "rolled_back_at" not in sql
+    expected = ", ".join("'%s'" % x for x in writer_db.RISK_CHARGED_STATUSES)
+    assert "status IN (%s)" % expected in sql
+    assert "'rolled_back'" in sql
+
+
+def test_spent_risk_window_covers_exposure_overlapping_week_start(monkeypatch):
+    # Риск оценён на DEFAULT_DAYS_TO_MEASURE дней вперёд, значит действие,
+    # применённое в конце прошлой недели, продолжает жить под риском в начале
+    # этой. Окно «с понедельника» обнуляло счёт в ночь на понедельник, и
+    # суммарная экспозиция могла достигать двух недельных лимитов сразу.
+    sql, params = _captured_sql(
+        monkeypatch, lambda: writer_db.spent_risk("2026-08-17"))
+
+    assert "make_interval(days => %s)" in sql
+    assert params == ("2026-08-17", risk.DEFAULT_DAYS_TO_MEASURE)
+
+
+def test_charged_objects_matches_spent_risk_filter(monkeypatch):
+    # Множество оплаченных объектов обязано считаться тем же фильтром, что и
+    # сумма spent_risk: разъедутся — прогон либо спишет за объект второй раз,
+    # либо посчитает свободным бюджет, которого нет.
+    sql, params = _captured_sql(
+        monkeypatch, lambda: writer_db.charged_objects("2026-08-17"))
+
+    assert "rolled_back_at" not in sql
+    expected = ", ".join("'%s'" % x for x in writer_db.RISK_CHARGED_STATUSES)
+    assert "status IN (%s)" % expected in sql
+    assert "make_interval(days => %s)" in sql
+    assert params == ("2026-08-17", risk.DEFAULT_DAYS_TO_MEASURE)

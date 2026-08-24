@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import psycopg2.extras
 
 from sync.db import get_connection
+from sync.agent.writer.risk import DEFAULT_DAYS_TO_MEASURE
 
 WRITER_DDL: List[str] = [
     # Журнал действий: что собирались сделать, что было до, что ответил API.
@@ -199,6 +200,14 @@ FINAL_STATUSES = ("applied", "rolled_back", "stale")
 # Статусы ЖИВОГО изменения в кабинете: наблюдаются сторожем красных линий и
 # оплачены риск-бюджетом. 'rolled_back' сюда не входит — изменения больше нет.
 LIVE_STATUSES = ("applied", "stale")
+
+# Статусы, за которые СПИСАН риск-бюджет. Шире живых: откатанная строка тоже
+# считается — экспозиция уже случилась, и худший недельный исход складывается
+# по всем применённым изменениям недели, а не только по тем, что ещё живы.
+# Освобождение бюджета откатом создавало насос «применили → пробили линию →
+# откатили → бюджет свободен → применили следующее»: недельный лимит переставал
+# ограничивать суммарный взятый риск.
+RISK_CHARGED_STATUSES = LIVE_STATUSES + ("rolled_back",)
 
 # Статусы, из которых действие уходит на ПОВТОРНУЮ отправку следующим
 # прогоном. В кабинете по ним ничего не изменилось, поэтому они не финальные,
@@ -1030,13 +1039,25 @@ def run_lock(name: str, ttl_minutes: int = RUN_LOCK_TTL_MINUTES):
                 pass
 
 
-def spent_risk(week_start: str) -> float:
-    """Деньги под живыми непроверенными изменениями недели.
+def spent_risk(week_start: str,
+               exposure_days: int = DEFAULT_DAYS_TO_MEASURE) -> float:
+    """Деньги под риском, взятым в окне текущей недели.
 
-    Зависшая строка ('stale') считается наравне с применённой: запрос ушёл в
-    кабинет, изменение с высокой вероятностью живое, и не списывать за него
-    риск значит выдавать бюджет, которого нет. Неделя берётся по applied_at,
-    который для такой строки равен моменту отправки (см. MARK_STALE_SQL).
+    Риск списывается за ВЗЯТИЕ, а не за исход, — отсюда три решения:
+
+      * Зависшая строка ('stale') считается наравне с применённой: запрос
+        ушёл в кабинет, изменение с высокой вероятностью живое. Неделя
+        берётся по applied_at, который для такой строки равен моменту
+        отправки (см. MARK_STALE_SQL).
+      * Откатанная строка тоже считается (RISK_CHARGED_STATUSES): экспозиция
+        уже случилась, откат не возвращает деньги, потраченные за дни до
+        него. Освобождение бюджета откатом создавало насос «применили →
+        пробили линию → откатили → бюджет свободен → применили следующее».
+      * Окно расширено назад на горизонт замера: риск оценён на exposure_days
+        вперёд (risk.DEFAULT_DAYS_TO_MEASURE), и действие, применённое в
+        конце прошлой недели, продолжает жить под риском в начале этой.
+        Отсчёт строго с понедельника обнулял счёт в ночь на понедельник и
+        разрешал до двух недельных лимитов одновременной экспозиции.
 
     Считается МАКСИМУМ по объекту, а не сумма его строк. Цена ошибки — расход
     кампании за горизонт замера; этот расход у кампании ОДИН, сколько бы правок
@@ -1054,33 +1075,36 @@ def spent_risk(week_start: str) -> float:
         FROM (
             SELECT MAX(risk_rub) AS per_object
             FROM edu_agent_actions
-            WHERE status IN (__LIVE_STATUSES__)
-              AND rolled_back_at IS NULL
-              AND applied_at >= %s
+            WHERE status IN (__RISK_CHARGED_STATUSES__)
+              AND applied_at >= %s::timestamptz - make_interval(days => %s)
             GROUP BY object_level, object_id
         ) AS by_object
-        """.replace("__LIVE_STATUSES__", _sql_literals(LIVE_STATUSES)),
-        (week_start,),
+        """.replace("__RISK_CHARGED_STATUSES__",
+                    _sql_literals(RISK_CHARGED_STATUSES)),
+        (week_start, int(exposure_days)),
     )
     return float(rows[0]["spent"]) if rows else 0.0
 
 
-def charged_objects_this_week(week_start: str) -> Set[str]:
-    """Объекты, риск которых на этой неделе уже оплачен: {'level:id'}.
+def charged_objects(week_start: str,
+                    exposure_days: int = DEFAULT_DAYS_TO_MEASURE) -> Set[str]:
+    """Объекты, риск которых в окне недели уже оплачен: {'level:id'}.
 
     Форма ключа — та же, что у risk.risk_object; расхождение здесь означало бы
     тихое повторное списание, то есть ровно тот дефект, против которого это и
-    сделано.
+    сделано. Фильтр — тот же, что у spent_risk, и по той же причине: множество
+    и сумма обязаны описывать одни и те же строки, иначе прогон либо спишет за
+    объект второй раз, либо посчитает свободным бюджет, которого нет.
     """
     rows = _fetch(
         """
         SELECT DISTINCT object_level, object_id
         FROM edu_agent_actions
-        WHERE status IN (__LIVE_STATUSES__)
-          AND rolled_back_at IS NULL
-          AND applied_at >= %s
-        """.replace("__LIVE_STATUSES__", _sql_literals(LIVE_STATUSES)),
-        (week_start,),
+        WHERE status IN (__RISK_CHARGED_STATUSES__)
+          AND applied_at >= %s::timestamptz - make_interval(days => %s)
+        """.replace("__RISK_CHARGED_STATUSES__",
+                    _sql_literals(RISK_CHARGED_STATUSES)),
+        (week_start, int(exposure_days)),
     )
     return {f"{r['object_level']}:{r['object_id']}" for r in rows}
 
