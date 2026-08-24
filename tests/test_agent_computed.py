@@ -206,9 +206,12 @@ def test_compute_schedule_covers_all_hours_present():
     # sum_p_pay почасового профиля — ym:s:sumGoalReachesAny по часу
     # (sync/agent/metrika.py::fetch_hourly_profile), то есть реальные достижения
     # целей, а не размазанная по визитам величина.
+    # Разброс часов должен быть РЕАЛЬНЫМ, а не на уровне биномиального шума:
+    # приор теперь выводится из данных (empirical_prior_trials), и профиль,
+    # чей разброс объясняется шумом, честно сжимается в нули.
     rows = [
         {"segment_kind": "hour", "segment_key": str(h), "leads": 100,
-         "sum_p_pay": 100.0 + h, "clicks": 5000}
+         "sum_p_pay": 100.0 + 20.0 * h, "clicks": 5000}
         for h in range(24)
     ]
     out, reason = compute_schedule(rows)
@@ -243,3 +246,41 @@ def test_cap_constants_carry_their_unit_in_the_name():
     assert computed.MODIFIER_CAP_RATIO == 0.5
     assert guardrails.MODIFIER_CAP == 50
     assert computed.MODIFIER_CAP_RATIO * 100 == guardrails.MODIFIER_CAP
+
+
+# ------------------- эмпирический Байес: приор из самих данных
+
+
+def test_prior_comes_from_between_segment_spread():
+    # PRIOR_EVENTS=2 «подогнан под легаси» и не знает, различаются ли сегменты
+    # среза вообще. Приор обязан выводиться из данных: разброс сегментов сверх
+    # биномиального шума (τ̂²) — это и есть сила сигнала. Срез, где сегменты
+    # различаются вдвое, доверяет им; срез, где разброс объясняется шумом,
+    # сжимает почти к базе.
+    noisy = [_seg("a", 1000, 40), _seg("b", 1000, 42), _seg("c", 1000, 38)]
+    real = [_seg("a", 1000, 20), _seg("b", 1000, 40), _seg("c", 1000, 60)]
+    assert computed.empirical_prior_trials(noisy, "conversions") > \
+        computed.empirical_prior_trials(real, "conversions")
+
+
+def test_prior_is_infinite_when_segments_do_not_differ_beyond_noise():
+    # Разброс целиком объясняется биномиальным шумом — межсегментной
+    # дисперсии нет, сигнала нет, сжатие полное.
+    same = [_seg("a", 1000, 40), _seg("b", 1000, 40), _seg("c", 1000, 40)]
+    assert computed.empirical_prior_trials(same, "conversions") == float("inf")
+
+
+def test_noise_only_slice_gets_near_zero_modifiers():
+    # Сквозная проверка: срез из одного шума не должен давать корректировок
+    # заметного размера, сколько бы кликов в нём ни было.
+    rows, reason = compute_segment_modifiers(
+        [_seg("a", 5000, 200), _seg("b", 5000, 205), _seg("c", 5000, 195)])
+    assert reason is None
+    assert all(abs(r["value"]) <= 1 for r in rows)
+
+
+def test_real_spread_survives_the_empirical_prior():
+    rows, reason = compute_segment_modifiers(
+        [_seg("a", 5000, 100), _seg("b", 5000, 200), _seg("c", 5000, 300)])
+    assert reason is None
+    assert max(abs(r["value"]) for r in rows) >= 30

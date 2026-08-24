@@ -86,6 +86,50 @@ def prior_trials(base_conv: float, prior_events: float = PRIOR_EVENTS) -> float:
     return prior_events / base_conv
 
 
+def empirical_prior_trials(
+    rows: List[Dict[str, Any]], conv_key: str,
+) -> float:
+    """Априорный вес В НАБЛЮДЕНИЯХ, выведенный из самого среза (эмпирический Байес).
+
+    PRIOR_EVENTS — калибровочная константа: она не знает, различаются ли
+    сегменты этого среза вообще. Сегмент с тысячей кликов получал вес 0.95
+    независимо от того, есть ли в срезе сигнал, и корректировки гнались за
+    шумом (аудит 2026-08-23).
+
+    Приор выводится методом моментов: наблюдаемый разброс конверсий сегментов
+    минус ожидаемый биномиальный шум даёт межсегментную дисперсию τ̂², а
+    её пересчёт в наблюдения — n₀ = base(1−base)/τ̂². Смысл прямой: сегменты
+    различаются сильно — n₀ мал, своим данным сегмента верим почти сразу;
+    разброс объясняется шумом — τ̂² = 0, n₀ бесконечен, сжатие полное и
+    корректировки нулевые. Это ровно то, что и должно происходить со срезом
+    без сигнала.
+
+    Меньше двух сегментов — разброса нет по определению: возвращается
+    бесконечность (полное сжатие), а не калибровочная константа.
+    """
+    usable = [(int(r.get("clicks") or 0), float(r.get(conv_key) or 0.0))
+              for r in rows if int(r.get("clicks") or 0) > 0]
+    if len(usable) < 2:
+        return float("inf")
+    total_clicks = sum(n for n, _ in usable)
+    total_conv = sum(c for _, c in usable)
+    if total_clicks <= 0 or total_conv <= 0:
+        return float("inf")
+    base = total_conv / total_clicks
+    if base >= 1.0:
+        return float("inf")
+
+    # Взвешенная по кликам дисперсия наблюдаемых конверсий и средний
+    # биномиальный шум тех же сегментов. Веса — клики: сегмент с большей
+    # выборкой и точнее, и важнее для базы.
+    observed_var = sum(n * (c / n - base) ** 2 for n, c in usable) / total_clicks
+    noise_var = sum(n * (base * (1.0 - base) / n) for n, _ in usable) / total_clicks
+    tau2 = observed_var - noise_var
+    if tau2 <= 0:
+        return float("inf")
+    return base * (1.0 - base) / tau2
+
+
 def shrink_ratio(
     segment_conv: float, segment_n: int, base_conv: float,
     prior_weight: Optional[float] = None
@@ -152,6 +196,12 @@ def _emit(
     if not supported:
         return [], LOW_SUPPORT_REASON
 
+    # Приор — из самого среза, а не из константы: сила сжатия обязана зависеть
+    # от того, есть ли в срезе межсегментный сигнал. Считается по ВСЕМ строкам
+    # среза, включая мелкие: они тоже свидетельствуют о разбросе, хотя своих
+    # корректировок и не получают.
+    prior_weight = empirical_prior_trials(rows, conv_key)
+
     # Единственный сегмент сравнивать не с чем — _all_equal на списке из одного
     # элемента истинно, и это правильный ответ: отношение к базе, которую этот же
     # сегмент и задаёт, даёт ровно 1, то есть нулевую корректировку без информации.
@@ -162,7 +212,7 @@ def _emit(
     out: List[Dict[str, Any]] = []
     for row, conv in zip(supported, conv_rates):
         clicks = int(row["clicks"])
-        ratio = shrink_ratio(conv, clicks, base_conv)
+        ratio = shrink_ratio(conv, clicks, base_conv, prior_weight=prior_weight)
         rel = ratio_rel_error(float(row.get(conv_key) or 0.0), total_conv)
         out.append({
             "setting_kind": f"{kind_prefix}:{row['segment_kind']}",
