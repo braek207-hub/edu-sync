@@ -36,6 +36,13 @@ from sync.agent.confidence import assess
 # отыгрывается срезанием, ×0.5 вниз — доливом на следующем такте.
 MAX_STEP_UP = 1.5
 MAX_STEP_DOWN = 0.5
+
+# Шаг кампании с β ≥ 1. «Насыщения не видно» — экстраполяционное утверждение
+# с самым слабым обоснованием из всей кривой (saturation.BETA_MAX его же и
+# зажимает сверху), а прыжок сразу в кап ×1.5 ставил максимальную ставку
+# ровно на слабейшую оценку. Шаг умеренный: направление сохраняется,
+# недельный такт волен его повторить, когда наблюдения подтвердятся.
+BETA_SUPERLINEAR_STEP = 1.15
 _BISECT_ITERATIONS = 80
 
 # Насколько предельная окупаемость на полу капа должна не дотягивать до λ,
@@ -67,15 +74,16 @@ def _target_spend(campaign: Dict[str, Any], lam: float) -> float:
 
     Считается в лог-пространстве: при β → 1 показатель 1/(1−β) взрывается, и
     прямое возведение в степень переполняется задолго до капа. β ≥ 1
-    (насыщения нет) — предельная цена с объёмом не растёт, порог внутри капа
-    не пересекается: кампания упирается в кап той стороны, где её текущая
-    предельная окупаемость относительно λ.
+    (насыщения нет) — порог внутри капа не пересекается; шаг в сторону
+    текущей предельной окупаемости относительно λ, но умеренный
+    (BETA_SUPERLINEAR_STEP), а не сразу в кап: см. комментарий у константы.
     """
     cost = campaign["cost"]
     log_ratio = math.log(campaign["value"] / (lam * campaign["marginal_cpl"]))
     beta = campaign["beta"]
     if beta >= 1.0:
-        return cost * (MAX_STEP_UP if log_ratio > 0 else MAX_STEP_DOWN)
+        return cost * (BETA_SUPERLINEAR_STEP if log_ratio > 0
+                       else 1.0 / BETA_SUPERLINEAR_STEP)
     scaled = log_ratio / (1.0 - beta)
     if scaled >= math.log(MAX_STEP_UP):
         return cost * MAX_STEP_UP
@@ -142,13 +150,21 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, 
     Ожидаемые лиды — вдоль кривой: leads·((S*/S₀)^β − 1); выручка — через
     ценность лида. Ошибка решения складывается из ошибки ценности (лестница)
     и ошибки предельной цены (Э3.1) — независимые источники.
+
+    Уверенность — по ЭКОНОМИЧЕСКОЙ гипотезе value против λ·marginal, тем же
+    инвариантом, что у кандидата на выключение: числитель assess и его ошибка
+    описывают одну и ту же величину. Старый assess(target/cost) мерил готовый
+    шаг: при β → 1 показатель 1/(1−β) раздувал шаг до капа, и p_sign выходил
+    ~0.98 там, где экономическая разница тонула в шуме, — раздутая
+    уверенность двигала деньги по слепой истории (аудит 2026-08-23, C2).
     """
     cost = campaign["cost"]
     ratio = target / cost
     delta_leads = campaign["leads"] * (ratio ** campaign["beta"] - 1.0)
     rel = math.sqrt(campaign["value_rel_error"] ** 2
                     + campaign["marginal_rel_error"] ** 2)
-    verdict = assess(ratio, rel, "budget_shift")
+    roi_ratio = campaign["value"] / (lam * campaign["marginal_cpl"])
+    verdict = assess(roi_ratio, rel, "budget_shift")
     if abs(ratio - 1.0) < 0.01:
         move = "hold"
     else:
@@ -165,6 +181,7 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, 
         "value_per_lead": round(campaign["value"], 2),
         "marginal_cpl": round(campaign["marginal_cpl"], 2),
         "marginal_roi": round(campaign["value"] / campaign["marginal_cpl"], 4),
+        "marginal_roi_vs_lambda": round(roi_ratio, 4),
         "expected_leads_delta": round(delta_leads, 1),
         "expected_revenue_delta": round(delta_leads * campaign["value"], 2),
         "rel_error": round(rel, 4),
@@ -222,6 +239,12 @@ def portfolio_targets(
         switch_off = [m for m in moves.values() if m.get("switch_off")]
         accounts[login] = {
             "lambda": round(lam, 4),
+            # λ — окупаемость предельного рубля кабинета. λ < 1: предельный
+            # рубль возвращает меньше рубля ожидаемой выручки, перенос лишь
+            # выравнивает убыточность. Само по себе это не команда резать
+            # бюджет — план освоения B задаёт Павел, — но состояние обязано
+            # быть видно флагом, а не прятаться в числе (аудит 2026-08-23, C6).
+            "lambda_breakeven": bool(lam >= 1.0),
             "budget_28d": round(budget, 2),
             "target_sum_28d": round(target_sum, 2),
             # Невязка суммы — прямая проверка «сумма на уровне кабинета».
@@ -241,6 +264,9 @@ def portfolio_targets(
     return {
         "campaigns_no_value": no_value,
         "accounts": accounts,
+        "accounts_below_breakeven": sorted(
+            login for login, acc in accounts.items()
+            if not acc["lambda_breakeven"]),
     }
 
 
@@ -259,6 +285,17 @@ def computed_rows(section: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
                 "setting_key": "target_28d",
                 "value": m["target_28d"],
                 "raw_value": m["cost_28d"],
+                "support_n": m["leads_28d"],
+                "rel_error": m["rel_error"],
+            }, {
+                # Экономическое отношение value/(λ·marginal) — отдельной
+                # строкой: писатель Э3.3 гейтует уверенность заново, и без
+                # него он судил бы по target/cost, то есть повторял бы
+                # раздутый p_sign, снятый здесь. raw_value — λ кабинета.
+                "setting_kind": "budget_target",
+                "setting_key": "roi_vs_lambda",
+                "value": m["marginal_roi_vs_lambda"],
+                "raw_value": account["lambda"],
                 "support_n": m["leads_28d"],
                 "rel_error": m["rel_error"],
             }]

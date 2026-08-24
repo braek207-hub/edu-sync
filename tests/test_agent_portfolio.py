@@ -2,6 +2,7 @@
 """Э3.2: единый порог предельной окупаемости и целевые бюджеты кампаний."""
 
 from sync.agent.portfolio import (
+    BETA_SUPERLINEAR_STEP,
     MAX_STEP_DOWN,
     MAX_STEP_UP,
     SWITCH_OFF_ROI_SHARE,
@@ -77,12 +78,16 @@ def test_extreme_gap_hits_step_caps():
     assert abs(targets["poor"] - 100000.0 * MAX_STEP_DOWN) < 1
 
 
-def test_unsaturated_campaign_takes_cap_by_current_roi():
-    # β ≥ 1: предельная цена с объёмом не растёт — кампания упирается в кап
-    # стороны, где её текущая окупаемость относительно порога.
+def test_unsaturated_campaign_steps_gently_not_to_cap():
+    # β ≥ 1 — «насыщения не видно» — экстраполяционное утверждение с самым
+    # слабым обоснованием из всей кривой (BETA_MAX в saturation его же и
+    # зажимает). Прыжок сразу в кап ×1.5 ставил максимальную ставку на
+    # слабейшую оценку; шаг умеренный, направление сохраняется, недельный
+    # такт волен его повторить.
     rows = [_solver_row("flat", 8000.0, beta=1.1), _solver_row("norm", 3000.0)]
     _, targets = solve_threshold(rows, 200000.0)
-    assert abs(targets["flat"] - 100000.0 * MAX_STEP_UP) < 1
+    assert abs(targets["flat"] - 100000.0 * BETA_SUPERLINEAR_STEP) < 1
+    assert targets["flat"] < 100000.0 * MAX_STEP_UP
 
 
 def test_beta_near_one_does_not_overflow():
@@ -207,11 +212,64 @@ def test_computed_rows_add_campaign_switch_for_candidate():
                                 {"rich": "acc", "mid": "acc", "poor": "acc"})
     rows = computed_rows(section)
     kinds_poor = [r["setting_kind"] for r in rows["poor"]]
-    assert kinds_poor == ["budget_target", "campaign_switch"]
-    switch_row = rows["poor"][1]
+    assert kinds_poor == ["budget_target", "budget_target", "campaign_switch"]
+    switch_row = rows["poor"][2]
     move = section["accounts"]["acc"]["moves"]["poor"]
     assert switch_row["setting_key"] == "suspend"
     assert switch_row["value"] == move["switch_off"]["roi_share_of_lambda"]
     assert switch_row["raw_value"] == move["switch_off"]["roi_at_floor"]
     assert switch_row["rel_error"] == move["rel_error"]
-    assert [r["setting_kind"] for r in rows["rich"]] == ["budget_target"]
+    assert [r["setting_kind"] for r in rows["rich"]] == [
+        "budget_target", "budget_target"]
+
+
+# --------------------------------- находки аудита 2026-08-23
+
+
+def test_confidence_measures_economic_edge_not_amplified_step():
+    # C2: p_sign обязан мерить экономическую гипотезу value против λ·marginal,
+    # а не готовый шаг. При β → 1 показатель 1/(1−β) раздувает шаг до капа:
+    # ln-разрыв экономики 0.2 на двоих при ошибке ~0.2 стоит z ≈ 0.5, а
+    # старый assess(target/cost) видел ln(1.5)/0.2 ≈ 2 и давал «уверенно».
+    saturation = {"hot": _curve(beta=0.9, rel=0.14),
+                  "cold": _curve(beta=0.9, rel=0.14)}
+    ladder = {"hot": _ladder(revenue=1000000.0, rel=0.14),
+              "cold": _ladder(revenue=818731.0, rel=0.14)}
+    section = portfolio_targets(saturation, ladder,
+                                {"hot": "acc", "cold": "acc"})
+    acc = section["accounts"]["acc"]
+    assert acc["moves_confident"] == 0
+    assert acc["moves"]["hot"]["p_sign"] < 0.90
+    assert acc["moves"]["hot"]["marginal_roi_vs_lambda"] > 1.0
+
+
+def test_account_below_marginal_breakeven_is_flagged():
+    # C6: λ — окупаемость предельного рубля кабинета. λ < 1 значит предельный
+    # рубль возвращает меньше рубля ожидаемой выручки; это состояние обязано
+    # стоять в отчёте отдельным флагом, а не прятаться в самом числе λ.
+    saturation = {"1": _curve(marginal=1250.0)}
+    ladder = {"1": _ladder(revenue=80000.0)}
+    section = portfolio_targets(saturation, ladder, {"1": "acc"})
+    acc = section["accounts"]["acc"]
+    assert acc["lambda"] < 1.0
+    assert acc["lambda_breakeven"] is False
+    assert section["accounts_below_breakeven"] == ["acc"]
+
+    healthy = portfolio_targets({"1": _curve(marginal=1250.0)},
+                                {"1": _ladder(revenue=1000000.0)},
+                                {"1": "acc"})
+    assert healthy["accounts"]["acc"]["lambda_breakeven"] is True
+    assert healthy["accounts_below_breakeven"] == []
+
+
+def test_computed_rows_carry_roi_vs_lambda():
+    # Писатель Э3.3 гейтует уверенность заново из computed-строк — без
+    # экономического отношения он мог бы судить только по target/cost, то есть
+    # повторял бы раздутый p_sign. Отношение едет отдельной строкой.
+    saturation, ladder = _inputs()
+    section = portfolio_targets(saturation, ladder, {"1": "acc", "2": "acc"})
+    rows = computed_rows(section)["1"]
+    roi = next(r for r in rows if r["setting_key"] == "roi_vs_lambda")
+    assert roi["setting_kind"] == "budget_target"
+    assert roi["value"] == section["accounts"]["acc"]["moves"]["1"]["marginal_roi_vs_lambda"]
+    assert roi["raw_value"] == section["accounts"]["acc"]["lambda"]

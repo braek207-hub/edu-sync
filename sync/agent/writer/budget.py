@@ -91,7 +91,8 @@ NOT_TEXT_REASON = (
     "проверена, применение не планируется"
 )
 LOW_CONFIDENCE_REASON = (
-    "уверенность в знаке сдвига ниже порога класса budget_shift"
+    "уверенность в экономическом преимуществе сдвига (value против "
+    "λ·marginal) ниже порога класса budget_shift"
 )
 
 
@@ -132,7 +133,8 @@ def plan_budget_moves(
 
     for cid, rows in computed_by_campaign.items():
         row = next((r for r in rows
-                    if str(r.get("setting_kind")) == "budget_target"), None)
+                    if str(r.get("setting_kind")) == "budget_target"
+                    and str(r.get("setting_key")) == "target_28d"), None)
         if row is None:
             continue
         target = float(row.get("value") or 0.0)
@@ -143,12 +145,26 @@ def plan_budget_moves(
         if abs(ratio - 1.0) < MIN_SHIFT:
             small_shift += 1
             continue
-        verdict = assess(ratio, row.get("rel_error"), "budget_shift")
+        # Уверенность — по экономическому отношению value/(λ·marginal), а не
+        # по размеру шага: шаг раздут показателем кривой 1/(1−β), и
+        # assess(target/current) выдавал «уверенно» на слепой истории (аудит
+        # 2026-08-23, C2). Строка старого формата без отношения — уверенность
+        # неизвестна: свежий прогон Э0 допишет её, ждать дешевле ложного
+        # сдвига.
+        roi_row = next((r for r in rows
+                        if str(r.get("setting_kind")) == "budget_target"
+                        and str(r.get("setting_key")) == "roi_vs_lambda"), None)
+        if roi_row is None or not float(roi_row.get("value") or 0.0) > 0:
+            confidence_unknown += 1
+            continue
+        verdict = assess(float(roi_row["value"]), roi_row.get("rel_error"),
+                         "budget_shift")
         if verdict["confident"] is None:
             confidence_unknown += 1
         elif not verdict["confident"]:
             low_confidence.append({
                 "campaign_id": str(cid), "ratio": round(ratio, 3),
+                "roi_vs_lambda": round(float(roi_row["value"]), 4),
                 "p_sign": verdict["p_sign"], "min_p_sign": verdict["min_p_sign"],
                 "reason": LOW_CONFIDENCE_REASON,
             })
@@ -157,6 +173,7 @@ def plan_budget_moves(
             "target_28d": target,
             "cost_28d": current,
             "ratio": round(ratio, 4),
+            "roi_vs_lambda": round(float(roi_row["value"]), 4),
             "p_sign": verdict["p_sign"],
         }
 

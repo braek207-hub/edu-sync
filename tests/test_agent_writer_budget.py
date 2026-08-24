@@ -31,6 +31,12 @@ def _target_row(target, current, rel_error=0.1):
             "rel_error": rel_error}
 
 
+def _roi_row(roi, rel_error=0.1):
+    return {"setting_kind": "budget_target", "setting_key": "roi_vs_lambda",
+            "value": roi, "raw_value": 1.0, "support_n": 100,
+            "rel_error": rel_error}
+
+
 def _strategy(weekly_micros, channel="Search"):
     """Блок BiddingStrategy формы campaigns.get: лимит в одном канале."""
     other = "Network" if channel == "Search" else "Search"
@@ -61,14 +67,16 @@ def test_weekly_micros_rounds_to_whole_rubles():
 
 
 def test_plan_takes_confident_shift():
-    plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=0.05)]})
+    plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=0.05),
+                                    _roi_row(1.5, rel_error=0.05)]})
     assert "1" in plan["desired"]
     assert plan["desired"]["1"]["ratio"] == 1.5
 
 
 def test_plan_rejects_low_confidence():
     # Ошибка решения такого размера не даёт p_sign>=0.90 для сдвига ×1.2.
-    plan = plan_budget_moves({"1": [_target_row(120_000, 100_000, rel_error=0.9)]})
+    plan = plan_budget_moves({"1": [_target_row(120_000, 100_000, rel_error=0.9),
+                                    _roi_row(1.2, rel_error=0.9)]})
     assert not plan["desired"]
     assert len(plan["low_confidence"]) == 1
 
@@ -80,7 +88,8 @@ def test_plan_skips_small_shift():
 
 
 def test_plan_counts_unknown_confidence():
-    plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=None)]})
+    plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=None),
+                                    _roi_row(1.5, rel_error=None)]})
     # Нет rel_error — уверенность неизвестна; для бюджета это НЕ допуск:
     # сдвиг без ошибки решения не планируется, но и не теряется молча.
     assert plan["confidence_unknown"] == 1
@@ -331,3 +340,37 @@ def test_guard_form_distinguishes_schedule_from_budget():
         {"object_id": "1"}, "campaigns", "update",
         {"Campaigns": [{"Id": 1, "TimeTargeting": {"Schedule": {"Items": []}}}]})
     assert form["action_kind"] == "schedule.set"
+
+
+# --------------------------- гейт уверенности — по экономике, не по шагу
+
+
+def test_plan_gates_on_economic_edge_not_step_ratio():
+    # Шаг ×1.5 при честной ошибке 0.1 давал z = ln(1.5)/0.1 ≈ 4 — «уверенно»,
+    # даже когда экономическое преимущество (value против λ·marginal) на
+    # грани шума. Гейт обязан мерить преимущество, а не размер шага.
+    plan = plan_budget_moves({"1": [
+        _target_row(150_000, 100_000, rel_error=0.1),
+        _roi_row(1.05, rel_error=0.1),
+    ]})
+    assert plan["desired"] == {}
+    assert plan["low_confidence"][0]["campaign_id"] == "1"
+
+
+def test_plan_confident_edge_passes_and_carries_roi():
+    plan = plan_budget_moves({"1": [
+        _target_row(150_000, 100_000, rel_error=0.05),
+        _roi_row(1.5, rel_error=0.05),
+    ]})
+    assert plan["desired"]["1"]["ratio"] == 1.5
+    assert plan["desired"]["1"]["roi_vs_lambda"] == 1.5
+
+
+def test_plan_without_roi_row_is_unknown_confidence():
+    # Строки старого формата (до строки roi_vs_lambda) не несут экономического
+    # отношения — уверенность по ним неизвестна, и применять их нельзя:
+    # свежий прогон Э0 допишет отношение, ждать его — дешевле ложного сдвига.
+    plan = plan_budget_moves({"1": [_target_row(150_000, 100_000,
+                                                rel_error=0.05)]})
+    assert plan["desired"] == {}
+    assert plan["confidence_unknown"] == 1
