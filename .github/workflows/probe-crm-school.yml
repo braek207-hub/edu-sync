@@ -41,4 +41,5 @@ jobs:
           CRM_LEADS_SHEETS: "Лиды"
           CRM_PAYMENTS_SHEETS: "Оплаты"
           PROBE_LAND: ${{ github.event.inputs.land || 'eduschool' }}
+          PROBE_CAMPAIGNS: "713560585,713806183,713806208,713806986,713807647"
         run: python probe_crm_school.py

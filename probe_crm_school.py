@@ -48,7 +48,7 @@ def main() -> None:
         print(f"\n=== ЛИДЫ [{sheet}] — строк {len(values) - 1}")
         print("  колонки:", headers)
         i_land = pick_index_loose(headers, ["ленд", "land"])
-        i_lead = pick_index_loose(headers, ["id лида в scrm", "lead id", "id лида"])
+        i_lead = pick_index_loose(headers, ["id"])  # в листе «Лиды» ID лида — колонка «ID»
         i_camp = pick_index_loose(headers, ["кампания", "utm campaign", "utm_campaign"])
         i_date = pick_index_loose(headers, ["дата", "date"])
         lands = Counter()
@@ -101,6 +101,14 @@ def main() -> None:
             days = sorted({to_iso_date(_cell(r, i_pay)) for r in rows if to_iso_date(_cell(r, i_pay))})
             print(f"  без кампании: {no_camp}, без ID лида: {no_lead}, orders==1: {ord1}, выручка: {paid_rev:.0f}")
             print("  период оплат:", days[:1], "…", days[-1:])
+
+        # Кампании школы могут прийти в оплаты без ленда — ищем ещё и по utm_campaign.
+        camp_ids = {c.strip() for c in os.environ.get("PROBE_CAMPAIGNS", "").split(",") if c.strip()}
+        if camp_ids and i_camp != -1:
+            by_camp = [r for r in values[1:] if normalize_campaign_id(_cell(r, i_camp)) in camp_ids]
+            print(f"  строк по кампаниям {sorted(camp_ids)}: {len(by_camp)}")
+            for r in by_camp[:5]:
+                print("    ", r)
 
         # Склейка в обратную сторону: оплаты, чей ID лида есть среди лидов школы,
         # но сама строка оплаты помечена другим лендом (или пустым).
