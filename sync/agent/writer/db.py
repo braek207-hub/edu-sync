@@ -113,6 +113,16 @@ WRITER_DDL: List[str] = [
     ALTER TABLE edu_agent_actions
       ADD COLUMN IF NOT EXISTS apply_attempts INTEGER NOT NULL DEFAULT 0
     """,
+    # МОМЕНТ ОТПРАВКИ, отдельно от created_at и applied_at. Ставится сразу
+    # перед mutate (apply.apply_actions): зависшая planned-строка С sent_at —
+    # неизвестный исход ('stale', наблюдается, риск списан), БЕЗ sent_at —
+    # процесс оборвался до отправки, кабинет запроса не видел ('aborted',
+    # безопасно переприменяется). До этой колонки обе судьбы лечились одним
+    # 'stale', и никогда-не-отправленные строки навсегда занимали риск-бюджет.
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ
+    """,
     # Потолок попыток читается на каждом прогоне по сегменту среди строк,
     # оставшихся в отказных статусах, — тот же довод про seq scan, что у
     # индексов кулдауна.
@@ -303,6 +313,7 @@ INSERT_ACTION_SQL = """
         risk_rub       = EXCLUDED.risk_rub,
         status         = 'planned',
         response       = '{}'::jsonb,
+        sent_at        = NULL,
         created_at     = now()
     WHERE edu_agent_actions.status NOT IN (__FINAL_STATUSES__)
 """.replace("__FINAL_STATUSES__", _sql_literals(FINAL_STATUSES))
@@ -355,6 +366,23 @@ def insert_action(row: Dict[str, Any]) -> str:
 # (REATTEMPTED_STATUSES) и тем же UPDATE, что ставит статус: попытка и её
 # исход не могут разъехаться между двумя прогонами — тот же приём, что у
 # MARK_ROLLBACK_FAILED_SQL. На 'applied' и 'dry_run' счётчик не двигается.
+# Гард по статусу: отметить отправку можно только у строки, которая всё ещё
+# 'planned', — строку, уже забранную другим контуром, трогать нельзя.
+MARK_SENT_SQL = """
+    UPDATE edu_agent_actions
+       SET sent_at = now()
+     WHERE action_id = %s AND status = 'planned'
+"""
+
+
+def mark_sent(action_id: str) -> None:
+    """Отмечает момент отправки запроса — см. комментарий у колонки sent_at."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(MARK_SENT_SQL, (action_id,))
+        conn.commit()
+
+
 MARK_ACTION_SQL = """
     UPDATE edu_agent_actions
        SET status = %(status)s,
@@ -533,17 +561,35 @@ def record_experiments(rows: List[Dict[str, Any]]) -> int:
 MARK_STALE_SQL = """
     UPDATE edu_agent_actions
        SET status     = 'stale',
-           applied_at = COALESCE(applied_at, created_at),
+           applied_at = COALESCE(applied_at, sent_at, created_at),
            response   = jsonb_build_object(
                             'stale', true,
                             'detected_at', now(),
                             'note', 'обрыв после отправки: результат неизвестен, '
                                     'нужна ручная сверка кабинета с журналом')
      WHERE status = 'planned'
+       AND sent_at IS NOT NULL
        AND created_at < now() - make_interval(mins => %s)
        AND (%s IS NULL OR account = %s)
     RETURNING action_id, idempotency_key, account, object_level, object_id,
               action_kind, created_at, risk_rub
+"""
+
+# Вторая судьба зависшей строки: sent_at пуст — процесс оборвался МЕЖДУ
+# записью в журнал и отправкой, кабинет запроса не видел. Никакого
+# applied_at: риск не списывается, сторожу строка не видна, статус не
+# финальный — diff следующего прогона переприменит действие штатно.
+MARK_ABORTED_SQL = """
+    UPDATE edu_agent_actions
+       SET status   = 'aborted',
+           response = jsonb_build_object(
+                          'aborted', true,
+                          'detected_at', now(),
+                          'note', 'обрыв до отправки: запрос в кабинет не уходил')
+     WHERE status = 'planned'
+       AND sent_at IS NULL
+       AND created_at < now() - make_interval(mins => %s)
+       AND (%s IS NULL OR account = %s)
 """
 
 
@@ -556,9 +602,15 @@ def mark_stale_planned(
     Повторный вызов вернёт пустой список: строка уже не в статусе 'planned'.
     Ровно этим отчёт прогона перестаёт бесконечно повторять одну и ту же
     находку, а сама находка не теряется — она видна через open_actions.
+
+    Тем же проходом строки БЕЗ sent_at закрываются статусом 'aborted'
+    (MARK_ABORTED_SQL): их запрос в кабинет не уходил, наблюдать нечего,
+    и в возврат «зависших» они не попадают — diff следующего прогона
+    переприменит их штатно.
     """
     with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(MARK_ABORTED_SQL, (int(older_than_minutes), account, account))
             cur.execute(MARK_STALE_SQL, (int(older_than_minutes), account, account))
             rows = [dict(r) for r in cur.fetchall()]
         conn.commit()

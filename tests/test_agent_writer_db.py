@@ -300,7 +300,8 @@ def test_mark_stale_sql_marks_only_rows_past_threshold():
     assert "created_at < now() - make_interval(mins => %s)" in sql
     # applied_at = момент ОТПРАВКИ, не момент обнаружения: иначе изменение
     # прошлой недели съело бы риск-бюджет текущей.
-    assert "applied_at = COALESCE(applied_at, created_at)" in sql
+    assert "applied_at = COALESCE(applied_at, sent_at, created_at)" in sql
+    assert "sent_at IS NOT NULL" in sql
     # RETURNING — то, чем отчёт ограничивается первым обнаружением.
     assert "RETURNING" in sql
 
@@ -1289,3 +1290,32 @@ def test_recent_action_objects_filters_kind_status_window_account(monkeypatch):
     assert "status IN (%s)" % expected in sql
     assert "applied_at >= now() - make_interval(days => %s)" in sql
     assert params == (["budget.set", "budget.set_daily"], 14, "acc", "acc")
+
+
+# ------------------------------- статусы deferred / aborted
+
+
+def test_deferred_is_neither_final_nor_live_nor_reattempted():
+    # 'deferred' — квота/недоступность API: не финальный (переприменяется),
+    # не живой (в кабинете ничего не изменилось — сторожу и риск-бюджету не
+    # виден), не reattempted (попытку не жжёт: кабинет виноват, не действие).
+    assert "deferred" not in writer_db.FINAL_STATUSES
+    assert "deferred" not in writer_db.LIVE_STATUSES
+    assert "deferred" not in writer_db.REATTEMPTED_STATUSES
+    assert "deferred" not in writer_db.RISK_CHARGED_STATUSES
+
+
+def test_aborted_is_neither_final_nor_live():
+    assert "aborted" not in writer_db.FINAL_STATUSES
+    assert "aborted" not in writer_db.LIVE_STATUSES
+    assert "aborted" not in writer_db.RISK_CHARGED_STATUSES
+
+
+def test_mark_stale_requires_sent_at_and_aborts_the_rest():
+    # Раскол зависших: 'stale' (исход неизвестен) — только у строк, чей
+    # запрос ТОЧНО уходил (sent_at стоит). Строка без sent_at оборвалась до
+    # отправки: кабинет её не видел, риск не списывается, статус 'aborted'.
+    assert "sent_at IS NOT NULL" in writer_db.MARK_STALE_SQL
+    assert "sent_at IS NULL" in writer_db.MARK_ABORTED_SQL
+    assert "'aborted'" in writer_db.MARK_ABORTED_SQL
+    assert "applied_at" not in writer_db.MARK_ABORTED_SQL

@@ -130,6 +130,10 @@ class _FakeDB:
         self.rows[row["idempotency_key"]] = {**row, "status": "planned"}
         return row["idempotency_key"]  # action_id — в тестах достаточно ключа
 
+    def mark_sent(self, action_id: str) -> None:
+        self.events.append(f"sent:{action_id}")
+        self.rows[action_id]["sent_at"] = "now"
+
     def mark_action(self, action_id: str, status: str, response: Dict[str, Any]) -> bool:
         self.events.append(f"mark:{action_id}:{status}")
         if self.conflict_on_mark:
@@ -155,6 +159,12 @@ class _FakeClient:
         self._response = response if response is not None else {}
         self._raises = raises
         self.calls: List[tuple] = []
+        self.units_left: Optional[int] = None
+        self.units_limit: Optional[int] = None
+        self.write_allowed = True
+
+    def is_write_allowed(self) -> bool:
+        return self.write_allowed
 
     def mutate(self, service: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         self.calls.append((service, method, params))
@@ -171,6 +181,7 @@ def test_apply_actions_marks_applied_on_clean_success():
 
     assert report == {"applied": 1, "skipped": 0, "failed": 0, "rejected": 0,
                        "dry_run": 0, "unknown_outcome": 0, "conflicted": 0,
+                       "deferred": 0, "units_low": 0,
                        "details": [{"key": "k1", "result": "applied"}]}
     assert db.rows["k1"]["status"] == "applied"
     assert len(client.calls) == 1
@@ -217,6 +228,7 @@ def test_apply_actions_repeat_run_skips_already_applied():
 
     assert report == {"applied": 0, "skipped": 1, "failed": 0, "rejected": 0,
                        "dry_run": 0, "unknown_outcome": 0, "conflicted": 0,
+                       "deferred": 0, "units_low": 0,
                        "details": [{"key": "k1", "result": "skipped"}]}
     assert client.calls == []  # запрос не ушёл второй раз
 
@@ -811,3 +823,76 @@ def test_schedule_payload_keeps_neighbour_fields():
     })
 
     assert params["Campaigns"][0]["TimeTargeting"] == targeting
+
+
+# ------------------------------- квоты API: deferred и порог баллов
+
+
+def test_quota_error_defers_without_burning_attempt():
+    # Код 152 «Недостаточно баллов» — ошибка уровня запроса: Директ отклонил
+    # вызов, НЕ применив его. Это не провал действия ('failed' жёг попытку и
+    # вёл к потолку apply_attempts), а временное состояние кабинета: статус
+    # 'deferred', следующий прогон переприменит без счёта попыток.
+    db = _FakeDB()
+    client = _FakeClient(raises=DirectWriteError(
+        "bidmodifiers", 152, "Недостаточно баллов"))
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["deferred"] == 1
+    assert report["failed"] == 0
+    assert db.rows["k1"]["status"] == "deferred"
+    assert report["details"][0]["result"] == "deferred"
+
+
+def test_units_low_stops_before_journal():
+    # Баллов почти нет (остаток < 5 % суточного лимита) — отправлять нечем.
+    # Прогон останавливается ДО записи в журнал: строка 'planned' без
+    # отправки — мусор, который потом закрывал бы сторож.
+    db = _FakeDB()
+    client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+    client.units_left = 100
+    client.units_limit = 10_000
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["units_low"] == 1
+    assert db.events == []
+    assert client.calls == []
+
+
+def test_units_healthy_does_not_stop():
+    db = _FakeDB()
+    client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+    client.units_left = 9_000
+    client.units_limit = 10_000
+
+    report = apply_actions(client, [_action()], db)
+
+    assert report["applied"] == 1
+    assert report["units_low"] == 0
+
+
+def test_sent_at_marked_between_insert_and_mutate():
+    # Отметка «запрос отправляется» ложится в журнал ДО mutate: обрыв
+    # процесса между insert и отправкой оставляет строку БЕЗ sent_at, и
+    # закрывать её надо как никогда-не-отправленную, а не как зависшую.
+    db = _FakeDB()
+    client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+
+    apply_actions(client, [_action()], db)
+
+    assert db.events[0] == "insert:k1"
+    assert db.events[1] == "sent:k1"
+    assert db.events[2].startswith("mark:k1")
+
+
+def test_rehearsal_does_not_mark_sent():
+    # dry-run никуда не ходит — sent_at репетиции лгал бы, что запрос уходил.
+    db = _FakeDB()
+    client = _FakeClient(response={"dry_run": True})
+    client.write_allowed = False
+
+    apply_actions(client, [_action()], db)
+
+    assert not any(e.startswith("sent:") for e in db.events)

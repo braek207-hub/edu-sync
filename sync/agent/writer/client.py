@@ -162,13 +162,50 @@ def journal_allowed(client) -> bool:
     )
 
 
+# Коды ошибок уровня запроса, означающие «кабинет временно не принимает,
+# повторите позже» — Директ ОТКЛОНИЛ вызов, ничего не применив. По справочнику
+# ошибок API v5 (ref-v5/concepts/errors-list): 52 — сервер авторизации
+# временно недоступен, 152 — недостаточно баллов, 506 — превышено ограничение
+# на число соединений, 1000 — сервер временно недоступен, 1001 — ошибка
+# инициализации сервиса. Это состояние КАБИНЕТА, а не дефект действия:
+# жечь на нём счётчик попыток (как 'failed') значило бы доводить здоровые
+# действия до потолка apply_attempts из-за чужой квоты.
+TRANSIENT_QUOTA_CODES = (52, 152, 506, 1000, 1001)
+
+
+def is_transient_quota(exc: BaseException) -> bool:
+    """Отклонение из-за квоты/временной недоступности — переносится, не жжётся.
+
+    Только ошибки уровня запроса с известным исходом: outcome_unknown-ошибки
+    сюда не попадают принципиально — у них изменение может быть живым, и
+    их контур ('stale') строже.
+    """
+    if not isinstance(exc, DirectWriteError) or exc.outcome_unknown:
+        return False
+    try:
+        return int(exc.code) in TRANSIENT_QUOTA_CODES
+    except (TypeError, ValueError):
+        return False
+
+
 def parse_units(header: str) -> Optional[int]:
-    """Заголовок Units: «израсходовано/осталось/суточный лимит»."""
+    """Заголовок Units: «израсходовано/осталось/суточный лимит» → остаток."""
+    parts = _units_parts(header)
+    return parts[1] if parts else None
+
+
+def parse_units_limit(header: str) -> Optional[int]:
+    """Суточный лимит из того же заголовка Units."""
+    parts = _units_parts(header)
+    return parts[2] if parts else None
+
+
+def _units_parts(header: str) -> Optional[tuple]:
     parts = (header or "").split("/")
-    if len(parts) < 2:
+    if len(parts) < 3:
         return None
     try:
-        return int(parts[1])
+        return tuple(int(p) for p in parts[:3])
     except ValueError:
         return None
 
@@ -182,6 +219,7 @@ class WriteClient:
         self.base = SANDBOX_BASE if sandbox else PROD_BASE
         self._token = token
         self.units_left: Optional[int] = None
+        self.units_limit: Optional[int] = None
 
     def is_write_allowed(self) -> bool:
         return not self.dry_run
@@ -245,6 +283,9 @@ class WriteClient:
             units = parse_units(resp.headers.get("Units", ""))
             if units is not None:
                 self.units_left = units
+            limit = parse_units_limit(resp.headers.get("Units", ""))
+            if limit is not None:
+                self.units_limit = limit
             try:
                 data = resp.json()
             except ValueError:

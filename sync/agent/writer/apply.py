@@ -30,8 +30,13 @@ apply_actions отказывается стартовать (SandboxApplyRefusal
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from sync.agent.writer.client import is_outcome_unknown
+from sync.agent.writer.client import is_outcome_unknown, is_transient_quota
 from sync.agent.writer.db import FINAL_STATUSES
+
+# Доля суточного лимита баллов, ниже которой запись не начинается: остаток
+# нужен ретраям чтения, сторожу отката и завтрашним синкам — выжигать его в
+# ноль мутациями нельзя.
+UNITS_RESERVE_SHARE = 0.05
 from sync.agent.writer.plan import DEMOGRAPHIC_FIELD
 from sync.agent.writer.units import delta_to_api
 
@@ -275,6 +280,7 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
         raise SandboxApplyRefusal(SANDBOX_APPLY_REFUSAL)
 
     applied = skipped = failed = rejected = dry_run = unknown = conflicted = 0
+    deferred = units_low = 0
     details: List[Dict[str, Any]] = []
 
     def _mark(action_id: str, status: str, response: Dict[str, Any]) -> bool:
@@ -287,6 +293,20 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
         return db_module.mark_action(action_id, status, response) is not False
 
     for action in actions:
+        # Порог баллов ДО записи в журнал: остаток ниже резерва — отправлять
+        # нечем, и строка 'planned' без отправки стала бы мусором, который
+        # потом закрывал бы сторож. Порог — доля от суточного ЛИМИТА из
+        # заголовка Units этого же кабинета, не магическое число: лимиты
+        # кабинетов различаются на порядок. Остаток обновляется каждым
+        # ответом API, поэтому проверка стоит в цикле, а не перед ним.
+        left, limit = (getattr(client, "units_left", None),
+                       getattr(client, "units_limit", None))
+        if left is not None and limit and left < UNITS_RESERVE_SHARE * limit:
+            units_low += 1
+            details.append({"key": action["idempotency_key"],
+                            "result": "units_low"})
+            continue
+
         existing = db_module.find_action_by_key(action["idempotency_key"])
         if existing and existing.get("status") in set(FINAL_STATUSES):
             skipped += 1
@@ -301,6 +321,13 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
             lease.guard()
 
         action_id = db_module.insert_action(action)
+        # «Запрос отправляется» — в журнал ДО mutate: обрыв процесса между
+        # insert и отправкой оставляет строку БЕЗ sent_at, и закрывается она
+        # как никогда-не-отправленная ('aborted', db.mark_stale_planned), а
+        # не как зависшая с неизвестным исходом. Репетиция не отмечается:
+        # dry-run никуда не ходит, и sent_at лгал бы.
+        if client.is_write_allowed():
+            db_module.mark_sent(action_id)
         # Факт отправки отмечается СРАЗУ после возврата из транспорта, до
         # любого разбора ответа. Всё, что падает после этой отметки, —
         # неизвестный исход, а не «запрос не ушёл»: запрос уже состоялся, и
@@ -352,6 +379,20 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
                 details.append({"key": action["idempotency_key"],
                                 "result": "unknown_outcome", "error": str(exc)[:200]})
                 continue
+            if not sent and is_transient_quota(exc):
+                # Квота/временная недоступность: Директ отклонил вызов, не
+                # применив его. Не 'failed' — попытка не жжётся (кабинет
+                # виноват, не действие); следующий прогон переприменит.
+                if not _mark(action_id, "deferred", {"error": reason}):
+                    conflicted += 1
+                    details.append({"key": action["idempotency_key"],
+                                    "result": "conflicted",
+                                    "attempted_status": "deferred"})
+                    continue
+                deferred += 1
+                details.append({"key": action["idempotency_key"],
+                                "result": "deferred", "error": str(exc)[:200]})
+                continue
             if not _mark(action_id, "failed", {"error": reason}):
                 conflicted += 1
                 details.append({"key": action["idempotency_key"], "result": "conflicted",
@@ -370,4 +411,5 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
     # conflicted — строки, исход которых записал другой контур.
     return {"applied": applied, "skipped": skipped, "failed": failed, "rejected": rejected,
             "dry_run": dry_run, "unknown_outcome": unknown, "conflicted": conflicted,
+            "deferred": deferred, "units_low": units_low,
             "details": details}

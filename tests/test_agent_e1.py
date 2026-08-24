@@ -75,6 +75,7 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
                                        "checks": []})
     monkeypatch.setattr(agent_e1.writer_db, "recent_action_objects",
                         lambda *a, **k: set())
+    monkeypatch.setattr(agent_e1.writer_db, "mark_sent", lambda action_id: None)
 
 
 class _FakeCampaignsClient:
@@ -271,6 +272,9 @@ class _FakeWriteClient:
     """Кампания 111 без корректировок — desired_bid_modifiers всегда предложит
     добавление, которое дальше упирается в отсутствие красной линии."""
 
+    def is_write_allowed(self):
+        return True
+
     def __init__(self, login, sandbox=True, dry_run=True):
         self.login = login
         self.sandbox = sandbox
@@ -331,6 +335,9 @@ def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeyp
 
 class _RecordingWriteClient:
     """Кампания 111 без корректировок; mutate только записывает вызовы."""
+
+    def is_write_allowed(self):
+        return True
 
     instances = []
 
@@ -517,6 +524,9 @@ class _MultiCabinetClient:
 
     campaigns_by_login задаётся тестом; mutate только записывает вызовы.
     """
+
+    def is_write_allowed(self):
+        return True
 
     instances = []
     campaigns_by_login = {}
@@ -1542,6 +1552,10 @@ class _NoDBTouch:
 
 
 class _StubMutateClient:
+
+    def is_write_allowed(self):
+        return not self.dry_run
+
     def __init__(self, sandbox, dry_run):
         self.sandbox = sandbox
         self.dry_run = dry_run
@@ -1574,6 +1588,9 @@ def test_apply_actions_allows_sandbox_rehearsal_and_prod_apply():
 
         def mark_action(self, action_id, status, response):
             return True
+
+        def mark_sent(self, action_id):
+            pass
 
     action = {"idempotency_key": "x", "action_kind": "bidmodifier.set",
               "payload": {"Id": 1, "BidModifier": 10}}
@@ -1913,6 +1930,9 @@ def test_stuck_row_does_not_eat_the_cap_on_the_run_that_finds_it(monkeypatch, ca
 
 class _ScheduleClient:
     """Кампания 111 с ровным расписанием: профиль обязан дать одно действие."""
+
+    def is_write_allowed(self):
+        return True
 
     instances = []
 
