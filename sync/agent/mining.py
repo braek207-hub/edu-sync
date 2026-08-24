@@ -17,7 +17,7 @@ import hashlib
 import math
 from datetime import date
 from statistics import mean, pstdev
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 MIN_SIDE_DAYS = 7          # минимум дней с каждой стороны точки изменения
 
@@ -187,26 +187,53 @@ def pre_trend_check(
     }
 
 
-def _did_at(rows: List[Dict[str, Any]], control_rows: List[Dict[str, Any]],
-            change_date: str, window: int) -> Optional[float]:
-    """DiD-эффект в названной точке, или None, если окна не полны."""
-    before_dates = _window_dates(rows, change_date, window, before=True)
-    after_dates = _window_dates(rows, change_date, window, before=False)
-    if len(before_dates) < window or len(after_dates) < window:
+def _daily_by_campaign(
+    facts: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Dict[str, Tuple[float, int]]], Dict[str, Tuple[float, int]]]:
+    """(расход, лиды) по дню и кампании плюс дневные итоги ВСЕЙ выборки.
+
+    Контроль кампании — «кабинет минус она сама», и считать его вычитанием из
+    итогов дня, а не пересборкой списка чужих строк, — единственный способ
+    удержать плацебо-проход дешёвым: иначе на каждую точку каждой кампании
+    перебирались бы все строки окна истории (сотни кампаний × 180 дней).
+    """
+    by_campaign: Dict[str, Dict[str, Tuple[float, int]]] = {}
+    totals: Dict[str, Tuple[float, int]] = {}
+    for row in facts:
+        day = str(row["fact_date"])
+        cost = float(row.get("cost") or 0.0)
+        leads = int(row.get("eff_leads") or 0)
+        cell = by_campaign.setdefault(str(row["campaign_id"]), {})
+        prev = cell.get(day, (0.0, 0))
+        cell[day] = (prev[0] + cost, prev[1] + leads)
+        total = totals.get(day, (0.0, 0))
+        totals[day] = (total[0] + cost, total[1] + leads)
+    return by_campaign, totals
+
+
+def _cpl(daily: Dict[str, Tuple[float, int]], days: List[str]) -> Optional[float]:
+    cost = sum(daily.get(d, (0.0, 0))[0] for d in days)
+    leads = sum(daily.get(d, (0.0, 0))[1] for d in days)
+    return (cost / leads) if leads > 0 and cost > 0 else None
+
+
+def _did_at_daily(own: Dict[str, Tuple[float, int]],
+                  totals: Dict[str, Tuple[float, int]],
+                  days: List[str], point_index: int,
+                  window: int) -> Optional[float]:
+    """DiD в точке ряда по дневным агрегатам, или None, если окна не полны."""
+    before = days[point_index - window:point_index]
+    after = days[point_index:point_index + window]
+    if len(before) < window or len(after) < window:
         return None
-    windows = {
-        "tb": _window_metrics([r for r in rows if r["fact_date"] in before_dates]),
-        "ta": _window_metrics([r for r in rows if r["fact_date"] in after_dates]),
-        "cb": _window_metrics([r for r in control_rows
-                               if r["fact_date"] in before_dates]),
-        "ca": _window_metrics([r for r in control_rows
-                               if r["fact_date"] in after_dates]),
-    }
-    if any(w["leads"] == 0 for w in windows.values()):
+    control = {d: (totals.get(d, (0.0, 0))[0] - own.get(d, (0.0, 0))[0],
+                   totals.get(d, (0.0, 0))[1] - own.get(d, (0.0, 0))[1])
+               for d in before + after}
+    tb, ta = _cpl(own, before), _cpl(own, after)
+    cb, ca = _cpl(control, before), _cpl(control, after)
+    if None in (tb, ta, cb, ca):
         return None
-    measured = did_effect(windows["tb"]["cpl"], windows["ta"]["cpl"],
-                          windows["cb"]["cpl"], windows["ca"]["cpl"], 0.0)
-    return measured["effect"]
+    return did_effect(tb, ta, cb, ca, 0.0)["effect"]
 
 
 def placebo_sigma(facts: List[Dict[str, Any]], window: int = 14,
@@ -229,24 +256,20 @@ def placebo_sigma(facts: List[Dict[str, Any]], window: int = 14,
     """
     if not facts:
         return None
-    by_campaign: Dict[str, List[Dict[str, Any]]] = {}
-    for f in facts:
-        by_campaign.setdefault(str(f["campaign_id"]), []).append(f)
+    by_campaign, totals = _daily_by_campaign(facts)
 
     effects: List[float] = []
-    for campaign_id, rows in sorted(by_campaign.items()):
-        control_rows = [f for f in facts if str(f["campaign_id"]) != campaign_id]
-        series = [{"date": r["fact_date"], "value": float(r.get("cost") or 0.0)}
-                  for r in rows]
+    for campaign_id, own in sorted(by_campaign.items()):
+        days = sorted(own)
+        series = [{"date": d, "value": own[d][0]} for d in days]
         change_days = {p["date"] for p in detect_change_points(series)}
-        days = sorted({r["fact_date"] for r in rows})
         for i in range(window, len(days) - window + 1, step):
             point = days[i]
             if any(abs((date.fromisoformat(point)
                         - date.fromisoformat(d)).days) <= window
                    for d in change_days):
                 continue
-            effect = _did_at(rows, control_rows, point, window)
+            effect = _did_at_daily(own, totals, days, i, window)
             if effect is not None:
                 effects.append(effect)
     if len(effects) < MIN_PLACEBO_POINTS:
