@@ -290,18 +290,51 @@ def fetch_segment_report(
     return rows, chosen_goal(records, goal_column)
 
 
-def _api_post(url: str, login: str, payload: Dict[str, Any], what: str) -> Dict[str, Any]:
-    resp = requests.post(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=_api_headers(login),
-        timeout=120,
-    )
-    resp.encoding = "utf-8"
-    body = resp.json()
-    if body.get("error"):
-        raise RuntimeError(f"{what}: {body['error']}")
-    return body.get("result") or {}
+# Сколько раз повторяется ЧТЕНИЕ при обрыве транспорта. Чтение идемпотентно:
+# повтор возвращает то же самое, а обрыв на стороне сети — обычное дело на
+# длинных отчётах. Боевой прогон Э0 (run 32730235917) упал целиком на
+# ChunkedEncodingError «Response ended prematurely» посреди отчёта одного
+# кабинета — час работы и все остальные кабинеты вместе с ним.
+READ_ATTEMPTS = 4
+
+# Исключения транспорта, при которых повтор осмыслен: тело не дошло или
+# соединение оборвалось. Ошибки уровня API (error в теле) сюда не входят —
+# они детерминированы, и повтор дал бы тот же ответ.
+_TRANSPORT_ERRORS = (
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
+
+
+def _api_post(url: str, login: str, payload: Dict[str, Any], what: str,
+              attempts: int = READ_ATTEMPTS) -> Dict[str, Any]:
+    """POST к API Директа с повтором на обрывах транспорта.
+
+    Повторяется только транспортный сбой. Ответ с полем error — решение
+    сервиса, а не помеха связи: он поднимается сразу.
+    """
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            resp = requests.post(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers=_api_headers(login),
+                timeout=120,
+            )
+            resp.encoding = "utf-8"
+            body = resp.json()
+        except _TRANSPORT_ERRORS as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+        if body.get("error"):
+            raise RuntimeError(f"{what}: {body['error']}")
+        return body.get("result") or {}
+    raise last_error  # недостижимо: последняя попытка либо вернула, либо подняла
 
 
 def fetch_campaign_ids(login: str) -> List[int]:

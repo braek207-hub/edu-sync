@@ -1,3 +1,4 @@
+import pytest
 import sync.agent.segments as segments
 from sync.agent.segments import _stamp_report_name
 
@@ -279,3 +280,48 @@ def test_search_queries_carry_real_conversions_too(monkeypatch):
     assert by_query["что такое вуз"]["conversions"] == 0
     assert goal == {"goal_column": "Conversions_111_LSCCD",
                     "conversions": 7, "columns_offered": 1}
+
+
+# ------------------- устойчивость чтения отчётов к обрывам транспорта
+
+
+def test_api_post_retries_transport_errors(monkeypatch):
+    # Обрыв соединения при чтении отчёта уронил боевой прогон Э0 целиком
+    # (run 32730235917: ChunkedEncodingError «Response ended prematurely»).
+    # Чтение идемпотентно — его можно и нужно повторить.
+    import requests as _requests
+    calls = {"n": 0}
+
+    class _Resp:
+        encoding = "utf-8"
+        @staticmethod
+        def json():
+            return {"result": {"ok": True}}
+
+    def _post(*a, **k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _requests.exceptions.ChunkedEncodingError("Response ended prematurely")
+        return _Resp()
+
+    monkeypatch.setattr(segments.requests, "post", _post)
+    monkeypatch.setattr(segments.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(segments, "_api_headers", lambda login: {})
+
+    out = segments._api_post("http://x", "acc", {"method": "get"}, "test")
+    assert out == {"ok": True}
+    assert calls["n"] == 3
+
+
+def test_api_post_gives_up_after_the_last_attempt(monkeypatch):
+    import requests as _requests
+
+    def _post(*a, **k):
+        raise _requests.exceptions.ConnectionError("boom")
+
+    monkeypatch.setattr(segments.requests, "post", _post)
+    monkeypatch.setattr(segments.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(segments, "_api_headers", lambda login: {})
+
+    with pytest.raises(_requests.exceptions.ConnectionError):
+        segments._api_post("http://x", "acc", {"method": "get"}, "test")
