@@ -63,7 +63,7 @@ from sync.agent.writer.apply import _element_errors
 from sync.agent.writer.client import WriteClient, journal_allowed
 from sync.agent.writer.guardrails import check_rollback
 from sync.agent.writer.rollback import (rollback_payload, is_breached,
-                                        is_spend_collapsed)
+                                        is_spend_collapsed, outcome_verdict)
 
 # Чтение корректировок кампании берётся у прогона применения, а не пишется
 # заново: форма запроса выверена пробой (Levels внутри SelectionCriteria), а
@@ -456,6 +456,23 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
     return {**verdict, "state": STATE_WATCHED, "reason": reason or ""}
 
 
+def closing_verdict(observed: Dict[str, Any], action: Dict[str, Any]) -> str:
+    """Вердикт закрываемого наблюдения — по непрерывному эффекту (Э2.4).
+
+    Считает тот же эффект, что уйдёт в историю экспериментов
+    (action_experiment), и переводит его в градуированный исход
+    (rollback.outcome_verdict). Прежнее «held» означало лишь «не пробил
+    аварийный порог» и записывало умеренный вред как успех.
+    """
+    red = action.get("red_line") or {}
+    base = float(red.get("baseline_cpa") or 0.0)
+    cpa = float((observed or {}).get("cpa") or 0.0)
+    leads = int((observed or {}).get("leads") or 0)
+    if base <= 0 or cpa <= 0:
+        return "unknown"
+    return outcome_verdict((cpa - base) / base, math.sqrt(1.0 / max(leads, 1)))
+
+
 def action_experiment(action: Dict[str, Any], observed: Dict[str, Any],
                       window: Tuple[date, date, bool], verdict: str) -> Dict[str, Any]:
     """Исход собственного действия — строкой истории экспериментов (Э2.4).
@@ -821,6 +838,7 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
     needs_review: List[Dict[str, Any]] = []
     deferred_closing: List[Dict[str, Any]] = []
     closed_held: List[Dict[str, Any]] = []
+    closed_verdicts: Dict[str, int] = {}
     would_close_held: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
     rollback_allowed = gate_allows_rollback(data_gate)
@@ -902,16 +920,24 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
                 window = observation_window(action, today, crm_through)
                 # Захват строки — до записи эксперимента: из двух параллельных
                 # сторожей исход записывает тот, чья пометка легла.
+                observed = verdict.get("observed") or {}
+                # Градуированный исход вместо «held»: умеренный вред обязан
+                # лечь в историю вредом, а неотличимый от нуля — «неясно»,
+                # иначе шум отобранных по экстремуму действий читается как
+                # успех (winner's curse).
+                outcome = closing_verdict(observed, action)
                 if window is not None and db_module.mark_observation_closed(
-                        action["action_id"], "held"):
+                        action["action_id"], outcome):
                     db_module.record_experiments([action_experiment(
-                        action, verdict.get("observed") or {}, window, "held")])
+                        action, observed, window, outcome)])
                     closed_held.append({
                         "action_id": action.get("action_id"),
                         "object_id": action.get("object_id"),
                         "action_kind": action.get("action_kind"),
-                        "observed": verdict.get("observed"),
+                        "verdict": outcome,
+                        "observed": observed,
                     })
+                    closed_verdicts[outcome] = closed_verdicts.get(outcome, 0) + 1
             except Exception as exc:
                 errors.append({"action_id": action.get("action_id"),
                                "object_id": action.get("object_id"),
@@ -1018,6 +1044,9 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
         # Чистый исход (Э2.4): горизонт закрыт, линия не пробита — изменение
         # выдержало, записано в историю экспериментов и снято с наблюдения.
         "closed_held": len(closed_held),
+        # Распределение исходов закрытых наблюдений: «сколько выдержало» —
+        # не ответ, пока не видно, сколько из них на самом деле навредило.
+        "closed_verdicts": dict(sorted(closed_verdicts.items())),
         "closed_held_sample": closed_held[:PREVIEW_SAMPLE_LIMIT],
         # То же в репетиции: закрыл бы, но журнал репетиции недоступен.
         "would_close_held": len(would_close_held),

@@ -113,6 +113,33 @@ def is_breached(red_line: Dict[str, Any], observed: Dict[str, Any]) -> Tuple[boo
     return False, ""
 
 
+# Порог уверенности исхода: эффект меньше собственной ошибки неотличим от
+# нуля. Именно на этом месте живёт winner's curse — действия отбираются по
+# экстремальным оценкам, и шум систематически читается как успех, если
+# «неопределённо» считать «выдержало».
+OUTCOME_SIGMA = 1.0
+
+
+def outcome_verdict(effect: Optional[float], rel_error: float) -> str:
+    """Исход закрытого наблюдения по НЕПРЕРЫВНОМУ эффекту.
+
+    Прежний вердикт был бинарен: «пробил аварийный порог +40 %» или
+    «выдержало». Действие, поднявшее CPA на 25 %, ложилось в обучающую
+    историю подтверждением — и петля обучения наполнялась «успехами» по
+    построению (аудит 2026-08-23, C4). Непрерывный эффект (cpa−base)/base
+    считался и раньше, но вердикт его не видел.
+
+    Четыре исхода: improved / worsened — эффект больше своей ошибки в ту или
+    другую сторону; inconclusive — меньше; unknown — эффекта нет вовсе (нет
+    базы или наблюдаемой цены).
+    """
+    if effect is None:
+        return "unknown"
+    if rel_error <= 0 or abs(effect) < OUTCOME_SIGMA * rel_error:
+        return "inconclusive"
+    return "improved" if effect < 0 else "worsened"
+
+
 def is_spend_collapsed(
     action: Dict[str, Any], observed: Dict[str, Any],
     days_to_measure: int = DEFAULT_DAYS_TO_MEASURE,

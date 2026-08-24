@@ -1205,13 +1205,15 @@ def test_held_action_at_closed_horizon_becomes_experiment_and_leaves_watch():
     assert report["states"] == {watchdog.STATE_WATCHED: 1}
     assert report["closed_held"] == 1
     assert report["closed_held_sample"][0]["object_id"] == "111"
-    assert db.observation_closed == [("act-1", "held")]
+    # Вердикт градуированный: CPA вдвое ниже базы — это «улучшило», а не
+    # безразличное «не пробило порог» (аудит C4).
+    assert db.observation_closed == [("act-1", "improved")]
     assert db.failed == [] and db.rolled_back == []
     assert client.calls == []          # закрытие — не запись в кабинет
 
     exp = db.experiments[0]
     assert exp["source"] == "action"
-    assert exp["verdict"] == "held"
+    assert exp["verdict"] == "improved"
     assert exp["metric"] == "eff_cpl"
     assert exp["mechanism"] == "before_after"
     # Без контроля сезон не вычтен — класс B, не A.
@@ -1707,3 +1709,34 @@ def test_fail_on_alarm_flag_turns_alarms_into_nonzero_exit(monkeypatch, capsys):
     monkeypatch.setattr(watchdog.writer_db, "failed_rollbacks_count", lambda: 2)
     assert watchdog.main() == 0
     capsys.readouterr()
+
+
+# ------------------- C4: исход по непрерывному эффекту, а не «не пробил»
+
+
+def test_outcome_verdict_calls_moderate_harm_harm():
+    from sync.agent.writer.rollback import outcome_verdict
+    # CPA на 25 % выше базы аварийный порог (+40 %) не пробивает, но это
+    # ПРОВАЛ, а не «выдержало»: в обучающую историю он обязан лечь как вред.
+    assert outcome_verdict(0.25, rel_error=0.05) == "worsened"
+    assert outcome_verdict(-0.20, rel_error=0.05) == "improved"
+
+
+def test_outcome_verdict_is_inconclusive_within_one_sigma():
+    from sync.agent.writer.rollback import outcome_verdict
+    # Эффект меньше собственной ошибки — исход неотличим от нуля. «Улучшение»
+    # здесь было бы winner's curse: действия отбираются по экстремальным
+    # оценкам, и шум систематически читается как успех.
+    assert outcome_verdict(0.05, rel_error=0.20) == "inconclusive"
+    assert outcome_verdict(None, rel_error=0.20) == "unknown"
+
+
+def test_closed_action_experiment_carries_graded_verdict():
+    action = _action()
+    window = (date(2026, 8, 2), date(2026, 8, 15), True)
+    observed = {"cost": 12500.0, "leads": 100, "cpa": 892.5, "days": 14}
+    exp = watchdog.action_experiment(action, observed, window,
+                                     watchdog.closing_verdict(observed, action))
+    # База 714, наблюдаемая 892.5 → +25 % при ошибке 0.1: вред, не «held».
+    assert exp["verdict"] == "worsened"
+    assert exp["effect"] > 0
