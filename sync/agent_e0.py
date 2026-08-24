@@ -182,6 +182,14 @@ LADDER_WINDOW_DAYS = 90
 # probe_economics (прогон 32590373892): p90 = 33 дня, к 30-му дню видно 88 %
 # выручки когорты. Значение НЕ константа — каждый прогон выводит его из данных.
 LADDER_MATURITY_PERCENTILE = 0.90
+# Возраст когорты, начиная с которого её лаги считаются НЕцензурированными.
+# Свежая когорта физически не может показать длинный лаг: её длинные оплаты
+# ещё не случились, и в выборку от неё попадают только короткие. Считать её
+# наравне со зрелыми — правая цензура: p90 занижается, «зрелое» окно решений
+# оказывается незрелым, а value направлений с длинным лагом занижена (аудит
+# 2026-08-23). Порог — вдвое больше замеренного p90 = 33 дня: когорта старше
+# 180 дней успела показать свой хвост целиком.
+LAG_COHORT_MIN_AGE_DAYS = 180
 # Мост «лид → устройство» для качества сегментов (Э2.2b): окно длинное, потому
 # что глубокие ступени (сделки, оплаты) редкие — за квартал планшеты не набирают
 # даже соединений. 540 дней = окно probe 32622086445, на котором мера доказана.
@@ -193,20 +201,35 @@ _LADDER_FIELDS = {
 }
 
 
-def _lag_percentile(lead_rows: List[Dict[str, Any]], q: float) -> int:
+def _lag_percentile(lead_rows: List[Dict[str, Any]], q: float,
+                    today: date = None,
+                    min_age_days: int = LAG_COHORT_MIN_AGE_DAYS) -> int:
+    """Перцентиль лага оплаты по НЕцензурированным когортам.
+
+    Учитываются лиды, созданные не позже чем min_age_days назад: у более
+    свежих длинные оплаты ещё не случились, и их короткие лаги утягивают
+    перцентиль вниз — см. LAG_COHORT_MIN_AGE_DAYS. Зрелых когорт нет вовсе
+    (история короче порога) — считаем по всем, что есть: цензурированная
+    оценка всё же лучше нуля, а ноль означал бы «окно не сдвигать», то есть
+    решения по совсем незрелым дням.
+    """
     def _as_date(value):
         if value is None or isinstance(value, date):
             return value
         return date.fromisoformat(str(value)[:10])
 
-    lags = []
+    today = today or date.today()
+    cutoff = today - timedelta(days=min_age_days)
+    lags, mature_lags = [], []
     for r in lead_rows:
         paid_on, created = _as_date(r.get("payment_date")), _as_date(r.get("created_date"))
         if r.get("is_paid") and paid_on and created:
             lags.append((paid_on - created).days)
-    if not lags:
+            if created <= cutoff:
+                mature_lags.append((paid_on - created).days)
+    ordered = sorted(mature_lags or lags)
+    if not ordered:
         return 0
-    ordered = sorted(lags)
     return int(ordered[min(int(q * len(ordered)), len(ordered) - 1)])
 
 
@@ -224,7 +247,8 @@ def funnel_ladder_section(
     единичных оплатах — шум.
     """
     today = today or date.today()
-    maturity_days = _lag_percentile(lead_rows, LADDER_MATURITY_PERCENTILE)
+    maturity_days = _lag_percentile(lead_rows, LADDER_MATURITY_PERCENTILE,
+                                    today=today)
     window_to = (today - timedelta(days=maturity_days)).isoformat()
     window_from = (today - timedelta(days=maturity_days + LADDER_WINDOW_DAYS)).isoformat()
 
@@ -517,7 +541,8 @@ def main() -> int:
     # сегмента к базе моста. Окно моста — зрелое: свежие лиды ещё не доехали
     # до глубоких ступеней и занижали бы качество всем сегментам разом.
     quality_adjusted = 0
-    bridge_maturity = _lag_percentile(lead_rows, LADDER_MATURITY_PERCENTILE)
+    bridge_maturity = _lag_percentile(lead_rows, LADDER_MATURITY_PERCENTILE,
+                                      today=date.today())
     bridge_to = (date.today() - timedelta(days=bridge_maturity)).isoformat()
     bridge_from = (date.today() - timedelta(days=BRIDGE_LOOKBACK_DAYS)).isoformat()
     bridge_rows = agent_db.load_device_bridge(bridge_from, bridge_to)

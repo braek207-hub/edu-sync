@@ -18,7 +18,7 @@ tests/test_agent_e0.py — тесты расчётной стороны Э0.
 """
 
 import json as _json
-from datetime import date
+from datetime import date, timedelta
 
 import sync.agent_e0 as agent_e0
 from sync.agent.guard import check_freshness as real_check_freshness
@@ -937,3 +937,48 @@ def test_main_writes_campaign_level_device_modifiers(monkeypatch, capsys):
     # Кабинет без покампанийных данных честно назван с причиной, а не молчит.
     assert any(sk["account"] == "acc-2"
                for sk in report["campaign_modifiers_skipped"])
+
+
+# ------------------------- p90 лага: правая цензура свежих когорт
+
+
+def test_lag_percentile_ignores_censored_young_cohorts():
+    # Свежая когорта физически не может показать длинный лаг: её длинные
+    # оплаты ещё не случились. Считать её лаги наравне со зрелыми — правая
+    # цензура: p90 занижается, «зрелое» окно оказывается незрелым, value
+    # направлений с длинным лагом занижена. Лаг меряется только по когортам,
+    # у которых было время оплатиться (возраст ≥ LAG_COHORT_MIN_AGE_DAYS).
+    today = date(2026, 8, 22)
+    # Когорта старше LAG_COHORT_MIN_AGE_DAYS: её хвост уже виден целиком.
+    mature = [_ladder_lead("2026-01-05", "spo",
+                           paid_on=(date(2026, 1, 5)
+                                    + timedelta(days=lag)).isoformat())
+              for lag in (30, 35, 40, 45, 50)]
+    young = [_ladder_lead("2026-08-15", "spo", paid_on="2026-08-15")] * 20
+    # min_age_days=0 воспроизводит прежнее поведение: все когорты подряд.
+    censored_p90 = agent_e0._lag_percentile(mature + young, 0.90, today=today,
+                                            min_age_days=0)
+    honest_p90 = agent_e0._lag_percentile(mature + young, 0.90, today=today)
+    assert censored_p90 == 40   # молодые нули утопили хвост
+    assert honest_p90 == 50     # только зрелые когорты
+
+
+def test_lag_percentile_falls_back_when_no_mature_cohorts():
+    # Истории меньше порога зрелости — честного замера нет; цензурированная
+    # оценка всё же лучше нуля (ноль = «окно не сдвигать» = решения по
+    # полностью незрелым дням).
+    today = date(2026, 8, 22)
+    young = [_ladder_lead("2026-08-10", "spo", paid_on="2026-08-15")] * 5
+    assert agent_e0._lag_percentile(young, 0.90, today=today) == 5
+
+
+def test_ladder_section_uses_uncensored_lag():
+    today = date(2026, 8, 22)
+    # Когорта старше LAG_COHORT_MIN_AGE_DAYS: её хвост уже виден целиком.
+    mature = [_ladder_lead("2026-01-05", "spo",
+                           paid_on=(date(2026, 1, 5)
+                                    + timedelta(days=lag)).isoformat())
+              for lag in (30, 35, 40, 45, 50)]
+    young = [_ladder_lead("2026-08-15", "spo", paid_on="2026-08-15")] * 20
+    section = agent_e0.funnel_ladder_section([], mature + young, today=today)
+    assert section["maturity_days"] == 50
