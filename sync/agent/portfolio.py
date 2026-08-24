@@ -28,7 +28,7 @@ sync/agent/portfolio.py — Э3.2: единый порог предельной 
 """
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent.confidence import assess
 
@@ -194,6 +194,7 @@ def portfolio_targets(
     saturation_campaigns: Dict[str, Dict[str, Any]],
     ladder_by_object: Dict[str, Dict[str, Any]],
     login_by_campaign_id: Dict[str, str],
+    holdout_ids: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """Целевые бюджеты по кабинетам: порог λ на кабинет, сумма сохраняется.
 
@@ -201,12 +202,27 @@ def portfolio_targets(
     сумма обязана сходиться там же. Кампании без привязки к кабинету решаются
     своей группой "unmapped": молчать о них нельзя, но и смешивать их бюджет
     с чьим-то кабинетом — тоже.
+
+    holdout_ids — заповедник: кампании, которых агент не трогает по
+    определению (agent_e1 блокирует по ним действия). В солвер они не идут.
+    Держать их внутри значило бы задавать порог λ ограничением «сумма целевых
+    равна сумме текущих», часть которой никогда не сдвинется: сумма сходится
+    фиктивно, а сам порог отчасти задают неподвижные кампании. Их бюджет
+    виден отдельной строкой отчёта, как и у кампаний без ценности лида.
     """
+    holdout_ids = {str(h) for h in (holdout_ids or set())}
     by_login: Dict[str, List[Dict[str, Any]]] = {}
     fixed_by_login: Dict[str, Dict[str, float]] = {}
+    holdout_by_login: Dict[str, Dict[str, float]] = {}
     no_value = 0
     for campaign_id, curve in saturation_campaigns.items():
         login = login_by_campaign_id.get(str(campaign_id)) or "unmapped"
+        if str(campaign_id) in holdout_ids:
+            guarded = holdout_by_login.setdefault(
+                login, {"campaigns": 0, "cost": 0.0})
+            guarded["campaigns"] += 1
+            guarded["cost"] += float(curve["cost_28d"])
+            continue
         value = value_per_lead(ladder_by_object.get(str(campaign_id)) or {})
         if value is None:
             no_value += 1
@@ -251,6 +267,10 @@ def portfolio_targets(
             "sum_residual": round(target_sum - budget, 2),
             "campaigns": len(campaigns),
             "fixed": fixed_by_login.get(login, {"campaigns": 0, "cost": 0.0}),
+            # Заповедник: в солвере не участвует, но его расход обязан быть
+            # виден — иначе «бюджет кабинета» в отчёте меньше настоящего без
+            # объяснения.
+            "holdout": holdout_by_login.get(login, {"campaigns": 0, "cost": 0.0}),
             "moves_up": sum(1 for m in moves.values() if m["move"] == "up"),
             "moves_down": sum(1 for m in moves.values() if m["move"] == "down"),
             "moves_confident": len(confident),

@@ -273,3 +273,28 @@ def test_computed_rows_carry_roi_vs_lambda():
     assert roi["setting_kind"] == "budget_target"
     assert roi["value"] == section["accounts"]["acc"]["moves"]["1"]["marginal_roi_vs_lambda"]
     assert roi["raw_value"] == section["accounts"]["acc"]["lambda"]
+
+
+def test_holdout_campaigns_stay_out_of_the_solver():
+    # Заповедник агент не трогает по определению (agent_e1 блокирует действия
+    # по его кампаниям). Оставлять их в солвере значит держать порог λ
+    # ограничением «сумма целевых = сумме текущих», часть которой никогда не
+    # сдвинется: сумма сходится фиктивно, а порог задан неподвижными
+    # кампаниями (аудит 2026-08-23).
+    saturation, ladder = _inputs()
+    free = portfolio_targets(saturation, ladder, {"1": "acc", "2": "acc"})
+    guarded = portfolio_targets(saturation, ladder, {"1": "acc", "2": "acc"},
+                                holdout_ids={"2"})
+    acc = guarded["accounts"]["acc"]
+    assert set(acc["moves"]) == {"1"}
+    assert acc["holdout"]["campaigns"] == 1
+    assert acc["budget_28d"] < free["accounts"]["acc"]["budget_28d"]
+    # Бюджет заповедника не участвует и в сумме переноса.
+    assert abs(acc["sum_residual"]) < 1.0
+
+
+def test_holdout_only_account_is_not_reported_as_movable():
+    saturation, ladder = _inputs()
+    section = portfolio_targets(saturation, ladder, {"1": "acc", "2": "acc"},
+                                holdout_ids={"1", "2"})
+    assert "acc" not in section["accounts"]

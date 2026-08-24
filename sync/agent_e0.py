@@ -792,7 +792,11 @@ def main() -> int:
     # кабинет» (сумма переноса сходится на уровне кабинета). Расчётный слой:
     # запись бюджетов в Директ — Э3.3.
     budget_threshold = portfolio_targets(
-        saturation["campaigns"], ladder_section["by_object"], login_by_campaign_id)
+        saturation["campaigns"], ladder_section["by_object"], login_by_campaign_id,
+        # Заповедник вне солвера: агент его не двигает, и держать его внутри
+        # ограничения «сумма целевых = сумме текущих» значит задавать порог λ
+        # отчасти неподвижными кампаниями.
+        holdout_ids={str(h["campaign_id"]) for h in holdout})
     budget_target_count = 0
     for campaign_id, rows in portfolio_computed_rows(budget_threshold).items():
         agent_db.upsert_computed_settings(
