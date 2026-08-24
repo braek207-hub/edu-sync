@@ -241,13 +241,18 @@ def computed_rows(candidates: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, 
         phrase = normalize_phrase(candidate.get("query"))
         if not phrase:
             continue
+        split = candidate.get("cost_by_campaign") or {}
         for campaign_id in candidate.get("campaigns") or []:
             if not campaign_id:
                 continue
+            # Доля расхода ЭТОЙ кампании, а не общий расход фразы: иначе при
+            # обратной сборке (candidates_from_computed) расход складывается
+            # сам с собой столько раз, в скольких кампаниях фраза живёт.
             out.setdefault(str(campaign_id), []).append({
                 "setting_kind": NEGATIVE_SETTING_KIND,
                 "setting_key": phrase,
-                "value": float(candidate.get("cost") or 0.0),
+                "value": float(split.get(str(campaign_id),
+                                         candidate.get("cost") or 0.0)),
                 "raw_value": int(candidate.get("clicks") or 0),
                 "support_n": int(candidate.get("clicks") or 0),
                 "reason": candidate.get("reason"),

@@ -121,14 +121,23 @@ def minus_word_candidates(
             continue
         slot = totals.setdefault(phrase, {
             "query": phrase, "cost": 0.0, "clicks": 0, "conversions": 0,
-            "campaigns": set(),
+            "campaigns": set(), "cost_by_campaign": {},
         })
         clicks = int(q.get("clicks") or 0)
         conversions = int(q.get("conversions") or 0)
-        slot["cost"] += float(q.get("cost") or 0.0)
+        cost = float(q.get("cost") or 0.0)
+        campaign_id = str(q.get("campaign_id") or "")
+        slot["cost"] += cost
         slot["clicks"] += clicks
         slot["conversions"] += conversions
-        slot["campaigns"].add(str(q.get("campaign_id") or ""))
+        slot["campaigns"].add(campaign_id)
+        if campaign_id:
+            # Разбивка расхода по кампаниям: одна и та же фраза стоит в разных
+            # кампаниях разных денег, и записать ей всюду общий расход значит
+            # сложить его с самим собой при обратной сборке (репетиция Э1
+            # отчиталась о 29,7 млн ₽ при месячном расходе кабинета 8,5 млн).
+            slot["cost_by_campaign"][campaign_id] = (
+                slot["cost_by_campaign"].get(campaign_id, 0.0) + cost)
         clicks_total += clicks
         conversions_total += conversions
 
@@ -167,6 +176,8 @@ def minus_word_candidates(
             "cpa": round(cpa, 2),
             "reason": reason,
             "campaigns": sorted(c for c in slot["campaigns"] if c),
+            "cost_by_campaign": {c: round(v, 2)
+                                 for c, v in sorted(slot["cost_by_campaign"].items())},
         })
     out.sort(key=lambda r: -r["cost"])
     return out
@@ -243,7 +254,7 @@ def word_minus_candidates(
                 continue
             slot = by_word.setdefault(word, {
                 "query": word, "cost": 0.0, "clicks": 0, "conversions": 0,
-                "phrases": 0, "campaigns": set(),
+                "phrases": 0, "campaigns": set(), "cost_by_campaign": {},
             })
             slot["cost"] += cost
             slot["clicks"] += clicks
@@ -251,9 +262,12 @@ def word_minus_candidates(
             slot["phrases"] += 1
             if campaign_id:
                 slot["campaigns"].add(campaign_id)
+                slot["cost_by_campaign"][campaign_id] = (
+                    slot["cost_by_campaign"].get(campaign_id, 0.0) + cost)
 
     ready = [{**slot, "campaigns": sorted(slot["campaigns"])}
              for slot in by_word.values() if slot["phrases"] >= min_phrases]
+    split_by_word = {slot["query"]: slot["cost_by_campaign"] for slot in ready}
     judged = minus_word_candidates(ready, cpa_limit=cpa_limit,
                                    multiplier=multiplier,
                                    base_conversion=base_conversion)
@@ -261,5 +275,10 @@ def word_minus_candidates(
     campaigns_by_word = {slot["query"]: slot["campaigns"] for slot in ready}
     return [{**row,
              "phrases": phrases_by_word.get(row["query"], 0),
-             "campaigns": campaigns_by_word.get(row["query"], row.get("campaigns", []))}
+             "campaigns": campaigns_by_word.get(row["query"], row.get("campaigns", [])),
+             # Разбивка слова по кампаниям берётся из его собственного
+             # агрегата: судья (minus_word_candidates) видел слово как одну
+             # «фразу» и разбивки не строил.
+             "cost_by_campaign": {c: round(v, 2) for c, v in
+                                  sorted(split_by_word.get(row["query"], {}).items())}}
             for row in judged]

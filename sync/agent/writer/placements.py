@@ -163,13 +163,16 @@ def computed_rows(candidates: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, 
         site = normalize_site(candidate.get("placement"))
         if not site:
             continue
+        split = candidate.get("cost_by_campaign") or {}
         for campaign_id in candidate.get("campaigns") or []:
             if not campaign_id:
                 continue
+            # Доля расхода этой кампании — см. тот же довод в negatives.
             out.setdefault(str(campaign_id), []).append({
                 "setting_kind": PLACEMENT_SETTING_KIND,
                 "setting_key": site,
-                "value": float(candidate.get("cost") or 0.0),
+                "value": float(split.get(str(campaign_id),
+                                         candidate.get("cost") or 0.0)),
                 "raw_value": int(candidate.get("clicks") or 0),
                 "support_n": int(candidate.get("clicks") or 0),
                 "reason": candidate.get("reason"),

@@ -206,3 +206,34 @@ def test_word_candidates_skip_short_words():
                 "clicks": 50, "conversions": 0} for i in range(4)]
     out = word_minus_candidates(queries, cpa_limit=1000.0, base_conversion=0.05)
     assert {r["query"] for r in out} == {"мгту"}
+
+
+def test_candidate_carries_cost_split_by_campaign():
+    # Расход фразы, записанный целиком в каждую её кампанию, при обратной
+    # сборке складывается сам с собой: репетиция Э1 отчиталась о 29,7 млн ₽
+    # «покрытого расхода» при месячном расходе кабинета 8,5 млн. Кандидат
+    # обязан нести РАЗБИВКУ по кампаниям.
+    from sync.agent.objects import minus_word_candidates
+    queries = [
+        {"campaign_id": "1", "query": "мгсу", "cost": 4000.0, "clicks": 40,
+         "conversions": 0},
+        {"campaign_id": "2", "query": "мгсу", "cost": 2000.0, "clicks": 20,
+         "conversions": 0},
+    ]
+    out = minus_word_candidates(queries, cpa_limit=1000.0, base_conversion=0.05)
+    assert out[0]["cost"] == 6000.0
+    assert out[0]["cost_by_campaign"] == {"1": 4000.0, "2": 2000.0}
+
+
+def test_word_candidate_carries_cost_split_by_campaign():
+    from sync.agent.objects import word_minus_candidates
+    queries = [
+        {"campaign_id": "1", "query": f"мгту {i}", "cost": 1000.0, "clicks": 20,
+         "conversions": 0} for i in range(3)
+    ] + [
+        {"campaign_id": "2", "query": "мгту заочно", "cost": 500.0, "clicks": 10,
+         "conversions": 0},
+    ]
+    out = word_minus_candidates(queries, cpa_limit=1000.0, base_conversion=0.05)
+    mgtu = next(r for r in out if r["query"] == "мгту")
+    assert mgtu["cost_by_campaign"] == {"1": 3000.0, "2": 500.0}
