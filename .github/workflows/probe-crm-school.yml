@@ -1,0 +1,44 @@
+name: probe-crm-school
+# Разовый разбор книги CRM по ленду школы: какие листы есть, есть ли оплаты
+# ленда и склеиваются ли они с лидами по ID лида. Только чтение.
+on:
+  workflow_dispatch:
+    inputs:
+      land:
+        description: "Ленд в CRM (колонка «Ленд»)"
+        required: false
+        default: "eduschool"
+        type: string
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Create Google SA key file
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -n "$GCP_SA_KEY" ]; then
+            printf '%s' "$GCP_SA_KEY" > sa.json
+          elif [ -n "$GOOGLE_SERVICE_ACCOUNT" ]; then
+            printf '%s' "$GOOGLE_SERVICE_ACCOUNT" > sa.json
+          else
+            echo "No Google credentials secret"
+            exit 1
+          fi
+      - name: Разбор ленда в книге CRM
+        env:
+          PYTHONUNBUFFERED: "1"
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
+          SHEET_ID_EDU: ${{ secrets.SHEET_ID_EDU }}
+          CRM_LEADS_SHEETS: "Лиды"
+          CRM_PAYMENTS_SHEETS: "Оплаты"
+          PROBE_LAND: ${{ github.event.inputs.land || 'eduschool' }}
+        run: python probe_crm_school.py
