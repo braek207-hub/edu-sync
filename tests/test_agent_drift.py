@@ -207,7 +207,8 @@ def test_only_needed_fields_are_requested():
     agent_drift.check_account(cabinet, [_budget_action()])
 
     _, params = cabinet.asked[0]
-    assert set(params["FieldNames"]) == {"Id", "Type", "State", "Status", "DailyBudget"}
+    assert set(params["FieldNames"]) == {"Id", "Type", "State", "Status",
+                                         "DailyBudget", "TimeTargeting"}
     assert params["TextCampaignFieldNames"] == ["BiddingStrategy"]
 
 
@@ -291,3 +292,36 @@ def test_modifiers_are_requested_only_for_campaigns_that_need_them():
         assert calls == ["111"]
     finally:
         agent_e1._actual_modifiers = original
+
+
+def _schedule_action(items, previous=None):
+    return {"action_id": "s1", "account": "acc", "object_id": "111",
+            "direct_type": "TIME_TARGETING", "setting_key": "schedule",
+            "payload": {"TimeTargeting": {"Schedule": {"Items": items}}},
+            "previous_state": ({"TimeTargeting": {"Schedule": {"Items": previous}}}
+                               if previous is not None else {})}
+
+
+def test_schedule_matches_regardless_of_day_order():
+    # Порядок дней в ответе API не гарантирован; различие в порядке при
+    # одинаковом содержании — ложный дрейф.
+    action = _schedule_action(["1,120,100", "2,100,100"])
+    state = {"time_targeting": {"Schedule": {"Items": ["2,100,100", "1,120,100"]}}}
+
+    assert drift.check(action, state)["verdict"] == drift.MATCH
+
+
+def test_schedule_erased_by_hand_is_a_rollback():
+    # Профиля в кабинете нет — это «ровные сотни», то есть точка возврата,
+    # а не нечитаемый ответ.
+    action = _schedule_action(["1,120,100"])
+    state = {"time_targeting": None}
+
+    assert drift.check(action, state)["verdict"] == drift.REVERTED
+
+
+def test_schedule_replaced_by_a_third_profile_is_drift():
+    action = _schedule_action(["1,120,100"], previous=["1,100,100"])
+    state = {"time_targeting": {"Schedule": {"Items": ["1,80,100"]}}}
+
+    assert drift.check(action, state)["verdict"] == drift.DRIFTED

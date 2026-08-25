@@ -93,6 +93,32 @@ def _tcpa_actual(state: Dict[str, Any]) -> Any:
     return read_target_cpa(state.get("strategy") or {})
 
 
+def _schedule_items(block: Any) -> Tuple[str, ...]:
+    """Почасовой профиль → сортированный кортеж строк Items.
+
+    Сортировка — потому что порядок дней в ответе API не гарантирован, а
+    различие в порядке при одинаковом содержании означало бы ложный дрейф.
+    Отсутствие блока — это ПУСТОЙ профиль («ровные сотни»), а не «нечитаемо»:
+    расписание, стёртое руками, обязано отличаться от нечитаемого ответа.
+    """
+    items = _dig(block, "Schedule", "Items")
+    if not isinstance(items, list):
+        return ()
+    return tuple(sorted(str(item) for item in items))
+
+
+def _schedule_expected(payload: Dict[str, Any]) -> Any:
+    return _schedule_items(_dig(payload, "TimeTargeting"))
+
+
+def _schedule_actual(state: Dict[str, Any]) -> Any:
+    return _schedule_items(state.get("time_targeting"))
+
+
+def _schedule_previous(previous: Dict[str, Any]) -> Any:
+    return _schedule_items(_dig(previous, "TimeTargeting"))
+
+
 SUSPENDED = "SUSPENDED"
 
 
@@ -163,6 +189,7 @@ READERS: Dict[str, Tuple[Callable, Callable, Callable]] = {
     "DAILY_BUDGET": (_daily, _daily_actual, _daily),
     "AVERAGE_CPA": (_tcpa, _tcpa_actual, _tcpa),
     "CAMPAIGN_STATE": (_state_expected, _state_actual, _state_previous),
+    "TIME_TARGETING": (_schedule_expected, _schedule_actual, _schedule_previous),
 }
 
 

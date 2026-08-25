@@ -65,8 +65,8 @@ def fetch_state(client, campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     """Текущее состояние кампаний кабинета — свежим чтением.
 
     Поля ровно те, по которым написана сверка (sync/agent/drift.py): статус
-    кампании, дневной бюджет и блок стратегии, внутри которого лежат
-    недельный лимит и цель конверсии.
+    кампании, дневной бюджет, почасовое расписание и блок стратегии, внутри
+    которого лежат недельный лимит и цель конверсии.
     """
     out: Dict[str, Dict[str, Any]] = {}
     ids = sorted({int(c) for c in campaign_ids if str(c).isdigit()})
@@ -74,7 +74,8 @@ def fetch_state(client, campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     for start in range(0, len(ids), page):
         result = client.get("campaigns", {
             "SelectionCriteria": {"Ids": ids[start:start + page]},
-            "FieldNames": ["Id", "Type", "State", "Status", "DailyBudget"],
+            "FieldNames": ["Id", "Type", "State", "Status", "DailyBudget",
+                           "TimeTargeting"],
             "TextCampaignFieldNames": ["BiddingStrategy"],
         })
         for item in result.get("Campaigns") or []:
@@ -83,6 +84,7 @@ def fetch_state(client, campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                 "state": item.get("State"),
                 "status": item.get("Status"),
                 "daily_budget": item.get("DailyBudget"),
+                "time_targeting": item.get("TimeTargeting"),
                 "strategy": (item.get("TextCampaign") or {}).get("BiddingStrategy"),
             }
     return out
