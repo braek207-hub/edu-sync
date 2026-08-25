@@ -20,6 +20,7 @@ ENV:
 import os
 import json
 import time
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -649,7 +650,7 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
             "targeting": {
                 "placements": sorted(set(placements)),
                 "campaignSettings": sorted(set(settings_opts)),
-                "negativeKeywords": list((c.get("NegativeKeywords") or {}).get("Items") or []),
+                "negativeKeywords": _as_list(c.get("NegativeKeywords")),
             },
         }
 
@@ -807,9 +808,9 @@ def _fetch_adgroups_by_campaign(campaign_ids: List[str]) -> Dict[str, List[Dict[
                     "name": ag.get("Name"),
                     "type": ag.get("Type"),
                     "status": ag.get("Status"),
-                    "regionIds": list(ag.get("RegionIds") or []),
-                    "restrictedRegionIds": list(ag.get("RestrictedRegionIds") or []),
-                    "negativeKeywords": list((ag.get("NegativeKeywords") or {}).get("Items") or []),
+                    "regionIds": _as_list(ag.get("RegionIds")),
+                    "restrictedRegionIds": _as_list(ag.get("RestrictedRegionIds")),
+                    "negativeKeywords": _as_list(ag.get("NegativeKeywords")),
                     "feedId": feed_id,
                     "offerRetargeting": (
                         (ag.get("UnifiedAdGroup") or {}).get("OfferRetargeting")
@@ -1511,6 +1512,7 @@ def sync_edu_campaign_settings() -> int:
     from sync.direct import _direct_clients
 
     total = 0
+    failed: List[str] = []
     for client in _direct_clients():
         login = client["login"]
         _CURRENT_LOGIN = login
@@ -1524,13 +1526,23 @@ def sync_edu_campaign_settings() -> int:
             print(f"[edu_direct_settings] {login}: настройки {n} кампаний")
             total += n
         except Exception as e:
-            print(f"[edu_direct_settings] {login}: WARN настройки не синхронизированы: {e}")
+            # Остальные кабинеты досинхронизировать стоит: витрина частичная
+            # лучше пустой. Но прогон обязан кончиться красным — три кабинета
+            # из четырёх падали месяцами под зелёной галочкой, и агент считал
+            # своей слепой зоной кампании, которые просто не доехали.
+            failed.append(login)
+            print(f"[edu_direct_settings] {login}: ОШИБКА настройки не синхронизированы: {e}")
+            traceback.print_exc()
     print(f"[edu_direct_settings] ИТОГО upsert {total}")
     if total:
         try:
             _snapshot_strategies()
         except Exception as e:
             print(f"[edu_direct_settings] WARN снапшот стратегий не записан: {e}")
+    if failed:
+        raise RuntimeError(
+            "настройки не синхронизированы для кабинетов: " + ", ".join(failed)
+        )
     return total
 
 
