@@ -1,0 +1,19 @@
+name: probe-blind-spend-window
+# Разовый read-only замер: от какого окна зависит слепая доля расхода
+# (см. probe_blind_spend_window.py).
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Замер слепой доли на двух окнах
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python probe_blind_spend_window.py
