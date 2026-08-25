@@ -328,25 +328,35 @@ jobs:
 
 | Поле | Вердикт API | Комментарий |
 |---|---|---|
-| ImpressionShare | <из лога> | |
-| SearchImpressionShare | <из лога> | |
-| AuctionWinShare | <из лога> | |
-| AvgTrafficVolume | <из лога> | контроль: поле из справочника |
+| ImpressionShare | FIELD_UNKNOWN | |
+| SearchImpressionShare | FIELD_UNKNOWN | |
+| AuctionWinShare | FIELD_UNKNOWN | |
+| AvgTrafficVolume | OK | контроль: поле из справочника |
 
-Заполненность в `direct_stats` за 30 дней: <из лога>.
+Заполненность в `direct_stats` за 30 дней: 85 кампаний, 2302 дня, 13 549 252 показа,
+`volume_coverage = 1.0` (дней с ненулевым объёмом 2302 из 2302). Колонка
+`w_auction_win_share`: дней с данными 0.
 
-| Тип кампании | Показов за 30 дней | Из них с непустым объёмом трафика |
-|---|---|---|
-| Поиск (TEXT_CAMPAIGN) | <из лога> | <из лога> |
-| Сети / смарт / МК | <из лога> | <из лога> |
+| Разрез | Кампаний | volume_coverage | Средний объём трафика |
+|---|---|---|---|
+| Всего | 85 | 1.0 | 69.48 |
+| TEXT_CAMPAIGN | 70 | 1.0 | 65.32 |
+| Нет в витрине настроек | 15 | 1.0 | 84.36 |
+| Только поиск | 67 | 1.0 | 52.59 |
+| Только сети | 3 | 1.0 | **100.0** |
+| Поиск + сети | 0 | — | — |
 
-Этот разрез — обязательная часть probe, а не украшение: объём трафика определён для
-поиска, и если в сетях он приходит пустым, витрина запишет ноль. Ноль, прочитанный
-как «недобор 100 %», вылил бы карман разведки и шаг ×2 в сети по несуществующему
-признаку. Порог `MIN_VOLUME_COVERAGE` (задача 3) настраивается по этому числу.
+**Вывод.** Поля доли выкупа в Reports API нет — недобор меряем объёмом трафика
+`AvgTrafficVolume`. Поле заполнено на 100 % во всех разрезах, поэтому проверка
+покрытия не отличает «поле пустое» от «объём низкий»: пустых значений просто нет.
+Отличать приходится по размещению — у трёх сетевых кампаний объём **вырожден в
+константу 100.0**, то есть недобора там не бывает по построению, а не потому, что
+всё выкуплено.
 
-**Вывод.** <Одна фраза: чем меряем недобор — долей выкупа из API, если поле нашлось,
-иначе объёмом трафика AvgTrafficVolume.>
+**Опровергнутая гипотеза** (записана, чтобы её не воскресили): предполагалось, что в
+сетях API отдаёт «--», `sync/direct.py:117` превращает прочерк в ноль, и такой ноль
+прочитается как «недобор 100 %». Замер показал обратное — в сетях приходит 100.0.
+Ложным был бы не недобор, а «выкуплен»: механизм решил бы, что сетям расти некуда.
 ```
 
 Если probe покажет, что поле доли выкупа API отдаёт, — задачи 2–4 делаются по нему
@@ -547,9 +557,11 @@ git commit -m "fix(agent): взвешенные метрики Директа д
 
 **Интерфейсы:**
 - Потребляет: строки фактов с `campaign_id`, `fact_date`, `impressions`, `cost`,
-  `avg_traffic_vol` (задача 2).
+  `avg_traffic_vol` (задача 2) и настройки кампаний
+  `agent_db.load_campaign_settings_raw()` — `Dict[campaign_id, settings]`
+  (`sync/agent/db.py:329`), из которых читается канал показа.
 - Отдаёт:
-  - `traffic_headroom(facts, window_from, window_to) -> Dict[str, Dict[str, Any]]` —
+  - `traffic_headroom(facts, settings_by_id, window_from, window_to) -> Dict[str, Dict[str, Any]]` —
     по `campaign_id`: `{"traffic_volume": float 0..100, "headroom_share": float 0..1,
     "impressions": int, "cost": float, "verdict": str}`, где `verdict` ∈
     `"есть куда расти" | "выкуплен" | "неопределённо"`.
@@ -573,30 +585,59 @@ def _fact(day, campaign_id, impressions, volume, cost=1000.0):
             "impressions": impressions, "avg_traffic_vol": volume}
 
 
+def _settings(search="HIGHEST_POSITION", network="SERVING_OFF"):
+    return {"111": {"strategy": {"search": {"biddingStrategyType": search},
+                                 "network": {"biddingStrategyType": network}}}}
+
+
+SEARCH = _settings()
+
+
 def test_volume_is_weighted_by_impressions():
     # День с 9000 показов на объёме 50 весит вдевятеро против дня с 1000 на 100.
     rows = [_fact("2026-08-02", "111", 9000, 50.0),
             _fact("2026-08-03", "111", 1000, 100.0)]
-    out = traffic_headroom(rows, *WINDOW)
+    out = traffic_headroom(rows, SEARCH, *WINDOW)
     assert out["111"]["traffic_volume"] == 55.0
     assert out["111"]["headroom_share"] == 0.45
 
 
 def test_low_volume_with_enough_impressions_has_room():
     rows = [_fact("2026-08-02", "111", 20000, 45.0)]
-    assert traffic_headroom(rows, *WINDOW)["111"]["verdict"] == "есть куда расти"
+    assert traffic_headroom(rows, SEARCH, *WINDOW)["111"]["verdict"] == "есть куда расти"
 
 
 def test_high_volume_is_bought_out():
     rows = [_fact("2026-08-02", "111", 20000, 95.0)]
-    assert traffic_headroom(rows, *WINDOW)["111"]["verdict"] == "выкуплен"
+    assert traffic_headroom(rows, SEARCH, *WINDOW)["111"]["verdict"] == "выкуплен"
+
+
+def test_network_campaign_gets_no_verdict_despite_full_volume():
+    # Замер probe: у сетевых кампаний объём трафика приходит равным 100.0
+    # при стопроцентной заполненности. Это не «всё выкуплено», а константа:
+    # величина в сетях не измеряется. Вердикт «выкуплен» здесь объявил бы
+    # сетевую часть кабинета упершейся в потолок и увёл бы от неё рост.
+    rows = [_fact("2026-08-02", "111", 40_000, 100.0)]
+    out = traffic_headroom(rows, _settings(search="SERVING_OFF",
+                                           network="WB_MAXIMUM_CLICKS"), *WINDOW)
+    assert out["111"]["verdict"] == "неопределённо"
+    assert out["111"]["headroom_share"] is None
+
+
+def test_campaign_without_settings_gets_no_verdict():
+    # 15 кампаний из 85 (22 % показов) в edu_campaign_settings отсутствуют —
+    # канал показа у них неизвестен, значит неизвестно и то, осмысленна ли
+    # у них величина объёма. Приписать им поиск значило бы выдать незнание
+    # за знание. Пересекается со слепой долей расхода (задача 6).
+    rows = [_fact("2026-08-02", "111", 40_000, 45.0)]
+    assert traffic_headroom(rows, {}, *WINDOW)["111"]["verdict"] == "неопределённо"
 
 
 def test_small_campaign_is_undetermined_not_optimistic():
     # 300 показов — объём, на котором среднее ничего не значит. Вердикт
     # «есть куда расти» здесь стал бы поводом долить деньги в шум.
     rows = [_fact("2026-08-02", "111", 300, 20.0)]
-    assert traffic_headroom(rows, *WINDOW)["111"]["verdict"] == "неопределённо"
+    assert traffic_headroom(rows, SEARCH, *WINDOW)["111"]["verdict"] == "неопределённо"
 
 
 def test_days_outside_window_are_ignored():
@@ -610,16 +651,15 @@ def test_days_outside_window_are_ignored():
 def test_zero_impressions_campaign_is_absent():
     # Кампания без показов не получает вердикта: делить не на что, а строка
     # с нулевым объёмом читалась бы как «весь трафик недобран».
-    assert traffic_headroom([_fact("2026-08-02", "111", 0, 0.0)], *WINDOW) == {}
+    assert traffic_headroom([_fact("2026-08-02", "111", 0, 0.0)], SEARCH, *WINDOW) == {}
 
 
 def test_zero_volume_with_live_impressions_is_no_data_not_full_headroom():
-    # Объём трафика определён для ПОИСКА. У кампании в сетях поле приходит
-    # пустым (в витрине — нулём), а показов при этом десятки тысяч. Прочитать
-    # такой ноль как «недобор 100 %» значит объявить всю сетевую часть
-    # кабинета недоливаемой и вылить в неё карман разведки и шаг x2.
+    # Страховка, а не наблюдение: на замере 2026-08-25 нулевого объёма при
+    # живых показах в витрине нет ни одного дня. Если поле когда-нибудь
+    # перестанет приходить, ноль не должен прочитаться как «недобор 100 %».
     rows = [_fact("2026-08-02", "111", 40_000, 0.0)]
-    out = traffic_headroom(rows, *WINDOW)
+    out = traffic_headroom(rows, SEARCH, *WINDOW)
     assert out["111"]["verdict"] == "неопределённо"
     assert out["111"]["headroom_share"] is None
 
@@ -630,11 +670,12 @@ def test_partial_coverage_of_volume_is_undetermined():
     # набору дней, чем показы, и сравнивать его с порогом нельзя.
     rows = [_fact("2026-08-02", "111", 20_000, 0.0),
             _fact("2026-08-03", "111", 20_000, 40.0)]
-    assert traffic_headroom(rows, *WINDOW)["111"]["verdict"] == "неопределённо"
+    assert traffic_headroom(rows, SEARCH, *WINDOW)["111"]["verdict"] == "неопределённо"
 
 
 def test_computed_rows_carry_support():
-    section = traffic_headroom([_fact("2026-08-02", "111", 20000, 45.0)], *WINDOW)
+    section = traffic_headroom([_fact("2026-08-02", "111", 20000, 45.0)],
+                               SEARCH, *WINDOW)
     rows = computed_rows(section)["111"]
     by_key = {r["setting_key"]: r for r in rows}
     assert by_key["traffic_volume"]["value"] == 45.0
@@ -682,14 +723,44 @@ FULL_VOLUME = 100.0
 # примерно 180 показов в день, ниже этого кампании в EDU живут дни-обрывки.
 MIN_IMPRESSIONS = 5_000
 
-# Доля показов окна, пришедшихся на дни с НЕНУЛЕВЫМ объёмом трафика. Поле
-# определено для поиска; в сетях API отдаёт «--», а sync/direct.py:117
-# (to_num_gas) превращает прочерк в ноль — признак «поля не было» до витрины
-# не доезжает вовсе. Различать «объём ноль» и «объём не измерялся» приходится
-# по косвенному: у живой поисковой кампании объём положителен почти каждый
-# день, у сетевой — ноль всегда. Кампания с покрытием ниже этой доли вердикта
-# не получает: недобор у неё неизвестен, а не полный.
+# Доля показов окна, пришедшихся на дни с НЕНУЛЕВЫМ объёмом трафика.
+# СТРАХОВКА, а не рабочий фильтр: на замере probe (2026-08-25) покрытие равно
+# 1.0 во всех разрезах — пустых значений в витрине нет. Порог сработает, если
+# поле когда-нибудь перестанет приходить и sync/direct.py:117 (to_num_gas)
+# начнёт писать нули вместо прочерков. Полагаться на него как на защиту от
+# сетей нельзя: сети отсекаются каналом показа, см. _placement_mode.
 MIN_VOLUME_COVERAGE = 0.8
+
+# Канал выключен — так Директ помечает отсутствующую половину стратегии.
+SERVING_OFF = "SERVING_OFF"
+
+
+def _placement_mode(settings: Dict[str, Any]) -> str:
+    """Где кампания показывается — по типам стратегий обоих каналов.
+
+    Правило чтения повторяет probe_traffic_headroom.py:85, которым мерили
+    боевые числа; расходиться им нельзя, иначе разрез замера и разрез
+    боевого расчёта перестанут означать одно и то же.
+    """
+    strategy = (settings or {}).get("strategy") or {}
+    search = ((strategy.get("search") or {}).get("biddingStrategyType"))
+    network = ((strategy.get("network") or {}).get("biddingStrategyType"))
+    search_on = bool(search) and search != SERVING_OFF
+    network_on = bool(network) and network != SERVING_OFF
+    if search_on and network_on:
+        return "поиск+сети"
+    if search_on:
+        return "только поиск"
+    if network_on:
+        return "только сети"
+    return "неизвестно"
+
+
+# Каналы, для которых объём трафика — измеряемая величина. У чисто сетевых
+# кампаний probe намерил ровно 100.0 при стопроцентной заполненности: это
+# константа, а не результат выкупа. Кампаниям вне этого множества (сети и те,
+# кого нет в витрине настроек) вердикт не выдаётся.
+MEASURABLE_PLACEMENTS = frozenset({"только поиск", "поиск+сети"})
 
 # Границы вердикта. 70 — ниже этого недобор больше трети, и это уже повод
 # усомниться в «насыщении». 90 — выше этого добирать почти нечего, и разница
@@ -699,11 +770,16 @@ BOUGHT_OUT_VOLUME = 90.0
 
 
 def traffic_headroom(facts: List[Dict[str, Any]],
+                     settings_by_id: Dict[str, Any],
                      window_from: str, window_to: str) -> Dict[str, Dict[str, Any]]:
     """Недобор трафика по кампаниям за окно.
 
     Средний объём взвешивается ПОКАЗАМИ, а не днями: день с тысячей показов
     и день с сотней тысяч — не равноправные наблюдения одной величины.
+
+    settings_by_id — Dict[campaign_id, settings] из load_campaign_settings_raw().
+    Нужен ровно для одного: понять канал показа. Без него сетевые кампании
+    получили бы вердикт «выкуплен» на своей константной сотне.
     """
     totals: Dict[str, Dict[str, float]] = {}
     for row in facts:
@@ -725,7 +801,11 @@ def traffic_headroom(facts: List[Dict[str, Any]],
         if impressions <= 0:
             continue
         volume = slot["weighted"] / impressions
-        if impressions < MIN_IMPRESSIONS:
+        measurable = _placement_mode(
+            (settings_by_id or {}).get(campaign_id)
+            or (settings_by_id or {}).get(str(campaign_id))
+        ) in MEASURABLE_PLACEMENTS
+        if not measurable or impressions < MIN_IMPRESSIONS:
             verdict = "неопределённо"
         elif volume < ROOM_BELOW_VOLUME:
             verdict = "есть куда расти"
@@ -982,7 +1062,8 @@ def test_exploration_without_headroom_is_unchanged():
 
     # Недобор трафика считается по тому же зрелому окну, что кривые: иначе
     # признак «есть куда расти» и вердикт насыщения говорили бы о разных неделях.
-    headroom_section = traffic_headroom(facts, slice_from, date_to)
+    headroom_section = traffic_headroom(
+        facts, agent_db.load_campaign_settings_raw(), slice_from, date_to)
     headroom_rows_written = 0
     for campaign_id, rows in headroom_computed_rows(headroom_section).items():
         agent_db.upsert_computed_settings(
