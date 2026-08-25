@@ -37,6 +37,10 @@ DRIFTED = "drifted"
 # Значение вернулось ровно в точку возврата — это откат, а не дрейф.
 REVERTED = "reverted"
 OBJECT_GONE = "object_gone"
+# Кампания на месте, а самой корректировки в кабинете больше нет: её удалили.
+# Для действия-добавления это ровно откат, для действия-правки — исчезновение
+# объекта, который агент считает своим; в обоих случаях изменения нет.
+SEGMENT_GONE = "segment_gone"
 # Вид действия, для которого сверка ещё не написана. Отдельный вердикт, а не
 # молчаливый пропуск: «не проверено» обязано отличаться от «проверено и
 # сошлось», иначе покрытие сверки нельзя измерить.
@@ -107,6 +111,50 @@ def _state_previous(previous: Dict[str, Any]) -> Any:
     return _dig(previous, "State")
 
 
+# Корректировки ставок. Их вид — это не один тип, а семейство (устройства,
+# демография, регионы), и справочником оно не задаётся: типы приходят из
+# плана, и забытая строка в справочнике означала бы молчаливый пропуск целого
+# семейства. Признак — суффикс, тот же, которым их называет API Директа.
+MODIFIER_SUFFIX = "_ADJUSTMENT"
+
+
+def is_modifier(direct_type: str) -> bool:
+    return str(direct_type).endswith(MODIFIER_SUFFIX)
+
+
+def _check_modifier(action: Dict[str, Any], state: Dict[str, Any],
+                    out: Dict[str, Any]) -> Dict[str, Any]:
+    """Сверка одной корректировки ставки.
+
+    Величина и там, и там в дельтах (100-базный коэффициент API приводится к
+    дельте при чтении — sync/agent_e1._normalize_actual), поэтому сравнение
+    прямое. Отсутствие корректировки в кабинете — не «нечитаемо», а факт:
+    объекта нет.
+    """
+    modifiers = state.get("modifiers")
+    if modifiers is None:
+        out["verdict"] = UNREADABLE
+        return out
+    expected = _dig(action.get("payload") or {}, "BidModifier")
+    previous = _dig(action.get("previous_state") or {}, "percent")
+    actual = modifiers.get((str(action.get("direct_type") or ""), str(out["key"])))
+    out.update({"expected": expected, "actual": actual, "previous": previous})
+    if expected is None:
+        out["verdict"] = UNREADABLE
+        return out
+    if actual is None:
+        out["verdict"] = SEGMENT_GONE
+        return out
+    if same(actual, expected):
+        out["verdict"] = MATCH
+        return out
+    if previous is not None and same(actual, previous):
+        out["verdict"] = REVERTED
+        return out
+    out["verdict"] = DRIFTED
+    return out
+
+
 # Вид действия → (что ожидали, что стоит сейчас, куда возвращаться).
 # Третий элемент читает previous_state: у бюджета и цели поле называется так
 # же, как в payload, у выключателя — иначе, и справочник это скрывает.
@@ -169,6 +217,12 @@ def check(action: Dict[str, Any],
         "applied_at": str(action.get("applied_at") or "") or None,
         "expected": None, "actual": None, "previous": None,
     }
+    if is_modifier(kind):
+        if not state:
+            out["verdict"] = OBJECT_GONE
+            return out
+        return _check_modifier(action, state, out)
+
     readers = READERS.get(kind)
     if readers is None:
         out["verdict"] = UNVERIFIABLE
@@ -215,7 +269,22 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, int]:
 # Вердикты, требующие человека. Дрейф и откат — не сбой прогона, а сообщение
 # о том, что кабинет живёт своей жизнью: агент судит исходы по изменениям,
 # которых там уже нет.
-ALARMING = (REVERTED, DRIFTED, OBJECT_GONE)
+ALARMING = (REVERTED, DRIFTED, OBJECT_GONE, SEGMENT_GONE)
+
+
+def unverified_kinds(rows: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    """Какие виды действий сверка не умеет проверять — счётчик по видам.
+
+    Покрытие обязано быть измеримым: без этой строки отчёт «расхождений нет»
+    одинаково выглядит и когда всё сошлось, и когда не проверено ничего.
+    """
+    out: Dict[str, int] = {}
+    for row in rows or ():
+        if str(row.get("verdict")) != UNVERIFIABLE:
+            continue
+        kind = str(row.get("direct_type") or "")
+        out[kind] = out.get(kind, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
 
 def alarms(rows: Iterable[Dict[str, Any]]) -> List[str]:

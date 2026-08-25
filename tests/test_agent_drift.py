@@ -209,3 +209,85 @@ def test_only_needed_fields_are_requested():
     _, params = cabinet.asked[0]
     assert set(params["FieldNames"]) == {"Id", "Type", "State", "Status", "DailyBudget"}
     assert params["TextCampaignFieldNames"] == ["BiddingStrategy"]
+
+
+def _modifier_action(percent=-30, previous=None, kind="MOBILE_ADJUSTMENT",
+                     key="MOBILE"):
+    action = {"action_id": "m1", "account": "acc", "object_id": "111",
+              "direct_type": kind, "setting_key": key,
+              "applied_at": "2026-08-20 10:00:00",
+              "payload": {"Id": 7, "BidModifier": percent},
+              "previous_state": {}}
+    if previous is not None:
+        action["previous_state"] = {"Id": 7, "percent": previous}
+    return action
+
+
+def test_modifier_that_still_stands():
+    state = {"modifiers": {("MOBILE_ADJUSTMENT", "MOBILE"): -30}}
+
+    assert drift.check(_modifier_action(), state)["verdict"] == drift.MATCH
+
+
+def test_modifier_returned_to_the_previous_percent():
+    state = {"modifiers": {("MOBILE_ADJUSTMENT", "MOBILE"): 10}}
+
+    row = drift.check(_modifier_action(previous=10), state)
+
+    assert row["verdict"] == drift.REVERTED
+
+
+def test_deleted_modifier_is_not_unreadable_but_gone():
+    # Корректировки в кабинете нет — это факт, а не «не смогли прочитать»:
+    # для добавления это ровно откат руками.
+    row = drift.check(_modifier_action(), {"modifiers": {}})
+
+    assert row["verdict"] == drift.SEGMENT_GONE
+
+
+def test_modifiers_not_read_at_all_is_unreadable():
+    # Пустой словарь и «не читали» — разные новости: во втором случае
+    # объявить сегменты удалёнными значило бы поднять ложную тревогу.
+    row = drift.check(_modifier_action(), {"strategy": {}})
+
+    assert row["verdict"] == drift.UNREADABLE
+
+
+def test_demographics_and_regions_are_the_same_family():
+    state = {"modifiers": {("DEMOGRAPHICS_ADJUSTMENT", "GENDER_MALE"): -20,
+                           ("REGIONAL_ADJUSTMENT", "213"): 15}}
+
+    assert drift.check(_modifier_action(percent=-20, kind="DEMOGRAPHICS_ADJUSTMENT",
+                                        key="GENDER_MALE"), state)["verdict"] == drift.MATCH
+    assert drift.check(_modifier_action(percent=15, kind="REGIONAL_ADJUSTMENT",
+                                        key="213"), state)["verdict"] == drift.MATCH
+
+
+def test_unverified_kinds_make_coverage_measurable():
+    rows = [{"verdict": drift.UNVERIFIABLE, "direct_type": "TIME_TARGETING"},
+            {"verdict": drift.UNVERIFIABLE, "direct_type": "TIME_TARGETING"},
+            {"verdict": drift.MATCH, "direct_type": "AVERAGE_CPA"}]
+
+    assert drift.unverified_kinds(rows) == {"TIME_TARGETING": 2}
+
+
+def test_modifiers_are_requested_only_for_campaigns_that_need_them():
+    # Запрос корректировок стоит баллов API на каждую кампанию.
+    from sync import agent_drift
+
+    calls = []
+
+    class _WithModifiers(_Cabinet):
+        pass
+
+    cabinet = _WithModifiers([_campaign()])
+    import sync.agent_e1 as agent_e1
+    original = agent_e1._actual_modifiers
+    agent_e1._actual_modifiers = lambda client, cid: calls.append(cid) or []
+    try:
+        agent_drift.check_account(cabinet, [_budget_action()])
+        assert calls == []
+        agent_drift.check_account(cabinet, [_modifier_action()])
+        assert calls == ["111"]
+    finally:
+        agent_e1._actual_modifiers = original

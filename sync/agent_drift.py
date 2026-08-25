@@ -94,11 +94,46 @@ def fetch_state(client, campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
 SAMPLE_LIMIT = 20
 
 
+def fetch_modifiers(client, campaign_ids: List[str]) -> Dict[str, Dict[Any, Any]]:
+    """Корректировки ставок кампаний → {кампания: {(вид, ключ): дельта}}.
+
+    Чтение и нормализация — те же, что у прогона применения
+    (sync/agent_e1._actual_modifiers): сверка обязана видеть ровно то, что
+    видел планировщик, иначе она сравнивала бы дельты с 100-базными
+    коэффициентами и объявляла дрейфом каждую корректировку.
+
+    Импорт внутри функции: прогон применения тянет за собой весь расчётный
+    слой, и чистая сверка не должна поднимать его при импорте модуля.
+    """
+    from sync.agent_e1 import _actual_modifiers
+
+    out: Dict[str, Dict[Any, Any]] = {}
+    for campaign_id in sorted({str(c) for c in campaign_ids if str(c).isdigit()}):
+        out[campaign_id] = {
+            # Ключ словаря — (вид, ключ сегмента), как в действии. Вид у
+            # нормализованной записи лежит в "Type" (имя из API), а не в
+            # "direct_type": последнего там нет, и запрос по нему собрал бы
+            # словарь из строк "None" — сверка молча объявила бы удалёнными
+            # все корректировки разом.
+            (str(item.get("Type")), str(item.get("key"))): item.get("percent")
+            for item in _actual_modifiers(client, campaign_id)
+        }
+    return out
+
+
 def check_account(client, actions: List[Dict[str, Any]]) -> Dict[str, Any]:
     latest = drift.latest_per_segment(actions)
     # По объектам, которых кабинет не вернул, состояния нет — это и есть
     # вердикт OBJECT_GONE, а не повод пропустить строку.
     states = fetch_state(client, [a.get("object_id") for a in latest])
+    # Корректировки читаются ПОКАМПАНИЙНО и только для тех кампаний, где они
+    # действительно сверяются: запрос на кампанию стоит баллов API, и платить
+    # их за объекты, по которым агент корректировок не ставил, незачем.
+    modifier_campaigns = [a.get("object_id") for a in latest
+                          if drift.is_modifier(a.get("direct_type"))]
+    for campaign_id, modifiers in fetch_modifiers(client, modifier_campaigns).items():
+        if campaign_id in states:
+            states[campaign_id]["modifiers"] = modifiers
     rows = [drift.check(action, states.get(str(action.get("object_id") or "")))
             for action in latest]
     mismatched = [r for r in rows if r["verdict"] in drift.ALARMING]
@@ -144,6 +179,9 @@ def main() -> int:
         "actions_in_window": len(actions),
         "checked": len(all_rows),
         "verdicts": drift.summarize(all_rows),
+        # Покрытие сверки: без этой строки «расхождений нет» одинаково
+        # выглядит и когда всё сошлось, и когда не проверено ничего.
+        "unverified_kinds": drift.unverified_kinds(all_rows),
         "alarms": alarms,
         "accounts": accounts,
     }
