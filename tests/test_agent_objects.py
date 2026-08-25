@@ -237,3 +237,50 @@ def test_word_candidate_carries_cost_split_by_campaign():
     out = word_minus_candidates(queries, cpa_limit=1000.0, base_conversion=0.05)
     mgtu = next(r for r in out if r["query"] == "мгту")
     assert mgtu["cost_by_campaign"] == {"1": 3000.0, "2": 500.0}
+
+
+# ------------------- защита семантического ядра при минусации СЛОВ
+
+
+def test_word_with_conversions_is_never_a_minus_candidate():
+    # Ветка «конверсии есть, но дорого» законна для ФРАЗЫ и катастрофична для
+    # СЛОВА: минус-слово гасит ВСЁ семейство фраз, включая конверсионные. На
+    # бою правило предложило заминусовать «высшее» (226 конверсий, 1,18 млн ₽)
+    # — то есть отрезать ядро трафика образовательного проекта.
+    from sync.agent.objects import word_minus_candidates
+    queries = [
+        {"campaign_id": "1", "query": f"высшее образование {i}", "cost": 50_000.0,
+         "clicks": 200, "conversions": 0} for i in range(4)
+    ] + [
+        {"campaign_id": "1", "query": "высшее образование", "cost": 20_000.0,
+         "clicks": 100, "conversions": 3},
+    ]
+    out = word_minus_candidates(queries, cpa_limit=1500.0, base_conversion=0.03)
+    assert not [r for r in out if r["query"] == "высшее"]
+
+
+def test_word_from_our_own_keywords_is_protected():
+    # Слово, входящее в КЛЮЧЕВЫЕ фразы кабинета (matched_key), мы купили
+    # осознанно. Дорого — регулируется ставкой и целью CPA (Э3.5), а не
+    # запретом: запрет отменяет собственную семантику.
+    from sync.agent.objects import word_minus_candidates
+    queries = [
+        {"campaign_id": "1", "query": f"институты москвы {i}", "cost": 40_000.0,
+         "clicks": 300, "conversions": 0, "matched_key": "институты москвы"}
+        for i in range(4)
+    ]
+    out = word_minus_candidates(queries, cpa_limit=1500.0, base_conversion=0.03)
+    assert not [r for r in out if r["query"] == "институты"]
+
+
+def test_junk_word_without_conversions_is_still_a_candidate():
+    # Обратная половина: слово, которого нет в нашей семантике и которое не
+    # дало ни одной конверсии, по-прежнему кандидат.
+    from sync.agent.objects import word_minus_candidates
+    queries = [
+        {"campaign_id": "1", "query": f"бесплатно скачать {i}", "cost": 30_000.0,
+         "clicks": 300, "conversions": 0, "matched_key": "институты москвы"}
+        for i in range(4)
+    ]
+    out = word_minus_candidates(queries, cpa_limit=1500.0, base_conversion=0.03)
+    assert [r for r in out if r["query"] == "скачать"]

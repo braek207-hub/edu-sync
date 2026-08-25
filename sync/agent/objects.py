@@ -220,11 +220,29 @@ MIN_PHRASES_PER_WORD = 3
 _WORD_RE = re.compile(r"[а-яёa-z0-9]+")
 
 
+def core_words(queries: List[Dict[str, Any]]) -> set:
+    """Слова НАШЕЙ семантики — те, что стоят в ключевых фразах кабинета.
+
+    matched_key отчёта поисковых запросов — это фраза, которую мы сами
+    купили. Её слова минусовать нельзя ни при какой цене: запрет отменил бы
+    собственную закупку, а дорогая своя семантика лечится ставкой и целью
+    CPA (Э3.5), а не запретом.
+    """
+    out = set()
+    for q in queries:
+        key = str(q.get("matched_key") or "").lower()
+        for word in _WORD_RE.findall(key):
+            if len(word) >= MIN_WORD_CHARS:
+                out.add(word)
+    return out
+
+
 def word_minus_candidates(
     queries: List[Dict[str, Any]], cpa_limit: float,
     multiplier: float = CPA_OVERSHOOT,
     base_conversion: Optional[float] = None,
     min_phrases: int = MIN_PHRASES_PER_WORD,
+    protected_words: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     """Кандидаты в минус-СЛОВА: слово судится по всем фразам, где встретилось.
 
@@ -234,10 +252,17 @@ def word_minus_candidates(
     полусотни фраз, объём набирает — и гасит всё семейство разом. Это и есть
     минусация в исходном смысле, а не удаление отдельных запросов.
 
-    Правило то же, что у фраз (minus_word_candidates): слово, у которого по
-    всем его фразам НЕТ конверсий при достаточном объёме, или есть, но дороже
-    допустимого. Слово, встречающееся хотя бы в одной конверсионной фразе,
-    кандидатом не станет — его конверсии войдут в агрегат.
+    Правило СТРОЖЕ, чем у фраз: кандидатом становится только слово, у
+    которого по всем его фразам НЕТ КОНВЕРСИЙ ВОВСЕ при достаточном объёме.
+    Ветка «конверсии есть, но дорого» законна для отдельной фразы и
+    катастрофична для слова: минус-слово гасит ВСЁ семейство фраз, включая
+    конверсионные. На боевых данных 25.08 эта ветка предложила заминусовать
+    «высшее» (226 конверсий, 1,18 млн ₽), «институты», «факультеты» — то есть
+    отрезать ядро трафика образовательного проекта. Дорогая, но живая
+    семантика лечится ставкой и целевым CPA (Э3.5), а не запретом.
+
+    protected_words — слова нашей собственной семантики (core_words по
+    matched_key). Не минусуются никогда, по тому же доводу.
     """
     if cpa_limit <= 0:
         return []
@@ -265,8 +290,18 @@ def word_minus_candidates(
                 slot["cost_by_campaign"][campaign_id] = (
                     slot["cost_by_campaign"].get(campaign_id, 0.0) + cost)
 
+    # Умолчание — защита ВКЛЮЧЕНА: своя семантика выводится из самих запросов
+    # (matched_key). Вызывающий, забывший передать список, не должен получать
+    # рычаг, готовый запретить собственные ключевые слова.
+    protected = ({str(w).lower() for w in protected_words}
+                 if protected_words is not None else core_words(queries))
     ready = [{**slot, "campaigns": sorted(slot["campaigns"])}
-             for slot in by_word.values() if slot["phrases"] >= min_phrases]
+             for slot in by_word.values()
+             if slot["phrases"] >= min_phrases
+             # Своя семантика и слова с конверсиями до судьи не доходят:
+             # см. докстринг — минус-слово гасит и конверсионные фразы.
+             and slot["query"] not in protected
+             and slot["conversions"] == 0]
     split_by_word = {slot["query"]: slot["cost_by_campaign"] for slot in ready}
     judged = minus_word_candidates(ready, cpa_limit=cpa_limit,
                                    multiplier=multiplier,

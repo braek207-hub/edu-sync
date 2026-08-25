@@ -58,6 +58,7 @@ from sync.agent.objects import (
     build_object_rows,
     minus_word_candidates,
     placement_candidates,
+    core_words,
     word_minus_candidates,
     top_queries_by_cost,
 )
@@ -697,8 +698,13 @@ def main() -> int:
     # конверсий — редкость), а слово, общее для полусотни фраз, набирает и
     # гасит всё семейство разом. Считаются по ВСЕМ запросам кабинета, не по
     # топу: слово живёт как раз в хвосте, который топ отсекает.
+    # Слова НАШЕЙ семантики (из ключевых фраз кабинета) минусации не подлежат:
+    # запрет отменил бы собственную закупку. Дорогая своя семантика лечится
+    # целевым CPA (Э3.5).
+    protected_words = core_words(seeing_queries)
     word_candidates = (word_minus_candidates(seeing_queries, cpa_limit=cpa_limit,
-                                             base_conversion=base_conversion)
+                                             base_conversion=base_conversion,
+                                             protected_words=protected_words)
                        if cpa_limit > 0 else [])
 
     # Кандидаты в минус-фразы уезжают в computed по кампаниям: применяет их
