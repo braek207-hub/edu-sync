@@ -29,6 +29,23 @@ for label, kwargs in (("data-bytes", {"data": payload}),
                       timeout=60, **kwargs)
     print(label, r.status_code, r.text[:300])
 
+prompt = semantic.build_prompt(["высшее образование дистанционно"], "онлайн-университет")
+for label, text in (("как есть", prompt),
+                    ("со строчным json", prompt + "
+Формат ответа — json.")):
+    body = _json.dumps({
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": text}],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }, ensure_ascii=False).encode("utf-8")
+    r = requests.post("https://api.deepseek.com/chat/completions",
+                      data=body,
+                      headers={"Authorization": "Bearer " + key,
+                               "Content-Type": "application/json; charset=utf-8"},
+                      timeout=60)
+    print(label, r.status_code, r.text[:400])
+
 try:
     answer = semantic.deepseek_asker()("высшее образование дистанционно")
     print("ответ получен, длина", len(answer))
