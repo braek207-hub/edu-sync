@@ -911,7 +911,7 @@ def absolute_max_cpa_from_baseline(baseline_cpa: Dict[str, float]) -> Any:
 
 def build_red_line(
     action: Dict[str, Any], baseline_cpa: Dict[str, float], absolute_max_cpa: Any,
-    baseline_window: Any = None,
+    baseline_window: Any = None, baseline_cpo: Optional[Dict[str, float]] = None,
 ) -> Any:
     """Красная линия для действия, или None, если её посчитать не из чего.
 
@@ -930,6 +930,15 @@ def build_red_line(
     поэтому здесь всегда безопасно передать absolute_max_cpa как есть.
     """
     baseline = {"cpa": baseline_cpa.get(str(action["object_id"]), 0.0)}
+    # Цена оплаты кампании на том же окне. Красная линия её не читает — по
+    # оплатам не откатывают, они дозревают дольше наблюдения. Едет она ради
+    # ВТОРОГО чекпоинта: через 35 дней сторож сверяет вердикт по заявкам с
+    # деньгами (money_verdict), и база к тому времени берётся уже неоткуда.
+    # Кампании без оплат за окно в справочнике нет — тогда поля не будет, и
+    # сверка честно скажет «unknown» вместо выдуманного успеха.
+    cpo = (baseline_cpo or {}).get(str(action["object_id"]))
+    if cpo:
+        baseline["cpo"] = cpo
     if baseline_window:
         # Границы окна базы едут в саму линию: по ним сторож считает сезонную
         # поправку порога (agent_e1_watchdog.seasonal_factor).
@@ -1404,7 +1413,7 @@ def run_account(
     no_red_line: List[Dict[str, Any]] = []
     for a in allowed:
         red_line = build_red_line(a, baseline_cpa, absolute_max_cpa,
-                                  baseline_window)
+                                  baseline_window, ctx.get("baseline_cpo"))
         if red_line is None:
             no_red_line.append({**a, "blocked_reason": NO_RED_LINE_REASON})
             continue
@@ -1674,6 +1683,16 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         agent_db.load_baseline_cpa(cutoff, crm_through.isoformat())
         if crm_through else {}
     )
+    # База ЦЕНЫ ОПЛАТЫ по тому же окну — для второго чекпоинта
+    # (agent_e1_watchdog.money_verdict): через 35 дней вердикт по заявкам
+    # сверяется с деньгами, и сравнивать он обязан с базой, снятой тем же
+    # способом и за тот же период. Снимается здесь, на применении, а не
+    # сторожем задним числом: к моменту сверки окно базы уже недоступно —
+    # кампанию с тех пор трогали, в том числе сам агент.
+    baseline_cpo = (
+        agent_db.load_baseline_cpo(cutoff, crm_through.isoformat())
+        if crm_through else {}
+    )
     wk = week_start(today)
 
     # Абсолютный аварийный порог красной линии считается один раз на весь
@@ -1705,6 +1724,7 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "cost_28d_by_campaign": {cid: value * 28.0
                                  for cid, value in daily_cost.items()},
         "baseline_cpa": baseline_cpa,
+        "baseline_cpo": baseline_cpo,
         # Окно, на котором снята база: едет в красную линию, по нему сторож
         # считает сезонную поправку порога.
         "baseline_window": (cutoff, crm_through.isoformat()) if crm_through else None,

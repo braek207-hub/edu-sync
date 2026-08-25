@@ -123,6 +123,25 @@ WRITER_DDL: List[str] = [
     ALTER TABLE edu_agent_actions
       ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ
     """,
+    # ВТОРОЙ ЧЕКПОИНТ. Наблюдение закрывается по заявкам — рано, на седьмой
+    # день (EARLY_CLOSE_MIN_DAYS), и это возвращает темп. Но оплаты дозревают
+    # до 35-го дня, и вердикт «подешевело» по заявкам регулярно оборачивается
+    # «подорожало» по деньгам. Без отдельной отметки такую сверку негде
+    # учесть: строка уже закрыта, и следующий прогон её не видит.
+    #
+    #   money_checked_at — когда сверка состоялась. NULL у закрытой строки
+    #                      моложе 35 дней означает «ещё рано», у строки старше
+    #                      — «ещё не сверяли».
+    #   money_verdict    — исход по цене оплаты той же шкалы, что и по
+    #                      заявкам (improved/worsened/inconclusive/unknown).
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS money_checked_at TIMESTAMPTZ
+    """,
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS money_verdict TEXT
+    """,
     # Потолок попыток читается на каждом прогоне по сегменту среди строк,
     # оставшихся в отказных статусах, — тот же довод про seq scan, что у
     # индексов кулдауна.
@@ -282,7 +301,7 @@ def make_action_id(idempotency_key: str) -> str:
     return hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:24]
 
 
-def _fetch(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+def _fetch(sql: str, params: Any = ()) -> List[Dict[str, Any]]:
     with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)
@@ -538,6 +557,58 @@ def mark_observation_closed(action_id: str, verdict: str) -> bool:
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(MARK_OBSERVATION_CLOSED_SQL, {
+                "action_id": action_id,
+                "verdict": str(verdict)[:200],
+            })
+            landed = cur.fetchone() is not None
+        conn.commit()
+    return landed
+
+
+# Строки, закрытые по заявкам и дозревшие для сверки деньгами. Фильтр по
+# датам делает БАЗА, а не Python: строк с закрытым наблюдением копится за
+# всё время работы агента, и тащить их все в память ради арифметики с датой
+# было бы тем же seq scan, от которого рядом стоят индексы кулдауна.
+ACTIONS_AWAITING_MONEY_CHECK_SQL = """
+    SELECT * FROM edu_agent_actions
+     WHERE observation_closed_at IS NOT NULL
+       AND money_checked_at IS NULL
+       AND applied_at IS NOT NULL
+       AND rolled_back_at IS NULL
+       AND applied_at <= now() - make_interval(days => %(days)s)
+     ORDER BY applied_at
+"""
+
+
+def actions_awaiting_money_check(days: int) -> List[Dict[str, Any]]:
+    """Закрытые действия, у которых пора сверить вердикт с оплатами.
+
+    Откатанные исключены: изменения в кабинете больше нет, и денежный след
+    окна принадлежит уже не ему. Строки без applied_at — тоже: отсчитывать
+    созревание не от чего.
+    """
+    return _fetch(ACTIONS_AWAITING_MONEY_CHECK_SQL, {"days": int(days)})
+
+
+MARK_MONEY_CHECKED_SQL = """
+    UPDATE edu_agent_actions
+       SET money_checked_at = now(),
+           money_verdict    = %(verdict)s
+     WHERE action_id = %(action_id)s
+       AND money_checked_at IS NULL
+    RETURNING action_id
+"""
+
+
+def mark_money_checked(action_id: str, verdict: str) -> bool:
+    """Отмечает сверку деньгами. True — строка была наша.
+
+    Тот же атомарный захват, что у закрытия наблюдения: два параллельных
+    сторожа не должны записать один исход дважды.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(MARK_MONEY_CHECKED_SQL, {
                 "action_id": action_id,
                 "verdict": str(verdict)[:200],
             })

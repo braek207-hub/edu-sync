@@ -486,6 +486,32 @@ def load_baseline_cpa(date_from: str, date_to: str) -> Dict[str, float]:
     return {str(r["campaign_id"]): float(r["cpa"]) for r in rows}
 
 
+def load_baseline_cpo(date_from: str, date_to: str) -> Dict[str, float]:
+    """Базовая цена ОПЛАТЫ кампании за то же окно — база второго чекпоинта.
+
+    Зеркало load_baseline_cpa со сменой знаменателя: там эффективные лиды,
+    здесь оплаты. Второй чекпоинт (agent_e1_watchdog.money_verdict) сверяет
+    вердикт по заявкам с деньгами через 35 дней, и сравнивать ему нужно с
+    базой, снятой по ТОМУ ЖЕ окну и тем же способом — иначе разница между
+    базой и наблюдением окажется разницей методик.
+
+    Кампании без единой оплаты за окно в словарь не попадают: цены нет, и
+    ноль здесь означал бы «оплата бесплатна».
+    """
+    rows = _fetch_dicts(
+        """
+        SELECT campaign_id,
+               SUM(cost) / NULLIF(SUM(payments_fact), 0) AS cpo
+        FROM edu_agent_facts
+        WHERE fact_date BETWEEN %s AND %s
+        GROUP BY campaign_id
+        HAVING SUM(payments_fact) > 0
+        """,
+        (date_from, date_to),
+    )
+    return {str(r["campaign_id"]): float(r["cpo"]) for r in rows}
+
+
 def load_daily_account_totals(date_from: str, date_to: str) -> List[Dict[str, Any]]:
     """Дневные агрегаты ВСЕЙ витрины: расход и эффективные лиды по дню.
 
@@ -527,7 +553,7 @@ def load_daily_facts(
         return []
     return _fetch_dicts(
         """
-        SELECT campaign_id, fact_date, cost, eff_leads
+        SELECT campaign_id, fact_date, cost, eff_leads, payments_fact
         FROM edu_agent_facts
         WHERE campaign_id = ANY(%s) AND fact_date BETWEEN %s AND %s
         """,

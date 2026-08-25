@@ -77,6 +77,15 @@ def red_line_for(
     # (agent_e1_watchdog.seasonal_factor). Без окна сезон не отличить от вреда.
     window = {"baseline_from": baseline.get("window_from"),
               "baseline_to": baseline.get("window_to")}
+    # Цена оплаты на том же окне. Откату она не служит — по оплатам не
+    # откатывают, они дозревают дольше наблюдения. Едет ради ВТОРОГО
+    # чекпоинта: через 35 дней сторож сверяет вердикт по заявкам с деньгами
+    # (agent_e1_watchdog.money_verdict), а взять базу к тому моменту уже
+    # неоткуда — кампанию с тех пор трогали. Нет оплат за окно — нет и поля:
+    # сверка честно скажет «unknown» вместо выдуманного успеха.
+    base_cpo = float(baseline.get("cpo") or 0.0)
+    if base_cpo > 0:
+        window["baseline_cpo"] = base_cpo
     if base_cpa > 0:
         return {
             "metric": "cpa",

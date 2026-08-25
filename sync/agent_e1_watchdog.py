@@ -535,6 +535,73 @@ def closing_verdict(observed: Dict[str, Any], action: Dict[str, Any]) -> str:
     return outcome_verdict((cpa - base) / base, math.sqrt(1.0 / max(leads, 1)))
 
 
+def money_metrics(rows: Iterable[Dict[str, Any]],
+                  window: Tuple[date, date, bool]) -> Dict[str, Any]:
+    """Наблюдение за тем же окном, но в оплатах: расход, оплаты, цена оплаты.
+
+    Зеркало observed_metrics со сменой знаменателя. Отдельная функция, а не
+    параметр: у них разные базы сравнения (baseline_cpa против baseline_cpo)
+    и разные сроки готовности данных, и смешивать их в одном вызове значило
+    бы однажды сравнить цену заявки с ценой оплаты.
+
+    payments=0 → cpo=0, ровно как leads=0 → cpa=0 у соседа: «цены нет» — не
+    «цена бесконечна». Бесконечность пробила бы любой порог на первом дне.
+    """
+    start, end, _ = window
+    cost = 0.0
+    payments = 0
+    days = 0
+    for row in rows:
+        fact_date = _as_date(row.get("fact_date"))
+        if fact_date is None or fact_date < start or fact_date > end:
+            continue
+        cost += float(row.get("cost") or 0.0)
+        payments += int(row.get("payments_fact") or 0)
+        days += 1
+    return {
+        "cost": round(cost, 2),
+        "payments": payments,
+        "cpo": round(cost / payments, 2) if payments > 0 else 0.0,
+        "days": days,
+    }
+
+
+def money_verdict(money: Dict[str, Any], action: Dict[str, Any]) -> str:
+    """Исход того же действия, посчитанный по цене ОПЛАТЫ.
+
+    Та же шкала, что у вердикта по заявкам (rollback.outcome_verdict), и та
+    же оценка ошибки — из объёма знаменателя. Разница в знаменателе и в
+    сроке: оплаты дозревают дольше наблюдения, поэтому вердикт снимается
+    позже (money_check_due).
+
+    Нет денежной базы — «unknown», а не успех. Действия, применённые до
+    появления baseline_cpo, сверять не с чем, и записывать их как
+    подтверждённые деньгами нельзя.
+    """
+    red = action.get("red_line") or {}
+    base = float(red.get("baseline_cpo") or 0.0)
+    cpo = float((money or {}).get("cpo") or 0.0)
+    payments = int((money or {}).get("payments") or 0)
+    if base <= 0 or cpo <= 0:
+        return "unknown"
+    return outcome_verdict((cpo - base) / base, math.sqrt(1.0 / max(payments, 1)))
+
+
+def money_check_due(action: Dict[str, Any], today: date) -> bool:
+    """Пора ли сверять вердикт деньгами: прошло ли MONEY_CHECKPOINT_DAYS.
+
+    Отсчёт от ПРИМЕНЕНИЯ, а не от закрытия наблюдения: дозревают оплаты
+    лидов, пришедших после изменения, и их возраст считается от него же.
+    Строка без даты применения чекпоинта не получает — отсчитывать не от
+    чего, и подставлять сюда дату создания значило бы измерять окно, которого
+    не было.
+    """
+    applied = _as_date(action.get("applied_at"))
+    if applied is None:
+        return False
+    return (today - applied).days >= MONEY_CHECKPOINT_DAYS
+
+
 def action_experiment(action: Dict[str, Any], observed: Dict[str, Any],
                       window: Tuple[date, date, bool], verdict: str) -> Dict[str, Any]:
     """Исход собственного действия — строкой истории экспериментов (Э2.4).
@@ -1283,6 +1350,14 @@ STALE_SWEEP_MINUTES = 60
 # которую легко принять за эффект действия.
 EARLY_CLOSE_MIN_DAYS = 7
 
+# Второй чекпоинт: через столько дней после ПРИМЕНЕНИЯ вердикт по заявкам
+# сверяется с деньгами. 35 — потому что к этому дню дозревают 91 % оплат
+# (лаг CRM, замер направления). Первый чекпоинт закрывает наблюдение рано и
+# этим возвращает темп; второй не даёт превратить темп в самообман: заявка
+# подешевела, а оплата подорожала — обычный исход, и без сверки он уходит в
+# обучающую историю как успех.
+MONEY_CHECKPOINT_DAYS = 35
+
 # Потолок сезонной поправки красной линии. Кабинет дорожает и дешевеет вместе
 # с рынком, и порог обязан двигаться следом — иначе перелом сезона устраивает
 # массовые ложные пробои и записывает «действия вредны» ровно там, где
@@ -1313,6 +1388,14 @@ def alarm_reasons(out: Dict[str, Any]) -> List[str]:
         reasons.append(f"неоткатываемых вручную: {out['needs_manual_rollback']}")
     if str((out.get("data_gate") or {}).get("status")) != "GREEN":
         reasons.append("гейт данных не зелёный — откаты заморожены")
+    # Заявки сказали одно, деньги — другое. Не аварийная ситуация, но
+    # молчать о ней нельзя: на этих вердиктах учится портфель, и «подешевела
+    # заявка, подорожала оплата» обязано дойти до человека, а не осесть
+    # строкой в журнале.
+    contradictions = (out.get("money_checkpoint") or {}).get("contradictions") or []
+    if contradictions:
+        reasons.append(
+            f"вердикт по деньгам разошёлся с вердиктом по заявкам: {len(contradictions)}")
     if int((out.get("stale_marked") or {}).get("count") or 0) > 0:
         reasons.append(f"зависших строк помечено: {out['stale_marked']['count']}")
     for account in out.get("accounts") or []:
@@ -1326,6 +1409,66 @@ def alarm_reasons(out: Dict[str, Any]) -> List[str]:
         if int(account.get("needs_review") or 0) > 0:
             reasons.append(f"{login}: строк без вердикта {account['needs_review']}")
     return reasons
+
+
+def money_checkpoint(db_module: Any, today: date, crm_through: Optional[date],
+                     journal_ok: bool) -> Dict[str, Any]:
+    """Второй чекпоинт: вердикт закрытых действий сверяется с оплатами.
+
+    Замыкает то, что первый чекпоинт открыл. Досрочное закрытие судит по
+    заявкам на седьмой день — это темп; здесь, на тридцать пятый, то же самое
+    окно пересчитывается по оплатам, которые к этому дню дозрели на 91 %
+    (edu_agent_facts зачисляет оплату в день СОЗДАНИЯ лида, поэтому окно не
+    надо сдвигать — оно само наполняется задним числом).
+
+    Расхождение вердиктов — не ошибка и не повод откатывать: изменение живёт
+    месяц, откатывать его вслепую вреднее, чем оставить. Это повод записать
+    правду в историю обучения и показать её человеку. Без сверки история
+    наполняется «успехами», подтверждёнными только заявками, — тот же дефект,
+    что аудит поймал у бинарного вердикта.
+
+    Репетиция журнал не трогает: сверка — утверждение о боевом кабинете.
+    """
+    due = db_module.actions_awaiting_money_check(MONEY_CHECKPOINT_DAYS)
+    out: Dict[str, Any] = {"due": len(due), "checked": 0, "verdicts": {},
+                           "contradictions": [], "skipped_no_baseline": 0}
+    if not due:
+        return out
+    facts = load_facts(due, today, crm_through)
+    for action in due:
+        # Выборка журнала сужает грубо (интервал считает БД), а правило
+        # созревания живёт здесь: одна проверка на обеих сторонах границы
+        # надёжнее, чем доверие к тому, что интервал посчитан тем же числом.
+        if not money_check_due(action, today):
+            continue
+        window = observation_window(action, today, crm_through)
+        if window is None:
+            continue
+        rows = facts.get(str(action.get("object_id"))) or []
+        money = money_metrics(rows, window)
+        verdict = money_verdict(money, action)
+        if verdict == "unknown":
+            out["skipped_no_baseline"] += 1
+        by_leads = str(action.get("observation_verdict") or "")
+        # Противоречие — только между ОПРЕДЕЛЁННЫМИ исходами: «неясно» с
+        # любой стороны означает, что сравнивать нечего, а не что вердикты
+        # разошлись.
+        if (by_leads in ("improved", "worsened") and verdict in ("improved", "worsened")
+                and by_leads != verdict):
+            out["contradictions"].append({
+                "action_id": action.get("action_id"),
+                "object_id": action.get("object_id"),
+                "by_leads": by_leads, "by_money": verdict,
+                "cpo": money.get("cpo"),
+                "baseline_cpo": (action.get("red_line") or {}).get("baseline_cpo"),
+                "payments": money.get("payments"),
+            })
+        if not journal_ok:
+            continue
+        if db_module.mark_money_checked(action.get("action_id"), verdict):
+            out["checked"] += 1
+            out["verdicts"][verdict] = out["verdicts"].get(verdict, 0) + 1
+    return out
 
 
 def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
@@ -1398,6 +1541,11 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
         # разбирает человек. Число накопительное, а не за прогон, — иначе
         # находка прошлого прогона исчезала бы из виду.
         "needs_manual_rollback": writer_db.failed_rollbacks_count(),
+        # Второй чекпоинт — сверка закрытых вердиктов с деньгами. Стоит
+        # отдельным блоком, а не внутри кабинета: строка сверяется по своему
+        # возрасту, а не по тому, чей кабинет попал в этот прогон.
+        "money_checkpoint": money_checkpoint(writer_db, today, crm_through,
+                                             journal_ok=not dry_run),
     }
     out["alarms"] = alarm_reasons(out)
     print(json.dumps(out, ensure_ascii=False, indent=2))

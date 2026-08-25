@@ -76,6 +76,10 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
     monkeypatch.setattr(agent_e1.writer_db, "recent_action_objects",
                         lambda *a, **k: set())
     monkeypatch.setattr(agent_e1.writer_db, "mark_sent", lambda action_id: None)
+    # База цены оплаты — инфраструктура второго чекпоинта: в красную линию
+    # она едет пассажиром и на решения прогона не влияет (по оплатам не
+    # откатывают). Тест, которому она важна, подменяет её сам.
+    monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpo", lambda *_: {})
 
 
 class _FakeCampaignsClient:

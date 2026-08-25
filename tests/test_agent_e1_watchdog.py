@@ -963,6 +963,11 @@ def _patch_watchdog_main(monkeypatch, lock):
     # аренды падал бы на отсутствии DATABASE_URL, а не на своём утверждении.
     monkeypatch.setattr(watchdog.agent_db, "crm_maturity_date",
                         lambda: DEFAULT_CRM_THROUGH)
+    # Второй чекпоинт спрашивает журнал о дозревших строках на каждом
+    # прогоне — тем же доводом, что и граница зрелости выше: тест про аренду
+    # обязан падать на своём утверждении, а не на живой базе.
+    monkeypatch.setattr(watchdog.writer_db, "actions_awaiting_money_check",
+                        lambda days: [])
 
 
 def test_watchdog_takes_the_run_lease_under_its_own_name(monkeypatch, capsys):
