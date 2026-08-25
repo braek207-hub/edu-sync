@@ -1,0 +1,22 @@
+name: probe-blind-campaigns-api
+# Разовый read-only замер: отдаёт ли API кампании, которые тратят деньги, но
+# отсутствуют в витрине настроек (см. probe_blind_campaigns_api.py).
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Спросить API про слепые кампании
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+          DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
+        run: python probe_blind_campaigns_api.py
