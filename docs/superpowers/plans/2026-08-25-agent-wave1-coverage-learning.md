@@ -4,7 +4,8 @@
 > (рекомендуется) или `superpowers:executing-plans`. Шаги отмечены чекбоксами `- [ ]`.
 
 **Цель:** закрыть три дыры в картине мира агента (недобор трафика, слепая зона расхода,
-спрос как календарь) и научить его не сбивать обучение автостратегий Директа.
+спрос как календарь), научить его не сбивать обучение автостратегий Директа и не дать
+ему сходиться к «эффективно, но мало»: каждое сокращение обязано иметь адресата роста.
 
 **Архитектура:** все расчёты — чистые функции в `sync/agent/*`, вызываемые из такта Э0
 (`sync/agent_e0.py`) и такта записи Э1 (`sync/agent_e1.py`). Ни один новый модуль не ходит
@@ -43,6 +44,13 @@ DDL-строками в `sync/agent/db.py::AGENT_DDL` + файл в `migrations/
   никогда `git add -A`).
 - Ничего из этой волны не применяется в боевой кабинет: рычаги эта волна не добавляет,
   только меняет отбор и отчётность.
+- **Рост и эффективность вместе** (решение Павла 25.08): агент не имеет права сводить
+  оптимизацию к сокращению. Освободившиеся деньги обязаны получить адресата, такт с
+  суммарным минусом по ожидаемым лидам не применяется целиком, и каждый такт — даже
+  без единого сокращения — предъявляет список того, что можно усилить (задачи 9, 10).
+- **Порог обучения по бюджету** (решение Павла 25.08): изменение недельного или
+  дневного лимита в пределах ±20 % обучение стратегии не сбрасывает; рост до ×2
+  оправдан адресно, при доказанном недоборе трафика (задачи 5, 8).
 
 ---
 
@@ -960,8 +968,8 @@ git commit -m "feat(agent): недобор трафика в кривых нас
 
 | Вид действия | Класс | Почему |
 |---|---|---|
-| `budget.set` | сбрасывает | недельный лимит = ограничение расхода |
-| `budget.set_daily` | сбрасывает | дневной лимит = ограничение расхода |
+| `budget.set` | **по величине**: ≤ 20 % — безопасно, больше — сбрасывает | практика Павла: изменение недельного бюджета в пределах ±20 % обучение не сбивает; справка говорит про «изменение ограничения расхода» без порога, порог — из практики ведения кабинетов |
+| `budget.set_daily` | **по величине**, тот же порог | дневной лимит — то же ограничение расхода |
 | `tcpa.set` | сбрасывает | цель CPA — параметр целевого действия стратегии |
 | `campaign.suspend` | сбрасывает | остановка дольше семи дней |
 | `bidmodifier.set` / `bidmodifier.add` | безопасно | корректировок в списке справки нет |
@@ -1009,11 +1017,41 @@ from sync.agent.writer.learning import (
 )
 
 
-def test_budget_and_tcpa_reset_learning():
-    assert learning_impact({"action_kind": "budget.set"}) == "resets"
-    assert learning_impact({"action_kind": "budget.set_daily"}) == "resets"
+def _budget(new_micros, old_micros):
+    return {"action_kind": "budget.set",
+            "payload": {"WeeklySpendLimit": new_micros},
+            "previous_state": {"WeeklySpendLimit": old_micros}}
+
+
+def test_tcpa_and_suspend_reset_learning():
     assert learning_impact({"action_kind": "tcpa.set"}) == "resets"
     assert learning_impact({"action_kind": "campaign.suspend"}) == "resets"
+
+
+def test_small_budget_change_is_safe():
+    # ±20 % недельного бюджета обучение не сбивают (практика ведения кабинетов).
+    assert learning_impact(_budget(1_200_000_000, 1_000_000_000)) == "safe"
+    assert learning_impact(_budget(850_000_000, 1_000_000_000)) == "safe"
+
+
+def test_big_budget_change_resets():
+    assert learning_impact(_budget(1_500_000_000, 1_000_000_000)) == "resets"
+    assert learning_impact(_budget(500_000_000, 1_000_000_000)) == "resets"
+
+
+def test_daily_budget_uses_same_threshold():
+    action = {"action_kind": "budget.set_daily",
+              "payload": {"DailyBudget": {"Amount": 110_000_000}},
+              "previous_state": {"DailyBudget": {"Amount": 100_000_000}}}
+    assert learning_impact(action) == "safe"
+
+
+def test_budget_without_previous_value_is_unknown():
+    # Прежнего лимита не прочитали — величину изменения не посчитать, и
+    # «безопасно» здесь было бы догадкой.
+    assert learning_impact({"action_kind": "budget.set",
+                            "payload": {"WeeklySpendLimit": 1_000_000_000},
+                            "previous_state": {}}) == "unknown"
 
 
 def test_modifiers_and_lists_are_safe():
@@ -1042,7 +1080,7 @@ def test_safe_actions_pass_cooldown_untouched():
 
 
 def test_resetting_action_blocked_inside_cooldown():
-    actions = [{"object_id": "111", "action_kind": "budget.set"}]
+    actions = [{"object_id": "111", **_budget(1_500_000_000, 1_000_000_000)}]
     allowed, blocked = split_by_learning_cooldown(
         actions, {"111": date(2026, 8, 20)}, today=date(2026, 8, 25))
     assert allowed == []
@@ -1060,9 +1098,18 @@ def test_resetting_action_passes_after_cooldown():
 
 
 def test_object_without_history_passes():
-    actions = [{"object_id": "222", "action_kind": "budget.set"}]
+    actions = [{"object_id": "222", **_budget(1_500_000_000, 1_000_000_000)}]
     allowed, blocked = split_by_learning_cooldown(actions, {}, today=date(2026, 8, 25))
-    assert allowed == actions
+    assert len(allowed) == 1 and blocked == []
+
+
+def test_small_budget_step_passes_inside_cooldown():
+    # Главный смысл порога: перелив в пределах ±20 % идёт каждый такт, даже
+    # если стратегию перезапускали вчера. Иначе перераспределение встало бы.
+    actions = [{"object_id": "111", **_budget(1_150_000_000, 1_000_000_000)}]
+    allowed, blocked = split_by_learning_cooldown(
+        actions, {"111": date(2026, 8, 24)}, today=date(2026, 8, 25))
+    assert len(allowed) == 1 and blocked == []
 
 
 def test_unknown_class_is_treated_as_resetting():
@@ -1122,8 +1169,6 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 RESETS_LEARNING = {
-    "budget.set",        # недельный лимит — ограничение расхода
-    "budget.set_daily",  # дневной лимит — оно же
     "tcpa.set",          # цель CPA — параметр целевого действия стратегии
     "campaign.suspend",  # остановка дольше семи дней
 }
@@ -1134,6 +1179,15 @@ SAFE_FOR_LEARNING = {
     "negative.add",
     "placement.exclude",
 }
+
+# Бюджетные действия судятся ВЕЛИЧИНОЙ, а не видом. Справка называет
+# перезапускающим «изменение ограничения расхода» без порога, но на практике
+# ведения кабинетов сдвиг лимита в пределах ±20 % стратегию не сбивает —
+# а именно такими шагами и работает перераспределение (portfolio.py двигает
+# бюджеты каждый такт). Записать весь класс в сбрасывающие значило бы
+# запереть перелив кулдауном в две недели и остановить главный механизм.
+BUDGET_KINDS = {"budget.set", "budget.set_daily"}
+BUDGET_SAFE_DELTA = 0.20
 
 # Обучение занимает недели (справка: «прежде чем стратегия покажет наилучшие
 # результаты, как правило, проходит несколько недель»). Две недели — нижняя
@@ -1147,9 +1201,31 @@ COOLDOWN_REASON = (
 )
 
 
+def _budget_values(action: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """Новый и прежний лимит действия (в микрорублях), если оба читаемы."""
+    payload = action.get("payload") or {}
+    previous = action.get("previous_state") or {}
+    if str(action.get("action_kind")) == "budget.set_daily":
+        new = (payload.get("DailyBudget") or {}).get("Amount")
+        old = (previous.get("DailyBudget") or {}).get("Amount")
+    else:
+        new = payload.get("WeeklySpendLimit")
+        old = previous.get("WeeklySpendLimit")
+    try:
+        return (float(new), float(old)) if new and old else (None, None)
+    except (TypeError, ValueError):
+        return None, None
+
+
 def learning_impact(action: Dict[str, Any]) -> str:
     """Класс действия: 'resets' | 'safe' | 'unknown'."""
     kind = str(action.get("action_kind") or "")
+    if kind in BUDGET_KINDS:
+        new, old = _budget_values(action)
+        if not new or not old:
+            # Величину изменения не посчитать — а «безопасно» без неё догадка.
+            return "unknown"
+        return "safe" if abs(new / old - 1.0) <= BUDGET_SAFE_DELTA else "resets"
     if kind in RESETS_LEARNING:
         return "resets"
     if kind in SAFE_FOR_LEARNING:
@@ -1202,7 +1278,7 @@ def split_by_learning_cooldown(
 - [ ] **Шаг 4: Прогнать тесты модуля**
 
 Запуск: `python -m pytest tests/test_agent_writer_learning.py -q`
-Ожидается: PASS (11 тестов).
+Ожидается: PASS (все тесты файла).
 
 - [ ] **Шаг 5: Завести колонку журнала и чтение истории**
 
@@ -1775,7 +1851,638 @@ git commit -m "feat(agent): спрос Wordstat как режим направл
 
 ---
 
-## Задача 8: свести волну в документации и прогнать боевой такт
+## Задача 8: рост бюджета до ×2, когда недобор доказан
+
+Кап шага сейчас ×1.5 за такт (`portfolio.MAX_STEP_UP`), рельса движка — ×1.6
+(`guardrails.BUDGET_RATIO_MAX`). Решение Павла: рост в два раза бывает оправдан.
+Открывать его всем нельзя — кап ×1.5 стоит там потому, что дальше собственных
+наблюдений кривая превращается в экстраполяцию. Значит ×2 разрешается адресно, под
+три условия сразу:
+
+1. **недобор трафика доказан** — `growth_room is True` (задача 3): деньги упрутся в
+   реально доступные показы, а не в выдуманный спрос;
+2. **кривая не спорит** — `beta < 1` и вердикт кривой не «насыщается»;
+3. **экономика с запасом** — `marginal_roi_vs_lambda >= BIG_STEP_ROI_MARGIN` (1.5):
+   предельный рубль возвращает в полтора раза больше порога кабинета.
+
+Шаг ×2 всегда сбрасывает обучение (задача 5: больше 20 %), поэтому он автоматически
+попадает под кулдаун 14 дней — повторить его на следующем такте не выйдет.
+
+**Файлы:**
+- Изменить: `sync/agent/portfolio.py:79-100` (`_target_spend`), `:20-62` (константы)
+- Изменить: `sync/agent/writer/guardrails.py:48-49` (`BUDGET_RATIO_MAX`)
+- Изменить: `tests/test_agent_portfolio.py`, `tests/test_agent_writer_guardrails.py`
+
+**Интерфейсы:**
+- Потребляет: поля кампании `headroom_share`, `growth_room` (задачи 3–4), `beta`,
+  `marginal_roi_vs_lambda`.
+- Отдаёт: `step_cap_up(campaign) -> float` — ×1.5 по умолчанию, ×2.0 при трёх условиях.
+
+- [ ] **Шаг 1: Написать падающий тест**
+
+```python
+def test_step_cap_is_1_5_by_default():
+    from sync.agent.portfolio import step_cap_up
+
+    assert step_cap_up({"growth_room": False, "beta": 0.6,
+                        "marginal_roi_vs_lambda": 3.0}) == 1.5
+
+
+def test_step_cap_is_2_when_headroom_and_economics_agree():
+    from sync.agent.portfolio import step_cap_up
+
+    assert step_cap_up({"growth_room": True, "beta": 0.6,
+                        "marginal_roi_vs_lambda": 1.6}) == 2.0
+
+
+def test_step_cap_stays_1_5_without_headroom_proof():
+    # Экономика хорошая, но объём брать негде: ×2 просто поднимет цену клика.
+    from sync.agent.portfolio import step_cap_up
+
+    assert step_cap_up({"growth_room": None, "beta": 0.6,
+                        "marginal_roi_vs_lambda": 3.0}) == 1.5
+
+
+def test_step_cap_stays_1_5_when_curve_is_superlinear():
+    from sync.agent.portfolio import step_cap_up
+
+    assert step_cap_up({"growth_room": True, "beta": 1.2,
+                        "marginal_roi_vs_lambda": 3.0}) == 1.5
+
+
+def test_step_cap_stays_1_5_on_thin_margin():
+    from sync.agent.portfolio import step_cap_up
+
+    assert step_cap_up({"growth_room": True, "beta": 0.6,
+                        "marginal_roi_vs_lambda": 1.1}) == 1.5
+```
+
+- [ ] **Шаг 2: Прогнать и убедиться, что падает**
+
+Запуск: `python -m pytest tests/test_agent_portfolio.py -q`
+Ожидается: FAIL — `ImportError: cannot import name 'step_cap_up'`.
+
+- [ ] **Шаг 3: Ввести адресный кап**
+
+В `sync/agent/portfolio.py` рядом с `MAX_STEP_UP`:
+
+```python
+# Расширенный кап шага вверх. Обычный ×1.5 стоит на том, что дальше кривая —
+# экстраполяция. Но когда недобор трафика доказан замером (headroom.py),
+# кривая не спорит (β<1) и предельный рубль возвращает в полтора раза больше
+# порога кабинета — экстраполяции нет: деньги идут в показы, которые уже
+# существуют и сейчас достаются конкурентам. Шаг ×2 сбрасывает обучение
+# (writer/learning.py) и потому сам себя ограничивает кулдауном в 14 дней.
+BIG_STEP_UP = 2.0
+BIG_STEP_ROI_MARGIN = 1.5
+
+
+def step_cap_up(campaign: Dict[str, Any]) -> float:
+    """Потолок шага вверх для кампании: ×1.5 обычно, ×2 при доказанном недоборе."""
+    if (campaign.get("growth_room") is True
+            and float(campaign.get("beta") or 1.0) < 1.0
+            and float(campaign.get("marginal_roi_vs_lambda") or 0.0) >= BIG_STEP_ROI_MARGIN):
+        return BIG_STEP_UP
+    return MAX_STEP_UP
+```
+
+В `_target_spend` заменить жёсткий `MAX_STEP_UP` на `step_cap_up(campaign)`.
+`marginal_roi_vs_lambda` внутри `_target_spend` считается как
+`campaign["value"] / (lam * campaign["marginal_cpl"])` — передать его в словарь
+кампании перед вызовом (там же, где считается `log_ratio`), чтобы `step_cap_up`
+получил готовое число, а не пересчитывал λ.
+
+В `portfolio_targets` при сборке словаря кампании добавить `growth_room`:
+
+```python
+            "growth_room": curve.get("growth_room"),
+```
+
+- [ ] **Шаг 4: Поднять рельсу движка**
+
+В `sync/agent/writer/guardrails.py`:
+
+```python
+# Верхняя граница расширена под адресный шаг ×2 (portfolio.step_cap_up):
+# рельса ловит не политику, а слом единиц (недели вместо дней — ×7,
+# микрорубли вместо рублей — ×10⁶), и ×2.1 от них по-прежнему далеко.
+BUDGET_RATIO_MAX = 2.1
+```
+
+В `tests/test_agent_writer_guardrails.py` поправить тест, фиксирующий прежнюю
+границу, и добавить:
+
+```python
+def test_double_budget_passes_but_sevenfold_does_not():
+    # ×2 — политика (адресный рост), ×7 — недели вместо дней.
+    assert _check_budget(_budget_action(new=200.0, cost=100.0))[0] is True
+    assert _check_budget(_budget_action(new=700.0, cost=100.0))[0] is False
+```
+
+- [ ] **Шаг 5: Прогнать весь набор**
+
+Запуск: `python -m pytest tests/ -q`
+Ожидается: PASS.
+
+- [ ] **Шаг 6: Коммит**
+
+```bash
+git add sync/agent/portfolio.py sync/agent/writer/guardrails.py \
+        tests/test_agent_portfolio.py tests/test_agent_writer_guardrails.py
+git commit -m "feat(agent): шаг бюджета ×2, когда недобор трафика доказан и экономика с запасом"
+```
+
+---
+
+## Задача 9: сокращение не бывает без адресата роста
+
+Требование Павла: агент не должен сходиться к «эффективно, но мало». Каждое
+сокращение обязано иметь адресата — куда переливаются освободившиеся деньги, — а
+такт целиком не имеет права ухудшать ожидаемый объём лидов и оплат.
+
+Что уже устроено правильно: солвер портфеля сохраняет сумму кабинета
+(`portfolio_targets`, «сумма целевых = бюджету»), то есть срезание одной кампании
+автоматически становится доливкой другой. Чего нет:
+
+- **выключение кампании** (`campaign_switch/suspend`) освобождает деньги, которые в
+  этом же такте никому не назначаются: солвер считал цели на бюджете, куда
+  выключаемая кампания ещё входила;
+- **минус-фразы и запреты площадок** режут расход, и это нигде не компенсируется;
+- **нетто-эффект такта** считается (`expected_leads_delta`, `expected_revenue_delta`),
+  но ни на что не влияет: план с суммарным минусом по лидам применяется так же, как
+  план с плюсом.
+
+**Файлы:**
+- Создать: `sync/agent/balance.py`
+- Создать: `tests/test_agent_balance.py`
+- Изменить: `sync/agent_e1.py` (гейт перед отбором по лимиту + секция отчёта)
+
+**Интерфейсы:**
+- Отдаёт:
+  - `tact_balance(moves, suspends, cuts) -> Dict[str, Any]` — `{"freed_rub",
+    "added_rub", "unassigned_rub", "expected_leads_delta",
+    "expected_payments_delta", "shrinking"}`, где `shrinking` — True, если такт
+    в сумме уменьшает ожидаемые лиды.
+  - `require_growth_address(actions, balance) -> Tuple[List[Dict], List[Dict]]` —
+    при сжимающем такте снимает сокращающие действия, начиная с самых слабых по
+    ожидаемому выигрышу, пока такт не перестанет быть сжимающим; снятые получают
+    `blocked_reason`.
+  - `MIN_ASSIGNED_SHARE = 0.9` — доля освободившихся денег, которая обязана быть
+    назначена адресатам.
+
+- [ ] **Шаг 1: Написать падающий тест**
+
+```python
+# tests/test_agent_balance.py
+# -*- coding: utf-8 -*-
+"""Баланс такта: сокращение обязано иметь адресата, такт — не сжимать объём.
+
+Механизм оптимизации, у которого единственный рычаг — резать неэффективное,
+сходится к «дорого и мало»: каждая итерация улучшает среднее и уменьшает
+объём. Требование продукта — рост И эффективность, поэтому у сокращения
+обязан быть адресат, а такт целиком не имеет права уменьшать ожидаемые лиды.
+"""
+
+from sync.agent.balance import require_growth_address, tact_balance
+
+
+def _move(cid, cost, target, leads_delta):
+    return {"campaign_id": cid, "cost_28d": cost, "target_28d": target,
+            "expected_leads_delta": leads_delta}
+
+
+def test_freed_money_is_matched_by_additions():
+    moves = [_move("111", 100_000.0, 60_000.0, -8.0),
+             _move("222", 100_000.0, 140_000.0, +12.0)]
+    balance = tact_balance(moves, suspends=[], cuts=[])
+    assert balance["freed_rub"] == 40_000.0
+    assert balance["added_rub"] == 40_000.0
+    assert balance["unassigned_rub"] == 0.0
+    assert balance["shrinking"] is False
+
+
+def test_suspend_without_reassignment_leaves_money_unassigned():
+    # Выключение кампании освобождает её расход, и он обязан быть кому-то отдан.
+    moves = [_move("222", 100_000.0, 100_000.0, 0.0)]
+    balance = tact_balance(moves, suspends=[{"campaign_id": "111",
+                                             "cost_28d": 50_000.0,
+                                             "expected_leads_delta": -4.0}],
+                           cuts=[])
+    assert balance["freed_rub"] == 50_000.0
+    assert balance["unassigned_rub"] == 50_000.0
+    assert balance["shrinking"] is True
+
+
+def test_negative_and_placement_cuts_count_as_shrink():
+    balance = tact_balance([], suspends=[],
+                           cuts=[{"kind": "negative.add", "cost_saved": 12_000.0,
+                                  "expected_leads_delta": -1.0}])
+    assert balance["freed_rub"] == 12_000.0
+    assert balance["shrinking"] is True
+
+
+def test_growth_gate_drops_weakest_cut_until_tact_grows():
+    # Сжимающий такт: два сокращения и одна доливка. Снимается то сокращение,
+    # чей выигрыш меньше, — пока баланс не перестанет быть отрицательным.
+    actions = [
+        {"action_kind": "campaign.suspend", "object_id": "111",
+         "expected_leads_delta": -9.0, "expected_gain_rub": 1_000.0},
+        {"action_kind": "negative.add", "object_id": "333",
+         "expected_leads_delta": -3.0, "expected_gain_rub": 200.0},
+        {"action_kind": "budget.set", "object_id": "222",
+         "expected_leads_delta": +8.0, "expected_gain_rub": 5_000.0},
+    ]
+    allowed, blocked = require_growth_address(
+        actions, {"expected_leads_delta": -4.0, "shrinking": True})
+    assert [a["object_id"] for a in blocked] == ["333"]
+    assert len(allowed) == 2
+
+
+def test_growth_gate_is_noop_when_tact_grows():
+    actions = [{"action_kind": "budget.set", "object_id": "222",
+                "expected_leads_delta": +8.0, "expected_gain_rub": 5_000.0}]
+    allowed, blocked = require_growth_address(
+        actions, {"expected_leads_delta": 8.0, "shrinking": False})
+    assert allowed == actions and blocked == []
+
+
+def test_growth_gate_keeps_cut_when_nothing_else_left():
+    # Единственное действие такта — сокращение, компенсировать нечем. Оно
+    # снимается: пустой такт честнее такта, который только сжимает.
+    actions = [{"action_kind": "campaign.suspend", "object_id": "111",
+                "expected_leads_delta": -9.0, "expected_gain_rub": 1_000.0}]
+    allowed, blocked = require_growth_address(
+        actions, {"expected_leads_delta": -9.0, "shrinking": True})
+    assert allowed == []
+    assert "адресат" in blocked[0]["blocked_reason"]
+```
+
+- [ ] **Шаг 2: Прогнать и убедиться, что падает**
+
+Запуск: `python -m pytest tests/test_agent_balance.py -q`
+Ожидается: FAIL — `ModuleNotFoundError: No module named 'sync.agent.balance'`.
+
+- [ ] **Шаг 3: Написать модуль**
+
+```python
+# sync/agent/balance.py
+# -*- coding: utf-8 -*-
+"""
+sync/agent/balance.py — баланс такта: рост и эффективность, а не эффективность вместо роста.
+
+Механизм, у которого единственный рычаг — резать неокупающееся, монотонно
+улучшает средние и монотонно уменьшает объём: через полгода кабинет
+эффективен и вдвое меньше. Продукту нужен рост ПРИ эффективности, поэтому:
+
+  • освободившиеся деньги обязаны иметь адресата (солвер портфеля это уже
+    делает переливом, выключение кампаний и минус-фразы — нет);
+  • такт, который в сумме уменьшает ожидаемые лиды, не применяется целиком:
+    слабейшие сокращения снимаются, пока баланс не станет неотрицательным.
+
+Считаем в ожидаемых ЛИДАХ, а не в рублях расхода: рубль, снятый с плохой
+кампании и отданный хорошей, — это плюс, а рубль, просто снятый, — минус,
+и различает их только ожидаемый результат.
+"""
+
+from typing import Any, Dict, List, Tuple
+
+# Доля освободившихся денег, которая обязана быть назначена адресатам.
+# Не 100 %: округления шага и капы оставляют хвост, придираться к нему значит
+# блокировать такт из-за копеек.
+MIN_ASSIGNED_SHARE = 0.9
+
+NO_ADDRESS_REASON = (
+    "сокращение без адресата роста: такт в сумме уменьшает ожидаемые лиды "
+    "({delta:+.1f}), а компенсировать нечем — усиление не найдено"
+)
+
+
+def tact_balance(moves: List[Dict[str, Any]], suspends: List[Dict[str, Any]],
+                 cuts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Сколько такт освобождает, сколько назначает и куда идёт объём."""
+    freed = 0.0
+    added = 0.0
+    leads_delta = 0.0
+    for move in moves:
+        delta = float(move.get("target_28d") or 0.0) - float(move.get("cost_28d") or 0.0)
+        if delta < 0:
+            freed += -delta
+        else:
+            added += delta
+        leads_delta += float(move.get("expected_leads_delta") or 0.0)
+    for suspend in suspends:
+        freed += float(suspend.get("cost_28d") or 0.0)
+        leads_delta += float(suspend.get("expected_leads_delta") or 0.0)
+    for cut in cuts:
+        freed += float(cut.get("cost_saved") or 0.0)
+        leads_delta += float(cut.get("expected_leads_delta") or 0.0)
+
+    unassigned = max(0.0, freed - added)
+    return {
+        "freed_rub": round(freed, 2),
+        "added_rub": round(added, 2),
+        "unassigned_rub": round(unassigned, 2),
+        "assigned_share": round(added / freed, 4) if freed > 0 else 1.0,
+        "expected_leads_delta": round(leads_delta, 1),
+        "shrinking": bool(leads_delta < 0
+                          or (freed > 0 and added / freed < MIN_ASSIGNED_SHARE)),
+    }
+
+
+def require_growth_address(
+    actions: List[Dict[str, Any]], balance: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Снимает слабейшие сокращения, пока такт остаётся сжимающим.
+
+    Слабейшее — с наименьшим ожидаемым выигрышем в рублях: снимать сначала то,
+    что меньше всего даёт. Порядок детерминирован (выигрыш, затем object_id),
+    иначе два прогона на одних данных дали бы разные планы.
+    """
+    if not balance.get("shrinking"):
+        return actions, []
+
+    delta = float(balance.get("expected_leads_delta") or 0.0)
+    shrinkers = sorted(
+        (a for a in actions if float(a.get("expected_leads_delta") or 0.0) < 0),
+        key=lambda a: (float(a.get("expected_gain_rub") or 0.0), str(a.get("object_id"))))
+
+    blocked: List[Dict[str, Any]] = []
+    for action in shrinkers:
+        if delta >= 0:
+            break
+        delta -= float(action.get("expected_leads_delta") or 0.0)
+        blocked.append({**action,
+                        "blocked_reason": NO_ADDRESS_REASON.format(
+                            delta=float(balance.get("expected_leads_delta") or 0.0))})
+
+    blocked_ids = {id(a) for a in shrinkers[:len(blocked)]}
+    allowed = [a for a in actions if id(a) not in blocked_ids]
+    return allowed, blocked
+```
+
+- [ ] **Шаг 4: Прогнать тесты**
+
+Запуск: `python -m pytest tests/test_agent_balance.py -q`
+Ожидается: PASS (6 тестов).
+
+- [ ] **Шаг 5: Встроить в такт Э1**
+
+В `sync/agent_e1.py` сразу после кулдауна обучения (задача 5) и до `cap_actions`:
+
+```python
+    # Баланс такта: сокращение без адресата роста не применяется. Стоит до
+    # отбора по лимиту по той же причине, что кулдауны: снятое здесь не должно
+    # занимать слот прогона.
+    balance = tact_balance(moves_of_run, suspends_of_run, cuts_of_run)
+    allowed, without_address = require_growth_address(allowed, balance)
+    blocked += without_address
+```
+
+`moves_of_run` — строки `budget_threshold["accounts"][login]["moves"]` этого кабинета;
+`suspends_of_run` — действия `campaign.suspend` этого прогона с расходом кампании;
+`cuts_of_run` — минус-фразы и площадки с полем `cost_saved` (оно уже считается в
+отчёте Э0: `cost_burned` у кандидатов).
+
+В отчёт прогона:
+
+```python
+        "balance": balance,
+```
+
+- [ ] **Шаг 6: Прогнать весь набор**
+
+Запуск: `python -m pytest tests/ -q`
+Ожидается: PASS.
+
+- [ ] **Шаг 7: Коммит**
+
+```bash
+git add sync/agent/balance.py tests/test_agent_balance.py sync/agent_e1.py
+git commit -m "feat(agent): сокращение без адресата роста не применяется — баланс такта"
+```
+
+---
+
+## Задача 10: каждый такт отвечает «что усилить»
+
+Вторая половина того же требования: даже когда агент ничего не режет, он обязан
+предъявить, что можно усилить. Полный генератор идей — Ф8 (отдельный план); здесь
+собирается список из данных, которые уже есть после задач 3–7.
+
+Четыре источника кандидатов на усиление:
+
+1. **недобор трафика при хорошей экономике** — `growth_room is True` и
+   `marginal_roi_vs_lambda >= 1`: показы существуют, окупаемость есть, мешает ставка;
+2. **упор в кап шага** — целевой бюджет уткнулся в потолок ×1.5/×2: солвер хотел дать
+   больше, чем разрешено за такт;
+3. **направления в режиме «подъём»** (задача 7): рынок растёт — время добавлять, а не
+   удерживать;
+4. **`expansion_candidates`** — конверсионные запросы без своей группы (уже считаются
+   в Э0, `sync/agent/objects.py`).
+
+Плюс отдельной строкой — **сколько бы агент долил, если бы общий бюджет не был
+прибит к трейлинг-28д**: суммарный запас по кампаниям, у которых предельная
+окупаемость выше λ и есть недобор трафика. Это число — основание для Павла поднять
+план освоения; сам агент общий бюджет не двигает (пейсинг месяца — Ф9.11).
+
+**Файлы:**
+- Создать: `sync/agent/growth.py`
+- Создать: `tests/test_agent_growth.py`
+- Изменить: `sync/agent_e0.py` (секция отчёта)
+
+**Интерфейсы:**
+- Отдаёт: `growth_candidates(portfolio_section, headroom_section, demand_section,
+  expansion) -> Dict[str, Any]` с ключами `candidates` (список
+  `{campaign_id, source, reason, headroom_share, roi_vs_lambda, room_rub}`),
+  `capped_by_step` (сколько кампаний уткнулись в кап), `room_rub_total`,
+  `directions_rising`.
+
+- [ ] **Шаг 1: Написать падающий тест**
+
+```python
+# tests/test_agent_growth.py
+# -*- coding: utf-8 -*-
+"""Кандидаты на усиление: что агент предлагает УСИЛИТЬ на каждом такте."""
+
+from sync.agent.growth import growth_candidates
+
+PORTFOLIO = {"accounts": {"acc": {"lambda": 1.0, "moves": {
+    "111": {"campaign_id": "111", "cost_28d": 100_000.0, "target_28d": 150_000.0,
+            "marginal_roi_vs_lambda": 2.0, "step_capped": True},
+    "222": {"campaign_id": "222", "cost_28d": 100_000.0, "target_28d": 90_000.0,
+            "marginal_roi_vs_lambda": 0.8, "step_capped": False},
+}}}}
+HEADROOM = {"111": {"headroom_share": 0.5, "verdict": "есть куда расти"},
+            "222": {"headroom_share": 0.02, "verdict": "выкуплен"}}
+DEMAND = {"vpo": {"regime": "подъём"}, "spo": {"regime": "норма"}}
+
+
+def test_campaign_with_room_and_economics_is_candidate():
+    out = growth_candidates(PORTFOLIO, HEADROOM, DEMAND, expansion=[])
+    ids = [c["campaign_id"] for c in out["candidates"]]
+    assert "111" in ids
+    assert "222" not in ids
+
+
+def test_step_capped_campaigns_counted():
+    out = growth_candidates(PORTFOLIO, HEADROOM, DEMAND, expansion=[])
+    assert out["capped_by_step"] == 1
+
+
+def test_rising_directions_listed():
+    out = growth_candidates(PORTFOLIO, HEADROOM, DEMAND, expansion=[])
+    assert out["directions_rising"] == ["vpo"]
+
+
+def test_room_rub_counts_only_profitable_with_headroom():
+    out = growth_candidates(PORTFOLIO, HEADROOM, DEMAND, expansion=[])
+    # 111: цель выше факта на 50 000 и упёрлась в кап — запас считается по ней.
+    assert out["room_rub_total"] == 50_000.0
+
+
+def test_expansion_candidates_carried_through():
+    out = growth_candidates(PORTFOLIO, HEADROOM, DEMAND,
+                            expansion=[{"query": "колледж заочно", "headroom": 3_000.0}])
+    sources = {c["source"] for c in out["candidates"]}
+    assert "expansion" in sources
+
+
+def test_empty_inputs_give_empty_answer_not_crash():
+    out = growth_candidates({"accounts": {}}, {}, {}, expansion=[])
+    assert out["candidates"] == []
+    assert out["room_rub_total"] == 0.0
+```
+
+- [ ] **Шаг 2: Прогнать и убедиться, что падает**
+
+Запуск: `python -m pytest tests/test_agent_growth.py -q`
+Ожидается: FAIL — `ModuleNotFoundError: No module named 'sync.agent.growth'`.
+
+- [ ] **Шаг 3: Написать модуль**
+
+```python
+# sync/agent/growth.py
+# -*- coding: utf-8 -*-
+"""
+sync/agent/growth.py — что усилить: ответ такта на вторую половину задачи.
+
+Агент, который умеет только сокращать, честно ведёт кабинет к «эффективно и
+мало». Поэтому каждый такт обязан предъявить список усиления — даже когда
+сокращать нечего.
+
+Полный генератор гипотез — отдельная работа (Ф8 роадмапа). Здесь собираются
+кандидаты из уже посчитанного: недобор трафика при живой экономике, упор в
+кап шага, направления с растущим спросом, конверсионные запросы без своей
+группы.
+
+room_rub_total — сколько агент долил бы, если бы общий бюджет кабинета не был
+прибит к трейлинг-28д. Сам он его не двигает: план освоения задаёт человек.
+Число нужно для того, чтобы это решение принималось с цифрой на руках.
+"""
+
+from typing import Any, Dict, List
+
+# Порог экономики для кандидата на усиление: предельный рубль должен как
+# минимум окупаться относительно порога кабинета.
+MIN_ROI_VS_LAMBDA = 1.0
+
+
+def growth_candidates(portfolio_section: Dict[str, Any],
+                      headroom_section: Dict[str, Dict[str, Any]],
+                      demand_section: Dict[str, Dict[str, Any]],
+                      expansion: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Кандидаты на усиление и денежный запас роста."""
+    candidates: List[Dict[str, Any]] = []
+    capped = 0
+    room_total = 0.0
+
+    for account in (portfolio_section.get("accounts") or {}).values():
+        for campaign_id, move in (account.get("moves") or {}).items():
+            headroom = headroom_section.get(str(campaign_id)) or {}
+            roi = float(move.get("marginal_roi_vs_lambda") or 0.0)
+            has_room = headroom.get("verdict") == "есть куда расти"
+            if move.get("step_capped"):
+                capped += 1
+            if not has_room or roi < MIN_ROI_VS_LAMBDA:
+                continue
+            room = max(0.0, float(move.get("target_28d") or 0.0)
+                       - float(move.get("cost_28d") or 0.0))
+            room_total += room
+            candidates.append({
+                "campaign_id": str(campaign_id),
+                "source": "headroom",
+                "reason": "недобор трафика при окупающемся предельном рубле",
+                "headroom_share": headroom.get("headroom_share"),
+                "roi_vs_lambda": round(roi, 2),
+                "room_rub": round(room, 2),
+            })
+
+    for item in expansion or []:
+        candidates.append({
+            "campaign_id": None,
+            "source": "expansion",
+            "reason": f"конверсионный запрос без своей группы: {item.get('query')}",
+            "headroom_share": None,
+            "roi_vs_lambda": None,
+            "room_rub": round(float(item.get("headroom") or 0.0), 2),
+        })
+
+    rising = sorted(d for d, row in (demand_section or {}).items()
+                    if row.get("regime") == "подъём")
+    return {
+        "candidates": sorted(candidates, key=lambda c: -(c["room_rub"] or 0.0)),
+        "capped_by_step": capped,
+        "room_rub_total": round(room_total, 2),
+        "directions_rising": rising,
+    }
+```
+
+- [ ] **Шаг 4: Прогнать тесты**
+
+Запуск: `python -m pytest tests/test_agent_growth.py -q`
+Ожидается: PASS (6 тестов).
+
+- [ ] **Шаг 5: Пометить упор в кап и вывести секцию в Э0**
+
+В `sync/agent/portfolio.py::_move_row` добавить поле (кап берётся из `step_cap_up`
+задачи 8):
+
+```python
+        # Уткнулись ли в потолок шага: солвер хотел дать больше, чем разрешено
+        # за такт. Это кандидат на усиление, а не законченное решение.
+        "step_capped": bool(target >= campaign["cost"] * step_cap_up(campaign) - 1e-6),
+```
+
+В `sync/agent_e0.py` после расчёта портфеля:
+
+```python
+    from sync.agent.growth import growth_candidates
+
+    growth = growth_candidates(budget_threshold, headroom_section, demand, expansion)
+```
+
+и в отчёт:
+
+```python
+        "growth": growth,
+```
+
+- [ ] **Шаг 6: Прогнать весь набор**
+
+Запуск: `python -m pytest tests/ -q`
+Ожидается: PASS.
+
+- [ ] **Шаг 7: Коммит**
+
+```bash
+git add sync/agent/growth.py sync/agent/portfolio.py sync/agent_e0.py \
+        tests/test_agent_growth.py
+git commit -m "feat(agent): каждый такт отвечает, что усилить, и во сколько это оценивается"
+```
+
+---
+
+## Задача 11: свести волну в документации и прогнать боевой такт
 
 **Файлы:**
 - Изменить: `docs/AGENT-ROADMAP-2026-08-25.md`
@@ -1784,8 +2491,13 @@ git commit -m "feat(agent): спрос Wordstat как режим направл
 - [ ] **Шаг 1: Прогнать Э0 в бою**
 
 Запуск: вкладка Actions → `agent-e0` → Run workflow (или дождаться крона 09:30 МСК).
-Проверить в логе четыре новые секции отчёта: `traffic_headroom`, `blind_spend`,
-`demand_regime` и — в отчёте Э1 (`agent-e1`, репетиция 11:00 МСК) — `learning`.
+Проверить в логе новые секции отчёта Э0: `traffic_headroom`, `blind_spend`,
+`demand_regime`, `growth` — и в отчёте Э1 (`agent-e1`, репетиция 11:00 МСК):
+`learning`, `balance`.
+
+Ключевая проверка боевого прогона: `balance.shrinking` при непустом плане должен быть
+`false`, а `growth.candidates` — непустым. Сжимающий такт с пустым списком усиления
+значит, что механизм роста не заработал, и это повод остановиться, а не применять.
 
 - [ ] **Шаг 2: Записать боевые числа**
 
@@ -1798,7 +2510,10 @@ git commit -m "feat(agent): спрос Wordstat как режим направл
 
 В `docs/AGENT-ROADMAP-2026-08-25.md` пометить Ф7.6, Ф7.7 (минимум — счётчик), Ф7.8, Ф6.5
 как выполненные со ссылкой на этот план; уточнить, что Ф7.7 закрыт счётчиком, а не
-самой слепой зоной — она остаётся открытой задачей.
+самой слепой зоной — она остаётся открытой задачей. Отдельным абзацем внести принцип
+«рост и эффективность»: сокращение с адресатом, такт не сжимает объём, каждый такт
+предъявляет усиление — и пометить, что полный генератор идей (Ф8) обязан продолжать
+именно эту линию, а не добавлять ещё один способ резать.
 
 - [ ] **Шаг 4: Коммит и пуш**
 
@@ -1819,6 +2534,9 @@ git push
    очередь гипотез с приоритетом «ожидаемая ценность ÷ цена теста».
 3. **Ф9 — боевая работа**: первое применение узким скоупом, лестница автономии по
    классам действий через shadow-режим, пейсинг месяца вместо трейлинг-28д.
+   Сюда же — снятие потолка общего бюджета: `growth.room_rub_total` (задача 10)
+   показывает, сколько агент долил бы, если бы сумма кабинета не была прибита к
+   трейлинг-28д; двигать её вправе только человек.
 
 Открытые решения Павла (нужны к плану Ф9, не к этой волне): скоуп первого применения,
 `target_romi` (1.0 или 2.0), поднимать ли недельный риск-бюджет (сейчас 50 000 ₽).
