@@ -284,3 +284,60 @@ def test_junk_word_without_conversions_is_still_a_candidate():
     ]
     out = word_minus_candidates(queries, cpa_limit=1500.0, base_conversion=0.03)
     assert [r for r in out if r["query"] == "скачать"]
+
+
+# ------------------- расширение семантики: обратная сторона минусации
+
+
+def test_expansion_candidates_are_converting_queries_we_do_not_buy():
+    # Зеркало минусации: запрос уже приносит конверсии дешевле допустимого,
+    # но своей ключевой фразы у него нет — мы получаем его случайно, по
+    # широкому соответствию, и не управляем ни ставкой, ни объявлением.
+    from sync.agent.objects import expansion_candidates
+    queries = [
+        # Конверсионный и дешёвый, но не куплен: кандидат.
+        {"campaign_id": "1", "query": "кинорежиссер москва", "matched_key": "вуз москва",
+         "cost": 2183.0, "clicks": 30, "conversions": 12},
+        # Куплен явно — управлять уже можем, кандидатом не является.
+        {"campaign_id": "1", "query": "вуз москва", "matched_key": "вуз москва",
+         "cost": 5000.0, "clicks": 40, "conversions": 10},
+        # Дороже допустимого — расширяться на него незачем.
+        {"campaign_id": "1", "query": "дорогой запрос", "matched_key": "вуз москва",
+         "cost": 90_000.0, "clicks": 50, "conversions": 2},
+        # Одна конверсия — шум, а не сигнал.
+        {"campaign_id": "1", "query": "случайный запрос", "matched_key": "вуз москва",
+         "cost": 300.0, "clicks": 5, "conversions": 1},
+    ]
+    out = expansion_candidates(queries, cpa_limit=1700.0)
+    assert [c["query"] for c in out] == ["кинорежиссер москва"]
+    row = out[0]
+    assert row["conversions"] == 12
+    assert row["cpa"] < 1700.0
+    assert row["campaigns"] == ["1"]
+
+
+def test_expansion_candidates_rank_by_headroom_not_by_volume():
+    # Порядок — по недополученной выгоде: конверсии × (допустимый CPA −
+    # фактический). Дешёвый запрос с меньшим числом конверсий может стоить
+    # выше, чем дорогой с большим.
+    from sync.agent.objects import expansion_candidates
+    queries = [
+        {"campaign_id": "1", "query": "дешёвый", "matched_key": "ключ",
+         "cost": 600.0, "clicks": 20, "conversions": 6},      # CPA 100
+        {"campaign_id": "1", "query": "средний", "matched_key": "ключ",
+         "cost": 12_000.0, "clicks": 40, "conversions": 10},  # CPA 1200
+    ]
+    out = expansion_candidates(queries, cpa_limit=1700.0)
+    assert [c["query"] for c in out] == ["дешёвый", "средний"]
+
+
+def test_expansion_ignores_queries_already_bought_in_another_campaign():
+    from sync.agent.objects import expansion_candidates
+    queries = [
+        {"campaign_id": "1", "query": "заочное обучение", "matched_key": "вуз",
+         "cost": 1000.0, "clicks": 20, "conversions": 5},
+        {"campaign_id": "2", "query": "другой запрос", "matched_key": "заочное обучение",
+         "cost": 1000.0, "clicks": 20, "conversions": 5},
+    ]
+    out = expansion_candidates(queries, cpa_limit=1700.0)
+    assert [c["query"] for c in out] == ["другой запрос"]

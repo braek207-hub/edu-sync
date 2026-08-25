@@ -56,9 +56,11 @@ from sync.agent.saturation import computed_rows as saturation_computed_rows
 from sync.agent.saturation import saturation_curves
 from sync.agent.objects import (
     build_object_rows,
+    CANDIDATE_WINDOW_DAYS,
     minus_word_candidates,
     placement_candidates,
     core_words,
+    expansion_candidates,
     word_minus_candidates,
     top_queries_by_cost,
 )
@@ -85,7 +87,7 @@ DEFAULT_DAYS = 180
 SLICE_WINDOW_DAYS = 90
 # Поисковые запросы — самая объёмная витрина (450 МБ за 90 дней на 4 кабинета).
 # Кандидаты в минус-слова считаются по свежим данным, глубокая история не нужна.
-QUERY_WINDOW_DAYS = 30
+QUERY_WINDOW_DAYS = CANDIDATE_WINDOW_DAYS
 PROFILE_FEATURES = ["groups_count", "phrases_per_group", "title2_fill_share"]
 # Пороги свежести РАЗНЫЕ, потому что источники разной природы.
 #
@@ -707,6 +709,14 @@ def main() -> int:
                                              protected_words=protected_words)
                        if cpa_limit > 0 else [])
 
+    # Расширение семантики — зеркало минусации: запросы, которые уже
+    # окупаются, но своей ключевой фразы не имеют. Единственный генератор
+    # гипотез, которому не нужны ни модель, ни рынок: доказательство лежит в
+    # собственном журнале. Рычага записи у него пока нет — сначала список
+    # смотрит человек.
+    expansion = (expansion_candidates(seeing_queries, cpa_limit=cpa_limit)
+                 if cpa_limit > 0 else [])
+
     # Кандидаты в минус-фразы уезжают в computed по кампаниям: применяет их
     # писатель Э3.6 в прогоне применения, и отчёт Э0 сам по себе действий не
     # производит. Фраза попадает в строки каждой кампании, где жгла деньги.
@@ -923,6 +933,13 @@ def main() -> int:
         "sliced_rows": len(sliced_rows),
         "objects": len(object_rows),
         "search_queries": len(query_rows),
+        "expansion_candidates": {
+            "count": len(expansion),
+            "conversions": sum(c["conversions"] for c in expansion),
+            "cost": round(sum(c["cost"] for c in expansion), 2),
+            "headroom": round(sum(c["headroom"] for c in expansion), 2),
+            "sample": expansion[:10],
+        },
         "minus_word_candidates": {
             "cpa_limit": round(cpa_limit, 2),
             "count": len(minus_candidates),

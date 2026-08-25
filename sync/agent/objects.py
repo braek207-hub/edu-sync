@@ -77,6 +77,12 @@ def top_queries_by_cost(
 # базовой конверсии кабинета, «ноль конверсий» означает лишь, что фразу мало
 # показывали. Приговор по такому нулю — самый частый способ выкосить живой
 # трафик, и именно он делает ручную минусацию опасной.
+# Окно, за которое собраны поисковые запросы и площадки кандидатов. Живёт
+# здесь, а не в прогоне Э0: по нему цена риска переводит расход кандидата
+# за окно в расход за день (writer/exposure.py), и разъедься эти два числа —
+# рычаг отсечения считал бы себе цену по чужому окну.
+CANDIDATE_WINDOW_DAYS = 30
+
 ZERO_CONVERSION_RULE_OF_THREE = 3.0
 
 # Во сколько раз фактическая цена конверсии фразы должна превышать допустимую,
@@ -218,6 +224,76 @@ MIN_WORD_CHARS = 3
 MIN_PHRASES_PER_WORD = 3
 
 _WORD_RE = re.compile(r"[а-яёa-z0-9]+")
+
+
+# Минимум конверсий, при котором запрос считается доказавшим себя. Одна —
+# шум: при базовой конверсии в проценты одиночное срабатывание случается у
+# любого мусора, а расширяться на мусор дороже, чем упустить один запрос.
+MIN_EXPANSION_CONVERSIONS = 2
+
+
+def expansion_candidates(
+    queries: List[Dict[str, Any]], cpa_limit: float,
+    min_conversions: int = MIN_EXPANSION_CONVERSIONS,
+) -> List[Dict[str, Any]]:
+    """Запросы, которые УЖЕ окупаются, но своей ключевой фразы не имеют.
+
+    Обратная сторона минусации и единственный генератор гипотез, которому не
+    нужна ни модель, ни рынок: доказательство лежит в собственном журнале.
+    Такой запрос приходит по широкому соответствию — мы за него платим, но не
+    управляем ни ставкой, ни объявлением, ни группой. Вынести его в свою
+    фразу значит получить управление тем, что и так работает.
+
+    Кандидат обязан: набрать min_conversions (одна конверсия — шум), стоить
+    не дороже допустимого CPA и НЕ БЫТЬ уже купленным — то есть не совпадать
+    ни с одной ключевой фразой кабинета (matched_key), в том числе чужой
+    кампании: там он уже управляем.
+
+    Порядок — по недополученной выгоде: конверсии × (допустимый CPA −
+    фактический). Дешёвый запрос с шестью конверсиями важнее дорогого с
+    десятью, потому что запас по цене у него больше.
+    """
+    if cpa_limit <= 0:
+        return []
+    bought = {str(q.get("matched_key") or "").strip().lower()
+              for q in queries if q.get("matched_key")}
+    totals: Dict[str, Dict[str, Any]] = {}
+    for q in queries:
+        phrase = str(q.get("query") or "").strip().lower()
+        if not phrase or phrase in bought:
+            continue
+        slot = totals.setdefault(phrase, {
+            "query": phrase, "cost": 0.0, "clicks": 0, "conversions": 0,
+            "campaigns": set(),
+        })
+        slot["cost"] += float(q.get("cost") or 0.0)
+        slot["clicks"] += int(q.get("clicks") or 0)
+        slot["conversions"] += int(q.get("conversions") or 0)
+        campaign_id = str(q.get("campaign_id") or "")
+        if campaign_id:
+            slot["campaigns"].add(campaign_id)
+
+    out: List[Dict[str, Any]] = []
+    for slot in totals.values():
+        conversions = slot["conversions"]
+        if conversions < min_conversions or slot["cost"] <= 0:
+            continue
+        cpa = slot["cost"] / conversions
+        if cpa > cpa_limit:
+            continue
+        out.append({
+            "query": slot["query"],
+            "cost": round(slot["cost"], 2),
+            "clicks": slot["clicks"],
+            "conversions": conversions,
+            "cpa": round(cpa, 2),
+            # Сколько мы недобираем, покупая это вслепую: запас по цене
+            # против допустимого CPA, умноженный на доказанный объём.
+            "headroom": round((cpa_limit - cpa) * conversions, 2),
+            "campaigns": sorted(slot["campaigns"]),
+        })
+    out.sort(key=lambda c: -c["headroom"])
+    return out
 
 
 def core_words(queries: List[Dict[str, Any]]) -> set:
