@@ -1,5 +1,12 @@
 name: agent-e1
 on:
+  schedule:
+    # 08:00 UTC = 11:00 МСК: после расчёта Э0 (09:30 МСК) и сторожа отката
+    # (10:30 МСК). По крону — только РЕПЕТИЦИЯ: боевая запись остаётся
+    # ручным решением человека, а ежедневный dry-run показывает, что агент
+    # СОБИРАЛСЯ сделать. Ровно так 25.08 поймали предложение заминусовать
+    # ядро семантики: репетиция стоит ноль и ловит то, чего не видят тесты.
+    - cron: "0 8 * * *"
   workflow_dispatch:
     inputs:
       prod:
@@ -24,6 +31,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -49,9 +57,16 @@ jobs:
             echo "Запрещено: apply без prod. Боевая запись — prod+apply; репетиция — без apply."
             exit 1
           fi
-          ARGS=""
-          if [ "${{ github.event.inputs.prod }}" = "true" ]; then ARGS="$ARGS --prod"; fi
-          if [ "${{ github.event.inputs.apply }}" = "true" ]; then ARGS="$ARGS --apply"; fi
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # Крон читает БОЕВОЙ кабинет, но не пишет: --prod без --apply.
+            # Песочница здесь бесполезна — в ней нет ни кампаний, ни истории,
+            # и репетиция показывала бы пустоту вместо реальных решений.
+            ARGS="--prod"
+          else
+            ARGS=""
+            if [ "${{ github.event.inputs.prod }}" = "true" ]; then ARGS="$ARGS --prod"; fi
+            if [ "${{ github.event.inputs.apply }}" = "true" ]; then ARGS="$ARGS --apply"; fi
+          fi
           LIMIT="${{ github.event.inputs.max_campaigns }}"
           if [ -n "$LIMIT" ]; then
             # Только целое: непустая нечисловая строка иначе молча уехала бы в
