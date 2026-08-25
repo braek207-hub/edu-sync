@@ -23,6 +23,8 @@ from typing import Any, Dict, List
 from sync.agent import db as agent_db
 from sync.agent.computed import compute_schedule, compute_segment_modifiers
 from sync.agent.coverage import blind_spend
+from sync.agent.demand import REGION as DEMAND_REGION
+from sync.agent.demand import demand_regime, directions_without_series
 from sync.agent.facts import assemble_facts
 from sync.agent.guard import (
     check_continuity,
@@ -129,6 +131,10 @@ CRM_MAX_AGE_HOURS = 144
 HISTORY_MAX_AGE_HOURS = DIRECT_MAX_AGE_HOURS
 # Директ ограничивает число одновременно формируемых отчётов на кабинет.
 REPORT_WORKERS = 4
+# Глубина чтения спроса Wordstat: базовое окно режима (demand.BASELINE_WEEKS = 8)
+# плюс запас на пропущенные недели выгрузки — с трёхкратным запасом база
+# набирается даже на рваном ряде.
+DEMAND_HISTORY_WEEKS = 26
 
 
 def _window(days: int) -> tuple:
@@ -1056,6 +1062,13 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         learning = {"unavailable": f"{type(exc).__name__}: {exc}"[:200]}
 
+    # Э7.8: спрос рынка как календарь направлений. Окно — 26 недель: базовое
+    # окно режима 8 недель плюс запас на дыры выгрузки Wordstat.
+    demand = demand_regime(
+        agent_db.load_wordstat_demand(
+            (date.today() - timedelta(weeks=DEMAND_HISTORY_WEEKS)).isoformat()),
+        through_week=date_to)
+
     sizes = agent_db.table_sizes()
     total_mb = round(sum(int(s["size_bytes"] or 0) for s in sizes) / 1024 / 1024, 1)
 
@@ -1242,6 +1255,21 @@ def main() -> int:
         # мера исхода судит по цене, а срезав объём, кампания почти всегда
         # дешевеет — общий hit_rate систематически хвалил бы резаков.
         "learning_loop": learning,
+        # Э7.8: режим спроса по направлениям. Сезонный подъём или спад меняет
+        # ожидания от кампаний направления, а не объявляется их провалом.
+        "demand_regime": {
+            "regimes": demand,
+            # Направления, у которых ряда спроса нет ВОВСЕ, — отдельной
+            # строкой. Это не «мало данных» (лечится временем), а дыра в
+            # семантике спроса (лечится фразами в sync/edu_demand.py), и
+            # среди них school — самое свежее направление кабинета.
+            "no_series": directions_without_series(demand),
+            # Регион один — 'ru'. Гео кампании нигде не вычисляется, сопоставить
+            # московский срез спроса с московскими кампаниями нечем;
+            # всероссийский ряд включает Москву и потому консервативен
+            # (docs/AGENT-DATA-SOURCES.md).
+            "region": DEMAND_REGION,
+        },
         "db_total_mb": total_mb,
         "db_tables": [{"t": s["table_name"], "size": s["size"]} for s in sizes],
     }, ensure_ascii=False, indent=2))

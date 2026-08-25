@@ -106,6 +106,9 @@ _DB_NOOPS = (
 _DB_EMPTY_LOADERS = (
     "load_direct_rows", "load_lead_rows", "load_score_rows",
     "load_campaign_features", "load_device_bridge", "table_sizes",
+    # Спрос Wordstat: без подмены прогон ушёл бы в реальную базу и напечатал
+    # ретраи коннекта в тот же stdout, который тест парсит как JSON.
+    "load_wordstat_demand",
 )
 
 # Отчёты Директа по кабинетам: у каждого свои сегменты и своя конверсионность —

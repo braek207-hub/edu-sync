@@ -779,6 +779,23 @@ def load_daily_cost_by_campaign(date_from: str, date_to: str) -> Dict[str, float
     return {str(r["campaign_id"]): float(r["daily_cost"]) for r in rows}
 
 
+def load_wordstat_demand(week_from: str) -> List[Dict[str, Any]]:
+    """Недельный спрос Wordstat с указанной недели.
+
+    Оба региона ('ru' и 'msk') — отбор делает потребитель
+    (sync/agent/demand.py считает только 'ru', чтобы не сложить москвичей
+    дважды), а не запрос: фильтр, спрятанный в SQL, невидим в тестах.
+    """
+    return _fetch_dicts(
+        """
+        SELECT week_start, region, phrase, frequency
+        FROM edu_wordstat_demand
+        WHERE week_start >= %s
+        """,
+        (week_from,),
+    )
+
+
 # ---------------------------------------------------------------- запись
 
 
