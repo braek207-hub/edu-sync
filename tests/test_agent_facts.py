@@ -118,3 +118,43 @@ def test_conversions_of_direct_goals_reach_the_mart():
 def test_missing_conversions_are_zero_not_absent():
     rows = assemble_facts(DIRECT, LEADS, SCORES)
     assert rows[0]["conversions"] == 0
+
+
+def test_weighted_direct_metrics_are_averaged_by_impressions():
+    # w_* приходят взвешенными на показы: среднее = Σw / Σпоказов.
+    # Присваивание вместо деления давало «среднюю позицию 1350».
+    rows = assemble_facts(
+        [{"date": "2026-08-01", "campaign_id": "111", "cost": 100.0, "clicks": 5,
+          "impressions": 1000, "w_avg_impr_pos": 1500.0,
+          "w_auction_win_share": 400.0, "w_avg_traffic_vol": 62000.0}],
+        [], [])
+    row = rows[0]
+    assert row["avg_impr_pos"] == 1.5
+    assert row["auction_win_share"] == 0.4
+    assert row["avg_traffic_vol"] == 62.0
+
+
+def test_two_direct_rows_of_one_day_are_summed_not_overwritten():
+    # Один и тот же день+кампания приходит двумя строками (два кабинета
+    # одного проекта, дозагрузка). Затирание последней строкой теряло половину.
+    rows = assemble_facts(
+        [{"date": "2026-08-01", "campaign_id": "111", "cost": 50.0, "clicks": 2,
+          "impressions": 1000, "w_avg_impr_pos": 1000.0,
+          "w_auction_win_share": 0.0, "w_avg_traffic_vol": 40000.0},
+         {"date": "2026-08-01", "campaign_id": "111", "cost": 50.0, "clicks": 3,
+          "impressions": 1000, "w_avg_impr_pos": 2000.0,
+          "w_auction_win_share": 0.0, "w_avg_traffic_vol": 80000.0}],
+        [], [])
+    row = rows[0]
+    assert row["impressions"] == 2000
+    assert row["avg_impr_pos"] == 1.5
+    assert row["avg_traffic_vol"] == 60.0
+
+
+def test_zero_impressions_give_zero_not_division_error():
+    rows = assemble_facts(
+        [{"date": "2026-08-01", "campaign_id": "111", "cost": 0.0, "clicks": 0,
+          "impressions": 0, "w_avg_impr_pos": 0.0,
+          "w_auction_win_share": 0.0, "w_avg_traffic_vol": 0.0}],
+        [], [])
+    assert rows[0]["avg_traffic_vol"] == 0.0

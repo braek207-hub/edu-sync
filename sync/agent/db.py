@@ -77,6 +77,14 @@ AGENT_DDL: List[str] = [
     ALTER TABLE edu_agent_facts
       ADD COLUMN IF NOT EXISTS conversions INTEGER NOT NULL DEFAULT 0
     """,
+    # Средний объём трафика Директа (0–100) — мера того, сколько показов
+    # кампания недобирает на своей ставке. Поля «доля выкупа» в Reports API
+    # нет (probe_traffic_headroom, docs/AGENT-DATA-SOURCES.md), а колонка
+    # auction_win_share наполнялась только выгрузкой интерфейса времён GAS.
+    """
+    ALTER TABLE edu_agent_facts
+      ADD COLUMN IF NOT EXISTS avg_traffic_vol DOUBLE PRECISION NOT NULL DEFAULT 0
+    """,
     # Срезы: НЕДЕЛЬНАЯ грань и три отдельных двумерных разреза вместо декартова
     # произведения. slice_kind ∈ region|network|device|gender|age|hour.
     # Хвост (мало кликов) сворачивается в slice_key='other' — иначе длинный хвост
@@ -250,7 +258,7 @@ def load_direct_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
         """
         SELECT date, campaign_id, campaign_name, project, direction,
                cost, clicks, impressions, conversions,
-               w_avg_impr_pos, w_auction_win_share
+               w_avg_impr_pos, w_auction_win_share, w_avg_traffic_vol
         FROM direct_stats
         WHERE date BETWEEN %s AND %s
         """,
@@ -756,13 +764,13 @@ UPSERT_FACTS_SQL = """
         INSERT INTO edu_agent_facts (
             fact_date, campaign_id, campaign_name, project, direction,
             cost, clicks, impressions, leads, eff_leads, sum_p_pay,
-            payments_fact, avg_impr_pos, auction_win_share,
+            payments_fact, avg_impr_pos, auction_win_share, avg_traffic_vol,
             connected_leads, deals, mins_to_connection_sum, mins_to_connection_count,
             days_to_pay_sum, days_to_pay_count, revenue, conversions
         ) VALUES (
             %(fact_date)s, %(campaign_id)s, %(campaign_name)s, %(project)s, %(direction)s,
             %(cost)s, %(clicks)s, %(impressions)s, %(leads)s, %(eff_leads)s, %(sum_p_pay)s,
-            %(payments_fact)s, %(avg_impr_pos)s, %(auction_win_share)s,
+            %(payments_fact)s, %(avg_impr_pos)s, %(auction_win_share)s, %(avg_traffic_vol)s,
             %(connected_leads)s, %(deals)s, %(mins_to_connection_sum)s,
             %(mins_to_connection_count)s, %(days_to_pay_sum)s, %(days_to_pay_count)s,
             %(revenue)s, %(conversions)s
@@ -780,6 +788,7 @@ UPSERT_FACTS_SQL = """
             payments_fact = EXCLUDED.payments_fact,
             avg_impr_pos = EXCLUDED.avg_impr_pos,
             auction_win_share = EXCLUDED.auction_win_share,
+            avg_traffic_vol = EXCLUDED.avg_traffic_vol,
             connected_leads = EXCLUDED.connected_leads,
             deals = EXCLUDED.deals,
             mins_to_connection_sum = EXCLUDED.mins_to_connection_sum,

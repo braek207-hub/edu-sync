@@ -53,6 +53,15 @@ def assemble_facts(
                 "payments_fact": 0,
                 "avg_impr_pos": 0.0,
                 "auction_win_share": 0.0,
+                "avg_traffic_vol": 0.0,
+                # Накопители взвешенных сумм Директа: w_* = значение × показы.
+                # Средним они становятся в самом конце, делением на показы дня.
+                # Держать их отдельно обязательно: строк источника на пару
+                # «день × кампания» бывает больше одной, и присваивание среднего
+                # по ходу цикла теряло бы все, кроме последней.
+                "_w_impr_pos": 0.0,
+                "_w_win_share": 0.0,
+                "_w_traffic_vol": 0.0,
                 "connected_leads": 0,
                 "deals": 0,
                 "mins_to_connection_sum": 0.0,
@@ -76,8 +85,9 @@ def assemble_facts(
         # эффективный лид, и коэффициент между ними у кампаний разный.
         slot["conversions"] += int(r.get("conversions") or 0)
         slot["impressions"] += int(r.get("impressions") or 0)
-        slot["avg_impr_pos"] = float(r.get("w_avg_impr_pos") or 0.0)
-        slot["auction_win_share"] = float(r.get("w_auction_win_share") or 0.0)
+        slot["_w_impr_pos"] += float(r.get("w_avg_impr_pos") or 0.0)
+        slot["_w_win_share"] += float(r.get("w_auction_win_share") or 0.0)
+        slot["_w_traffic_vol"] += float(r.get("w_avg_traffic_vol") or 0.0)
 
     for r in lead_rows:
         slot = _slot(str(r["created_date"]), str(r["campaign_id"]))
@@ -105,5 +115,13 @@ def assemble_facts(
             days = (date.fromisoformat(str(payment_date)) - date.fromisoformat(str(r["created_date"]))).days
             slot["days_to_pay_sum"] += float(days)
             slot["days_to_pay_count"] += 1
+
+    for slot in facts.values():
+        impressions = slot["impressions"]
+        for target, source in (("avg_impr_pos", "_w_impr_pos"),
+                               ("auction_win_share", "_w_win_share"),
+                               ("avg_traffic_vol", "_w_traffic_vol")):
+            weighted = slot.pop(source)
+            slot[target] = round(weighted / impressions, 4) if impressions else 0.0
 
     return sorted(facts.values(), key=lambda x: (x["fact_date"], x["campaign_id"]))
