@@ -1,0 +1,24 @@
+name: probe-traffic-headroom
+# Разовый read-only замер под Ф7.6: чем меряется недобор трафика — принимает ли
+# Reports API поля доли выкупа и заполнен ли AvgTrafficVolume в витрине
+# (в разрезе типа кампании). См. probe_traffic_headroom.py.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Замер недобора трафика
+        env:
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+          DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python probe_traffic_headroom.py
