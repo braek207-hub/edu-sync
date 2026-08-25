@@ -1187,3 +1187,27 @@ def test_monthly_cap_from_the_panel_reaches_the_solver(monkeypatch, capsys):
 
     assert captured[1]["monthly_cap_rub"] == 3_000_000.0
     assert captured[1]["target_romi"] == 2.0
+
+
+def test_blind_share_is_measured_on_both_windows(monkeypatch, capsys):
+    """Слепая доля печатается за окно решений и за окно лестницы.
+
+    Замер 25.08.2026: 30,3 % на окне лестницы против 14,4 % на окне решений,
+    и вся разница — кампании, которые давно не тратят. Одно число вместо двух
+    заставляло бы не доверять живым данным из-за архива.
+    """
+    import json as _json
+
+    _patch_e0_run(monkeypatch)
+    assert agent_e0.main() == 0
+    report = _json.JSONDecoder().raw_decode(capsys.readouterr().out.lstrip())[0]
+
+    blind = report["blind_spend"]
+    assert set(blind) == {"decision_window", "ladder_window"}
+    decision, ladder = blind["decision_window"], blind["ladder_window"]
+    # Окно решений короче и кончается там же, поэтому его начало позже.
+    assert decision["window"][1] == ladder["window"][1]
+    assert decision["window"][0] > ladder["window"][0]
+    for section in (decision, ladder):
+        assert "blind_share" in section
+        assert "cost_blind" in section

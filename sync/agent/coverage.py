@@ -86,4 +86,9 @@ def blind_spend(facts: Iterable[Dict[str, Any]], settings_rows: Any,
         if row.get("campaign_name"):
             name_by_campaign[campaign_id] = str(row["campaign_name"])
 
-    return blind_share(cost_by_campaign, settings_rows, name_by_campaign)
+    # Окно едет вместе с числом: такт расчёта печатает долю за два разных
+    # окна, и без подписи 30 % и 14 % выглядят противоречием, а не разными
+    # вопросами.
+    out = blind_share(cost_by_campaign, settings_rows, name_by_campaign)
+    out["window"] = [window_from, window_to]
+    return out
