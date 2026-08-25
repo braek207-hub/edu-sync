@@ -43,6 +43,9 @@ jobs:
           DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
           DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
           YM_TOKEN: ${{ secrets.YM_TOKEN }}
+          # Смысловой слой над кандидатами рычагов. Ключа нет — слой молчит,
+          # и рычаги работают только на экономике (видно в отчёте: semantic).
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           ARGS="--days ${{ github.event.inputs.days || '180' }}"
           if [ "${{ github.event.inputs.skip_direct }}" = "true" ]; then

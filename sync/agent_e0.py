@@ -32,6 +32,16 @@ from sync.agent.guard import (
     verdict,
 )
 from sync.agent.holdout import select_holdout
+from sync.agent import semantic
+
+# Чем занимается проект — контекст для смыслового слоя. Без него модель судит
+# фразы в вакууме: «школа» для образовательного проекта ядро, для магазина
+# одежды мусор.
+SEMANTIC_CONTEXT = (
+    "онлайн-образование: высшее и среднее профессиональное образование, "
+    "колледж, дистанционное обучение, приём абитуриентов"
+)
+
 from sync.agent.metrika import (
     EDU_COUNTERS,
     fetch_campaign_behavior,
@@ -717,6 +727,37 @@ def main() -> int:
     expansion = (expansion_candidates(seeing_queries, cpa_limit=cpa_limit)
                  if cpa_limit > 0 else [])
 
+    # Смысловой слой поверх экономики: модель ВЕТИРУЕТ кандидатов, но своих
+    # не добавляет (sync/agent/semantic.py). Спрашиваем только про уже
+    # отобранных кандидатов — это десятки фраз, а не 237 тысяч строк отчёта.
+    # Нет ключа — вердиктов нет, и рычаги работают ровно как раньше.
+    ask = semantic.deepseek_asker()
+    semantic_verdicts = {}
+    if ask is not None:
+        semantic_verdicts = semantic.classify(
+            [c["query"] for c in minus_candidates + word_candidates + expansion],
+            ask=ask, context=SEMANTIC_CONTEXT)
+        before_minus = len(minus_candidates) + len(word_candidates)
+        minus_candidates = semantic.keep_minus_candidates(
+            minus_candidates, semantic_verdicts)
+        word_candidates = semantic.keep_minus_candidates(
+            word_candidates, semantic_verdicts)
+        expansion = semantic.keep_expansion_candidates(expansion, semantic_verdicts)
+        semantic_stats = {
+            "asked": len(semantic_verdicts),
+            "vetoed_minus": before_minus - len(minus_candidates) - len(word_candidates),
+            "core": sum(1 for v in semantic_verdicts.values()
+                        if v["verdict"] == semantic.CORE),
+            "junk": sum(1 for v in semantic_verdicts.values()
+                        if v["verdict"] == semantic.JUNK),
+            "unclear": sum(1 for v in semantic_verdicts.values()
+                           if v["verdict"] == semantic.UNCLEAR),
+        }
+    else:
+        # Молчаливое отсутствие слоя неотличимо от «модель всё одобрила» —
+        # поэтому причина стоит в отчёте явной строкой.
+        semantic_stats = {"asked": 0, "reason": "DEEPSEEK_API_KEY не задан"}
+
     # Кандидаты в минус-фразы уезжают в computed по кампаниям: применяет их
     # писатель Э3.6 в прогоне применения, и отчёт Э0 сам по себе действий не
     # производит. Фраза попадает в строки каждой кампании, где жгла деньги.
@@ -933,6 +974,7 @@ def main() -> int:
         "sliced_rows": len(sliced_rows),
         "objects": len(object_rows),
         "search_queries": len(query_rows),
+        "semantic": semantic_stats,
         "expansion_candidates": {
             "count": len(expansion),
             "conversions": sum(c["conversions"] for c in expansion),
