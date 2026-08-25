@@ -69,6 +69,11 @@ from sync.agent.writer.guardrails import (
     check_action,
     check_holdout,
 )
+from sync.agent.writer.learning import (
+    LEARNING_COOLDOWN_DAYS,
+    learning_impact,
+    split_by_learning_cooldown,
+)
 from sync.agent.writer.plan import plan_bid_modifiers, plan_schedule
 from sync.agent.writer.schedule import describe as describe_schedule
 from sync.agent.writer.schedule import schedule_changed, schedule_items
@@ -1378,6 +1383,23 @@ def run_account(
     allowed, in_cooldown = split_by_cooldown(allowed, cooled)
     blocked += in_cooldown
 
+    # Кулдаун ОБУЧЕНИЯ стратегии. Не второй кулдаун денежных ручек, а его
+    # продолжение поперёк видов действий: тот же журнал, то же число дней
+    # (learning.LEARNING_COOLDOWN_DAYS берётся из budget.BUDGET_COOLDOWN_DAYS),
+    # но история читается по КЛАССУ влияния на обучение, а не по виду
+    # действия. Денежный кулдаун выше (budget.apply_cooldown на стадии
+    # desired) видит только собственный вид: бюджет не знает, что цель CPA
+    # той же кампании перезапустила обучение три дня назад, а остановка
+    # кампании не под ним вовсе. Действие, запертое там, сюда не доходит —
+    # у одного действия ровно один запрет и одна формулировка причины.
+    #
+    # Место — там же, где кулдаун вредных сегментов, до отбора по лимиту
+    # действий: отсечённое здесь не занимает слотов прогона.
+    last_resets = writer_db.last_learning_reset(login)
+    allowed, in_learning_cooldown = split_by_learning_cooldown(
+        allowed, last_resets, today=date.fromisoformat(today))
+    blocked += in_learning_cooldown
+
     # Потолок попыток применения — там же, где кулдаун, и по той же причине:
     # сегмент, по которому API отказывает детерминированно, обязан выпасть ДО
     # лимита действий, а не занимать его слот каждый прогон.
@@ -1436,6 +1458,11 @@ def run_account(
             **a,
             "baseline_daily_rub": None if baseline == float("inf") else round(baseline, 2),
             "risk_basis": action_risk_basis(a, daily_cost),
+            # Класс влияния на обучение едет в журнал ВМЕСТЕ со строкой —
+            # одним местом на все виды действий, включая безопасные. Иначе
+            # колонка была бы заполнена наполовину, и «безопасно» не
+            # отличалось бы от «класс не приписан».
+            "learning_impact": learning_impact(a),
         })
     # Бюджет читается заново для каждого кабинета: он общий на весь прогон,
     # а не на кабинет, и предыдущий клиент этого же прогона мог его уже
@@ -1546,6 +1573,27 @@ def run_account(
                 if out_of_attempts else None),
             "segments": sorted({f"{a['object_id']}:{a['direct_type']}:{a['key']}"
                                 for a in out_of_attempts})[:PREVIEW_SAMPLE_LIMIT],
+        },
+        # Что прогон делает с обучением стратегий. Счётчики — по тому, что
+        # РЕАЛЬНО уходит в кабинет (prepared), а не по всему, что прошло
+        # гейт: между гейтом и отправкой действие ещё режут лимит прогона и
+        # риск-бюджет, и «перезапусков обучения» в отчёте обязано быть
+        # столько, сколько их случится.
+        "learning": {
+            # Сколько перезапусков обучения прогон берёт на себя осознанно
+            # и сколько — вслепую. Второе число отдельно: «мы не знаем» не
+            # должно маскироваться под «мы знаем».
+            "resets_applied": sum(1 for a in prepared
+                                  if a.get("learning_impact") == "resets"),
+            "unknown_applied": sum(1 for a in prepared
+                                   if a.get("learning_impact") == "unknown"),
+            "blocked_by_cooldown": len(in_learning_cooldown),
+            "cooldown_days": LEARNING_COOLDOWN_DAYS,
+            # Дата последнего сброса по каждой запертой кампании — из
+            # журнала: без неё «заперто кулдауном» нечем проверить.
+            "blocked_objects": sorted(
+                {f"{a['object_id']}:{a['last_learning_reset_at']}"
+                 for a in in_learning_cooldown})[:PREVIEW_SAMPLE_LIMIT],
         },
         "deferred_by_risk": len(deferred),
         "deferred_by_cap": len(over_cap),

@@ -200,6 +200,17 @@ WRITER_DDL: List[str] = [
       ADD COLUMN IF NOT EXISTS baseline_daily_rub DOUBLE PRECISION,
       ADD COLUMN IF NOT EXISTS risk_basis         TEXT
     """,
+    # Класс действия по влиянию на обучение автостратегии (writer/learning.py):
+    # resets | safe | unknown. Отдельной колонкой, а не выводом из action_kind
+    # на чтении: карта классов будет меняться вслед за справкой Директа, а
+    # журнал обязан помнить, чем действие считалось В МОМЕНТ ПРИМЕНЕНИЯ —
+    # иначе завтрашняя правка карты задним числом перепишет вчерашнюю историю
+    # и кулдаун обучения (last_learning_reset) посчитается по новым правилам
+    # на старых строках.
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS learning_impact TEXT
+    """,
     # Аренда на прогон: два одновременных прогона на одном ключе создают в
     # кабинете ДВА объекта, и Id первого теряется навсегда — без строки
     # журнала и без красной линии. Таблица, а не pg_advisory_lock: сессионная
@@ -333,12 +344,13 @@ INSERT_ACTION_SQL = """
     INSERT INTO edu_agent_actions (
         action_id, idempotency_key, account, object_level, object_id,
         action_kind, direct_type, setting_key, payload, previous_state,
-        red_line, risk_rub, baseline_daily_rub, risk_basis, status
+        red_line, risk_rub, baseline_daily_rub, risk_basis, learning_impact,
+        status
     ) VALUES (
         %(action_id)s, %(idempotency_key)s, %(account)s, %(object_level)s,
         %(object_id)s, %(action_kind)s, %(direct_type)s, %(setting_key)s,
         %(payload)s, %(previous_state)s, %(red_line)s, %(risk_rub)s,
-        %(baseline_daily_rub)s, %(risk_basis)s, 'planned'
+        %(baseline_daily_rub)s, %(risk_basis)s, %(learning_impact)s, 'planned'
     )
     ON CONFLICT (idempotency_key) DO UPDATE SET
         account        = EXCLUDED.account,
@@ -353,6 +365,7 @@ INSERT_ACTION_SQL = """
         risk_rub       = EXCLUDED.risk_rub,
         baseline_daily_rub = EXCLUDED.baseline_daily_rub,
         risk_basis     = EXCLUDED.risk_basis,
+        learning_impact = EXCLUDED.learning_impact,
         status         = 'planned',
         response       = '{}'::jsonb,
         sent_at        = NULL,
@@ -385,6 +398,10 @@ def insert_action(row: Dict[str, Any]) -> str:
         # обвала расхода умеет это отличать от нуля.
         "baseline_daily_rub": row.get("baseline_daily_rub"),
         "risk_basis": row.get("risk_basis"),
+        # Класс влияния на обучение стратегии — из writer/learning.py, его
+        # приписывает прогон. Пустое значение означает «строка старше карты
+        # классов», и кулдаун обучения такую строку не считает сбросом.
+        "learning_impact": row.get("learning_impact"),
         "payload": json.dumps(row.get("payload", {}), ensure_ascii=False),
         "previous_state": json.dumps(row.get("previous_state", {}), ensure_ascii=False),
         "red_line": json.dumps(row.get("red_line", {}), ensure_ascii=False),
@@ -1307,6 +1324,36 @@ def recent_action_objects(action_kinds, days, account=None):
         (list(action_kinds), int(days), account, account),
     )
     return {str(r["object_id"]) for r in rows}
+
+
+def last_learning_reset(account: Optional[str] = None) -> Dict[str, Any]:
+    """По object_id — дата последнего ПРИМЕНЁННОГО сбрасывающего действия.
+
+    Пара к recent_action_objects, а не её замена: там кулдаун считается по
+    ВИДУ действия (бюджет видит бюджет), здесь — по классу влияния на
+    обучение, поперёк видов. Тот же журнал, то же окно (learning.py берёт
+    число дней у budget.py), другая проекция.
+
+    Считаются только применённые (applied_at IS NOT NULL) и только те же
+    статусы, что списывают риск (RISK_CHARGED_STATUSES): откатанное изменение
+    тоже успело сбить обучение, а запланированное и не ушедшее в кабинет —
+    нет. Строки со старым NULL в learning_impact не считаются сбросом: класс
+    приписывается при записи, и задним числом судить их нечем.
+    """
+    rows = _fetch(
+        """
+        SELECT object_id, max(applied_at::date) AS last_reset
+        FROM edu_agent_actions
+        WHERE (%s IS NULL OR account = %s)
+          AND applied_at IS NOT NULL
+          AND status IN (__RISK_CHARGED_STATUSES__)
+          AND learning_impact IN ('resets', 'unknown')
+        GROUP BY object_id
+        """.replace("__RISK_CHARGED_STATUSES__",
+                    _sql_literals(RISK_CHARGED_STATUSES)),
+        (account, account),
+    )
+    return {str(r["object_id"]): r["last_reset"] for r in rows}
 
 
 def risk_limit(week_start: str, default_rub: float) -> float:

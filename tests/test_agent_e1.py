@@ -54,7 +54,7 @@ def _no_lock(lease=None):
 
 
 def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=None,
-                 campaign_computed=None):
+                 campaign_computed=None, learning_resets=None):
     """Общая подмена того, что прогон спрашивает у журнала помимо действий:
     аренда на прогон, история вредных сегментов, исчерпавшие попытки
     сегменты, уже закрытые ключи. campaign_computed — покампанийные строки
@@ -76,6 +76,10 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
                                        "checks": []})
     monkeypatch.setattr(agent_e1.writer_db, "recent_action_objects",
                         lambda *a, **k: set())
+    # История перезапусков обучения по кампаниям (кулдаун обучения). По
+    # умолчанию пустая: кабинет, где стратегии никто не сбивал.
+    monkeypatch.setattr(agent_e1.writer_db, "last_learning_reset",
+                        lambda *a, **k: dict(learning_resets or {}))
     monkeypatch.setattr(agent_e1.writer_db, "mark_sent", lambda action_id: None)
     # База цены оплаты — инфраструктура второго чекпоинта: в красную линию
     # она едет пассажиром и на решения прогона не влияет (по оплатам не
@@ -1978,7 +1982,7 @@ class _ScheduleClient:
         return {"dry_run": True}
 
 
-def _patch_schedule_run(monkeypatch, settings):
+def _patch_schedule_run(monkeypatch, settings, learning_resets=None):
     _ScheduleClient.instances = []
     monkeypatch.setattr(agent_e1, "_clients", lambda: [{"login": "acc-1"}])
     monkeypatch.setattr(agent_e1.writer_db, "ensure_writer_tables", lambda: None)
@@ -1999,7 +2003,7 @@ def _patch_schedule_run(monkeypatch, settings):
     monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1.writer_db, "mark_unknown_outcome", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1, "WriteClient", _ScheduleClient)
-    _patch_infra(monkeypatch)
+    _patch_infra(monkeypatch, learning_resets=learning_resets)
 
 
 def test_schedule_reaches_the_cabinet(monkeypatch, capsys):
@@ -2169,3 +2173,75 @@ def test_budget_and_tcpa_do_not_touch_the_same_campaign_in_one_tick():
     import inspect
     source = inspect.getsource(agent_e1)
     assert "cid not in budget_desired" in source
+
+
+# ------------------- кулдаун обучения стратегий (writer/learning.py)
+
+
+def test_learning_cooldown_blocks_action_that_would_restart_learning(monkeypatch, capsys):
+    # Сквозной: обучение стратегии кампании перезапускали три дня назад
+    # (журнал), и расписание — действие класса unknown, то есть заведомо
+    # меняющее объём показов, — в этот такт до кабинета не доходит.
+    _patch_schedule_run(
+        monkeypatch, [_setting("schedule:hour", "3", -40.0)],
+        learning_resets={"111": date.today() - timedelta(days=3)})
+
+    assert agent_e1.main() == 0
+    report = json.loads(capsys.readouterr().out)
+
+    sent = [s for c in _ScheduleClient.instances for s in c.sent]
+    assert [s for s in sent if s[0] == "campaigns"] == [], \
+        "сбрасывающее обучение действие ушло в кабинет внутри кулдауна"
+    assert report["learning"]["blocked_by_cooldown"] == 1
+    assert report["learning"]["cooldown_days"] == \
+        agent_e1.LEARNING_COOLDOWN_DAYS
+    # Дата последнего сброса — в отчёте: без неё запрет нечем проверить.
+    assert report["learning"]["blocked_objects"] == [
+        "111:" + (date.today() - timedelta(days=3)).isoformat()]
+
+
+def test_learning_cooldown_lets_the_action_through_when_history_is_old(monkeypatch, capsys):
+    # Обратная половина того же: сброс был давно — действие уходит в кабинет,
+    # а отчёт называет его классом (unknown у расписания — не «безопасно»).
+    _patch_schedule_run(
+        monkeypatch, [_setting("schedule:hour", "3", -40.0)],
+        learning_resets={"111": date.today() - timedelta(
+            days=agent_e1.LEARNING_COOLDOWN_DAYS + 1)})
+
+    assert agent_e1.main() == 0
+    report = json.loads(capsys.readouterr().out)
+
+    sent = [s for c in _ScheduleClient.instances for s in c.sent]
+    assert [s for s in sent if s[0] == "campaigns"], "действие не дошло до кабинета"
+    assert report["learning"]["blocked_by_cooldown"] == 0
+    assert report["learning"]["unknown_applied"] == 1
+
+
+def test_learning_class_travels_to_the_journal_with_the_action(monkeypatch, capsys):
+    # Класс влияния на обучение обязан лечь в СТРОКУ ЖУРНАЛА: по нему потом
+    # считается кулдаун (writer_db.last_learning_reset). Без этого поля
+    # история сбросов осталась бы пустой навсегда, и гейт молчал бы всегда.
+    rows = _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 100.0},
+        prod_apply=True,
+    )
+
+    assert agent_e1.main() == 0
+    capsys.readouterr()
+
+    assert rows, "действие не дошло до журнала"
+    # Корректировка ставок обучение не сбивает — и это записано словом,
+    # а не пропуском: NULL означал бы «класс не приписан».
+    assert rows[0]["learning_impact"] == "safe"
+
+
+def test_learning_cooldown_reuses_the_money_knob_window(monkeypatch):
+    # Гейт обучения не заводит собственный срок: и он, и кулдаун денежных
+    # ручек (budget.apply_cooldown, применяется к бюджету и цели CPA) считают
+    # по одному числу дней. Две копии разъехались бы при первой правке.
+    from sync.agent.writer import budget as budget_writer
+
+    assert agent_e1.LEARNING_COOLDOWN_DAYS == budget_writer.BUDGET_COOLDOWN_DAYS
