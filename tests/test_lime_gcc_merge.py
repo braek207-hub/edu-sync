@@ -252,7 +252,7 @@ def test_merge_writes_goal_reaches():
     assert r["cart_reaches"] == 25 and r["checkout_reaches"] == 9
 
 
-# === Дробные заказы linearAll → INTEGER (largest remainder по стране) ===
+# === Дробные заказы linearAll пишутся как есть (purchases_count = double precision) ===
 
 
 def _o(country, channel, subchannel, orders, revenue=0.0, campaign=None):
@@ -261,20 +261,19 @@ def _o(country, channel, subchannel, orders, revenue=0.0, campaign=None):
             "orders": orders, "revenue": revenue}
 
 
-def test_fractional_orders_rounded_with_exact_country_total():
-    """0.6+0.4 внутри страны → тотал 1: единицу получает строка с большей дробью."""
+def test_fractional_orders_written_as_is():
+    """0.6 и 0.4 доезжают до строк без округления — ручной отчёт показывает их дробью."""
     orders = [_o("ОАЭ", "SEM", "Google.Adwords", 0.6, 600.0),
               _o("ОАЭ", "SEO", "SEO Google", 0.4, 400.0)]
     rows = [dict(zip(COLS, r)) for r in merge_rows([], orders, [], 1.0, "2026-07-17")]
     got = {r["subchannel"]: r["purchases_count"] for r in rows}
-    assert got == {"Google.Adwords": 1, "SEO Google": 0}
+    assert got == {"Google.Adwords": 0.6, "SEO Google": 0.4}
     assert sum(r["purchases_count"] for r in rows) == 1
-    # выручка остаётся точной дробной долей
     assert {r["purchases_revenue"] for r in rows} == {600.0, 400.0}
 
 
-def test_rounding_is_per_country_not_global():
-    """Каждая страна округляется отдельно: 0.5+0.5 в двух странах → по 1 заказу в каждой."""
+def test_fractions_sum_exactly_per_country():
+    """0.5+0.5 в двух странах → ровно 1 заказ в каждой, без раздачи остатка."""
     orders = [_o("ОАЭ", "SEM", "Google.Adwords", 0.5), _o("ОАЭ", "SMM paid", "Meta Ads", 0.5),
               _o("Катар", "SEM", "Google.Adwords", 0.5), _o("Катар", "SMM paid", "Meta Ads", 0.5)]
     rows = [dict(zip(COLS, r)) for r in merge_rows([], orders, [], 1.0, "2026-07-17")]
@@ -282,31 +281,32 @@ def test_rounding_is_per_country_not_global():
     for r in rows:
         by_country[r["country"]] = by_country.get(r["country"], 0) + r["purchases_count"]
     assert by_country == {"ОАЭ": 1, "Катар": 1}
+    assert all(r["purchases_count"] == 0.5 for r in rows)
 
 
-def test_rounding_preserves_day_total():
-    """Много дробных строк — сумма целых = round(суммы дробей)."""
+def test_day_total_equals_sum_of_fractions():
+    """Тотал дня = точная сумма дробей, а не round(суммы)."""
     orders = [_o("ОАЭ", "SEM", "Google.Adwords", 3.2, campaign="111"),
               _o("ОАЭ", "SMM paid", "Meta Ads", 2.5, campaign="222"),
               _o("ОАЭ", "SEO", "SEO Google", 1.9),
-              _o("ОАЭ", "CRM", "Mindbox", 0.4)]
+              _o("ОАЭ", "CRM", "Mindbox", 0.45)]
     rows = [dict(zip(COLS, r)) for r in merge_rows([], orders, [], 1.0, "2026-07-17")]
-    assert sum(r["purchases_count"] for r in rows) == 8   # round(8.0)
+    assert sum(r["purchases_count"] for r in rows) == 8.05
 
 
 def test_integer_orders_pass_through_unchanged():
-    """Целые заказы (fallback без linearAll) округление не искажает."""
+    """Целые заказы (fallback без linearAll) остаются целыми."""
     orders = [_o("ОАЭ", "SEM", "Google.Adwords", 10.0, 1000.0)]
     r = dict(zip(COLS, merge_rows([], orders, [], 1.0, "2026-07-17")[0]))
     assert r["purchases_count"] == 10
 
 
-def test_app_order_rows_round_fractional():
-    """app-строки округляются так же: тотал страны точный."""
+def test_app_order_rows_keep_fractions():
+    """app-строки дробные так же, как web."""
     app = [_o("ОАЭ", "SEM", "Google.Adwords", 0.7, 700.0),
            _o("ОАЭ", "SEO", "SEO Google", 0.3, 300.0)]
     rows = [dict(zip(COLS, r)) for r in app_order_rows(app, 1.0, "2026-07-17")]
     assert all(r["data_source"] == "app" for r in rows)
     assert sum(r["purchases_count"] for r in rows) == 1
     got = {r["subchannel"]: r["purchases_count"] for r in rows}
-    assert got["Google.Adwords"] == 1 and got["SEO Google"] == 0
+    assert got["Google.Adwords"] == 0.7 and got["SEO Google"] == 0.3

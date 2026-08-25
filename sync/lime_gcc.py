@@ -14,9 +14,10 @@ docs/superpowers/plans/2026-08-20-lime-gcc-linearall-ga4.md в EDU v2):
 map_ga4_channel, TW-заказы/расход через map_tw_source/SPEND_METRIC_MAP — поэтому мерж по
 (channel, subchannel) валиден.
 
-Дробные заказы linearAll округляются в INTEGER-колонку purchases_count методом largest
-remainder внутри (день, страна): тотал дня и страны точный, дробится только раскладка
-по каналам/кампаниям. Выручка (FLOAT) остаётся точной дробной.
+Заказы пишутся ДРОБНЫМИ: linearAll кладёт 1/N заказа на касание, и ручной отчёт агентства
+так их и показывает (157,2 у All Paid, 9 026 у канала). Колонка purchases_count переведена
+в double precision миграцией 20260825170000 — до неё дробность гасилась largest remainder
+внутри (день, страна), из-за чего раскладка по каналам и кампаниям гуляла на ±2 заказа.
 
 customers/new_customers/new_customers_revenue = 0: TW-атрибуция не даёт чистого
 per-channel деления новый/лояльный клиент — блок «Новые/Лояльные» GCC пуст в v1.
@@ -28,7 +29,6 @@ LIME_GCC_DRY_RUN — пропустить БД, только напечатат�
 без доступа к прод-Supabase с машины).
 Запуск: python -m sync.lime_gcc
 """
-import math
 import os
 import time
 from datetime import date, timedelta
@@ -59,30 +59,6 @@ COLUMNS = (
 )
 
 INSERT_SQL = f"INSERT INTO lime_stats ({', '.join(COLUMNS)}) VALUES %s"
-
-
-def _round_orders_largest_remainder(agg: dict) -> dict:
-    """Дробные заказы linearAll → целые с точным тоталом внутри каждой страны.
-
-    Группа = country (ключ agg[0]); в группе floor каждому, остаток до round(суммы)
-    раздаётся строкам с наибольшей дробной частью. Тотал дня и страны не плывёт,
-    погрешность ±1 живёт только в раскладке по каналам/кампаниям.
-
-    Returns:
-        {key из agg: целые заказы}.
-    """
-    by_country: dict[str | None, list[tuple]] = {}
-    for key, row in agg.items():
-        by_country.setdefault(key[0], []).append((key, float(row["orders"])))
-    out: dict = {}
-    for items in by_country.values():
-        target = round(sum(v for _, v in items))
-        base = {k: math.floor(v) for k, v in items}
-        rem = target - sum(base.values())
-        for k, _v in sorted(items, key=lambda kv: -(kv[1] - math.floor(kv[1])))[:rem]:
-            base[k] += 1
-        out.update(base)
-    return out
 
 
 def merge_rows(ga4_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
@@ -176,7 +152,6 @@ def merge_rows(ga4_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
         if sp.get("campaign_name") and not row["campaign_name"]:
             row["campaign_name"] = sp["campaign_name"]
 
-    orders_int = _round_orders_largest_remainder(agg)
     out: list[tuple] = []
     for key, row in agg.items():
         country, campaign, channel, subchannel = key
@@ -187,7 +162,7 @@ def merge_rows(ga4_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
             date_s, "web", "gcc", country, channel, subchannel, row["traffic_type"],
             campaign, row["campaign_name"],                    # campaign_id, campaign_name
             cost_rub, 0, 0, row["sessions"], row["users"], 0,   # cost, clicks, impressions, sessions, users, clients
-            orders_int[key], revenue_rub, 0,                    # purchases_count, purchases_revenue, customers
+            round(float(row["orders"]), 6), revenue_rub, 0,     # purchases_count, purchases_revenue, customers
             row["new_users"], 0, 0.0,                           # new_users, new_customers, new_customers_revenue
             # Средневзвешенные по визитам; проценты и «страниц за визит» — конвенция
             # polinarepik_metrica_visits, хендлер взвешивает обратно (SUM(x * sessions)).
@@ -203,17 +178,16 @@ def app_order_rows(app_agg: list[dict], fx_rate: float, date_s: str) -> list[tup
 
     Только заказы/выручка (трафика тут нет — app-трафик считает AppMetrica). Атрибуция
     (paid/organic, linearAll) и страна доставки — те же, что у web (из TW/Shopify), но
-    канал app. Дробные заказы округляются так же, как web (largest remainder по стране).
+    канал app. Заказы дробные, как у web.
     """
     pseudo_agg = {(o.get("country"), i): o for i, o in enumerate(app_agg)}
-    orders_int = _round_orders_largest_remainder(pseudo_agg)
     out: list[tuple] = []
     for key, o in pseudo_agg.items():
         out.append((
             date_s, "app", "gcc", o.get("country"), o["channel"], o["subchannel"],
             o.get("traffic_type"), o.get("campaign"), "",
             0.0, 0, 0, 0, 0, 0,                                    # cost, clicks, impressions, sessions, users, clients
-            orders_int[key], round(float(o["revenue"] or 0) * fx_rate, 2), 0,
+            round(float(o["orders"] or 0), 6), round(float(o["revenue"] or 0) * fx_rate, 2), 0,
             0, 0, 0.0, None, None, 0, 0,
         ))
     return out
@@ -453,7 +427,7 @@ def _read_preserved(conn, day_s: str) -> tuple[list[dict], list[tuple]]:
                 "country": r["country"], "campaign": r["campaign_id"],
                 "channel": r["channel"], "subchannel": r["subchannel"],
                 "traffic_type": r["traffic_type"], "campaign_name": r["campaign_name"] or "",
-                "orders": int(r["purchases_count"] or 0),
+                "orders": float(r["purchases_count"] or 0),
                 "revenue_rub": float(r["purchases_revenue"] or 0),
                 "cost_rub": float(r["cost"] or 0),
             })
