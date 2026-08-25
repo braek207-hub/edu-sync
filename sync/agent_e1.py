@@ -79,6 +79,7 @@ from sync.agent.writer.risk import (
     median,
     object_cap,
     object_daily_cost,
+    paced_allowance,
     risk_object,
     week_start,
 )
@@ -1440,10 +1441,15 @@ def run_account(
     # а не на кабинет, и предыдущий клиент этого же прогона мог его уже
     # частично занять (spent_risk читает applied_at из журнала, куда
     # apply_actions уже успел записать применённые действия).
-    remaining = writer_db.risk_limit(wk, DEFAULT_WEEKLY_RISK_RUB) - writer_db.spent_risk(wk)
+    weekly_left = writer_db.risk_limit(wk, DEFAULT_WEEKLY_RISK_RUB) - writer_db.spent_risk(wk)
+    # Из двух потолков берётся меньший: остаток НЕДЕЛИ и доля СЕГОДНЯШНЕГО
+    # дня. Второй общий на все кабинеты прогона, поэтому он не перечитывается,
+    # а уменьшается по мере трат — ровно как лимит действий рядом.
+    remaining = min(weekly_left, ctx["run_risk_remaining"])
     prepared, deferred = fit_into_budget(priced, risks, remaining,
                                          charged_risk, caps)
     ctx["remaining_cap"] -= len(prepared)
+    ctx["run_risk_remaining"] -= sum(float(a.get("risk_rub") or 0.0) for a in prepared)
 
     report = apply_actions(client, prepared, writer_db, lease=lease)
 
@@ -1549,6 +1555,11 @@ def run_account(
             "reason": NO_RED_LINE_REASON if no_red_line else None,
         },
         "remaining_risk_rub": round(remaining, 2),
+        # Три числа, а не одно: сколько осталось у недели, сколько у дня и
+        # сколько взято. Иначе «бюджет кончился» и «дневная доля выбрана»
+        # выглядят одинаково, хотя первое ждёт понедельника, а второе — утра.
+        "weekly_risk_left_rub": round(weekly_left, 2),
+        "run_risk_left_rub": round(max(ctx["run_risk_remaining"], 0.0), 2),
         "risk_charged_rub": round(sum(a["risk_rub"] for a in prepared), 2),
         # Дельта-модель против прежней: во сколько раз дешевле обошёлся тот
         # же набор действий. Без этой строки переход проверить нечем — цена
@@ -1733,6 +1744,12 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "charged_risk": charged_risk,
         "week_start": wk,
         "remaining_cap": remaining_cap,
+        # Доля недельного риска на этот прогон. Считается ОДИН раз на весь
+        # прогон: делить остаток заново на каждом кабинете значило бы выдать
+        # четыре дневных доли за один день.
+        "run_risk_remaining": paced_allowance(
+            writer_db.risk_limit(wk, DEFAULT_WEEKLY_RISK_RUB) - writer_db.spent_risk(wk),
+            today, wk),
         # Ограничитель кампаний — один объект на весь прогон: его остаток
         # общий на все кабинеты, тем же доводом, что и лимит действий.
         # Пустой (ничего не ограничивает) — когда прогон запущен без

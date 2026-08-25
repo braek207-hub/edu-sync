@@ -20,6 +20,7 @@ import pytest
 
 import sync.agent_e1 as agent_e1
 from sync.agent.writer.apply import SandboxApplyRefusal, apply_actions
+from sync.agent.writer import risk
 
 
 class _FakeLease:
@@ -748,8 +749,13 @@ def test_campaign_risk_is_capped_by_the_object_price(monkeypatch, capsys):
 
 def test_budget_is_not_exhausted_by_repeated_actions_on_same_campaign(monkeypatch, capsys):
     # Тот же расчёт «в лоб»: три действия по кампании с расходом 1000 ₽/день
-    # стоили бы 21 000 ₽ при остатке 10 000 ₽ — два из трёх ушли бы в
+    # стоили бы 21 000 ₽ при доступных 10 000 ₽ — два из трёх ушли бы в
     # отложенные, хотя реальная цена ошибки по этой кампании 7000 ₽.
+    #
+    # Недельный лимит здесь — семь дневных долей, чтобы прогону досталось
+    # ровно те 10 000 ₽ в любой день недели: проверяется модель ПОТОЛКА
+    # ОБЪЕКТА, и распределение недели по дням (paced_allowance) не должно
+    # подмешиваться в неё днём запуска.
     journal = []
     _patch_run(
         monkeypatch,
@@ -762,7 +768,8 @@ def test_budget_is_not_exhausted_by_repeated_actions_on_same_campaign(monkeypatc
         daily_cost={"111": 1000.0},
         journal=journal,
     )
-    monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 10_000.0)
+    monkeypatch.setattr(agent_e1.writer_db, "risk_limit",
+                        lambda *_: 10_000.0 * risk.DAYS_IN_WEEK)
 
     assert agent_e1.main() == 0
 
