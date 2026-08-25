@@ -35,7 +35,8 @@ from sync.agent.confidence import assess
 # у него быть не должно: разойдись они — расчёт поднимал бы вес кампании,
 # которой писатель всё равно откажет. Поэтому и порог, и единицы берутся
 # оттуда, а не переписываются здесь.
-from sync.agent.writer.budget import BINDING_SHARE, VAT, WEEKS_IN_WINDOW
+from sync.agent.writer.budget import (BINDING_SHARE, MAX_WRITE_STEP, VAT,
+                                      WEEKS_IN_WINDOW)
 
 # Кап шага за такт. Симметричный в лог-смысле он не обязан быть: ×1.5 вверх
 # отыгрывается срезанием, ×0.5 вниз — доливом на следующем такте.
@@ -48,6 +49,16 @@ EXPLORATION_SHARE = 0.07
 
 MAX_STEP_UP = 1.5
 MAX_STEP_DOWN = 0.5
+
+# Расширенный кап шага вверх. Обычный ×1.5 стоит на том, что дальше кривая —
+# экстраполяция. Но когда недобор трафика доказан замером (headroom.py),
+# кривая не спорит (β<1), предельный рубль возвращает в полтора раза больше
+# порога кабинета и текущий лимит СВЯЗЫВАЕТ расход — экстраполяции нет:
+# деньги идут в показы, которые уже существуют и сейчас достаются
+# конкурентам. Шаг ×2 сбрасывает обучение стратегии (он больше ±20 %) и
+# потому сам себя ограничивает кулдауном в 14 дней (writer/budget.py).
+BIG_STEP_UP = 2.0
+BIG_STEP_ROI_MARGIN = 1.5
 
 # Шаг кампании с β ≥ 1. «Насыщения не видно» — экстраполяционное утверждение
 # с самым слабым обоснованием из всей кривой (saturation.BETA_MAX его же и
@@ -128,6 +139,42 @@ def binding_limit(settings: Optional[Dict[str, Any]], cost_28d: float) -> bool:
     return False
 
 
+def step_cap_up(campaign: Dict[str, Any]) -> float:
+    """Потолок шага вверх для кампании: ×1.5 обычно, ×2 при доказанном недоборе.
+
+    Четыре условия сразу, и каждое отсекает свой способ сжечь деньги:
+
+      * growth_room is True — недобор ИЗМЕРЕН. None («не мерили») права на ×2
+        не даёт: это не то же самое, что измеренное «места нет»;
+      * β < 1 — кривая не спорит с ростом;
+      * предельный рубль возвращает BIG_STEP_ROI_MARGIN порога кабинета —
+        запас на то, что вторая половина шага окупится хуже первой;
+      * лимит связывает расход — иначе поднятый потолок не купит ни одного
+        показа (замер рычага: 9 кампаний из 62), и писатель откажет
+        NOT_APPLICABLE_UP_REASON, а солвер уже считал бы эти деньги
+        распределёнными.
+    """
+    if (campaign.get("growth_room") is True
+            and campaign.get("limit_binding") is True
+            and float(campaign.get("beta") or 1.0) < 1.0
+            and float(campaign.get("marginal_roi_vs_lambda") or 0.0)
+            >= BIG_STEP_ROI_MARGIN):
+        return BIG_STEP_UP
+    return MAX_STEP_UP
+
+
+def write_step_for(campaign: Dict[str, Any]) -> float:
+    """Кап ЗАПИСИ для кампании: доля расхода, на которую писателю можно двигать.
+
+    Обычные ±MAX_WRITE_STEP — граница, за которой стратегия переобучается.
+    Расширенный кап солвера ровно её и переходит осознанно, и без этой
+    передачи шаг ×2 умирал бы на последнем метре: писатель зажал бы цель
+    до +20 %, а тесты остались бы зелёными — до него они не доходят.
+    """
+    cap = step_cap_up(campaign)
+    return cap - 1.0 if cap > MAX_STEP_UP else MAX_WRITE_STEP
+
+
 def _target_spend(campaign: Dict[str, Any], lam: float) -> float:
     """Целевой бюджет кампании при пороге λ, с капом шага.
 
@@ -138,14 +185,19 @@ def _target_spend(campaign: Dict[str, Any], lam: float) -> float:
     (BETA_SUPERLINEAR_STEP), а не сразу в кап: см. комментарий у константы.
     """
     cost = campaign["cost"]
-    log_ratio = math.log(campaign["value"] / (lam * campaign["marginal_cpl"]))
+    roi_ratio = campaign["value"] / (lam * campaign["marginal_cpl"])
+    log_ratio = math.log(roi_ratio)
     beta = campaign["beta"]
     if beta >= 1.0:
         return cost * (BETA_SUPERLINEAR_STEP if log_ratio > 0
                        else 1.0 / BETA_SUPERLINEAR_STEP)
+    # Кап вверх — решение по кампании, а не общая константа: отношение к λ
+    # известно только здесь, и передаётся готовым числом, чтобы step_cap_up
+    # не пересчитывал порог второй раз.
+    cap_up = step_cap_up({**campaign, "marginal_roi_vs_lambda": roi_ratio})
     scaled = log_ratio / (1.0 - beta)
-    if scaled >= math.log(MAX_STEP_UP):
-        return cost * MAX_STEP_UP
+    if scaled >= math.log(cap_up):
+        return cost * cap_up
     if scaled <= math.log(MAX_STEP_DOWN):
         return cost * MAX_STEP_DOWN
     return cost * math.exp(scaled)
@@ -270,8 +322,15 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, 
     else:
         move = "up" if ratio > 1.0 else "down"
     switch_off = _switch_off_candidate(campaign, ratio, lam, rel)
+    # Кап записи едет вместе со сдвигом и только вверх: расширенный шаг —
+    # это про рост, и симметрично разжимать им кап вниз значило бы разрешить
+    # обвал расхода за один такт. Обычные ±20 % писатель ставит сам, и
+    # дублировать их строкой незачем.
+    write_step = write_step_for({**campaign, "marginal_roi_vs_lambda": roi_ratio})
     return {
         **({"switch_off": switch_off} if switch_off else {}),
+        **({"write_step": write_step}
+           if write_step > MAX_WRITE_STEP and ratio > 1.0 else {}),
         "direction": campaign["direction"],
         "leads_28d": campaign["leads"],
         "cost_28d": round(cost, 2),
@@ -292,7 +351,7 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, 
 
 def _apply_exploration(
     targets: Dict[str, float], cost_by_id: Dict[str, float],
-    explore_rub: float, campaigns: List[Dict[str, Any]],
+    explore_rub: float, campaigns: List[Dict[str, Any]], lam: float,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     """Цели с изъятым и перераспределённым карманом разведки.
 
@@ -302,6 +361,12 @@ def _apply_exploration(
     целевых по кабинету не меняется. Раздача ограничена верхним капом по той
     же причине; невыданный остаток возвращается источникам пропорционально
     изъятому, а не растворяется.
+
+    Потолок раздачи — АДРЕСНЫЙ кап кампании (step_cap_up), а не общий ×1.5.
+    Иначе кампания с доказанным недобором отдавала бы в карман свою долю
+    наравне со всеми, а вернуть не могла: её цель уже стоит выше общего
+    потолка, room выходит нулём, и заявленный ×2 садится примерно на ×1.8 —
+    молча, потому что сумма кабинета при этом сходится.
     """
     floors = {cid: cost_by_id.get(cid, 0.0) * MAX_STEP_DOWN for cid in targets}
     headroom = {cid: max(0.0, targets[cid] - floors[cid]) for cid in targets}
@@ -315,7 +380,16 @@ def _apply_exploration(
     if not bonus:
         return targets, {}
 
-    ceilings = {cid: cost_by_id.get(cid, 0.0) * MAX_STEP_UP for cid in targets}
+    cap_by_id = {
+        str(c["campaign_id"]): step_cap_up({
+            **c,
+            "marginal_roi_vs_lambda": (c["value"] / (lam * c["marginal_cpl"])
+                                       if lam > 0 and c["marginal_cpl"] > 0 else 0.0),
+        })
+        for c in campaigns
+    }
+    ceilings = {cid: cost_by_id.get(cid, 0.0) * cap_by_id.get(cid, MAX_STEP_UP)
+                for cid in targets}
     out = {cid: targets[cid] - withdrawn.get(cid, 0.0) for cid in targets}
     unspent = 0.0
     for cid, extra in bonus.items():
@@ -394,6 +468,10 @@ def portfolio_targets(
             "limit_binding": binding_limit(
                 settings_by_campaign.get(str(campaign_id)),
                 float(curve["cost_28d"])),
+            # Трёхзначен: True — недобор измерен, False — измерен и места
+            # нет, None — не мерили. Право на расширенный шаг даёт только
+            # True (step_cap_up), и подменять None на False здесь нельзя.
+            "growth_room": curve.get("growth_room"),
         })
 
     accounts: Dict[str, Dict[str, Any]] = {}
@@ -414,7 +492,7 @@ def portfolio_targets(
         targets, bonus = _apply_exploration(
             targets, cost_by_id, budget * EXPLORATION_SHARE,
             [{**c, "switch_off": bool(preliminary[c["campaign_id"]].get("switch_off"))}
-             for c in campaigns])
+             for c in campaigns], lam)
         moves = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam)
                  for c in campaigns}
         target_sum = sum(targets.values())
@@ -513,6 +591,19 @@ def computed_rows(section: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
                 "support_n": m["leads_28d"],
                 "rel_error": m["rel_error"],
             }]
+            if m.get("write_step"):
+                # Кап записи для ЭТОЙ кампании. Без строки писатель зажал бы
+                # цель общими ±20 % от расхода, и адресный шаг ×2 не доехал
+                # бы до кабинета ни разу. raw_value — сам сдвиг, чтобы в
+                # журнале было видно, к чему кап приложен.
+                rows.append({
+                    "setting_kind": "budget_target",
+                    "setting_key": "write_step",
+                    "value": m["write_step"],
+                    "raw_value": m["ratio"],
+                    "support_n": m["leads_28d"],
+                    "rel_error": m["rel_error"],
+                })
             switch = m.get("switch_off")
             if switch:
                 # value — доля предельной окупаемости на полу от λ (<0.75 по

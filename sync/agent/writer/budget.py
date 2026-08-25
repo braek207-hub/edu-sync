@@ -262,6 +262,15 @@ def plan_budget_moves(
         expected = _expected_leads_delta(rows)
         if expected is not None:
             desired[str(cid)]["expected_leads_delta"] = expected
+        # Кап записи, назначенный солвером именно этой кампании
+        # (portfolio.write_step_for): строки нет — действует общий
+        # MAX_WRITE_STEP. Политику капа держит солвер, рельса движка
+        # (guardrails.BUDGET_RATIO_MAX) ловит его поверх независимо.
+        step_row = next((r for r in rows
+                         if str(r.get("setting_kind")) == "budget_target"
+                         and str(r.get("setting_key")) == "write_step"), None)
+        if step_row is not None and float(step_row.get("value") or 0.0) > 0:
+            desired[str(cid)]["write_step"] = float(step_row["value"])
 
     return {"desired": desired, "low_confidence": low_confidence,
             "confidence_unknown": confidence_unknown,
@@ -360,11 +369,16 @@ def diff_budget(
 
         spend = float(weekly_spend_no_vat.get(str(cid)) or 0.0)
         target_micros = desired_weekly_micros(move["target_28d"])
+        # Кап записи — не глобальная константа, а решение по кампании:
+        # ±MAX_WRITE_STEP по умолчанию (столько можно, не сбивая обучение
+        # стратегии), больше — только там, где солвер доказал недобор
+        # трафика и запас окупаемости. Оставить здесь константу значило бы
+        # тихо обнулять адресный шаг ×2 на последнем метре.
+        step = float(move.get("write_step") or MAX_WRITE_STEP)
         if spend > 0:
-            # Кап записи ±MAX_WRITE_STEP от недельного РАСХОДА — до проверки
-            # «уже стоит»: судить, стоит ли лимит, надо о том значении,
-            # которое реально поедет в кабинет.
-            target_micros = clamp_write_step(target_micros, spend)
+            # Кап применяется ДО проверки «уже стоит»: судить, стоит ли
+            # лимит, надо о том значении, которое реально поедет в кабинет.
+            target_micros = clamp_write_step(target_micros, spend, max_step=step)
         strategy = state.get("strategy")
         channel, current_micros, reason = (
             read_weekly_limit(strategy) if isinstance(strategy, dict)
@@ -421,7 +435,7 @@ def diff_budget(
             target_daily_micros = int(round(target_micros / 7 / MICROS)) * MICROS
             if spend > 0:
                 target_daily_micros = clamp_write_step(
-                    target_daily_micros, spend / 7.0)
+                    target_daily_micros, spend / 7.0, max_step=step)
             up = move["ratio"] > 1.0
             if up and spend * MICROS / 7 < binding_share * int(daily_micros):
                 _refuse(cid, NOT_APPLICABLE_UP_REASON.format(share=binding_share))

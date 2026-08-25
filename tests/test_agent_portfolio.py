@@ -475,3 +475,128 @@ def test_portfolio_without_settings_boosts_nobody():
     ladder = {cid: _ladder() for cid in saturation}
     section = portfolio_targets(saturation, ladder, {"1": "acc", "2": "acc"})
     assert section["accounts"]["acc"]["exploration"]["headroom_boosted"] == 0
+
+
+# --------------------------------- адресный шаг ×2 (кап шага вверх)
+
+
+def _big_step_campaign(**over):
+    """Кампания, у которой сошлись все четыре условия расширенного капа."""
+    base = {"growth_room": True, "beta": 0.6, "marginal_roi_vs_lambda": 1.6,
+            "limit_binding": True}
+    base.update(over)
+    return base
+
+
+def test_step_cap_is_1_5_by_default():
+    from sync.agent.portfolio import step_cap_up
+
+    assert step_cap_up(_big_step_campaign(growth_room=False,
+                                          marginal_roi_vs_lambda=3.0)) == 1.5
+
+
+def test_step_cap_is_2_when_headroom_and_economics_agree():
+    from sync.agent.portfolio import step_cap_up
+
+    assert step_cap_up(_big_step_campaign()) == 2.0
+
+
+def test_step_cap_stays_1_5_without_headroom_proof():
+    # Экономика хорошая, но объём брать негде: ×2 просто поднимет цену клика.
+    # None — «не мерили», и это не то же самое, что измеренный ноль.
+    from sync.agent.portfolio import step_cap_up
+
+    assert step_cap_up(_big_step_campaign(growth_room=None,
+                                          marginal_roi_vs_lambda=3.0)) == 1.5
+
+
+def test_step_cap_stays_1_5_when_curve_is_superlinear():
+    from sync.agent.portfolio import step_cap_up
+
+    assert step_cap_up(_big_step_campaign(beta=1.2,
+                                          marginal_roi_vs_lambda=3.0)) == 1.5
+
+
+def test_step_cap_stays_1_5_on_thin_margin():
+    from sync.agent.portfolio import step_cap_up
+
+    assert step_cap_up(_big_step_campaign(marginal_roi_vs_lambda=1.1)) == 1.5
+
+
+def test_step_cap_stays_1_5_where_the_limit_does_not_bind():
+    # Замер рычага: «вверх» лимитом применимо к 9 кампаниям из 62. У
+    # остальных поднятый потолок не купит ни одного показа — писатель
+    # откажет, а солвер уже посчитал бы эти деньги распределёнными.
+    from sync.agent.portfolio import step_cap_up
+
+    assert step_cap_up(_big_step_campaign(limit_binding=False,
+                                          marginal_roi_vs_lambda=3.0)) == 1.5
+
+
+def _twin(campaign_id, **over):
+    row = _solver_row(campaign_id, 5000.0)
+    row.update(over)
+    return row
+
+
+def test_solver_grants_double_step_only_to_the_addressed_campaign():
+    # Экономика у обеих одна и та же — отличается только доказанный недобор.
+    rows = [_twin("addressed", growth_room=True, limit_binding=True),
+            _twin("plain")]
+    _, targets = solve_threshold(rows, 350_000.0)
+    assert abs(targets["addressed"] - 100_000.0 * 2.0) < 1
+    assert abs(targets["plain"] - 100_000.0 * MAX_STEP_UP) < 1
+
+
+def _addressed_inputs():
+    # «anchor» несёт бюджет кабинета и держит λ; «rich» упирается в кап
+    # вверх, и только у неё сошлись условия расширенного шага.
+    rich = _curve()
+    rich["headroom_share"] = 0.6
+    rich["growth_room"] = True
+    saturation = {"rich": rich, "anchor": _curve(cost=1_000_000.0, leads=1000)}
+    ladder = {"rich": _ladder(revenue=50_000.0 * 100),
+              "anchor": _ladder(revenue=5_000.0 * 1000, eff=1000)}
+    return saturation, ladder
+
+
+def test_move_carries_write_step_for_the_addressed_campaign():
+    saturation, ladder = _addressed_inputs()
+    section = portfolio_targets(
+        saturation, ladder, {"rich": "acc", "anchor": "acc"},
+        settings_by_campaign={"rich": _settings(weekly=BINDING_WEEKLY)})
+    moves = section["accounts"]["acc"]["moves"]
+    # Кап записи для этой кампании — ±100 % от расхода, а не общие ±20 %.
+    assert moves["rich"]["write_step"] == 1.0
+    assert "write_step" not in moves["anchor"]
+
+
+def test_exploration_ceiling_follows_the_addressed_cap_not_the_common_one():
+    # Карман разведки изымает долю у всех, в том числе у кампании с правом
+    # на ×2, и обратно возвращает только её долю кармана — до ровных ×2 она
+    # не дотягивает, и это правильно: 7 % бюджета кабинета уходят на разведку.
+    # Проверяется другое: потолок РАЗДАЧИ адресный. Будь он общим ×1.5, у неё
+    # room выходил бы нулём (цель уже выше потолка), деньги возвращались бы
+    # источникам, и расширенный шаг съезжал бы под общий кап — молча, потому
+    # что сумма кабинета при этом сходится и ни один инвариант не краснеет.
+    saturation, ladder = _addressed_inputs()
+    section = portfolio_targets(
+        saturation, ladder, {"rich": "acc", "anchor": "acc"},
+        settings_by_campaign={"rich": _settings(weekly=BINDING_WEEKLY)})
+    account = section["accounts"]["acc"]
+    assert account["exploration"]["rub"] > 0
+    assert account["moves"]["rich"]["ratio"] > MAX_STEP_UP
+    assert abs(account["sum_residual"]) < 0.01 * account["budget_28d"]
+
+
+def test_computed_rows_carry_the_addressed_write_step():
+    saturation, ladder = _addressed_inputs()
+    section = portfolio_targets(
+        saturation, ladder, {"rich": "acc", "anchor": "acc"},
+        settings_by_campaign={"rich": _settings(weekly=BINDING_WEEKLY)})
+    rows = computed_rows(section)
+    step_rows = [r for r in rows["rich"] if r["setting_key"] == "write_step"]
+    assert len(step_rows) == 1
+    assert step_rows[0]["setting_kind"] == "budget_target"
+    assert step_rows[0]["value"] == 1.0
+    assert not [r for r in rows["anchor"] if r["setting_key"] == "write_step"]

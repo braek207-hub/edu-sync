@@ -135,11 +135,13 @@ def test_strategy_with_limit_preserves_siblings_and_source():
 # ------------------------------------------------------------------ diff
 
 
-def _move(target, current, leads_delta=None):
+def _move(target, current, leads_delta=None, write_step=None):
     move = {"target_28d": target, "cost_28d": current,
             "ratio": round(target / current, 4), "p_sign": 0.99}
     if leads_delta is not None:
         move["expected_leads_delta"] = leads_delta
+    if write_step is not None:
+        move["write_step"] = write_step
     return move
 
 
@@ -454,3 +456,55 @@ def test_daily_budget_action_carries_expectation():
         {"1": _state(daily_micros=20_000 * M)},
         {"1": 100_000.0})
     assert actions[0]["payload"]["expected_leads_delta"] == -4.0
+
+
+# ---------------------------------------------- адресный кап записи (×2)
+
+
+def _write_step_row(step):
+    return {"setting_kind": "budget_target", "setting_key": "write_step",
+            "value": step, "raw_value": 2.0, "support_n": 100,
+            "rel_error": 0.05}
+
+
+def test_plan_carries_the_addressed_write_step():
+    plan = plan_budget_moves({"1": [_target_row(200_000, 100_000, rel_error=0.05),
+                                    _roi_row(1.6, rel_error=0.05),
+                                    _write_step_row(1.0)]})
+    assert plan["desired"]["1"]["write_step"] == 1.0
+
+
+def test_plan_without_write_step_row_keeps_the_default():
+    plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=0.05),
+                                    _roi_row(1.5, rel_error=0.05)]})
+    assert "write_step" not in plan["desired"]["1"]
+
+
+def test_double_step_reaches_the_account():
+    # Без параметризации кап записи ±20 % убивал адресный шаг ×2 на последнем
+    # метре: солвер назначал 200 000 ₽/нед, а в кабинет уезжало 120 000.
+    # Тесты этого не ловили — они не доходили до писателя.
+    actions, refused = diff_budget(
+        {"1": _move(960_000, 480_000, write_step=1.0)},
+        {"1": _state(weekly_micros=100_000 * M)},
+        {"1": 100_000.0})
+    assert not refused
+    assert actions[0]["payload"]["WeeklySpendLimit"] == 200_000 * M
+
+
+def test_without_the_addressed_step_the_default_still_clamps():
+    # Та же цель без пометки солвера — ±20 % от расхода, как и было.
+    actions, _ = diff_budget(
+        {"1": _move(960_000, 480_000)},
+        {"1": _state(weekly_micros=100_000 * M)},
+        {"1": 100_000.0})
+    assert actions[0]["payload"]["WeeklySpendLimit"] == 120_000 * M
+
+
+def test_daily_branch_honours_the_addressed_step():
+    # Ручная стратегия: тот же кап, но от дневного расхода.
+    actions, _ = diff_budget(
+        {"1": _move(960_000, 480_000, write_step=1.0)},
+        {"1": _state(daily_micros=14_000 * M)},
+        {"1": 100_000.0})
+    assert actions[0]["payload"]["DailyBudget"]["Amount"] == 28_571 * M

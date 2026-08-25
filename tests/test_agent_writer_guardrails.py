@@ -238,11 +238,11 @@ def test_budget_rail_uses_independent_spend_not_the_payload_number():
     # ошибись он в окне или в кампании — рельса это одобрит. Коридор считается
     # по витрине: тот же лимит проходит по числу построителя и не проходит по
     # независимому расходу, хотя сами числа расходятся в пределах допуска.
-    action = _budget_action(100_000 * 1_000_000, cost_28d_in_payload=320_000.0)
+    action = _budget_action(100_000 * 1_000_000, cost_28d_in_payload=240_000.0)
     ok, _ = check_action(action)
-    assert ok, "×1.5 от расхода построителя — внутри коридора"
+    assert ok, "×2.0 от расхода построителя — внутри коридора"
 
-    ok, reason = check_action(action, cost_28d_by_campaign={"111": 265_000.0})
+    ok, reason = check_action(action, cost_28d_by_campaign={"111": 200_000.0})
     assert not ok
     assert "коридор" in reason
 
@@ -351,4 +351,15 @@ def test_negative_rail_refuses_too_many_added_at_once():
 
 def test_negative_rail_refuses_empty_list():
     ok, _ = check_action(_neg_action([]))
+    assert not ok
+
+
+def test_double_budget_passes_but_sevenfold_does_not():
+    # ×2 — политика (адресный рост при доказанном недоборе), ×7 — недели
+    # вместо дней: рельса обязана пропускать первое и ловить второе.
+    ok, reason = check_action(
+        _budget_action(200_000 * 1_000_000, cost_28d_in_payload=480_000.0))
+    assert ok, reason
+    ok, _ = check_action(
+        _budget_action(700_000 * 1_000_000, cost_28d_in_payload=480_000.0))
     assert not ok
