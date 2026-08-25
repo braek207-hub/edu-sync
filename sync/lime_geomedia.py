@@ -24,6 +24,12 @@ from sync.lime_media_session import yandex_page
 COMPANY_ID = os.environ.get("LIME_GEO_COMPANY_ID", "93296554")
 ORIGIN = f"https://yandex.ru/geoadv/statistics?company_id={COMPANY_ID}"
 
+# Кабинет Георекламы показывает «Потрачено» БЕЗ НДС — как Reports API Директа с
+# IncludeVAT=NO. В отчёт медийки расход идёт в колонку «Расход (c НДС)» рядом с
+# Директом (там IncludeVAT=YES, уже с налогом), поэтому домножаем при записи, на
+# сервере, а не в витрине — тот же инвариант, что у Директа KZ (LIME_DIRECT_VAT_MULT).
+VAT_MULT = float(os.environ.get("LIME_GEO_VAT_MULT", "1.2"))
+
 
 def _day_url(day: str) -> str:
     # фильтр в URL страницы → сайт сам грузит статистику за этот день (со своим CSRF)
@@ -75,7 +81,7 @@ def build_rows(page, date_from: date, date_to: date) -> list:
             det = c.get("details") or {}
             shows = int(_num(det.get("shows")))
             clicks = int(_num(det.get("clicks")))
-            spent = round(_num(det.get("spent")), 2)
+            spent = round(_num(det.get("spent")) * VAT_MULT, 2)
             if shows == 0 and clicks == 0 and spent == 0:
                 continue  # день без открутки по кампании — не засоряем
             name = str(c.get("campaignName", "")).strip() or "geo.media"
