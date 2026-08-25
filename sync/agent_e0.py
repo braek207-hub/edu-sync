@@ -785,6 +785,10 @@ def main() -> int:
                         if v["verdict"] == semantic.JUNK),
             "unclear": sum(1 for v in semantic_verdicts.values()
                            if v["verdict"] == semantic.UNCLEAR),
+            # Само по себе число unclear ничего не говорит: «модель честно
+            # не знает» и «слой упал» дают одинаковую цифру и одинаковое
+            # отсутствие вето. Разводит их только причина.
+            "unclear_reasons": semantic.unclear_reasons(semantic_verdicts),
         }
     else:
         # Молчаливое отсутствие слоя неотличимо от «модель всё одобрила» —

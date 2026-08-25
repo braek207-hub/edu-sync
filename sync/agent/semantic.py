@@ -134,6 +134,24 @@ def classify(
     return out
 
 
+def unclear_reasons(verdicts: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+    """Почему вердикты вышли неопределёнными — счётчик по причинам.
+
+    UNCLEAR приходит тремя разными путями: модель честно ответила «не знаю»,
+    ответ не разобрался, вызов упал. Для рычага это одно и то же (вето нет),
+    для человека — совершенно разные новости: первое значит, что слой
+    работает, а два других — что он молчит, и молчание выглядит как согласие.
+    Одна строка счётчиков в отчёте отличает их без чтения логов.
+    """
+    out: Dict[str, int] = {}
+    for verdict in verdicts.values():
+        if verdict.get("verdict") != UNCLEAR:
+            continue
+        reason = str(verdict.get("reason") or "").strip() or "без причины"
+        out[reason[:60]] = out.get(reason[:60], 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+
 def keep_minus_candidates(
     candidates: List[Dict[str, Any]], verdicts: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:

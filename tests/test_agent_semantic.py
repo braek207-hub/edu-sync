@@ -14,6 +14,7 @@
 
 import json
 
+from sync.agent import semantic
 from sync.agent.semantic import (
     UNCLEAR,
     build_prompt,
@@ -85,3 +86,35 @@ def test_prompt_carries_context_and_queries():
 def test_parse_response_tolerates_code_fences():
     raw = '```json\n{"verdicts": [{"query": "a", "verdict": "junk"}]}\n```'
     assert parse_response(raw)["a"]["verdict"] == "junk"
+
+
+def test_unclear_reasons_separate_silence_from_ignorance():
+    # Для рычага все три случая одинаковы — вето нет. Для человека это
+    # «слой работает» против «слой молчит, и молчание похоже на согласие».
+    verdicts = {
+        "а": {"verdict": semantic.UNCLEAR, "reason": "слой недоступен: ReadTimeout"},
+        "б": {"verdict": semantic.UNCLEAR, "reason": "слой недоступен: ReadTimeout"},
+        "в": {"verdict": semantic.UNCLEAR, "reason": "модель не ответила"},
+        "г": {"verdict": semantic.CORE, "reason": "ровно наш продукт"},
+    }
+
+    assert semantic.unclear_reasons(verdicts) == {
+        "слой недоступен: ReadTimeout": 2, "модель не ответила": 1}
+
+
+def test_unclear_reasons_are_sorted_by_weight():
+    verdicts = {
+        "а": {"verdict": semantic.UNCLEAR, "reason": "редкая"},
+        "б": {"verdict": semantic.UNCLEAR, "reason": "частая"},
+        "в": {"verdict": semantic.UNCLEAR, "reason": "частая"},
+    }
+
+    assert list(semantic.unclear_reasons(verdicts)) == ["частая", "редкая"]
+
+
+def test_verdict_without_a_reason_is_still_counted():
+    # Причины нет — строка всё равно обязана быть видна: пропуск сделал бы
+    # сумму причин меньше числа unclear, и разница читалась бы как ноль.
+    verdicts = {"а": {"verdict": semantic.UNCLEAR}}
+
+    assert semantic.unclear_reasons(verdicts) == {"без причины": 1}
