@@ -1043,3 +1043,35 @@ def test_unavailable_journal_does_not_kill_the_calculation(monkeypatch, capsys):
     assert agent_e0.main() == 0
     loop = _json.loads(capsys.readouterr().out)["learning_loop"]
     assert "журнал недоступен" in loop["unavailable"]
+
+
+def test_report_names_what_to_strengthen_and_how_much_fits(monkeypatch, capsys):
+    """Э0 печатает не только «что срезать», но и «что усилить».
+
+    Секция обязана быть в каждом такте, в том числе пустая: молчание про
+    усиление неотличимо от «усиливать нечего», а агент, отвечающий только на
+    первый вопрос, ведёт кабинет к «эффективно и мало».
+
+    Денег в ней ДВА числа, а не одно: доливка бюджета доедет только там, где
+    лимит связывает расход (9 кампаний из 62), остальным нужна цена
+    конверсии. Задача 11 растит кабинет на room_rub_budget, и сумма обязана
+    сходиться с разбивкой.
+    """
+    import json as _json
+
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0, "demand_regime",
+                        lambda *a, **k: {"vpo": {"regime": "подъём"},
+                                         "spo": {"regime": "норма"}})
+
+    assert agent_e0.main() == 0
+    growth = _json.loads(capsys.readouterr().out)["growth"]
+
+    # Режим спроса доезжает до списка усиления, а не остаётся сам по себе.
+    assert growth["directions_rising"] == ["vpo"]
+    assert isinstance(growth["candidates"], list)
+    assert growth["room_rub_total"] == (growth["room_rub_budget"]
+                                        + growth["room_rub_tcpa"])
+    # Качество когорты (задача 14) ещё не считается: тормоза нет, и никого
+    # он не снимает.
+    assert growth["skipped_by_quality"] == 0

@@ -296,6 +296,23 @@ def _switch_off_candidate(
     }
 
 
+def _step_capped(campaign: Dict[str, Any], roi_ratio: float, cap_up: float) -> bool:
+    """Хотел ли солвер дать больше, чем разрешает кап шага за такт.
+
+    Считается по НЕЗАЖАТОМУ оптимуму (_target_spend до капа), а не сравнением
+    итоговой цели с потолком: карман разведки изымает долю у всех, и кампания,
+    упёршаяся в кап, приходит в отчёт чуть ниже него — сравнение с целью
+    объявляло бы «в кап не упёрлись» ровно там, где упёрлись.
+
+    β ≥ 1 в кап не упирается по построению: такой кампании положен отдельный
+    умеренный шаг (BETA_SUPERLINEAR_STEP), и он ниже любого потолка.
+    """
+    beta = float(campaign.get("beta") or 0.0)
+    if beta >= 1.0 or roi_ratio <= 0:
+        return False
+    return math.log(roi_ratio) / (1.0 - beta) >= math.log(cap_up)
+
+
 def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, Any]:
     """Строка рекомендации: дельта, ожидаемый эффект, вердикт сдвига.
 
@@ -327,6 +344,11 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, 
     # обвал расхода за один такт. Обычные ±20 % писатель ставит сам, и
     # дублировать их строкой незачем.
     write_step = write_step_for({**campaign, "marginal_roi_vs_lambda": roi_ratio})
+    # Упор в потолок шага: солвер хотел дать больше, чем разрешено за такт.
+    # Это кандидат на усиление (agent/growth.py), а не законченное решение.
+    capped = _step_capped(
+        campaign, roi_ratio,
+        step_cap_up({**campaign, "marginal_roi_vs_lambda": roi_ratio}))
     return {
         **({"switch_off": switch_off} if switch_off else {}),
         **({"write_step": write_step}
@@ -341,6 +363,10 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, 
         "marginal_cpl": round(campaign["marginal_cpl"], 2),
         "marginal_roi": round(campaign["value"] / campaign["marginal_cpl"], 4),
         "marginal_roi_vs_lambda": round(roi_ratio, 4),
+        "step_capped": capped,
+        # Рычаг роста этой кампании: доливка бюджета доедет только там, где
+        # лимит уже связывает расход (9 из 62), остальным нужна цена.
+        "limit_binding": bool(campaign.get("limit_binding")),
         "expected_leads_delta": round(delta_leads, 1),
         "expected_revenue_delta": round(delta_leads * campaign["value"], 2),
         "rel_error": round(rel, 4),

@@ -600,3 +600,25 @@ def test_computed_rows_carry_the_addressed_write_step():
     assert step_rows[0]["setting_kind"] == "budget_target"
     assert step_rows[0]["value"] == 1.0
     assert not [r for r in rows["anchor"] if r["setting_key"] == "write_step"]
+
+
+def test_move_names_the_lever_and_the_upper_cap_it_reached():
+    """Строка сдвига обязана нести повод роста, а не только его величину.
+
+    Список усиления (agent/growth.py) собирается из этих двух полей: без
+    limit_binding он предлагал бы долить денег 53 кампаниям из 62, где лимит
+    расход не связывает и прибавка не превратится ни в один показ, а без
+    step_capped молчал бы о кампаниях, которым солвер хотел дать больше, чем
+    разрешено за такт.
+    """
+    saturation, ladder = _addressed_inputs()
+    section = portfolio_targets(
+        saturation, ladder, {"rich": "acc", "anchor": "acc"},
+        settings_by_campaign={"rich": _settings(weekly=BINDING_WEEKLY)})
+    moves = section["accounts"]["acc"]["moves"]
+
+    assert moves["rich"]["limit_binding"] is True
+    assert moves["rich"]["step_capped"] is True
+    # Якорь держит λ и никуда не упирается: лимита у него нет вовсе.
+    assert moves["anchor"]["limit_binding"] is False
+    assert moves["anchor"]["step_capped"] is False

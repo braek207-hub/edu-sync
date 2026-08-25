@@ -53,6 +53,7 @@ from sync.agent.metrika import (
     fetch_hourly_profile,
     resolve_counter_account,
 )
+from sync.agent.growth import growth_candidates
 from sync.agent.hierarchy import hierarchical_modifiers
 from sync.agent.ladder import ladder_report
 from sync.agent.history import budget_response
@@ -1069,6 +1070,13 @@ def main() -> int:
             (date.today() - timedelta(weeks=DEMAND_HISTORY_WEEKS)).isoformat()),
         through_week=date_to)
 
+    # Вторая половина оптимизации: что УСИЛИТЬ. Собирается из уже посчитанного
+    # — недобор трафика, упор в кап шага, режим спроса, запросы без своей
+    # группы — и ничего нового в Директ не спрашивает. Качество когорты
+    # (quality_drift) пока не считается: тормоз подключит задача 14.
+    growth = growth_candidates(budget_threshold, headroom_section, demand,
+                               expansion)
+
     sizes = agent_db.table_sizes()
     total_mb = round(sum(int(s["size_bytes"] or 0) for s in sizes) / 1024 / 1024, 1)
 
@@ -1270,6 +1278,12 @@ def main() -> int:
             # (docs/AGENT-DATA-SOURCES.md).
             "region": DEMAND_REGION,
         },
+        # Что УСИЛИТЬ. Печатается каждый такт, в том числе пустым: молчание
+        # про усиление неотличимо от «усиливать нечего», а агент, отвечающий
+        # только на «что срезать», ведёт кабинет к «эффективно и мало».
+        # Денег два числа: room_rub_budget кабинет освоит поднятием лимитов
+        # сразу, room_rub_tcpa — только после эскалации цены конверсии.
+        "growth": growth,
         "db_total_mb": total_mb,
         "db_tables": [{"t": s["table_name"], "size": s["size"]} for s in sizes],
     }, ensure_ascii=False, indent=2))
