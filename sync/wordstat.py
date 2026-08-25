@@ -1,9 +1,13 @@
 """Yandex Cloud Search API (Wordstat) → lime_wordstat_demand (+ _daily).
 
-Брендовый спрос (Σ 5 фраз, БЕЗ фильтра региона, широкое соответствие) в двух зернах:
-недельном (вся история) и дневном (Wordstat хранит дневную детализацию только
-за последние 60 дней — глубже дневного ряда не будет, это ок).
+Брендовый спрос (Σ фраз региона, широкое соответствие) в двух зернах: недельном
+(вся история) и дневном (Wordstat хранит дневную детализацию только за последние
+60 дней — глубже дневного ряда не будет, это ок).
 Старый api.wordstat.yandex.net закрыт — используем Search API.
+
+Регионы: ru (без гео-фильтра — канон Павла), kz и gcc (гео-фильтр + локальные
+бренд-фразы, см. REGION_GEO / REGION_EXTRA_PHRASES). Ряд региона лежит в тех же
+таблицах — region входит в первичный ключ.
 
 Без региона — потому что так собирает ручной канон Павла (таблица «Частотность
 брендовых запросов»): сверка 2026-08-20 по неделе 10.08 дала бит-в-бит совпадение
@@ -21,6 +25,58 @@ import requests
 
 WORDSTAT_URL = "https://searchapi.api.cloud.yandex.net/v2/wordstat/dynamics"
 BRAND_PHRASES = ["lime", "лайм интернет", "лайм купить", "лайм магазин", "лайм одежда"]
+
+# Гео-фильтр региона спроса: id из справочника GeoRegions Директа (сверено 2026-08-25).
+# ru — None: без фильтра, так собирает ручной канон Павла (см. докстринг модуля).
+# gcc — 6 стран Залива одним списком: API суммирует список регионов (проба 2026-08-25,
+# неделя 10.08 по фразе «lime»: ОАЭ отдельно 107, шестёрка списком 111 — добавка мелких стран).
+REGION_GEO: dict[str, list[str] | None] = {
+    "ru": None,
+    "kz": ["159"],  # Казахстан
+    "gcc": [
+        "210",    # Объединённые Арабские Эмираты
+        "10540",  # Саудовская Аравия
+        "21486",  # Катар
+        "10537",  # Кувейт
+        "10532",  # Бахрейн
+        "21586",  # Оман
+    ],
+}
+
+# Региональные добавки к бренд-набору. Широкое соответствие «lime» уже ловит любые
+# запросы со словом lime («lime kz» 2089/мес, «lime dubai» 98/мес), поэтому добираем
+# только то, что мимо него: кириллицу с локальными уточнениями и слитное «limestore».
+# Замеры topRequests+regions 2026-08-25 (показов/мес): KZ +774 к базовым 6326 (+12%),
+# GCC +33 к 504 (+7%). «лайм официальный» (KZ 111) НЕ берём — на 90% это «лайм
+# официальный сайт», уже покрытый фразой «лайм сайт»: был бы двойной счёт.
+# Арабица («لايم», «ليم») и «leem» в Wordstat по Заливу дают ноль — не берём.
+REGION_EXTRA_PHRASES: dict[str, list[str]] = {
+    "kz": [
+        "лайм кз",         # 366
+        "лайм сайт",       # 153
+        "лайм казахстан",  # 76
+        "лайм алматы",     # 52
+        "limestore",       # 55
+        "лайм каталог",    # 37
+        "лайм астана",     # 35
+    ],
+    "gcc": [
+        "лайм дубай",    # 15
+        "лайм сайт",     # 12
+        "limestore",     # 4
+        "лайм каталог",  # 2
+    ],
+}
+
+
+def phrases_for(region: str) -> list[str]:
+    """Бренд-набор региона: канон RU + локальные написания."""
+    return BRAND_PHRASES + REGION_EXTRA_PHRASES.get(region, [])
+
+
+def geo_for(region: str) -> list[str] | None:
+    """Гео-фильтр региона (None = без фильтра). Неизвестный регион — KeyError, а не тихий тотал."""
+    return REGION_GEO[region]
 # Глубина дневной детализации Wordstat: «в дневном отображении данные показываются
 # за последние 60 дней» (справка Wordstat). Граница у API СТРОГАЯ: from ровно 60 дней
 # назад отвергается 400 «The from field value is older than 60 days» (проверено probe
@@ -182,9 +238,10 @@ def fetch_phrase_daily(phrase: str, from_date: str, to_date: str, regions: list[
     return _post_dynamics(body)
 
 
-def sync_wordstat_demand(from_date: str, to_date: str) -> int:
-    """Синк недельного спроса за период. Возвращает число записанных недель."""
-    responses = [fetch_phrase(p, from_date, to_date) for p in BRAND_PHRASES]
+def sync_wordstat_demand(from_date: str, to_date: str, region: str = "ru") -> int:
+    """Синк недельного спроса региона за период. Возвращает число записанных недель."""
+    geo = geo_for(region)
+    responses = [fetch_phrase(p, from_date, to_date, geo) for p in phrases_for(region)]
     weekly = aggregate_weekly(responses)
     if not weekly:
         return 0
@@ -195,18 +252,18 @@ def sync_wordstat_demand(from_date: str, to_date: str) -> int:
             cur.executemany(
                 """
                 INSERT INTO lime_wordstat_demand (week_start, region, frequency, updated_at)
-                VALUES (%s, 'ru', %s, now())
+                VALUES (%s, %s, %s, now())
                 ON CONFLICT (week_start, region)
                 DO UPDATE SET frequency = EXCLUDED.frequency, updated_at = now()
                 """,
-                [(wk, freq) for wk, freq in sorted(weekly.items())],
+                [(wk, region, freq) for wk, freq in sorted(weekly.items())],
             )
         conn.commit()
     return len(weekly)
 
 
-def sync_wordstat_demand_daily(from_date: str, to_date: str) -> int:
-    """Синк ДНЕВНОГО спроса за период → lime_wordstat_demand_daily. Возвращает число дней.
+def sync_wordstat_demand_daily(from_date: str, to_date: str, region: str = "ru") -> int:
+    """Синк ДНЕВНОГО спроса региона за период → lime_wordstat_demand_daily. Число дней.
 
     from клампится к daily_floor() (60-дневная глубина Wordstat), to — к сегодня:
     запрос старше/в будущее дневных точек не даст. Идемпотентно (upsert по (day, region)),
@@ -217,7 +274,8 @@ def sync_wordstat_demand_daily(from_date: str, to_date: str) -> int:
     to = min(to_date[:10], today.isoformat())
     if frm > to:
         return 0
-    responses = [fetch_phrase_daily(p, frm, to) for p in BRAND_PHRASES]
+    geo = geo_for(region)
+    responses = [fetch_phrase_daily(p, frm, to, geo) for p in phrases_for(region)]
     daily = aggregate_daily(responses)
     if not daily:
         return 0
@@ -228,11 +286,11 @@ def sync_wordstat_demand_daily(from_date: str, to_date: str) -> int:
             cur.executemany(
                 """
                 INSERT INTO lime_wordstat_demand_daily (day, region, frequency, updated_at)
-                VALUES (%s, 'ru', %s, now())
+                VALUES (%s, %s, %s, now())
                 ON CONFLICT (day, region)
                 DO UPDATE SET frequency = EXCLUDED.frequency, updated_at = now()
                 """,
-                [(d, f) for d, f in sorted(daily.items())],
+                [(d, region, f) for d, f in sorted(daily.items())],
             )
         conn.commit()
     return len(daily)

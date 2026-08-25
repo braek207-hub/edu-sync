@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 INCREMENTAL_WEEKS = 8
+# Регионы спроса Wordstat (ряды в lime_wordstat_demand[_daily] по колонке region).
+WORDSTAT_REGIONS = ("ru", "kz", "gcc")
 
 
 def main() -> None:
@@ -24,46 +26,53 @@ def main() -> None:
 
     # Wordstat спрос (Cloud Search API) — нужен только API-ключ (folderId опц.).
     # WORDSTAT_FROM=YYYY-MM-DD → бэкфилл с этой даты; иначе инкремент последних недель.
+    # Регионы: ru (без гео), kz и gcc (гео-фильтр + локальные фразы) — свой ряд у каждого,
+    # свой гард свежести; ошибка одного региона не мешает остальным.
     if os.environ.get("YANDEX_SEARCHAPI_KEY"):
-        try:
-            from sync.wordstat import sync_wordstat_demand, demand_up_to_date
+        for region in WORDSTAT_REGIONS:
+            try:
+                from sync.wordstat import sync_wordstat_demand, demand_up_to_date
 
-            # Крон ежедневный: пока прошлой закрытой недели нет — дёргаем API; появилась — пропуск.
-            if not os.environ.get("WORDSTAT_FROM") and demand_up_to_date("lime_wordstat_demand"):
-                print("wordstat: последняя закрытая неделя уже есть — пропуск (до закрытия новой)")
-            else:
-                frm = os.environ.get("WORDSTAT_FROM") or (
-                    dt.date.today() - dt.timedelta(weeks=INCREMENTAL_WEEKS)
-                ).isoformat()
-                n = sync_wordstat_demand(frm, dt.date.today().isoformat())
-                print(f"wordstat: {n} недель (с {frm})")
-        except Exception as e:
-            print(f"ОШИБКА wordstat: {e}")
-            errors.append(f"wordstat: {e}")
+                # Крон ежедневный: пока прошлой закрытой недели нет — дёргаем API; появилась — пропуск.
+                if not os.environ.get("WORDSTAT_FROM") and demand_up_to_date(
+                    "lime_wordstat_demand", region
+                ):
+                    print(f"wordstat[{region}]: последняя закрытая неделя уже есть — пропуск")
+                else:
+                    frm = os.environ.get("WORDSTAT_FROM") or (
+                        dt.date.today() - dt.timedelta(weeks=INCREMENTAL_WEEKS)
+                    ).isoformat()
+                    n = sync_wordstat_demand(frm, dt.date.today().isoformat(), region)
+                    print(f"wordstat[{region}]: {n} недель (с {frm})")
+            except Exception as e:
+                print(f"ОШИБКА wordstat[{region}]: {e}")
+                errors.append(f"wordstat[{region}]: {e}")
 
-        # Дневной срез спроса (глубина Wordstat — 60 дней) — отдельный try:
-        # ошибка дневного не мешает уже записанному недельному (и наоборот).
-        try:
-            from sync.wordstat import (
-                daily_demand_up_to_date,
-                daily_floor,
-                sync_wordstat_demand_daily,
-            )
+            # Дневной срез спроса (глубина Wordstat — 60 дней) — отдельный try:
+            # ошибка дневного не мешает уже записанному недельному (и наоборот).
+            try:
+                from sync.wordstat import (
+                    daily_demand_up_to_date,
+                    daily_floor,
+                    sync_wordstat_demand_daily,
+                )
 
-            # Лаг дневного Wordstat 1-3 дня: пока «вчера-1» нет — дёргаем API, появился — отдыхаем.
-            # WORDSTAT_FROM (бэкфилл/смена методики) перезаписывает и дневное окно:
-            # свежесть не гарантирует, что старые дни сняты той же методикой, что недельный ряд.
-            if not os.environ.get("WORDSTAT_FROM") and daily_demand_up_to_date("lime_wordstat_demand_daily"):
-                print("wordstat-daily: свежие дни уже есть — пропуск (до нового отставания)")
-            else:
-                # Всё доступное окно (60 дней): upsert идемпотентен, поэтому первый запуск —
-                # это же и бэкфилл, отдельная команда не нужна.
-                frm = daily_floor()
-                n = sync_wordstat_demand_daily(frm, dt.date.today().isoformat())
-                print(f"wordstat-daily: {n} дней (с {frm})")
-        except Exception as e:
-            print(f"ОШИБКА wordstat-daily: {e}")
-            errors.append(f"wordstat-daily: {e}")
+                # Лаг дневного Wordstat 1-3 дня: пока «вчера-1» нет — дёргаем API, появился — отдыхаем.
+                # WORDSTAT_FROM (бэкфилл/смена методики) перезаписывает и дневное окно:
+                # свежесть не гарантирует, что старые дни сняты той же методикой, что недельный ряд.
+                if not os.environ.get("WORDSTAT_FROM") and daily_demand_up_to_date(
+                    "lime_wordstat_demand_daily", region
+                ):
+                    print(f"wordstat-daily[{region}]: свежие дни уже есть — пропуск")
+                else:
+                    # Всё доступное окно (60 дней): upsert идемпотентен, поэтому первый запуск —
+                    # это же и бэкфилл, отдельная команда не нужна.
+                    frm = daily_floor()
+                    n = sync_wordstat_demand_daily(frm, dt.date.today().isoformat(), region)
+                    print(f"wordstat-daily[{region}]: {n} дней (с {frm})")
+            except Exception as e:
+                print(f"ОШИБКА wordstat-daily[{region}]: {e}")
+                errors.append(f"wordstat-daily[{region}]: {e}")
     else:
         print("wordstat: пропуск (нет YANDEX_SEARCHAPI_KEY)")
 

@@ -3,11 +3,49 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from sync.wordstat import BRAND_PHRASES, _monday, _sunday, aggregate_daily, aggregate_weekly
+import pytest
+
+from sync.wordstat import (
+    BRAND_PHRASES,
+    REGION_GEO,
+    _monday,
+    _sunday,
+    aggregate_daily,
+    aggregate_weekly,
+    geo_for,
+    phrases_for,
+)
 
 
 def test_brand_phrases_are_the_five():
     assert BRAND_PHRASES == ["lime", "лайм интернет", "лайм купить", "лайм магазин", "лайм одежда"]
+
+
+def test_region_geo_ids():
+    # Гео-id из справочника GeoRegions Директа (сверено 2026-08-25).
+    assert REGION_GEO["ru"] is None  # канон Павла — без фильтра региона
+    assert REGION_GEO["kz"] == ["159"]
+    assert REGION_GEO["gcc"] == ["210", "10540", "21486", "10537", "10532", "21586"]
+
+
+def test_geo_for_unknown_region_raises():
+    # Тихий тотал вместо региона хуже падения: опечатка региона должна быть слышна.
+    with pytest.raises(KeyError):
+        geo_for("uae")
+
+
+def test_phrases_for_region():
+    assert phrases_for("ru") == BRAND_PHRASES  # RU — ровно канон, без добавок
+    kz = phrases_for("kz")
+    assert kz[: len(BRAND_PHRASES)] == BRAND_PHRASES  # база везде одна
+    assert "лайм кз" in kz  # мимо broad-«lime»: кириллица
+    assert "limestore" in kz  # мимо broad-«lime»: слитное написание
+    assert "лайм дубай" in phrases_for("gcc")
+    for region in ("ru", "kz", "gcc"):
+        # Дубль фразы = двойной счёт в Σ по набору.
+        assert len(set(phrases_for(region))) == len(phrases_for(region))
+        # «лайм официальный» на 90% сидит внутри «лайм сайт» — брать обе нельзя.
+        assert not {"лайм официальный", "лайм сайт"} <= set(phrases_for(region))
 
 
 def test_monday_normalizes_to_iso_monday():
