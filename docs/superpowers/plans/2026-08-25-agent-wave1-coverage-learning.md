@@ -55,6 +55,13 @@ DDL-строками в `sync/agent/db.py::AGENT_DDL` + файл в `migrations/
   кабинета перестаёт быть константой — при предельной окупаемости выше цели с запасом
   агент растит её шагом до 20 % за такт, в пределах месячного потолка из панели
   настроек. Потолок не задан — рост только предлагается числом (задача 11).
+- **Ожидание пишется рядом с действием, факт — рядом с исходом** (задачи 12, 13):
+  без пары «прогноз / результат» в журнале калибровка модели неизмерима, а класс
+  надёжности `A` даёт только контроль-заповедник за то же окно, но не авторство
+  действия.
+- **Рост не покупает мусор** (задача 14): доливка бюджета останавливается по раннему
+  прокси качества когорты (средний ML-скор оплаты), не дожидаясь денежного
+  чекпоинта на 35-й день.
 
 ---
 
@@ -2033,6 +2040,47 @@ git commit -m "feat(agent): шаг бюджета ×2, когда недобор
     `blocked_reason`.
   - `MIN_ASSIGNED_SHARE = 0.9` — доля освободившихся денег, которая обязана быть
     назначена адресатам.
+  - `EMERGENCY_KINDS` — виды действий, которые гейт НЕ трогает никогда.
+
+**Аварийные сокращения гейту не подчиняются.** Откат по красной линии, реакция на
+обвал расхода, запрет вредного сегмента по вердикту сторожа — это защита денег, а не
+оптимизация объёма, и требовать под них адресата роста значит запереть тормоз. В
+`require_growth_address` такие действия проходят насквозь, а такт от них сжимающим
+не считается:
+
+```python
+# Аварийное сокращение — не оптимизация, а тормоз. Требовать под откат
+# «куда переливаем» значит держать заведомо убыточное изменение живым до
+# тех пор, пока солвер не найдёт адресата. Такие действия гейт пропускает
+# всегда, и в баланс такта они входят только справочно.
+EMERGENCY_KINDS = frozenset({"campaign.rollback", "segment.harmful_block",
+                             "budget.crash_guard"})
+
+
+def _is_emergency(action):
+    return (str(action.get("action_kind") or "") in EMERGENCY_KINDS
+            or bool(action.get("emergency")))
+```
+
+Точный состав множества сверить на шаге реализации с `sync/agent/writer/apply.py::
+to_api_call` и путями отката в `sync/agent_e1_watchdog.py`: имя вида в журнале —
+источник правды, а не этот список. Вида, которого нет в `to_api_call`, в
+`EMERGENCY_KINDS` быть не должно; если аварийность в коде выражена не отдельным
+видом, а флагом на действии — читать флаг (`_is_emergency` покрывает оба случая).
+
+Тест на вычет обязателен:
+
+```python
+def test_emergency_cut_passes_gate_even_when_tact_shrinks():
+    # Откат по красной линии режет расход и адресата не имеет по определению.
+    # Гейт, снявший откат, оставил бы в кабинете изменение, уже признанное
+    # убыточным, — это дороже сжатия объёма.
+    actions = [{"action_kind": "campaign.rollback", "expected_leads_delta": -20.0}]
+    kept, blocked = require_growth_address(
+        actions, {"shrinking": True, "freed_rub": 50_000.0, "added_rub": 0.0})
+    assert kept == actions
+    assert blocked == []
+```
 
 - [ ] **Шаг 1: Написать падающий тест**
 
@@ -2506,6 +2554,36 @@ git commit -m "feat(agent): каждый такт отвечает, что ус�
   предлагается в отчёте: сколько и почему. Общий бюджет — деньги Павла, и цифру
   потолка ставит он.
 
+**Невязка прибавки.** Бюджет кабинета вырос, а капы шага по кампаниям
+(`MAX_STEP_UP`, кап записи ±`MAX_WRITE_STEP` в `writer/budget.py`) могут не дать
+разложить прибавку целиком: сумма целевых окажется меньше нового бюджета, и инвариант
+«Σ целевых = бюджету» сломается — тихо, без единого исключения. Правило: **остаток
+не размазывается, а снимается.** После раскладки солвер сверяет сумму и, если
+назначено меньше, уменьшает бюджет кабинета до фактически назначенного, а разницу
+показывает в отчёте отдельным числом:
+
+```python
+    assigned = sum(t["target_28d"] for t in targets.values())
+    if assigned < budget - 1.0:
+        # Прибавка, которую капы шага не дают разложить, — не деньги в работе,
+        # а невязка. Оставить её в бюджете значит каждый такт «дораспределять»
+        # призрак: солвер видел бы недоданные рубли и задирал цели тем, кто и
+        # так упёрся в кап. Признаём назначенное и переносим остаток на
+        # следующий такт, когда капы отсчитаются от нового расхода.
+        out["deferred_growth_rub"] = round(budget - assigned, 2)
+        budget = assigned
+```
+
+Тест:
+
+```python
+def test_growth_beyond_step_caps_is_deferred_not_smeared():
+    # Одна кампания, кап шага +50 %: прибавку +100 % разложить некуда.
+    rows = portfolio_targets(_one_campaign(cost=100_000.0), budget=200_000.0)
+    assert rows[0]["target_28d"] == 150_000.0
+    assert rows[0]["deferred_growth_rub"] == 50_000.0
+```
+
 **Файлы:**
 - Изменить: `sync/agent/portfolio.py::portfolio_targets` (бюджет кабинета как параметр)
 - Изменить: `sync/agent/config.py` (ключ `monthly_budget_cap_rub`)
@@ -2677,17 +2755,253 @@ git commit -m "feat(agent): бюджет кабинета растёт шаго�
 
 ---
 
-## Задача 12: замкнуть петлю обучения на собственных действиях
+## Задача 12: ожидание и факт лидов доезжают до журнала
+
+Петля обучения следующей задачи меряет смещение прогноза — насколько модель
+систематически завышает или занижает эффект своих рычагов. Мерить нечем: **ни
+ожидания, ни факта в журнале нет.**
+
+- `expected_leads_delta` считается в солвере (`sync/agent/portfolio.py:221`) и умирает
+  там же: в `edu_agent_actions` ни одна колонка и ни один ключ `payload` его не несёт
+  (проверено grep по `sync/agent_e1.py`, `sync/agent_e1_watchdog.py`, `sync/agent/writer/`).
+- Наблюдаемой дельты нет тем более: сторож считает уровень (`observed_metrics` — расход,
+  лиды, CPA за окно), а сравнить его не с чем, потому что **объём базы нигде не
+  записан**. `load_baseline_cpa` отдаёт только цену; комментарий в `action_experiment`
+  это фиксирует прямым текстом: «объём базы в красной линии не записан, поэтому
+  rel_error — нижняя граница».
+
+Без этой задачи `forecast_bias` из задачи 13 вернёт пустой словарь на живой базе, а
+тесты при этом будут зелёными — они кормят функцию словарями. Поэтому задача идёт
+раньше петли.
+
+**Файлы:**
+- Изменить: `sync/agent/db.py` (новая `load_baseline_volume`)
+- Изменить: `sync/agent_e1.py::build_red_line` (объём базы в красную линию)
+- Изменить: `sync/agent/writer/rollback.py::red_line_for` (плоский ключ)
+- Изменить: `sync/agent/writer/budget.py` (ожидание в payload действия)
+- Изменить: `sync/agent/writer/db.py` (колонка `observed_leads_delta` + запись при закрытии)
+- Изменить: `sync/agent_e1_watchdog.py` (считать факт при закрытии наблюдения)
+- Изменить: `tests/test_agent_e1.py`, `tests/test_agent_e1_watchdog.py`, `tests/test_agent_budget_writer.py`
+
+**Интерфейсы:**
+- Отдаёт: `load_baseline_volume(date_from, date_to) -> Dict[str, Dict[str, float]]` —
+  по `campaign_id`: `{"leads", "days", "leads_per_day"}`.
+- Отдаёт: плоский ключ `baseline_leads_per_day` в `red_line`.
+- Отдаёт: `payload["expected_leads_delta"]` у бюджетных действий.
+- Отдаёт: колонка `observed_leads_delta` в `edu_agent_actions`, заполняемая при закрытии.
+- Потребляет: задача 13 (`forecast_bias`).
+
+- [ ] **Шаг 1: Написать падающий тест на объём базы**
+
+```python
+# tests/test_agent_e1.py
+def test_red_line_carries_baseline_volume():
+    """Красная линия несёт не только цену базы, но и её темп.
+
+    Цена без объёма не даёт сравнить ожидание с фактом: сторож знает лиды за
+    окно наблюдения, а сколько их было до изменения — неизвестно. Темп, а не
+    сумма: окна базы и наблюдения разной длины, суммы несопоставимы.
+    """
+    action = {"action_kind": "budget.set", "object_id": "111", "object_level": "campaign"}
+    red = build_red_line(action, {"111": 1000.0}, None, ("2026-07-01", "2026-07-28"),
+                         None, {"111": {"leads": 56.0, "days": 28, "leads_per_day": 2.0}})
+    assert red["baseline_leads_per_day"] == 2.0
+```
+
+- [ ] **Шаг 2: Прогнать — упадёт**
+
+Запуск: `python -m pytest tests/test_agent_e1.py::test_red_line_carries_baseline_volume -q`
+Ожидается: FAIL — `build_red_line() takes 5 positional arguments but 6 were given`.
+
+- [ ] **Шаг 3: Объём базы: запрос, красная линия, плоский ключ**
+
+`sync/agent/db.py` — рядом с `load_baseline_cpa`, отдельной функцией, чтобы не менять
+сигнатуру существующей (у неё четыре потребителя, и все ждут `Dict[str, float]`):
+
+```python
+def load_baseline_volume(date_from: str, date_to: str) -> Dict[str, Dict[str, float]]:
+    """Объём базы кампании за окно: сколько эффективных лидов в день.
+
+    Зеркало load_baseline_cpa со сменой вопроса: там «сколько стоил лид», здесь
+    «сколько их было». Темп (лиды в день), а не сумма за окно, — окно базы и
+    окно наблюдения разной длины, и суммы сравнивались бы через разные
+    знаменатели.
+    """
+    rows = _fetch_dicts(
+        """
+        SELECT campaign_id,
+               SUM(eff_leads)            AS leads,
+               COUNT(DISTINCT fact_date) AS days
+        FROM edu_agent_facts
+        WHERE fact_date BETWEEN %s AND %s
+        GROUP BY campaign_id
+        HAVING COUNT(DISTINCT fact_date) > 0
+        """,
+        (date_from, date_to),
+    )
+    return {
+        str(r["campaign_id"]): {
+            "leads": float(r["leads"] or 0.0),
+            "days": int(r["days"] or 0),
+            "leads_per_day": round(float(r["leads"] or 0.0) / int(r["days"]), 4),
+        }
+        for r in rows
+    }
+```
+
+`sync/agent_e1.py::build_red_line` — новый необязательный параметр
+`baseline_volume: Optional[Dict[str, Dict[str, float]]] = None`, и перед возвратом:
+
+```python
+    volume = (baseline_volume or {}).get(str(action["object_id"])) or {}
+    if volume.get("leads_per_day"):
+        # Темп базы едет в линию ради сверки ожидания с фактом (learning_loop).
+        # Красная линия его не читает: откатывают по цене, а не по объёму.
+        baseline["leads_per_day"] = volume["leads_per_day"]
+```
+
+`sync/agent/writer/rollback.py::red_line_for` — плоским ключом, как `baseline_cpo`:
+
+```python
+    if baseline.get("leads_per_day"):
+        window["baseline_leads_per_day"] = float(baseline["leads_per_day"])
+```
+
+Вызов в `sync/agent_e1.py` (рядом с `load_baseline_cpa`/`load_baseline_cpo`) —
+`agent_db.load_baseline_volume(...)` на том же окне, результат передать в
+`build_red_line` шестым аргументом.
+
+- [ ] **Шаг 4: Прогнать тест**
+
+Запуск: `python -m pytest tests/test_agent_e1.py -q`
+Ожидается: PASS.
+
+- [ ] **Шаг 5: Ожидание в payload действия**
+
+Тест:
+
+```python
+# tests/test_agent_budget_writer.py
+def test_budget_action_carries_expectation():
+    """Ожидаемая дельта лидов едет в payload действия.
+
+    Солвер её считает, а журнал терял: сравнить прогноз с исходом было
+    невозможно, и калибровка модели держалась на вере в модель.
+    """
+    actions, _ = budget_actions(desired={"111": _move(ratio=1.2, leads_delta=6.0)}, ...)
+    assert actions[0]["payload"]["expected_leads_delta"] == 6.0
+```
+
+В `sync/agent/writer/budget.py` в оба места сборки действия (недельный лимит и
+дневной бюджет) добавить в `payload`:
+
+```python
+                    # Ожидание солвера едет вместе с действием: через 7–14 дней
+                    # сторож положит рядом факт, и разница этих двух чисел —
+                    # единственный способ узнать, что модель врёт систематически.
+                    "expected_leads_delta": round(
+                        float(move.get("expected_leads_delta") or 0.0), 2),
+```
+
+- [ ] **Шаг 6: Факт при закрытии наблюдения**
+
+Тест:
+
+```python
+# tests/test_agent_e1_watchdog.py
+def test_observed_leads_delta_is_measured_against_base_rate():
+    """Наблюдаемая дельта = (темп наблюдения − темп базы) × длина окна.
+
+    Не разность сумм: окно базы 28 дней, окно наблюдения 7–14, и голая
+    разность сумм показала бы обвал там, где темп вырос.
+    """
+    action = {"red_line": {"baseline_leads_per_day": 2.0}}
+    observed = {"leads": 21, "days": 7}          # темп 3.0 против базовых 2.0
+    assert observed_leads_delta(observed, action) == 7.0
+```
+
+В `sync/agent_e1_watchdog.py`:
+
+```python
+def observed_leads_delta(observed: Dict[str, Any],
+                         action: Dict[str, Any]) -> Optional[float]:
+    """Сколько лидов действие принесло сверх базового темпа за окно наблюдения.
+
+    None, когда темпа базы в красной линии нет (действие спланировано до
+    задачи 12) или окно пустое: отсутствие числа честнее нуля, который
+    learning_loop прочитал бы как «прогноз сбылся ровно наполовину».
+    """
+    base_rate = float((action.get("red_line") or {}).get("baseline_leads_per_day") or 0.0)
+    days = int(observed.get("days") or 0)
+    if base_rate <= 0 or days <= 0:
+        return None
+    return round(float(observed.get("leads") or 0) - base_rate * days, 2)
+```
+
+`observed_metrics` уже считает `days` — отдать его в возвращаемый словарь, если
+его там ещё нет.
+
+- [ ] **Шаг 7: Колонка и запись при закрытии**
+
+`sync/agent/writer/db.py` — ALTER в `WRITER_DDL` (отдельным оператором, не правкой
+CREATE TABLE: таблица в базе уже есть, и `CREATE TABLE IF NOT EXISTS` её не тронет):
+
+```python
+    # Наблюдаемая дельта лидов против базового темпа — вторая половина пары
+    # «ожидание / факт». Ожидание лежит в payload действия, факт появляется
+    # только при закрытии наблюдения, поэтому колонка, а не payload: payload —
+    # то, что собирались сделать, и дописывать в него постфактум значит
+    # смешивать намерение с исходом.
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS observed_leads_delta DOUBLE PRECISION
+    """,
+```
+
+`MARK_OBSERVATION_CLOSED_SQL` — третье присваивание и параметр:
+
+```python
+    UPDATE edu_agent_actions
+       SET observation_closed_at  = now(),
+           observation_verdict    = %(verdict)s,
+           observed_leads_delta   = %(leads_delta)s
+```
+
+`mark_observation_closed(action_id, verdict, leads_delta=None)` — новый
+необязательный параметр, чтобы существующие вызовы не сломались; в стороже
+передать `observed_leads_delta(observed, action)`.
+
+- [ ] **Шаг 8: Прогнать весь набор**
+
+Запуск: `python -m pytest tests/test_agent_e1.py tests/test_agent_e1_watchdog.py tests/test_agent_budget_writer.py -q`
+Ожидается: PASS.
+
+- [ ] **Шаг 9: Коммит**
+
+```bash
+git add sync/agent/db.py sync/agent_e1.py sync/agent/writer/rollback.py \
+        sync/agent/writer/budget.py sync/agent/writer/db.py sync/agent_e1_watchdog.py \
+        tests/test_agent_e1.py tests/test_agent_e1_watchdog.py tests/test_agent_budget_writer.py
+git commit -m "feat(agent): ожидание и факт лидов в журнале — вход калибровки прогноза"
+```
+
+---
+
+## Задача 13: замкнуть петлю обучения на собственных действиях
 
 Сейчас агент учится **косвенно**: применённое изменение меняет расход, детектор скачков
 (`mining.detect_change_points`) видит это в фактах как квазиэксперимент, DiD даёт
 эластичность, она входит в кривую насыщения следующего такта. Работает, но с тремя
 дырами:
 
-1. **Собственные действия неотличимы от ручных правок.** У квазиэксперимента класс
-   всегда `B` (или `C`, если RTM-фильтр заподозрил реакцию на всплеск), хотя у своего
-   действия известны точная дата, величина и намерение — это самый чистый эксперимент
-   в системе, и он деклассируется наравне с чужими.
+1. **У собственных действий нет контроля.** Свои исходы в историю уже попадают:
+   `agent_e1_watchdog.action_experiment` пишет закрытое действие в
+   `edu_agent_experiments` с `mechanism="before_after"` и классом `B` — отличить их
+   от чужих скачков можно. Дыра в другом: `before_after` не вычитает сезон, поэтому
+   класс `A` этим строкам не положен, и комментарий в самом коде это фиксирует
+   («A появится, когда исход будет меряться против заповедника за то же окно»).
+   Заповедник (holdout) в портфеле есть — значит контрольная группа за то же окно
+   доступна, и класс `A` берётся ею, а не пометкой «это сделал я».
 2. **Вердикты никуда не идут.** `closing_verdict` (по заявкам) и `money_verdict`
    (по деньгам, 35 дней) пишутся в журнал и читаются только кулдауном вредных
    сегментов. Доля попаданий по рычагам не считается — значит нет track record,
@@ -2702,7 +3016,7 @@ git commit -m "feat(agent): бюджет кабинета растёт шаго�
 **Файлы:**
 - Создать: `sync/agent/learning_loop.py`
 - Создать: `tests/test_agent_learning_loop.py`
-- Изменить: `sync/agent/mining.py` (класс A для собственных действий)
+- Изменить: `sync/agent_e1_watchdog.py::action_experiment` (класс A против заповедника)
 - Изменить: `sync/agent/writer/db.py` (чтение закрытых действий с вердиктами)
 - Изменить: `sync/agent_e0.py` (секция отчёта + подача калибровки в портфель)
 
@@ -2715,8 +3029,12 @@ git commit -m "feat(agent): бюджет кабинета растёт шаго�
     `{"ratio", "n", "shrunk_ratio"}`, где `ratio` — медиана
     факт/ожидание, `shrunk_ratio` — то же с усадкой к 1.0 по объёму наблюдений.
   - `BIAS_PRIOR_N = 10` — сила приора усадки.
-- Потребляет: строки журнала `edu_agent_actions` со статусом `applied`, полями
-  `closing_verdict`, `money_verdict`, `expected_leads_delta`, `observed_leads_delta`.
+- Потребляет: строки журнала `edu_agent_actions` со статусом `applied`. **Имена
+  колонок сверены с DDL** (`sync/agent/writer/db.py`): вердикт по заявкам лежит в
+  `observation_verdict` (`closing_verdict` — это функция сторожа, не колонка),
+  вердикт по деньгам — `money_verdict`, ожидание — `payload->>'expected_leads_delta'`,
+  факт — колонка `observed_leads_delta`. Последние два появляются задачей 12; до неё
+  `forecast_bias` вернёт пустой словарь, и это ожидаемо, а не поломка.
 
 - [ ] **Шаг 1: Написать падающий тест**
 
@@ -2888,31 +3206,72 @@ def forecast_bias(actions: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
 Запуск: `python -m pytest tests/test_agent_learning_loop.py -q`
 Ожидается: PASS (7 тестов).
 
-- [ ] **Шаг 5: Пометить собственные действия классом A**
+- [ ] **Шаг 5: Класс A — там, где есть контроль, а не там, где есть авторство**
 
-В `sync/agent/mining.py::mine_quasi_experiments` добавить параметр
-`own_actions: Optional[Dict[str, List[str]]] = None` — по `campaign_id` список дат
-применённых собственных действий (из журнала). Скачок, дата которого совпала с
-собственным действием (±1 день), получает:
+Соблазн пометить свои действия классом `A` потому, что дата и намерение известны, —
+ошибка, и код `action_experiment` прямо предупреждает о ней: `before_after` не
+вычитает сезон, а знание даты сезон не отменяет. Августовский спад накроет и
+изменение, и его базу; «чистым» наблюдение делает контроль за то же окно, а не
+запись в журнале.
+
+Контроль у нас есть — заповедник портфеля (`EXPLORATION`/holdout: кампании, к
+которым в это окно сознательно не применялось ничего). Меняем
+`sync/agent_e1_watchdog.py::action_experiment`: когда контроль за окно доступен и
+набрал минимум наблюдений — считаем разность разностей и повышаем класс; когда
+недоступен — оставляем `before_after` и класс `B` как сейчас.
 
 ```python
-                # Собственное действие: дата и величина известны точно, намерение
-                # записано заранее. RTM-фильтр к нему неприменим — мы знаем, что
-                # правку сделали не в ответ на всплеск, а по расчёту прошлого
-                # такта. Это самое чистое наблюдение в системе, и класс у него
-                # выше, чем у скачка неизвестного происхождения.
-                "reliability_class": "A",
+MIN_CONTROL_LEADS = 20
+
+
+def _did_effect(observed, baseline_cpa, control):
+    """Эффект действия против контроля за то же окно (разность разностей).
+
+    Контроль — кампании заповедника: в окно наблюдения к ним не применялось
+    ничего, значит их изменение CPA относительно своей базы и есть сезон плюс
+    рынок. Вычитая его, получаем эффект самого действия. Без контроля вернуть
+    None и остаться на before_after: завышенный класс надёжности дороже
+    отсутствующего, потому что на классах строится автономия (Ф9).
+    """
+    if not control or control.get("leads", 0) < MIN_CONTROL_LEADS:
+        return None
+    base_c, obs_c = control.get("baseline_cpa", 0.0), control.get("cpa", 0.0)
+    if baseline_cpa <= 0 or obs_c <= 0 or base_c <= 0:
+        return None
+    treated = (observed.get("cpa", 0.0) - baseline_cpa) / baseline_cpa
+    control_shift = (obs_c - base_c) / base_c
+    return round(treated - control_shift, 4)
 ```
 
-Тест дописать в `tests/test_agent_mining.py`:
+В теле `action_experiment` подменяются три поля: `effect` на разность разностей,
+`mechanism` на `"did_holdout"`, `reliability_class` на `"A"`. Остальные — как есть.
+
+Тесты дописать в `tests/test_agent_e1_watchdog.py`:
 
 ```python
-def test_own_action_gets_class_a_even_when_rtm_suspects():
-    from sync.agent.mining import mine_quasi_experiments
+def test_class_a_only_with_control():
+    action = _applied_action(baseline_cpa=1000.0)
+    observed = {"cpa": 1200.0, "leads": 40}
 
-    facts = _rtm_suspicious_facts()  # тот же набор, что у теста RTM-фильтра
-    out = mine_quasi_experiments(facts, own_actions={"111": ["2026-08-10"]})
-    assert [e["reliability_class"] for e in out] == ["A"]
+    without = action_experiment(action, observed, _window(), "worsened", control=None)
+    assert without["reliability_class"] == "B"
+    assert without["mechanism"] == "before_after"
+
+    # Контроль подорожал ровно так же — значит это сезон, а не действие.
+    control = {"baseline_cpa": 1000.0, "cpa": 1200.0, "leads": 50}
+    with_control = action_experiment(action, observed, _window(), "worsened",
+                                     control=control)
+    assert with_control["reliability_class"] == "A"
+    assert with_control["mechanism"] == "did_holdout"
+    assert with_control["params"]["effect"] == 0.0
+
+
+def test_thin_control_does_not_upgrade_class():
+    control = {"baseline_cpa": 1000.0, "cpa": 1200.0, "leads": 3}
+    out = action_experiment(_applied_action(baseline_cpa=1000.0),
+                            {"cpa": 1200.0, "leads": 40}, _window(), "worsened",
+                            control=control)
+    assert out["reliability_class"] == "B"
 ```
 
 - [ ] **Шаг 6: Читать закрытые действия и выводить петлю в отчёт**
@@ -2925,9 +3284,12 @@ def closed_actions(days: int = 180) -> List[Dict[str, Any]]:
     return _fetch_dicts(
         """
         SELECT action_kind, object_id, applied_at::date AS applied_on,
-               closing_verdict, money_verdict,
-               (red_line->>'expected_leads_delta')::float AS expected_leads_delta,
-               (response->>'observed_leads_delta')::float AS observed_leads_delta
+               -- В журнале колонка называется observation_verdict; closing_verdict
+               -- — функция сторожа, которая её и заполняет. Алиас оставлен, чтобы
+               -- learning_loop читал одно имя независимо от происхождения строки.
+               observation_verdict AS closing_verdict, money_verdict,
+               (payload->>'expected_leads_delta')::float AS expected_leads_delta,
+               observed_leads_delta
         FROM edu_agent_actions
         WHERE applied_at IS NOT NULL
           AND applied_at >= now() - make_interval(days => %s)
@@ -2967,7 +3329,214 @@ git commit -m "feat(agent): петля обучения на своих дейс
 
 ---
 
-## Задача 13: свести волну в документации и прогнать боевой такт
+## Задача 14: рост объёма не покупает мусор
+
+Задачи 8–11 учат агента доливать деньги. У доливки есть цена, которой нет у
+сокращения: **новый трафик холоднее старого**. Кампания расширяет охват, CPA держится
+или даже падает, вердикт по заявкам через 7–14 дней говорит «improved» — а оплаты
+приходят хуже. Узнаём мы об этом только на денежном чекпоинте, через 35 дней, потратив
+месяц бюджета на когорту, которая не платит.
+
+Ранний прокси качества у нас уже лежит и никем не читается: `sum_p_pay` — сумма
+ML-скоров вероятности оплаты по лидам кампании (`edu_agent_facts.sum_p_pay`,
+`sync/agent/db.py:56`, заполняется `sync/agent/facts.py:89`). Средний скор лида
+`sum_p_pay / eff_leads` — качество когорты, доступное **на следующий день**, а не
+через месяц. Сейчас он попадает только в вывод `computed.py:244` и ни на что не
+влияет.
+
+**Файлы:**
+- Создать: `sync/agent/quality.py`
+- Создать: `tests/test_agent_quality.py`
+- Изменить: `sync/agent/growth.py` (кандидат с падающим качеством не усиливается)
+- Изменить: `sync/agent_e0.py` (секция `lead_quality` в отчёте)
+
+**Интерфейсы:**
+- Отдаёт:
+  - `lead_quality(rows, date_from, date_to) -> Dict[str, Dict[str, float]]` — по
+    `campaign_id`: `{"avg_p_pay", "leads"}`.
+  - `quality_drift(before, after) -> Dict[str, Dict[str, Any]]` — по `campaign_id`:
+    `{"drop", "flagged", "reason"}`.
+  - `QUALITY_DROP_LIMIT = 0.2` — относительное падение среднего скора, после
+    которого доливка останавливается.
+  - `MIN_QUALITY_LEADS = 20` — минимум лидов в каждом окне; на меньшем объёме
+    средний скор шумит сильнее, чем падает.
+- Потребляет: `edu_agent_facts` (`sum_p_pay`, `eff_leads`), кандидаты усиления
+  (задача 10).
+
+- [ ] **Шаг 1: Написать падающий тест**
+
+```python
+# tests/test_agent_quality.py
+# -*- coding: utf-8 -*-
+"""Качество когорты как ранний тормоз роста.
+
+Доливка бюджета расширяет охват, и новый трафик холоднее старого. CPA этого
+не показывает — заявка остаётся заявкой; деньги показывают, но через 35 дней.
+Средний ML-скор оплаты меняется на следующий день после того, как когорта
+испортилась, и это единственный сигнал в системе, успевающий остановить
+доливку до того, как месяц бюджета уйдёт в неплатящих.
+"""
+
+from sync.agent.quality import (MIN_QUALITY_LEADS, QUALITY_DROP_LIMIT,
+                                lead_quality, quality_drift)
+
+
+def _facts(cid, day, leads, p_pay):
+    return {"campaign_id": cid, "fact_date": day, "eff_leads": leads, "sum_p_pay": p_pay}
+
+
+def test_avg_score_is_per_lead_not_per_day():
+    rows = [_facts("111", "2026-08-01", 10, 3.0), _facts("111", "2026-08-02", 30, 3.0)]
+    out = lead_quality(rows, "2026-08-01", "2026-08-02")
+    assert out["111"]["leads"] == 40
+    assert out["111"]["avg_p_pay"] == 0.15     # 6.0 / 40, а не среднее из 0.3 и 0.1
+
+
+def test_quality_drop_flags_campaign():
+    before = {"111": {"avg_p_pay": 0.20, "leads": 40}}
+    after = {"111": {"avg_p_pay": 0.14, "leads": 40}}      # −30 %
+    out = quality_drift(before, after)
+    assert out["111"]["flagged"] is True
+    assert out["111"]["drop"] == 0.3
+
+
+def test_small_drop_is_not_a_flag():
+    before = {"111": {"avg_p_pay": 0.20, "leads": 40}}
+    after = {"111": {"avg_p_pay": 0.18, "leads": 40}}      # −10 %, шум
+    out = quality_drift(before, after)
+    assert out["111"]["flagged"] is False
+
+
+def test_thin_cohort_is_not_judged():
+    # Пять лидов дадут разброс среднего скора больше любого порога.
+    before = {"111": {"avg_p_pay": 0.20, "leads": 5}}
+    after = {"111": {"avg_p_pay": 0.10, "leads": 5}}
+    out = quality_drift(before, after)
+    assert out["111"]["flagged"] is False
+    assert out["111"]["reason"] == "мало наблюдений"
+```
+
+- [ ] **Шаг 2: Прогнать — упадёт**
+
+Запуск: `python -m pytest tests/test_agent_quality.py -q`
+Ожидается: FAIL — `ModuleNotFoundError: No module named 'sync.agent.quality'`.
+
+- [ ] **Шаг 3: Реализация**
+
+```python
+# sync/agent/quality.py
+# -*- coding: utf-8 -*-
+"""Качество когорты лидов как ранний тормоз доливки бюджета.
+
+Механизм роста без контроля качества оптимизирует то, что видит: заявки.
+Заявка при расширении охвата дешевеет, оплата — дорожает, и разрыв виден
+только на денежном чекпоинте (35 дней). Средний ML-скор оплаты по лидам
+кампании доступен на следующий день и играет роль предохранителя: доливка
+кампании, чья когорта портится, ставится на паузу до вердикта по деньгам.
+"""
+
+from typing import Any, Dict, Iterable
+
+QUALITY_DROP_LIMIT = 0.2
+MIN_QUALITY_LEADS = 20
+
+
+def lead_quality(rows: Iterable[Dict[str, Any]], date_from: str,
+                 date_to: str) -> Dict[str, Dict[str, float]]:
+    """Средний скор оплаты на лид по кампаниям за окно.
+
+    Взвешивание — по лидам, а не по дням: день с тремя лидами и день с
+    тридцатью не равноправны, среднее из дневных средних дало бы вес
+    случайности.
+    """
+    acc: Dict[str, Dict[str, float]] = {}
+    for row in rows:
+        day = str(row.get("fact_date") or "")
+        if not (date_from <= day <= date_to):
+            continue
+        slot = acc.setdefault(str(row.get("campaign_id") or ""),
+                              {"leads": 0.0, "sum_p_pay": 0.0})
+        slot["leads"] += float(row.get("eff_leads") or 0.0)
+        slot["sum_p_pay"] += float(row.get("sum_p_pay") or 0.0)
+    out: Dict[str, Dict[str, float]] = {}
+    for cid, slot in acc.items():
+        leads = slot["leads"]
+        out[cid] = {
+            "leads": leads,
+            "avg_p_pay": round(slot["sum_p_pay"] / leads, 4) if leads else 0.0,
+        }
+    return out
+
+
+def quality_drift(before: Dict[str, Dict[str, float]],
+                  after: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, Any]]:
+    """Падение среднего скора между окнами: до доливки и после.
+
+    Флаг ставится только при достаточном объёме в ОБОИХ окнах: на десятке
+    лидов средний скор гуляет сильнее порога, и тормоз срабатывал бы на шуме,
+    останавливая рост там, где его надо продолжать.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for cid, now in after.items():
+        was = before.get(cid) or {}
+        base = float(was.get("avg_p_pay") or 0.0)
+        cur = float(now.get("avg_p_pay") or 0.0)
+        thin = (float(was.get("leads") or 0.0) < MIN_QUALITY_LEADS
+                or float(now.get("leads") or 0.0) < MIN_QUALITY_LEADS)
+        drop = round((base - cur) / base, 4) if base > 0 else 0.0
+        if thin:
+            out[cid] = {"drop": drop, "flagged": False, "reason": "мало наблюдений"}
+            continue
+        flagged = drop >= QUALITY_DROP_LIMIT
+        out[cid] = {"drop": drop, "flagged": flagged,
+                    "reason": "качество когорты упало" if flagged else ""}
+    return out
+```
+
+- [ ] **Шаг 4: Прогнать тесты**
+
+Запуск: `python -m pytest tests/test_agent_quality.py -q`
+Ожидается: PASS (4 теста).
+
+- [ ] **Шаг 5: Кандидат с падающим качеством не усиливается**
+
+В `sync/agent/growth.py` (задача 10) перед выдачей кандидатов усиления:
+
+```python
+    # Кампания, чья когорта портится, из списка усиления выбывает — но не из
+    # кабинета: это пауза роста до вердикта по деньгам, а не сокращение.
+    # Резать её сейчас значило бы судить о деньгах по прокси, а прокси для
+    # того и ранний, что менее точен.
+    flagged = {cid for cid, d in drift.items() if d.get("flagged")}
+    candidates = [c for c in candidates if c["campaign_id"] not in flagged]
+```
+
+Тест дописать в `tests/test_agent_growth.py`:
+
+```python
+def test_growth_skips_campaign_with_falling_lead_quality():
+    out = growth_candidates(_rows_with_room(), drift={"111": {"flagged": True}})
+    assert [c["campaign_id"] for c in out] == ["222"]
+```
+
+- [ ] **Шаг 6: Секция отчёта**
+
+В `sync/agent_e0.py` — секция `lead_quality`: по каждой кампании с флагом строка
+«скор упал с X до Y (−Z %), рост приостановлен до денежного чекпоинта».
+Строк нет — секция всё равно печатается пустым списком, как и остальные:
+отсутствие секции неотличимо от отсутствия падений, а различать их нужно.
+
+- [ ] **Шаг 7: Коммит**
+
+```bash
+git add sync/agent/quality.py sync/agent/growth.py sync/agent_e0.py \
+        tests/test_agent_quality.py tests/test_agent_growth.py
+git commit -m "feat(agent): ранний тормоз роста по качеству когорты лидов"
+```
+
+---
+
+## Задача 15: свести волну в документации и прогнать боевой такт
 
 **Файлы:**
 - Изменить: `docs/AGENT-ROADMAP-2026-08-25.md`
@@ -2980,13 +3549,17 @@ git commit -m "feat(agent): петля обучения на своих дейс
 `demand_regime`, `growth` — и в отчёте Э1 (`agent-e1`, репетиция 11:00 МСК):
 `learning`, `balance`.
 
-Плюс секции задач 11–12: `budget_growth` (Э0) и `learning_loop` (Э0).
+Плюс секции задач 11–14: `budget_growth`, `learning_loop`, `lead_quality` (Э0).
 
 Ключевая проверка боевого прогона: `balance.shrinking` при непустом плане должен быть
-`false`, а `growth.candidates` — непустым. Сжимающий такт с пустым списком усиления
+`false` (кроме аварийных сокращений — они вне гейта), а `growth.candidates` — непустым. Сжимающий такт с пустым списком усиления
 значит, что механизм роста не заработал, и это повод остановиться, а не применять.
 `learning_loop.track_record` в первые недели будет пуст — закрытых вердиктов ещё нет;
-это нормально и должно быть видно нулём, а не отсутствием секции.
+это нормально и должно быть видно нулём, а не отсутствием секции. То же у
+`forecast_bias`: пара «ожидание / факт» появляется только у действий, спланированных
+ПОСЛЕ задачи 12, — по ранее применённым она пуста навсегда, и это не дефект.
+Отдельно проверить, что у свежих действий `payload.expected_leads_delta` непустой:
+пустой у всех означает, что задача 12 доехала только до тестов.
 
 - [ ] **Шаг 2: Записать боевые числа**
 
@@ -3023,7 +3596,7 @@ git push
    очередь гипотез с приоритетом «ожидаемая ценность ÷ цена теста».
 3. **Ф9 — боевая работа**: первое применение узким скоупом, лестница автономии по
    классам действий через shadow-режим, пейсинг месяца вместо трейлинг-28д.
-   Лестница строится прямо на `learning_loop.track_record` (задача 12): класс
+   Лестница строится прямо на `learning_loop.track_record` (задача 13): класс
    действий с доказанной долей попаданий получает автономию, недоказанный остаётся
    в тени. Рост общего бюджета уже введён задачей 11; в Ф9 к нему добавляется
    пейсинг внутри месяца (сейчас потолок — плоское число из панели настроек).
