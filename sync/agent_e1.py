@@ -95,7 +95,7 @@ from sync.agent.writer.risk import (
     risk_object,
     week_start,
 )
-from sync.agent import blackbox, rejects
+from sync.agent import blackbox, conflicts, rejects
 from sync.agent.writer.rollback import red_line_for
 from sync.agent.writer.units import api_to_delta
 
@@ -1457,6 +1457,16 @@ def run_account(
     # считается бюджет. Обратный порядок списывал бы риск за действия,
     # которые дальше отваливаются, — объект помечался бы оплаченным, а
     # изменение по нему так и не уходило бы в кабинет.
+    # Противоречия внутри собранного плана. Каждый рычаг считает своё и
+    # по-своему; несовместимость двух законных решений видна только когда они
+    # оказались в одном прогоне на одном объекте. Разбор стоит ДО лимита
+    # прогона по той же причине, что и кулдауны: снятая конфликтная пара не
+    # должна занимать слот, а применённая — стоить риска дважды и испортить
+    # наблюдение обоим участникам.
+    allowed, in_conflict = conflicts.resolve(allowed)
+    blocked += [{**a, "blocked_reason": a.get("conflict_reason")}
+                for a in in_conflict]
+
     allowed, over_cap = cap_actions(allowed, max_per_run=max(ctx["remaining_cap"], 0))
 
     # Красная линия ставится ВМЕСТЕ с действием: у каждого применённого
@@ -1513,12 +1523,20 @@ def run_account(
 
     report = apply_actions(client, prepared, writer_db, lease=lease)
 
-    account_rejects = rejects.from_groups([
+    conflict_groups = [
+        (reason, [a for a in in_conflict if a.get("conflict_reason") == reason])
+        for reason in sorted(conflicts.by_reason(in_conflict))
+    ]
+    account_rejects = rejects.from_groups(conflict_groups + [
         (rejects.BUDGET, deferred),
         (rejects.RUN_CAP, over_cap),
         (rejects.NO_RED_LINE, no_red_line),
         (rejects.COOLDOWN, in_cooldown),
         (rejects.ATTEMPTS_EXHAUSTED, out_of_attempts),
+        (rejects.HOLDOUT, in_holdout),
+        (rejects.LEARNING_COOLDOWN, in_learning_cooldown),
+        (rejects.CLOSED_KEY, closed_keys),
+        (rejects.NO_GROWTH_ADDRESS, without_address),
     ], account=login, stage="e1", risks=risks)
 
     return {
@@ -1658,6 +1676,10 @@ def run_account(
         # упирается в одну и ту же стену изо дня в день. Один отказ — это
         # бюджет кончился; тридцать одинаковых — неверная модель.
         "rejects": rejects.by_reason(account_rejects),
+        # Конфликты отдельной строкой отчёта: в общем счётчике отказов они
+        # растворяются среди бюджетных, а читать их надо иначе — это не
+        # «не хватило денег», а «план сам себе противоречил».
+        "conflicts": conflicts.by_reason(in_conflict),
         "actions_left_in_run": max(ctx["remaining_cap"], 0),
         "no_red_line": {
             "count": len(no_red_line),

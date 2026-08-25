@@ -152,6 +152,10 @@ def _patch_e0_run(monkeypatch, reports=None):
     from datetime import date as _date
 
     calls = []
+    # Чёрный ящик ходит в живую базу — в тестах он молчит. Своё поведение
+    # он проверяет сам (tests/test_agent_blackbox.py).
+    monkeypatch.setattr(agent_e0.blackbox, "save_run",
+                        lambda *a, **k: {"saved": False, "error": "тест"})
     monkeypatch.setattr(agent_e0.sys, "argv", ["agent_e0"])
     monkeypatch.delenv("YM_TOKEN", raising=False)
     monkeypatch.setenv("DIRECT_CLIENTS_JSON", _json.dumps(

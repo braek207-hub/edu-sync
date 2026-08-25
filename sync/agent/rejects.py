@@ -21,6 +21,8 @@ sync/agent/rejects.py — отказы прогона: чего агент хо�
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from sync.agent import conflicts
+
 # Причины. Список закрытый: отказ без известной причины — это дефект
 # врезки, а не новое состояние, и он обязан выглядеть иначе, чем известные.
 BUDGET = "budget"                     # не влез в остаток риска (недели или дня)
@@ -28,10 +30,23 @@ RUN_CAP = "run_cap"                   # исчерпан лимит действ
 NO_RED_LINE = "no_red_line"           # не с чем сравнивать исход — не применяем
 COOLDOWN = "cooldown"                 # свежий откат по этому сегменту
 ATTEMPTS_EXHAUSTED = "attempts_exhausted"   # исчерпаны попытки отправки
+HOLDOUT = "holdout"                   # объект в заповеднике — агент его не трогает
+LEARNING_COOLDOWN = "learning_cooldown"     # обучение стратегии ещё не остыло
+CLOSED_KEY = "closed_key"             # ключ уже закрыт финальным статусом
+NO_GROWTH_ADDRESS = "no_growth_address"     # сокращение без адресата роста
 UNKNOWN = "unknown"
 
-KNOWN_REASONS = frozenset({BUDGET, RUN_CAP, NO_RED_LINE,
-                           COOLDOWN, ATTEMPTS_EXHAUSTED, UNKNOWN})
+# Причины конфликтов берутся из sync/agent/conflicts.py, а не переписываются
+# сюда строками: один код причины в двух местах рано или поздно разъедется,
+# и группировка беты молча потеряет половину отказов.
+CONFLICT_REASONS = frozenset({conflicts.SUSPENDED_OBJECT,
+                              conflicts.OPPOSING_LEVERS,
+                              conflicts.DUPLICATE_SEGMENT})
+
+KNOWN_REASONS = frozenset({BUDGET, RUN_CAP, NO_RED_LINE, COOLDOWN,
+                           ATTEMPTS_EXHAUSTED, HOLDOUT, LEARNING_COOLDOWN,
+                           CLOSED_KEY, NO_GROWTH_ADDRESS,
+                           UNKNOWN}) | CONFLICT_REASONS
 
 # Сколько знаков ключа сегмента едет в строку. Ключ бывает длинным (список
 # минус-фраз), а группировка беты идёт по объекту и причине, не по ключу.

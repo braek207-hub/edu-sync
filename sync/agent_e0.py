@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List
 
+from sync.agent import blackbox
 from sync.agent import db as agent_db
 from sync.agent.computed import compute_schedule, compute_segment_modifiers
 from sync.agent.coverage import blind_spend
@@ -1103,7 +1104,7 @@ def main() -> int:
     # как «выгрузка ещё не приехала», и разбор уходит не туда.
     crm_lag = (date.today() - date.fromisoformat(latest_lead)).days if latest_lead else None
 
-    print(json.dumps({
+    report = {
         "verdict": "GREEN",
         "crm_through": latest_lead,
         "crm_lag_days": crm_lag,
@@ -1310,7 +1311,17 @@ def main() -> int:
         "growth": growth,
         "db_total_mb": total_mb,
         "db_tables": [{"t": s["table_name"], "size": s["size"]} for s in sizes],
-    }, ensure_ascii=False, indent=2))
+    }
+    # Такт расчёта — половина ответа на вопрос «почему агент так решил»:
+    # вторая половина (что он с этим сделал) лежит в отчёте такта записи.
+    # Разбирать их порознь бессмысленно, поэтому оба едут в один чёрный ящик.
+    #
+    # Итог записи вкладывается в отчёт, а не печатается вторым JSON-ом: вывод
+    # такта расчёта — ровно один документ, и на этом держится его разбор.
+    report["blackbox"] = blackbox.save_run(
+        blackbox.new_run_id(), stage="e0",
+        mode=blackbox.MODE_COMPUTE, report=report)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
 
