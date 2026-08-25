@@ -85,6 +85,14 @@ AGENT_DDL: List[str] = [
     ALTER TABLE edu_agent_facts
       ADD COLUMN IF NOT EXISTS avg_traffic_vol DOUBLE PRECISION NOT NULL DEFAULT 0
     """,
+    # Лиды, у которых скор оплаты вообще есть, — знаменатель среднего p_pay
+    # (sync/agent/quality.py). Скоринг требует client_id, проставленного не на
+    # всех лендах, поэтому eff_leads в этой роли мерил бы покрытие скорингом,
+    # а не качество когорты. Отдельным ALTER — таблица давно создана в бою.
+    """
+    ALTER TABLE edu_agent_facts
+      ADD COLUMN IF NOT EXISTS scored_leads INTEGER NOT NULL DEFAULT 0
+    """,
     # Срезы: НЕДЕЛЬНАЯ грань и три отдельных двумерных разреза вместо декартова
     # произведения. slice_kind ∈ region|network|device|gender|age|hour.
     # Хвост (мало кликов) сворачивается в slice_key='other' — иначе длинный хвост
@@ -601,6 +609,23 @@ def load_daily_facts(
     )
 
 
+def load_quality_facts(date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    """Дневные лиды и скоры по всем кампаниям — сырьё тормоза роста (quality.py).
+
+    Без агрегата и без фильтра по кампаниям: окна «до доливки» и «после» режет
+    сам расчёт, а список кампаний до вызова неизвестен — тормоз обязан судить
+    и тех, кого сегодня впервые предложат усилить.
+    """
+    return _fetch_dicts(
+        """
+        SELECT campaign_id, fact_date, eff_leads, scored_leads, sum_p_pay
+        FROM edu_agent_facts
+        WHERE fact_date BETWEEN %s AND %s
+        """,
+        (date_from, date_to),
+    )
+
+
 def mart_cost_total(date_from: str, date_to: str) -> float:
     """Суммарный расход, лежащий в витрине фактов за окно.
 
@@ -815,14 +840,14 @@ UPSERT_FACTS_SQL = """
             cost, clicks, impressions, leads, eff_leads, sum_p_pay,
             payments_fact, avg_impr_pos, auction_win_share, avg_traffic_vol,
             connected_leads, deals, mins_to_connection_sum, mins_to_connection_count,
-            days_to_pay_sum, days_to_pay_count, revenue, conversions
+            days_to_pay_sum, days_to_pay_count, revenue, conversions, scored_leads
         ) VALUES (
             %(fact_date)s, %(campaign_id)s, %(campaign_name)s, %(project)s, %(direction)s,
             %(cost)s, %(clicks)s, %(impressions)s, %(leads)s, %(eff_leads)s, %(sum_p_pay)s,
             %(payments_fact)s, %(avg_impr_pos)s, %(auction_win_share)s, %(avg_traffic_vol)s,
             %(connected_leads)s, %(deals)s, %(mins_to_connection_sum)s,
             %(mins_to_connection_count)s, %(days_to_pay_sum)s, %(days_to_pay_count)s,
-            %(revenue)s, %(conversions)s
+            %(revenue)s, %(conversions)s, %(scored_leads)s
         )
         ON CONFLICT (fact_date, campaign_id) DO UPDATE SET
             campaign_name = EXCLUDED.campaign_name,
@@ -846,6 +871,7 @@ UPSERT_FACTS_SQL = """
             days_to_pay_count = EXCLUDED.days_to_pay_count,
             revenue = EXCLUDED.revenue,
             conversions = EXCLUDED.conversions,
+            scored_leads = EXCLUDED.scored_leads,
             collected_at = now()
 """
 

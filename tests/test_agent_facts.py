@@ -151,6 +151,38 @@ def test_two_direct_rows_of_one_day_are_summed_not_overwritten():
     assert row["avg_traffic_vol"] == 60.0
 
 
+def test_scored_leads_counted_apart_from_eff_leads():
+    # Знаменатель среднего скора — лиды СО СКОРОМ. Скоринг требует client_id,
+    # он проставлен не на всех лендах, и лид без скора входит в sum_p_pay
+    # нулём: делением на eff_leads витрина мерила бы долю скоренных лидов,
+    # а не качество когорты.
+    leads = LEADS + [{"lead_id": "L3", "campaign_id": "111",
+                      "created_date": "2026-08-01", "is_eff": True, "is_paid": False}]
+    row = assemble_facts(DIRECT, leads, SCORES)[0]
+    assert row["leads"] == 3
+    assert row["eff_leads"] == 2
+    assert row["scored_leads"] == 2
+
+
+def test_zero_score_still_counts_as_scored():
+    # p_pay = 0 — это замер «платить почти наверняка не будет», а не пропуск.
+    # Считать его отсутствием скора значит выкидывать из среднего худшие лиды
+    # и получать тем более красивое качество, чем хуже трафик.
+    scores = [{"lead_id": "L1", "scoring_point": "at_creation", "p_pay": 0.0},
+              {"lead_id": "L2", "scoring_point": "at_creation", "p_pay": 0.0}]
+    row = assemble_facts(DIRECT, LEADS, scores)[0]
+    assert row["scored_leads"] == 2
+    assert row["sum_p_pay"] == 0.0
+
+
+def test_post_connection_score_does_not_make_a_lead_scored():
+    # Витрина живёт на at_creation: скор после дозвона считается по другой,
+    # смещённой выборке, и в счётчик знаменателя входить не должен.
+    scores = [{"lead_id": "L1", "scoring_point": "post_connection", "p_pay": 0.9}]
+    row = assemble_facts(DIRECT, LEADS, scores)[0]
+    assert row["scored_leads"] == 0
+
+
 def test_zero_impressions_give_zero_not_division_error():
     rows = assemble_facts(
         [{"date": "2026-08-01", "campaign_id": "111", "cost": 0.0, "clicks": 0,

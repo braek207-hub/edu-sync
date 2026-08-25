@@ -58,6 +58,36 @@ def test_facts_have_crm_depth_columns():
         assert column in ddl, column
 
 
+def test_facts_carry_scored_leads_counter():
+    # Отдельный счётчик лидов со скором: знаменатель среднего p_pay. Таблица
+    # давно в бою, поэтому колонка добавляется ALTER'ом, как conversions.
+    ddl = "\n".join(AGENT_DDL)
+    assert "ADD COLUMN IF NOT EXISTS scored_leads" in ddl
+
+
+def test_upsert_facts_writes_and_updates_scored_leads():
+    # Колонка, попавшая в INSERT и забытая в DO UPDATE, обновляется только у
+    # новых строк: пересчёт прошлых дней тихо оставлял бы вчерашние числа.
+    sql = agent_db.UPSERT_FACTS_SQL
+    assert "%(scored_leads)s" in sql
+    assert "scored_leads = EXCLUDED.scored_leads" in sql
+
+
+def test_load_quality_facts_takes_both_denominators(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(agent_db, "_fetch_dicts",
+                        lambda sql, params=(): captured.update(sql=sql, params=params) or [])
+
+    agent_db.load_quality_facts("2026-08-01", "2026-08-28")
+
+    # eff_leads рядом со scored_leads обязателен: без него не посчитать
+    # покрытие, а без покрытия падение среднего скора неотличимо от поломки
+    # ingest'а поведения.
+    for column in ("campaign_id", "fact_date", "eff_leads", "scored_leads", "sum_p_pay"):
+        assert column in captured["sql"], column
+    assert captured["params"] == ("2026-08-01", "2026-08-28")
+
+
 def test_objects_snapshot_versioned_by_hash():
     # Снимок структуры пишется новой версией только при изменении:
     # ежедневная копия 55k объектов дала бы 5 млн строк за квартал.
