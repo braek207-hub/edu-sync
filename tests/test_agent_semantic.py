@@ -118,3 +118,56 @@ def test_verdict_without_a_reason_is_still_counted():
     verdicts = {"а": {"verdict": semantic.UNCLEAR}}
 
     assert semantic.unclear_reasons(verdicts) == {"без причины": 1}
+
+
+def test_request_body_is_utf8_bytes(monkeypatch):
+    # Фразы кириллические все до одной. Тело, ушедшее строкой, по дороге
+    # кодируется в latin-1 — UnicodeEncodeError, весь батч становится
+    # UNCLEAR, и слой молчит неотличимо от «ключа нет». Так он и молчал в
+    # первом боевом прогоне: 12 из 12.
+    import requests
+
+    sent = {}
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"verdicts": []}'}}]}
+
+    def _fake_post(url, **kwargs):
+        sent.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr(requests, "post", _fake_post)
+
+    semantic.deepseek_asker(api_key="ключ-проверки")("скачать реферат бесплатно")
+
+    assert "json" not in sent, "тело обязано уходить готовыми байтами"
+    assert isinstance(sent["data"], bytes)
+    body = json.loads(sent["data"].decode("utf-8"))
+    assert "скачать реферат бесплатно" in body["messages"][0]["content"]
+
+
+def test_non_ascii_body_survives_a_latin1_only_transport(monkeypatch):
+    # Проверка у ПОЛУЧАТЕЛЯ: транспорт, умеющий только latin-1, — это и есть
+    # http.client. Байты он пропускает, строку с кириллицей — нет.
+    import requests
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "{}"}}]}
+
+    def _latin1_only_post(url, **kwargs):
+        body = kwargs.get("data")
+        if isinstance(body, str):
+            body.encode("latin-1")      # то же исключение, что в проде
+        return _Response()
+
+    monkeypatch.setattr(requests, "post", _latin1_only_post)
+
+    semantic.deepseek_asker(api_key="k")("высшее образование дистанционно")

@@ -206,17 +206,24 @@ def deepseek_asker(
     def _ask(prompt: str) -> str:
         import requests
 
+        # Тело кодируется в UTF-8 ЗДЕСЬ, а не отдаётся строкой параметру
+        # json=: строку по дороге кодируют в latin-1, и первая же кириллица
+        # даёт UnicodeEncodeError. Слой ошибку глотает и возвращает UNCLEAR
+        # по всему батчу — то есть молчит ровно так же, как без ключа, и это
+        # молчание неотличимо от согласия. Ровно так он и молчал в первом
+        # боевом прогоне: 12 вердиктов из 12, все «слой недоступен».
+        payload = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            # Ноль температуры: разметка обязана быть воспроизводимой,
+            # иначе один и тот же кандидат в разных прогонах получает
+            # разные вердикты и рычаг дрожит.
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }, ensure_ascii=False).encode("utf-8")
         response = requests.post(
             "https://api.deepseek.com/chat/completions",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                # Ноль температуры: разметка обязана быть воспроизводимой,
-                # иначе один и тот же кандидат в разных прогонах получает
-                # разные вердикты и рычаг дрожит.
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-            },
+            data=payload,
             headers={"Authorization": f"Bearer {key}",
                      "Content-Type": "application/json; charset=utf-8"},
             timeout=timeout,
