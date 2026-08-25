@@ -171,3 +171,33 @@ def test_non_ascii_body_survives_a_latin1_only_transport(monkeypatch):
     monkeypatch.setattr(requests, "post", _latin1_only_post)
 
     semantic.deepseek_asker(api_key="k")("высшее образование дистанционно")
+
+
+def test_invisible_characters_in_the_key_do_not_break_the_call(monkeypatch):
+    # BOM и переводы строки цепляются к секрету от конвейера, которым его
+    # заливали. Заголовки HTTP кодируются в latin-1, поэтому один такой
+    # символ роняет ВЕСЬ батч, а слой при этом молчит ровно так же, как без
+    # ключа. Сутки тишины стоили именно этого.
+    import requests
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "{}"}}]}
+
+    def _latin1_headers_post(url, **kwargs):
+        for value in (kwargs.get("headers") or {}).values():
+            value.encode("latin-1")     # то же, что делает http.client
+        return _Response()
+
+    monkeypatch.setattr(requests, "post", _latin1_headers_post)
+
+    semantic.deepseek_asker(api_key="﻿sk-ключ\n".replace("ключ", "abc"))("фраза")
+
+
+def test_a_key_of_only_invisible_characters_counts_as_no_key():
+    # Пустой после чистки ключ — это «ключа нет», а не «ключ есть, но
+    # сломан»: отчёт обязан сказать про отсутствие, а не молчать вердиктами.
+    assert semantic.deepseek_asker(api_key="﻿\n ") is None
