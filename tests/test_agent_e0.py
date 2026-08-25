@@ -1127,3 +1127,63 @@ def test_quality_brake_reaches_the_report_and_the_growth_list(monkeypatch, capsy
     # бы сама с собой и падение размывалось.
     before_from, before_to, after_from, after_to = seen["windows"]
     assert before_from < before_to < after_from < after_to
+
+
+def _spy_portfolio(monkeypatch):
+    """Перехват вызовов солвера: чем такт кормит раскладку бюджетов."""
+    captured = []
+    original = agent_e0.portfolio_targets
+
+    def _spy(*args, **kwargs):
+        captured.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(agent_e0, "portfolio_targets", _spy)
+    return captured
+
+
+def test_account_growth_is_proposed_while_the_monthly_cap_is_empty(monkeypatch, capsys):
+    """Такт считает запас кабинета и печатает предложение роста.
+
+    Запас «сколько кабинет освоит СЕГОДНЯ» виден только после того, как
+    солвер назвал цели, поэтому раскладок две: первая — ради запаса, вторая —
+    итоговая, с выросшим бюджетом. Пока потолок месяца не задан, рост не
+    применяется: общий бюджет — деньги владельца.
+    """
+    import json as _json
+
+    _patch_e0_run(monkeypatch)
+    captured = _spy_portfolio(monkeypatch)
+
+    assert agent_e0.main() == 0
+    report = _json.JSONDecoder().raw_decode(capsys.readouterr().out.lstrip())[0]
+
+    assert len(captured) == 2
+    assert "room_rub_by_login" not in captured[0]
+    assert isinstance(captured[1]["room_rub_by_login"], dict)
+    # Ключ панели пуст — потолка нет, и солвер об этом знает.
+    assert captured[1]["monthly_cap_rub"] is None
+    assert captured[1]["target_romi"] == 1.0
+    # Секция печатается всегда, по кабинету: молчание про рост неотличимо от
+    # «расти некуда».
+    assert set(report["budget_growth"]) == set(
+        report["budget_threshold"]["accounts"])
+
+
+def test_monthly_cap_from_the_panel_reaches_the_solver(monkeypatch, capsys):
+    # Потолок освоения ставит человек в панели настроек, и путь от неё до
+    # раскладки обязан быть проверен: настройка, которая никуда не доехала,
+    # выглядит применённой.
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(
+        agent_e0.agent_db, "load_agent_config",
+        lambda *a, **k: {"preset": None,
+                         "overrides": {"monthly_budget_cap_rub": 3_000_000.0,
+                                       "target_romi": 2.0}})
+    captured = _spy_portfolio(monkeypatch)
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+
+    assert captured[1]["monthly_cap_rub"] == 3_000_000.0
+    assert captured[1]["target_romi"] == 2.0

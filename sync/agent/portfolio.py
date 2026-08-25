@@ -14,9 +14,12 @@ sync/agent/portfolio.py — Э3.2: единый порог предельной 
     S*_i(λ) = S₀_i · (value_i / (λ · m₀_i))^(1/(1−β_i)),  β_i < 1
 
 λ ищется бинарным поиском: Σ S*_i(λ) монотонно убывает по λ, решение — где
-сумма равна бюджету. Бюджет — ТЕКУЩИЙ расход кабинета за то же окно: Э3.2 —
-перенос при том же объёме (проверка суммы на уровне кабинета — прямо в
-выходе); план освоения B от Павла подставится сюда же, когда появится.
+сумма равна бюджету. Бюджет кабинета — текущий расход за то же окно ПЛЮС
+рост, когда предельная окупаемость выше цели с запасом и кабинету есть куда
+потратить сегодня (account_budget). Потолок роста — месячный план освоения из
+панели настроек; пока он пуст, рост только предлагается числом. Инвариант
+«сумма целевых = бюджету кабинета» от этого не меняется — меняется сам
+бюджет, и разница названа явно (growth_rub).
 
 Шаг зажат в [×0.5, ×1.5] за такт: дальше собственных наблюдений кривая —
 экстраполяция, а недельный такт волен повторить шаг. Кампании без ценности
@@ -31,12 +34,14 @@ import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent.confidence import assess
+from sync.agent.tcpa import DEFAULT_TARGET_ROMI
 # Признак «лимит связывает расход» задан рычагом записи, и второго определения
 # у него быть не должно: разойдись они — расчёт поднимал бы вес кампании,
 # которой писатель всё равно откажет. Поэтому и порог, и единицы берутся
 # оттуда, а не переписываются здесь.
 from sync.agent.writer.budget import (BINDING_SHARE, MAX_WRITE_STEP, VAT,
                                       WEEKS_IN_WINDOW)
+from sync.agent.writer.learning import BUDGET_SAFE_DELTA
 
 # Кап шага за такт. Симметричный в лог-смысле он не обязан быть: ×1.5 вверх
 # отыгрывается срезанием, ×0.5 вниз — доливом на следующем такте.
@@ -75,6 +80,80 @@ _BISECT_ITERATIONS = 80
 # кампания, которой не помогает даже урезание вдвое: предельная окупаемость
 # на полу всё ещё ниже λ с запасом.
 SWITCH_OFF_ROI_SHARE = 0.75
+
+# Шаг роста ОБЩЕЙ суммы кабинета за такт. Число не своё: это тот же порог, за
+# которым правка ограничения расхода перезапускает обучение стратегии
+# (writer/learning.BUDGET_SAFE_DELTA). Прибавку раскладывает по кампаниям тот
+# же солвер, и держать её в той же границе значит не платить за рост
+# переобучением всего кабинета.
+ACCOUNT_GROWTH_STEP = BUDGET_SAFE_DELTA
+
+# Запас предельной окупаемости, при котором есть смысл доливать сверху. Ровно
+# на цели растить нечего: предельный рубль там уже равен порогу, и прибавка
+# сдвинет кабинет за него — кривая насыщения на то и кривая.
+GROWTH_LAMBDA_MARGIN = 1.2
+
+# Потолок владелец называет за МЕСЯЦ, а солвер считает окном в 28 дней
+# (WEEKS_IN_WINDOW недель). Сравнивать их напрямую значит разрешить перерасход
+# на 8,6 %: 28 дней подряд по потолку — это 30,44/28 потолка за месяц.
+DAYS_IN_MONTH = 30.44
+WINDOW_DAYS = WEEKS_IN_WINDOW * 7.0
+
+# Допуск сверки «Σ целевых = бюджету», рубль. Бинарный поиск сходится с
+# точностью до копеек, и объявлять невязкой их значило бы печатать шум.
+GROWTH_RESIDUAL_RUB = 1.0
+
+
+def account_budget(current_cost: float, lam: float, target_romi: float,
+                   room_rub: float,
+                   monthly_cap: Optional[float]) -> Dict[str, Any]:
+    """Бюджет кабинета на такт: держим или растим, и чем ограничены.
+
+    Три условия роста, и каждое закрывает свой способ сжечь деньги:
+
+      * λ выше требуемой окупаемости С ЗАПАСОМ — иначе прибавка уходит за
+        порог сразу, ещё до того как кривая насыщения её отработает;
+      * есть куда потратить СЕГОДНЯ (room_rub — запас кампаний, у которых
+        лимит связывает расход, growth.room_rub_budget). Запас, доступный
+        только через эскалацию цены, сюда не подаётся: эти деньги кабинет
+        физически не выберет, и они каждый такт изображали бы резерв;
+      * потолок месячного освоения задан человеком. Не задан — предложение
+        считается и печатается, но сумма не меняется: решение «тратить
+        больше» принимает владелец денег, агент приносит ему цифру.
+
+    capped_by называет ограничитель: "lambda" | "room" | "step" |
+    "monthly_cap".
+    """
+    def hold(reason: str, proposed: float = 0.0) -> Dict[str, Any]:
+        return {"budget": round(current_cost, 2), "growth_rub": 0.0,
+                "proposed_growth_rub": round(proposed, 2), "capped_by": reason}
+
+    # Безубыточность предельного рубля (lambda_breakeven) и запас над целью —
+    # два разных требования. Второе при цели от 1.0 строже первого, но
+    # условие роста должно читаться целиком, а не опираться на текущий
+    # минимум панели настроек.
+    if lam < 1.0 or lam < float(target_romi) * GROWTH_LAMBDA_MARGIN:
+        return hold("lambda")
+    if room_rub <= 0:
+        return hold("room")
+
+    step_rub = current_cost * ACCOUNT_GROWTH_STEP
+    growth = min(step_rub, float(room_rub))
+    capped_by = "step" if step_rub <= room_rub else "room"
+    if monthly_cap is None:
+        return hold(capped_by, proposed=growth)
+
+    # Потолок ниже факта — это команда сокращать общую сумму, а сокращения по
+    # кабинету агент не делает: перенос внутри кабинета решает солвер, а
+    # объём освоения — владелец. Сумма остаётся, упор в потолок виден.
+    cap_window = float(monthly_cap) * WINDOW_DAYS / DAYS_IN_MONTH
+    budget = max(current_cost, min(current_cost + growth, cap_window))
+    if budget < current_cost + growth - 1e-6:
+        capped_by = "monthly_cap"
+    return {"budget": round(budget, 2),
+            "growth_rub": round(budget - current_cost, 2),
+            "proposed_growth_rub": round(growth, 2),
+            "capped_by": capped_by}
 
 
 def value_per_lead(ladder_row: Dict[str, Any]) -> Optional[Dict[str, float]]:
@@ -437,6 +516,9 @@ def portfolio_targets(
     holdout_ids: Optional[Set[str]] = None,
     explore_share: float = EXPLORATION_SHARE,
     settings_by_campaign: Optional[Dict[str, Dict[str, Any]]] = None,
+    target_romi: float = DEFAULT_TARGET_ROMI,
+    room_rub_by_login: Optional[Dict[str, float]] = None,
+    monthly_cap_rub: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Целевые бюджеты по кабинетам: порог λ на кабинет, сумма сохраняется.
 
@@ -451,6 +533,10 @@ def portfolio_targets(
     равна сумме текущих», часть которой никогда не сдвинется: сумма сходится
     фиктивно, а сам порог отчасти задают неподвижные кампании. Их бюджет
     виден отдельной строкой отчёта, как и у кампаний без ценности лида.
+
+    room_rub_by_login — рубли, которые кабинет освоит СЕГОДНЯ поднятием
+    лимитов (growth.room_rub_budget по кабинетам). Запас чужого кабинета в
+    рост не складывается: счёт один на кабинет, и деньги внутри него.
     """
     holdout_ids = {str(h) for h in (holdout_ids or set())}
     # Настроек нет — «связывает ли лимит» неизвестно, и множитель недобора не
@@ -501,14 +587,32 @@ def portfolio_targets(
         })
 
     accounts: Dict[str, Dict[str, Any]] = {}
+    room_rub_by_login = room_rub_by_login or {}
     for login, campaigns in sorted(by_login.items()):
-        budget = sum(c["cost"] for c in campaigns)
-        if budget <= 0:
+        fact_cost = sum(c["cost"] for c in campaigns)
+        if fact_cost <= 0:
             continue
         # Порог и вердикты считаются на ПОЛНОМ бюджете: карман не должен
         # двигать λ, иначе кампания у пола капа становится кандидатом на
         # выключение только потому, что часть денег ушла на разведку.
-        lam, targets = solve_threshold(campaigns, budget)
+        lam, targets = solve_threshold(campaigns, fact_cost)
+        # Растить или держать общую сумму — решается по порогу ПРИ ТЕКУЩЕМ
+        # расходе: λ выросшего бюджета уже учитывает прибавку и сам по себе
+        # её не оправдывает.
+        growth_plan = account_budget(fact_cost, lam, target_romi,
+                                     float(room_rub_by_login.get(login) or 0.0),
+                                     monthly_cap_rub)
+        budget = growth_plan["budget"]
+        if budget > fact_cost:
+            grown_lam, targets = solve_threshold(campaigns, budget)
+            # Порог берётся из новой раскладки, только если она УПИРАЕТСЯ в
+            # бюджет. Не упирается — капы шага не дают освоить прибавку,
+            # ограничение «сумма = бюджету» на этом плато порог не задаёт, и
+            # бинарный поиск уходит к нулю. Нулевой λ объявил бы кабинет
+            # убыточным и раздул бы уверенность каждого сдвига — механизм
+            # начал бы резать по мусорному числу.
+            if sum(targets.values()) >= budget - GROWTH_RESIDUAL_RUB:
+                lam = grown_lam
         preliminary = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam)
                        for c in campaigns}
         # Карман изымается ПОСЛЕ решения — пропорционально у всех — и уходит
@@ -522,6 +626,18 @@ def portfolio_targets(
         moves = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam)
                  for c in campaigns}
         target_sum = sum(targets.values())
+        # Сверка суммы — на ИТОГОВЫХ целях, тех самых, что уедут писателю:
+        # карман разведки изымает свою долю уже после раскладки, и проверять
+        # числа до него значило бы проверять не то, что применяется.
+        # Прибавка, которую капы шага не дают разложить, — не деньги в
+        # работе, а невязка. Оставить её в бюджете значит каждый такт
+        # дораспределять призрак: солвер видел бы недоданные рубли и задирал
+        # цели тем, кто и так упёрся в кап. Признаём назначенное, а остаток
+        # уедет на следующий такт, когда капы отсчитаются от нового расхода.
+        deferred = 0.0
+        if target_sum < budget - GROWTH_RESIDUAL_RUB:
+            deferred = round(budget - target_sum, 2)
+            budget = target_sum
         confident = [m for m in moves.values() if m["confident"] and m["move"] != "hold"]
         switch_off = [m for m in moves.values() if m.get("switch_off")]
         accounts[login] = {
@@ -533,6 +649,20 @@ def portfolio_targets(
             # быть видно флагом, а не прятаться в числе (аудит 2026-08-23, C6).
             "lambda_breakeven": bool(lam >= 1.0),
             "budget_28d": round(budget, 2),
+            # Факт окна и прибавка к нему — двумя числами: «бюджет кабинета»
+            # больше не равен расходу, и без обеих сторон непонятно, откуда
+            # взялась разница.
+            "cost_28d": round(fact_cost, 2),
+            "growth_rub": round(budget - fact_cost, 2),
+            # Сколько дал бы рост, будь потолок месяца задан. Пока ключа
+            # monthly_budget_cap_rub нет, это единственное место, где видно
+            # цену решения «тратить больше».
+            "proposed_growth_rub": growth_plan["proposed_growth_rub"],
+            "growth_capped_by": growth_plan["capped_by"],
+            # Рубли прибавки, которые капы шага не дали разложить: они не
+            # размазаны по кампаниям и не висят в бюджете, а перенесены на
+            # следующий такт.
+            "deferred_growth_rub": deferred,
             # Сколько денег кабинета ушло на разведку и кому: без этой строки
             # надбавка неотличима от решения солвера.
             "exploration": {

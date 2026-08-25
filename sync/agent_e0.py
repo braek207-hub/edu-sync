@@ -54,7 +54,7 @@ from sync.agent.metrika import (
     fetch_hourly_profile,
     resolve_counter_account,
 )
-from sync.agent.growth import growth_candidates
+from sync.agent.growth import LEVER_BUDGET, growth_candidates
 from sync.agent.quality import (
     QUALITY_WINDOW_DAYS,
     lead_quality_section,
@@ -1028,24 +1028,26 @@ def main() -> int:
             object_level="campaign")
         tcpa_count += len(rows)
 
-    budget_threshold = portfolio_targets(
-        saturation["campaigns"], ladder_section["by_object"], login_by_campaign_id,
-        # Заповедник вне солвера: агент его не двигает, и держать его внутри
-        # ограничения «сумма целевых = сумме текущих» значит задавать порог λ
-        # отчасти неподвижными кампаниями.
-        holdout_ids={str(h["campaign_id"]) for h in holdout},
-        # Доля разведки — из панели настроек, а не из константы модуля.
-        explore_share=active_config["explore_share"],
-        # Настройки кабинета — только ради признака «лимит связывает расход»:
-        # разведочная надбавка это деньги, и множитель недобора трафика
-        # применяется там, где деньги действительно доедут (Э3.3).
-        settings_by_campaign=campaign_settings)
-    budget_target_count = 0
-    for campaign_id, rows in portfolio_computed_rows(budget_threshold).items():
-        agent_db.upsert_computed_settings(
-            rows, calc_date=today_iso, object_id=campaign_id,
-            object_level="campaign")
-        budget_target_count += len(rows)
+    def _solve_portfolio(**growth_args):
+        return portfolio_targets(
+            saturation["campaigns"], ladder_section["by_object"],
+            login_by_campaign_id,
+            # Заповедник вне солвера: агент его не двигает, и держать его
+            # внутри ограничения «сумма целевых = сумме текущих» значит
+            # задавать порог λ отчасти неподвижными кампаниями.
+            holdout_ids={str(h["campaign_id"]) for h in holdout},
+            # Доля разведки — из панели настроек, а не из константы модуля.
+            explore_share=active_config["explore_share"],
+            # Настройки кабинета — только ради признака «лимит связывает
+            # расход»: разведочная надбавка это деньги, и множитель недобора
+            # трафика применяется там, где деньги действительно доедут (Э3.3).
+            settings_by_campaign=campaign_settings, **growth_args)
+
+    # Первая раскладка — при бюджете, равном факту окна. Она нужна не ради
+    # чисел, а ради ЗАПАСА: сколько рублей кабинет освоит сегодня поднятием
+    # лимитов, видно только после того, как солвер назвал цели (growth.py).
+    # Итоговой станет вторая раскладка, ниже.
+    preliminary_threshold = _solve_portfolio()
     # Слепая доля расхода: сколько денег прошло мимо настроек, которые агент
     # читает (Мастер кампаний и прочее вне API). Считается за то же зрелое
     # окно, что лестница, — чтобы доля относилась к тем же числам, рядом с
@@ -1089,10 +1091,46 @@ def main() -> int:
         before_from.isoformat(), before_to.isoformat(),
         after_from.isoformat(), quality_end.isoformat())
 
+    # Предварительный список усиления — ради ОДНОГО числа: сколько кабинет
+    # освоит сегодня поднятием лимитов. Раньше его не посчитать, оно выводится
+    # из целей солвера.
+    preliminary_growth = growth_candidates(preliminary_threshold, headroom_section,
+                                           demand, expansion,
+                                           quality_drift=quality["drift"])
+
+    # Общая сумма кабинета перестала быть константой: при предельной
+    # окупаемости выше цели с запасом агент растит её шагом до 20 % за такт,
+    # в пределах месячного потолка из панели настроек. Запас считается ПО
+    # КАБИНЕТАМ: счёт один на кабинет, и запас соседнего в рост не
+    # складывается. Рычаг цены (LEVER_TCPA) сюда не входит — эти рубли
+    # кабинет сегодня физически не выберет.
+    room_by_login: Dict[str, float] = {}
+    for candidate in preliminary_growth["candidates"]:
+        if candidate["lever"] != LEVER_BUDGET or not candidate["campaign_id"]:
+            continue
+        login = login_by_campaign_id.get(candidate["campaign_id"]) or "unmapped"
+        room_by_login[login] = (room_by_login.get(login, 0.0)
+                                + float(candidate["room_rub"] or 0.0))
+
+    budget_threshold = _solve_portfolio(
+        target_romi=active_config["target_romi"],
+        room_rub_by_login=room_by_login,
+        # Потолок месячного освоения — деньги владельца. Ключ пуст: рост
+        # только предлагается числом в отчёте, сумма кабинета не меняется.
+        monthly_cap_rub=active_config["monthly_budget_cap_rub"])
+    budget_target_count = 0
+    for campaign_id, rows in portfolio_computed_rows(budget_threshold).items():
+        agent_db.upsert_computed_settings(
+            rows, calc_date=today_iso, object_id=campaign_id,
+            object_level="campaign")
+        budget_target_count += len(rows)
+
     # Вторая половина оптимизации: что УСИЛИТЬ. Собирается из уже посчитанного
     # — недобор трафика, упор в кап шага, режим спроса, запросы без своей
     # группы — и ничего нового в Директ не спрашивает. Карта дрейфа качества
     # едет сюда тормозом: кандидат с портящейся когортой в список не попадает.
+    # Считается по ИТОГОВОЙ раскладке: предварительная знала бюджет-факт, и
+    # печатать её значило бы отчитываться числами, которых писатель не увидит.
     growth = growth_candidates(budget_threshold, headroom_section, demand,
                                expansion, quality_drift=quality["drift"])
 
@@ -1240,6 +1278,21 @@ def main() -> int:
                 }
                 for login, acc in budget_threshold["accounts"].items()
             },
+        },
+        # Рост ОБЩЕЙ суммы кабинета — отдельной секцией, а не строкой внутри
+        # раскладки: пока потолок месяца не задан, это единственное место,
+        # где владелец видит цену решения «тратить больше» — сколько агент
+        # долил бы сегодня и чем он ограничен.
+        "budget_growth": {
+            login: {"cost_28d": acc["cost_28d"],
+                    "budget_28d": acc["budget_28d"],
+                    "growth_rub": acc["growth_rub"],
+                    "proposed_growth_rub": acc["proposed_growth_rub"],
+                    "deferred_growth_rub": acc["deferred_growth_rub"],
+                    "capped_by": acc["growth_capped_by"],
+                    "monthly_cap_rub": active_config["monthly_budget_cap_rub"],
+                    "lambda": acc["lambda"]}
+            for login, acc in budget_threshold["accounts"].items()
         },
         "budget_target_rows": budget_target_count,
         "computed_settings": computed_count,

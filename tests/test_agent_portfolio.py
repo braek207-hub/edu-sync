@@ -622,3 +622,199 @@ def test_move_names_the_lever_and_the_upper_cap_it_reached():
     # Якорь держит λ и никуда не упирается: лимита у него нет вовсе.
     assert moves["anchor"]["limit_binding"] is False
     assert moves["anchor"]["step_capped"] is False
+
+
+# --------------------------------- бюджет кабинета растёт при запасе окупаемости
+
+
+def test_budget_grows_when_lambda_has_margin():
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=2.5, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=5_000_000.0)
+    assert out["budget"] == 1_200_000.0
+    assert out["growth_rub"] == 200_000.0
+    assert out["capped_by"] == "step"
+
+
+def test_no_growth_without_lambda_margin():
+    # Ровно на цели растить нечего: предельный рубль уже стоит на пороге, и
+    # прибавка уводит кабинет за него.
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=2.1, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=5_000_000.0)
+    assert out["budget"] == 1_000_000.0
+    assert out["growth_rub"] == 0.0
+    assert out["capped_by"] == "lambda"
+
+
+def test_no_growth_below_marginal_breakeven():
+    # λ < 1 — предельный рубль возвращает меньше рубля выручки. Требование
+    # безубыточности проверяется отдельно от запаса над целью: цель ниже
+    # единицы панель настроек не даёт, но условие роста должно читаться
+    # целиком, а не опираться на текущий минимум панели.
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=0.9, target_romi=0.5,
+                         room_rub=500_000.0, monthly_cap=5_000_000.0)
+    assert out["budget"] == 1_000_000.0
+    assert out["capped_by"] == "lambda"
+
+
+def test_no_growth_without_place_to_spend():
+    # Окупаемость есть, а недобора нет: прибавка купит те же показы дороже.
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=3.0, target_romi=2.0,
+                         room_rub=0.0, monthly_cap=5_000_000.0)
+    assert out["budget"] == 1_000_000.0
+    assert out["capped_by"] == "room"
+
+
+def test_growth_limited_by_room():
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=3.0, target_romi=2.0,
+                         room_rub=50_000.0, monthly_cap=5_000_000.0)
+    assert out["growth_rub"] == 50_000.0
+    assert out["capped_by"] == "room"
+
+
+def test_monthly_cap_is_hard_ceiling():
+    from sync.agent.portfolio import account_budget
+
+    # Потолок назван за МЕСЯЦ, а окно солвера — 28 дней: 1 141 500 ₽ в месяц
+    # это 1 050 000 ₽ за окно. Сравнивать их напрямую значило бы разрешить
+    # 28 дней подряд тратить по месячному потолку — перерасход на 8,6 %.
+    out = account_budget(current_cost=1_000_000.0, lam=3.0, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=1_141_500.0)
+    assert out["budget"] == 1_050_000.0
+    assert out["growth_rub"] == 50_000.0
+    assert out["capped_by"] == "monthly_cap"
+
+
+def test_monthly_cap_is_not_spent_as_if_it_were_the_window():
+    # Прямое сравнение потолка с окном — та самая ошибка, которую ловит
+    # пересчёт: месячный потолок, равный текущему расходу за 28 дней, роста
+    # не разрешает вовсе, потому что за месяц кабинет уже потратит больше.
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=3.0, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=1_000_000.0)
+    assert out["growth_rub"] == 0.0
+    assert out["capped_by"] == "monthly_cap"
+
+
+def test_cap_below_current_spend_does_not_shrink_the_account():
+    # Потолок ниже факта — это команда сокращать общую сумму, а сокращения
+    # по кабинету агент не делает: он растит или держит. Сумма остаётся, а
+    # упор в потолок виден в отчёте.
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=3.0, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=800_000.0)
+    assert out["budget"] == 1_000_000.0
+    assert out["growth_rub"] == 0.0
+    assert out["capped_by"] == "monthly_cap"
+
+
+def test_without_cap_growth_is_proposed_not_applied():
+    # Потолок не задан — сумма не меняется, но предложение посчитано: общий
+    # бюджет это деньги владельца, и цифру ставит он.
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=3.0, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=None)
+    assert out["budget"] == 1_000_000.0
+    assert out["growth_rub"] == 0.0
+    assert out["proposed_growth_rub"] == 200_000.0
+
+
+def test_solver_keeps_the_account_sum_without_room():
+    # Запас не передан — расти некуда, и инвариант «Σ целевых = факту»
+    # остаётся ровно тем, чем был до задачи 11.
+    saturation, ladder = _inputs()
+    section = portfolio_targets(saturation, ladder, {"1": "acc", "2": "acc"},
+                                monthly_cap_rub=5_000_000.0)
+    acc = section["accounts"]["acc"]
+    assert acc["budget_28d"] == 200_000.0
+    assert acc["growth_rub"] == 0.0
+    assert acc["growth_capped_by"] == "room"
+
+
+def test_solver_grows_the_account_within_the_step():
+    saturation = {"1": _curve()}
+    ladder = {"1": _ladder()}
+    section = portfolio_targets(saturation, ladder, {"1": "acc"},
+                                room_rub_by_login={"acc": 50_000.0},
+                                monthly_cap_rub=5_000_000.0)
+    acc = section["accounts"]["acc"]
+    # λ = 10 000 / 1250 = 8 — запас над целью 1.0 огромный.
+    assert acc["lambda_breakeven"] is True
+    assert acc["cost_28d"] == 100_000.0
+    assert acc["budget_28d"] == 120_000.0
+    assert acc["growth_rub"] == 20_000.0
+    assert acc["growth_capped_by"] == "step"
+    assert acc["deferred_growth_rub"] == 0.0
+    # Инвариант тот же, только бюджет теперь больше факта.
+    assert abs(acc["sum_residual"]) < 1.0
+    assert abs(acc["target_sum_28d"] - 120_000.0) < 1.0
+
+
+def test_growth_beyond_step_caps_is_deferred_not_smeared():
+    # β ≥ 1: шаг такой кампании — умеренные ×1.15, и прибавку +20 %
+    # разложить некуда. Остаток не размазывается, а снимается с бюджета.
+    saturation = {"1": _curve(beta=1.1)}
+    ladder = {"1": _ladder()}
+    section = portfolio_targets(saturation, ladder, {"1": "acc"},
+                                room_rub_by_login={"acc": 50_000.0},
+                                monthly_cap_rub=5_000_000.0)
+    acc = section["accounts"]["acc"]
+    assert acc["budget_28d"] == 115_000.0
+    assert acc["growth_rub"] == 15_000.0
+    assert acc["deferred_growth_rub"] == 5_000.0
+    # Инвариант «Σ целевых = бюджету» держится: невязка снята, а не спрятана.
+    assert abs(acc["sum_residual"]) < 1.0
+    # Порог остался порогом текущего расхода: на плато капов ограничение
+    # суммы его не задаёт, и бинарный поиск ушёл бы в ноль — а нулевой λ
+    # объявил бы кабинет убыточным и раздул бы уверенность каждого сдвига.
+    assert acc["lambda"] > 1.0
+    assert acc["lambda_breakeven"] is True
+
+
+def test_growth_is_capped_by_the_monthly_plan_of_the_owner():
+    saturation = {"1": _curve()}
+    ladder = {"1": _ladder()}
+    # 119 585,71 ₽ в месяц = 110 000 ₽ за окно в 28 дней.
+    section = portfolio_targets(saturation, ladder, {"1": "acc"},
+                                room_rub_by_login={"acc": 50_000.0},
+                                monthly_cap_rub=119_585.71)
+    acc = section["accounts"]["acc"]
+    assert abs(acc["budget_28d"] - 110_000.0) < 0.5
+    assert acc["growth_capped_by"] == "monthly_cap"
+
+
+def test_without_the_monthly_plan_growth_is_only_proposed():
+    saturation = {"1": _curve()}
+    ladder = {"1": _ladder()}
+    section = portfolio_targets(saturation, ladder, {"1": "acc"},
+                                room_rub_by_login={"acc": 50_000.0})
+    acc = section["accounts"]["acc"]
+    assert acc["budget_28d"] == 100_000.0
+    assert acc["growth_rub"] == 0.0
+    assert acc["proposed_growth_rub"] == 20_000.0
+
+
+def test_target_romi_raises_the_bar_for_growth():
+    # Требование окупаемости из панели настроек: λ = 8 проходит с запасом
+    # при цели 1.0 и не проходит при цели 8.0.
+    saturation = {"1": _curve()}
+    ladder = {"1": _ladder()}
+    section = portfolio_targets(saturation, ladder, {"1": "acc"},
+                                target_romi=8.0,
+                                room_rub_by_login={"acc": 50_000.0},
+                                monthly_cap_rub=5_000_000.0)
+    acc = section["accounts"]["acc"]
+    assert acc["budget_28d"] == 100_000.0
+    assert acc["growth_capped_by"] == "lambda"

@@ -92,6 +92,25 @@ def test_describe_lists_every_parameter_with_its_source():
     assert set(by_key) == set(DEFAULTS)
 
 
+def test_monthly_budget_cap_is_empty_until_the_owner_names_it():
+    # Общий бюджет — деньги владельца: пока потолок месяца не задан, агент
+    # рост только предлагает (sync/agent/portfolio.py::account_budget).
+    # Пустое значение обязано быть законным, а не «настройкой по умолчанию,
+    # которая случайно работает».
+    assert DEFAULTS["monthly_budget_cap_rub"] is None
+    assert resolve()["monthly_budget_cap_rub"] is None
+    assert resolve(preset="balanced")["monthly_budget_cap_rub"] is None
+    cfg = resolve(overrides={"monthly_budget_cap_rub": 3_000_000.0})
+    assert cfg["monthly_budget_cap_rub"] == 3_000_000.0
+
+
+def test_monthly_budget_cap_out_of_scale_is_refused():
+    # Опечатка в порядке величины — самая дешёвая ошибка в этой настройке и
+    # самая дорогая по последствиям.
+    with pytest.raises(ValueError, match="вне допустимого диапазона"):
+        resolve(overrides={"monthly_budget_cap_rub": 5_000_000_000.0})
+
+
 def test_every_preset_is_valid():
     # Пресет, который сам не проходит валидацию, — мина: он применится в
     # первый же раз, когда его выберут.
