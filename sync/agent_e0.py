@@ -22,6 +22,7 @@ from typing import Any, Dict, List
 
 from sync.agent import db as agent_db
 from sync.agent.computed import compute_schedule, compute_segment_modifiers
+from sync.agent.coverage import blind_spend
 from sync.agent.facts import assemble_facts
 from sync.agent.guard import (
     check_continuity,
@@ -997,6 +998,13 @@ def main() -> int:
             rows, calc_date=today_iso, object_id=campaign_id,
             object_level="campaign")
         budget_target_count += len(rows)
+    # Слепая доля расхода: сколько денег прошло мимо настроек, которые агент
+    # читает (Мастер кампаний и прочее вне API). Считается за то же зрелое
+    # окно, что лестница, — чтобы доля относилась к тем же числам, рядом с
+    # которыми она печатается.
+    blind = blind_spend(facts, agent_db.load_campaign_settings_raw(),
+                        ladder_section["window_from"], ladder_section["window_to"])
+
     sizes = agent_db.table_sizes()
     total_mb = round(sum(int(s["size_bytes"] or 0) for s in sizes) / 1024 / 1024, 1)
 
@@ -1010,6 +1018,10 @@ def main() -> int:
         "crm_through": latest_lead,
         "crm_lag_days": crm_lag,
         "facts_rows": len(facts),
+        # Доля расхода, прошедшая мимо настроек агента. Печатается всегда, в
+        # том числе нулём: отсутствие строки неотличимо от отсутствия слепой
+        # зоны, а решения принимаются по числам рядом с ней.
+        "blind_spend": blind,
         "sliced_rows": len(sliced_rows),
         "objects": len(object_rows),
         "search_queries": len(query_rows),
