@@ -51,6 +51,10 @@ DDL-строками в `sync/agent/db.py::AGENT_DDL` + файл в `migrations/
 - **Порог обучения по бюджету** (решение Павла 25.08): изменение недельного или
   дневного лимита в пределах ±20 % обучение стратегии не сбрасывает; рост до ×2
   оправдан адресно, при доказанном недоборе трафика (задачи 5, 8).
+- **Тратить больше, когда хорошо окупаемся** (решение Павла 25.08): общая сумма
+  кабинета перестаёт быть константой — при предельной окупаемости выше цели с запасом
+  агент растит её шагом до 20 % за такт, в пределах месячного потолка из панели
+  настроек. Потолок не задан — рост только предлагается числом (задача 11).
 
 ---
 
@@ -2482,7 +2486,488 @@ git commit -m "feat(agent): каждый такт отвечает, что ус�
 
 ---
 
-## Задача 11: свести волну в документации и прогнать боевой такт
+## Задача 11: бюджет кабинета растёт, когда окупаемость с запасом
+
+Сейчас сумма по кабинету — константа: солвер держит инвариант «Σ целевых = бюджету»,
+а бюджет берётся из трейлинг-28д факта. Значит агент физически не может потратить
+больше, сколько бы хорошо ни окупался. Решение Павла: **можно и больше тратить, если
+хорошо окупаемся.**
+
+Правило роста общей суммы:
+
+- растём, только когда λ кабинета (предельная окупаемость) **выше цели с запасом**:
+  `lambda_breakeven` истинно и `λ ≥ target_romi · GROWTH_LAMBDA_MARGIN` (1.2);
+- шаг роста — **не больше 20 % за такт**: ровно тот порог, за которым начинается
+  перезапуск обучения (задача 5), поэтому рост суммы сам по себе стратегии не сбивает;
+- есть куда потратить: сумма `room_rub` кандидатов усиления (задача 10) больше нуля —
+  иначе прибавка уйдёт в те же показы по более дорогой цене;
+- потолок — **месячный план освоения из панели настроек** (`edu_agent_config`,
+  ключ `monthly_budget_cap_rub`). Пока ключ пуст, рост не применяется, а только
+  предлагается в отчёте: сколько и почему. Общий бюджет — деньги Павла, и цифру
+  потолка ставит он.
+
+**Файлы:**
+- Изменить: `sync/agent/portfolio.py::portfolio_targets` (бюджет кабинета как параметр)
+- Изменить: `sync/agent/config.py` (ключ `monthly_budget_cap_rub`)
+- Изменить: `sync/agent_e0.py` (передать потолок, вывести предложение в отчёт)
+- Изменить: `tests/test_agent_portfolio.py`, `tests/test_agent_config.py`
+
+**Интерфейсы:**
+- Отдаёт: `account_budget(current_cost, lam, target_romi, room_rub, monthly_cap)
+  -> Dict[str, Any]` — `{"budget": float, "growth_rub": float, "capped_by": str}`,
+  где `capped_by` ∈ `"step" | "monthly_cap" | "room" | "lambda" | "none"`.
+- Потребляет: `room_rub_total` (задача 10), `lambda` и `budget_28d` кабинета.
+
+- [ ] **Шаг 1: Написать падающий тест**
+
+```python
+def test_budget_grows_when_lambda_has_margin():
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=2.5, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=5_000_000.0)
+    assert out["budget"] == 1_200_000.0     # шаг +20 %
+    assert out["growth_rub"] == 200_000.0
+    assert out["capped_by"] == "step"
+
+
+def test_no_growth_without_lambda_margin():
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=2.1, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=5_000_000.0)
+    assert out["budget"] == 1_000_000.0
+    assert out["capped_by"] == "lambda"
+
+
+def test_no_growth_without_place_to_spend():
+    # Окупаемость есть, а недобора нет: прибавка купит те же показы дороже.
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=3.0, target_romi=2.0,
+                         room_rub=0.0, monthly_cap=5_000_000.0)
+    assert out["budget"] == 1_000_000.0
+    assert out["capped_by"] == "room"
+
+
+def test_growth_limited_by_room():
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=3.0, target_romi=2.0,
+                         room_rub=50_000.0, monthly_cap=5_000_000.0)
+    assert out["growth_rub"] == 50_000.0
+    assert out["capped_by"] == "room"
+
+
+def test_monthly_cap_is_hard_ceiling():
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=3.0, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=1_050_000.0)
+    assert out["budget"] == 1_050_000.0
+    assert out["capped_by"] == "monthly_cap"
+
+
+def test_without_cap_growth_is_proposed_not_applied():
+    # Потолок не задан — сумма не меняется, но предложение посчитано.
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=3.0, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=None)
+    assert out["budget"] == 1_000_000.0
+    assert out["growth_rub"] == 0.0
+    assert out["proposed_growth_rub"] == 200_000.0
+```
+
+- [ ] **Шаг 2: Прогнать и убедиться, что падает**
+
+Запуск: `python -m pytest tests/test_agent_portfolio.py -q`
+Ожидается: FAIL — `ImportError: cannot import name 'account_budget'`.
+
+- [ ] **Шаг 3: Написать расчёт бюджета кабинета**
+
+В `sync/agent/portfolio.py`:
+
+```python
+# Шаг роста ОБЩЕЙ суммы кабинета за такт. Та же граница, что у безопасного
+# бюджетного шага кампании (writer/learning.BUDGET_SAFE_DELTA): рост суммы
+# раскладывается солвером по кампаниям, и держать его в тех же 20 % значит
+# не перезапускать обучение ради самого роста.
+ACCOUNT_GROWTH_STEP = 0.20
+
+# Запас предельной окупаемости, при котором вообще имеет смысл доливать
+# сверху. Ровно на цели растить нечего: предельный рубль там уже равен
+# порогу, и прибавка сдвинет кабинет за него.
+GROWTH_LAMBDA_MARGIN = 1.2
+
+
+def account_budget(current_cost: float, lam: float, target_romi: float,
+                   room_rub: float, monthly_cap: Optional[float]) -> Dict[str, Any]:
+    """Бюджет кабинета на такт: держим или растим, и чем ограничены.
+
+    Рост применяется только при заданном потолке месяца (панель настроек).
+    Без потолка предложение считается и печатается, но сумма не меняется:
+    решение «тратить больше» принимает человек, а агент приносит ему цифру.
+    """
+    wanted = current_cost * (1.0 + ACCOUNT_GROWTH_STEP)
+    if lam < target_romi * GROWTH_LAMBDA_MARGIN:
+        return {"budget": current_cost, "growth_rub": 0.0,
+                "proposed_growth_rub": 0.0, "capped_by": "lambda"}
+    if room_rub <= 0:
+        return {"budget": current_cost, "growth_rub": 0.0,
+                "proposed_growth_rub": 0.0, "capped_by": "room"}
+
+    growth = min(wanted - current_cost, room_rub)
+    capped_by = "step" if growth >= room_rub - 1e-6 and room_rub >= wanted - current_cost else "room"
+    if growth >= wanted - current_cost - 1e-6:
+        capped_by = "step"
+
+    if monthly_cap is None:
+        return {"budget": current_cost, "growth_rub": 0.0,
+                "proposed_growth_rub": round(growth, 2), "capped_by": capped_by}
+
+    budget = min(current_cost + growth, float(monthly_cap))
+    if budget < current_cost + growth - 1e-6:
+        capped_by = "monthly_cap"
+    return {"budget": round(budget, 2),
+            "growth_rub": round(budget - current_cost, 2),
+            "proposed_growth_rub": round(growth, 2),
+            "capped_by": capped_by}
+```
+
+В `portfolio_targets` заменить `budget = sum(c["cost"] for c in campaigns)` на вызов
+`account_budget(...)` и передавать в `solve_threshold` полученный `budget`. Параметры
+`target_romi`, `room_rub_by_login`, `monthly_cap` приходят аргументами функции —
+модуль не читает ни конфиг, ни БД.
+
+Инвариант суммы при этом сохраняется в новом виде: Σ целевых = бюджету кабинета,
+где бюджет теперь может быть больше факта — и разница названа явно (`growth_rub`).
+
+- [ ] **Шаг 4: Завести ключ в панели настроек**
+
+В `sync/agent/config.py` добавить ключ `monthly_budget_cap_rub` (по умолчанию `None`,
+не входит в `LOCKED_KEYS` — Павел меняет его сам) с комментарием: «потолок месячного
+освоения на кабинет; пусто — агент общий бюджет не растит, только предлагает».
+
+- [ ] **Шаг 5: Вывести в отчёт Э0**
+
+```python
+        "budget_growth": {
+            login: {"budget_28d": acc["budget_28d"],
+                    "growth_rub": acc.get("growth_rub", 0.0),
+                    "proposed_growth_rub": acc.get("proposed_growth_rub", 0.0),
+                    "capped_by": acc.get("capped_by"),
+                    "lambda": acc["lambda"]}
+            for login, acc in budget_threshold["accounts"].items()
+        },
+```
+
+- [ ] **Шаг 6: Прогнать весь набор**
+
+Запуск: `python -m pytest tests/ -q`
+Ожидается: PASS.
+
+- [ ] **Шаг 7: Коммит**
+
+```bash
+git add sync/agent/portfolio.py sync/agent/config.py sync/agent_e0.py \
+        tests/test_agent_portfolio.py tests/test_agent_config.py
+git commit -m "feat(agent): бюджет кабинета растёт шагом 20%, когда предельная окупаемость с запасом"
+```
+
+---
+
+## Задача 12: замкнуть петлю обучения на собственных действиях
+
+Сейчас агент учится **косвенно**: применённое изменение меняет расход, детектор скачков
+(`mining.detect_change_points`) видит это в фактах как квазиэксперимент, DiD даёт
+эластичность, она входит в кривую насыщения следующего такта. Работает, но с тремя
+дырами:
+
+1. **Собственные действия неотличимы от ручных правок.** У квазиэксперимента класс
+   всегда `B` (или `C`, если RTM-фильтр заподозрил реакцию на всплеск), хотя у своего
+   действия известны точная дата, величина и намерение — это самый чистый эксперимент
+   в системе, и он деклассируется наравне с чужими.
+2. **Вердикты никуда не идут.** `closing_verdict` (по заявкам) и `money_verdict`
+   (по деньгам, 35 дней) пишутся в журнал и читаются только кулдауном вредных
+   сегментов. Доля попаданий по рычагам не считается — значит нет track record,
+   на котором строится лестница автономии (Ф9).
+3. **Смещение прогноза не измеряется.** Каждое действие несёт ожидание
+   (`expected_leads_delta`), сторож знает факт — но систематическая разница
+   («модель завышает эффект бюджетных сдвигов в полтора раза») не выводится и не
+   вычитается из следующих оценок.
+
+Эта задача закрывает все три и служит фундаментом Ф9.
+
+**Файлы:**
+- Создать: `sync/agent/learning_loop.py`
+- Создать: `tests/test_agent_learning_loop.py`
+- Изменить: `sync/agent/mining.py` (класс A для собственных действий)
+- Изменить: `sync/agent/writer/db.py` (чтение закрытых действий с вердиктами)
+- Изменить: `sync/agent_e0.py` (секция отчёта + подача калибровки в портфель)
+
+**Интерфейсы:**
+- Отдаёт:
+  - `track_record(actions) -> Dict[str, Dict[str, Any]]` — по ключу
+    `action_kind`: `{"closed", "improved", "worsened", "unchanged", "hit_rate",
+    "money_confirmed", "money_contradicted"}`.
+  - `forecast_bias(actions) -> Dict[str, Dict[str, float]]` — по `action_kind`:
+    `{"ratio", "n", "shrunk_ratio"}`, где `ratio` — медиана
+    факт/ожидание, `shrunk_ratio` — то же с усадкой к 1.0 по объёму наблюдений.
+  - `BIAS_PRIOR_N = 10` — сила приора усадки.
+- Потребляет: строки журнала `edu_agent_actions` со статусом `applied`, полями
+  `closing_verdict`, `money_verdict`, `expected_leads_delta`, `observed_leads_delta`.
+
+- [ ] **Шаг 1: Написать падающий тест**
+
+```python
+# tests/test_agent_learning_loop.py
+# -*- coding: utf-8 -*-
+"""Петля обучения: агент учится на СВОИХ закрытых действиях, а не только на фактах."""
+
+from sync.agent.learning_loop import BIAS_PRIOR_N, forecast_bias, track_record
+
+
+def _action(kind, verdict, money=None, expected=None, observed=None):
+    return {"action_kind": kind, "closing_verdict": verdict, "money_verdict": money,
+            "expected_leads_delta": expected, "observed_leads_delta": observed}
+
+
+def test_track_record_counts_by_lever():
+    actions = [_action("budget.set", "improved"), _action("budget.set", "worsened"),
+               _action("bidmodifier.set", "improved")]
+    out = track_record(actions)
+    assert out["budget.set"]["closed"] == 2
+    assert out["budget.set"]["improved"] == 1
+    assert out["budget.set"]["hit_rate"] == 0.5
+    assert out["bidmodifier.set"]["hit_rate"] == 1.0
+
+
+def test_money_contradiction_counted_separately():
+    # Заявка подешевела, оплата подорожала — успех по заявкам, промах по деньгам.
+    actions = [_action("tcpa.set", "improved", money="worsened"),
+               _action("tcpa.set", "improved", money="improved")]
+    out = track_record(actions)
+    assert out["tcpa.set"]["money_confirmed"] == 1
+    assert out["tcpa.set"]["money_contradicted"] == 1
+
+
+def test_unknown_verdicts_do_not_count_as_success():
+    actions = [_action("budget.set", "unknown"), _action("budget.set", "improved")]
+    out = track_record(actions)
+    assert out["budget.set"]["closed"] == 1
+    assert out["budget.set"]["hit_rate"] == 1.0
+
+
+def test_forecast_bias_is_median_of_fact_over_expectation():
+    actions = [_action("budget.set", "improved", expected=10.0, observed=5.0),
+               _action("budget.set", "improved", expected=10.0, observed=6.0),
+               _action("budget.set", "improved", expected=10.0, observed=4.0)]
+    out = forecast_bias(actions)
+    assert out["budget.set"]["ratio"] == 0.5
+    assert out["budget.set"]["n"] == 3
+
+
+def test_bias_is_shrunk_towards_one_on_thin_evidence():
+    # Три наблюдения не повод верить, что модель завышает вдвое: усадка к 1.0
+    # по объёму (тот же приём, что эмпирический Байес в history.combine).
+    actions = [_action("budget.set", "improved", expected=10.0, observed=5.0)] * 3
+    out = forecast_bias(actions)
+    shrunk = out["budget.set"]["shrunk_ratio"]
+    assert 0.5 < shrunk < 1.0
+    assert round(shrunk, 4) == round((0.5 * 3 + 1.0 * BIAS_PRIOR_N) / (3 + BIAS_PRIOR_N), 4)
+
+
+def test_zero_expectation_is_skipped_not_infinite():
+    actions = [_action("budget.set", "improved", expected=0.0, observed=5.0)]
+    assert forecast_bias(actions) == {}
+
+
+def test_empty_journal_gives_empty_answer():
+    assert track_record([]) == {}
+    assert forecast_bias([]) == {}
+```
+
+- [ ] **Шаг 2: Прогнать и убедиться, что падает**
+
+Запуск: `python -m pytest tests/test_agent_learning_loop.py -q`
+Ожидается: FAIL — `ModuleNotFoundError: No module named 'sync.agent.learning_loop'`.
+
+- [ ] **Шаг 3: Написать модуль**
+
+```python
+# sync/agent/learning_loop.py
+# -*- coding: utf-8 -*-
+"""
+sync/agent/learning_loop.py — обучение на СВОИХ закрытых действиях.
+
+Косвенная петля уже работает: применённое изменение меняет расход, детектор
+скачков видит его в фактах, DiD даёт эластичность, она входит в кривые
+следующего такта. Здесь замыкается прямая петля — по журналу действий:
+
+  • track_record — доля попаданий по каждому рычагу: сколько закрытых
+    действий улучшили метрику, сколько ухудшили, и подтвердили ли это деньги
+    на втором чекпоинте (agent_e1_watchdog.money_checkpoint). Это же —
+    фундамент лестницы автономии: класс действий с доказанной долей попаданий
+    получает больше свободы, недоказанный остаётся в тени.
+
+  • forecast_bias — систематическое смещение прогноза: медиана отношения
+    «факт / ожидание». Медиана, а не среднее: одно действие с ожиданием
+    близким к нулю даёт отношение в сотни и утаскивает среднее.
+    Усадка к 1.0 по объёму наблюдений — тот же приём, что эмпирический Байес
+    в history.combine: три наблюдения не повод верить, что модель завышает
+    вдвое.
+
+Модуль ничего не решает и никуда не пишет: считает два числа, потребители —
+портфель (поправка ожиданий) и отчёт (track record).
+"""
+
+import statistics
+from typing import Any, Dict, List
+
+# Сила приора усадки смещения: при n наблюдениях вес факта n/(n+BIAS_PRIOR_N).
+# Десять — примерно такт-два боевой работы: до этого поправку применять рано.
+BIAS_PRIOR_N = 10
+
+SUCCESS = "improved"
+FAILURE = "worsened"
+NEUTRAL = "unchanged"
+
+
+def track_record(actions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Доля попаданий по видам действий среди ЗАКРЫТЫХ наблюдений."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for action in actions:
+        verdict = str(action.get("closing_verdict") or "")
+        if verdict not in (SUCCESS, FAILURE, NEUTRAL):
+            continue  # 'unknown' и незакрытые — не свидетельство ни за, ни против
+        kind = str(action.get("action_kind") or "")
+        slot = out.setdefault(kind, {"closed": 0, "improved": 0, "worsened": 0,
+                                     "unchanged": 0, "money_confirmed": 0,
+                                     "money_contradicted": 0})
+        slot["closed"] += 1
+        slot[verdict] += 1
+        money = str(action.get("money_verdict") or "")
+        if verdict == SUCCESS and money == SUCCESS:
+            slot["money_confirmed"] += 1
+        elif verdict == SUCCESS and money == FAILURE:
+            slot["money_contradicted"] += 1
+    for slot in out.values():
+        slot["hit_rate"] = round(slot["improved"] / slot["closed"], 4) if slot["closed"] else 0.0
+    return out
+
+
+def forecast_bias(actions: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    """Систематическое смещение прогноза по видам действий."""
+    ratios: Dict[str, List[float]] = {}
+    for action in actions:
+        expected = action.get("expected_leads_delta")
+        observed = action.get("observed_leads_delta")
+        if not expected or observed is None:
+            continue
+        try:
+            ratio = float(observed) / float(expected)
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+        ratios.setdefault(str(action.get("action_kind") or ""), []).append(ratio)
+
+    out: Dict[str, Dict[str, float]] = {}
+    for kind, values in ratios.items():
+        median = statistics.median(values)
+        n = len(values)
+        out[kind] = {
+            "ratio": round(median, 4),
+            "n": n,
+            "shrunk_ratio": round((median * n + 1.0 * BIAS_PRIOR_N) / (n + BIAS_PRIOR_N), 4),
+        }
+    return out
+```
+
+- [ ] **Шаг 4: Прогнать тесты**
+
+Запуск: `python -m pytest tests/test_agent_learning_loop.py -q`
+Ожидается: PASS (7 тестов).
+
+- [ ] **Шаг 5: Пометить собственные действия классом A**
+
+В `sync/agent/mining.py::mine_quasi_experiments` добавить параметр
+`own_actions: Optional[Dict[str, List[str]]] = None` — по `campaign_id` список дат
+применённых собственных действий (из журнала). Скачок, дата которого совпала с
+собственным действием (±1 день), получает:
+
+```python
+                # Собственное действие: дата и величина известны точно, намерение
+                # записано заранее. RTM-фильтр к нему неприменим — мы знаем, что
+                # правку сделали не в ответ на всплеск, а по расчёту прошлого
+                # такта. Это самое чистое наблюдение в системе, и класс у него
+                # выше, чем у скачка неизвестного происхождения.
+                "reliability_class": "A",
+```
+
+Тест дописать в `tests/test_agent_mining.py`:
+
+```python
+def test_own_action_gets_class_a_even_when_rtm_suspects():
+    from sync.agent.mining import mine_quasi_experiments
+
+    facts = _rtm_suspicious_facts()  # тот же набор, что у теста RTM-фильтра
+    out = mine_quasi_experiments(facts, own_actions={"111": ["2026-08-10"]})
+    assert [e["reliability_class"] for e in out] == ["A"]
+```
+
+- [ ] **Шаг 6: Читать закрытые действия и выводить петлю в отчёт**
+
+В `sync/agent/writer/db.py`:
+
+```python
+def closed_actions(days: int = 180) -> List[Dict[str, Any]]:
+    """Применённые действия с вынесенным вердиктом — вход петли обучения."""
+    return _fetch_dicts(
+        """
+        SELECT action_kind, object_id, applied_at::date AS applied_on,
+               closing_verdict, money_verdict,
+               (red_line->>'expected_leads_delta')::float AS expected_leads_delta,
+               (response->>'observed_leads_delta')::float AS observed_leads_delta
+        FROM edu_agent_actions
+        WHERE applied_at IS NOT NULL
+          AND applied_at >= now() - make_interval(days => %s)
+        """,
+        (int(days),),
+    )
+```
+
+В `sync/agent_e0.py`:
+
+```python
+    from sync.agent.learning_loop import forecast_bias, track_record
+
+    closed = writer_db.closed_actions()
+    loop = {"track_record": track_record(closed), "forecast_bias": forecast_bias(closed)}
+```
+
+и в отчёт — `"learning_loop": loop,`.
+
+Поправка ожиданий применяется в портфеле: `expected_leads_delta` умножается на
+`shrunk_ratio` своего вида действия, когда он есть. Пока наблюдений мало, усадка
+держит множитель около единицы — то есть поправка включается сама собой по мере
+накопления истории, без отдельного переключателя.
+
+- [ ] **Шаг 7: Прогнать весь набор**
+
+Запуск: `python -m pytest tests/ -q`
+Ожидается: PASS.
+
+- [ ] **Шаг 8: Коммит**
+
+```bash
+git add sync/agent/learning_loop.py sync/agent/mining.py sync/agent/writer/db.py \
+        sync/agent_e0.py tests/test_agent_learning_loop.py tests/test_agent_mining.py
+git commit -m "feat(agent): петля обучения на своих действиях — track record, смещение прогноза, класс A"
+```
+
+---
+
+## Задача 13: свести волну в документации и прогнать боевой такт
 
 **Файлы:**
 - Изменить: `docs/AGENT-ROADMAP-2026-08-25.md`
@@ -2495,9 +2980,13 @@ git commit -m "feat(agent): каждый такт отвечает, что ус�
 `demand_regime`, `growth` — и в отчёте Э1 (`agent-e1`, репетиция 11:00 МСК):
 `learning`, `balance`.
 
+Плюс секции задач 11–12: `budget_growth` (Э0) и `learning_loop` (Э0).
+
 Ключевая проверка боевого прогона: `balance.shrinking` при непустом плане должен быть
 `false`, а `growth.candidates` — непустым. Сжимающий такт с пустым списком усиления
 значит, что механизм роста не заработал, и это повод остановиться, а не применять.
+`learning_loop.track_record` в первые недели будет пуст — закрытых вердиктов ещё нет;
+это нормально и должно быть видно нулём, а не отсутствием секции.
 
 - [ ] **Шаг 2: Записать боевые числа**
 
@@ -2534,9 +3023,10 @@ git push
    очередь гипотез с приоритетом «ожидаемая ценность ÷ цена теста».
 3. **Ф9 — боевая работа**: первое применение узким скоупом, лестница автономии по
    классам действий через shadow-режим, пейсинг месяца вместо трейлинг-28д.
-   Сюда же — снятие потолка общего бюджета: `growth.room_rub_total` (задача 10)
-   показывает, сколько агент долил бы, если бы сумма кабинета не была прибита к
-   трейлинг-28д; двигать её вправе только человек.
+   Лестница строится прямо на `learning_loop.track_record` (задача 12): класс
+   действий с доказанной долей попаданий получает автономию, недоказанный остаётся
+   в тени. Рост общего бюджета уже введён задачей 11; в Ф9 к нему добавляется
+   пейсинг внутри месяца (сейчас потолок — плоское число из панели настроек).
 
 Открытые решения Павла (нужны к плану Ф9, не к этой волне): скоуп первого применения,
 `target_romi` (1.0 или 2.0), поднимать ли недельный риск-бюджет (сейчас 50 000 ₽).
