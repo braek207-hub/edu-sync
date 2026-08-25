@@ -158,6 +158,10 @@ def _patch_e0_run(monkeypatch, reports=None):
         monkeypatch.setattr(agent_e0.agent_db, name, lambda *a, **k: [])
     # Снимок настроек читается словарём кампания → сырые настройки, не списком.
     monkeypatch.setattr(agent_e0.agent_db, "load_campaign_settings_raw", lambda *a, **k: {})
+    # Панель настроек агента: без подмены прогон пошёл бы в БД за пресетом и
+    # напечатал бы ретраи коннекта в тот же stdout, который тест парсит как JSON.
+    monkeypatch.setattr(agent_e0.agent_db, "load_agent_config",
+                        lambda *a, **k: {"preset": None, "overrides": {}})
     # Отчёт по площадкам — отдельный поход в Директ; без подмены тесты
     # расчёта падали бы на сети, а не на своих утверждениях.
     monkeypatch.setattr(agent_e0, "fetch_placements", lambda *a, **k: ([], {}))

@@ -561,6 +561,45 @@ CRM_MATURITY_MIN_SHARE = 0.5
 CRM_MATURITY_WINDOW_DAYS = 14
 
 
+AGENT_CONFIG_DDL = """
+    CREATE TABLE IF NOT EXISTS edu_agent_config (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        preset     TEXT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_by TEXT
+    )
+"""
+
+
+def load_agent_config() -> Dict[str, Any]:
+    """Настройки агента из БД: {'preset': ..., 'overrides': {...}}.
+
+    Таблицы нет или она пуста — пустой результат: агент работает на кодовых
+    дефолтах, и это законное состояние, а не ошибка. Разбирает значения
+    sync/agent/config.resolve — здесь только чтение строк, чтобы правила
+    валидации жили в одном месте.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(AGENT_CONFIG_DDL)
+        conn.commit()
+    rows = _fetch_dicts("SELECT key, value, preset FROM edu_agent_config")
+    preset = None
+    overrides: Dict[str, Any] = {}
+    for row in rows:
+        key = str(row["key"])
+        if key == "preset":
+            preset = str(row["value"])
+            continue
+        raw = str(row["value"])
+        try:
+            overrides[key] = float(raw) if raw.replace(".", "", 1).isdigit() else raw
+        except (TypeError, ValueError):
+            overrides[key] = raw
+    return {"preset": preset, "overrides": overrides}
+
+
 def crm_maturity_date() -> Optional[date]:
     """Последний день, за который лиды в CRM РЕАЛЬНО есть. Граница зрелости.
 

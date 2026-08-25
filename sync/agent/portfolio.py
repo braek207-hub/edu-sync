@@ -271,6 +271,7 @@ def portfolio_targets(
     ladder_by_object: Dict[str, Dict[str, Any]],
     login_by_campaign_id: Dict[str, str],
     holdout_ids: Optional[Set[str]] = None,
+    explore_share: float = EXPLORATION_SHARE,
 ) -> Dict[str, Any]:
     """Целевые бюджеты по кабинетам: порог λ на кабинет, сумма сохраняется.
 
@@ -354,7 +355,7 @@ def portfolio_targets(
             # Сколько денег кабинета ушло на разведку и кому: без этой строки
             # надбавка неотличима от решения солвера.
             "exploration": {
-                "share": EXPLORATION_SHARE if bonus else 0.0,
+                "share": explore_share if bonus else 0.0,
                 "rub": round(sum(bonus.values()), 2),
                 "campaigns": len(bonus),
             },

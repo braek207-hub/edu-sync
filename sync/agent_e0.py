@@ -32,6 +32,7 @@ from sync.agent.guard import (
     verdict,
 )
 from sync.agent.holdout import select_holdout
+from sync.agent import config as agent_config
 from sync.agent import semantic
 
 # Чем занимается проект — контекст для смыслового слоя. Без него модель судит
@@ -371,6 +372,26 @@ def main() -> int:
     today_iso = date.today().isoformat()
 
     agent_db.ensure_agent_tables()
+
+    # Настройки агента: пресет и переопределения из БД поверх кодовых
+    # дефолтов. Битая настройка роняет прогон намеренно — молча
+    # проигнорированная выглядит как применённая (sync/agent/config.py).
+    try:
+        stored_config = agent_db.load_agent_config()
+    except Exception as exc:  # noqa: BLE001
+        # Настройки — надстройка над кодовыми дефолтами: их недоступность не
+        # имеет права ронять расчёт. Дефолты равны константам кода, то есть
+        # поведение остаётся прежним, а причина видна в отчёте.
+        stored_config = {"preset": None, "overrides": {},
+                         "unavailable": f"{type(exc).__name__}: {exc}"[:200]}
+    active_config = agent_config.resolve(stored_config["preset"],
+                                         stored_config["overrides"])
+    active_config_rows = agent_config.describe(stored_config["preset"],
+                                               stored_config["overrides"])
+    if stored_config.get("unavailable"):
+        active_config_rows = [{"key": "__source__", "value": "кодовые дефолты",
+                               "source": "unavailable",
+                               "about": stored_config["unavailable"]}] + active_config_rows
 
     direct_rows = agent_db.load_direct_rows(date_from, date_to)
     lead_rows = agent_db.load_lead_rows(date_from, date_to)
@@ -951,7 +972,9 @@ def main() -> int:
         # Заповедник вне солвера: агент его не двигает, и держать его внутри
         # ограничения «сумма целевых = сумме текущих» значит задавать порог λ
         # отчасти неподвижными кампаниями.
-        holdout_ids={str(h["campaign_id"]) for h in holdout})
+        holdout_ids={str(h["campaign_id"]) for h in holdout},
+        # Доля разведки — из панели настроек, а не из константы модуля.
+        explore_share=active_config["explore_share"])
     budget_target_count = 0
     for campaign_id, rows in portfolio_computed_rows(budget_threshold).items():
         agent_db.upsert_computed_settings(
@@ -974,6 +997,9 @@ def main() -> int:
         "sliced_rows": len(sliced_rows),
         "objects": len(object_rows),
         "search_queries": len(query_rows),
+        # Активный конфиг с источником каждого значения: «почему агент стал
+        # резче» не должно требовать археологии по коммитам.
+        "config": active_config_rows,
         "semantic": semantic_stats,
         "expansion_candidates": {
             "count": len(expansion),
