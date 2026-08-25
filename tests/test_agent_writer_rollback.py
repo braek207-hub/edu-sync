@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 import pytest
 
-from sync.agent.writer.rollback import is_breached, red_line_for, rollback_payload
+from sync.agent.writer.rollback import (
+    is_breached,
+    is_spend_collapsed,
+    red_line_for,
+    rollback_payload,
+)
 
 # Тестовый аварийный потолок: раньше на его месте молча подставлялся
 # захардкоженный DEFAULT_ABSOLUTE_MAX_CPA=3000 из rollback.py — теперь
@@ -152,3 +157,45 @@ def test_rollback_of_add_returns_none_when_id_unknown():
 
 def test_rollback_returns_none_without_previous_state_and_id():
     assert rollback_payload({"action_kind": "unknown", "payload": {}, "previous_state": {}}) is None
+
+
+# ------------------- обвал расхода считается от расхода объекта, не от цены правки
+
+
+def test_spend_collapse_expects_the_object_spend_not_the_price_of_the_change():
+    # Дельта-модель: корректировка сегмента стоит 300 ₽ (risk_rub), а кампания
+    # тратит 1 000 ₽/день (baseline_daily_rub). Ожидание обязано браться из
+    # второго: выводи его из risk_rub, как раньше, — и кампания, вставшая с
+    # 1 000 до 200 ₽/день, считалась бы «выше ожидания» (43 ₽/день) и обвал
+    # не обнаруживался бы вовсе.
+    action = {"action_kind": "bidmodifier.set", "risk_rub": 300.0,
+              "baseline_daily_rub": 1000.0}
+    observed = {"cost": 600.0, "leads": 0, "cpa": 0.0, "days": 3}
+
+    collapsed, reason = is_spend_collapsed(action, observed)
+
+    assert collapsed
+    assert "обвал" in reason
+
+
+def test_spend_collapse_falls_back_to_risk_for_rows_written_before_the_change():
+    # Строки журнала, применённые до перехода, своей колонки не имеют. Для них
+    # сохранён прежний вывод ожидания из risk_rub — иначе наблюдение за ними
+    # оборвалось бы ровно на переходе.
+    action = {"action_kind": "bidmodifier.set", "risk_rub": 7000.0}
+    observed = {"cost": 600.0, "leads": 0, "cpa": 0.0, "days": 3}
+
+    collapsed, _ = is_spend_collapsed(action, observed)
+
+    assert collapsed
+
+
+def test_spend_collapse_is_silent_when_the_object_spend_is_unknown():
+    action = {"action_kind": "bidmodifier.set", "risk_rub": 300.0,
+              "baseline_daily_rub": 0.0}
+    observed = {"cost": 0.0, "leads": 0, "cpa": 0.0, "days": 5}
+
+    collapsed, reason = is_spend_collapsed(action, observed)
+
+    assert not collapsed
+    assert "неизвест" in reason
