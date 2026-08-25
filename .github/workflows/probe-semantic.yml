@@ -18,4 +18,4 @@ jobs:
       - name: Probe
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: python scripts/probe_semantic.py
+        run: PYTHONPATH=. python scripts/probe_semantic.py
