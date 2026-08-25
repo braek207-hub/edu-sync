@@ -1,0 +1,62 @@
+name: agent-config
+on:
+  # Только руками: настройки агента меняет человек и только осознанно. Крона
+  # здесь быть не может — расписание, само себе меняющее темп и осторожность,
+  # это ровно то, от чего защищает панель.
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Что делаем"
+        required: true
+        default: "show"
+        type: choice
+        options:
+          - show
+          - set
+          - preset
+          - unset
+      args:
+        description: >-
+          set: пары KEY=VALUE через пробел (monthly_budget_cap_rub= очищает).
+          preset: имя (conservative/balanced/aggressive).
+          unset: ключи через пробел. show: не нужно.
+        required: false
+        default: ""
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Apply agent config
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # Ни токена Директа, ни клиентов: панель не ходит в кабинет вовсе —
+          # она пишет одну строку в edu_agent_config и читает её обратно.
+          # Автор правки — тот, кто нажал кнопку: без этого в updated_by
+          # стояло бы безликое "cli" на каждую смену из Actions.
+          AGENT_CONFIG_ACTOR: ${{ github.actor }}
+          ACTION: ${{ github.event.inputs.action }}
+          ARGS: ${{ github.event.inputs.args }}
+        run: |
+          set -euo pipefail
+          # Показ обязан работать без аргументов: это первый шаг разбора
+          # «почему агент так себя ведёт», и требовать для него ввод — способ
+          # получить ошибку вместо ответа.
+          if [ "$ACTION" = "show" ]; then
+            python -m sync.agent_config --show
+            exit 0
+          fi
+          if [ -z "$ARGS" ]; then
+            echo "ОТКАЗ: действию $ACTION нужны аргументы в поле args" >&2
+            exit 2
+          fi
+          # Без кавычек намеренно: args — это список пар/ключей через пробел,
+          # и он должен доехать до модуля отдельными аргументами. Всё, что
+          # придёт мусором, отвергнет валидация — до единой записи в базу.
+          # shellcheck disable=SC2086
+          python -m sync.agent_config --$ACTION $ARGS
