@@ -74,9 +74,12 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
     monkeypatch.setattr(agent_e1.writer_db, "purge_dry_run_actions", lambda *a, **k: 0)
     # Витрина настроек — знаменатель слепой доли в отчёте прогона. Пустая по
     # умолчанию: тесты про действия к ней безразличны, а тест про саму долю
-    # подменяет её сам.
+    # подменяет её сам. Числитель — сумма расхода за окно, тем же правилом:
+    # без подмены прогон ушёл бы в реальную базу и напечатал ретраи коннекта
+    # в тот же stdout, который тесты разбирают как JSON.
     monkeypatch.setattr(agent_e1.agent_db, "load_campaign_settings_raw",
                         lambda: dict(campaign_settings or {}))
+    monkeypatch.setattr(agent_e1.agent_db, "load_cost_by_campaign", lambda *_: {})
     monkeypatch.setattr(agent_e1, "data_gate",
                         lambda today: {"status": "GREEN", "reason": "",
                                        "checks": []})
@@ -606,7 +609,8 @@ def _reports(capsys):
 
 def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
                baseline_cpa=None, stale=(), journal=None, cooled=None, final_keys=(),
-               lease=None, prod_apply=False, exhausted=None, argv=()):
+               lease=None, prod_apply=False, exhausted=None, argv=(),
+               window_cost=None):
     # prod_apply — боевой режим (--prod --apply). Нужен там, где проверяется
     # изменение состояния журнала: по общему правилу движка
     # (writer/client.py::journal_writes_allowed) репетиция журнал не трогает.
@@ -649,6 +653,12 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
     monkeypatch.setattr(agent_e1, "WriteClient", _MultiCabinetClient)
     _patch_infra(monkeypatch, cooled=cooled, final_keys=final_keys, lease=lease,
                  exhausted=exhausted)
+    # После _patch_infra: он ставит свою пустую заглушку суммы расхода, а
+    # здесь она должна отвечать числами этого теста.
+    monkeypatch.setattr(agent_e1.agent_db, "load_cost_by_campaign",
+                        lambda *_: dict(window_cost if window_cost is not None
+                                        else {cid: v * 28.0
+                                              for cid, v in daily_cost.items()}))
     return rows
 
 
@@ -1496,13 +1506,18 @@ def test_run_purges_old_rehearsal_rows(monkeypatch, capsys):
 def test_run_reports_share_of_spend_it_cannot_see(monkeypatch, capsys):
     # «Изменили десять кампаний» без слепой доли читается как «кабинет взят
     # под управление», хотя часть денег живёт вне витрины настроек и на неё
-    # эти изменения не влияют никак. Доля считается по тому же расходу, по
-    # которому решает рельса бюджета (средний дневной × 28).
+    # эти изменения не влияют никак.
+    #
+    # Знаменатель — СУММА расхода за окно, а не средний дневной × 28: второе
+    # растягивает темп кампании, отработавшей часть окна, на всё окно, и доля
+    # выходит про расход, которого не было. Кампания «999» здесь как раз
+    # такая: темп 300 в день, но за окно потратила 1000.
     _patch_run(
         monkeypatch,
         computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
         campaigns_by_login={"acc-1": [111]},
         daily_cost={"111": 100.0, "999": 300.0},
+        window_cost={"111": 1000.0, "999": 1000.0},
     )
     monkeypatch.setattr(agent_e1.agent_db, "load_campaign_settings_raw",
                         lambda: {"111": {}})
@@ -1512,8 +1527,8 @@ def test_run_reports_share_of_spend_it_cannot_see(monkeypatch, capsys):
     blind = [r for r in _reports(capsys) if r.get("verdict") == "BLIND_SPEND"]
     assert blind, "слепая доля печатается всегда, в том числе нулём"
     section = blind[0]["blind_spend"]
-    assert section["cost_total"] == 400.0 * 28
-    assert section["blind_share"] == 0.75
+    assert section["cost_total"] == 2000.0
+    assert section["blind_share"] == 0.5
     assert [s["campaign_id"] for s in section["sample"]] == ["999"]
 
 

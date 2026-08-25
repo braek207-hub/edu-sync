@@ -804,6 +804,27 @@ def load_daily_cost_by_campaign(date_from: str, date_to: str) -> Dict[str, float
     return {str(r["campaign_id"]): float(r["daily_cost"]) for r in rows}
 
 
+def load_cost_by_campaign(date_from: str, date_to: str) -> Dict[str, float]:
+    """СУММА расхода кампании за окно — знаменатель доли, а не множитель цены.
+
+    Отдельно от load_daily_cost_by_campaign, и это не дубль. Там AVG по дням,
+    ПРИСУТСТВУЮЩИМ в окне: кампания, отработавшая 5 дней из 28, получает свой
+    дневной темп, и умножение на 28 даёт расход, которого не было. Для цены
+    ошибки это верно (важен темп), для доли денег — нет: доля, посчитанная по
+    выдуманным суммам, врёт и в числителе, и в знаменателе.
+    """
+    rows = _fetch_dicts(
+        """
+        SELECT campaign_id, SUM(cost) AS cost
+        FROM edu_agent_facts
+        WHERE fact_date BETWEEN %s AND %s
+        GROUP BY campaign_id
+        """,
+        (date_from, date_to),
+    )
+    return {str(r["campaign_id"]): float(r["cost"] or 0.0) for r in rows}
+
+
 def load_wordstat_demand(week_from: str) -> List[Dict[str, Any]]:
     """Недельный спрос Wordstat с указанной недели.
 
