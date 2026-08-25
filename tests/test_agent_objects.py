@@ -341,3 +341,31 @@ def test_expansion_ignores_queries_already_bought_in_another_campaign():
     ]
     out = expansion_candidates(queries, cpa_limit=1700.0)
     assert [c["query"] for c in out] == ["другой запрос"]
+
+
+def test_expansion_cpa_never_counts_more_conversions_than_clicks():
+    # Директ приписывает конверсию запросу по атрибуции, а клик — по факту
+    # показа: на живых данных 61 фраза имеет конверсий больше, чем кликов
+    # («1 клик, 5 конверсий»). CPA по таким числам занижен в разы, и фраза
+    # уезжает в топ расширения на основании чужого окна. Доказанный объём не
+    # может превышать собственные клики.
+    from sync.agent.objects import expansion_candidates
+    queries = [
+        {"campaign_id": "1", "query": "странная фраза", "matched_key": "ключ",
+         "cost": 900.0, "clicks": 3, "conversions": 12},
+    ]
+    out = expansion_candidates(queries, cpa_limit=1700.0)
+    assert out[0]["conversions"] == 12          # факт не переписываем
+    assert out[0]["proven_conversions"] == 3    # но считаем по кликам
+    assert out[0]["cpa"] == 300.0               # 900 / 3, а не 900 / 12
+
+
+def test_expansion_needs_a_few_clicks_of_its_own():
+    # Одна-две случайности не должны поднимать фразу в топ: расширяемся на
+    # то, у чего есть собственный доказанный объём.
+    from sync.agent.objects import expansion_candidates
+    queries = [
+        {"campaign_id": "1", "query": "один клик", "matched_key": "ключ",
+         "cost": 90.0, "clicks": 1, "conversions": 5},
+    ]
+    assert expansion_candidates(queries, cpa_limit=1700.0) == []

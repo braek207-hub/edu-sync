@@ -231,10 +231,17 @@ _WORD_RE = re.compile(r"[а-яёa-z0-9]+")
 # любого мусора, а расширяться на мусор дороже, чем упустить один запрос.
 MIN_EXPANSION_CONVERSIONS = 2
 
+# Минимум СВОИХ кликов у кандидата. Директ приписывает конверсию запросу по
+# атрибуции, а клик — по факту показа, поэтому у фразы бывает конверсий
+# больше, чем кликов (на живых данных 25.08 таких 61). Одна-две случайности
+# не должны поднимать фразу в топ расширения.
+MIN_EXPANSION_CLICKS = 3
+
 
 def expansion_candidates(
     queries: List[Dict[str, Any]], cpa_limit: float,
     min_conversions: int = MIN_EXPANSION_CONVERSIONS,
+    min_clicks: int = MIN_EXPANSION_CLICKS,
 ) -> List[Dict[str, Any]]:
     """Запросы, которые УЖЕ окупаются, но своей ключевой фразы не имеют.
 
@@ -276,20 +283,28 @@ def expansion_candidates(
     out: List[Dict[str, Any]] = []
     for slot in totals.values():
         conversions = slot["conversions"]
+        clicks = slot["clicks"]
         if conversions < min_conversions or slot["cost"] <= 0:
             continue
-        cpa = slot["cost"] / conversions
+        if clicks < min_clicks:
+            continue
+        # Доказанный объём не может превышать собственные клики: конверсии
+        # приходят по атрибуции из другого окна, и деление на них занижало
+        # CPA в разы — фраза уезжала в топ на основании чужого клика.
+        proven = min(conversions, clicks)
+        cpa = slot["cost"] / proven
         if cpa > cpa_limit:
             continue
         out.append({
             "query": slot["query"],
             "cost": round(slot["cost"], 2),
-            "clicks": slot["clicks"],
+            "clicks": clicks,
             "conversions": conversions,
+            "proven_conversions": proven,
             "cpa": round(cpa, 2),
             # Сколько мы недобираем, покупая это вслепую: запас по цене
             # против допустимого CPA, умноженный на доказанный объём.
-            "headroom": round((cpa_limit - cpa) * conversions, 2),
+            "headroom": round((cpa_limit - cpa) * proven, 2),
             "campaigns": sorted(slot["campaigns"]),
         })
     out.sort(key=lambda c: -c["headroom"])
