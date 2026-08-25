@@ -211,16 +211,18 @@ def test_computed_rows_add_campaign_switch_for_candidate():
     section = portfolio_targets(saturation, ladder,
                                 {"rich": "acc", "mid": "acc", "poor": "acc"})
     rows = computed_rows(section)
-    kinds_poor = [r["setting_kind"] for r in rows["poor"]]
-    assert kinds_poor == ["budget_target", "budget_target", "campaign_switch"]
-    switch_row = rows["poor"][2]
+    # По ключу, а не по индексу: строки budget_target прибавляются по мере
+    # того, как писателю нужны новые числа солвера, и тест, привязанный к
+    # позиции, краснел бы на каждой такой прибавке, ничего не проверяя.
+    switch_rows = [r for r in rows["poor"] if r["setting_kind"] == "campaign_switch"]
+    assert len(switch_rows) == 1
+    switch_row = switch_rows[0]
     move = section["accounts"]["acc"]["moves"]["poor"]
     assert switch_row["setting_key"] == "suspend"
     assert switch_row["value"] == move["switch_off"]["roi_share_of_lambda"]
     assert switch_row["raw_value"] == move["switch_off"]["roi_at_floor"]
     assert switch_row["rel_error"] == move["rel_error"]
-    assert [r["setting_kind"] for r in rows["rich"]] == [
-        "budget_target", "budget_target"]
+    assert not [r for r in rows["rich"] if r["setting_kind"] == "campaign_switch"]
 
 
 # --------------------------------- находки аудита 2026-08-23

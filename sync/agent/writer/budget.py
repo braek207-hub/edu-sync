@@ -162,24 +162,24 @@ def apply_cooldown(desired, touched):
     return kept, cooled
 
 
-def _expected_leads_delta(rows: List[Dict[str, Any]], leads: float,
-                          ratio: float) -> Optional[float]:
-    """Ожидаемый прирост лидов от сдвига: leads × (ratio**β − 1).
+def _expected_leads_delta(rows: List[Dict[str, Any]]) -> Optional[float]:
+    """Ожидание солвера: прирост лидов от этого сдвига.
 
-    Та же формула и те же входы, что у солвера (portfolio._move_row): лиды
-    окна и β кривой насыщения. Восстанавливается здесь, потому что через
-    edu_agent_computed_settings солвер передаёт только цель и экономическое
-    отношение — своё ожидание он выбрасывает.
+    Число приходит готовой строкой budget_target/expected_leads_delta
+    (portfolio.computed_rows). Формула кривой живёт там, где строится сама
+    кривая, и повторять её здесь нельзя: две копии модели разъезжаются при
+    первой же правке одной из них, а расхождение прогноза с исходом — ровно
+    та величина, которую меряет петля обучения.
 
-    None, когда кривой кампании нет или окно без лидов: ноль здесь означал бы
-    прогноз «эффекта не будет», и петля обучения зачла бы его как сбывшийся.
+    None, когда строки нет: ноль означал бы прогноз «эффекта не будет», и
+    петля зачла бы его как сбывшийся.
     """
-    beta_row = next((r for r in rows
-                     if str(r.get("setting_kind")) == "saturation"
-                     and str(r.get("setting_key")) == "beta"), None)
-    if beta_row is None or beta_row.get("value") is None or leads <= 0:
+    row = next((r for r in rows
+                if str(r.get("setting_kind")) == "budget_target"
+                and str(r.get("setting_key")) == "expected_leads_delta"), None)
+    if row is None or row.get("value") is None:
         return None
-    return round(leads * (float(ratio) ** float(beta_row["value"]) - 1.0), 2)
+    return round(float(row["value"]), 2)
 
 
 def _expectation_payload(move: Dict[str, Any]) -> Dict[str, float]:
@@ -259,8 +259,7 @@ def plan_budget_moves(
             "roi_vs_lambda": round(float(roi_row["value"]), 4),
             "p_sign": verdict["p_sign"],
         }
-        expected = _expected_leads_delta(
-            rows, float(row.get("support_n") or 0.0), ratio)
+        expected = _expected_leads_delta(rows)
         if expected is not None:
             desired[str(cid)]["expected_leads_delta"] = expected
 

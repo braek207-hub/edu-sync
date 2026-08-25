@@ -489,6 +489,19 @@ def computed_rows(section: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
                 "support_n": m["leads_28d"],
                 "rel_error": m["rel_error"],
             }, {
+                # Ожидаемый прирост лидов вдоль кривой — то самое число,
+                # против которого сторож через 7–14 дней положит факт. Едет
+                # готовым: пересчитывать формулу leads·((S*/S₀)^β − 1) в
+                # писателе значило бы держать вторую копию модели, и первая
+                # же правка кривой развела бы их молча. raw_value — та же
+                # дельта в деньгах.
+                "setting_kind": "budget_target",
+                "setting_key": "expected_leads_delta",
+                "value": m["expected_leads_delta"],
+                "raw_value": m["expected_revenue_delta"],
+                "support_n": m["leads_28d"],
+                "rel_error": m["rel_error"],
+            }, {
                 # Экономическое отношение value/(λ·marginal) — отдельной
                 # строкой: писатель Э3.3 гейтует уверенность заново, и без
                 # него он судил бы по target/cost, то есть повторял бы

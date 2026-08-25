@@ -410,23 +410,23 @@ def test_apply_cooldown_without_touched_is_passthrough():
 # --------------------------------------------------- ожидание солвера
 
 
-def _beta_row(beta):
-    return {"setting_kind": "saturation", "setting_key": "beta",
-            "value": beta, "raw_value": 0.02, "support_n": 26,
-            "rel_error": 0.1}
+def _expectation_row(leads_delta):
+    return {"setting_kind": "budget_target", "setting_key": "expected_leads_delta",
+            "value": leads_delta, "raw_value": leads_delta * 900.0,
+            "support_n": 100, "rel_error": 0.1}
 
 
-def test_plan_derives_expected_leads_delta_from_curve():
-    # 100 лидов окна × (1.5**0.5 − 1) — та же кривая, по которой солвер
-    # выбрал цель.
+def test_plan_takes_expected_leads_delta_from_the_solver():
+    # Число приходит готовым: формула кривой живёт в солвере, писатель её не
+    # повторяет — иначе двух копий модели не избежать.
     plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=0.05),
                                     _roi_row(1.5, rel_error=0.05),
-                                    _beta_row(0.5)]})
+                                    _expectation_row(22.47)]})
     assert plan["desired"]["1"]["expected_leads_delta"] == 22.47
 
 
-def test_plan_without_curve_has_no_expectation():
-    # Кривой кампании нет — ожидания нет вовсе: ноль петля обучения
+def test_plan_without_expectation_row_has_none():
+    # Строки ожидания нет — ожидания нет вовсе: ноль петля обучения
     # прочитала бы как прогноз «эффекта не будет».
     plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=0.05),
                                     _roi_row(1.5, rel_error=0.05)]})
