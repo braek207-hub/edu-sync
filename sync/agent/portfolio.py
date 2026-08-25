@@ -156,6 +156,49 @@ def account_budget(current_cost: float, lam: float, target_romi: float,
             "capped_by": capped_by}
 
 
+# Границы поправки прогноза. Медиана факт/ожидание живёт на десятке
+# наблюдений, и без зажима одна аномальная пара («ожидали 1,2 лида, пришло
+# 9») перевернула бы весь план. Внутри полосы поправка меняет числа, за её
+# краями — уже не калибровка, а другой вопрос: почему модель промахнулась в
+# разы. Такое видно в learning_loop.forecast_bias и разбирается руками.
+BIAS_MULTIPLIER_MIN = 0.5
+BIAS_MULTIPLIER_MAX = 2.0
+
+# Рычаги журнала, которыми исполняется бюджетный сдвиг: автостратегия правит
+# недельный лимит, ручная — дневной бюджет. Солвер этой разницы не знает (она
+# зависит от стратегии кампании и решается в писателе), поэтому калибровка
+# берётся у того из двух, чья история длиннее.
+BUDGET_ACTION_KINDS = ("budget.set", "budget.set_daily")
+
+
+def bias_multiplier(forecast_bias: Optional[Dict[str, Dict[str, float]]],
+                    direction: str) -> float:
+    """Поправка ожидания по истории собственных промахов, 1.0 — поправки нет.
+
+    forecast_bias — learning_loop.forecast_bias(): ключ «вид действия:сторона»,
+    значение с shrunk_ratio (медиана факт/ожидание, усаженная к единице по
+    объёму наблюдений). Усадка и есть выключатель: пока пар мало, множитель
+    сам держится около единицы, и поправка включается по мере накопления
+    истории, а не отдельным флагом.
+
+    Берётся ИМЕННО shrunk_ratio, не сырая медиана: на трёх наблюдениях медиана
+    отношений — это шум, помноженный на план.
+    """
+    if not forecast_bias:
+        return 1.0
+    best: Optional[Dict[str, float]] = None
+    for kind in BUDGET_ACTION_KINDS:
+        entry = forecast_bias.get(f"{kind}:{direction}")
+        if not entry or entry.get("shrunk_ratio") is None:
+            continue
+        if best is None or float(entry.get("n") or 0) > float(best.get("n") or 0):
+            best = entry
+    if best is None:
+        return 1.0
+    return min(BIAS_MULTIPLIER_MAX,
+               max(BIAS_MULTIPLIER_MIN, float(best["shrunk_ratio"])))
+
+
 def value_per_lead(ladder_row: Dict[str, Any]) -> Optional[Dict[str, float]]:
     """Ожидаемая выручка на эффективный лид кампании из строки лестницы.
 
@@ -392,7 +435,8 @@ def _step_capped(campaign: Dict[str, Any], roi_ratio: float, cap_up: float) -> b
     return math.log(roi_ratio) / (1.0 - beta) >= math.log(cap_up)
 
 
-def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, Any]:
+def _move_row(campaign: Dict[str, Any], target: float, lam: float,
+              forecast_bias: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, Any]:
     """Строка рекомендации: дельта, ожидаемый эффект, вердикт сдвига.
 
     Ожидаемые лиды — вдоль кривой: leads·((S*/S₀)^β − 1); выручка — через
@@ -418,6 +462,7 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, 
     else:
         move = "up" if ratio > 1.0 else "down"
     switch_off = _switch_off_candidate(campaign, ratio, lam, rel)
+    bias_k = bias_multiplier(forecast_bias, move if move != "hold" else "up")
     # Кап записи едет вместе со сдвигом и только вверх: расширенный шаг —
     # это про рост, и симметрично разжимать им кап вниз значило бы разрешить
     # обвал расхода за один такт. Обычные ±20 % писатель ставит сам, и
@@ -446,8 +491,18 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, 
         # Рычаг роста этой кампании: доливка бюджета доедет только там, где
         # лимит уже связывает расход (9 из 62), остальным нужна цена.
         "limit_binding": bool(campaign.get("limit_binding")),
+        # СЫРОЕ ожидание модели — то самое число, против которого сторож
+        # положит факт. Калиброванное сюда писать нельзя: петля мерила бы
+        # собственную поправку и каждый раз подтверждала бы её, а смещение
+        # уходило бы в единицу, ничего не исправив.
         "expected_leads_delta": round(delta_leads, 1),
         "expected_revenue_delta": round(delta_leads * campaign["value"], 2),
+        # То же ожидание, поправленное на историю собственных промахов. По
+        # нему читается план и судится, сжимает ли такт объём.
+        "expected_leads_delta_calibrated": round(delta_leads * bias_k, 1),
+        "expected_revenue_delta_calibrated": round(
+            delta_leads * bias_k * campaign["value"], 2),
+        "forecast_bias_ratio": round(bias_k, 4),
         "rel_error": round(rel, 4),
         "p_sign": verdict["p_sign"],
         "confident": verdict["confident"] is True,
@@ -519,6 +574,7 @@ def portfolio_targets(
     target_romi: float = DEFAULT_TARGET_ROMI,
     room_rub_by_login: Optional[Dict[str, float]] = None,
     monthly_cap_rub: Optional[float] = None,
+    forecast_bias: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[str, Any]:
     """Целевые бюджеты по кабинетам: порог λ на кабинет, сумма сохраняется.
 
@@ -537,6 +593,12 @@ def portfolio_targets(
     room_rub_by_login — рубли, которые кабинет освоит СЕГОДНЯ поднятием
     лимитов (growth.room_rub_budget по кабинетам). Запас чужого кабинета в
     рост не складывается: счёт один на кабинет, и деньги внутри него.
+
+    forecast_bias — learning_loop.forecast_bias(): история собственных
+    промахов прогноза. Поправляет ОЖИДАНИЕ, а не цели: сколько тратить,
+    решает кривая насыщения, а петля обучения знает лишь то, насколько
+    сбывались обещания. Сырое ожидание при этом остаётся в строке — им
+    меряется сама поправка.
     """
     holdout_ids = {str(h) for h in (holdout_ids or set())}
     # Настроек нет — «связывает ли лимит» неизвестно, и множитель недобора не
@@ -613,7 +675,8 @@ def portfolio_targets(
             # начал бы резать по мусорному числу.
             if sum(targets.values()) >= budget - GROWTH_RESIDUAL_RUB:
                 lam = grown_lam
-        preliminary = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam)
+        preliminary = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam,
+                                                   forecast_bias)
                        for c in campaigns}
         # Карман изымается ПОСЛЕ решения — пропорционально у всех — и уходит
         # туда, где оценка хуже всего. Сумма целевых при этом не меняется:
@@ -623,7 +686,8 @@ def portfolio_targets(
             targets, cost_by_id, budget * EXPLORATION_SHARE,
             [{**c, "switch_off": bool(preliminary[c["campaign_id"]].get("switch_off"))}
              for c in campaigns], lam)
-        moves = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam)
+        moves = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam,
+                                             forecast_bias)
                  for c in campaigns}
         target_sum = sum(targets.values())
         # Сверка суммы — на ИТОГОВЫХ целях, тех самых, что уедут писателю:
@@ -694,6 +758,12 @@ def portfolio_targets(
                 sum(m["expected_leads_delta"] for m in moves.values()), 1),
             "expected_revenue_delta": round(
                 sum(m["expected_revenue_delta"] for m in moves.values()), 2),
+            # То же с поправкой на историю промахов: по этой паре видно, на
+            # сколько петля обучения ужимает обещание такта.
+            "expected_leads_delta_calibrated": round(
+                sum(m["expected_leads_delta_calibrated"] for m in moves.values()), 1),
+            "expected_revenue_delta_calibrated": round(
+                sum(m["expected_revenue_delta_calibrated"] for m in moves.values()), 2),
             "moves": moves,
         }
     return {
@@ -733,6 +803,19 @@ def computed_rows(section: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
                 "setting_key": "expected_leads_delta",
                 "value": m["expected_leads_delta"],
                 "raw_value": m["expected_revenue_delta"],
+                "support_n": m["leads_28d"],
+                "rel_error": m["rel_error"],
+            }, {
+                # Та же дельта с поправкой на историю собственных промахов —
+                # ОТДЕЛЬНОЙ строкой, а не вместо сырой. Сырую сторож кладёт
+                # рядом с фактом и ею же меряет поправку; подмени её здесь —
+                # петля мерила бы себя и подтверждала бы любую поправку.
+                # raw_value — множитель, чтобы разницу двух строк не пришлось
+                # выводить делением.
+                "setting_kind": "budget_target",
+                "setting_key": "expected_leads_delta_calibrated",
+                "value": m["expected_leads_delta_calibrated"],
+                "raw_value": m["forecast_bias_ratio"],
                 "support_n": m["leads_28d"],
                 "rel_error": m["rel_error"],
             }, {

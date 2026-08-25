@@ -508,3 +508,34 @@ def test_daily_branch_honours_the_addressed_step():
         {"1": _state(daily_micros=14_000 * M)},
         {"1": 100_000.0})
     assert actions[0]["payload"]["DailyBudget"]["Amount"] == 28_571 * M
+
+
+def test_plan_carries_both_expectations_side_by_side():
+    # Два числа, и они не взаимозаменяемы: сырое — мера самой поправки,
+    # калиброванное — то, по чему план читается и судится на сжатие.
+    calibrated = {"setting_kind": "budget_target",
+                  "setting_key": "expected_leads_delta_calibrated",
+                  "value": 11.2, "raw_value": 0.5,
+                  "support_n": 100, "rel_error": 0.1}
+    plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=0.05),
+                                    _roi_row(1.5, rel_error=0.05),
+                                    _expectation_row(22.47), calibrated]})
+    assert plan["desired"]["1"]["expected_leads_delta"] == 22.47
+    assert plan["desired"]["1"]["expected_leads_delta_calibrated"] == 11.2
+
+
+def test_journal_keeps_the_raw_expectation_next_to_the_calibrated_one():
+    """Сырое ожидание не подменяется поправленным.
+
+    Поправка выведена из сравнения прогноза с исходом. Положи в журнал уже
+    поправленное число — и петля начнёт мерить собственную поправку: любое
+    смещение сойдётся к единице, ничего не исправив.
+    """
+    move = _move(720_000, 480_000, leads_delta=6.0)
+    move["expected_leads_delta_calibrated"] = 3.0
+    actions, _ = diff_budget({"1": move},
+                             {"1": _state(weekly_micros=100_000 * M)},
+                             {"1": 100_000.0})
+    payload = actions[0]["payload"]
+    assert payload["expected_leads_delta"] == 6.0
+    assert payload["expected_leads_delta_calibrated"] == 3.0

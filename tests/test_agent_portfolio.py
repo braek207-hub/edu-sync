@@ -818,3 +818,89 @@ def test_target_romi_raises_the_bar_for_growth():
     acc = section["accounts"]["acc"]
     assert acc["budget_28d"] == 100_000.0
     assert acc["growth_capped_by"] == "lambda"
+
+
+def test_bias_multiplier_is_one_without_history():
+    from sync.agent.portfolio import bias_multiplier
+
+    assert bias_multiplier(None, "up") == 1.0
+    assert bias_multiplier({}, "up") == 1.0
+    # Есть история другой стороны — своей стороне это ничего не говорит.
+    assert bias_multiplier({"budget.set:down": {"shrunk_ratio": 0.5, "n": 9}},
+                           "up") == 1.0
+
+
+def test_bias_multiplier_takes_the_shrunk_ratio_of_its_side():
+    from sync.agent.portfolio import bias_multiplier
+
+    bias = {"budget.set:up": {"ratio": 0.4, "shrunk_ratio": 0.7, "n": 12},
+            "budget.set:down": {"ratio": 1.9, "shrunk_ratio": 1.4, "n": 5}}
+    # Берётся усаженное отношение, а не сырая медиана: на десятке наблюдений
+    # медиана отношений — это шум, помноженный на план.
+    assert bias_multiplier(bias, "up") == 0.7
+    assert bias_multiplier(bias, "down") == 1.4
+
+
+def test_bias_multiplier_prefers_the_longer_history_of_the_two_levers():
+    from sync.agent.portfolio import bias_multiplier
+
+    # Бюджетный сдвиг исполняется двумя рычагами (недельный лимит и дневной
+    # бюджет), и какой достанется кампании, решает писатель по её стратегии.
+    # Солвер берёт того, чья история длиннее.
+    bias = {"budget.set:up": {"shrunk_ratio": 0.6, "n": 3},
+            "budget.set_daily:up": {"shrunk_ratio": 0.9, "n": 30}}
+    assert bias_multiplier(bias, "up") == 0.9
+
+
+def test_wild_bias_is_clamped():
+    from sync.agent.portfolio import (BIAS_MULTIPLIER_MAX, BIAS_MULTIPLIER_MIN,
+                                      bias_multiplier)
+
+    # За полосой это уже не калибровка, а вопрос «почему модель промахнулась
+    # в разы»: разбирается руками по forecast_bias, а не множится на план.
+    assert bias_multiplier({"budget.set:up": {"shrunk_ratio": 9.0, "n": 40}},
+                           "up") == BIAS_MULTIPLIER_MAX
+    assert bias_multiplier({"budget.set:up": {"shrunk_ratio": 0.01, "n": 40}},
+                           "up") == BIAS_MULTIPLIER_MIN
+
+
+def test_calibration_corrects_the_expectation_but_not_the_raw_number():
+    saturation = {"1": _curve()}
+    ladder = {"1": _ladder()}
+    plain = portfolio_targets(saturation, ladder, {"1": "acc"})
+    calibrated = portfolio_targets(
+        saturation, ladder, {"1": "acc"},
+        forecast_bias={"budget.set:up": {"shrunk_ratio": 0.5, "n": 40},
+                       "budget.set:down": {"shrunk_ratio": 0.5, "n": 40}})
+
+    a = plain["accounts"]["acc"]["moves"]["1"]
+    b = calibrated["accounts"]["acc"]["moves"]["1"]
+    # Цели не двигаются: сколько тратить, решает кривая насыщения, а петля
+    # обучения знает лишь то, насколько сбывались обещания.
+    assert a["target_28d"] == b["target_28d"]
+    # Сырое ожидание остаётся сырым — им меряется сама поправка. Подмени его,
+    # и петля мерила бы себя: любое смещение сошлось бы к единице.
+    assert a["expected_leads_delta"] == b["expected_leads_delta"]
+    assert b["forecast_bias_ratio"] == 0.5
+    assert b["expected_leads_delta_calibrated"] == round(
+        b["expected_leads_delta"] * 0.5, 1)
+    assert a["forecast_bias_ratio"] == 1.0
+    assert a["expected_leads_delta_calibrated"] == a["expected_leads_delta"]
+
+
+def test_computed_rows_carry_both_expectations():
+    saturation = {"1": _curve()}
+    ladder = {"1": _ladder()}
+    section = portfolio_targets(
+        saturation, ladder, {"1": "acc"},
+        forecast_bias={"budget.set:up": {"shrunk_ratio": 0.5, "n": 40},
+                       "budget.set:down": {"shrunk_ratio": 0.5, "n": 40}})
+    rows = computed_rows(section)["1"]
+    by_key = {r["setting_key"]: r for r in rows}
+    assert "expected_leads_delta" in by_key
+    calibrated = by_key["expected_leads_delta_calibrated"]
+    assert calibrated["value"] == round(
+        by_key["expected_leads_delta"]["value"] * 0.5, 1)
+    # Множитель едет рядом: иначе разницу двух строк пришлось бы выводить
+    # делением и гадать, поправка это или другая модель.
+    assert calibrated["raw_value"] == 0.5

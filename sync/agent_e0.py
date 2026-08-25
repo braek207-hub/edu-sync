@@ -1128,7 +1128,12 @@ def main() -> int:
         room_rub_by_login=room_by_login,
         # Потолок месячного освоения — деньги владельца. Ключ пуст: рост
         # только предлагается числом в отчёте, сумма кабинета не меняется.
-        monthly_cap_rub=active_config["monthly_budget_cap_rub"])
+        monthly_cap_rub=active_config["monthly_budget_cap_rub"],
+        # Замыкание петли: история собственных промахов поправляет ОЖИДАНИЕ
+        # такта, не цели. Журнал недоступен — поправки нет, расчёт идёт на
+        # сырой модели, как до петли. Предварительная раскладка идёт без неё
+        # намеренно: она считает запас по целям, а цели поправка не трогает.
+        forecast_bias=learning.get("forecast_bias"))
     budget_target_count = 0
     for campaign_id, rows in portfolio_computed_rows(budget_threshold).items():
         agent_db.upsert_computed_settings(

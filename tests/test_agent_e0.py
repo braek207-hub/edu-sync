@@ -1211,3 +1211,20 @@ def test_blind_share_is_measured_on_both_windows(monkeypatch, capsys):
     for section in (decision, ladder):
         assert "blind_share" in section
         assert "cost_blind" in section
+
+
+def test_forecast_bias_reaches_the_solver(monkeypatch, capsys):
+    # Петля обучения замкнута только тогда, когда измеренное смещение
+    # доезжает до расчёта. Считать его и не подавать — то же, что не считать.
+    _patch_e0_run(monkeypatch)
+    captured = _spy_portfolio(monkeypatch)
+    bias = {"budget.set:up": {"ratio": 0.4, "shrunk_ratio": 0.7, "n": 12}}
+    monkeypatch.setattr(agent_e0, "forecast_bias", lambda closed: bias)
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+
+    # Предварительная раскладка идёт без поправки намеренно: она считает
+    # запас по целям, а цели поправка не трогает.
+    assert "forecast_bias" not in captured[0]
+    assert captured[1]["forecast_bias"] == bias

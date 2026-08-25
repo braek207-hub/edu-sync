@@ -82,11 +82,20 @@ def _leads_delta(entry: Dict[str, Any]) -> float:
     У боевого действия оно лежит в payload (writer/budget._expectation_payload):
     туда его кладут, чтобы ожидание уехало в журнал вместе со строкой. Гейт,
     читающий только верхний уровень, считал бы каждую доливку нулевой.
+
+    Предпочитается КАЛИБРОВАННОЕ ожидание, когда оно есть: вопрос «сжимает ли
+    такт объём» — про то, что действительно случится, а история собственных
+    промахов ровно об этом и знает. Сырое остаётся мерой самой поправки
+    (learning_loop.forecast_bias) и здесь работает запасным, когда истории
+    ещё нет.
     """
-    if entry.get("expected_leads_delta") is not None:
-        return _num(entry["expected_leads_delta"])
     payload = entry.get("payload") or {}
-    return _num(payload.get("expected_leads_delta"))
+    for key in ("expected_leads_delta_calibrated", "expected_leads_delta"):
+        if entry.get(key) is not None:
+            return _num(entry[key])
+        if payload.get(key) is not None:
+            return _num(payload[key])
+    return 0.0
 
 
 def tact_balance(moves: List[Dict[str, Any]], suspends: List[Dict[str, Any]],

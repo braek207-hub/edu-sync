@@ -162,7 +162,8 @@ def apply_cooldown(desired, touched):
     return kept, cooled
 
 
-def _expected_leads_delta(rows: List[Dict[str, Any]]) -> Optional[float]:
+def _expected_leads_delta(rows: List[Dict[str, Any]],
+                          key: str = "expected_leads_delta") -> Optional[float]:
     """Ожидание солвера: прирост лидов от этого сдвига.
 
     Число приходит готовой строкой budget_target/expected_leads_delta
@@ -176,7 +177,7 @@ def _expected_leads_delta(rows: List[Dict[str, Any]]) -> Optional[float]:
     """
     row = next((r for r in rows
                 if str(r.get("setting_kind")) == "budget_target"
-                and str(r.get("setting_key")) == "expected_leads_delta"), None)
+                and str(r.get("setting_key")) == key), None)
     if row is None or row.get("value") is None:
         return None
     return round(float(row["value"]), 2)
@@ -188,11 +189,22 @@ def _expectation_payload(move: Dict[str, Any]) -> Dict[str, float]:
     Ожидание едет вместе с действием: через 7–14 дней сторож положит рядом
     факт (agent_e1_watchdog.observed_leads_delta), и разница этих двух чисел —
     единственный способ узнать, что модель врёт систематически.
+
+    Чисел два, и они не взаимозаменяемы. expected_leads_delta — СЫРОЕ
+    ожидание модели, и меряется поправка именно против него. Заменить его
+    калиброванным значило бы дать петле мерить собственную поправку: любая
+    вошла бы в норму, а смещение сошлось бы к единице, ничего не исправив.
+    expected_leads_delta_calibrated — то же с поправкой, для чтения и для
+    проверки «сжимает ли такт объём».
     """
     expected = move.get("expected_leads_delta")
     if expected is None:
         return {}
-    return {"expected_leads_delta": round(float(expected), 2)}
+    out = {"expected_leads_delta": round(float(expected), 2)}
+    calibrated = move.get("expected_leads_delta_calibrated")
+    if calibrated is not None:
+        out["expected_leads_delta_calibrated"] = round(float(calibrated), 2)
+    return out
 
 
 def plan_budget_moves(
@@ -262,6 +274,9 @@ def plan_budget_moves(
         expected = _expected_leads_delta(rows)
         if expected is not None:
             desired[str(cid)]["expected_leads_delta"] = expected
+        calibrated = _expected_leads_delta(rows, "expected_leads_delta_calibrated")
+        if calibrated is not None:
+            desired[str(cid)]["expected_leads_delta_calibrated"] = calibrated
         # Кап записи, назначенный солвером именно этой кампании
         # (portfolio.write_step_for): строки нет — действует общий
         # MAX_WRITE_STEP. Политику капа держит солвер, рельса движка

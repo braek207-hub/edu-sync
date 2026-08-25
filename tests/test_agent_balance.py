@@ -266,3 +266,40 @@ def test_balance_inputs_ignores_actions_without_money_meaning():
     assert balance["freed_rub"] == 0.0
     assert balance["added_rub"] == 0.0
     assert balance["shrinking"] is False
+
+
+def test_tact_is_judged_by_the_calibrated_expectation_when_it_exists():
+    """Сжимает ли такт объём — вопрос про то, что действительно случится.
+
+    Модель, систематически завышающая эффект доливки, обещала бы рост там,
+    где его нет: сырые числа дают +6 лидов и такт выглядит растущим, а
+    история собственных промахов ужимает доливку до +1 — и тот же такт
+    оказывается сжимающим. Поправка есть — судим по ней; истории нет — по
+    сырому числу, как раньше.
+    """
+    actions = [
+        {"action_kind": "budget.set", "object_id": "222",
+         "payload": {"expected_leads_delta": 9.0,
+                     "expected_leads_delta_calibrated": 1.0}},
+        {"action_kind": "budget.set", "object_id": "111",
+         "payload": {"expected_leads_delta": -3.0,
+                     "expected_leads_delta_calibrated": -3.0}},
+    ]
+    moves_by_campaign = {"222": {"cost_28d": 100_000.0, "target_28d": 140_000.0},
+                         "111": {"cost_28d": 100_000.0, "target_28d": 60_000.0}}
+    parts = balance_inputs(actions, moves_by_campaign, {}, {})
+    assert [m["expected_leads_delta"] for m in parts["moves"]] == [1.0, -3.0]
+
+    balance = tact_balance(parts["moves"], parts["suspends"], parts["cuts"])
+    assert balance["expected_leads_delta"] == -2.0
+    assert balance["shrinking"] is True
+
+
+def test_raw_expectation_is_used_while_there_is_no_history():
+    # Пока пар «прогноз / факт» нет, поправки нет тоже, и гейт обязан читать
+    # сырое число: иначе первые недели работы такт судился бы по нулю.
+    actions = [{"action_kind": "budget.set", "object_id": "222",
+                "payload": {"expected_leads_delta": 5.0}}]
+    parts = balance_inputs(actions, {"222": {"cost_28d": 1.0, "target_28d": 2.0}},
+                           {}, {})
+    assert parts["moves"][0]["expected_leads_delta"] == 5.0
