@@ -2275,3 +2275,83 @@ def test_red_line_without_volume_has_no_rate_key():
         {"object_id": "111"}, {"111": 1000.0}, None, None, None, {})
 
     assert "baseline_leads_per_day" not in red_line
+
+
+# ------------------- баланс такта: сокращение без адресата роста (agent/balance.py)
+
+
+class _SwitchClient(_MultiCabinetClient):
+    """Кабинет, который умеет отвечать на чтение State (writer/switch.py)."""
+
+    def get(self, service, params):
+        if service == "campaigns" and "State" in (params.get("FieldNames") or []):
+            ids = (params.get("SelectionCriteria") or {}).get("Ids") or []
+            return {"Campaigns": [{"Id": i, "State": "ON"} for i in ids]}
+        return super().get(service, params)
+
+
+def _switch_row(roi_share=0.3):
+    return {"setting_kind": "campaign_switch", "setting_key": "off",
+            "value": roi_share, "raw_value": roi_share, "rel_error": 0.05,
+            "support_n": 300, "calc_date": date.today().isoformat()}
+
+
+def _patch_switch_run(monkeypatch, daily_cost):
+    _patch_run(monkeypatch,
+               computed_by_login={"acc-1": []},
+               campaigns_by_login={"acc-1": [111]},
+               daily_cost=daily_cost)
+    monkeypatch.setattr(agent_e1, "WriteClient", _SwitchClient)
+    monkeypatch.setattr(agent_e1.agent_db, "load_latest_campaign_computed",
+                        lambda ids: {"111": [_switch_row()]})
+
+
+def test_suspend_without_growth_address_does_not_reach_the_cabinet(monkeypatch, capsys):
+    # Сквозной: единственное действие такта — выключение кампании. Оно
+    # освобождает её расход, назначать его некому, и такт целиком сводится к
+    # «стало эффективнее и меньше». Гейт снимает его до отправки.
+    _patch_switch_run(monkeypatch, daily_cost={"111": 1000.0})
+
+    assert agent_e1.main() == 0
+    report = json.loads(capsys.readouterr().out)
+
+    sent = [s for c in _MultiCabinetClient.instances for s in c.sent]
+    assert sent == [], "сокращение без адресата роста ушло в кабинет"
+    assert report["balance"]["blocked_without_address"] == 1
+    assert report["balance"]["gate"]["freed_rub"] == 28_000.0      # 1000 ₽/день × 28
+    assert report["balance"]["gate"]["unassigned_rub"] == 28_000.0
+    assert report["balance"]["gate"]["shrinking"] is True
+    # Применённый баланс — по тому, что реально уехало: пусто, а не «план».
+    assert report["balance"]["applied"]["freed_rub"] == 0.0
+
+
+def test_balance_gate_leaves_a_tact_that_does_not_cut_alone(monkeypatch, capsys):
+    # Обратная половина: корректировка ставок расход не освобождает, такт не
+    # сжимающий — гейт не имеет права его трогать.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 100.0},
+    )
+
+    assert agent_e1.main() == 0
+    report = json.loads(capsys.readouterr().out)
+
+    sent = [s for c in _MultiCabinetClient.instances for s in c.sent]
+    assert len(sent) == 1, "действие, которое ничего не режет, не дошло до кабинета"
+    assert report["balance"]["gate"]["shrinking"] is False
+    assert report["balance"]["blocked_without_address"] == 0
+
+
+def test_balance_gate_stands_after_the_other_gates_and_before_the_run_cap():
+    # Место гейта — не деталь. Все гейты стоят ПОСЛЕ солвера, и доливка,
+    # запертая кулдауном или потолком попыток, обязана быть уже вычтенной к
+    # моменту расчёта баланса: иначе её рубли считались бы назначенными.
+    # А до отбора по лимиту прогона — чтобы снятое здесь не занимало слот.
+    import inspect
+
+    source = inspect.getsource(agent_e1.run_account)
+    assert (source.index("split_by_final_keys")
+            < source.index("require_growth_address")
+            < source.index("cap_actions("))

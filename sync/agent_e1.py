@@ -53,6 +53,12 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent import db as agent_db
+from sync.agent.balance import (
+    MIN_ASSIGNED_SHARE,
+    balance_inputs,
+    require_growth_address,
+    tact_balance,
+)
 from sync.agent.gate import data_gate
 from sync.agent.writer import budget
 from sync.agent.writer import switch
@@ -1428,6 +1434,22 @@ def run_account(
     allowed, closed_keys = split_by_final_keys(allowed, already_final)
     blocked += closed_keys
 
+    # Баланс такта: сокращение без адресата роста не применяется. Стоит в том
+    # же ряду, что кулдауны, и по той же причине — до отбора по лимиту:
+    # снятое здесь не должно занимать слот прогона. Но ПОСЛЕДНИМ в ряду, а не
+    # сразу после кулдауна обучения: все гейты стоят ПОСЛЕ солвера, и доливка,
+    # запертая потолком попыток или закрытым ключом, обязана быть уже
+    # вычтенной — иначе её рубли считались бы назначенными, хотя в кабинет
+    # они не поедут.
+    cut_cost_by_kind = {
+        negatives.NEGATIVE_KIND: negatives_plan.get("cut_cost") or {},
+        placements.PLACEMENT_KIND: placements_plan.get("cut_cost") or {},
+    }
+    balance = tact_balance(**balance_inputs(
+        allowed, budget_desired, cost_28d_by_campaign, cut_cost_by_kind))
+    allowed, without_address = require_growth_address(allowed, balance)
+    blocked += without_address
+
     # Порядок рельс: сначала отсекается всё, что применять нельзя или
     # незачем (лимит прогона, отсутствие красной линии), и только потом
     # считается бюджет. Обратный порядок списывал бы риск за действия,
@@ -1603,6 +1625,18 @@ def run_account(
             "blocked_objects": sorted(
                 {f"{a['object_id']}:{a['last_learning_reset_at']}"
                  for a in in_learning_cooldown})[:PREVIEW_SAMPLE_LIMIT],
+        },
+        # Баланс такта двумя числами, а не одним: на чём стоял гейт и что
+        # реально уехало в кабинет. Между ними ещё режут лимит прогона и
+        # риск-бюджет, и «такт сбалансирован» обязано считаться по
+        # применённому, иначе отчёт хвалит план, а не результат.
+        "balance": {
+            "gate": {k: v for k, v in balance.items() if k != "freed_by_key"},
+            "applied": {k: v for k, v in tact_balance(**balance_inputs(
+                prepared, budget_desired, cost_28d_by_campaign,
+                cut_cost_by_kind)).items() if k != "freed_by_key"},
+            "blocked_without_address": len(without_address),
+            "min_assigned_share": MIN_ASSIGNED_SHARE,
         },
         "deferred_by_risk": len(deferred),
         "deferred_by_cap": len(over_cap),
