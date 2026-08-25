@@ -321,6 +321,16 @@ jobs:
 
 Заполненность в `direct_stats` за 30 дней: <из лога>.
 
+| Тип кампании | Показов за 30 дней | Из них с непустым объёмом трафика |
+|---|---|---|
+| Поиск (TEXT_CAMPAIGN) | <из лога> | <из лога> |
+| Сети / смарт / МК | <из лога> | <из лога> |
+
+Этот разрез — обязательная часть probe, а не украшение: объём трафика определён для
+поиска, и если в сетях он приходит пустым, витрина запишет ноль. Ноль, прочитанный
+как «недобор 100 %», вылил бы карман разведки и шаг ×2 в сети по несуществующему
+признаку. Порог `MIN_VOLUME_COVERAGE` (задача 3) настраивается по этому числу.
+
 **Вывод.** <Одна фраза: чем меряем недобор — долей выкупа из API, если поле нашлось,
 иначе объёмом трафика AvgTrafficVolume.>
 ```
@@ -589,6 +599,25 @@ def test_zero_impressions_campaign_is_absent():
     assert traffic_headroom([_fact("2026-08-02", "111", 0, 0.0)], *WINDOW) == {}
 
 
+def test_zero_volume_with_live_impressions_is_no_data_not_full_headroom():
+    # Объём трафика определён для ПОИСКА. У кампании в сетях поле приходит
+    # пустым (в витрине — нулём), а показов при этом десятки тысяч. Прочитать
+    # такой ноль как «недобор 100 %» значит объявить всю сетевую часть
+    # кабинета недоливаемой и вылить в неё карман разведки и шаг x2.
+    rows = [_fact("2026-08-02", "111", 40_000, 0.0)]
+    out = traffic_headroom(rows, *WINDOW)
+    assert out["111"]["verdict"] == "неопределённо"
+    assert out["111"]["headroom_share"] is None
+
+
+def test_partial_coverage_of_volume_is_undetermined():
+    # Половина дней окна без объёма — среднее считается по другому набору
+    # дней, чем показы, и сравнивать его с порогом нельзя.
+    rows = [_fact("2026-08-02", "111", 20_000, 0.0),
+            _fact("2026-08-03", "111", 20_000, 40.0)]
+    assert traffic_headroom(rows, *WINDOW)["111"]["verdict"] == "неопределённо"
+
+
 def test_computed_rows_carry_support():
     section = traffic_headroom([_fact("2026-08-02", "111", 20000, 45.0)], *WINDOW)
     rows = computed_rows(section)["111"]
@@ -637,6 +666,12 @@ FULL_VOLUME = 100.0
 # аукционов и скачет сильнее, чем измеряемая величина. 5000 показов за окно —
 # примерно 180 показов в день, ниже этого кампании в EDU живут дни-обрывки.
 MIN_IMPRESSIONS = 5_000
+
+# Доля показов окна, у которых объём трафика вообще заполнен. Поле определено
+# для поиска; в сетях оно приходит пустым, и ноль в витрине означает «не
+# измерялось», а не «не выкупили ничего». Кампания, у которой заполнено меньше
+# этой доли, вердикта не получает: недобор у неё неизвестен, а не полный.
+MIN_VOLUME_COVERAGE = 0.8
 
 # Границы вердикта. 70 — ниже этого недобор больше трети, и это уже повод
 # усомниться в «насыщении». 90 — выше этого добирать почти нечего, и разница
@@ -991,6 +1026,27 @@ git commit -m "feat(agent): недобор трафика в кривых нас
 Неизвестное остаётся неизвестным: класс `unknown` считается сбрасывающим при отборе
 (осторожная сторона), но в отчёте различим — иначе «мы не знаем» навсегда замаскируется
 под «мы знаем».
+
+**Половина этого механизма в кабинете уже работает — не строить второй.**
+`sync/agent/writer/budget.py::apply_cooldown` + `BUDGET_COOLDOWN_DAYS = 14`
+применяются в `sync/agent_e1.py:1157` к бюджетным действиям и в `:1293` к целевому
+CPA, по факту журнала (`writer_db.recent_action_objects`). Параллельный кулдаун
+обучения дал бы два независимых запрета на одно действие и две разные причины в
+отчёте. Задача 5 **расширяет существующий**, а не дублирует:
+
+- `learning_impact` даёт классификацию (что именно сбрасывает обучение и почему) —
+  сейчас кулдаун применяется к видам действий списком, без объяснения;
+- под кулдаун добавляются `campaign.suspend` и **возобновление после паузы дольше
+  семи дней** — сейчас они не под ним вовсе, а обучение сбрасывают;
+- `last_learning_reset` даёт отчёту дату и причину последнего сброса по объекту.
+
+**И ещё одно, важнее остального:** `writer/budget.py::MAX_WRITE_STEP = 0.20` зажимает
+любой бюджетный сдвиг до ±20 % от недельного расхода — то есть **сбрасывающих
+бюджетных действий движок сегодня физически не порождает**. Порог из практики Павла
+уже зашит в писателя. Классификация «по величине» становится не отбором, а
+проверкой инварианта — до тех пор, пока задача 8 не откроет адресный шаг ×2. Это
+надо понимать при приёмке: пустой список сбрасывающих бюджетных действий в первом
+прогоне — ожидаемый результат, а не признак того, что гейт не работает.
 
 **Файлы:**
 - Создать: `sync/agent/writer/learning.py`
@@ -1626,6 +1682,33 @@ git commit -m "feat(agent): слепая доля расхода в отчёте
     `"подъём" | "спад" | "норма" | "мало данных"`.
 - Потребляет: строки `edu_wordstat_demand` (`week_start`, `region`, `phrase`, `frequency`).
 
+**Два ограничения, которые обязаны быть видимыми, а не молчаливыми.**
+
+1. **Ряд есть не у всех направлений.** `EDU_DEMAND_PHRASES` покрывает СПО, ВПО,
+   дистант и ДПО. Направления `school`, `it`, `med`, `mti`, `ntb`, `transfer` фраз не
+   имеют вовсе — и среди них `school` — самое свежее направление кабинета (запуск
+   14.08.2026). Такие направления получают `regime = "нет ряда"`, отдельно от
+   «мало данных» (ряд есть, но короткий): первое лечится добавлением фраз в
+   `sync/edu_demand.py`, второе — временем. Слить их в один вердикт значит навсегда
+   спрятать дыру в семантике спроса. Список направлений без ряда печатается в отчёте
+   Э0 отдельной строкой.
+2. **Регион берётся один — `ru`.** В витрине есть и `msk`, но гео кампании нигде не
+   вычисляется: `classify.normalize_city_ip_segment` работает по городу ЛИДА, а не по
+   настройкам кампании, и сопоставить московский срез спроса с московскими кампаниями
+   сейчас нечем. Всероссийский ряд включает Москву, поэтому режим по нему —
+   консервативное приближение, а не ошибка; но у московских кампаний сезон может
+   отличаться, и это записывается ограничением в `docs/AGENT-DATA-SOURCES.md`, а не
+   умалчивается. Разрез по гео — работа для Ф8, когда гео кампании начнёт сниматься из
+   настроек (`edu_agent_objects`).
+
+```python
+def test_direction_without_phrases_is_distinguishable():
+    # «Нет ряда» и «мало данных» — разные диагнозы: первое чинится семантикой,
+    # второе — временем. Один вердикт на оба прячет дыру навсегда.
+    out = demand_regime([_row("2026-08-17", "колледж", 100)], through_week="2026-08-17")
+    assert out["school"]["regime"] == "нет ряда"
+```
+
 - [ ] **Шаг 1: Написать падающий тест**
 
 ```python
@@ -1879,6 +1962,43 @@ git commit -m "feat(agent): спрос Wordstat как режим направл
 Шаг ×2 всегда сбрасывает обучение (задача 5: больше 20 %), поэтому он автоматически
 попадает под кулдаун 14 дней — повторить его на следующем такте не выйдет.
 
+**Главное препятствие — не в портфеле.** Даже подняв `portfolio.MAX_STEP_UP` и
+`guardrails.BUDGET_RATIO_MAX`, шага ×2 в кабинете не будет: писатель зажимает целевой
+лимит по `writer/budget.py::clamp_write_step` с `MAX_WRITE_STEP = 0.20` — до ±20 % от
+недельного РАСХОДА. Солвер посчитает ×2, рельса пропустит, а в кабинет уедет +20 %,
+и тесты при этом останутся зелёными: они не доходят до писателя. Поэтому задача 8
+обязана тронуть три уровня, а не два:
+
+1. `portfolio.step_cap_up` — сколько солвер вправе назначить;
+2. `guardrails.BUDGET_RATIO_MAX` — коридор рельсы (поднять до 2.1: рельса ловит слом
+   единиц, а не политику, и должна оставаться шире политики);
+3. `writer/budget.py` — `clamp_write_step` получает шаг **параметром**, а не константой
+   модуля, и `budget_actions` передаёт в него шаг именно этой кампании:
+
+```python
+            # Кап записи — не глобальная константа, а решение по кампании:
+            # ±20 % по умолчанию (столько можно, не сбивая обучение), больше —
+            # только там, где солвер доказал недобор трафика и запас
+            # окупаемости. Оставить здесь константу значило бы тихо
+            # обнулять адресный шаг x2 на последнем метре.
+            step = float(move.get("write_step") or MAX_WRITE_STEP)
+            target_micros = clamp_write_step(target_micros, spend, max_step=step)
+```
+
+`write_step` кладёт в move солвер: `step_cap_up(campaign) - 1.0` (×1.5 → 0.5, ×2.0 →
+1.0), и по умолчанию — `MAX_WRITE_STEP`. Тест обязателен именно на этом стыке:
+
+```python
+def test_double_step_reaches_the_account():
+    # Без параметризации clamp_write_step шаг x2 умирал в писателе:
+    # солвер назначал 200 000, а в кабинет уезжало 120 000.
+    actions, _ = budget_actions(
+        desired={"111": _move(target_28d=200_000.0, ratio=2.0, write_step=1.0)},
+        actual_by_campaign={"111": _text_campaign(weekly_micros=25_000 * MICROS)},
+        weekly_spend_no_vat={"111": 25_000.0})
+    assert actions[0]["payload"]["WeeklySpendLimit"] == 50_000 * MICROS
+```
+
 **Файлы:**
 - Изменить: `sync/agent/portfolio.py:79-100` (`_target_spend`), `:20-62` (константы)
 - Изменить: `sync/agent/writer/guardrails.py:48-49` (`BUDGET_RATIO_MAX`)
@@ -2062,8 +2182,38 @@ def _is_emergency(action):
             or bool(action.get("emergency")))
 ```
 
-Точный состав множества сверить на шаге реализации с `sync/agent/writer/apply.py::
-to_api_call` и путями отката в `sync/agent_e1_watchdog.py`: имя вида в журнале —
+**Снятое действие обязано вернуть свои деньги в раскладку.** Гейты стоят ПОСЛЕ
+солвера: и этот, и кулдаун обучения (задача 5), и существующий `apply_cooldown`
+снимают уже посчитанные сдвиги. Инвариант «Σ целевых = бюджету» при этом остаётся
+верным в расчёте и ломается в кабинете: деньги, назначенные запертой кампании, не
+уезжают никуда, а адресаты роста рассчитывали на её сокращение. Правило: **список
+запертых объектов возвращается в солвер вторым проходом**, где их бюджеты
+зафиксированы на текущем уровне, а свободные деньги раскладываются между остальными.
+
+```python
+    # Второй проход, а не пропорциональная добивка: доливать всем поровну
+    # значит игнорировать предельную окупаемость, ради которой солвер и
+    # существует. Проход дешёвый — это чистая функция на десятках строк.
+    locked = {a["object_id"] for a in blocked_by_cooldown + blocked_by_balance}
+    if locked:
+        targets = portfolio_targets(campaigns, budget=budget, frozen=locked)
+```
+
+Тест:
+
+```python
+def test_locked_campaign_money_is_redistributed_not_lost():
+    campaigns = [_c("111", cost=100_000.0, lam_ratio=0.5),   # заперта кулдауном
+                 _c("222", cost=100_000.0, lam_ratio=3.0)]
+    rows = portfolio_targets(campaigns, budget=200_000.0, frozen={"111"})
+    by_id = {r["campaign_id"]: r for r in rows}
+    assert by_id["111"]["target_28d"] == 100_000.0        # заморожена на месте
+    assert by_id["222"]["target_28d"] == 100_000.0        # своё, а не чужое сверху
+    assert sum(r["target_28d"] for r in rows) == 200_000.0
+```
+
+Точный состав аварийного множества сверить на шаге реализации с
+`sync/agent/writer/apply.py::to_api_call` и путями отката в `sync/agent_e1_watchdog.py`: имя вида в журнале —
 источник правды, а не этот список. Вида, которого нет в `to_api_call`, в
 `EMERGENCY_KINDS` быть не должно; если аварийность в коде выражена не отдельным
 видом, а флагом на действии — читать флаг (`_is_emergency` покрывает оба случая).
@@ -2332,10 +2482,11 @@ git commit -m "feat(agent): сокращение без адресата рос�
 4. **`expansion_candidates`** — конверсионные запросы без своей группы (уже считаются
    в Э0, `sync/agent/objects.py`).
 
-Плюс отдельной строкой — **сколько бы агент долил, если бы общий бюджет не был
-прибит к трейлинг-28д**: суммарный запас по кампаниям, у которых предельная
-окупаемость выше λ и есть недобор трафика. Это число — основание для Павла поднять
-план освоения; сам агент общий бюджет не двигает (пейсинг месяца — Ф9.11).
+Плюс отдельной строкой — `room_rub_total`: суммарный запас по кампаниям, у которых
+предельная окупаемость выше λ и есть недобор трафика. Это число потребляет задача 11
+(рост общей суммы кабинета) как ответ на вопрос «есть ли куда потратить прибавку», и
+оно же печатается человеку как основание поднять месячный план освоения. Внутримесячный
+пейсинг остаётся за Ф9.
 
 **Файлы:**
 - Создать: `sync/agent/growth.py`
@@ -2344,10 +2495,12 @@ git commit -m "feat(agent): сокращение без адресата рос�
 
 **Интерфейсы:**
 - Отдаёт: `growth_candidates(portfolio_section, headroom_section, demand_section,
-  expansion) -> Dict[str, Any]` с ключами `candidates` (список
+  expansion, quality_drift=None) -> Dict[str, Any]` с ключами `candidates` (список
   `{campaign_id, source, reason, headroom_share, roi_vs_lambda, room_rub}`),
   `capped_by_step` (сколько кампаний уткнулись в кап), `room_rub_total`,
-  `directions_rising`.
+  `directions_rising`, `skipped_by_quality`.
+  `quality_drift` — словарь из задачи 14; параметр объявляется здесь пустым по
+  умолчанию, чтобы задача 14 не переписывала сигнатуру и вызовы.
 
 - [ ] **Шаг 1: Написать падающий тест**
 
@@ -2781,7 +2934,7 @@ git commit -m "feat(agent): бюджет кабинета растёт шаго�
 - Изменить: `sync/agent/writer/budget.py` (ожидание в payload действия)
 - Изменить: `sync/agent/writer/db.py` (колонка `observed_leads_delta` + запись при закрытии)
 - Изменить: `sync/agent_e1_watchdog.py` (считать факт при закрытии наблюдения)
-- Изменить: `tests/test_agent_e1.py`, `tests/test_agent_e1_watchdog.py`, `tests/test_agent_budget_writer.py`
+- Изменить: `tests/test_agent_e1.py`, `tests/test_agent_e1_watchdog.py`, `tests/test_agent_writer_budget.py`
 
 **Интерфейсы:**
 - Отдаёт: `load_baseline_volume(date_from, date_to) -> Dict[str, Dict[str, float]]` —
@@ -2881,7 +3034,7 @@ def load_baseline_volume(date_from: str, date_to: str) -> Dict[str, Dict[str, fl
 Тест:
 
 ```python
-# tests/test_agent_budget_writer.py
+# tests/test_agent_writer_budget.py
 def test_budget_action_carries_expectation():
     """Ожидаемая дельта лидов едет в payload действия.
 
@@ -2973,7 +3126,7 @@ CREATE TABLE: таблица в базе уже есть, и `CREATE TABLE IF NO
 
 - [ ] **Шаг 8: Прогнать весь набор**
 
-Запуск: `python -m pytest tests/test_agent_e1.py tests/test_agent_e1_watchdog.py tests/test_agent_budget_writer.py -q`
+Запуск: `python -m pytest tests/test_agent_e1.py tests/test_agent_e1_watchdog.py tests/test_agent_writer_budget.py -q`
 Ожидается: PASS.
 
 - [ ] **Шаг 9: Коммит**
@@ -2981,7 +3134,7 @@ CREATE TABLE: таблица в базе уже есть, и `CREATE TABLE IF NO
 ```bash
 git add sync/agent/db.py sync/agent_e1.py sync/agent/writer/rollback.py \
         sync/agent/writer/budget.py sync/agent/writer/db.py sync/agent_e1_watchdog.py \
-        tests/test_agent_e1.py tests/test_agent_e1_watchdog.py tests/test_agent_budget_writer.py
+        tests/test_agent_e1.py tests/test_agent_e1_watchdog.py tests/test_agent_writer_budget.py
 git commit -m "feat(agent): ожидание и факт лидов в журнале — вход калибровки прогноза"
 ```
 
@@ -3339,21 +3492,46 @@ git commit -m "feat(agent): петля обучения на своих дейс
 
 Ранний прокси качества у нас уже лежит и никем не читается: `sum_p_pay` — сумма
 ML-скоров вероятности оплаты по лидам кампании (`edu_agent_facts.sum_p_pay`,
-`sync/agent/db.py:56`, заполняется `sync/agent/facts.py:89`). Средний скор лида
-`sum_p_pay / eff_leads` — качество когорты, доступное **на следующий день**, а не
-через месяц. Сейчас он попадает только в вывод `computed.py:244` и ни на что не
-влияет.
+`sync/agent/db.py:56`, заполняется `sync/agent/facts.py:89`). Скор доступен **на
+следующий день** после лида, а не через месяц, — этим он и ценен. Сейчас он попадает
+только в вывод `computed.py:244` и ни на что не влияет.
+
+**Знаменатель — не `eff_leads`.** Скор есть не у каждого лида: `load_score_rows`
+джойнит `edu_lead_scores` с `crm_lead_details`, а скоринг ведётся по поведению
+визита и требует `client_id` — он проставлен не на всех лендах. Лид без скора входит
+в `sum_p_pay` нулём, а в `eff_leads` — единицей, поэтому отношение
+`sum_p_pay / eff_leads` меряет не качество когорты, а **долю лидов со скором**.
+Кампания, у которой выросла доля мобильного трафика или приложения, немедленно
+покажет «падение качества», не изменившись ни на грамм. Поэтому задача начинается с
+третьего счётчика в фактах:
+
+- новая колонка `edu_agent_facts.scored_leads` (ALTER, как `conversions`);
+- инкремент в `sync/agent/facts.py` рядом с `sum_p_pay`: `if r["lead_id"] in
+  p_pay_by_lead: slot["scored_leads"] += 1`;
+- поле в INSERT/UPDATE `upsert_facts` (`sync/agent/db.py:758-780`);
+- средний скор считается как `sum_p_pay / scored_leads`, а покрытие
+  `scored_leads / eff_leads` печатается рядом: падение ПОКРЫТИЯ — отдельный сигнал
+  (сломался ingest поведения), и путать его с падением качества нельзя.
+
+Родственный механизм, который не надо переписывать: `sync/agent/segment_quality.py`
+считает качество лида по СЕГМЕНТАМ внутри кампании через мост client_id × Метрика и
+лестницу событий. Здесь другая ось — когорта одной кампании во времени, до и после
+доливки; общего кода у них нет, но термин «качество лида» обязан значить одно и то
+же, поэтому в докстринге модуля стоит ссылка на соседа.
 
 **Файлы:**
 - Создать: `sync/agent/quality.py`
 - Создать: `tests/test_agent_quality.py`
+- Изменить: `sync/agent/db.py` (ALTER `scored_leads`, поле в `upsert_facts`)
+- Изменить: `sync/agent/facts.py` (счётчик лидов со скором)
 - Изменить: `sync/agent/growth.py` (кандидат с падающим качеством не усиливается)
 - Изменить: `sync/agent_e0.py` (секция `lead_quality` в отчёте)
+- Изменить: `tests/test_agent_facts.py` (счётчик), `tests/test_agent_growth.py`
 
 **Интерфейсы:**
 - Отдаёт:
   - `lead_quality(rows, date_from, date_to) -> Dict[str, Dict[str, float]]` — по
-    `campaign_id`: `{"avg_p_pay", "leads"}`.
+    `campaign_id`: `{"avg_p_pay", "scored_leads", "leads", "coverage"}`.
   - `quality_drift(before, after) -> Dict[str, Dict[str, Any]]` — по `campaign_id`:
     `{"drop", "flagged", "reason"}`.
   - `QUALITY_DROP_LIMIT = 0.2` — относительное падение среднего скора, после
@@ -3381,36 +3559,47 @@ from sync.agent.quality import (MIN_QUALITY_LEADS, QUALITY_DROP_LIMIT,
                                 lead_quality, quality_drift)
 
 
-def _facts(cid, day, leads, p_pay):
-    return {"campaign_id": cid, "fact_date": day, "eff_leads": leads, "sum_p_pay": p_pay}
+def _facts(cid, day, leads, p_pay, scored=None):
+    return {"campaign_id": cid, "fact_date": day, "eff_leads": leads,
+            "sum_p_pay": p_pay, "scored_leads": leads if scored is None else scored}
 
 
-def test_avg_score_is_per_lead_not_per_day():
+def test_avg_score_is_per_scored_lead_not_per_day():
     rows = [_facts("111", "2026-08-01", 10, 3.0), _facts("111", "2026-08-02", 30, 3.0)]
     out = lead_quality(rows, "2026-08-01", "2026-08-02")
-    assert out["111"]["leads"] == 40
+    assert out["111"]["scored_leads"] == 40
     assert out["111"]["avg_p_pay"] == 0.15     # 6.0 / 40, а не среднее из 0.3 и 0.1
 
 
+def test_unscored_leads_do_not_dilute_quality():
+    # 40 лидов, скор есть у 20. Отношение к eff_leads дало бы 0.15 вместо
+    # честных 0.30 — и «падение качества» при любом росте доли лендов без
+    # client_id. Покрытие при этом видно отдельным числом.
+    rows = [_facts("111", "2026-08-01", 40, 6.0, scored=20)]
+    out = lead_quality(rows, "2026-08-01", "2026-08-02")
+    assert out["111"]["avg_p_pay"] == 0.30
+    assert out["111"]["coverage"] == 0.5
+
+
 def test_quality_drop_flags_campaign():
-    before = {"111": {"avg_p_pay": 0.20, "leads": 40}}
-    after = {"111": {"avg_p_pay": 0.14, "leads": 40}}      # −30 %
+    before = {"111": {"avg_p_pay": 0.20, "scored_leads": 40}}
+    after = {"111": {"avg_p_pay": 0.14, "scored_leads": 40}}      # −30 %
     out = quality_drift(before, after)
     assert out["111"]["flagged"] is True
     assert out["111"]["drop"] == 0.3
 
 
 def test_small_drop_is_not_a_flag():
-    before = {"111": {"avg_p_pay": 0.20, "leads": 40}}
-    after = {"111": {"avg_p_pay": 0.18, "leads": 40}}      # −10 %, шум
+    before = {"111": {"avg_p_pay": 0.20, "scored_leads": 40}}
+    after = {"111": {"avg_p_pay": 0.18, "scored_leads": 40}}      # −10 %, шум
     out = quality_drift(before, after)
     assert out["111"]["flagged"] is False
 
 
 def test_thin_cohort_is_not_judged():
     # Пять лидов дадут разброс среднего скора больше любого порога.
-    before = {"111": {"avg_p_pay": 0.20, "leads": 5}}
-    after = {"111": {"avg_p_pay": 0.10, "leads": 5}}
+    before = {"111": {"avg_p_pay": 0.20, "scored_leads": 5}}
+    after = {"111": {"avg_p_pay": 0.10, "scored_leads": 5}}
     out = quality_drift(before, after)
     assert out["111"]["flagged"] is False
     assert out["111"]["reason"] == "мало наблюдений"
@@ -3455,15 +3644,23 @@ def lead_quality(rows: Iterable[Dict[str, Any]], date_from: str,
         if not (date_from <= day <= date_to):
             continue
         slot = acc.setdefault(str(row.get("campaign_id") or ""),
-                              {"leads": 0.0, "sum_p_pay": 0.0})
+                              {"leads": 0.0, "scored_leads": 0.0, "sum_p_pay": 0.0})
         slot["leads"] += float(row.get("eff_leads") or 0.0)
+        slot["scored_leads"] += float(row.get("scored_leads") or 0.0)
         slot["sum_p_pay"] += float(row.get("sum_p_pay") or 0.0)
     out: Dict[str, Dict[str, float]] = {}
     for cid, slot in acc.items():
-        leads = slot["leads"]
+        scored, leads = slot["scored_leads"], slot["leads"]
         out[cid] = {
             "leads": leads,
-            "avg_p_pay": round(slot["sum_p_pay"] / leads, 4) if leads else 0.0,
+            "scored_leads": scored,
+            # Делим на лиды СО СКОРОМ: у лида без client_id скора нет, и в
+            # сумме он ноль. Знаменателем eff_leads эта функция мерила бы
+            # долю скоренных лидов, а не качество когорты.
+            "avg_p_pay": round(slot["sum_p_pay"] / scored, 4) if scored else 0.0,
+            # Покрытие — отдельный сигнал: его падение означает поломку
+            # ingest'а поведения, а не ухудшение трафика.
+            "coverage": round(scored / leads, 4) if leads else 0.0,
         }
     return out
 
@@ -3481,8 +3678,8 @@ def quality_drift(before: Dict[str, Dict[str, float]],
         was = before.get(cid) or {}
         base = float(was.get("avg_p_pay") or 0.0)
         cur = float(now.get("avg_p_pay") or 0.0)
-        thin = (float(was.get("leads") or 0.0) < MIN_QUALITY_LEADS
-                or float(now.get("leads") or 0.0) < MIN_QUALITY_LEADS)
+        thin = (float(was.get("scored_leads") or 0.0) < MIN_QUALITY_LEADS
+                or float(now.get("scored_leads") or 0.0) < MIN_QUALITY_LEADS)
         drop = round((base - cur) / base, 4) if base > 0 else 0.0
         if thin:
             out[cid] = {"drop": drop, "flagged": False, "reason": "мало наблюдений"}
@@ -3507,16 +3704,19 @@ def quality_drift(before: Dict[str, Dict[str, float]],
     # кабинета: это пауза роста до вердикта по деньгам, а не сокращение.
     # Резать её сейчас значило бы судить о деньгах по прокси, а прокси для
     # того и ранний, что менее точен.
-    flagged = {cid for cid, d in drift.items() if d.get("flagged")}
+    flagged = {cid for cid, d in (quality_drift or {}).items() if d.get("flagged")}
     candidates = [c for c in candidates if c["campaign_id"] not in flagged]
+    out["skipped_by_quality"] = sorted(flagged)
 ```
 
 Тест дописать в `tests/test_agent_growth.py`:
 
 ```python
 def test_growth_skips_campaign_with_falling_lead_quality():
-    out = growth_candidates(_rows_with_room(), drift={"111": {"flagged": True}})
-    assert [c["campaign_id"] for c in out] == ["222"]
+    out = growth_candidates(_portfolio_with_room(), _headroom(), _demand(), [],
+                            quality_drift={"111": {"flagged": True}})
+    assert [c["campaign_id"] for c in out["candidates"]] == ["222"]
+    assert out["skipped_by_quality"] == ["111"]
 ```
 
 - [ ] **Шаг 6: Секция отчёта**
