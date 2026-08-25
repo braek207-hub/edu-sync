@@ -250,3 +250,61 @@ def test_weekly_pairs_respect_the_placebo_error_floor():
     log_jump = math.log(3.0)
     assert tight["111"][0]["rel_error"] >= 0.5 / log_jump - 1e-9
     assert tight["111"][0]["rel_error"] > loose["111"][0]["rel_error"]
+
+
+# --------------------------------- недобор трафика в кривой
+
+
+def _curves_with_headroom(headroom=None):
+    """Кривая одной кампании с известной эластичностью + недобор трафика."""
+    return saturation_curves(
+        _flat("111", "spo"), [_quasi("111")], {"111": "spo"}, _sunday(3),
+        headroom_by_campaign=headroom)
+
+
+def test_curve_carries_traffic_headroom():
+    section = _curves_with_headroom(
+        {"111": {"traffic_volume": 45.0, "headroom_share": 0.55,
+                 "verdict": "есть куда расти"}})
+    curve = section["campaigns"]["111"]
+    assert curve["traffic_volume"] == 45.0
+    assert curve["headroom_share"] == 0.55
+    assert curve["growth_room"] is True
+
+
+def test_curve_without_headroom_data_says_none_not_false():
+    # Отсутствие замера и «замерили, места нет» — разные вещи. False здесь
+    # означал бы «расти некуда», а мы просто не знаем.
+    curve = _curves_with_headroom()["campaigns"]["111"]
+    assert curve["growth_room"] is None
+    assert curve["traffic_volume"] is None
+
+
+def test_curve_undetermined_headroom_is_none_not_false():
+    # Сетевая кампания: объём приходит константой 100, вердикта нет. Записать
+    # ей growth_room = False значит объявить «расти некуда» по величине,
+    # которой никто не мерил.
+    section = _curves_with_headroom(
+        {"111": {"traffic_volume": None, "headroom_share": None,
+                 "verdict": "неопределённо"}})
+    curve = section["campaigns"]["111"]
+    assert curve["growth_room"] is None
+    assert curve["headroom_share"] is None
+
+
+def test_bought_out_campaign_has_no_growth_room():
+    section = _curves_with_headroom(
+        {"111": {"traffic_volume": 95.0, "headroom_share": 0.05,
+                 "verdict": "выкуплен"}})
+    assert section["campaigns"]["111"]["growth_room"] is False
+
+
+def test_direction_rows_carry_no_headroom():
+    # Недобор не складывается по направлению линейно, а среднее по чужому
+    # весу — та же ошибка «величина посчитана по чужой популяции».
+    section = _curves_with_headroom(
+        {"111": {"traffic_volume": 45.0, "headroom_share": 0.55,
+                 "verdict": "есть куда расти"}})
+    for row in section["directions"].values():
+        assert row["traffic_volume"] is None
+        assert row["growth_room"] is None

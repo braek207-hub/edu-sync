@@ -64,6 +64,12 @@ from sync.agent.tcpa import (
     computed_rows as tcpa_computed_rows,
     tcpa_targets,
 )
+from sync.agent.headroom import VERDICT_BOUGHT_OUT as HEADROOM_BOUGHT_OUT
+from sync.agent.headroom import VERDICT_ROOM as HEADROOM_ROOM
+from sync.agent.headroom import VERDICT_UNDETERMINED as HEADROOM_UNDETERMINED
+from sync.agent.headroom import computed_rows as headroom_computed_rows
+from sync.agent.headroom import placement_modes, traffic_headroom
+from sync.agent.saturation import RECENT_DAYS
 from sync.agent.saturation import computed_rows as saturation_computed_rows
 from sync.agent.saturation import saturation_curves
 from sync.agent.objects import (
@@ -488,13 +494,37 @@ def main() -> int:
     history = budget_response(
         quasi, {str(f["campaign_id"]): f.get("direction") for f in facts})
 
+    # Настройки кабинета читаются ОДИН раз на прогон: их спрашивают недобор
+    # трафика, целевой CPA, портфель и слепая зона, а витрина за прогон не
+    # меняется — четыре одинаковых запроса были бы разной правдой только по
+    # случайности.
+    campaign_settings = agent_db.load_campaign_settings_raw()
+
+    # Э7.6: недобор трафика — сколько показов кампания не покупает на своей
+    # ставке. Окно ровно то же, что у текущей точки кривых (RECENT_DAYS
+    # зрелых дней до границы CRM): иначе признак «есть куда расти» и вердикт
+    # насыщения говорили бы о разных неделях. Размещение — из витрины
+    # настроек: объём трафика осмыслен только на поиске, у сетевых он
+    # приходит константой 100 (замер, docs/AGENT-DATA-SOURCES.md).
+    mature_through = latest_lead or date_to
+    headroom_from = (date.fromisoformat(mature_through)
+                     - timedelta(days=RECENT_DAYS - 1)).isoformat()
+    headroom_section = traffic_headroom(
+        facts, headroom_from, mature_through, placement_modes(campaign_settings))
+    headroom_rows_written = 0
+    for campaign_id, rows in headroom_computed_rows(headroom_section).items():
+        agent_db.upsert_computed_settings(
+            rows, calc_date=today_iso, object_id=campaign_id,
+            object_level="campaign")
+        headroom_rows_written += len(rows)
+
     # Э3.1: кривые насыщения — эластичность из квазиэкспериментов плюс пары
     # соседних недель (оба DiD — сезон вычтен), из неё β и предельная цена
     # эфф. лида на текущем объёме. Граница зрелости — CRM: эффективные лиды
     # свежих дней ещё едут, и хвостовые недели занизили бы лиды всем окнам.
     saturation = saturation_curves(
-        facts, quasi, direction_by_campaign, latest_lead or date_to,
-        error_floor=placebo_floor)
+        facts, quasi, direction_by_campaign, mature_through,
+        error_floor=placebo_floor, headroom_by_campaign=headroom_section)
     saturation_count = 0
     for campaign_id, rows in saturation_computed_rows(saturation).items():
         agent_db.upsert_computed_settings(
@@ -843,7 +873,7 @@ def main() -> int:
         placement_candidates_list = []
 
     # 9. Снимок настроек.
-    snapshot_rows = build_snapshot_rows(agent_db.load_campaign_settings_raw(), seen_on=today_iso)
+    snapshot_rows = build_snapshot_rows(campaign_settings, seen_on=today_iso)
     agent_db.upsert_settings_snapshot(snapshot_rows)
 
     # 10. Профиль успеха и дистанции (после снимка структуры — признаки берутся оттуда).
@@ -975,7 +1005,7 @@ def main() -> int:
     # кабинета (edu_campaign_settings), кампании на стратегиях без цели CPA
     # рычагом не управляются и в расчёт не входят.
     tcpa_section = tcpa_targets(build_tcpa_inputs(
-        facts, saturation["campaigns"], agent_db.load_campaign_settings_raw(),
+        facts, saturation["campaigns"], campaign_settings,
         ladder_section["window_from"], ladder_section["window_to"]))
     tcpa_count = 0
     for campaign_id, rows in tcpa_computed_rows(tcpa_section).items():
@@ -991,7 +1021,11 @@ def main() -> int:
         # отчасти неподвижными кампаниями.
         holdout_ids={str(h["campaign_id"]) for h in holdout},
         # Доля разведки — из панели настроек, а не из константы модуля.
-        explore_share=active_config["explore_share"])
+        explore_share=active_config["explore_share"],
+        # Настройки кабинета — только ради признака «лимит связывает расход»:
+        # разведочная надбавка это деньги, и множитель недобора трафика
+        # применяется там, где деньги действительно доедут (Э3.3).
+        settings_by_campaign=campaign_settings)
     budget_target_count = 0
     for campaign_id, rows in portfolio_computed_rows(budget_threshold).items():
         agent_db.upsert_computed_settings(
@@ -1002,7 +1036,7 @@ def main() -> int:
     # читает (Мастер кампаний и прочее вне API). Считается за то же зрелое
     # окно, что лестница, — чтобы доля относилась к тем же числам, рядом с
     # которыми она печатается.
-    blind = blind_spend(facts, agent_db.load_campaign_settings_raw(),
+    blind = blind_spend(facts, campaign_settings,
                         ladder_section["window_from"], ladder_section["window_to"])
 
     sizes = agent_db.table_sizes()
@@ -1119,6 +1153,25 @@ def main() -> int:
             },
         },
         "saturation_rows": saturation_count,
+        # Э7.6: недобор трафика. Считается по всем кампаниям с показами, но
+        # вердикт получают только поисковые — поэтому «неопределённо» с
+        # разбивкой по причине печатается рядом со счётчиками, иначе «сетям
+        # некуда расти» и «про сети ничего не известно» слились бы в одно.
+        "traffic_headroom": {
+            "window": [headroom_from, mature_through],
+            "campaigns": len(headroom_section),
+            "with_room": sum(1 for r in headroom_section.values()
+                             if r["verdict"] == HEADROOM_ROOM),
+            "bought_out": sum(1 for r in headroom_section.values()
+                              if r["verdict"] == HEADROOM_BOUGHT_OUT),
+            "undetermined_by_reason": _count_by(
+                [{"reason": r["reason"]} for r in headroom_section.values()
+                 if r["verdict"] == HEADROOM_UNDETERMINED], "reason"),
+            # Расход в кампаниях, которым есть куда расти: цена вопроса.
+            "cost_with_room": round(sum(r["cost"] for r in headroom_section.values()
+                                        if r["verdict"] == HEADROOM_ROOM), 2),
+            "computed_rows": headroom_rows_written,
+        },
         # Э3.2: порог и перенос бюджетов. Полные moves не влезают — по
         # кабинету сводка и топ уверенных сдвигов по модулю переноса.
         "budget_threshold": {

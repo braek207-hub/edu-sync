@@ -40,6 +40,8 @@ from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.confidence import assess
+from sync.agent.headroom import VERDICT_BOUGHT_OUT as HEADROOM_BOUGHT_OUT
+from sync.agent.headroom import VERDICT_ROOM as HEADROOM_ROOM
 from sync.agent.history import MIN_LOG_JUMP, combine, elasticity
 from sync.agent.mining import (RTM_SIGMA_THRESHOLD, did_effect,
                                did_rel_error, placebo_sigma)
@@ -224,7 +226,8 @@ def _pooled_eps(
     return account, ("account" if account else "none")
 
 
-def _curve(eps: Dict[str, float], cost: float, leads: int) -> Dict[str, Any]:
+def _curve(eps: Dict[str, float], cost: float, leads: int,
+           headroom: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Точка кривой: β, предельная цена и её ошибка из eps и текущего объёма.
 
     Ошибка предельной цены складывается из пуассоновской ошибки среднего CPL
@@ -241,6 +244,21 @@ def _curve(eps: Dict[str, float], cost: float, leads: int) -> Dict[str, Any]:
         label = "насыщается" if eps["eps"] > 0 else "не насыщена"
     else:
         label = "неопределённо"
+    # Недобор трафика — независимый от статистики признак «расти есть куда».
+    # Кривая молчит, когда наблюдений мало; ставка режет объём и при молчащей
+    # кривой, и это видно сразу. Три состояния, а не два: «замера не было» и
+    # «замерили, места нет» — разные вещи, и False на месте None означал бы
+    # «расти некуда» там, где просто неизвестно.
+    headroom = headroom or {}
+    volume = headroom.get("traffic_volume")
+    room_share = headroom.get("headroom_share")
+    room_verdict = headroom.get("verdict")
+    if room_verdict == HEADROOM_ROOM:
+        growth_room: Optional[bool] = True
+    elif room_verdict == HEADROOM_BOUGHT_OUT:
+        growth_room = False
+    else:
+        growth_room = None
     return {
         "eps": round(eps["eps"], 4),
         "eps_rel_error": round(eps["rel_error"], 4),
@@ -257,6 +275,9 @@ def _curve(eps: Dict[str, float], cost: float, leads: int) -> Dict[str, Any]:
         "marginal_rel_error": round(rel, 4),
         "p_sign": verdict["p_sign"],
         "verdict": label,
+        "traffic_volume": (float(volume) if volume is not None else None),
+        "headroom_share": (float(room_share) if room_share is not None else None),
+        "growth_room": growth_room,
     }
 
 
@@ -266,6 +287,7 @@ def saturation_curves(
     direction_by_campaign: Dict[str, Optional[str]],
     mature_through: str,
     error_floor: Optional[float] = None,
+    headroom_by_campaign: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Кривые насыщения по кампаниям и направлениям.
 
@@ -274,6 +296,7 @@ def saturation_curves(
     окне кривой не получают — предельную цену не к чему прикладывать — и
     перечисляются счётчиком, а не молчанием.
     """
+    headroom_by_campaign = headroom_by_campaign or {}
     quasi_dates: Dict[str, List[str]] = {}
     quasi_obs: Dict[str, List[Dict[str, float]]] = {}
     for exp in quasi_experiments:
@@ -334,7 +357,8 @@ def saturation_curves(
             no_signal += 1
             continue
         campaigns[campaign_id] = {
-            **_curve(pooled, cell["cost"], cell["leads"]),
+            **_curve(pooled, cell["cost"], cell["leads"],
+                     headroom_by_campaign.get(str(campaign_id))),
             "direction": direction,
             "eps_source": source,
         }
@@ -350,6 +374,9 @@ def saturation_curves(
         pooled = combine(by_direction_obs.get(direction, []))
         if pooled is None or agg["cost"] <= 0 or agg["leads"] <= 0:
             continue
+        # Недобор трафика направлению не передаётся: он не складывается по
+        # направлению линейно, а среднее по чужому весу — та же ошибка
+        # «величина посчитана по чужой популяции», что уже чинилась в Э0.
         directions[direction] = _curve(pooled, agg["cost"], agg["leads"])
 
     return {

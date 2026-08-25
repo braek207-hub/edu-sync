@@ -344,3 +344,132 @@ def test_exploration_skips_campaigns_headed_for_shutdown():
     bonus = exploration_bonus(campaigns, explore_rub=10_000.0)
     assert bonus.get("dying", 0.0) == 0.0
     assert abs(bonus["alive"] - 10_000.0) < 1.0
+
+
+# --------------------------------- недобор трафика в кармане разведки
+
+
+def _settings(weekly=None, channel="search", daily=None,
+              campaign_type="TEXT_CAMPAIGN", package=None):
+    """Строка edu_campaign_settings в форме sync/edu_direct_settings.py:632."""
+    strategy = {"search": None, "network": None,
+                "dailyBudget": daily, "package": package}
+    if weekly is not None:
+        strategy[channel] = {"biddingStrategyType": "AVERAGE_CPA",
+                             "weeklyBudget": weekly}
+    return {"meta": {"campaignType": campaign_type}, "strategy": strategy}
+
+
+# Расход 100 000 ₽ за 28 дней с НДС — это 20 833 ₽ в неделю без НДС.
+BINDING_WEEKLY = 20_000.0      # расход добирает до лимита → лимит связывает
+LOOSE_WEEKLY = 200_000.0       # лимит висит в разы выше расхода → декорация
+
+
+def test_binding_limit_is_spend_against_the_weekly_limit():
+    from sync.agent.portfolio import binding_limit
+
+    assert binding_limit(_settings(weekly=BINDING_WEEKLY), 100_000.0) is True
+    assert binding_limit(_settings(weekly=LOOSE_WEEKLY), 100_000.0) is False
+    # Тот же лимит в сетевом канале читается так же: канал ровно один.
+    assert binding_limit(_settings(weekly=BINDING_WEEKLY, channel="network"),
+                         100_000.0) is True
+
+
+def test_binding_limit_falls_back_to_the_daily_budget():
+    # Ручная стратегия: недельного лимита нет, регулятор — DailyBudget
+    # (та же ветка, что в writer/budget.py::diff_budget).
+    from sync.agent.portfolio import binding_limit
+
+    assert binding_limit(_settings(daily=3_000.0), 100_000.0) is True
+    assert binding_limit(_settings(daily=30_000.0), 100_000.0) is False
+
+
+def test_limit_is_not_binding_where_the_lever_refuses():
+    # Ровно те отказы, которые писатель Э3.3 выдаёт на повышение: пакетная
+    # стратегия, не TEXT_CAMPAIGN, лимит в обоих каналах, лимита нет вовсе.
+    from sync.agent.portfolio import binding_limit
+
+    package = _settings(weekly=BINDING_WEEKLY)
+    package["strategy"]["package"] = {"id": 777}
+    assert binding_limit(package, 100_000.0) is False
+
+    assert binding_limit(_settings(weekly=BINDING_WEEKLY,
+                                   campaign_type="UNIFIED_CAMPAIGN"),
+                         100_000.0) is False
+
+    both = _settings(weekly=BINDING_WEEKLY)
+    both["strategy"]["network"] = {"biddingStrategyType": "NETWORK_DEFAULT",
+                                   "weeklyBudget": BINDING_WEEKLY}
+    assert binding_limit(both, 100_000.0) is False
+
+    assert binding_limit(_settings(), 100_000.0) is False
+    assert binding_limit(None, 100_000.0) is False
+
+
+def test_exploration_prefers_campaigns_with_traffic_headroom():
+    from sync.agent.portfolio import exploration_bonus
+
+    base = {"value_rel_error": 0.2, "marginal_rel_error": 0.2, "cost": 100_000.0,
+            "limit_binding": True}
+    campaigns = [
+        {"campaign_id": "111", **base, "headroom_share": 0.6},
+        {"campaign_id": "222", **base, "headroom_share": 0.0},
+    ]
+    bonus = exploration_bonus(campaigns, explore_rub=16_000.0)
+    # Незнание и расход равны, отличается только недобор: 1.6 против 1.0.
+    assert round(bonus["111"] / bonus["222"], 2) == 1.6
+    assert round(bonus["111"] + bonus["222"], 2) == 16_000.0
+
+
+def test_exploration_without_headroom_is_unchanged():
+    from sync.agent.portfolio import exploration_bonus
+
+    campaigns = [
+        {"campaign_id": "111", "value_rel_error": 0.2, "marginal_rel_error": 0.0,
+         "cost": 100_000.0},
+        {"campaign_id": "222", "value_rel_error": 0.1, "marginal_rel_error": 0.0,
+         "cost": 100_000.0},
+    ]
+    bonus = exploration_bonus(campaigns, explore_rub=3_000.0)
+    assert round(bonus["111"] / bonus["222"], 2) == 2.0
+
+
+def test_exploration_ignores_headroom_where_the_limit_does_not_bind():
+    # Надбавка — это ДЕНЬГИ, а деньги доезжают только туда, где лимит
+    # связывает расход (9 кампаний из 62). Кампания с недобором и висящим
+    # лимитом прибавку просто не выберет: вес поднимать не за что.
+    from sync.agent.portfolio import exploration_bonus
+
+    base = {"value_rel_error": 0.2, "marginal_rel_error": 0.2, "cost": 100_000.0,
+            "headroom_share": 0.6}
+    campaigns = [
+        {"campaign_id": "111", **base, "limit_binding": True},
+        {"campaign_id": "222", **base, "limit_binding": False},
+    ]
+    bonus = exploration_bonus(campaigns, explore_rub=16_000.0)
+    assert round(bonus["111"] / bonus["222"], 2) == 1.6
+
+
+def test_portfolio_carries_headroom_and_binding_from_the_settings_vitrine():
+    saturation = {"1": _curve(), "2": _curve()}
+    for row in saturation.values():
+        row["headroom_share"] = 0.6
+    ladder = {cid: _ladder() for cid in saturation}
+    section = portfolio_targets(
+        saturation, ladder, {"1": "acc", "2": "acc"},
+        settings_by_campaign={"1": _settings(weekly=BINDING_WEEKLY),
+                              "2": _settings(weekly=LOOSE_WEEKLY)})
+    account = section["accounts"]["acc"]
+    # Недобор есть у обеих, разведочную надбавку он поднимает у одной.
+    assert account["exploration"]["headroom_boosted"] == 1
+
+
+def test_portfolio_without_settings_boosts_nobody():
+    # Настроек нет — «связывает ли лимит» неизвестно, и множитель недобора
+    # не применяется: надбавка по незнанию, но без выдуманного признака.
+    saturation = {"1": _curve(), "2": _curve()}
+    for row in saturation.values():
+        row["headroom_share"] = 0.6
+    ladder = {cid: _ladder() for cid in saturation}
+    section = portfolio_targets(saturation, ladder, {"1": "acc", "2": "acc"})
+    assert section["accounts"]["acc"]["exploration"]["headroom_boosted"] == 0

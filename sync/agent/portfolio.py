@@ -31,6 +31,11 @@ import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent.confidence import assess
+# Признак «лимит связывает расход» задан рычагом записи, и второго определения
+# у него быть не должно: разойдись они — расчёт поднимал бы вес кампании,
+# которой писатель всё равно откажет. Поэтому и порог, и единицы берутся
+# оттуда, а не переписываются здесь.
+from sync.agent.writer.budget import BINDING_SHARE, VAT, WEEKS_IN_WINDOW
 
 # Кап шага за такт. Симметричный в лог-смысле он не обязан быть: ×1.5 вверх
 # отыгрывается срезанием, ×0.5 вниз — доливом на следующем такте.
@@ -76,6 +81,53 @@ def value_per_lead(ladder_row: Dict[str, Any]) -> Optional[Dict[str, float]]:
     return {"value": float(revenue) / eff, "rel_error": float(rel)}
 
 
+def binding_limit(settings: Optional[Dict[str, Any]], cost_28d: float) -> bool:
+    """Связывает ли текущий лимит расход кампании — по витрине настроек.
+
+    Повторяет правило рычага записи (writer/budget.py::diff_budget): повышение
+    бюджета лимитом достижимо только там, где кампания в него упирается, —
+    таких по замеру 9 из 62 (docs/AGENT-AUDIT-2026-08-23.md:214). Все отказы
+    писателя тоже воспроизведены: пакетная стратегия, не TEXT_CAMPAIGN, лимит
+    сразу в двух каналах и полное отсутствие лимита означают, что деньги в эту
+    кампанию рычагом не доедут, — а значит и «связывает» тут неприменимо.
+
+    В одном месте правило СТРОЖЕ писательского намеренно: тот пропускает
+    кампанию с неизвестным типом (writer/budget.py:358 — `not in (None,
+    "TEXT_CAMPAIGN")`), потому что отказать реальному действию по незнанию
+    дороже, чем попробовать. Здесь наоборот: незнание не должно поднимать вес
+    в разведке, иначе карман уйдёт кампании, про которую нечего сказать.
+
+    Единицы: cost_28d — расход за 28 дней С НДС (все факты EDU), лимиты
+    витрины — рубли БЕЗ НДС (edu_direct_settings переводит микрорубли).
+    Конверсия та же, что у писателя: cost / 4 недель / VAT.
+    """
+    strategy = ((settings or {}).get("strategy") or {})
+    if not isinstance(strategy, dict) or strategy.get("package"):
+        return False
+    if ((settings or {}).get("meta") or {}).get("campaignType") != "TEXT_CAMPAIGN":
+        return False
+
+    weekly_spend = float(cost_28d or 0.0) / WEEKS_IN_WINDOW / VAT
+    if weekly_spend <= 0:
+        return False
+
+    limits = []
+    for channel in ("search", "network"):
+        block = strategy.get(channel)
+        weekly = (block or {}).get("weeklyBudget") if isinstance(block, dict) else None
+        if weekly:
+            limits.append(float(weekly))
+    if len(limits) > 1:
+        return False
+    if limits:
+        return weekly_spend >= BINDING_SHARE * limits[0]
+
+    daily = strategy.get("dailyBudget")
+    if daily:
+        return weekly_spend / 7.0 >= BINDING_SHARE * float(daily)
+    return False
+
+
 def _target_spend(campaign: Dict[str, Any], lam: float) -> float:
     """Целевой бюджет кампании при пороге λ, с капом шага.
 
@@ -119,7 +171,19 @@ def exploration_bonus(
             continue
         rel = math.sqrt(float(campaign.get("value_rel_error") or 0.0) ** 2
                         + float(campaign.get("marginal_rel_error") or 0.0) ** 2)
-        weight = rel * float(campaign.get("cost") or 0.0)
+        # Недобор трафика поднимает ценность разведки: там, где ставка режет
+        # объём, доливка отвечает на вопрос «сколько ещё есть», а на
+        # выкупленной кампании тот же рубль отвечает только «дороже ли
+        # следующий показ». Множитель 1..2 — линейный по недобору, без
+        # свободных параметров.
+        # Но только там, где лимит СВЯЗЫВАЕТ расход: надбавка — это деньги, а
+        # деньги тратятся лишь у кампании, упирающейся в лимит (9 из 62).
+        # Иначе прибавка зафиксировалась бы в отчёте и не превратилась ни в
+        # показы, ни в знание; недобор такой кампании — повод для эскалации
+        # цены, а не для разведочного рубля.
+        room = (min(max(float(campaign.get("headroom_share") or 0.0), 0.0), 1.0)
+                if campaign.get("limit_binding") else 0.0)
+        weight = rel * float(campaign.get("cost") or 0.0) * (1.0 + room)
         if weight > 0:
             weights[str(campaign["campaign_id"])] = weight
     total = sum(weights.values())
@@ -272,6 +336,7 @@ def portfolio_targets(
     login_by_campaign_id: Dict[str, str],
     holdout_ids: Optional[Set[str]] = None,
     explore_share: float = EXPLORATION_SHARE,
+    settings_by_campaign: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Целевые бюджеты по кабинетам: порог λ на кабинет, сумма сохраняется.
 
@@ -288,6 +353,9 @@ def portfolio_targets(
     виден отдельной строкой отчёта, как и у кампаний без ценности лида.
     """
     holdout_ids = {str(h) for h in (holdout_ids or set())}
+    # Настроек нет — «связывает ли лимит» неизвестно, и множитель недобора не
+    # применяется никому: карман делится по одному незнанию, как до задачи 4.
+    settings_by_campaign = settings_by_campaign or {}
     by_login: Dict[str, List[Dict[str, Any]]] = {}
     fixed_by_login: Dict[str, Dict[str, float]] = {}
     holdout_by_login: Dict[str, Dict[str, float]] = {}
@@ -317,6 +385,15 @@ def portfolio_targets(
             "marginal_rel_error": float(curve["marginal_rel_error"]),
             "value": value["value"],
             "value_rel_error": value["rel_error"],
+            # Недобор трафика кривой (Э7.6): 0.0 — либо выкуплено, либо
+            # величина не измерена. Различие между ними держит сама кривая
+            # (growth_room = None), а карман разведки одинаково не поднимает
+            # вес в обоих случаях: надбавка по недобору требует замера.
+            "headroom_share": (float(curve["headroom_share"])
+                               if curve.get("headroom_share") is not None else 0.0),
+            "limit_binding": binding_limit(
+                settings_by_campaign.get(str(campaign_id)),
+                float(curve["cost_28d"])),
         })
 
     accounts: Dict[str, Dict[str, Any]] = {}
@@ -358,6 +435,13 @@ def portfolio_targets(
                 "share": explore_share if bonus else 0.0,
                 "rub": round(sum(bonus.values()), 2),
                 "campaigns": len(bonus),
+                # Кому недобор трафика поднял вес: замер есть, лимит
+                # связывает. Ноль при живом недоборе — не поломка, а правда
+                # о рычаге: доливать некуда, кампаниям нужна цена (Э4).
+                "headroom_boosted": sum(
+                    1 for c in campaigns
+                    if c.get("limit_binding") and c.get("headroom_share")
+                    and not preliminary[c["campaign_id"]].get("switch_off")),
             },
             "target_sum_28d": round(target_sum, 2),
             # Невязка суммы — прямая проверка «сумма на уровне кабинета».
