@@ -1,0 +1,21 @@
+name: probe-semantic
+# Временная проба: воспроизводит вызов смыслового слоя с кириллицей на том
+# же раннере, где он падал, и печатает полный traceback. Отчёт Э0 знает
+# только тип исключения, а 25-минутный прогон — слишком дорогая единица
+# отладки.
+on:
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Probe
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python scripts/probe_semantic.py
