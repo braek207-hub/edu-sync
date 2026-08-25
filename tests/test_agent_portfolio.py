@@ -298,3 +298,49 @@ def test_holdout_only_account_is_not_reported_as_movable():
     section = portfolio_targets(saturation, ladder, {"1": "acc", "2": "acc"},
                                 holdout_ids={"1", "2"})
     assert "acc" not in section["accounts"]
+
+
+# ------------------- карман исследования
+
+
+def test_exploration_budget_goes_to_the_least_understood_campaigns():
+    # Без разведки кривая насыщения уточняется только там, где история уже
+    # что-то говорит, и кампания с неопределённой оценкой остаётся
+    # неопределённой навсегда. Часть бюджета распределяется не по λ, а по
+    # НЕЗНАНИЮ: чем хуже мы понимаем кривую кампании, тем ценнее узнать.
+    from sync.agent.portfolio import exploration_bonus
+    campaigns = [
+        {"campaign_id": "known", "cost": 100_000.0, "marginal_rel_error": 0.05,
+         "value_rel_error": 0.05},
+        {"campaign_id": "unknown", "cost": 100_000.0, "marginal_rel_error": 0.40,
+         "value_rel_error": 0.40},
+    ]
+    bonus = exploration_bonus(campaigns, explore_rub=10_000.0)
+    assert bonus["unknown"] > bonus["known"]
+    assert abs(sum(bonus.values()) - 10_000.0) < 1.0
+
+
+def test_exploration_budget_is_a_small_share_and_sum_is_kept():
+    # Инвариант портфеля не меняется: сумма целевых по-прежнему равна бюджету
+    # кабинета — карман берётся ИЗ него, а не сверх него.
+    saturation, ladder = _inputs()
+    section = portfolio_targets(saturation, ladder, {"1": "acc", "2": "acc"})
+    acc = section["accounts"]["acc"]
+    assert abs(acc["sum_residual"]) < 1.0
+    assert 0 < acc["exploration"]["share"] <= 0.1
+    assert acc["exploration"]["rub"] > 0
+
+
+def test_exploration_skips_campaigns_headed_for_shutdown():
+    # Разведка на кампании, которую механизм и так предлагает выключить, —
+    # деньги на изучение того, что закрывается.
+    from sync.agent.portfolio import exploration_bonus
+    campaigns = [
+        {"campaign_id": "alive", "cost": 100_000.0, "marginal_rel_error": 0.30,
+         "value_rel_error": 0.30},
+        {"campaign_id": "dying", "cost": 100_000.0, "marginal_rel_error": 0.90,
+         "value_rel_error": 0.90, "switch_off": True},
+    ]
+    bonus = exploration_bonus(campaigns, explore_rub=10_000.0)
+    assert bonus.get("dying", 0.0) == 0.0
+    assert abs(bonus["alive"] - 10_000.0) < 1.0

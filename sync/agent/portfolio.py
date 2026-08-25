@@ -34,6 +34,13 @@ from sync.agent.confidence import assess
 
 # Кап шага за такт. Симметричный в лог-смысле он не обязан быть: ×1.5 вверх
 # отыгрывается срезанием, ×0.5 вниз — доливом на следующем такте.
+# Доля бюджета кабинета на РАЗВЕДКУ. Без неё кривая насыщения уточняется
+# только там, где история уже что-то говорит: кампания с неопределённой
+# оценкой такой и остаётся, а механизм год за годом делит деньги по тому, что
+# знал вначале. Карман берётся ИЗ бюджета, а не сверх него — инвариант
+# «сумма целевых = бюджету кабинета» не меняется.
+EXPLORATION_SHARE = 0.07
+
 MAX_STEP_UP = 1.5
 MAX_STEP_DOWN = 0.5
 
@@ -90,6 +97,35 @@ def _target_spend(campaign: Dict[str, Any], lam: float) -> float:
     if scaled <= math.log(MAX_STEP_DOWN):
         return cost * MAX_STEP_DOWN
     return cost * math.exp(scaled)
+
+
+def exploration_bonus(
+    campaigns: List[Dict[str, Any]], explore_rub: float,
+) -> Dict[str, float]:
+    """Разведочная надбавка по кампаниям: {campaign_id: ₽}.
+
+    Делится пропорционально НЕЗНАНИЮ — совокупной относительной ошибке
+    оценки (ценность лида и предельная цена, независимые источники), взвешенной
+    расходом кампании: узнать про кампанию, которая тратит много и понята
+    плохо, ценнее всего. Кандидаты на выключение исключены: разведка на том,
+    что закрывается, — деньги на изучение уходящего.
+
+    Совсем нет кого изучать (все кандидаты на выключение или ошибки нулевые) —
+    пустой словарь: карман вернётся в общий солвер, а не растворится.
+    """
+    weights: Dict[str, float] = {}
+    for campaign in campaigns:
+        if campaign.get("switch_off"):
+            continue
+        rel = math.sqrt(float(campaign.get("value_rel_error") or 0.0) ** 2
+                        + float(campaign.get("marginal_rel_error") or 0.0) ** 2)
+        weight = rel * float(campaign.get("cost") or 0.0)
+        if weight > 0:
+            weights[str(campaign["campaign_id"])] = weight
+    total = sum(weights.values())
+    if total <= 0 or explore_rub <= 0:
+        return {}
+    return {cid: explore_rub * w / total for cid, w in weights.items()}
 
 
 def solve_threshold(
@@ -190,6 +226,46 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float) -> Dict[str, 
     }
 
 
+def _apply_exploration(
+    targets: Dict[str, float], cost_by_id: Dict[str, float],
+    explore_rub: float, campaigns: List[Dict[str, Any]],
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Цели с изъятым и перераспределённым карманом разведки.
+
+    Карман берётся ТОЛЬКО из запаса цели до нижнего капа шага: кампания,
+    уже стоящая на полу (×MAX_STEP_DOWN), не должна проседать глубже — кап
+    шага держится и при разведке. Столько же и раздаётся, поэтому сумма
+    целевых по кабинету не меняется. Раздача ограничена верхним капом по той
+    же причине; невыданный остаток возвращается источникам пропорционально
+    изъятому, а не растворяется.
+    """
+    floors = {cid: cost_by_id.get(cid, 0.0) * MAX_STEP_DOWN for cid in targets}
+    headroom = {cid: max(0.0, targets[cid] - floors[cid]) for cid in targets}
+    total_headroom = sum(headroom.values())
+    taken = min(float(explore_rub), total_headroom)
+    if taken <= 0:
+        return targets, {}
+
+    withdrawn = {cid: taken * h / total_headroom for cid, h in headroom.items()}
+    bonus = exploration_bonus(campaigns, taken)
+    if not bonus:
+        return targets, {}
+
+    ceilings = {cid: cost_by_id.get(cid, 0.0) * MAX_STEP_UP for cid in targets}
+    out = {cid: targets[cid] - withdrawn.get(cid, 0.0) for cid in targets}
+    unspent = 0.0
+    for cid, extra in bonus.items():
+        room = max(0.0, ceilings.get(cid, float("inf")) - out.get(cid, 0.0))
+        given = min(extra, room)
+        out[cid] = out.get(cid, 0.0) + given
+        unspent += extra - given
+    if unspent > 0 and taken > 0:
+        # Возврат тем, у кого изъяли: сумма кабинета обязана сойтись.
+        for cid, amount in withdrawn.items():
+            out[cid] += unspent * amount / taken
+    return out, bonus
+
+
 def portfolio_targets(
     saturation_campaigns: Dict[str, Dict[str, Any]],
     ladder_by_object: Dict[str, Dict[str, Any]],
@@ -247,7 +323,20 @@ def portfolio_targets(
         budget = sum(c["cost"] for c in campaigns)
         if budget <= 0:
             continue
+        # Порог и вердикты считаются на ПОЛНОМ бюджете: карман не должен
+        # двигать λ, иначе кампания у пола капа становится кандидатом на
+        # выключение только потому, что часть денег ушла на разведку.
         lam, targets = solve_threshold(campaigns, budget)
+        preliminary = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam)
+                       for c in campaigns}
+        # Карман изымается ПОСЛЕ решения — пропорционально у всех — и уходит
+        # туда, где оценка хуже всего. Сумма целевых при этом не меняется:
+        # (1−share)·Σцелей + share·бюджет = бюджет.
+        cost_by_id = {c["campaign_id"]: c["cost"] for c in campaigns}
+        targets, bonus = _apply_exploration(
+            targets, cost_by_id, budget * EXPLORATION_SHARE,
+            [{**c, "switch_off": bool(preliminary[c["campaign_id"]].get("switch_off"))}
+             for c in campaigns])
         moves = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam)
                  for c in campaigns}
         target_sum = sum(targets.values())
@@ -262,6 +351,13 @@ def portfolio_targets(
             # быть видно флагом, а не прятаться в числе (аудит 2026-08-23, C6).
             "lambda_breakeven": bool(lam >= 1.0),
             "budget_28d": round(budget, 2),
+            # Сколько денег кабинета ушло на разведку и кому: без этой строки
+            # надбавка неотличима от решения солвера.
+            "exploration": {
+                "share": EXPLORATION_SHARE if bonus else 0.0,
+                "rub": round(sum(bonus.values()), 2),
+                "campaigns": len(bonus),
+            },
             "target_sum_28d": round(target_sum, 2),
             # Невязка суммы — прямая проверка «сумма на уровне кабинета».
             "sum_residual": round(target_sum - budget, 2),
