@@ -1,0 +1,46 @@
+name: agent-drift
+on:
+  schedule:
+    # 08:00 UTC = 11:00 МСК: после сторожа красных линий (10:30 МСК). Порядок
+    # не косметический — сторож в этот час откатывает вредные изменения, и
+    # сверка, запущенная до него, назвала бы дрейфом ещё не сделанный откат.
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Глубина окна сверки в днях"
+        required: false
+        default: "21"
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run drift check
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          # DIRECT_CLIENTS_JSON не передаётся по той же причине, что у
+          # сторожа: кабинет берётся из журнала. Изменение, применённое
+          # кабинету, которого больше нет в списке клиентов, обязано
+          # сверяться — иначе правка переменной снимала бы часть кабинета с
+          # проверки молча.
+        run: |
+          # Всегда --prod: песочница этим логинам недоступна (Code 513, они
+          # там не заведены), и прогон по ней вернул бы пустоту, выглядящую
+          # как «расхождений нет». Записи у сверки нет вовсе, поэтому
+          # боевой кабинет здесь безопасен — только чтение.
+          #
+          # --fail-on-alarm по крону: откат руками, исчезнувшая кампания и
+          # разъехавшееся значение обязаны приходить письмом о красном ране,
+          # а не лежать в логе зелёного.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            python -m sync.agent_drift --prod --fail-on-alarm
+          else
+            python -m sync.agent_drift --prod --days=${{ github.event.inputs.days || '21' }}
+          fi
