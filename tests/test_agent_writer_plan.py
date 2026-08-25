@@ -284,3 +284,41 @@ def test_one_significant_hour_is_enough_to_act():
 
 def test_schedule_plan_ignores_other_kinds():
     assert plan_schedule([_row("bid_modifier:device", "MOBILE", 30.0)]) == []
+
+
+def test_kinds_with_their_own_lever_are_not_called_unapplicable():
+    # Минус-фразы, площадки и целевой CPA применяются СВОИМИ рычагами
+    # (writer/negatives, writer/placements, writer/tcpa). В общей ветке
+    # корректировок им не место — но и в unsupported тоже: боевой отчёт 25.08
+    # уверял, что «применение не запланировано», про 3 934 строки минус-фраз,
+    # которые тот же прогон раскладывал по 27 кампаниям.
+    from sync.agent.writer.plan import NOT_A_SETTING_KINDS, OWN_LEVER_KINDS
+
+    rows = [_row(kind, "любой", 40.0)
+            for kind in sorted(OWN_LEVER_KINDS | NOT_A_SETTING_KINDS)]
+
+    plan = plan_bid_modifiers(rows)
+
+    assert plan["desired"] == []
+    assert plan["unsupported"] == []
+
+
+def test_registry_covers_every_lever_that_writes_its_own_kind():
+    # Реестр обязан ссылаться на константы самих рычагов, а не на копии
+    # строк: разъехавшись, копия вернёт ровно тот дефект, что и чинится.
+    from sync.agent.writer import negatives, placements, tcpa
+    from sync.agent.writer.plan import OWN_LEVER_KINDS
+
+    assert negatives.NEGATIVE_SETTING_KIND in OWN_LEVER_KINDS
+    assert placements.PLACEMENT_SETTING_KIND in OWN_LEVER_KINDS
+    assert tcpa.TCPA_SETTING_KIND in OWN_LEVER_KINDS
+
+
+def test_truly_unknown_kind_still_reaches_the_report():
+    # Защита от обратного перекоса: пропускать надо ИМЕНОВАННЫЕ виды, а не
+    # всё незнакомое. Иначе вернётся молчаливое выпадение, из-за которого
+    # когда-то потерялся bid_modifier:network.
+    plan = plan_bid_modifiers([_row("bid_modifier:network", "СЕТЬ", 40.0)])
+
+    assert plan["desired"] == []
+    assert plan["unsupported"] and plan["unsupported"][0]["kind"] == "bid_modifier:network"

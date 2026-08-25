@@ -30,6 +30,7 @@ DESKTOP_ADJUSTMENT, TABLET_ADJUSTMENT (образец разбора: sync/edu_d
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.confidence import assess
+from sync.agent.writer import negatives, placements, tcpa
 
 # Вид вычисленной настройки → тип корректировки в API Директа. Устройства
 # сюда не входят: у них тип зависит от ключа, см. DEVICE_TYPE_MAP.
@@ -249,21 +250,10 @@ def plan_bid_modifiers(
 
     for row in computed:
         kind = str(row.get("setting_kind") or "")
-        # Расписание идёт своим путём (plan_schedule → TimeTargeting кампании),
-        # а не через корректировки: у него другой механизм в API. В unsupported
-        # ему тоже не место — иначе отчёт говорит «применить не умеем» про то,
-        # что умеет применять соседняя ветка.
-        if kind == SCHEDULE_KIND:
-            continue
-        # Целевой бюджет (Э3.2) — тоже свой путь (plan_budget_moves →
-        # campaigns.update), не корректировка. Без скипа строка budget_target
-        # шла бы в unsupported, и отчёт говорил бы «применить не умеем» про
-        # то, что применяет соседний рычаг.
-        if kind == BUDGET_TARGET_KIND:
-            continue
-        # Кандидат на выключение (Э3.4) — свой путь (plan_switch_offs →
-        # campaigns.suspend), тем же доводом.
-        if kind == CAMPAIGN_SWITCH_KIND:
+        # Вид с собственным рычагом здесь пропускается: его применяет соседняя
+        # ветка, а не корректировки. См. OWN_LEVER_KINDS — реестр обязан быть
+        # один, иначе очередной рычаг снова окажется «неприменяемым» в отчёте.
+        if kind in OWN_LEVER_KINDS or kind in NOT_A_SETTING_KINDS:
             continue
         # Отбор по виду настройки СНЯТ намеренно. Прежде незнакомый вид
         # (schedule:*, bid_modifier:network) выпадал здесь молча: строка не
@@ -354,6 +344,30 @@ SCHEDULE_KIND = "schedule:hour"
 BUDGET_TARGET_KIND = "budget_target"
 # Вид строк Э3.4 (там же): кандидаты на выключение, применяет writer/switch.py.
 CAMPAIGN_SWITCH_KIND = "campaign_switch"
+# Расчётная строка Э3.1: коэффициенты кривой насыщения. В кабинет не пишется
+# никогда и ничем — это вход портфеля, а не настройка кампании.
+SATURATION_KIND = "saturation"
+
+# Виды, у которых СВОЙ механизм записи. Общая ветка корректировок их
+# пропускает — не потому, что не умеет, а потому, что применяет их соседний
+# рычаг. Реестр держится в одном месте и собирается из констант самих
+# рычагов: пока это были три вида в трёх if-ах, добавленные позже минус-фразы,
+# площадки и целевой CPA молча уехали в unsupported, и боевой отчёт 25.08
+# уверял, что «применение не запланировано» — про 3 934 строки минус-фраз,
+# которые в этом же прогоне раскладывались по 27 кампаниям.
+OWN_LEVER_KINDS = frozenset({
+    SCHEDULE_KIND,
+    BUDGET_TARGET_KIND,
+    CAMPAIGN_SWITCH_KIND,
+    negatives.NEGATIVE_SETTING_KIND,
+    placements.PLACEMENT_SETTING_KIND,
+    tcpa.TCPA_SETTING_KIND,
+})
+
+# Виды, которые вообще не являются настройкой кабинета: расчёт, который Э0
+# кладёт в ту же таблицу. Отличать их от «умеем, но другим рычагом» важно —
+# иначе непонятно, ждать ли для них когда-нибудь записи.
+NOT_A_SETTING_KINDS = frozenset({SATURATION_KIND})
 # Часов в профиле 24, и порог значимости у каждого свой. Но само расписание —
 # ОДНО действие на кампанию: Директ принимает Schedule целиком, а не по часу.
 # Поэтому решение «менять ли расписание» принимается по набору: хотя бы один
