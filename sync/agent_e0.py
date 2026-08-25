@@ -71,6 +71,7 @@ from sync.agent.objects import (
     minus_word_candidates,
     placement_candidates,
     core_words,
+    phrases_cutting_only_waste,
     expansion_candidates,
     word_minus_candidates,
     top_queries_by_cost,
@@ -726,6 +727,17 @@ def main() -> int:
     minus_candidates = (minus_word_candidates(scored_queries, cpa_limit=cpa_limit,
                                               base_conversion=base_conversion)
                         if cpa_limit > 0 else [])
+    # Минус-фраза гасит не строку отчёта, а СЕМЕЙСТВО запросов, содержащих все
+    # её слова (справка Директа). Судить кандидата по одной его строке — та же
+    # ошибка, что уже исправлена для минус-СЛОВ: 25.08 в кандидаты попал
+    # «университет синергия» — собственный бренд, — и та же фраза погасила бы
+    # «университет синергия красноярск», который расширение в этом же отчёте
+    # предлагало докупить. Семейство считается по ВСЕМ запросам кабинета, а не
+    # по топу scored_queries: окупающийся хвост живёт как раз вне топа.
+    minus_dropped: List[Dict[str, Any]] = []
+    if minus_candidates:
+        minus_candidates, minus_dropped = phrases_cutting_only_waste(
+            minus_candidates, seeing_queries, cpa_limit=cpa_limit)
     # Минус-СЛОВА поверх минус-фраз: отдельная фраза почти никогда не набирает
     # объём для приговора (при базовой конверсии в проценты сотня кликов без
     # конверсий — редкость), а слово, общее для полусотни фраз, набирает и
@@ -1031,6 +1043,18 @@ def main() -> int:
                 "sample": [w.get("query") for w in word_candidates[:10]],
             },
             "sample": [q.get("query") for q in minus_candidates[:10]],
+            # Что снято проверкой семейства и почему. Без этой строки отсев
+            # неотличим от «кандидатов не нашлось», а именно здесь видно, что
+            # рычаг едва не отрезал собственный бренд.
+            "family_check": {
+                "dropped": len(minus_dropped),
+                "by_reason": _count_by(minus_dropped, "reason"),
+                "cost_saved": round(sum(float(q.get("cost") or 0.0)
+                                        for q in minus_dropped), 2),
+                "sample": [{"query": q.get("query"), "reason": q.get("reason"),
+                            "family": q.get("family")}
+                           for q in minus_dropped[:10]],
+            },
             "blind_accounts": blind_accounts,
         },
         "placements": {

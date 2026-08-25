@@ -13,7 +13,7 @@ sync/agent/objects.py — снимок структуры кабинета и п
 import hashlib
 import re
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Поля, по которым объект опознаётся на каждом уровне: (id, кампания, родитель).
 _ID_FIELDS = {
@@ -326,6 +326,131 @@ def core_words(queries: List[Dict[str, Any]]) -> set:
             if len(word) >= MIN_WORD_CHARS:
                 out.add(word)
     return out
+
+
+def _phrase_words(text: Any) -> frozenset:
+    """Слова фразы — ВСЕ, включая короткие.
+
+    Порог MIN_WORD_CHARS существует для минус-СЛОВ: предлог в роли минус-слова
+    выкосил бы всю семантику. В сопоставлении фразы с запросом он вреден —
+    Директ учитывает «в», «на», «и» наравне с прочими, и выброшенный предлог
+    расширил бы посчитанное семейство против настоящего.
+    """
+    return frozenset(_WORD_RE.findall(str(text or "").lower()))
+
+
+def bought_phrases(queries: List[Dict[str, Any]]) -> set:
+    """Ключевые фразы кабинета как наборы слов.
+
+    Набор, а не строка: минус-фраза не различает порядок, и «мти институт»
+    запретит показ по купленной «институт мти» ровно так же.
+    """
+    return {words for words in
+            (_phrase_words(q.get("matched_key")) for q in queries) if words}
+
+
+def cut_family(queries: List[Dict[str, Any]], phrase: Any) -> Dict[str, Any]:
+    """Весь поток, который погасит минус-фраза: агрегат по семейству.
+
+    Семейство — запросы, содержащие ВСЕ слова фразы (справка Директа: без
+    операторов минус-фраза запрещает показ по любому такому запросу, в любом
+    порядке слов). Оценка НИЖНЯЯ: словоформы здесь не сводятся к основе —
+    морфологии в проекте нет, а обрезать окончания «на глаз» значило бы
+    угадывать. Значит настоящее семейство не меньше посчитанного, и ошибка
+    правила — только в сторону «оставить кандидата», не в сторону «отрезать
+    лишнее».
+    """
+    words = _phrase_words(phrase)
+    out: Dict[str, Any] = {"cost": 0.0, "clicks": 0, "conversions": 0,
+                           "queries": 0, "campaigns": set(),
+                           "cost_by_campaign": {}}
+    if not words:
+        return out
+    for q in queries:
+        if not words <= _phrase_words(q.get("query")):
+            continue
+        cost = float(q.get("cost") or 0.0)
+        out["cost"] += cost
+        out["clicks"] += int(q.get("clicks") or 0)
+        out["conversions"] += int(q.get("conversions") or 0)
+        out["queries"] += 1
+        campaign_id = str(q.get("campaign_id") or "")
+        if campaign_id:
+            out["campaigns"].add(campaign_id)
+            out["cost_by_campaign"][campaign_id] = (
+                out["cost_by_campaign"].get(campaign_id, 0.0) + cost)
+    return out
+
+
+def phrases_cutting_only_waste(
+    candidates: List[Dict[str, Any]], queries: List[Dict[str, Any]],
+    cpa_limit: float, multiplier: float = CPA_OVERSHOOT,
+    bought: Optional[set] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Отсев кандидатов, которые заберут с собой окупающийся трафик.
+
+    Минус-фраза действует не на строку отчёта, а на СЕМЕЙСТВО запросов
+    (cut_family). Судить её по собственной строке — ровно та ошибка, что уже
+    исправлена для минус-СЛОВ (word_minus_candidates): на боевых данных 25.08
+    кандидатом стала «университет синергия» — собственный бренд кабинета, —
+    и та же минус-фраза погасила бы «университет синергия красноярск»
+    (6 конверсий по 294 ₽), который соседний рычаг в том же отчёте предлагал
+    ДОКУПИТЬ. Единица суждения обязана совпадать с единицей действия.
+
+    Два основания снять кандидата:
+
+      * own_keyword — фраза куплена кабинетом (matched_key). Свою закупку
+        отменяет человек, а не автопилот; дорогая своя семантика лечится
+        ставкой и целевым CPA (Э3.5).
+      * family_pays_off — семейство приносит конверсии по цене в пределах
+        допустимой (та же планка cpa_limit × multiplier, что судит фразу).
+        Резать поток, который окупается, нельзя даже если отдельная строка
+        внутри него дорогая.
+
+    Пустой источник запросов даёт family_unknown: без данных о семействе
+    кандидат не подтверждён. Молча пропустить его значило бы вернуть ровно то
+    поведение, от которого правило защищает.
+
+    У выживших кандидатов расход и разбивка по кампаниям заменяются на
+    СЕМЕЙСТВЕННЫЕ: цену риска (writer/exposure.traffic_cut_exposure) и
+    обещанную экономию считает то же, что отсекается. Прежние числа занижали
+    экспозицию ровно на хвост.
+    """
+    own = bought if bought is not None else bought_phrases(queries)
+    kept: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        phrase = candidate.get("query")
+        words = _phrase_words(phrase)
+        if words and words in own:
+            dropped.append({**candidate, "reason": "own_keyword"})
+            continue
+        family = cut_family(queries, phrase)
+        if not family["queries"]:
+            dropped.append({**candidate, "reason": "family_unknown"})
+            continue
+        conversions = family["conversions"]
+        if conversions > 0 and family["cost"] / conversions <= cpa_limit * multiplier:
+            dropped.append({
+                **candidate, "reason": "family_pays_off",
+                "family": {"queries": family["queries"],
+                           "cost": round(family["cost"], 2),
+                           "conversions": conversions,
+                           "cpa": round(family["cost"] / conversions, 2)},
+            })
+            continue
+        kept.append({
+            **candidate,
+            "cost": round(family["cost"], 2),
+            "clicks": family["clicks"],
+            "conversions": conversions,
+            "campaigns": sorted(family["campaigns"]),
+            "cost_by_campaign": {c: round(v, 2) for c, v
+                                 in sorted(family["cost_by_campaign"].items())},
+            "family_queries": family["queries"],
+        })
+    kept.sort(key=lambda r: -r["cost"])
+    return kept, dropped
 
 
 def word_minus_candidates(
