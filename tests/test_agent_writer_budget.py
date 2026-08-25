@@ -135,9 +135,12 @@ def test_strategy_with_limit_preserves_siblings_and_source():
 # ------------------------------------------------------------------ diff
 
 
-def _move(target, current):
-    return {"target_28d": target, "cost_28d": current,
+def _move(target, current, leads_delta=None):
+    move = {"target_28d": target, "cost_28d": current,
             "ratio": round(target / current, 4), "p_sign": 0.99}
+    if leads_delta is not None:
+        move["expected_leads_delta"] = leads_delta
+    return move
 
 
 def _state(weekly_micros=None, daily_micros=None, package_id=None,
@@ -402,3 +405,52 @@ def test_apply_cooldown_without_touched_is_passthrough():
     desired = {"1": {"target_28d": 1.0}}
     kept, cooled = apply_cooldown(desired, set())
     assert kept == desired and cooled == []
+
+
+# --------------------------------------------------- ожидание солвера
+
+
+def _beta_row(beta):
+    return {"setting_kind": "saturation", "setting_key": "beta",
+            "value": beta, "raw_value": 0.02, "support_n": 26,
+            "rel_error": 0.1}
+
+
+def test_plan_derives_expected_leads_delta_from_curve():
+    # 100 лидов окна × (1.5**0.5 − 1) — та же кривая, по которой солвер
+    # выбрал цель.
+    plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=0.05),
+                                    _roi_row(1.5, rel_error=0.05),
+                                    _beta_row(0.5)]})
+    assert plan["desired"]["1"]["expected_leads_delta"] == 22.47
+
+
+def test_plan_without_curve_has_no_expectation():
+    # Кривой кампании нет — ожидания нет вовсе: ноль петля обучения
+    # прочитала бы как прогноз «эффекта не будет».
+    plan = plan_budget_moves({"1": [_target_row(150_000, 100_000, rel_error=0.05),
+                                    _roi_row(1.5, rel_error=0.05)]})
+    assert "expected_leads_delta" not in plan["desired"]["1"]
+
+
+def test_budget_action_carries_expectation():
+    """Ожидаемая дельта лидов едет в payload действия.
+
+    Солвер её считает, а журнал терял: сравнить прогноз с исходом было
+    невозможно, и калибровка модели держалась на вере в модель.
+    """
+    actions, _ = diff_budget(
+        {"1": _move(720_000, 480_000, leads_delta=6.0)},
+        {"1": _state(weekly_micros=100_000 * M)},
+        {"1": 100_000.0})
+    assert actions[0]["payload"]["expected_leads_delta"] == 6.0
+
+
+def test_daily_budget_action_carries_expectation():
+    # Второй сборщик действия — ручная стратегия: ожидание обязано ехать и
+    # там, иначе половина журнала осталась бы без прогноза.
+    actions, _ = diff_budget(
+        {"1": _move(240_000, 480_000, leads_delta=-4.0)},
+        {"1": _state(daily_micros=20_000 * M)},
+        {"1": 100_000.0})
+    assert actions[0]["payload"]["expected_leads_delta"] == -4.0

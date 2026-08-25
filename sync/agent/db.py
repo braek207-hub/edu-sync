@@ -520,6 +520,38 @@ def load_baseline_cpo(date_from: str, date_to: str) -> Dict[str, float]:
     return {str(r["campaign_id"]): float(r["cpo"]) for r in rows}
 
 
+def load_baseline_volume(date_from: str, date_to: str) -> Dict[str, Dict[str, float]]:
+    """Объём базы кампании за окно: сколько эффективных лидов в день.
+
+    Зеркало load_baseline_cpa со сменой вопроса: там «сколько стоил лид»,
+    здесь «сколько их было». Отдельной функцией, а не расширением соседней:
+    у load_baseline_cpa четыре потребителя, и все ждут Dict[str, float].
+
+    Темп (лиды в день), а не сумма за окно: окно базы и окно наблюдения
+    разной длины, и суммы сравнивались бы через разные знаменатели.
+    """
+    rows = _fetch_dicts(
+        """
+        SELECT campaign_id,
+               SUM(eff_leads)            AS leads,
+               COUNT(DISTINCT fact_date) AS days
+        FROM edu_agent_facts
+        WHERE fact_date BETWEEN %s AND %s
+        GROUP BY campaign_id
+        HAVING COUNT(DISTINCT fact_date) > 0
+        """,
+        (date_from, date_to),
+    )
+    return {
+        str(r["campaign_id"]): {
+            "leads": float(r["leads"] or 0.0),
+            "days": int(r["days"]),
+            "leads_per_day": round(float(r["leads"] or 0.0) / int(r["days"]), 4),
+        }
+        for r in rows
+    }
+
+
 def load_daily_account_totals(date_from: str, date_to: str) -> List[Dict[str, Any]]:
     """Дневные агрегаты ВСЕЙ витрины: расход и эффективные лиды по дню.
 

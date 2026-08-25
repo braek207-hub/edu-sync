@@ -86,6 +86,14 @@ def red_line_for(
     base_cpo = float(baseline.get("cpo") or 0.0)
     if base_cpo > 0:
         window["baseline_cpo"] = base_cpo
+    # Темп базы — тем же плоским ключом, что и цена оплаты, и по той же
+    # причине: линия его не читает, но без него наблюдаемую дельту лидов не
+    # с чем сравнить (agent_e1_watchdog.observed_leads_delta). Нуля здесь не
+    # бывает: «база не давала лидов» и «темпа не записали» — разные вещи, и
+    # петля обучения обязана их различать.
+    base_rate = float(baseline.get("leads_per_day") or 0.0)
+    if base_rate > 0:
+        window["baseline_leads_per_day"] = base_rate
     if base_cpa > 0:
         return {
             "metric": "cpa",

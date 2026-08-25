@@ -276,6 +276,26 @@ def observed_metrics(rows: Iterable[Dict[str, Any]], window: Tuple[date, date, b
     }
 
 
+def observed_leads_delta(observed: Dict[str, Any],
+                         action: Dict[str, Any]) -> Optional[float]:
+    """Сколько лидов действие принесло сверх базового темпа за окно наблюдения.
+
+    Не разность сумм: окно базы 28 дней, окно наблюдения 7–14, и голая
+    разность показала бы обвал там, где темп вырос. Поэтому темп базы
+    (red_line.baseline_leads_per_day, положен туда при планировании) множится
+    на длину окна наблюдения и вычитается из его лидов.
+
+    None, когда темпа базы в линии нет (действие спланировано до появления
+    этой пары) или окно пустое: отсутствие числа честнее нуля, который петля
+    обучения прочитала бы как «прогноз сбылся ровно наполовину».
+    """
+    base_rate = float((action.get("red_line") or {}).get("baseline_leads_per_day") or 0.0)
+    days = int(observed.get("days") or 0)
+    if base_rate <= 0 or days <= 0:
+        return None
+    return round(float(observed.get("leads") or 0) - base_rate * days, 2)
+
+
 def peak_cost_day(rows: Iterable[Dict[str, Any]],
                   window: Tuple[date, date, bool]) -> Optional[date]:
     """День окна с максимальным расходом. None — фактов в окне нет вовсе."""
@@ -614,8 +634,10 @@ def action_experiment(action: Dict[str, Any], observed: Dict[str, Any],
     базы до изменения» не вычитает сезон (контроля у него нет, в отличие от
     DiD квазиэкспериментов). A появится, когда исход будет меряться против
     заповедника за то же окно. Ошибка оценки — только из счётчика лидов окна
-    наблюдения: объём базы в красной линии не записан, поэтому rel_error —
-    нижняя граница, и это отмечено полем rel_error_floor.
+    наблюдения: в красной линии лежит ТЕМП базы (лиды в день, ради
+    observed_leads_delta), а не число лидов, на котором она снята, — поэтому
+    rel_error по-прежнему нижняя граница, и это отмечено полем
+    rel_error_floor.
     """
     red = action.get("red_line") or {}
     base = float(red.get("baseline_cpa") or 0.0)
@@ -1074,8 +1096,12 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
                 # иначе шум отобранных по экстремуму действий читается как
                 # успех (winner's curse).
                 outcome = closing_verdict(observed, action)
+                # Факт кладётся той же отметкой, что и вердикт: разнести их
+                # на два запроса значило бы допустить строку с исходом, но
+                # без числа, — а петля обучения читает именно пару.
                 if window is not None and db_module.mark_observation_closed(
-                        action["action_id"], outcome):
+                        action["action_id"], outcome,
+                        observed_leads_delta(observed, action)):
                     db_module.record_experiments([action_experiment(
                         action, observed, window, outcome)])
                     closed_held.append({

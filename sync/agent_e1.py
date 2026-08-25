@@ -918,6 +918,7 @@ def absolute_max_cpa_from_baseline(baseline_cpa: Dict[str, float]) -> Any:
 def build_red_line(
     action: Dict[str, Any], baseline_cpa: Dict[str, float], absolute_max_cpa: Any,
     baseline_window: Any = None, baseline_cpo: Optional[Dict[str, float]] = None,
+    baseline_volume: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Any:
     """Красная линия для действия, или None, если её посчитать не из чего.
 
@@ -949,6 +950,13 @@ def build_red_line(
         # Границы окна базы едут в саму линию: по ним сторож считает сезонную
         # поправку порога (agent_e1_watchdog.seasonal_factor).
         baseline["window_from"], baseline["window_to"] = baseline_window
+    # Темп базы едет в линию ради сверки ожидания с фактом: сторож знает лиды
+    # окна наблюдения, а сколько их было ДО изменения — больше ниоткуда не
+    # берётся, кампанию с тех пор трогали. Красная линия его не читает:
+    # откатывают по цене, а не по объёму.
+    volume = (baseline_volume or {}).get(str(action["object_id"])) or {}
+    if volume.get("leads_per_day"):
+        baseline["leads_per_day"] = volume["leads_per_day"]
     if baseline["cpa"] <= 0 and absolute_max_cpa is None:
         return None
     return red_line_for(action, baseline, absolute_max_cpa)
@@ -1436,7 +1444,8 @@ def run_account(
     no_red_line: List[Dict[str, Any]] = []
     for a in allowed:
         red_line = build_red_line(a, baseline_cpa, absolute_max_cpa,
-                                  baseline_window, ctx.get("baseline_cpo"))
+                                  baseline_window, ctx.get("baseline_cpo"),
+                                  ctx.get("baseline_volume"))
         if red_line is None:
             no_red_line.append({**a, "blocked_reason": NO_RED_LINE_REASON})
             continue
@@ -1752,6 +1761,14 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         agent_db.load_baseline_cpo(cutoff, crm_through.isoformat())
         if crm_through else {}
     )
+    # ОБЪЁМ базы по тому же окну — вторая половина точки отсчёта. Цена без
+    # темпа не даёт сравнить прогноз с исходом: сторож посчитает лиды окна
+    # наблюдения, а сколько их было до изменения, к тому моменту уже не
+    # восстановить — кампанию трогали, в том числе сам агент.
+    baseline_volume = (
+        agent_db.load_baseline_volume(cutoff, crm_through.isoformat())
+        if crm_through else {}
+    )
     wk = week_start(today)
 
     # Абсолютный аварийный порог красной линии считается один раз на весь
@@ -1784,6 +1801,7 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
                                  for cid, value in daily_cost.items()},
         "baseline_cpa": baseline_cpa,
         "baseline_cpo": baseline_cpo,
+        "baseline_volume": baseline_volume,
         # Окно, на котором снята база: едет в красную линию, по нему сторож
         # считает сезонную поправку порога.
         "baseline_window": (cutoff, crm_through.isoformat()) if crm_through else None,

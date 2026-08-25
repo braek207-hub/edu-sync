@@ -162,6 +162,39 @@ def apply_cooldown(desired, touched):
     return kept, cooled
 
 
+def _expected_leads_delta(rows: List[Dict[str, Any]], leads: float,
+                          ratio: float) -> Optional[float]:
+    """Ожидаемый прирост лидов от сдвига: leads × (ratio**β − 1).
+
+    Та же формула и те же входы, что у солвера (portfolio._move_row): лиды
+    окна и β кривой насыщения. Восстанавливается здесь, потому что через
+    edu_agent_computed_settings солвер передаёт только цель и экономическое
+    отношение — своё ожидание он выбрасывает.
+
+    None, когда кривой кампании нет или окно без лидов: ноль здесь означал бы
+    прогноз «эффекта не будет», и петля обучения зачла бы его как сбывшийся.
+    """
+    beta_row = next((r for r in rows
+                     if str(r.get("setting_kind")) == "saturation"
+                     and str(r.get("setting_key")) == "beta"), None)
+    if beta_row is None or beta_row.get("value") is None or leads <= 0:
+        return None
+    return round(leads * (float(ratio) ** float(beta_row["value"]) - 1.0), 2)
+
+
+def _expectation_payload(move: Dict[str, Any]) -> Dict[str, float]:
+    """Кусок payload с ожиданием солвера — или пустой, если ожидания нет.
+
+    Ожидание едет вместе с действием: через 7–14 дней сторож положит рядом
+    факт (agent_e1_watchdog.observed_leads_delta), и разница этих двух чисел —
+    единственный способ узнать, что модель врёт систематически.
+    """
+    expected = move.get("expected_leads_delta")
+    if expected is None:
+        return {}
+    return {"expected_leads_delta": round(float(expected), 2)}
+
+
 def plan_budget_moves(
     computed_by_campaign: Dict[str, List[Dict[str, Any]]],
 ) -> Dict[str, Any]:
@@ -226,6 +259,10 @@ def plan_budget_moves(
             "roi_vs_lambda": round(float(roi_row["value"]), 4),
             "p_sign": verdict["p_sign"],
         }
+        expected = _expected_leads_delta(
+            rows, float(row.get("support_n") or 0.0), ratio)
+        if expected is not None:
+            desired[str(cid)]["expected_leads_delta"] = expected
 
     return {"desired": desired, "low_confidence": low_confidence,
             "confidence_unknown": confidence_unknown,
@@ -369,6 +406,7 @@ def diff_budget(
                     # которого посчитана цель. В API не уходит (to_api_call
                     # берёт из payload только BiddingStrategy).
                     "Cost28dVat": move["cost_28d"],
+                    **_expectation_payload(move),
                 },
                 "previous_state": {
                     "BiddingStrategy": strategy,
@@ -403,6 +441,7 @@ def diff_budget(
                     "CampaignId": int(cid),
                     "DailyBudget": {**daily, "Amount": target_daily_micros},
                     "Cost28dVat": move["cost_28d"],
+                    **_expectation_payload(move),
                 },
                 "previous_state": {"DailyBudget": daily},
                 "idempotency_key": _idempotency_key(cid, "daily", target_daily_micros),

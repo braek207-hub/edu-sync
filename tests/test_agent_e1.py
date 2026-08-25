@@ -85,6 +85,9 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
     # она едет пассажиром и на решения прогона не влияет (по оплатам не
     # откатывают). Тест, которому она важна, подменяет её сам.
     monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpo", lambda *_: {})
+    # Тем же пассажиром едет ОБЪЁМ базы: он входит в красную линию ради
+    # сверки прогноза с исходом, а решения прогона не трогает.
+    monkeypatch.setattr(agent_e1.agent_db, "load_baseline_volume", lambda *_: {})
 
 
 class _FakeCampaignsClient:
@@ -2245,3 +2248,30 @@ def test_learning_cooldown_reuses_the_money_knob_window(monkeypatch):
     from sync.agent.writer import budget as budget_writer
 
     assert agent_e1.LEARNING_COOLDOWN_DAYS == budget_writer.BUDGET_COOLDOWN_DAYS
+
+
+def test_red_line_carries_baseline_volume():
+    """Красная линия несёт не только цену базы, но и её темп.
+
+    Цена без объёма не даёт сравнить ожидание с фактом: сторож знает лиды за
+    окно наблюдения, а сколько их было до изменения — неизвестно. Темп, а не
+    сумма: окна базы и наблюдения разной длины, суммы несопоставимы.
+    """
+    action = {"action_kind": "budget.set", "object_id": "111",
+              "object_level": "campaign"}
+
+    red_line = agent_e1.build_red_line(
+        action, {"111": 1000.0}, None, ("2026-07-01", "2026-07-28"), None,
+        {"111": {"leads": 56.0, "days": 28, "leads_per_day": 2.0}})
+
+    assert red_line["baseline_leads_per_day"] == 2.0
+
+
+def test_red_line_without_volume_has_no_rate_key():
+    # Кампании нет в справочнике объёма — темпа в линии нет вовсе: ноль
+    # сторож прочитал бы как «база не давала лидов», и наблюдаемая дельта
+    # оказалась бы равна всему объёму окна.
+    red_line = agent_e1.build_red_line(
+        {"object_id": "111"}, {"111": 1000.0}, None, None, None, {})
+
+    assert "baseline_leads_per_day" not in red_line

@@ -104,8 +104,8 @@ class _FakeDb:
         self.rolled_back.append(action_id)
         return not self._rolled_back_taken
 
-    def mark_observation_closed(self, action_id, verdict):
-        self.observation_closed.append((action_id, verdict))
+    def mark_observation_closed(self, action_id, verdict, leads_delta=None):
+        self.observation_closed.append((action_id, verdict, leads_delta))
         return not self._observation_taken
 
     def record_experiments(self, rows):
@@ -1212,7 +1212,10 @@ def test_held_action_at_closed_horizon_becomes_experiment_and_leaves_watch():
     assert report["closed_held_sample"][0]["object_id"] == "111"
     # Вердикт градуированный: CPA вдвое ниже базы — это «улучшило», а не
     # безразличное «не пробило порог» (аудит C4).
-    assert db.observation_closed == [("act-1", "improved")]
+    # Темпа базы в линии этого действия нет — факта не существует, и в
+    # журнал едет None, а не ноль: «не измерено» и «эффекта не было» петля
+    # обучения обязана различать.
+    assert db.observation_closed == [("act-1", "improved", None)]
     assert db.failed == [] and db.rolled_back == []
     assert client.calls == []          # закрытие — не запись в кабинет
 
@@ -1805,7 +1808,7 @@ def test_watch_closes_early_when_the_verdict_is_already_certain():
     facts = {"111": _facts("111", date(2026, 8, 2), 7, cost=1000.0, leads=10)}
     report, client, db = _run(action, facts, today=date(2026, 8, 11))
     assert report["closed_held"] == 1
-    assert db.observation_closed == [("act-1", "improved")]
+    assert db.observation_closed == [("act-1", "improved", None)]
 
 
 def test_early_close_needs_a_full_week():
@@ -1826,3 +1829,38 @@ def test_early_close_does_not_fire_on_an_inconclusive_effect():
     facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=2800.0, leads=4)}
     report, client, db = _run(action, facts, today=date(2026, 8, 14))
     assert report["closed_held"] == 0
+
+
+def test_observed_leads_delta_is_measured_against_base_rate():
+    """Наблюдаемая дельта = лиды окна − темп базы × длина окна.
+
+    Не разность сумм: окно базы 28 дней, окно наблюдения 7–14, и голая
+    разность сумм показала бы обвал там, где темп вырос.
+    """
+    action = {"red_line": {"baseline_leads_per_day": 2.0}}
+    observed = {"leads": 21, "days": 7}          # темп 3.0 против базовых 2.0
+
+    assert watchdog.observed_leads_delta(observed, action) == 7.0
+
+
+def test_observed_leads_delta_is_none_without_base_rate():
+    # Действие спланировано до появления темпа базы в линии — сравнивать не
+    # с чем. None, а не ноль: ноль петля обучения прочитала бы как «эффекта
+    # ровно не было», то есть как измерение, которого не делали.
+    assert watchdog.observed_leads_delta({"leads": 21, "days": 7},
+                                         {"red_line": {}}) is None
+    assert watchdog.observed_leads_delta({"leads": 0, "days": 0},
+                                         {"red_line": {"baseline_leads_per_day": 2.0}}) is None
+
+
+def test_closing_writes_the_observed_leads_delta_to_the_journal():
+    # Пара «ожидание / факт» замыкается здесь: темп базы лежал в линии с
+    # момента планирования, лиды окна знает сторож — журнал получает разницу.
+    action = _action(red_line={**_action()["red_line"],
+                               "baseline_leads_per_day": 1.0})
+    report, client, db = _run(action, _held_facts(), today=date(2026, 9, 1))
+
+    observed = report["closed_held_sample"][0]["observed"]
+    expected = round(observed["leads"] - 1.0 * observed["days"], 2)
+    assert expected > 0
+    assert db.observation_closed == [("act-1", "improved", expected)]

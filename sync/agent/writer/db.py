@@ -211,6 +211,19 @@ WRITER_DDL: List[str] = [
     ALTER TABLE edu_agent_actions
       ADD COLUMN IF NOT EXISTS learning_impact TEXT
     """,
+    # Наблюдаемая дельта лидов против базового ТЕМПА — вторая половина пары
+    # «ожидание / факт». Ожидание лежит в payload действия, факт появляется
+    # только при закрытии наблюдения, поэтому колонка, а не payload: payload —
+    # то, что собирались сделать, и дописывать в него постфактум значит
+    # смешивать намерение с исходом.
+    #
+    # NULL — «не измерено» (у действия не записан темп базы или окно пустое),
+    # а не «эффекта не было»: калибровка прогноза обязана эти случаи
+    # различать, иначе смещение модели считается по выдуманным нулям.
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS observed_leads_delta DOUBLE PRECISION
+    """,
     # Аренда на прогон: два одновременных прогона на одном ключе создают в
     # кабинете ДВА объекта, и Id первого теряется навсегда — без строки
     # журнала и без красной линии. Таблица, а не pg_advisory_lock: сессионная
@@ -560,7 +573,8 @@ def open_actions() -> List[Dict[str, Any]]:
 MARK_OBSERVATION_CLOSED_SQL = """
     UPDATE edu_agent_actions
        SET observation_closed_at = now(),
-           observation_verdict   = %(verdict)s
+           observation_verdict   = %(verdict)s,
+           observed_leads_delta  = %(leads_delta)s
      WHERE action_id = %(action_id)s
        AND observation_closed_at IS NULL
        AND rolled_back_at IS NULL
@@ -569,13 +583,21 @@ MARK_OBSERVATION_CLOSED_SQL = """
 """
 
 
-def mark_observation_closed(action_id: str, verdict: str) -> bool:
-    """Закрывает наблюдение действия с вердиктом. True — строка была наша."""
+def mark_observation_closed(action_id: str, verdict: str,
+                            leads_delta: Optional[float] = None) -> bool:
+    """Закрывает наблюдение действия с вердиктом. True — строка была наша.
+
+    leads_delta необязателен: у действия без темпа базы в красной линии факта
+    не существует, и NULL в колонке отличает «не измерено» от «эффекта не
+    было» — петля обучения обязана эти случаи различать.
+    """
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(MARK_OBSERVATION_CLOSED_SQL, {
                 "action_id": action_id,
                 "verdict": str(verdict)[:200],
+                "leads_delta": (None if leads_delta is None
+                                else float(leads_delta)),
             })
             landed = cur.fetchone() is not None
         conn.commit()
