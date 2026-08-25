@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Слепая доля: сколько расхода идёт мимо настроек, которые агент читает."""
 
-from sync.agent.coverage import blind_spend
+from sync.agent.coverage import blind_share, blind_spend
 
 WINDOW = ("2026-08-01", "2026-08-28")
 
@@ -60,3 +60,23 @@ def test_settings_accepted_as_mapping_from_db_loader():
     out = blind_spend(facts, {"111": {"BudgetWeekly": 1000}}, *WINDOW)
     assert out["cost_blind"] == 150_000.0
     assert out["campaigns_blind"] == 1
+
+
+# --------------------------- ядро: готовый расход без сырых фактов
+
+
+def test_core_counts_the_same_share_from_ready_cost():
+    # Такт записи приходит со своим агрегатом расхода (средний дневной × 28),
+    # фактов у него нет. Доля обязана считаться тем же кодом, иначе два такта
+    # однажды напечатают разные числа под одним именем.
+    out = blind_share({"111": 850_000.0, "222": 150_000.0}, [{"campaign_id": "111"}])
+    assert out["cost_total"] == 1_000_000.0
+    assert out["blind_share"] == 0.15
+    assert out["campaigns_blind"] == 1
+
+
+def test_core_sample_without_names_keeps_ids():
+    # Имён кампаний у такта записи нет — образец обязан остаться полезным.
+    out = blind_share({"222": 150_000.0}, {})
+    assert out["sample"] == [{"campaign_id": "222", "campaign_name": "",
+                              "cost": 150_000.0}]

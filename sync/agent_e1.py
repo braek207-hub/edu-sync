@@ -59,6 +59,7 @@ from sync.agent.balance import (
     require_growth_address,
     tact_balance,
 )
+from sync.agent.coverage import blind_share
 from sync.agent.gate import data_gate
 from sync.agent.writer import budget
 from sync.agent.writer import switch
@@ -1895,6 +1896,30 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
             }
             failed_accounts.append({"account": login, "error": report["reason"]})
         print(json.dumps(report, ensure_ascii=False, indent=2))
+
+    # Слепая доля расхода — та же величина, что печатает такт расчёта, и
+    # считает её тот же код (agent/coverage.py::blind_share). Здесь она нужнее:
+    # такт расчёта ею оговаривает свои оценки, а такт записи ею оговаривает
+    # изменения в кабинете. «Изменили десять кампаний» без неё читается как
+    # «взяли кабинет под управление», хотя пятая часть денег живёт вне поля
+    # зрения агента и на неё эти изменения не влияют никак.
+    #
+    # Расход берётся из ctx (средний дневной × 28), а не из фактов заново:
+    # рельса бюджета решает по этому же числу, и доля обязана относиться к
+    # тому расходу, по которому принимаются решения, а не к похожему.
+    #
+    # Отчётный слой не вправе уронить запись: витрина настроек недоступна —
+    # видна причина, прогон продолжается.
+    try:
+        blind = blind_share(ctx["cost_28d_by_campaign"],
+                            agent_db.load_campaign_settings_raw())
+    except Exception as exc:  # noqa: BLE001
+        blind = {"unavailable": f"{type(exc).__name__}: {exc}"[:200]}
+    print(json.dumps({
+        "verdict": "BLIND_SPEND",
+        "window": [cutoff, today],
+        "blind_spend": blind,
+    }, ensure_ascii=False, indent=2))
 
     if failed_accounts:
         # Итоговая строка отдельно от кабинетных отчётов: иначе отказ первого

@@ -41,22 +41,17 @@ def _known_campaign_ids(settings_rows: Any) -> set:
     return known
 
 
-def blind_spend(facts: Iterable[Dict[str, Any]], settings_rows: Any,
-                window_from: str, window_to: str) -> Dict[str, Any]:
-    """Расход вне витрины настроек за окно."""
-    known = _known_campaign_ids(settings_rows)
+def blind_share(cost_by_campaign: Mapping[str, float], settings_rows: Any,
+                name_by_campaign: Mapping[str, str] = None) -> Dict[str, Any]:
+    """Слепая доля по готовому расходу кампаний.
 
-    cost_by_campaign: Dict[str, float] = {}
-    name_by_campaign: Dict[str, str] = {}
-    for row in facts:
-        day = str(row.get("fact_date"))[:10]
-        if day < window_from or day > window_to:
-            continue
-        campaign_id = str(row["campaign_id"])
-        cost_by_campaign[campaign_id] = (cost_by_campaign.get(campaign_id, 0.0)
-                                         + float(row.get("cost") or 0.0))
-        if row.get("campaign_name"):
-            name_by_campaign[campaign_id] = str(row["campaign_name"])
+    Ядро счётчика. Такт расчёта приходит сюда через blind_spend (у него есть
+    сырые факты), такт записи — напрямую своим агрегатом расхода: держать в
+    двух тактах две реализации одной доли значит однажды напечатать в отчётах
+    два разных числа под одним именем.
+    """
+    known = _known_campaign_ids(settings_rows)
+    names = name_by_campaign or {}
 
     total = sum(cost_by_campaign.values())
     blind = {cid: cost for cid, cost in cost_by_campaign.items() if cid not in known}
@@ -70,7 +65,25 @@ def blind_spend(facts: Iterable[Dict[str, Any]], settings_rows: Any,
         "campaigns_total": len(cost_by_campaign),
         "campaigns_blind": len(blind),
         "sample": [{"campaign_id": cid,
-                    "campaign_name": name_by_campaign.get(cid, ""),
+                    "campaign_name": names.get(cid, ""),
                     "cost": round(cost, 2)}
                    for cid, cost in sample if cost > 0],
     }
+
+
+def blind_spend(facts: Iterable[Dict[str, Any]], settings_rows: Any,
+                window_from: str, window_to: str) -> Dict[str, Any]:
+    """Расход вне витрины настроек за окно — по сырым фактам."""
+    cost_by_campaign: Dict[str, float] = {}
+    name_by_campaign: Dict[str, str] = {}
+    for row in facts:
+        day = str(row.get("fact_date"))[:10]
+        if day < window_from or day > window_to:
+            continue
+        campaign_id = str(row["campaign_id"])
+        cost_by_campaign[campaign_id] = (cost_by_campaign.get(campaign_id, 0.0)
+                                         + float(row.get("cost") or 0.0))
+        if row.get("campaign_name"):
+            name_by_campaign[campaign_id] = str(row["campaign_name"])
+
+    return blind_share(cost_by_campaign, settings_rows, name_by_campaign)

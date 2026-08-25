@@ -54,7 +54,8 @@ def _no_lock(lease=None):
 
 
 def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=None,
-                 campaign_computed=None, learning_resets=None):
+                 campaign_computed=None, learning_resets=None,
+                 campaign_settings=None):
     """Общая подмена того, что прогон спрашивает у журнала помимо действий:
     аренда на прогон, история вредных сегментов, исчерпавшие попытки
     сегменты, уже закрытые ключи. campaign_computed — покампанийные строки
@@ -71,6 +72,11 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
     monkeypatch.setattr(agent_e1.writer_db, "final_status_keys",
                         lambda keys: set(final_keys))
     monkeypatch.setattr(agent_e1.writer_db, "purge_dry_run_actions", lambda *a, **k: 0)
+    # Витрина настроек — знаменатель слепой доли в отчёте прогона. Пустая по
+    # умолчанию: тесты про действия к ней безразличны, а тест про саму долю
+    # подменяет её сам.
+    monkeypatch.setattr(agent_e1.agent_db, "load_campaign_settings_raw",
+                        lambda: dict(campaign_settings or {}))
     monkeypatch.setattr(agent_e1, "data_gate",
                         lambda today: {"status": "GREEN", "reason": "",
                                        "checks": []})
@@ -334,7 +340,7 @@ def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeyp
     exit_code = agent_e1.main()
 
     assert exit_code == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
     assert report["no_red_line"] == {"count": 1, "reason": agent_e1.NO_RED_LINE_REASON}
     assert report["absolute_max_cpa"] is None
     assert report["result"]["applied"] == 0
@@ -406,7 +412,7 @@ def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatc
 
     assert agent_e1.main() == 0
 
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
     assert report["desired"] == 1                      # только устройство
     assert report["unsupported"]["count"] == 1         # регион — с причиной
     assert sum(report["unsupported"]["by_reason"].values()) == 1
@@ -458,7 +464,7 @@ def test_campaign_with_own_values_gets_its_plan_not_the_accounts(monkeypatch, ca
     )
 
     assert agent_e1.main() == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
 
     sent = _RecordingWriteClient.instances[0].sent
     assert len(sent) == 1
@@ -476,7 +482,7 @@ def test_campaign_without_own_values_falls_back_to_account(monkeypatch, capsys):
     )
 
     assert agent_e1.main() == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
 
     item = _RecordingWriteClient.instances[0].sent[0][2]["BidModifiers"][0]
     assert item["DesktopAdjustment"]["BidModifier"] == 130
@@ -497,7 +503,7 @@ def test_stale_campaign_rows_do_not_apply_and_are_counted(monkeypatch, capsys):
     )
 
     assert agent_e1.main() == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
 
     item = _RecordingWriteClient.instances[0].sent[0][2]["BidModifiers"][0]
     assert item["DesktopAdjustment"]["BidModifier"] == 130   # кабинетный план
@@ -516,7 +522,7 @@ def test_campaign_rows_alone_are_enough_without_account_plan(monkeypatch, capsys
     )
 
     assert agent_e1.main() == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
 
     item = _RecordingWriteClient.instances[0].sent[0][2]["BidModifiers"][0]
     assert item["MobileAdjustment"]["BidModifier"] == 125
@@ -686,7 +692,7 @@ def test_cabinet_without_computed_settings_is_visible_in_report(monkeypatch, cap
 
     assert agent_e1.main() == 0
 
-    reports = {r["account"]: r for r in _reports(capsys)}
+    reports = {r["account"]: r for r in _reports(capsys) if "account" in r}
     silent = reports["acc-2"]
     assert silent["verdict"] == "NO_COMPUTED_SETTINGS"
     assert silent["computed_settings"] == 0
@@ -717,7 +723,7 @@ def test_action_cap_is_shared_across_cabinets(monkeypatch, capsys):
 
     sent = sum(len(c.sent) for c in _MultiCabinetClient.instances)
     assert sent == 2, "потолок прогона обязан считаться на все кабинеты сразу"
-    reports = {r["account"]: r for r in _reports(capsys)}
+    reports = {r["account"]: r for r in _reports(capsys) if "account" in r}
     assert reports["acc-1"]["actions_left_in_run"] == 0
     assert reports["acc-2"]["deferred_by_cap"] == 2
 
@@ -1482,6 +1488,53 @@ def test_run_purges_old_rehearsal_rows(monkeypatch, capsys):
     assert maintenance and maintenance[0]["dry_run_rows_purged"] == 3
 
 
+def test_run_reports_share_of_spend_it_cannot_see(monkeypatch, capsys):
+    # «Изменили десять кампаний» без слепой доли читается как «кабинет взят
+    # под управление», хотя часть денег живёт вне витрины настроек и на неё
+    # эти изменения не влияют никак. Доля считается по тому же расходу, по
+    # которому решает рельса бюджета (средний дневной × 28).
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 100.0, "999": 300.0},
+    )
+    monkeypatch.setattr(agent_e1.agent_db, "load_campaign_settings_raw",
+                        lambda: {"111": {}})
+
+    assert agent_e1.main() == 0
+
+    blind = [r for r in _reports(capsys) if r.get("verdict") == "BLIND_SPEND"]
+    assert blind, "слепая доля печатается всегда, в том числе нулём"
+    section = blind[0]["blind_spend"]
+    assert section["cost_total"] == 400.0 * 28
+    assert section["blind_share"] == 0.75
+    assert [s["campaign_id"] for s in section["sample"]] == ["999"]
+
+
+def test_unavailable_settings_do_not_break_the_writing_tact(monkeypatch, capsys):
+    # Отчётный слой не вправе уронить запись: витрина настроек недоступна —
+    # видна причина, кабинеты обработаны.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [111]},
+        daily_cost={"111": 100.0},
+    )
+
+    def _boom():
+        raise RuntimeError("витрина недоступна")
+
+    monkeypatch.setattr(agent_e1.agent_db, "load_campaign_settings_raw", _boom)
+
+    assert agent_e1.main() == 0
+
+    reports = _reports(capsys)
+    blind = [r for r in reports if r.get("verdict") == "BLIND_SPEND"]
+    assert "витрина недоступна" in blind[0]["blind_spend"]["unavailable"]
+    assert [r for r in reports if "account" in r], "кабинет обработан"
+
+
 # =========================================================================
 # Дефект 3: кулдаун обязан включать неоткатанный пробой
 # =========================================================================
@@ -1715,7 +1768,7 @@ def test_campaign_limit_is_shared_across_cabinets(monkeypatch, capsys):
 
     touched = sum(len(c.read) for c in _MultiCabinetClient.instances)
     assert touched == 1, "потолок кампаний обязан считаться на все кабинеты сразу"
-    reports = {r["account"]: r for r in _reports(capsys)}
+    reports = {r["account"]: r for r in _reports(capsys) if "account" in r}
     assert reports["acc-2"]["campaigns_touched"] == 0
 
 
@@ -2040,7 +2093,7 @@ def test_schedule_is_reported_even_when_it_changes_nothing(monkeypatch, capsys):
     _patch_schedule_run(monkeypatch, [_setting("schedule:hour", "3", 1.0)])
 
     assert agent_e1.main() == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
 
     assert report["schedule"]["significant_hours"] == 0
     assert "пороги значимости" in report["schedule"]["reason"]
@@ -2056,7 +2109,7 @@ def test_schedule_alone_is_enough_to_work(monkeypatch, capsys):
     _patch_schedule_run(monkeypatch, [_setting("schedule:hour", "3", -40.0)])
 
     assert agent_e1.main() == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
 
     # Полный отчёт (а не короткий с verdict) — прогон нашёл, что делать.
     assert "verdict" not in report
@@ -2071,7 +2124,7 @@ def test_stale_settings_block_the_schedule_too(monkeypatch, capsys):
     _patch_schedule_run(monkeypatch, [_setting("schedule:hour", "3", -40.0, calc_date=old)])
 
     assert agent_e1.main() == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
 
     assert report["verdict"] == "STALE_COMPUTED_SETTINGS"
     sent = [s for c in _ScheduleClient.instances for s in c.sent]
@@ -2190,7 +2243,7 @@ def test_learning_cooldown_blocks_action_that_would_restart_learning(monkeypatch
         learning_resets={"111": date.today() - timedelta(days=3)})
 
     assert agent_e1.main() == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
 
     sent = [s for c in _ScheduleClient.instances for s in c.sent]
     assert [s for s in sent if s[0] == "campaigns"] == [], \
@@ -2212,7 +2265,7 @@ def test_learning_cooldown_lets_the_action_through_when_history_is_old(monkeypat
             days=agent_e1.LEARNING_COOLDOWN_DAYS + 1)})
 
     assert agent_e1.main() == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
 
     sent = [s for c in _ScheduleClient.instances for s in c.sent]
     assert [s for s in sent if s[0] == "campaigns"], "действие не дошло до кабинета"
@@ -2313,7 +2366,7 @@ def test_suspend_without_growth_address_does_not_reach_the_cabinet(monkeypatch, 
     _patch_switch_run(monkeypatch, daily_cost={"111": 1000.0})
 
     assert agent_e1.main() == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
 
     sent = [s for c in _MultiCabinetClient.instances for s in c.sent]
     assert sent == [], "сокращение без адресата роста ушло в кабинет"
@@ -2336,7 +2389,7 @@ def test_balance_gate_leaves_a_tact_that_does_not_cut_alone(monkeypatch, capsys)
     )
 
     assert agent_e1.main() == 0
-    report = json.loads(capsys.readouterr().out)
+    report = _reports(capsys)[0]
 
     sent = [s for c in _MultiCabinetClient.instances for s in c.sent]
     assert len(sent) == 1, "действие, которое ничего не режет, не дошло до кабинета"
