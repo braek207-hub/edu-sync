@@ -108,18 +108,23 @@ def test_risk_object_is_the_object_not_the_action():
     assert risk_object(_act("k3", object_id="222")) != risk_object(a)
 
 
-def test_same_campaign_is_charged_once_per_run():
-    # Две корректировки одной кампании: расход кампании один, сколько бы
-    # корректировок ей ни ставили. Полная цена — первому действию, 0 — второму.
-    actions = [_act("a", object_id="111"), _act("b", object_id="111")]
-    risks = {"a": 7000.0, "b": 7000.0}
+def test_each_change_pays_its_own_delta_up_to_the_object_cap():
+    # Дельта-модель: каждая правка платит СВОЮ цену, а не «первая платит за
+    # всю кампанию, остальные бесплатно». Сумма списаний по объекту ограничена
+    # его потолком — больше, чем кампания тратит за горизонт, потерять на ней
+    # нельзя, сколько бы правок в неё ни внесли.
+    actions = [_act("a", object_id="111"), _act("b", object_id="111"),
+               _act("c", object_id="111")]
+    risks = {"a": 3000.0, "b": 3000.0, "c": 3000.0}
+    caps = {"campaign:111": 7000.0}
 
-    fits, deferred = fit_into_budget(actions, risks, remaining_rub=10_000.0)
+    fits, deferred = fit_into_budget(actions, risks, remaining_rub=10_000.0,
+                                     caps=caps)
 
-    assert [a["idempotency_key"] for a in fits] == ["a", "b"]
+    assert [a["idempotency_key"] for a in fits] == ["a", "b", "c"]
     assert deferred == []
-    assert [a["risk_rub"] for a in fits] == [7000.0, 0.0]
-    # Сумма, уходящая в журнал, равна цене ОДНОЙ кампании, а не двух.
+    # Третья правка упирается в потолок объекта и доплачивает только остаток.
+    assert [a["risk_rub"] for a in fits] == [3000.0, 3000.0, 1000.0]
     assert sum(a["risk_rub"] for a in fits) == 7000.0
 
 
@@ -133,27 +138,32 @@ def test_different_campaigns_are_charged_separately():
     assert [a["idempotency_key"] for a in deferred] == ["b"]
 
 
-def test_charged_objects_carry_across_calls_within_one_run():
-    # Множество оплаченных объектов общее на прогон: кабинеты обрабатываются
-    # по очереди, и второй вызов не должен снова платить за уже оплаченное.
-    charged = set()
-    fit_into_budget([_act("a", object_id="111")], {"a": 7000.0}, 10_000.0, charged)
+def test_charged_amounts_carry_across_calls_within_one_run():
+    # Счёт списаний по объекту общий на прогон: кабинеты обрабатываются по
+    # очереди, и второй вызов обязан видеть, сколько по объекту уже списано.
+    charged = {}
+    caps = {"campaign:111": 7000.0}
+    fit_into_budget([_act("a", object_id="111")], {"a": 5000.0}, 10_000.0,
+                    charged, caps)
 
-    fits, _ = fit_into_budget([_act("b", object_id="111")], {"b": 7000.0}, 10_000.0, charged)
+    fits, _ = fit_into_budget([_act("b", object_id="111")], {"b": 5000.0},
+                              10_000.0, charged, caps)
 
-    assert fits[0]["risk_rub"] == 0.0
+    # Остаток до потолка объекта — 2000, его и платит вторая правка.
+    assert fits[0]["risk_rub"] == 2000.0
 
 
 def test_deferred_action_does_not_mark_object_as_paid():
     # Действие, не влезшее в бюджет, объект не помечает — иначе следующее
     # действие по той же кампании прошло бы бесплатно за счёт так и не
     # применённого первого.
-    charged = set()
+    charged = {}
     actions = [_act("a", object_id="111"), _act("b", object_id="111")]
     risks = {"a": 7000.0, "b": 7000.0}
 
-    fits, deferred = fit_into_budget(actions, risks, remaining_rub=100.0, charged_objects=charged)
+    fits, deferred = fit_into_budget(actions, risks, remaining_rub=100.0,
+                                     charged_by_object=charged)
 
     assert fits == []
     assert len(deferred) == 2
-    assert charged == set()
+    assert charged == {}

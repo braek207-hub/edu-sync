@@ -15,7 +15,7 @@ previous_state заполняется ДО применения: без него
 import hashlib
 from typing import Any, Dict, List
 
-from sync.agent.writer import schedule
+from sync.agent.writer import exposure, schedule
 
 
 def _idempotency_key(campaign_id: str, direct_type: str, key: str, percent: int) -> str:
@@ -61,6 +61,10 @@ def diff_schedule(
         "action_kind": "schedule.set",
         "object_level": "campaign",
         "object_id": str(campaign_id),
+        # Расписание двигает ставку всей кампании, поэтому доля объекта здесь
+        # единица, а цену задаёт средний по суткам сдвиг (writer/exposure.py).
+        "exposure": exposure.schedule_exposure(
+            schedule.percent_by_hour(desired_items)),
         # Тип и ключ заполнены и здесь: по ним адресуются кулдаун после отката
         # и счётчик попыток. Без них расписание жило бы вне этих механизмов —
         # то есть переотправлялось бы вечно и после вредного вердикта.
@@ -112,6 +116,10 @@ def diff_modifiers(
             "action_kind": action_kind,
             "object_level": "campaign",
             "object_id": str(campaign_id),
+            # Цена риска этого действия: доля сегмента × сила сдвига, а не
+            # расход всей кампании (writer/exposure.py). Доля приходит из
+            # плана; её отсутствие честно означает «весь объект».
+            "exposure": exposure.bid_modifier_exposure(percent, item.get("share")),
             # Вид и ключ корректировки — на верхнем уровне действия, а не
             # только внутри payload: у bidmodifier.set payload несёт лишь Id,
             # и без этих полей отчёт прогона не мог бы сказать, ЧТО именно

@@ -38,6 +38,7 @@ import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.confidence import assess
+from sync.agent.writer import exposure
 
 # Факты расхода с НДС, лимиты кабинета без. Ставка НДС РФ; менялась в 2019 —
 # если изменится снова, конверсия обязана поехать за ней.
@@ -350,6 +351,11 @@ def diff_budget(
                 "action_kind": BUDGET_KIND,
                 "object_level": "campaign",
                 "object_id": str(cid),
+                # Под ударом — разница между новым лимитом и фактическим
+                # расходом, а не весь расход кампании: прежние деньги уже
+                # тратились и не становятся сомнительными от сдвига потолка.
+                "exposure": exposure.budget_exposure(
+                    target_micros / MICROS / 7.0, spend / 7.0),
                 # Тип и ключ адресуют кулдаун и счётчик попыток — как у
                 # расписания: без них бюджет жил бы вне этих механизмов.
                 "direct_type": "WEEKLY_SPEND_LIMIT",
@@ -389,6 +395,8 @@ def diff_budget(
                 "action_kind": BUDGET_DAILY_KIND,
                 "object_level": "campaign",
                 "object_id": str(cid),
+                "exposure": exposure.budget_exposure(
+                    target_daily_micros / MICROS, spend / 7.0),
                 "direct_type": "DAILY_BUDGET",
                 "key": "daily",
                 "payload": {

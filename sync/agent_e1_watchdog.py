@@ -955,6 +955,23 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
                                "error": f"{type(exc).__name__}: {exc}"[:200]})
             continue
 
+        # Наблюдение закрывается либо по исчерпанию горизонта, либо ДОСРОЧНО —
+        # когда вердикт уже определён. Пока действие «под наблюдением», оно
+        # держит риск-бюджет и кулдаун своей кампании, и следующая правка по
+        # ней не начинается: лишние дни ожидания — прямая потеря темпа. На
+        # живых данных 39 % кампаний набирают порог наблюдений за неделю,
+        # то есть горизонт для них вдвое длиннее необходимого.
+        if state == STATE_WATCHED and not (verdict.get("window") or {}).get("closed"):
+            observed_now = verdict.get("observed") or {}
+            red = action.get("red_line") or {}
+            enough_days = int(observed_now.get("days") or 0) >= EARLY_CLOSE_MIN_DAYS
+            enough_leads = (int(observed_now.get("leads") or 0)
+                            >= int(red.get("min_leads") or MIN_LEADS_FOR_VERDICT))
+            certain = closing_verdict(observed_now, action) in ("improved", "worsened")
+            if enough_days and enough_leads and certain:
+                verdict = {**verdict, "early_close": True,
+                           "window": {**(verdict.get("window") or {}), "closed": True}}
+
         if state == STATE_WATCHED and (verdict.get("window") or {}).get("closed"):
             # Горизонт закрыт, линия не пробита: изменение ВЫДЕРЖАЛО. Исход
             # уходит в историю экспериментов, строка — из наблюдения (Э2.4).
@@ -1260,6 +1277,11 @@ def main() -> int:
 # Порог зависшей строки — тот же час, что у e1 (STALE_PLANNED_MINUTES) и у
 # срока аренды: процесс, молчащий дольше, по общему критерию считается мёртвым.
 STALE_SWEEP_MINUTES = 60
+
+# Минимум дней наблюдения для ДОСРОЧНОГО закрытия. Полная неделя, потому что
+# недельный ритм рекламы (будни против выходных) сам по себе даёт разницу,
+# которую легко принять за эффект действия.
+EARLY_CLOSE_MIN_DAYS = 7
 
 # Потолок сезонной поправки красной линии. Кабинет дорожает и дешевеет вместе
 # с рынком, и порог обязан двигаться следом — иначе перелом сезона устраивает

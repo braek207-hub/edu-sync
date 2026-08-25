@@ -27,7 +27,10 @@ sync/agent/writer/negatives.py — Э3.6 (запись): минус-фразы �
 
 import hashlib
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from sync.agent.objects import CANDIDATE_WINDOW_DAYS
+from sync.agent.writer import exposure
 
 NEGATIVE_KIND = "negative.add"
 
@@ -106,18 +109,26 @@ def plan_negatives(
     over_cap = len(valid) - len(taken)
 
     desired: Dict[str, List[str]] = {}
+    # Сколько денег каждая кампания перестанет тратить, если фразы уедут в
+    # минус: вход цены риска. Считается по той же выборке taken, что и сами
+    # фразы, — иначе рычаг платил бы за трафик, который не отсекает.
+    cut_cost: Dict[str, float] = {}
     for candidate in taken:
+        split = candidate.get("cost_by_campaign") or {}
         for campaign_id in candidate.get("campaigns") or []:
             if not campaign_id:
                 continue
             phrases = desired.setdefault(str(campaign_id), [])
             if candidate["phrase"] not in phrases:
                 phrases.append(candidate["phrase"])
+            cut_cost[str(campaign_id)] = cut_cost.get(str(campaign_id), 0.0) + float(
+                split.get(str(campaign_id), 0.0))
     for phrases in desired.values():
         phrases.sort()
 
     return {
         "desired": desired,
+        "cut_cost": {cid: round(v, 2) for cid, v in sorted(cut_cost.items())},
         "over_cap": over_cap,
         "invalid": invalid,
         "cost_covered": round(sum(float(c.get("cost") or 0.0) for c in taken), 2),
@@ -153,6 +164,8 @@ def _idempotency_key(campaign_id: str, phrases: List[str]) -> str:
 def diff_negatives(
     desired: Dict[str, List[str]],
     actual_by_campaign: Dict[str, Dict[str, Any]],
+    cut_cost: Optional[Dict[str, float]] = None,
+    window_days: int = CANDIDATE_WINDOW_DAYS,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Желаемые фразы × прочитанные списки кабинета → (действия, отказы).
 
@@ -178,10 +191,16 @@ def diff_negatives(
         if merged == sorted(existing):
             continue
 
+        # Цена риска — дневной расход отсекаемого трафика. Расход кандидатов
+        # собран за окно наблюдения (CANDIDATE_WINDOW_DAYS), поэтому делится
+        # на него: горизонт замера риска считает дни, а не окна.
+        cut_daily = float((cut_cost or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
         actions.append({
             "action_kind": NEGATIVE_KIND,
             "object_level": "campaign",
             "object_id": str(campaign_id),
+            "exposure": exposure.traffic_cut_exposure(
+                cut_daily, f"минус-фразы ({len([p for p in merged if p not in existing])})"),
             "direct_type": "NEGATIVE_KEYWORDS",
             "key": "campaign",
             "payload": {
@@ -280,10 +299,18 @@ def candidates_from_computed(
             slot = by_phrase.setdefault(phrase, {
                 "query": phrase, "cost": 0.0, "clicks": 0,
                 "conversions": 0, "campaigns": [],
+                "cost_by_campaign": {},
                 "reason": row.get("reason"),
             })
-            slot["cost"] += float(row.get("value") or 0.0)
+            cost = float(row.get("value") or 0.0)
+            slot["cost"] += cost
             slot["clicks"] += int(row.get("raw_value") or 0)
+            # Расход фразы В ЭТОЙ кампании — множитель цены риска: минус-фраза
+            # ставит под удар ровно тот трафик, который отсекает, а не расход
+            # всей кампании (writer/exposure.py). Сумма по кампаниям здесь уже
+            # разложена строками computed, собирать её обратно не нужно.
+            slot["cost_by_campaign"][str(campaign_id)] = (
+                slot["cost_by_campaign"].get(str(campaign_id), 0.0) + cost)
             if str(campaign_id) not in slot["campaigns"]:
                 slot["campaigns"].append(str(campaign_id))
     return sorted(by_phrase.values(), key=lambda c: -c["cost"])

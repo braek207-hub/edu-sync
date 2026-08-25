@@ -14,7 +14,10 @@ sync/agent/writer/placements.py — Э3.7 (запись): запрет площ�
 
 import hashlib
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from sync.agent.objects import CANDIDATE_WINDOW_DAYS
+from sync.agent.writer import exposure
 
 PLACEMENT_KIND = "placement.exclude"
 PLACEMENT_SETTING_KIND = "excluded_site"
@@ -77,18 +80,24 @@ def plan_placements(
     taken = valid[:max_per_tick]
 
     desired: Dict[str, List[str]] = {}
+    # Вырезаемый расход по кампаниям — вход цены риска, как у минус-фраз.
+    cut_cost: Dict[str, float] = {}
     for candidate in taken:
+        split = candidate.get("cost_by_campaign") or {}
         for campaign_id in candidate.get("campaigns") or []:
             if not campaign_id:
                 continue
             sites = desired.setdefault(str(campaign_id), [])
             if candidate["site"] not in sites:
                 sites.append(candidate["site"])
+            cut_cost[str(campaign_id)] = cut_cost.get(str(campaign_id), 0.0) + float(
+                split.get(str(campaign_id), 0.0))
     for sites in desired.values():
         sites.sort()
 
     return {
         "desired": desired,
+        "cut_cost": {cid: round(v, 2) for cid, v in sorted(cut_cost.items())},
         "over_cap": len(valid) - len(taken),
         "invalid": invalid,
         "cost_covered": round(sum(float(c.get("cost") or 0.0) for c in taken), 2),
@@ -121,6 +130,8 @@ def _idempotency_key(campaign_id: str, sites: List[str]) -> str:
 def diff_placements(
     desired: Dict[str, List[str]],
     actual_by_campaign: Dict[str, Dict[str, Any]],
+    cut_cost: Optional[Dict[str, float]] = None,
+    window_days: int = CANDIDATE_WINDOW_DAYS,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Желаемые запреты × прочитанные списки кабинета → (действия, отказы)."""
     actions: List[Dict[str, Any]] = []
@@ -139,10 +150,13 @@ def diff_placements(
         if merged == sorted(existing):
             continue
 
+        cut_daily = float((cut_cost or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
         actions.append({
             "action_kind": PLACEMENT_KIND,
             "object_level": "campaign",
             "object_id": str(campaign_id),
+            "exposure": exposure.traffic_cut_exposure(
+                cut_daily, f"запрет площадок ({len([s for s in merged if s not in existing])})"),
             "direct_type": "EXCLUDED_SITES",
             "key": "campaign",
             "payload": {
@@ -195,10 +209,16 @@ def candidates_from_computed(
             slot = by_site.setdefault(site, {
                 "placement": site, "cost": 0.0, "clicks": 0,
                 "conversions": 0, "campaigns": [],
+                "cost_by_campaign": {},
                 "reason": row.get("reason"),
             })
-            slot["cost"] += float(row.get("value") or 0.0)
+            cost = float(row.get("value") or 0.0)
+            slot["cost"] += cost
             slot["clicks"] += int(row.get("raw_value") or 0)
+            # Расход площадки В ЭТОЙ кампании — вход цены риска: запрет
+            # ставит под удар вырезаемый трафик, а не всю кампанию.
+            slot["cost_by_campaign"][str(campaign_id)] = (
+                slot["cost_by_campaign"].get(str(campaign_id), 0.0) + cost)
             if str(campaign_id) not in slot["campaigns"]:
                 slot["campaigns"].append(str(campaign_id))
     return sorted(by_site.values(), key=lambda c: -c["cost"])

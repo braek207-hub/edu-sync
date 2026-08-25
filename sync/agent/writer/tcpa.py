@@ -28,6 +28,7 @@ import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.confidence import assess
+from sync.agent.writer import exposure
 
 MICROS = 1_000_000
 
@@ -226,6 +227,10 @@ def diff_tcpa(
             "action_kind": TCPA_KIND,
             "object_level": "campaign",
             "object_id": str(cid),
+            # Цель двигает объём всей кампании, но под ударом не весь её
+            # расход, а относительный сдвиг цели (writer/exposure.py).
+            "exposure": exposure.tcpa_exposure(target_micros / MICROS,
+                                               current_micros / MICROS),
             "direct_type": "AVERAGE_CPA",
             "key": "target_cpa",
             "payload": {

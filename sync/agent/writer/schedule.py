@@ -146,6 +146,17 @@ def time_targeting_payload(
     return payload
 
 
+def percent_by_hour(desired_items: List[str]) -> Dict[str, int]:
+    """Профиль в дельтах: {час: отклонение от нейтрали в процентах}.
+
+    Нужен цене риска (writer/exposure.py): она считает силу сдвига по суткам,
+    а Items хранят 100-базные коэффициенты. Берётся первый день недели —
+    расчёт Э0 строит один профиль на все семь.
+    """
+    hours = parse_items(desired_items).get(DAYS[0], [NEUTRAL] * HOURS)
+    return {str(i): int(h) - NEUTRAL for i, h in enumerate(hours)}
+
+
 def describe(desired_items: List[str]) -> Tuple[int, int, int]:
     """(сколько часов поднято, сколько опущено, сколько нейтрально) — для отчёта."""
     hours = parse_items(desired_items).get(DAYS[0], [NEUTRAL] * HOURS)

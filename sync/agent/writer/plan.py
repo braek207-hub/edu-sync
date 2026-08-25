@@ -184,6 +184,43 @@ def direct_type_for(kind: str, key: str) -> Tuple[Optional[str], str, str]:
     return direct_type, str(key).strip(), ""
 
 
+def segment_shares(computed: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
+    """Доля каждого сегмента внутри своего вида: {(вид, ключ): 0..1}.
+
+    Нужна цене риска: корректировка сегмента ставит под удар только его долю
+    объекта, а не весь расход кампании (writer/exposure.py). Считается по
+    support_n — кликам сегмента, которые расчёт Э0 уже принёс со строкой;
+    отдельного обращения к витрине не требуется.
+
+    Клики, а не расход: расхода в разрезе сегмента строка не несёт. Разница
+    между долей кликов и долей денег — это разница в цене клика между
+    сегментами (десктоп дороже мобильного), она в пределах полутора раз и
+    целиком покрыта запасом BID_ELASTICITY. Занижения доли она не создаёт
+    систематически, а завышение цены риска не опасно — оно консервативно.
+
+    Знаменатель — сумма support_n строк того же вида. В расчёт попадают
+    только сегменты, прошедшие порог наблюдений, поэтому знаменатель немного
+    меньше полного объёма, а доли — немного больше настоящих. Это тоже в
+    консервативную сторону.
+    """
+    totals: Dict[str, float] = {}
+    for row in computed:
+        kind = str(row.get("setting_kind") or "")
+        if not kind.startswith("bid_modifier:"):
+            continue
+        totals[kind] = totals.get(kind, 0.0) + float(row.get("support_n") or 0)
+
+    shares: Dict[Tuple[str, str], float] = {}
+    for row in computed:
+        kind = str(row.get("setting_kind") or "")
+        total = totals.get(kind, 0.0)
+        if total <= 0:
+            continue
+        shares[(kind, str(row.get("setting_key")))] = (
+            float(row.get("support_n") or 0) / total)
+    return shares
+
+
 def plan_bid_modifiers(
     computed: List[Dict[str, Any]],
     min_support: int = MIN_SUPPORT,
@@ -207,6 +244,8 @@ def plan_bid_modifiers(
     unsupported: List[Dict[str, Any]] = []
     low_confidence: List[Dict[str, Any]] = []
     confidence_unknown = 0
+
+    shares = segment_shares(computed)
 
     for row in computed:
         kind = str(row.get("setting_kind") or "")
@@ -266,6 +305,10 @@ def plan_bid_modifiers(
             "key": key,
             "percent": percent,
             "support_n": int(row.get("support_n") or 0),
+            # Доля объекта, которую занимает сегмент, — множитель цены риска
+            # (writer/exposure.py). None значит «установить не удалось»: там
+            # под ударом считается весь объект.
+            "share": shares.get((kind, str(row.get("setting_key")))),
         })
 
     desired, crowded_out = _resolve_device_exclusion(desired)

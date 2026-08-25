@@ -72,7 +72,16 @@ from sync.agent.writer.guardrails import (
 from sync.agent.writer.plan import plan_bid_modifiers, plan_schedule
 from sync.agent.writer.schedule import describe as describe_schedule
 from sync.agent.writer.schedule import schedule_changed, schedule_items
-from sync.agent.writer.risk import action_risk, fit_into_budget, median, week_start
+from sync.agent.writer.risk import (
+    action_risk,
+    action_risk_basis,
+    fit_into_budget,
+    median,
+    object_cap,
+    object_daily_cost,
+    risk_object,
+    week_start,
+)
 from sync.agent.writer.rollback import red_line_for
 from sync.agent.writer.units import api_to_delta
 
@@ -574,6 +583,33 @@ def action_label(action: Dict[str, Any]) -> str:
     return f"{action.get('direct_type')}:{action.get('key')} {percent:+d}% ({kind})"
 
 
+def _risk_pricing(prepared: List[Dict[str, Any]],
+                  caps: Dict[str, float]) -> Dict[str, Any]:
+    """Что дала дельта-модель: сколько списано против прежней арифметики.
+
+    Прежняя цена набора — сумма ПОТОЛКОВ затронутых объектов: старая модель
+    брала за первое действие по кампании её расход за горизонт целиком, и это
+    ровно cap. Отношение показывает, во сколько раз честная арифметика
+    освободила бюджет риска; по нему же видно, если освобождение оказалось
+    иллюзией — например, когда доля сегмента у всех действий неизвестна.
+    """
+    charged = round(sum(a["risk_rub"] for a in prepared), 2)
+    touched = {risk_object(a) for a in prepared}
+    old_model = round(sum(caps.get(o, 0.0) for o in touched), 2)
+    by_basis: Dict[str, int] = {}
+    for a in prepared:
+        basis = str(a.get("risk_basis") or "—")
+        by_basis[basis] = by_basis.get(basis, 0) + 1
+    return {
+        "charged_rub": charged,
+        "old_model_rub": old_model,
+        "cheaper_times": (round(old_model / charged, 1)
+                          if charged > 0 else None),
+        "objects_touched": len(touched),
+        "by_basis": dict(sorted(by_basis.items(), key=lambda kv: -kv[1])[:PREVIEW_SAMPLE_LIMIT]),
+    }
+
+
 def actions_preview(
     actions: List[Dict[str, Any]], limit: int = PREVIEW_SAMPLE_LIMIT
 ) -> Dict[str, Any]:
@@ -997,7 +1033,7 @@ def run_account(
     baseline_window = ctx.get("baseline_window")
     absolute_max_cpa = ctx["absolute_max_cpa"]
     holdout_ids = ctx["holdout_ids"]
-    charged_objects = ctx["charged_objects"]
+    charged_risk = ctx["charged_risk"]
     wk = ctx["week_start"]
     lease = ctx.get("lease")
 
@@ -1270,7 +1306,8 @@ def run_account(
     negatives_state = (negatives.fetch_negatives(client, sorted(negatives_desired))
                        if negatives_desired else {})
     negatives_actions, negatives_refused = negatives.diff_negatives(
-        negatives_desired, negatives_state)
+        negatives_desired, negatives_state,
+        cut_cost=negatives_plan.get("cut_cost"))
     negatives_not_found = sorted(c for c in negatives_desired
                                  if c not in negatives_state)
     negatives_planned_count = 0
@@ -1290,7 +1327,8 @@ def run_account(
     placements_state = (placements.fetch_excluded_sites(
         client, sorted(placements_desired)) if placements_desired else {})
     placements_actions, placements_refused = placements.diff_placements(
-        placements_desired, placements_state)
+        placements_desired, placements_state,
+        cut_cost=placements_plan.get("cut_cost"))
     placements_not_found = sorted(c for c in placements_desired
                                   if c not in placements_state)
     placements_planned_count = 0
@@ -1372,13 +1410,30 @@ def run_account(
             continue
         with_red_line.append({**a, "red_line": red_line})
 
-    risks = {a["idempotency_key"]: action_risk(a, daily_cost) for a in with_red_line}
+    # Цена действия — его ДЕЛЬТА (доля сегмента, вырезанный трафик, сдвиг
+    # лимита), а не расход всей кампании; потолок объекта не даёт сумме дельт
+    # превысить его расход за горизонт. Разбор — sync/agent/writer/exposure.py.
+    # Базовый расход и основание цены едут со строкой в журнал: первый читает
+    # красная линия обвала, второе — человек, проверяющий модель.
+    risks: Dict[str, float] = {}
+    caps: Dict[str, float] = {}
+    priced: List[Dict[str, Any]] = []
+    for a in with_red_line:
+        risks[a["idempotency_key"]] = action_risk(a, daily_cost)
+        caps[risk_object(a)] = object_cap(a, daily_cost)
+        baseline = object_daily_cost(a, daily_cost)
+        priced.append({
+            **a,
+            "baseline_daily_rub": None if baseline == float("inf") else round(baseline, 2),
+            "risk_basis": action_risk_basis(a, daily_cost),
+        })
     # Бюджет читается заново для каждого кабинета: он общий на весь прогон,
     # а не на кабинет, и предыдущий клиент этого же прогона мог его уже
     # частично занять (spent_risk читает applied_at из журнала, куда
     # apply_actions уже успел записать применённые действия).
     remaining = writer_db.risk_limit(wk, DEFAULT_WEEKLY_RISK_RUB) - writer_db.spent_risk(wk)
-    prepared, deferred = fit_into_budget(with_red_line, risks, remaining, charged_objects)
+    prepared, deferred = fit_into_budget(priced, risks, remaining,
+                                         charged_risk, caps)
     ctx["remaining_cap"] -= len(prepared)
 
     report = apply_actions(client, prepared, writer_db, lease=lease)
@@ -1486,6 +1541,10 @@ def run_account(
         },
         "remaining_risk_rub": round(remaining, 2),
         "risk_charged_rub": round(sum(a["risk_rub"] for a in prepared), 2),
+        # Дельта-модель против прежней: во сколько раз дешевле обошёлся тот
+        # же набор действий. Без этой строки переход проверить нечем — цена
+        # в журнале не говорит, что она была бы другой при старой арифметике.
+        "risk_pricing": _risk_pricing(prepared, caps),
         "absolute_max_cpa": absolute_max_cpa,
         # Состав того, что уходит (или ушло бы) в кабинет. В режиме
         # репетиции это единственное место, где он вообще виден.
@@ -1630,15 +1689,12 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     # он не зависит от того, на сколько кабинетов эти изменения разложены.
     # Внутри цикла по четырём кабинетам потолок был вчетверо выше заявленного.
     remaining_cap = MAX_ACTIONS_PER_RUN
-    # Объекты, риск которых уже оплачен. Заводится из журнала НЕДЕЛИ, а не
-    # пустым: цена ошибки — расход кампании за горизонт замера, и он у кампании
-    # один, сколько бы правок ей ни сделали и в скольких прогонах. Окно и
-    # фильтр — те же, что у spent_risk: неделя плюс горизонт замера назад,
-    # откатанные строки не освобождают место. Пустое
-    # множество означало «каждый прогон платит за ту же кампанию заново»: на
-    # неделе 2026-08-17 одно касание кампании 114057545 стоило 38 876 ₽ из
-    # 50 000, и вторая правка той же кампании не проходила уже никогда.
-    charged_objects: Set[str] = writer_db.charged_objects(wk)
+    # Сколько риска по каждому объекту уже списано. Заводится из журнала
+    # НЕДЕЛИ, а не пустым: потолок объекта (его расход за горизонт замера)
+    # общий на все прогоны недели, иначе каждый запуск начинал бы добор
+    # заново. Окно и фильтр — те же, что у spent_risk: неделя плюс горизонт
+    # замера назад, откатанные строки места не освобождают.
+    charged_risk: Dict[str, float] = writer_db.charged_risk_by_object(wk)
 
     ctx: Dict[str, Any] = {
         "daily_cost": daily_cost,
@@ -1654,7 +1710,7 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "baseline_window": (cutoff, crm_through.isoformat()) if crm_through else None,
         "absolute_max_cpa": absolute_max_cpa,
         "holdout_ids": holdout_ids,
-        "charged_objects": charged_objects,
+        "charged_risk": charged_risk,
         "week_start": wk,
         "remaining_cap": remaining_cap,
         # Ограничитель кампаний — один объект на весь прогон: его остаток

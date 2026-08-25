@@ -1783,3 +1783,41 @@ def test_season_wide_cpa_rise_does_not_breach_the_red_line():
                              date(2026, 8, 19), account_totals=totals)
     assert verdict["state"] != watchdog.STATE_BREACHED
     assert verdict["seasonal_factor"] > 1.0
+
+
+# ------------------- досрочное закрытие: не ждать горизонта без нужды
+
+
+def test_watch_closes_early_when_the_verdict_is_already_certain():
+    # Кампания набрала объём и показала определённый эффект на первой неделе.
+    # Ждать полного горизонта незачем: пока действие «под наблюдением», оно
+    # держит риск-бюджет и кулдаун, и следующая правка этой кампании не
+    # начинается. На живых данных 39 % кампаний набирают порог за 7 дней —
+    # для них горизонт вдвое длиннее необходимого.
+    action = _action()
+    # today выбран так, чтобы окно наблюдения было ровно теми 7 днями, за
+    # которые есть факты: иначе прогон честно упрётся в неполное покрытие.
+    facts = {"111": _facts("111", date(2026, 8, 2), 7, cost=1000.0, leads=10)}
+    report, client, db = _run(action, facts, today=date(2026, 8, 11))
+    assert report["closed_held"] == 1
+    assert db.observation_closed == [("act-1", "improved")]
+
+
+def test_early_close_needs_a_full_week():
+    # Три дня — не наблюдение: недельный ритм рекламы (будни против выходных)
+    # сам по себе даёт разницу, которую легко принять за эффект.
+    action = _action()
+    facts = {"111": _facts("111", date(2026, 8, 2), 3, cost=1000.0, leads=20)}
+    report, client, db = _run(action, facts, today=date(2026, 8, 9))
+    assert report["closed_held"] == 0
+
+
+def test_early_close_does_not_fire_on_an_inconclusive_effect():
+    # Эффект меньше собственной ошибки — исход неотличим от нуля. Такое
+    # действие обязано досматриваться до конца горизонта: вдруг определится.
+    action = _action(red_line={"metric": "cpa", "max_value": 1000.0,
+                               "min_leads": 20, "baseline_cpa": 700.0,
+                               "has_baseline": True})
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=2800.0, leads=4)}
+    report, client, db = _run(action, facts, today=date(2026, 8, 14))
+    assert report["closed_held"] == 0

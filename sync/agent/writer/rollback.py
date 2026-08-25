@@ -153,19 +153,32 @@ def is_spend_collapsed(
 ) -> Tuple[bool, str]:
     """Обвалился ли расход объекта после применения действия.
 
-    Сравнивается средний дневной расход окна с ожидаемым дневным
-    (risk_rub / days_to_measure). Средний, а не последний день: обвал —
-    состояние, а не событие, и один тихий день его не доказывает — как и
-    один шумный не опровергает.
+    Сравнивается средний дневной расход окна с ожидаемым дневным. Средний, а
+    не последний день: обвал — состояние, а не событие, и один тихий день его
+    не доказывает — как и один шумный не опровергает.
+
+    Ожидание берётся из baseline_daily_rub — расхода объекта на момент
+    применения. Прежде оно выводилось из risk_rub (risk_rub / горизонт), и
+    это было верно ровно до дельта-модели: пока цена действия равнялась
+    расходу объекта, из неё этот расход и восстанавливался. Теперь risk_rub —
+    цена конкретной правки (доля сегмента, вырезанный трафик), она меньше
+    расхода объекта в разы, и ожидание по ней провалилось бы вместе с ней:
+    кампания могла бы встать почти полностью, оставаясь «выше ожидания».
+    Старые строки журнала своей колонки не имеют — для них прежний вывод из
+    risk_rub сохранён, иначе наблюдение за ними оборвалось бы на переходе.
     """
     if str(action.get("action_kind") or "") in SPEND_COLLAPSE_EXEMPT_KINDS:
         return False, ""
     days = int(observed.get("days") or 0)
     if days < MIN_DAYS_FOR_SPEND_VERDICT:
         return False, f"наблюдаемых дней {days} из {MIN_DAYS_FOR_SPEND_VERDICT}"
-    expected_daily = float(action.get("risk_rub") or 0.0) / days_to_measure
+    baseline = action.get("baseline_daily_rub")
+    if baseline is None:
+        expected_daily = float(action.get("risk_rub") or 0.0) / days_to_measure
+    else:
+        expected_daily = float(baseline)
     if expected_daily <= 0:
-        return False, "ожидаемый расход неизвестен (risk_rub пуст)"
+        return False, "ожидаемый расход неизвестен (базовый расход не записан)"
     actual_daily = float(observed.get("cost") or 0.0) / days
     if actual_daily < SPEND_COLLAPSE_SHARE * expected_daily:
         return True, (f"обвал расхода: {actual_daily:.0f} ₽/день при ожидании "

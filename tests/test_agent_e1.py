@@ -314,7 +314,7 @@ def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeyp
                         lambda: date.today() - timedelta(days=3))
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
-    monkeypatch.setattr(agent_e1.writer_db, "charged_objects", lambda *_: set())
+    monkeypatch.setattr(agent_e1.writer_db, "charged_risk_by_object", lambda *_: {})
     monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: [])
     monkeypatch.setattr(agent_e1, "WriteClient", _FakeWriteClient)
     _patch_infra(monkeypatch)
@@ -383,7 +383,7 @@ def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatc
                         lambda: date.today() - timedelta(days=3))
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
-    monkeypatch.setattr(agent_e1.writer_db, "charged_objects", lambda *_: set())
+    monkeypatch.setattr(agent_e1.writer_db, "charged_risk_by_object", lambda *_: {})
     monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
     monkeypatch.setattr(agent_e1.writer_db, "insert_action", lambda action: 1)
     monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: True)
@@ -425,7 +425,7 @@ def _patch_single_account(monkeypatch, computed, campaign_computed=None):
                         lambda: date.today() - timedelta(days=3))
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
-    monkeypatch.setattr(agent_e1.writer_db, "charged_objects", lambda *_: set())
+    monkeypatch.setattr(agent_e1.writer_db, "charged_risk_by_object", lambda *_: {})
     monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
     monkeypatch.setattr(agent_e1.writer_db, "insert_action", lambda action: 1)
     monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: True)
@@ -613,7 +613,7 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
                         lambda: date.today() - timedelta(days=3))
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
-    monkeypatch.setattr(agent_e1.writer_db, "charged_objects", lambda *_: set())
+    monkeypatch.setattr(agent_e1.writer_db, "charged_risk_by_object", lambda *_: {})
     # Прогон не читает зависшие строки, а ПОМЕЧАЕТ их: mark_stale_planned
     # возвращает только впервые обнаруженные (writer/db.py::MARK_STALE_SQL).
     monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: list(stale))
@@ -713,10 +713,11 @@ def test_action_cap_is_shared_across_cabinets(monkeypatch, capsys):
 # --------------------------- дефект 4: риск кампании списывается один раз
 
 
-def test_campaign_risk_is_charged_once_per_run(monkeypatch, capsys):
-    # Четыре действия по одной кампании списывали четырёхкратный расход:
-    # бюджет исчерпывался на второй-третьей кампании, и посчитанные
-    # корректировки капали по паре в неделю.
+def test_campaign_risk_is_capped_by_the_object_price(monkeypatch, capsys):
+    # Дельта-модель: каждая правка платит цену СВОЕГО изменения (доля сегмента
+    # × насколько его двигают), а сумма списаний по кампании ограничена её
+    # ценой целиком — расходом за горизонт замера. Прежде первое же действие
+    # платило за всю кампанию, и бюджет исчерпывался на второй-третьей.
     journal = []
     _patch_run(
         monkeypatch,
@@ -735,9 +736,10 @@ def test_campaign_risk_is_charged_once_per_run(monkeypatch, capsys):
     report = _reports(capsys)[0]
     assert report["prepared"]["count"] == 3
     assert report["deferred_by_risk"] == 0
-    # Кампания одна — платим за неё один раз, а не трижды.
-    assert report["risk_charged_rub"] == 7000.0
-    assert sum(row["risk_rub"] for row in journal) == 7000.0
+    # Три корректировки сегментов кампании стоят долей её расхода, а не
+    # трёх её расходов: сумма меньше цены кампании целиком (7000 ₽).
+    assert 0 < report["risk_charged_rub"] <= 7000.0
+    assert sum(row["risk_rub"] for row in journal) == report["risk_charged_rub"]
 
 
 def test_budget_is_not_exhausted_by_repeated_actions_on_same_campaign(monkeypatch, capsys):
@@ -786,14 +788,17 @@ def test_object_paid_for_in_an_earlier_run_this_week_is_not_charged_again(monkey
     )
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 38_878.0)
-    monkeypatch.setattr(agent_e1.writer_db, "charged_objects",
-                        lambda *_: {"campaign:111"})
+    # По кампании уже списана её полная цена — потолок объекта исчерпан,
+    # и следующая правка по ней проходит, ничего не добавляя к риску.
+    monkeypatch.setattr(agent_e1.writer_db, "charged_risk_by_object",
+                        lambda *_: {"campaign:111": 38_878.0})
 
     assert agent_e1.main() == 0
 
     report = _reports(capsys)[0]
     assert report["deferred_by_risk"] == 0
     assert report["prepared"]["count"] == 1
+    assert report["risk_charged_rub"] == 0.0
     # Второе касание оплаченного объекта стоит НОЛЬ: цена ошибки по кампании
     # уже под наблюдением, второй раз тот же расход не тратится.
     assert report["risk_charged_rub"] == 0.0
@@ -814,16 +819,17 @@ def test_untouched_campaign_still_pays_full_price(monkeypatch, capsys):
         daily_cost={"222": 1_000.0},
         journal=journal,
     )
-    monkeypatch.setattr(agent_e1.writer_db, "charged_objects",
-                        lambda *_: {"campaign:111"})
+    monkeypatch.setattr(agent_e1.writer_db, "charged_risk_by_object",
+                        lambda *_: {"campaign:111": 7_000.0})
 
     assert agent_e1.main() == 0
 
     report = _reports(capsys)[0]
-    assert report["risk_charged_rub"] == 7_000.0
+    # Списания по ЧУЖОЙ кампании нашу не освобождают: она платит свою дельту.
+    assert report["risk_charged_rub"] > 0
 
 
-def test_charged_objects_are_read_for_the_same_week_as_the_budget(monkeypatch, capsys):
+def test_charged_risk_is_read_for_the_same_week_as_the_budget(monkeypatch, capsys):
     # Оплаченные объекты и потраченный бюджет обязаны читаться за ОДНУ неделю.
     # Разъехались бы — прогон освобождал бы от платы по одной границе, а
     # остаток считал по другой, и перерасход был бы невидим.
@@ -844,11 +850,11 @@ def test_charged_objects_are_read_for_the_same_week_as_the_budget(monkeypatch, c
 
     def _charged(wk):
         seen["charged"] = wk
-        return set()
+        return {}
 
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", _spent)
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", _limit)
-    monkeypatch.setattr(agent_e1.writer_db, "charged_objects", _charged)
+    monkeypatch.setattr(agent_e1.writer_db, "charged_risk_by_object", _charged)
 
     assert agent_e1.main() == 0
 
@@ -1975,7 +1981,7 @@ def _patch_schedule_run(monkeypatch, settings):
                         lambda: date.today() - timedelta(days=3))
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
-    monkeypatch.setattr(agent_e1.writer_db, "charged_objects", lambda *_: set())
+    monkeypatch.setattr(agent_e1.writer_db, "charged_risk_by_object", lambda *_: {})
     monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: [])
     monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
     monkeypatch.setattr(agent_e1.writer_db, "insert_action", lambda action: 1)

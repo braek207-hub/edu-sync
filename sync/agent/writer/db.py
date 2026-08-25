@@ -161,6 +161,26 @@ WRITER_DDL: List[str] = [
       ADD COLUMN IF NOT EXISTS observation_closed_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS observation_verdict   TEXT
     """,
+    # Дельта-модель риска (Ф4). risk_rub перестал означать «дневной расход
+    # объекта × горизонт» и стал ценой КОНКРЕТНОГО изменения, поэтому два
+    # прежних потребителя этого числа получают собственные колонки:
+    #
+    #   baseline_daily_rub — дневной расход объекта на момент применения.
+    #                        Его читает красная линия обвала расхода
+    #                        (rollback.is_spend_collapsed): ожидание «сколько
+    #                        кампания должна тратить» — это расход объекта, а
+    #                        не цена правки его сегмента. Без своей колонки
+    #                        ожидание упало бы в разы вместе с risk_rub, и
+    #                        обвал перестал бы обнаруживаться.
+    #   risk_basis         — чем посчитана дельта (доля сегмента, срез
+    #                        вырезанного трафика, «доля неизвестна»). Модель,
+    #                        которую нельзя проверить по журналу, проверять
+    #                        никто и не будет.
+    """
+    ALTER TABLE edu_agent_actions
+      ADD COLUMN IF NOT EXISTS baseline_daily_rub DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS risk_basis         TEXT
+    """,
     # Аренда на прогон: два одновременных прогона на одном ключе создают в
     # кабинете ДВА объекта, и Id первого теряется навсегда — без строки
     # журнала и без красной линии. Таблица, а не pg_advisory_lock: сессионная
@@ -294,11 +314,12 @@ INSERT_ACTION_SQL = """
     INSERT INTO edu_agent_actions (
         action_id, idempotency_key, account, object_level, object_id,
         action_kind, direct_type, setting_key, payload, previous_state,
-        red_line, risk_rub, status
+        red_line, risk_rub, baseline_daily_rub, risk_basis, status
     ) VALUES (
         %(action_id)s, %(idempotency_key)s, %(account)s, %(object_level)s,
         %(object_id)s, %(action_kind)s, %(direct_type)s, %(setting_key)s,
-        %(payload)s, %(previous_state)s, %(red_line)s, %(risk_rub)s, 'planned'
+        %(payload)s, %(previous_state)s, %(red_line)s, %(risk_rub)s,
+        %(baseline_daily_rub)s, %(risk_basis)s, 'planned'
     )
     ON CONFLICT (idempotency_key) DO UPDATE SET
         account        = EXCLUDED.account,
@@ -311,6 +332,8 @@ INSERT_ACTION_SQL = """
         previous_state = EXCLUDED.previous_state,
         red_line       = EXCLUDED.red_line,
         risk_rub       = EXCLUDED.risk_rub,
+        baseline_daily_rub = EXCLUDED.baseline_daily_rub,
+        risk_basis     = EXCLUDED.risk_basis,
         status         = 'planned',
         response       = '{}'::jsonb,
         sent_at        = NULL,
@@ -337,6 +360,12 @@ def insert_action(row: Dict[str, Any]) -> str:
         # называется "key", потому что это ключ настройки, а не действия.
         "direct_type": row.get("direct_type"),
         "setting_key": None if row.get("key") is None else str(row.get("key")),
+        # Дельта-модель: цена правки (risk_rub) и расход объекта
+        # (baseline_daily_rub) — разные числа с разными потребителями.
+        # Пустое значение здесь означает «не посчитано», и красная линия
+        # обвала расхода умеет это отличать от нуля.
+        "baseline_daily_rub": row.get("baseline_daily_rub"),
+        "risk_basis": row.get("risk_basis"),
         "payload": json.dumps(row.get("payload", {}), ensure_ascii=False),
         "previous_state": json.dumps(row.get("previous_state", {}), ensure_ascii=False),
         "red_line": json.dumps(row.get("red_line", {}), ensure_ascii=False),
@@ -1130,46 +1159,22 @@ def spent_risk(week_start: str,
         Отсчёт строго с понедельника обнулял счёт в ночь на понедельник и
         разрешал до двух недельных лимитов одновременной экспозиции.
 
-    Считается МАКСИМУМ по объекту, а не сумма его строк. Цена ошибки — расход
-    кампании за горизонт замера; этот расход у кампании ОДИН, сколько бы правок
-    ей ни сделали за неделю и в скольких прогонах. Ровно этот довод уже записан
-    в risk.fit_into_budget, но действовал он только внутри одного прогона:
-    множество оплаченных объектов создавалось заново на каждый запуск. На
-    неделе 2026-08-17 это стоило так: прогон 32559366898 списал 38 876 ₽ за
-    кампанию 114057545 (5 554 ₽/день × 7), и следующая правка ТОЙ ЖЕ кампании
-    требовала ещё 38 876 при остатке 11 124 — расписание не проходило вовсе.
-    Одна кампания съедала 78 % недельного бюджета за одно касание.
+    Считается ПРЯМАЯ СУММА строк. Прежде здесь стоял максимум по объекту —
+    защита от модели, в которой каждое действие платило цену всей кампании:
+    четыре правки одной кампании требовали четырёхкратного её расхода, бюджет
+    выгорал на второй кампании (прогон 32559366898 списал 38 876 ₽ за кампанию
+    114057545 — 78 % недельного лимита за одно касание).
+
+    В дельта-модели (Ф4) складывать честно: строка несёт цену СВОЕГО
+    изменения, а не объекта, и две правки одной кампании — это два разных
+    риска. Защита от переплаты за объект не исчезла, а переехала туда, где ей
+    место: risk.fit_into_budget не списывает по объекту больше его потолка
+    (расход × горизонт), опираясь на charged_risk_by_object ниже — то есть на
+    ту же сумму, что считается здесь.
     """
     rows = _fetch(
         """
-        SELECT COALESCE(SUM(per_object), 0) AS spent
-        FROM (
-            SELECT MAX(risk_rub) AS per_object
-            FROM edu_agent_actions
-            WHERE status IN (__RISK_CHARGED_STATUSES__)
-              AND applied_at >= %s::timestamptz - make_interval(days => %s)
-            GROUP BY object_level, object_id
-        ) AS by_object
-        """.replace("__RISK_CHARGED_STATUSES__",
-                    _sql_literals(RISK_CHARGED_STATUSES)),
-        (week_start, int(exposure_days)),
-    )
-    return float(rows[0]["spent"]) if rows else 0.0
-
-
-def charged_objects(week_start: str,
-                    exposure_days: int = DEFAULT_DAYS_TO_MEASURE) -> Set[str]:
-    """Объекты, риск которых в окне недели уже оплачен: {'level:id'}.
-
-    Форма ключа — та же, что у risk.risk_object; расхождение здесь означало бы
-    тихое повторное списание, то есть ровно тот дефект, против которого это и
-    сделано. Фильтр — тот же, что у spent_risk, и по той же причине: множество
-    и сумма обязаны описывать одни и те же строки, иначе прогон либо спишет за
-    объект второй раз, либо посчитает свободным бюджет, которого нет.
-    """
-    rows = _fetch(
-        """
-        SELECT DISTINCT object_level, object_id
+        SELECT COALESCE(SUM(risk_rub), 0) AS spent
         FROM edu_agent_actions
         WHERE status IN (__RISK_CHARGED_STATUSES__)
           AND applied_at >= %s::timestamptz - make_interval(days => %s)
@@ -1177,7 +1182,37 @@ def charged_objects(week_start: str,
                     _sql_literals(RISK_CHARGED_STATUSES)),
         (week_start, int(exposure_days)),
     )
-    return {f"{r['object_level']}:{r['object_id']}" for r in rows}
+    return float(rows[0]["spent"]) if rows else 0.0
+
+
+def charged_risk_by_object(week_start: str,
+                           exposure_days: int = DEFAULT_DAYS_TO_MEASURE
+                           ) -> Dict[str, float]:
+    """Сколько риска по каждому объекту уже списано в окне: {'level:id': ₽}.
+
+    Форма ключа — та же, что у risk.risk_object; расхождение здесь означало бы
+    тихую переплату или недосчёт потолка. Фильтр — тот же, что у spent_risk, и
+    по той же причине: сумма по объектам и общая сумма обязаны описывать одни
+    и те же строки.
+
+    До дельта-модели функция возвращала МНОЖЕСТВО объектов («оплачен целиком —
+    остальные действия по нему бесплатны»), потому что цена объекта списывалась
+    один раз и вся. Теперь каждое действие платит свою дельту, и объекту нужен
+    счёт, а не флаг: fit_into_budget добирает по объекту до его потолка и
+    только после этого перестаёт списывать.
+    """
+    rows = _fetch(
+        """
+        SELECT object_level, object_id, COALESCE(SUM(risk_rub), 0) AS spent
+        FROM edu_agent_actions
+        WHERE status IN (__RISK_CHARGED_STATUSES__)
+          AND applied_at >= %s::timestamptz - make_interval(days => %s)
+        GROUP BY object_level, object_id
+        """.replace("__RISK_CHARGED_STATUSES__",
+                    _sql_literals(RISK_CHARGED_STATUSES)),
+        (week_start, int(exposure_days)),
+    )
+    return {f"{r['object_level']}:{r['object_id']}": float(r["spent"]) for r in rows}
 
 
 def recent_action_objects(action_kinds, days, account=None):

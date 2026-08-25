@@ -29,6 +29,7 @@ import hashlib
 from typing import Any, Dict, List, Tuple
 
 from sync.agent.confidence import assess
+from sync.agent.writer import exposure
 
 SWITCH_KIND = "campaign.suspend"
 CAMPAIGN_SWITCH_SETTING = "campaign_switch"
@@ -158,6 +159,11 @@ def diff_switch(
             "action_kind": SWITCH_KIND,
             "object_level": "campaign",
             "object_id": str(cid),
+            # Единственный рычаг, который и в дельта-модели стоит целую
+            # кампанию: выключение ставит под удар весь её расход — дельта
+            # здесь и есть объект.
+            "exposure": exposure.whole_object_exposure(
+                "выключение кампании — под ударом весь её расход"),
             "direct_type": "CAMPAIGN_STATE",
             "key": "suspend",
             "payload": {"CampaignId": int(cid)},

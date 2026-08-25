@@ -265,31 +265,32 @@ def test_spent_risk_charges_every_live_status(monkeypatch):
     assert "status IN (%s)" % expected in sql
 
 
-def test_spent_risk_charges_an_object_once_not_once_per_row(monkeypatch):
-    # Цена ошибки по кампании — её расход за горизонт замера, и он ОДИН,
-    # сколько бы правок кампании ни сделали за неделю и в скольких прогонах.
-    # Сумма строк вместо максимума по объекту в августе 2026 заперла запись:
-    # кампания 114057545 стоила 38 876 ₽ за касание при недельном лимите
-    # 50 000 ₽, и второе касание не проходило вовсе.
+def test_spent_risk_sums_every_charged_row(monkeypatch):
+    # Дельта-модель: строка несёт цену СВОЕГО изменения, а не объекта, и две
+    # правки одной кампании — два разных риска. Прежний максимум по объекту
+    # защищал от модели, где каждое действие платило за всю кампанию; теперь
+    # переплату ограничивает потолок объекта в fit_into_budget.
     sql, _ = _captured_sql(monkeypatch, lambda: writer_db.spent_risk("2026-08-17"))
+    assert "SUM(risk_rub)" in sql
+    assert "MAX(risk_rub)" not in sql
 
-    assert "MAX(risk_rub)" in sql
-    assert "GROUP BY object_level, object_id" in sql
 
-
-def test_charged_objects_key_matches_the_key_risk_model_uses(monkeypatch):
+def test_charged_risk_key_matches_the_key_risk_model_uses(monkeypatch):
     # Форма ключа здесь и в risk.risk_object обязана совпадать: разъедутся —
     # прогон не узнает свой же оплаченный объект и спишет за него второй раз,
     # то есть ровно тот дефект, против которого эта функция и сделана.
     monkeypatch.setattr(
         writer_db, "_fetch",
-        lambda sql, params=(): [{"object_level": "campaign", "object_id": "114057545"}],
+        lambda sql, params=(): [{"object_level": "campaign",
+                                 "object_id": "114057545", "spent": 1234.5}],
     )
 
-    got = writer_db.charged_objects("2026-08-17")
+    got = writer_db.charged_risk_by_object("2026-08-17")
 
     expected = risk.risk_object({"object_level": "campaign", "object_id": "114057545"})
-    assert got == {expected}
+    # Значение — СУММА списаний по объекту: потолок в fit_into_budget
+    # добирает до цены объекта, а не переключает флаг «оплачен».
+    assert got == {expected: 1234.5}
 
 
 def test_mark_stale_sql_marks_only_rows_past_threshold():
@@ -1264,12 +1265,12 @@ def test_spent_risk_window_covers_exposure_overlapping_week_start(monkeypatch):
     assert params == ("2026-08-17", risk.DEFAULT_DAYS_TO_MEASURE)
 
 
-def test_charged_objects_matches_spent_risk_filter(monkeypatch):
+def test_charged_risk_matches_spent_risk_filter(monkeypatch):
     # Множество оплаченных объектов обязано считаться тем же фильтром, что и
     # сумма spent_risk: разъедутся — прогон либо спишет за объект второй раз,
     # либо посчитает свободным бюджет, которого нет.
     sql, params = _captured_sql(
-        monkeypatch, lambda: writer_db.charged_objects("2026-08-17"))
+        monkeypatch, lambda: writer_db.charged_risk_by_object("2026-08-17"))
 
     assert "rolled_back_at" not in sql
     expected = ", ".join("'%s'" % x for x in writer_db.RISK_CHARGED_STATUSES)
