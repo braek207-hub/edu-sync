@@ -91,6 +91,11 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
     # она едет пассажиром и на решения прогона не влияет (по оплатам не
     # откатывают). Тест, которому она важна, подменяет её сам.
     monkeypatch.setattr(agent_e1.agent_db, "load_baseline_cpo", lambda *_: {})
+    # Чёрный ящик в тестах не пишет: он ходит в живую базу, а прогон обязан
+    # считаться и без неё. Его собственное поведение проверяют свои тесты.
+    monkeypatch.setattr(agent_e1.blackbox, "save_run",
+                        lambda *a, **k: {"run_id": "test", "saved": False,
+                                         "rejects": 0, "error": "тест"})
     # Тем же пассажиром едет ОБЪЁМ базы: он входит в красную линию ради
     # сверки прогноза с исходом, а решения прогона не трогает.
     monkeypatch.setattr(agent_e1.agent_db, "load_baseline_volume", lambda *_: {})

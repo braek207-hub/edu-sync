@@ -49,6 +49,7 @@ import sys
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from sync.agent import blackbox
 from sync.agent import db as agent_db
 from sync.agent import gate as gate_module
 from sync.agent.gate import mart_gate, with_source_checks
@@ -1748,6 +1749,12 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
                                              journal_ok=not dry_run),
     }
     out["alarms"] = alarm_reasons(out)
+    # Сторож — третья часть той же истории: расчёт решил, запись применила,
+    # сторож увидел исход. В чёрном ящике они лежат рядом, иначе разбор
+    # инцидента снова собирается из трёх логов разной свежести.
+    out["blackbox"] = blackbox.save_run(
+        blackbox.new_run_id(), stage="watchdog",
+        mode=blackbox.run_mode(sandbox, dry_run), report=out)
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 1 if fail_on_alarm and out["alarms"] else 0
 

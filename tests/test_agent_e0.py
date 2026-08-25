@@ -109,6 +109,8 @@ _DB_EMPTY_LOADERS = (
     # Спрос Wordstat: без подмены прогон ушёл бы в реальную базу и напечатал
     # ретраи коннекта в тот же stdout, который тест парсит как JSON.
     "load_wordstat_demand",
+    # Лиды со скором — сырьё тормоза роста (quality.py), та же причина.
+    "load_quality_facts",
 )
 
 # Отчёты Директа по кабинетам: у каждого свои сегменты и своя конверсионность —
@@ -1075,3 +1077,49 @@ def test_report_names_what_to_strengthen_and_how_much_fits(monkeypatch, capsys):
     # Качество когорты (задача 14) ещё не считается: тормоза нет, и никого
     # он не снимает.
     assert growth["skipped_by_quality"] == 0
+
+
+def test_quality_brake_reaches_the_report_and_the_growth_list(monkeypatch, capsys):
+    # Тормоз роста бесполезен, если посчитан и никуда не доехал: кандидат с
+    # испортившейся когортой обязан выпасть из списка усиления, а не просто
+    # получить строчку в отчёте. Проверяются обе половины сразу — раздельно
+    # они выживали бы поодиночке.
+    _patch_e0_run(monkeypatch)
+    seen = {}
+
+    def _drifting(rows, before_from, before_to, after_from, after_to):
+        seen["windows"] = (before_from, before_to, after_from, after_to)
+        return {"window_before": [before_from, before_to],
+                "window_after": [after_from, after_to],
+                "flagged": [{"campaign_id": "111", "drop": 0.4}],
+                "coverage_alerts": [],
+                "drift": {"111": {"drop": 0.4, "flagged": True,
+                                  "reason": "качество когорты упало"}}}
+
+    monkeypatch.setattr(agent_e0, "lead_quality_section", _drifting)
+
+    captured = {}
+    original = agent_e0.growth_candidates
+
+    def _spy(*args, **kwargs):
+        captured["quality_drift"] = kwargs.get("quality_drift")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(agent_e0, "growth_candidates", _spy)
+
+    assert agent_e0.main() == 0
+    # Первый объект вывода: такт печатает отчёт, а следом могут идти
+    # служебные строки прогона.
+    import json as _json
+    report = _json.JSONDecoder().raw_decode(capsys.readouterr().out.lstrip())[0]
+
+    assert report["lead_quality"]["flagged"] == [{"campaign_id": "111", "drop": 0.4}]
+    # Полная карта дрейфа в отчёт не едет: это сотня строк служебных чисел,
+    # из-за которых важное в логе не найти.
+    assert "drift" not in report["lead_quality"]
+    assert captured["quality_drift"] == {"111": {"drop": 0.4, "flagged": True,
+                                                 "reason": "качество когорты упало"}}
+    # Окна смежные и не пересекаются: иначе одна и та же когорта сравнивалась
+    # бы сама с собой и падение размывалось.
+    before_from, before_to, after_from, after_to = seen["windows"]
+    assert before_from < before_to < after_from < after_to

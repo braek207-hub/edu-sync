@@ -54,6 +54,10 @@ from sync.agent.metrika import (
     resolve_counter_account,
 )
 from sync.agent.growth import growth_candidates
+from sync.agent.quality import (
+    QUALITY_WINDOW_DAYS,
+    lead_quality_section,
+)
 from sync.agent.hierarchy import hierarchical_modifiers
 from sync.agent.ladder import ladder_report
 from sync.agent.history import budget_response
@@ -1070,12 +1074,26 @@ def main() -> int:
             (date.today() - timedelta(weeks=DEMAND_HISTORY_WEEKS)).isoformat()),
         through_week=date_to)
 
+    # Ранний тормоз доливки: качество когорты лидов. Два СМЕЖНЫХ окна по
+    # QUALITY_WINDOW_DAYS, кончающиеся на границе зрелости CRM, — свежая
+    # когорта против предыдущей. Кончать окно сегодняшним днём нельзя: лиды
+    # приезжают с отставанием 2–4 дня, и хвост окна был бы недосчитан ровно
+    # там, где ищется падение.
+    quality_end = date.fromisoformat(latest_lead or date_to)
+    after_from = quality_end - timedelta(days=QUALITY_WINDOW_DAYS - 1)
+    before_to = after_from - timedelta(days=1)
+    before_from = before_to - timedelta(days=QUALITY_WINDOW_DAYS - 1)
+    quality = lead_quality_section(
+        agent_db.load_quality_facts(before_from.isoformat(), quality_end.isoformat()),
+        before_from.isoformat(), before_to.isoformat(),
+        after_from.isoformat(), quality_end.isoformat())
+
     # Вторая половина оптимизации: что УСИЛИТЬ. Собирается из уже посчитанного
     # — недобор трафика, упор в кап шага, режим спроса, запросы без своей
-    # группы — и ничего нового в Директ не спрашивает. Качество когорты
-    # (quality_drift) пока не считается: тормоз подключит задача 14.
+    # группы — и ничего нового в Директ не спрашивает. Карта дрейфа качества
+    # едет сюда тормозом: кандидат с портящейся когортой в список не попадает.
     growth = growth_candidates(budget_threshold, headroom_section, demand,
-                               expansion)
+                               expansion, quality_drift=quality["drift"])
 
     sizes = agent_db.table_sizes()
     total_mb = round(sum(int(s["size_bytes"] or 0) for s in sizes) / 1024 / 1024, 1)
@@ -1278,6 +1296,12 @@ def main() -> int:
             # (docs/AGENT-DATA-SOURCES.md).
             "region": DEMAND_REGION,
         },
+        # Ранний тормоз роста: качество когорты лидов до и после последних
+        # доливок. Печатается всегда — молчание тормоза и его поломка иначе
+        # выглядят одинаково. Падение ПОКРЫТИЯ скором вынесено отдельным
+        # списком: оно про ingest поведения, а не про качество трафика, и
+        # лечится в другом месте.
+        "lead_quality": {k: v for k, v in quality.items() if k != "drift"},
         # Что УСИЛИТЬ. Печатается каждый такт, в том числе пустым: молчание
         # про усиление неотличимо от «усиливать нечего», а агент, отвечающий
         # только на «что срезать», ведёт кабинет к «эффективно и мало».

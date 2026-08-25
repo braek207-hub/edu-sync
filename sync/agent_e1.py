@@ -95,6 +95,7 @@ from sync.agent.writer.risk import (
     risk_object,
     week_start,
 )
+from sync.agent import blackbox, rejects
 from sync.agent.writer.rollback import red_line_for
 from sync.agent.writer.units import api_to_delta
 
@@ -1512,8 +1513,19 @@ def run_account(
 
     report = apply_actions(client, prepared, writer_db, lease=lease)
 
+    account_rejects = rejects.from_groups([
+        (rejects.BUDGET, deferred),
+        (rejects.RUN_CAP, over_cap),
+        (rejects.NO_RED_LINE, no_red_line),
+        (rejects.COOLDOWN, in_cooldown),
+        (rejects.ATTEMPTS_EXHAUSTED, out_of_attempts),
+    ], account=login, stage="e1", risks=risks)
+
     return {
         "account": login,
+        # Строки отказов едут отдельным полем от их счётчиков: счётчики
+        # читает человек в логе, строки — чёрный ящик.
+        "_rejects": account_rejects,
         "sandbox": sandbox,
         "dry_run": dry_run,
         "own_campaigns": len(campaign_ids),
@@ -1641,6 +1653,11 @@ def run_account(
         },
         "deferred_by_risk": len(deferred),
         "deferred_by_cap": len(over_cap),
+        # Отказы строками, а не только счётчиками: они уезжают в чёрный ящик
+        # (sync/agent/blackbox.py), где на истории видно, какое намерение
+        # упирается в одну и ту же стену изо дня в день. Один отказ — это
+        # бюджет кончился; тридцать одинаковых — неверная модель.
+        "rejects": rejects.by_reason(account_rejects),
         "actions_left_in_run": max(ctx["remaining_cap"], 0),
         "no_red_line": {
             "count": len(no_red_line),
@@ -1872,6 +1889,13 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         }, ensure_ascii=False, indent=2))
 
     failed_accounts: List[Dict[str, Any]] = []
+    # Чёрный ящик прогона: отчёты кабинетов и отказы копятся, чтобы уехать в
+    # базу ОДНОЙ строкой прогона. Печать в лог остаётся как была — она для
+    # человека здесь и сейчас, а база нужна через две недели, когда вопрос
+    # звучит «почему он тогда так решил».
+    run_id = blackbox.new_run_id()
+    account_reports: List[Dict[str, Any]] = []
+    run_rejects: List[Dict[str, Any]] = []
     for client_info in clients:
         login = client_info["login"]
         # Отказ ОДНОГО кабинета не отменяет остальные. Кабинетов четыре, и
@@ -1895,6 +1919,11 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
                 "reason": f"{type(exc).__name__}: {exc}"[:400],
             }
             failed_accounts.append({"account": login, "error": report["reason"]})
+        # Строки отказов снимаются с печатного отчёта: человеку в логе нужен
+        # их расклад по причинам (он уже в отчёте), а поштучно они читаются
+        # запросом к чёрному ящику.
+        run_rejects += report.pop("_rejects", [])
+        account_reports.append(report)
         print(json.dumps(report, ensure_ascii=False, indent=2))
 
     # Слепая доля расхода — та же величина, что печатает такт расчёта, и
@@ -1920,6 +1949,17 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "window": [cutoff, today],
         "blind_spend": blind,
     }, ensure_ascii=False, indent=2))
+
+    saved = blackbox.save_run(
+        run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),
+        report={"accounts": account_reports, "blind_spend": blind,
+                "window": [cutoff, today], "failed_accounts": failed_accounts},
+        rejects=run_rejects)
+    # Итог записи печатается всегда, включая ошибку: молчащий чёрный ящик
+    # хуже отсутствующего — он создаёт уверенность, что история пишется.
+    print(json.dumps({"verdict": "BLACKBOX", **saved,
+                      "rejects_by_reason": rejects.by_reason(run_rejects)},
+                     ensure_ascii=False, indent=2))
 
     if failed_accounts:
         # Итоговая строка отдельно от кабинетных отчётов: иначе отказ первого

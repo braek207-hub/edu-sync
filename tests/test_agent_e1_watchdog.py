@@ -968,6 +968,10 @@ def _patch_watchdog_main(monkeypatch, lock):
     # обязан падать на своём утверждении, а не на живой базе.
     monkeypatch.setattr(watchdog.writer_db, "actions_awaiting_money_check",
                         lambda days: [])
+    # Чёрный ящик ходит в живую базу — в тестах он молчит. Своё поведение
+    # он проверяет сам (tests/test_agent_blackbox.py).
+    monkeypatch.setattr(watchdog.blackbox, "save_run",
+                        lambda *a, **k: {"saved": False, "error": "тест"})
 
 
 def test_watchdog_takes_the_run_lease_under_its_own_name(monkeypatch, capsys):
