@@ -54,9 +54,11 @@ from sync.agent.metrika import (
 from sync.agent.hierarchy import hierarchical_modifiers
 from sync.agent.ladder import ladder_report
 from sync.agent.history import budget_response
+from sync.agent.learning_loop import forecast_bias, track_record
 from sync.agent.mining import mine_quasi_experiments, placebo_sigma
 from sync.agent.portfolio import computed_rows as portfolio_computed_rows
 from sync.agent.portfolio import portfolio_targets
+from sync.agent.writer import db as writer_db
 from sync.agent.writer.negatives import computed_rows as negative_computed_rows
 from sync.agent.writer.placements import computed_rows as placement_computed_rows
 from sync.agent.tcpa import (
@@ -1039,6 +1041,21 @@ def main() -> int:
     blind = blind_spend(facts, campaign_settings,
                         ladder_section["window_from"], ladder_section["window_to"])
 
+    # Петля обучения на СВОИХ действиях: послужной список рычагов и смещение
+    # прогноза по журналу применённых изменений. Недоступность журнала расчёт
+    # не роняет — это отчётный слой поверх него, ровно как настройки выше;
+    # причина при этом видна в отчёте, а не молчит.
+    try:
+        closed = writer_db.closed_actions()
+        learning = {"closed_actions": len(closed),
+                    "track_record": track_record(closed),
+                    # Ключ — вид действия ПЛЮС направление: модель может
+                    # завышать эффект доливки и занижать эффект срезания, и
+                    # одно усреднённое число спрятало бы обе ошибки.
+                    "forecast_bias": forecast_bias(closed)}
+    except Exception as exc:  # noqa: BLE001
+        learning = {"unavailable": f"{type(exc).__name__}: {exc}"[:200]}
+
     sizes = agent_db.table_sizes()
     total_mb = round(sum(int(s["size_bytes"] or 0) for s in sizes) / 1024 / 1024, 1)
 
@@ -1220,6 +1237,11 @@ def main() -> int:
             "no_target": tcpa_section["no_target"],
             "computed_rows": tcpa_count,
         },
+        # Задача 13: чем закончились СОБСТВЕННЫЕ действия агента. Доля
+        # попаданий печатается ещё и раздельно для растящих и сокращающих:
+        # мера исхода судит по цене, а срезав объём, кампания почти всегда
+        # дешевеет — общий hit_rate систематически хвалил бы резаков.
+        "learning_loop": learning,
         "db_total_mb": total_mb,
         "db_tables": [{"t": s["table_name"], "size": s["size"]} for s in sizes],
     }, ensure_ascii=False, indent=2))

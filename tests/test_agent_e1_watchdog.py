@@ -1864,3 +1864,152 @@ def test_closing_writes_the_observed_leads_delta_to_the_journal():
     expected = round(observed["leads"] - 1.0 * observed["days"], 2)
     assert expected > 0
     assert db.observation_closed == [("act-1", "improved", expected)]
+
+
+# =========================================================================
+# Задача 13: петля обучения — класс A за контроль и экономический исход
+# =========================================================================
+
+
+def _obs_window():
+    return (date(2026, 8, 2), date(2026, 8, 15), True)
+
+
+def test_class_a_is_earned_by_control_not_by_authorship():
+    """Знание даты не отменяет сезон: класс A даёт контроль, а не авторство."""
+    action = _action()                       # база 714
+    observed = {"cpa": 892.5, "leads": 40}
+
+    without = watchdog.action_experiment(action, observed, _obs_window(), "worsened")
+    assert without["reliability_class"] == "B"
+    assert without["mechanism"] == "before_after"
+    assert without["effect"] == 0.25
+
+    # Заповедник подорожал ровно так же — значит это сезон, а не действие.
+    control = {"baseline_cpa": 714.0, "cpa": 892.5, "leads": 50}
+    with_control = watchdog.action_experiment(action, observed, _obs_window(),
+                                              "worsened", control=control)
+    assert with_control["reliability_class"] == "A"
+    assert with_control["mechanism"] == "did_holdout"
+    assert with_control["effect"] == 0.0
+    assert with_control["params"]["control"]["leads"] == 50
+
+
+def test_thin_control_does_not_upgrade_class():
+    # Контроль на трёх лидах — шум, а не эталон: завышенный класс надёжности
+    # дороже отсутствующего, на классах строится автономия.
+    out = watchdog.action_experiment(
+        _action(), {"cpa": 892.5, "leads": 40}, _obs_window(), "worsened",
+        control={"baseline_cpa": 714.0, "cpa": 892.5, "leads": 3})
+    assert out["reliability_class"] == "B"
+    assert out["mechanism"] == "before_after"
+
+
+def test_control_without_a_baseline_price_does_not_upgrade_class():
+    out = watchdog.action_experiment(
+        _action(), {"cpa": 892.5, "leads": 40}, _obs_window(), "worsened",
+        control={"baseline_cpa": 0.0, "cpa": 892.5, "leads": 50})
+    assert out["reliability_class"] == "B"
+
+
+def test_holdout_control_measures_the_same_two_windows():
+    rows = (_facts("900", date(2026, 7, 1), 10, cost=1000.0, leads=2)
+            + _facts("900", date(2026, 8, 2), 14, cost=1200.0, leads=2))
+    control = watchdog.holdout_control(rows, (date(2026, 7, 1), date(2026, 7, 10)),
+                                       (date(2026, 8, 2), date(2026, 8, 15)))
+    assert control == {"baseline_cpa": 500.0, "cpa": 600.0, "leads": 28}
+
+
+def test_holdout_control_is_none_without_a_reserve_or_a_window():
+    windows = ((date(2026, 7, 1), date(2026, 7, 10)),
+               (date(2026, 8, 2), date(2026, 8, 15)))
+    assert watchdog.holdout_control([], *windows) is None
+    assert watchdog.holdout_control(
+        _facts("900", date(2026, 8, 2), 14, cost=1200.0, leads=2), None,
+        windows[1]) is None
+    # Заповедник без лидов в базовом окне: делить не на что.
+    assert watchdog.holdout_control(
+        _facts("900", date(2026, 8, 2), 14, cost=1200.0, leads=2), *windows) is None
+
+
+# ------------------- экономический исход растящего действия
+
+
+def _growth_action(expected=12.0, kind="budget.set"):
+    return _action(action_kind=kind,
+                   payload={"expected_leads_delta": expected},
+                   red_line={**_action()["red_line"],
+                             "baseline_leads_per_day": 5.0})
+
+
+def test_growth_is_judged_by_volume_at_an_acceptable_price():
+    # Доливка обещала ОБЪЁМ: лиды выросли, цена осталась под потолком линии.
+    # Мера по цене назвала бы это провалом — за объём и платят дороже.
+    action = _growth_action()
+    observed = {"cpa": 892.5, "leads": 100, "days": 14}
+
+    assert watchdog.closing_verdict(observed, action) == "worsened"
+    assert watchdog.economic_outcome(action, observed, 1000.0) == "improved"
+
+
+def test_growth_that_did_not_buy_volume_is_a_miss_even_if_it_got_cheaper():
+    action = _growth_action()
+    observed = {"cpa": 600.0, "leads": 60, "days": 14}   # темп базы 5/д → −10
+
+    assert watchdog.closing_verdict(observed, action) == "improved"
+    assert watchdog.economic_outcome(action, observed, 1000.0) == "worsened"
+
+
+def test_growth_above_the_ceiling_is_not_a_hit():
+    action = _growth_action()
+    observed = {"cpa": 1200.0, "leads": 100, "days": 14}
+    assert watchdog.economic_outcome(action, observed, 1000.0) == "inconclusive"
+
+
+def test_growth_without_a_measured_fact_stays_unknown():
+    action = _action(action_kind="budget.set",
+                     payload={"expected_leads_delta": 12.0})   # темпа базы нет
+    assert watchdog.economic_outcome(
+        action, {"cpa": 892.5, "leads": 100, "days": 14}, 1000.0) == "unknown"
+
+
+def test_cuts_and_other_levers_keep_the_price_measure():
+    cut = _growth_action(expected=-8.0)
+    observed = {"cpa": 600.0, "leads": 60, "days": 14}
+    assert watchdog.economic_outcome(cut, observed, 1000.0) == "improved"
+
+    # Рычаг вне списка растящих судится ценой, даже если ожидание положительное.
+    other = _growth_action(kind="bidmodifier.set")
+    assert (watchdog.economic_outcome(other, {"cpa": 892.5, "leads": 100, "days": 14},
+                                      1000.0) == "worsened")
+
+
+def test_closing_stores_the_economic_outcome_for_a_growth_action():
+    # Сквозная проверка: в журнал уходит исход по обещанию действия, а не по
+    # цене. Тот же прогон по прежней мере записал бы «worsened».
+    action = _growth_action(expected=10.0)
+    action["red_line"] = {**action["red_line"], "baseline_leads_per_day": 1.0}
+    facts = {"111": _facts("111", date(2026, 8, 2), 14, cost=1800.0, leads=2)}
+    report, client, db = _run(action, facts, today=date(2026, 9, 1))
+
+    observed = report["closed_held_sample"][0]["observed"]
+    assert observed["cpa"] == 900.0
+    assert watchdog.closing_verdict(observed, action) == "worsened"
+    assert db.observation_closed == [("act-1", "improved", 14.0)]
+    assert db.experiments[0]["verdict"] == "improved"
+
+
+def test_closing_upgrades_the_class_when_the_reserve_covers_the_window():
+    action = _action(red_line={**_action()["red_line"],
+                               "baseline_from": "2026-07-01",
+                               "baseline_to": "2026-07-30"})
+    facts = {"111": _facts("111", date(2026, 8, 2), 14, cost=700.0, leads=2)}
+    holdout_facts = (_facts("900", date(2026, 7, 1), 30, cost=1000.0, leads=2)
+                     + _facts("900", date(2026, 8, 2), 14, cost=1000.0, leads=2))
+    db = _FakeDb()
+    watchdog.watch(_FakeClient(), [action], db, {"900"}, facts,
+                   date(2026, 9, 1), GREEN_GATE, date(2026, 8, 29), None,
+                   _mart(facts), None, holdout_facts)
+
+    assert db.experiments[0]["mechanism"] == "did_holdout"
+    assert db.experiments[0]["reliability_class"] == "A"

@@ -172,6 +172,10 @@ def _patch_e0_run(monkeypatch, reports=None):
     # Пусто = порога нет, кандидаты не считаются: это штатное состояние
     # кабинета без истории, а не повод падать.
     monkeypatch.setattr(agent_e0.agent_db, "load_baseline_cpa", lambda *a, **k: {})
+    # Журнал применённых действий — вход петли обучения. Без подмены прогон
+    # уходит в БД и печатает ретраи коннекта в тот же stdout, который тест
+    # парсит как JSON (та же причина, что у панели настроек выше).
+    monkeypatch.setattr(agent_e0.writer_db, "closed_actions", lambda *a, **k: [])
     monkeypatch.setattr(
         agent_e0.agent_db, "upsert_computed_settings",
         # Значения по умолчанию намеренно: на коде ДО правки вызов идёт без
@@ -993,3 +997,46 @@ def test_ladder_section_uses_uncensored_lag():
     young = [_ladder_lead("2026-08-15", "spo", paid_on="2026-08-15")] * 20
     section = agent_e0.funnel_ladder_section([], mature + young, today=today)
     assert section["maturity_days"] == 50
+
+
+def test_report_carries_the_learning_loop_over_own_actions(monkeypatch, capsys):
+    """Э0 печатает, чем закончились СОБСТВЕННЫЕ действия агента.
+
+    Без этой секции петля обучения посчиталась бы в никуда: модуль есть,
+    вызова из такта нет — ровно тот класс отказа, против которого поставлен
+    tests/test_no_orphan_code.py.
+    """
+    import json as _json
+
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0.writer_db, "closed_actions", lambda *a, **k: [
+        {"action_kind": "budget.set", "closing_verdict": "improved",
+         "expected_leads_delta": 10.0, "observed_leads_delta": 5.0},
+        {"action_kind": "budget.set", "closing_verdict": "worsened",
+         "expected_leads_delta": 10.0, "observed_leads_delta": 3.0},
+    ])
+
+    assert agent_e0.main() == 0
+    loop = _json.loads(capsys.readouterr().out)["learning_loop"]
+
+    assert loop["closed_actions"] == 2
+    assert loop["track_record"]["budget.set"]["hit_rate"] == 0.5
+    assert loop["track_record"]["budget.set"]["hit_rate_up"] == 0.5
+    # Ключ калибровки — вид действия ПЛЮС направление.
+    assert loop["forecast_bias"]["budget.set:up"]["n"] == 2
+
+
+def test_unavailable_journal_does_not_kill_the_calculation(monkeypatch, capsys):
+    # Петля — отчётный слой поверх расчёта: недоступность журнала обязана быть
+    # видна причиной, а не ронять весь такт Э0.
+    import json as _json
+
+    def _boom(*a, **k):
+        raise RuntimeError("журнал недоступен")
+
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0.writer_db, "closed_actions", _boom)
+
+    assert agent_e0.main() == 0
+    loop = _json.loads(capsys.readouterr().out)["learning_loop"]
+    assert "журнал недоступен" in loop["unavailable"]

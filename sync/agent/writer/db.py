@@ -656,6 +656,37 @@ def mark_money_checked(action_id: str, verdict: str) -> bool:
     return landed
 
 
+# Применённые действия с вынесенным вердиктом — вход петли обучения
+# (sync/agent/learning_loop.py).
+#
+# Имена колонок сверены с DDL, а не с именами функций сторожа: вердикт по
+# заявкам лежит в observation_verdict, тогда как closing_verdict — это
+# ФУНКЦИЯ, которая его заполняет. Запрос, написанный по имени функции, вернул
+# бы пустоту молча. Алиас оставлен, чтобы петля читала одно имя независимо от
+# того, пришла строка этой выборкой или прямо из журнала.
+#
+# Окно — по applied_at: калибровка описывает поведение модели, а не историю
+# кабинета, и полугодовой хвост в ней уже про другого агента.
+CLOSED_ACTIONS_SQL = """
+    SELECT action_kind, object_id, applied_at::date AS applied_on,
+           observation_verdict AS closing_verdict, money_verdict,
+           (payload->>'expected_leads_delta')::float AS expected_leads_delta,
+           observed_leads_delta
+      FROM edu_agent_actions
+     WHERE applied_at IS NOT NULL
+       AND observation_verdict IS NOT NULL
+       AND applied_at >= now() - make_interval(days => %s)
+     ORDER BY applied_at
+"""
+
+CLOSED_ACTIONS_DAYS = 180
+
+
+def closed_actions(days: int = CLOSED_ACTIONS_DAYS) -> List[Dict[str, Any]]:
+    """Применённые действия с вынесенным вердиктом — вход петли обучения."""
+    return _fetch(CLOSED_ACTIONS_SQL, (int(days),))
+
+
 def record_experiments(rows: List[Dict[str, Any]]) -> int:
     """Исходы действий → история экспериментов (edu_agent_experiments).
 

@@ -61,7 +61,9 @@ from sync.agent.writer.apply import _element_errors
 # здесь — защита от вызывающего кода, который соберёт такой клиент
 # программно (живой тест, разовый скрипт).
 from sync.agent.writer.client import WriteClient, journal_allowed
+from sync.agent.writer.budget import BUDGET_DAILY_KIND, BUDGET_KIND
 from sync.agent.writer.guardrails import check_rollback
+from sync.agent.writer.tcpa import TCPA_KIND
 from sync.agent.writer.rollback import (rollback_payload, is_breached,
                                         is_spend_collapsed, outcome_verdict)
 
@@ -487,9 +489,9 @@ def judge(action: Dict[str, Any], facts_by_campaign: Dict[str, List[Dict[str, An
     return {**verdict, "state": STATE_WATCHED, "reason": reason or ""}
 
 
-def _totals_cpa(rows: Iterable[Dict[str, Any]],
-                window: Tuple[date, date]) -> Optional[float]:
-    """Кабинетный CPA за окно из дневных агрегатов витрины, или None."""
+def _window_cost_leads(rows: Iterable[Dict[str, Any]],
+                       window: Tuple[date, date]) -> Tuple[float, int]:
+    """Расход и эффективные лиды дневных строк, попавших в окно."""
     start, end = window
     cost = 0.0
     leads = 0
@@ -499,6 +501,13 @@ def _totals_cpa(rows: Iterable[Dict[str, Any]],
             continue
         cost += float(row.get("cost") or 0.0)
         leads += int(row.get("eff_leads") or 0)
+    return cost, leads
+
+
+def _totals_cpa(rows: Iterable[Dict[str, Any]],
+                window: Tuple[date, date]) -> Optional[float]:
+    """Кабинетный CPA за окно из дневных агрегатов витрины, или None."""
+    cost, leads = _window_cost_leads(rows, window)
     if leads < SEASONAL_MIN_LEADS or cost <= 0:
         return None
     return cost / leads
@@ -553,6 +562,57 @@ def closing_verdict(observed: Dict[str, Any], action: Dict[str, Any]) -> str:
     if base <= 0 or cpa <= 0:
         return "unknown"
     return outcome_verdict((cpa - base) / base, math.sqrt(1.0 / max(leads, 1)))
+
+
+# Рычаги, которыми агент ПОКУПАЕТ ОБЪЁМ. Только у них ожидание может быть
+# положительным, и только их обещание — «лидов станет больше», а не «лид
+# станет дешевле». Список именно рычагов, а не «всех действий с плюсовым
+# ожиданием»: корректировка ставки вверх обещает перераспределение внутри
+# того же бюджета, и спрашивать с неё объём было бы подменой обещания.
+GROWTH_KINDS = frozenset({BUDGET_KIND, BUDGET_DAILY_KIND, TCPA_KIND})
+
+
+def economic_outcome(action: Dict[str, Any], observed: Dict[str, Any],
+                     max_cpa: float) -> str:
+    """Исход действия в терминах его же намерения — мера ОБУЧЕНИЯ.
+
+    Красная линия и откат этой функции не касаются: защита денег обязана
+    оставаться консервативной, и «CPA вырос» — правильный повод притормозить.
+    Меняется то, на чём агент учится.
+
+    Сокращение обещало цену — с него и спрашивается цена (closing_verdict).
+    Доливка обещала ОБЪЁМ при цене не выше предельно допустимой: лиды
+    выросли, а CPA остался под потолком — обещание выполнено, даже если цена
+    поднялась. Судить доливку по «подешевело ли» значит требовать от неё
+    того, ради чего её не делали, и получить механизм, который умеет только
+    резать: срезав объём, кампания почти всегда дешевеет, а за объём и платят
+    более высокой ценой конверсии.
+
+    max_cpa — потолок цены конверсии из красной линии этого же действия
+    (rollback.red_line_for: база × (1 + RED_LINE_TOLERANCE)), при
+    необходимости уже поправленный на сезон. В плане на его месте стояла λ
+    портфеля — но λ там безразмерное отношение окупаемости (portfolio.py:212),
+    и сравнивать с ним рубли нельзя; потолок линии — та самая «предельно
+    допустимая цена», о которой договорились при планировании.
+
+    Факта объёма нет (у действия не было темпа базы) — «unknown», а не ноль:
+    измерения не делали, и записывать его промахом нельзя.
+    """
+    expected = (action.get("payload") or {}).get("expected_leads_delta")
+    up = float(expected or 0.0) > 0
+    if not up or str(action.get("action_kind")) not in GROWTH_KINDS:
+        return closing_verdict(observed, action)
+    delta = observed_leads_delta(observed, action)
+    if delta is None or max_cpa <= 0:
+        return "unknown"
+    cpa = float((observed or {}).get("cpa") or 0.0)
+    if delta > 0 and 0 < cpa <= max_cpa:
+        return "improved"
+    if delta <= 0:
+        return "worsened"
+    # Объём пришёл, но дороже оговорённого потолка: обещание выполнено
+    # наполовину, и записывать это ни успехом, ни провалом нельзя.
+    return "inconclusive"
 
 
 def money_metrics(rows: Iterable[Dict[str, Any]],
@@ -622,18 +682,72 @@ def money_check_due(action: Dict[str, Any], today: date) -> bool:
     return (today - applied).days >= MONEY_CHECKPOINT_DAYS
 
 
+# Минимум эффективных лидов заповедника в окне наблюдения, чтобы контроль
+# вообще считался контролем. Тот же порог, что у сезонной поправки
+# (SEASONAL_MIN_LEADS): на десятке лидов CPA — шум, и «сезон», вычтенный по
+# такому контролю, добавил бы к оценке случайное число вместо поправки.
+MIN_CONTROL_LEADS = 20
+
+
+def holdout_control(rows: Iterable[Dict[str, Any]],
+                    baseline_window: Optional[Tuple[date, date]],
+                    observation: Optional[Tuple[date, date]]) -> Optional[Dict[str, Any]]:
+    """Заповедник за те же два окна: цена до и цена после — контроль для DiD.
+
+    Заповедник (holdout.select_holdout) — кампании, к которым агент сознательно
+    не применяет ничего. Их движение между базовым окном действия и окном его
+    наблюдения и есть сезон плюс рынок за тот же период.
+
+    None — контроля нет: пустой заповедник, нет окна базы у действия или в
+    одном из окон нет лидов. Молчаливая подстановка нулей выдала бы «сезон
+    равен нулю», то есть подтвердила бы авторство действия там, где о нём
+    ничего не известно.
+    """
+    if not rows or not baseline_window or not observation:
+        return None
+    base_cost, base_leads = _window_cost_leads(rows, baseline_window)
+    obs_cost, obs_leads = _window_cost_leads(rows, observation)
+    if base_leads <= 0 or obs_leads <= 0:
+        return None
+    return {"baseline_cpa": round(base_cost / base_leads, 2),
+            "cpa": round(obs_cost / obs_leads, 2),
+            "leads": obs_leads}
+
+
+def _did_effect(observed: Dict[str, Any], baseline_cpa: float,
+                control: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Эффект действия против контроля за то же окно (разность разностей).
+
+    Вычитая изменение заповедника, получаем эффект самого действия. Без
+    контроля — None и остаёмся на before_after: завышенный класс надёжности
+    дороже отсутствующего, потому что на классах строится автономия (Ф9).
+    """
+    if not control or int(control.get("leads") or 0) < MIN_CONTROL_LEADS:
+        return None
+    base_c = float(control.get("baseline_cpa") or 0.0)
+    obs_c = float(control.get("cpa") or 0.0)
+    cpa = float((observed or {}).get("cpa") or 0.0)
+    if baseline_cpa <= 0 or cpa <= 0 or base_c <= 0 or obs_c <= 0:
+        return None
+    treated = (cpa - baseline_cpa) / baseline_cpa
+    control_shift = (obs_c - base_c) / base_c
+    return round(treated - control_shift, 4)
+
+
 def action_experiment(action: Dict[str, Any], observed: Dict[str, Any],
-                      window: Tuple[date, date, bool], verdict: str) -> Dict[str, Any]:
+                      window: Tuple[date, date, bool], verdict: str,
+                      control: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Исход собственного действия — строкой истории экспериментов (Э2.4).
 
     Замыкает петлю «применили → понаблюдали → выучили»: до этого закрытые
     действия не оставляли в edu_agent_experiments ничего, и читатель истории
     видел только чужие скачки бюджета, но не опыт самого агента.
 
-    Класс надёжности — B, а не A, сознательно: сравнение «наблюдение против
-    базы до изменения» не вычитает сезон (контроля у него нет, в отличие от
-    DiD квазиэкспериментов). A появится, когда исход будет меряться против
-    заповедника за то же окно. Ошибка оценки — только из счётчика лидов окна
+    Класс надёжности — B, пока нет контроля: сравнение «наблюдение против
+    базы до изменения» не вычитает сезон, а знание даты и намерения сезон не
+    отменяет. Класс A даёт контроль за ТО ЖЕ окно — заповедник портфеля
+    (holdout.select_holdout): по нему считается разность разностей, и только
+    тогда механизм становится did_holdout. Ошибка оценки — только из счётчика лидов окна
     наблюдения: в красной линии лежит ТЕМП базы (лиды в день, ради
     observed_leads_delta), а не число лидов, на котором она снята, — поэтому
     rel_error по-прежнему нижняя граница, и это отмечено полем
@@ -649,6 +763,20 @@ def action_experiment(action: Dict[str, Any], observed: Dict[str, Any],
         effect = round((cpa - base) / base, 4)
         effect_lo = round(effect - rel, 4)
         effect_hi = round(effect + rel, 4)
+    # Контроль за то же окно повышает и оценку, и класс: DiD вычитает сезон,
+    # before_after — нет. Подменяются ровно три поля, остальные как есть.
+    did = _did_effect(observed, base, control)
+    mechanism, reliability = "before_after", "B"
+    control_params: Dict[str, Any] = {}
+    if did is not None:
+        effect = did
+        effect_lo = round(did - rel, 4)
+        effect_hi = round(did + rel, 4)
+        mechanism, reliability = "did_holdout", "A"
+        # Контроль едет в параметры: без его чисел разность разностей нечем
+        # перепроверить, а класс A — самое сильное утверждение в истории.
+        control_params = {"control": {k: control.get(k)
+                                      for k in ("baseline_cpa", "cpa", "leads")}}
     start, end, _ = window
     applied = _as_date(action.get("applied_at")) or _as_date(action.get("created_at"))
     raw = f"action:{action.get('action_id')}"
@@ -666,8 +794,9 @@ def action_experiment(action: Dict[str, Any], observed: Dict[str, Any],
             "leads": leads,
             "rel_error": round(rel, 4),
             "rel_error_floor": True,
+            **control_params,
         },
-        "mechanism": "before_after",
+        "mechanism": mechanism,
         "started_on": (applied or start).isoformat(),
         "measured_on": end.isoformat(),
         "effect": effect,
@@ -675,7 +804,7 @@ def action_experiment(action: Dict[str, Any], observed: Dict[str, Any],
         "effect_hi": effect_hi,
         "metric": "eff_cpl",
         "verdict": verdict,
-        "reliability_class": "B",
+        "reliability_class": reliability,
         "source": "action",
     }
 
@@ -965,7 +1094,8 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
           facts_by_campaign: Dict[str, List[Dict[str, Any]]], today: date,
           data_gate: Optional[Dict[str, Any]], crm_through: Optional[date],
           lease: Any = None, mart: Optional[Dict[str, Any]] = None,
-          account_totals: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+          account_totals: Optional[List[Dict[str, Any]]] = None,
+          holdout_facts: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Наблюдение и откат по всем открытым действиям одного кабинета.
 
     crm_through — граница зрелости CRM (agent_db.crm_maturity_date). Как и
@@ -973,6 +1103,11 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
     наблюдение по дням, где расход уже есть, а лидов ещё нет, — то есть откат
     здорового изменения по бесконечному CPA. Такая ошибка обязана быть видна
     как ошибка вызова.
+
+    holdout_facts — дневные факты заповедника (load_holdout_facts). Контроль
+    за то же окно, из которого исход собственного действия получает класс
+    надёжности A вместо B. Нет заповедника — исходы пишутся как раньше,
+    механизмом before_after: класс даёт контроль, а не авторство.
 
     data_gate — вердикт гейта витрины фактов (facts_gate). Красный гейт
     наблюдение не отменяет: состояния считаются и печатаются, пробои видны,
@@ -1095,7 +1230,13 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
                 # лечь в историю вредом, а неотличимый от нуля — «неясно»,
                 # иначе шум отобранных по экстремуму действий читается как
                 # успех (winner's curse).
-                outcome = closing_verdict(observed, action)
+                # Мера — по обещанию действия: растящему спрашивается объём
+                # при цене под потолком, сокращающему — цена. Потолок берётся
+                # уже поправленным на сезон, если поправка была.
+                ceiling = float(verdict.get("seasonal_max_value")
+                                or (action.get("red_line") or {}).get("max_value")
+                                or 0.0)
+                outcome = economic_outcome(action, observed, ceiling)
                 # Факт кладётся той же отметкой, что и вердикт: разнести их
                 # на два запроса значило бы допустить строку с исходом, но
                 # без числа, — а петля обучения читает именно пару.
@@ -1103,7 +1244,11 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
                         action["action_id"], outcome,
                         observed_leads_delta(observed, action)):
                     db_module.record_experiments([action_experiment(
-                        action, observed, window, outcome)])
+                        action, observed, window, outcome,
+                        control=holdout_control(
+                            holdout_facts,
+                            _baseline_window(action.get("red_line") or {}),
+                            (window[0], window[1])))])
                     closed_held.append({
                         "action_id": action.get("action_id"),
                         "object_id": action.get("object_id"),
@@ -1179,7 +1324,11 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
                     if window is not None:
                         db_module.record_experiments([action_experiment(
                             action, verdict.get("observed") or {},
-                            window, "breached")])
+                            window, "breached",
+                            control=holdout_control(
+                                holdout_facts,
+                                _baseline_window(action.get("red_line") or {}),
+                                (window[0], window[1])))])
                 except Exception as exc:
                     errors.append({"action_id": action.get("action_id"),
                                    "object_id": action.get("object_id"),
@@ -1293,6 +1442,27 @@ def load_account_totals(actions: List[Dict[str, Any]], today: date,
     earliest = min(span[0], (today - timedelta(days=SEASONAL_LOOKBACK_DAYS)))
     return agent_db.load_daily_account_totals(
         earliest.isoformat(), today.isoformat())
+
+
+def load_holdout_facts(actions: List[Dict[str, Any]], holdout_ids: Iterable[str],
+                       today: date,
+                       crm_through: Optional[date]) -> List[Dict[str, Any]]:
+    """Дневные факты заповедника — контроль за то же окно (класс A).
+
+    Охват шире окон наблюдения по той же причине, что у load_account_totals:
+    база красной линии снята до применения действия, и разность разностей
+    сравнивает именно эти два окна.
+
+    Строки возвращаются плоским списком, а не словарём по кампаниям:
+    контроль — это заповедник ЦЕЛИКОМ, отдельная кампания в нём слишком
+    мелкая, чтобы служить эталоном.
+    """
+    span = facts_window(actions, today, crm_through)
+    ids = sorted({str(i) for i in holdout_ids or ()})
+    if span is None or not ids:
+        return []
+    earliest = min(span[0], (today - timedelta(days=SEASONAL_LOOKBACK_DAYS)))
+    return agent_db.load_daily_facts(ids, earliest.isoformat(), today.isoformat())
 
 
 def load_mart_breadth(actions: List[Dict[str, Any]], today: date,
@@ -1522,6 +1692,10 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
     # агрегаты ВСЕЙ витрины за тот же охват, одним дешёвым запросом. Окно
     # шире охвата наблюдений — базы линий лежат до применения действий.
     account_totals = load_account_totals(actions, today, crm_through)
+    # Заповедник — контроль ЗА ТО ЖЕ ОКНО: из него исход собственного
+    # действия получает класс надёжности A. Кабинетные агрегаты для этого не
+    # годятся: в них сидят и кампании, которые агент как раз двигал.
+    holdout_facts = load_holdout_facts(actions, holdout_ids, today, crm_through)
     # Поверх витринного гейта — сверка сумм источник↔витрина: битая
     # сборка не видна ни свежести, ни ширине. Аномалия объёма сторожа
     # НЕ гейтует (include_volume=False): обвал расхода — возможное
@@ -1538,7 +1712,7 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
         client = WriteClient(login, sandbox=sandbox, dry_run=dry_run)
         report = watch(client, account_actions, writer_db, holdout_ids,
                        facts_by_campaign, today, gate, crm_through, lease, mart,
-                       account_totals)
+                       account_totals, holdout_facts)
         accounts.append({"account": login, **report, "units_left": client.units_left})
 
     out = {
