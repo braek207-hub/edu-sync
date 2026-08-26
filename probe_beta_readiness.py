@@ -264,6 +264,42 @@ def check_bets(days: int = 30) -> Dict[str, Any]:
     }
 
 
+def check_risk_budget() -> Dict[str, Any]:
+    """Чем занят недельный риск-бюджет — главный ограничитель после капа.
+
+    Кап прогона перестал связывать (26.08), и следующим упором стал риск:
+    его окно расширено назад на горизонт замера, поэтому изменения прошлой
+    недели продолжают держать деньги этой. Без разбивки «сколько занято и
+    чем» отказ `budget` неотличим от осторожности.
+    """
+    week = writer_db._fetch("SELECT date_trunc('week', now())::date::text AS w", {})[0]["w"]
+    held = writer_db._fetch(
+        """
+        SELECT action_kind, COUNT(*) AS cnt,
+               round(sum(risk_rub)::numeric, 0) AS rub,
+               MIN(applied_at)::date::text AS since
+          FROM edu_agent_actions
+         WHERE status IN ('applied', 'stale', 'rolled_back')
+           AND applied_at >= (%(w)s::date - 14)
+         GROUP BY 1 ORDER BY 3 DESC
+        """,
+        {"w": week},
+    )
+    limit = writer_db._fetch(
+        "SELECT limit_rub FROM edu_agent_risk_budget WHERE week_start = %(w)s",
+        {"w": week},
+    )
+    return {
+        "week_start": week,
+        "limit_rub": float(limit[0]["limit_rub"]) if limit else 50000.0,
+        "limit_source": "таблица" if limit else "код (DEFAULT_WEEKLY_RISK_RUB)",
+        "held_by_kind": [{"action_kind": r["action_kind"], "count": int(r["cnt"]),
+                          "rub": float(r["rub"] or 0), "since": r["since"]}
+                         for r in held],
+        "held_total_rub": round(sum(float(r["rub"] or 0) for r in held), 2),
+    }
+
+
 def check_gate() -> Dict[str, Any]:
     try:
         gate = data_gate(date.today())
@@ -452,6 +488,7 @@ def main() -> int:
         "rejects_7d": _safe("rejects", check_rejects),
         "hypotheses": _safe("hypotheses", check_hypotheses),
         "bets": _safe("bets", check_bets),
+        "risk_budget": _safe("risk_budget", check_risk_budget),
         "holdout": _safe("holdout", check_holdout),
         "write_rights": _safe("write_rights", check_write_rights),
     }
