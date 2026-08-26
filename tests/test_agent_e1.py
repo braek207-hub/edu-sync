@@ -2851,7 +2851,9 @@ def test_shortfall_counts_the_same_actions_as_the_lane_block(monkeypatch, capsys
 
     assert {lane: g["taken"] for lane, g in gap.items() if g["taken"]} \
         == lanes_block["taken"]
-    assert sum(g["refused"] for g in gap.values()) \
+    # Отказы разложены на «зажато лимитом» и «рычага записи нет», но в сумме
+    # обязаны сходиться с соседним блоком: разложение не вправе терять строки.
+    assert sum(g["refused"] + g["not_applicable"] for g in gap.values()) \
         == sum(lanes_block["refused"].values())
     # Потолок в отчёте — тот самый, которым отбор реально ограничивал полосу.
     # Разойдись он с ним, и человек поднимал бы ступень, глядя на чужое число.
