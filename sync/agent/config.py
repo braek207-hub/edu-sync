@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.portfolio import EXPLORATION_SHARE
 from sync.agent.writer.budget import BUDGET_COOLDOWN_DAYS, MAX_WRITE_STEP
+from sync.agent.writer.risk import DEFAULT_RISK_SHARE_WEEK
 from sync.agent.writer.switch import MAX_SUSPENDS_PER_RUN
 
 # Что регулируется. Значение по умолчанию = константа кода, диапазон — границы,
@@ -72,6 +73,17 @@ SPEC: Dict[str, Dict[str, Any]] = {
         # опускать её до уровня корректировок.
         "default": 0.97, "min": 0.95, "max": 0.999,
         "about": "порог уверенности для выключения кампании",
+    },
+    "risk_share_week": {
+        # Верх 6 % — не «побольше на всякий случай»: при недельном расходе
+        # кабинета 5,7 млн ₽ (замер 26.08.2026) это 342 000 ₽ под
+        # непроверенными изменениями против 57 000 ₽ на дефолте. Выше —
+        # уже не темп, а снятие того самого потолка, ради которого слой
+        # построен. Ноль — законное «ничего не применять по риску»: это
+        # решение человека, в отличие от нуля от пробела в витрине, где
+        # weekly_limit падает на абсолютный дефолт.
+        "default": DEFAULT_RISK_SHARE_WEEK, "min": 0.0, "max": 0.06,
+        "about": "доля недельного расхода кабинета на риск одной полосы",
     },
     "target_romi": {
         "default": 1.0, "min": 1.0, "max": 5.0,

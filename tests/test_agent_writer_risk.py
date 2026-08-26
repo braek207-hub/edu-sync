@@ -167,3 +167,25 @@ def test_deferred_action_does_not_mark_object_as_paid():
     assert fits == []
     assert len(deferred) == 2
     assert charged == {}
+
+
+# --- недельный лимит: доля расхода, а не константа -----------------------
+
+def test_weekly_limit_scales_with_account_spend():
+    # 50 000 ₽ — это 0,9 % от недельного расхода кабинета в 5,7 млн ₽
+    # (замер 26.08.2026). Константа не масштабируется: вырос кабинет вдвое —
+    # агент остался таким же зажатым.
+    assert risk_module.weekly_limit(5_700_000.0, 0.01, None) == 57_000.0
+    assert risk_module.weekly_limit(11_400_000.0, 0.01, None) == 114_000.0
+
+
+def test_absolute_override_wins_over_share():
+    # Абсолютное значение ставит человек (risk_budget_week в LOCKED_KEYS) —
+    # оно и решает, каким бы ни был расход.
+    assert risk_module.weekly_limit(5_700_000.0, 0.01, 50_000.0) == 50_000.0
+
+
+def test_unknown_spend_falls_back_to_default_not_to_zero():
+    # Ноль означал бы «агент не работает» при первом же пробеле в витрине —
+    # отказ, неотличимый от исправной остановки.
+    assert risk_module.weekly_limit(0.0, 0.01, None) == risk_module.DEFAULT_WEEKLY_RISK_RUB

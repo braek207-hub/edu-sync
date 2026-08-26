@@ -116,3 +116,30 @@ def test_every_preset_is_valid():
     # первый же раз, когда его выберут.
     for name in PRESETS:
         resolve(preset=name)
+
+
+def test_risk_share_is_in_spec_and_bounded():
+    # Недельный риск-бюджет — доля расхода кабинета, и доля регулируется
+    # панелью. Дефолт равен константе кода: появление ручки само по себе
+    # поведения не меняет.
+    from sync.agent.writer.risk import DEFAULT_RISK_SHARE_WEEK
+
+    assert DEFAULTS["risk_share_week"] == DEFAULT_RISK_SHARE_WEEK
+    assert resolve()["risk_share_week"] == DEFAULT_RISK_SHARE_WEEK
+    assert resolve(overrides={"risk_share_week": 0.03})["risk_share_week"] == 0.03
+    # 6 % недельного расхода под непроверенными изменениями — предел, за
+    # которым «настройка темпа» становится снятием защиты.
+    with pytest.raises(ValueError, match="вне допустимого диапазона"):
+        resolve(overrides={"risk_share_week": 0.10})
+    with pytest.raises(ValueError, match="вне допустимого диапазона"):
+        resolve(overrides={"risk_share_week": -0.01})
+
+
+def test_risk_budget_week_stays_locked():
+    # Доля — ручка панели, АБСОЛЮТНЫЙ потолок — нет: он перебивает долю
+    # (risk.weekly_limit), то есть отключает саму связь риска с расходом.
+    # Такое ставит человек руками, а не пресет.
+    assert "risk_budget_week" in LOCKED_KEYS
+    assert "risk_budget_week" not in DEFAULTS
+    with pytest.raises(ValueError, match="не переопределяется"):
+        resolve(overrides={"risk_budget_week": 500_000.0})

@@ -87,6 +87,8 @@ from sync.agent.writer.plan import plan_bid_modifiers, plan_schedule
 from sync.agent.writer.schedule import describe as describe_schedule
 from sync.agent.writer.schedule import schedule_changed, schedule_items
 from sync.agent.writer.risk import (
+    DAYS_IN_WEEK,
+    DEFAULT_RISK_SHARE_WEEK,
     action_risk,
     action_risk_basis,
     fit_into_budget,
@@ -96,13 +98,37 @@ from sync.agent.writer.risk import (
     paced_allowance,
     risk_object,
     week_start,
+    weekly_limit,
 )
 from sync.agent import blackbox, conflicts, experiments, rejects
 from sync.agent.writer.rollback import red_line_for
 from sync.agent.writer.units import api_to_delta
 
-DEFAULT_WEEKLY_RISK_RUB = 50_000.0
 CAMPAIGN_PAGE_LIMIT = 1000
+
+
+def weekly_risk_limit(week_start_iso: str, daily_cost: Dict[str, float],
+                      config: Optional[Dict[str, Any]] = None) -> float:
+    """Недельный потолок риска прогона — доля расхода; строка в таблице поверх.
+
+    Расход берётся тем же справочником дневных расходов, которым считается
+    цена каждого действия (agent_db.load_daily_cost_by_campaign): сумма
+    дневных темпов × 7. Он общий на все кабинеты прогона — ровно как и сам
+    риск-бюджет, который читается один раз на неделю, а не по кабинету.
+
+    Абсолютный потолок из edu_agent_risk_budget, если строка на неделю есть,
+    перебивает долю: это ручное решение человека (risk_budget_week в
+    LOCKED_KEYS панели), и оно не обязано ни с чем сходиться.
+
+    Пустой справочник — расход неизвестен: weekly_limit отдаёт прежний
+    абсолютный дефолт, а не ноль, иначе прогон при первом же пробеле в
+    витрине отложил бы всё до единого действия и выглядел бы в отчёте как
+    исправно остановленный.
+    """
+    share = float((config or {}).get("risk_share_week", DEFAULT_RISK_SHARE_WEEK))
+    run_weekly_spend = sum(float(v) for v in daily_cost.values()) * DAYS_IN_WEEK
+    return writer_db.risk_limit(week_start_iso,
+                                weekly_limit(run_weekly_spend, share))
 
 # --------------------------------------------- ограничение объёма прогона
 
@@ -1559,7 +1585,8 @@ def run_account(
     # а не на кабинет, и предыдущий клиент этого же прогона мог его уже
     # частично занять (spent_risk читает applied_at из журнала, куда
     # apply_actions уже успел записать применённые действия).
-    weekly_left = writer_db.risk_limit(wk, DEFAULT_WEEKLY_RISK_RUB) - writer_db.spent_risk(wk)
+    weekly_left = (weekly_risk_limit(wk, daily_cost, ctx.get("config"))
+                   - writer_db.spent_risk(wk))
     # Из двух потолков берётся меньший: остаток НЕДЕЛИ и доля СЕГОДНЯШНЕГО
     # дня. Второй общий на все кабинеты прогона, поэтому он не перечитывается,
     # а уменьшается по мере трат — ровно как лимит действий рядом.
@@ -1997,7 +2024,8 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         # прогон: делить остаток заново на каждом кабинете значило бы выдать
         # четыре дневных доли за один день.
         "run_risk_remaining": paced_allowance(
-            writer_db.risk_limit(wk, DEFAULT_WEEKLY_RISK_RUB) - writer_db.spent_risk(wk),
+            weekly_risk_limit(wk, daily_cost, active_config)
+            - writer_db.spent_risk(wk),
             today, wk),
         # Ограничитель кампаний — один объект на весь прогон: его остаток
         # общий на все кабинеты, тем же доводом, что и лимит действий.
