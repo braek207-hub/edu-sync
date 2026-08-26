@@ -22,6 +22,13 @@ from sync.agent.writer import exposure, expectation
 PLACEMENT_KIND = "placement.exclude"
 PLACEMENT_SETTING_KIND = "excluded_site"
 
+# Конверсии вырезаемого трафика — отдельной строкой, ровно по тем же доводам,
+# что у минус-фраз (negatives.NEGATIVE_CONVERSIONS_KIND): в таблице лежат
+# строки старого формата без конверсий, и отсутствие строки обязано читаться
+# как «не измеряли», а не как «ноль». Ноль даёт класс 0 — право резать без
+# риск-бюджета, — и выдавать его за неизмеренное нельзя.
+PLACEMENT_CONVERSIONS_KIND = "excluded_site_conversions"
+
 # Ограничения Директа: не больше 1000 запрещённых площадок на кампанию,
 # каждая — до 255 символов.
 MAX_EXCLUDED_SITES = 1000
@@ -85,11 +92,18 @@ def plan_placements(
     # Конверсии вырезаемого трафика — вход ожидания, тем же правилом и по той
     # же причине, что у минус-фраз (writer/negatives.plan_negatives).
     cut_conversions: Dict[str, float] = {}
+    # Кампании, чьи конверсии на вырезаемом трафике не измерены (строка
+    # витрины старого формата). Ноль вместо них дал бы класс 0 по данным,
+    # которых нет, — см. negatives.plan_negatives.
+    unknown: set = set()
     for candidate in taken:
         split = candidate.get("cost_by_campaign") or {}
+        conversions_split = candidate.get("conversions_by_campaign") or {}
+        measured = candidate.get("conversions") is not None
+        # Запасной путь, когда конверсии есть общим числом, но не разложены по
+        # кампаниям, — раскладка по деньгам; см. negatives.plan_negatives.
         cost_total = sum(float(v) for v in split.values()) or float(
             candidate.get("cost") or 0.0)
-        conversions = float(candidate.get("conversions") or 0.0)
         for campaign_id in candidate.get("campaigns") or []:
             if not campaign_id:
                 continue
@@ -98,9 +112,16 @@ def plan_placements(
                 sites.append(candidate["site"])
             campaign_cost = float(split.get(str(campaign_id), 0.0))
             cut_cost[str(campaign_id)] = cut_cost.get(str(campaign_id), 0.0) + campaign_cost
-            share = (campaign_cost / cost_total) if cost_total > 0 else 0.0
+            if not measured:
+                unknown.add(str(campaign_id))
+                continue
+            if conversions_split:
+                lost = float(conversions_split.get(str(campaign_id), 0.0))
+            else:
+                share = (campaign_cost / cost_total) if cost_total > 0 else 0.0
+                lost = float(candidate.get("conversions") or 0.0) * share
             cut_conversions[str(campaign_id)] = (
-                cut_conversions.get(str(campaign_id), 0.0) + conversions * share)
+                cut_conversions.get(str(campaign_id), 0.0) + lost)
     for sites in desired.values():
         sites.sort()
 
@@ -108,7 +129,9 @@ def plan_placements(
         "desired": desired,
         "cut_cost": {cid: round(v, 2) for cid, v in sorted(cut_cost.items())},
         "cut_conversions": {cid: round(v, 2)
-                            for cid, v in sorted(cut_conversions.items())},
+                            for cid, v in sorted(cut_conversions.items())
+                            if cid not in unknown},
+        "unknown_conversions": sorted(unknown),
         "over_cap": len(valid) - len(taken),
         "invalid": invalid,
         "cost_covered": round(sum(float(c.get("cost") or 0.0) for c in taken), 2),
@@ -194,16 +217,29 @@ def computed_rows(candidates: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, 
         if not site:
             continue
         split = candidate.get("cost_by_campaign") or {}
+        conversions_split = candidate.get("conversions_by_campaign") or {}
         for campaign_id in candidate.get("campaigns") or []:
             if not campaign_id:
                 continue
             # Доля расхода этой кампании — см. тот же довод в negatives.
-            out.setdefault(str(campaign_id), []).append({
+            rows = out.setdefault(str(campaign_id), [])
+            rows.append({
                 "setting_kind": PLACEMENT_SETTING_KIND,
                 "setting_key": site,
                 "value": float(split.get(str(campaign_id),
                                          candidate.get("cost") or 0.0)),
                 "raw_value": int(candidate.get("clicks") or 0),
+                "support_n": int(candidate.get("clicks") or 0),
+                "reason": candidate.get("reason"),
+            })
+            # Ноль пишется явно: только тогда отсутствие строки означает
+            # «не измеряли», а не «конверсий не было».
+            rows.append({
+                "setting_kind": PLACEMENT_CONVERSIONS_KIND,
+                "setting_key": site,
+                "value": float(conversions_split.get(
+                    str(campaign_id), candidate.get("conversions") or 0.0)),
+                "raw_value": float(candidate.get("conversions") or 0.0),
                 "support_n": int(candidate.get("clicks") or 0),
                 "reason": candidate.get("reason"),
             })
@@ -213,21 +249,34 @@ def computed_rows(candidates: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, 
 def candidates_from_computed(
     computed_by_campaign: Dict[str, List[Dict[str, Any]]],
 ) -> List[Dict[str, Any]]:
-    """Строки computed → кандидаты в виде, который ждёт plan_placements."""
+    """Строки computed → кандидаты в виде, который ждёт plan_placements.
+
+    conversions — None, если строк PLACEMENT_CONVERSIONS_KIND по площадке
+    нет ни одной: не измеряли. См. negatives.candidates_from_computed.
+    """
     by_site: Dict[str, Dict[str, Any]] = {}
     for campaign_id, rows in computed_by_campaign.items():
         for row in rows:
-            if str(row.get("setting_kind")) != PLACEMENT_SETTING_KIND:
+            kind = str(row.get("setting_kind"))
+            if kind not in (PLACEMENT_SETTING_KIND, PLACEMENT_CONVERSIONS_KIND):
                 continue
             site = normalize_site(row.get("setting_key"))
             if not site:
                 continue
             slot = by_site.setdefault(site, {
                 "placement": site, "cost": 0.0, "clicks": 0,
-                "conversions": 0, "campaigns": [],
+                "conversions": None, "campaigns": [],
                 "cost_by_campaign": {},
+                "conversions_by_campaign": {},
                 "reason": row.get("reason"),
             })
+            if kind == PLACEMENT_CONVERSIONS_KIND:
+                conversions = float(row.get("value") or 0.0)
+                slot["conversions"] = (slot["conversions"] or 0.0) + conversions
+                slot["conversions_by_campaign"][str(campaign_id)] = (
+                    slot["conversions_by_campaign"].get(str(campaign_id), 0.0)
+                    + conversions)
+                continue
             cost = float(row.get("value") or 0.0)
             slot["cost"] += cost
             slot["clicks"] += int(row.get("raw_value") or 0)

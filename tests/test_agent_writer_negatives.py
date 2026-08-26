@@ -161,3 +161,123 @@ def test_candidates_from_computed_restore_the_plan_input():
     assert candidates[0]["query"] == "мгсу"
     assert candidates[0]["cost"] == 56_902.0        # суммарный расход фразы
     assert sorted(candidates[0]["campaigns"]) == ["1", "2"]
+
+
+# ------------------- конверсии кандидата доезжают через витрину
+
+
+def test_computed_rows_carry_conversions_of_the_cut_traffic():
+    """Уберите этот тест — и конверсии вырезаемого трафика снова негде везти.
+
+    До 27.08.2026 строка витрины дублировала клики в raw_value и support_n, а
+    candidates_from_computed подставляла conversions=0 литералом. Следствий
+    два, и оба бьют по деньгам: кандидат cpa_above_limit (конверсии есть, но
+    дорогие) выглядел как zero_conversions, то есть получал класс 0 —
+    «арифметика, риском не платит, вносится весь и сразу», — и обещал «лидов
+    не теряем» ровно там, где режется конверсионный трафик.
+    """
+    from sync.agent.writer.negatives import (NEGATIVE_CONVERSIONS_KIND,
+                                             computed_rows)
+    rows = computed_rows([{
+        "query": "мгсу цена", "cost": 30_000.0, "clicks": 300,
+        "conversions": 5, "reason": "cpa_above_limit",
+        "campaigns": ["1", "2"],
+        "cost_by_campaign": {"1": 20_000.0, "2": 10_000.0},
+        "conversions_by_campaign": {"1": 4, "2": 1},
+    }])
+    by_kind = {r["setting_kind"]: r for r in rows["1"]}
+    assert by_kind[NEGATIVE_CONVERSIONS_KIND]["setting_key"] == "мгсу цена"
+    assert by_kind[NEGATIVE_CONVERSIONS_KIND]["value"] == 4.0
+    assert {r["setting_kind"] for r in rows["2"]} == {"negative_phrase",
+                                                     NEGATIVE_CONVERSIONS_KIND}
+
+
+def test_zero_conversions_are_written_too_so_that_silence_means_unknown():
+    # Строка с нулём обязана существовать: только тогда ОТСУТСТВИЕ строки
+    # честно означает «не измеряли», а не «конверсий не было».
+    from sync.agent.writer.negatives import (NEGATIVE_CONVERSIONS_KIND,
+                                             computed_rows)
+    rows = computed_rows([_candidate("мгсу")])
+    values = {r["setting_kind"]: r["value"] for r in rows["1"]}
+    assert values[NEGATIVE_CONVERSIONS_KIND] == 0.0
+
+
+def test_candidate_conversions_are_summed_back_from_computed():
+    from sync.agent.writer.negatives import (NEGATIVE_CONVERSIONS_KIND,
+                                             candidates_from_computed)
+    computed = {
+        "1": [{"setting_kind": "negative_phrase", "setting_key": "мгсу цена",
+               "value": 20_000.0, "raw_value": 200, "support_n": 200},
+              {"setting_kind": NEGATIVE_CONVERSIONS_KIND,
+               "setting_key": "мгсу цена", "value": 4.0}],
+        "2": [{"setting_kind": "negative_phrase", "setting_key": "мгсу цена",
+               "value": 10_000.0, "raw_value": 100, "support_n": 100},
+              {"setting_kind": NEGATIVE_CONVERSIONS_KIND,
+               "setting_key": "мгсу цена", "value": 1.0}],
+    }
+    candidate = candidates_from_computed(computed)[0]
+    assert candidate["conversions"] == 5.0
+    assert candidate["conversions_by_campaign"] == {"1": 4.0, "2": 1.0}
+
+
+def test_old_row_means_conversions_unknown_not_zero():
+    """Строка старого формата не даёт скидку правила трёх.
+
+    «Неизвестно» и «ноль» — разные вещи: на нуле действие становится классом 0
+    и перестаёт платить риском. Строка, записанная до 27.08.2026, конверсий не
+    несёт вовсе, и выдать её за ноль значило бы раздать бесплатные отсечения
+    всему, что успела накопить витрина.
+    """
+    from sync.agent.writer.negatives import candidates_from_computed
+    computed = {"1": [{"setting_kind": "negative_phrase", "setting_key": "мгсу",
+                       "value": 46_902.0, "raw_value": 300, "support_n": 300}]}
+    candidate = candidates_from_computed(computed)[0]
+    assert candidate["conversions"] is None
+
+
+def test_plan_uses_measured_conversions_per_campaign():
+    # Разложение по деньгам было единственным вариантом, пока разрез
+    # «фраза × кампания» конверсий не нёс. Теперь он их несёт, и приписывать
+    # кампании долю по расходу вместо её собственных лидов больше незачем.
+    plan = plan_negatives([{
+        "query": "мгсу цена", "cost": 30_000.0, "clicks": 300,
+        "conversions": 5.0, "reason": "cpa_above_limit",
+        "campaigns": ["1", "2"],
+        "cost_by_campaign": {"1": 20_000.0, "2": 10_000.0},
+        "conversions_by_campaign": {"1": 1.0, "2": 4.0},
+    }])
+    assert plan["cut_conversions"] == {"1": 1.0, "2": 4.0}
+    assert plan["unknown_conversions"] == []
+
+
+def test_plan_marks_campaigns_whose_conversions_were_never_measured():
+    """Уберите этот тест — и «не измеряли» снова станет «ноль».
+
+    Кандидат, собранный из строки витрины старого формата, конверсий не несёт.
+    Молчаливый ноль здесь означал бы «этот трафик не приносил лидов» — то есть
+    класс 0 и отсечение без риск-бюджета по данным, которых никто не видел.
+    """
+    plan = plan_negatives([{
+        "query": "мгсу", "cost": 30_000.0, "clicks": 300,
+        "conversions": None, "reason": "zero_conversions",
+        "campaigns": ["1"], "cost_by_campaign": {"1": 30_000.0},
+    }])
+    assert plan["desired"] == {"1": ["мгсу"]}
+    assert "1" not in plan["cut_conversions"]
+    assert plan["unknown_conversions"] == ["1"]
+
+
+def test_one_unknown_phrase_poisons_only_its_own_campaign():
+    # Кампания, у которой ВСЕ вырезаемые фразы измерены, скидку правила трёх
+    # не теряет из-за соседней кампании с легаси-строкой.
+    plan = plan_negatives([
+        {"query": "мгсу", "cost": 30_000.0, "clicks": 300, "conversions": None,
+         "reason": "zero_conversions", "campaigns": ["1"],
+         "cost_by_campaign": {"1": 30_000.0}},
+        {"query": "мгсу цена", "cost": 20_000.0, "clicks": 200,
+         "conversions": 0.0, "reason": "zero_conversions", "campaigns": ["2"],
+         "cost_by_campaign": {"2": 20_000.0},
+         "conversions_by_campaign": {"2": 0.0}},
+    ])
+    assert plan["unknown_conversions"] == ["1"]
+    assert plan["cut_conversions"] == {"2": 0.0}
