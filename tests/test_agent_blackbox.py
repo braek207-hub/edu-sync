@@ -129,3 +129,51 @@ def test_units_low_is_a_known_reason():
     assert rejects.UNITS_LOW in rejects.KNOWN_REASONS
     rows = rejects.from_groups([(rejects.UNITS_LOW, [_action()])])
     assert rows[0]["reason"] == rejects.UNITS_LOW
+
+
+# =========================================================================
+# Перечень причин: что агент имеет право ПИСАТЬ и что умеет ЧИТАТЬ.
+# =========================================================================
+
+
+def test_lane_limit_is_a_known_distinct_reason():
+    # Убрать этот тест — и «не влезло в полосу» схлопнется либо в UNKNOWN
+    # (row(): known = reason if reason in KNOWN_REASONS else UNKNOWN), либо
+    # в «бюджет». А это разные диагнозы: бюджет прогона общий и кончается на
+    # всех, лимит полосы принадлежит одной полосе и лечится её ступенью.
+    assert rejects.LANE_LIMIT in rejects.KNOWN_REASONS
+    assert rejects.LANE_LIMIT != rejects.BUDGET
+
+
+def test_run_cap_is_no_longer_writable():
+    # Лимит действий на прогон (guardrails.cap_actions) снят — отбор идёт
+    # полосами. Оставь причину в перечне записи, и новый код мог бы снова
+    # начать писать отказ рельсы, которой нет: строки в журнале выглядели бы
+    # как работа живого ограничителя, и разбор беты искал бы несуществующее.
+    assert "run_cap" not in rejects.KNOWN_REASONS
+
+
+def test_run_cap_stays_readable_as_history():
+    # Обратная сторона: в edu_agent_rejects лежат строки с этой причиной за
+    # июль–август 2026. Удали константу — и код причины останется голым
+    # литералом в review.EXPECTED_REASONS и в подписях панели, то есть
+    # разъедется при первой же опечатке, а история превратится в «unknown».
+    assert rejects.RUN_CAP in rejects.HISTORICAL_REASONS
+    assert rejects.RUN_CAP in rejects.READABLE_REASONS
+
+
+def test_written_reasons_are_a_subset_of_readable_ones():
+    # Причина, которую агент пишет, но не умеет читать, — слепое пятно
+    # разбора: строка ляжет в журнал и не найдётся ни одной группировкой.
+    assert rejects.KNOWN_REASONS <= rejects.READABLE_REASONS
+    assert not (rejects.KNOWN_REASONS & rejects.HISTORICAL_REASONS)
+
+
+def test_writing_a_historical_reason_keeps_the_original_code():
+    # Если код снятой рельсы всё же попробуют записать, причина схлопнется в
+    # UNKNOWN — но исходное значение обязано уехать в detail. Иначе отказ
+    # потеряет и причину, и след того, кто её поставил.
+    rows = rejects.from_groups([(rejects.RUN_CAP, [_action()])])
+
+    assert rows[0]["reason"] == rejects.UNKNOWN
+    assert rows[0]["detail"]["reason_given"] == "run_cap"
