@@ -1,0 +1,33 @@
+name: probe-retargeting-lever
+# Разовый read-only замер под Этап 2 конвейера экспериментов: есть ли в
+# кабинетах сегменты ретаргетинга, есть ли по ним ЗАМЕР в Reports API и
+# принимает ли запись форму RetargetingAdjustments.
+# Ничего не создаёт: единственные записывающие вызовы идут по заведомо
+# несуществующим идентификаторам и обязаны отказать на уровне элемента.
+on:
+  workflow_dispatch:
+    inputs:
+      account:
+        description: "Только один кабинет (логин); пусто — все"
+        required: false
+        type: string
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests python-dotenv
+      - name: Замер рычага «аудитории и ретаргетинг»
+        env:
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.account }}" ]; then
+            ARGS="--account=${{ github.event.inputs.account }}"
+          fi
+          python probe_retargeting_lever.py $ARGS
