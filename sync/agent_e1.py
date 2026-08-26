@@ -793,11 +793,10 @@ def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
     источника чисел здесь нет намеренно: разойдись он с отбором хоть на рубль,
     и отчёт объяснял бы решение, которого не было.
 
-    Потолок полосы берётся у самого lanes (_risk_budget), а не пересчитывается
-    формулой отсюда. Обращение к внутреннему имени — сознательный выбор из двух
-    зол: копия формулы «доля ступени от недельного потолка» тихо разъедется с
-    отбором при первой же правке ставок, а исчезнувшее имя роняет прогон громко
-    и сразу. Появится у полос публичный доступ к своему потолку — заменить тут.
+    Цена действия и потолок полосы берутся у самого lanes
+    (charged_price, risk_budget_of), а не пересчитываются формулой отсюда:
+    копия «доли ступени от недельного потолка» тихо разъехалась бы с отбором
+    при первой же правке ставок, и отчёт продолжал бы выглядеть правдой.
 
     Спрос считается на ПЕРВОМ круге цен, то есть на полном наборе кандидатов:
     это и есть «сколько полоса хотела». Списанное (lanes spent) считается на
@@ -826,7 +825,7 @@ def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
         _slot(action)[field] += 1
     for action in list(taken) + list(refused):
         lane = lanes.lane_of(action)
-        price = lanes._charged(action, lane, prices)     # noqa: SLF001 — см. докстринг
+        price = lanes.charged_price(action, lane, prices)
         if math.isfinite(price):
             slots[lane]["wanted"] += price
         else:
@@ -834,9 +833,8 @@ def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
 
     out: Dict[str, Any] = {}
     for lane, slot in sorted(slots.items()):
-        policy = lanes.policy_of(lane, steps.get(lane, lanes.DEFAULT_STEP), config)
-        limit = lanes._risk_budget(lane, policy, weekly_spend_rub,   # noqa: SLF001
-                                   risk_budget_rub)
+        limit = lanes.risk_budget_of(lane, steps.get(lane, lanes.DEFAULT_STEP),
+                                     weekly_spend_rub, config, risk_budget_rub)
         out[lane] = lane_shortfall(taken=slot["taken"], refused=slot["refused"],
                                    wanted_rub=slot["wanted"], limit_rub=limit,
                                    lane=lane, unpriced=slot["unpriced"],
