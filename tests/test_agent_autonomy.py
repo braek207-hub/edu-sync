@@ -55,9 +55,10 @@ def test_money_contradiction_blocks_step_two():
 
 
 def test_recent_failures_demote_by_one_step():
-    record = {"closed": 50, "improved": 30, "worsened": 20,
-              "recent_closed": 12, "recent_improved": 4}   # 33 % < 40 %
-    assert autonomy.step_of("tuning", record) == 2         # было бы 3
+    record = {"closed": 50, "improved": 35, "worsened": 15,   # 70 % накопленных
+              "money_confirmed": 12, "money_contradicted": 6,
+              "recent_closed": 12, "recent_improved": 4}      # 33 % < 40 %
+    assert autonomy.step_of("tuning", record) == 2            # было бы 3
 
 
 # ------------------- края лестницы
@@ -84,11 +85,27 @@ def test_money_confirmation_opens_step_two():
     assert autonomy.step_of("allocation", record) == 2
 
 
-def test_silent_money_checkpoint_does_not_block_the_ladder():
+def test_silent_money_checkpoint_caps_the_lane_at_step_one():
     # Ни одного проверенного деньгами успеха — сторож второго чекпоинта ещё не
-    # отработал. Это не свидетельство против полосы.
+    # отработал. Это не свидетельство ПРОТИВ полосы (в тень она не уходит), но
+    # и не подтверждение: ступени 2 и 3 требуют, чтобы деньги высказались.
     record = {"closed": 30, "improved": 20, "worsened": 10}
-    assert autonomy.step_of("allocation", record) == 2
+    assert autonomy.step_of("allocation", record) == 1
+
+    # Объём наблюдений молчание не лечит: полоса с идеальными заявками и
+    # неотработавшим сторожем остаётся на 1 %, продолжая нарабатывать ему
+    # материал. Заперта она при этом не будет — применения на 1 % идут.
+    brilliant = {"closed": 200, "improved": 190, "worsened": 10}
+    assert autonomy.step_of("allocation", brilliant) == 1
+
+
+def test_top_step_demands_a_higher_hit_rate_than_the_lower_ones():
+    # 6 % недельного расхода — ≈ 342 тыс ₽ под непроверенными изменениями.
+    # 60 % попаданий хватает на 1 % и 3 %, но не на верхнюю ступень.
+    record = {"closed": 50, "improved": 31, "worsened": 19,   # 62 %
+              "money_confirmed": 20, "money_contradicted": 5}
+    assert autonomy.step_of("tuning", record) == 2
+    assert autonomy.step_of("tuning", {**record, "improved": 34}) == 3  # 68 %
 
 
 def test_top_step_needs_forty_eight_closed():

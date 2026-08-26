@@ -557,10 +557,17 @@ def test_money_contradiction_blocks_step_two():
 
 ```python
 def test_recent_failures_demote_by_one_step():
-    record = {"closed": 50, "improved": 30, "worsened": 20,
-              "recent_closed": 12, "recent_improved": 4}   # 33 % < 40 %
-    assert autonomy.step_of("tuning", record) == 2         # было бы 3
+    record = {"closed": 50, "improved": 35, "worsened": 15,   # 70 % накопленных
+              "money_confirmed": 12, "money_contradicted": 6,
+              "recent_closed": 12, "recent_improved": 4}      # 33 % < 40 %
+    assert autonomy.step_of("tuning", record) == 2            # было бы 3
 ```
+
+Запись собрана под пороги ступени 3 из таблицы §1.5 (≥ 48 закрытых, ≥ 65 %
+улучшений, второй чекпоинт ≥ 60 %) — иначе тест проверял бы не понижение, а
+недобор до верхней ступени. Молчащий чекпоинт денег выше ступени 1 не пускает:
+он не свидетельство против полосы, но и не подтверждение, а на 6 % недельного
+расхода нужно именно подтверждение.
 
 - [ ] **Шаг 5–7:** красный → реализация → зелёный.
 - [ ] **Шаг 8: коммит** `feat(agent): лестница ступеней риска по track record полосы`
