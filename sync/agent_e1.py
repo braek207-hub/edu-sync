@@ -91,6 +91,7 @@ from sync.agent.writer.risk import (
     action_risk_basis,
     fit_into_budget,
     median,
+    net_risk,
     object_cap,
     object_daily_cost,
     paced_allowance,
@@ -1685,8 +1686,27 @@ def run_account(
     # дня. Второй общий на все кабинеты прогона, поэтому он не перечитывается,
     # а уменьшается по мере трат — ровно как лимит действий рядом.
     remaining = min(weekly_left, ctx["run_risk_remaining"])
-    prepared, deferred = fit_into_budget(priced, risks, remaining,
-                                         charged_risk, caps)
+    # Тот же довод, что в lanes.select: цена со скидкой за встречное движение
+    # денег верна только для набора, который уезжает ЦЕЛИКОМ. Эта рельса берёт
+    # действия по порядку, пока хватает денег, и способна взять получателя, а
+    # донора отложить — скидка выдана, компенсации не будет. Поэтому набор,
+    # который она урезала, переоценивается, и подгонка повторяется, пока не
+    # сойдётся. Счёт по объектам списывается только с сошедшегося набора.
+    candidates = priced
+    deferred: List[Dict[str, Any]] = []
+    prepared: List[Dict[str, Any]] = []
+    for _ in range(len(priced) + 1):
+        attempt_charged = dict(charged_risk)
+        prepared, dropped = fit_into_budget(candidates, risks, remaining,
+                                            attempt_charged, caps)
+        if not dropped:
+            charged_risk.clear()
+            charged_risk.update(attempt_charged)
+            break
+        deferred += dropped
+        kept = {a["idempotency_key"] for a in prepared}
+        candidates = [a for a in candidates if a["idempotency_key"] in kept]
+        risks = net_risk(candidates, daily_cost)
     ctx["run_risk_remaining"] -= sum(float(a.get("risk_rub") or 0.0) for a in prepared)
 
     # Реестр гипотез: разведочная ставка заводится ДО отправки в кабинет и
