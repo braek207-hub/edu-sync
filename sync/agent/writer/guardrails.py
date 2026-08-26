@@ -29,7 +29,6 @@ from sync.agent.writer.units import API_MAX, API_MIN, API_NEUTRAL
 # Та же цифра, приложенная к 100-базе, разрешала бы 0..50 — «срезать ставку
 # вдвое и сильнее», ровно наоборот к замыслу.
 MODIFIER_CAP = 50          # потолок и пол корректировки, проценты (дельта)
-MAX_ACTIONS_PER_RUN = 50
 
 # Allow-лист: разрешено ровно это, всё остальное отклоняется. Не блок-лист по
 # словам — тот пропускает любой ещё не придуманный вид действия (purge,
@@ -525,50 +524,3 @@ def check_holdout(
     allowed = [a for a in actions if str(a.get("object_id")) not in holdout_ids]
     blocked = [a for a in actions if str(a.get("object_id")) in holdout_ids]
     return allowed, blocked
-
-
-def cap_actions(
-    actions: List[Dict[str, Any]], max_per_run: int = MAX_ACTIONS_PER_RUN
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Ограничивает объём одного прогона. Остальное ждёт следующего.
-
-    Слоты раздаются по кругу между ВИДАМИ действий, а внутри вида — по цене
-    объекта, от дорогих к дешёвым. Раньше здесь стоял срез actions[:50], и
-    это была не безобидная простота: план собирается в порядке рычагов
-    (agent_e1), корректировки ставок идут первыми и по всем кампаниям сразу,
-    а их больше лимита. Результат за 30 дней к 26.08.2026 — в журнале только
-    bidmodifier.add (74), bidmodifier.set (24), schedule.set (14); бюджетных
-    действий, целевой цены, минус-фраз и площадок НОЛЬ. Заодно молча умер
-    контур ставок: разведочный карман (1 507 155 руб. на 62 кампании) ездит
-    на бюджетных сдвигах, и ни одна ставка не была заведена ни разу.
-
-    Лимит прогона существует ради ограничения радиуса поражения. Выбирать за
-    нас рычаг — не его работа, и круговая раздача возвращает ему ровно его
-    смысл: объём ограничен, но каждый рычаг доезжает до кабинета.
-
-    Порядок полностью определён: при равной цене (или когда цены нет вовсе —
-    новый объект без истории) решает ключ идемпотентности. Один и тот же
-    план обязан давать один и тот же срез, иначе разбор беты не с чем
-    сверять.
-    """
-    if max_per_run <= 0:
-        return [], list(actions)
-    by_kind: Dict[str, List[Dict[str, Any]]] = {}
-    for action in actions:
-        by_kind.setdefault(str(action.get("action_kind") or ""), []).append(action)
-    for queue in by_kind.values():
-        queue.sort(key=lambda a: (-float(a.get("baseline_daily_rub") or 0.0),
-                                  str(a.get("idempotency_key") or ""),
-                                  str(a.get("object_id") or "")))
-    taken: List[Dict[str, Any]] = []
-    queues = [by_kind[kind] for kind in sorted(by_kind)]
-    depth = 0
-    while len(taken) < max_per_run and any(len(q) > depth for q in queues):
-        for queue in queues:
-            if len(taken) >= max_per_run:
-                break
-            if len(queue) > depth:
-                taken.append(queue[depth])
-        depth += 1
-    chosen = {id(a) for a in taken}
-    return taken, [a for a in actions if id(a) not in chosen]

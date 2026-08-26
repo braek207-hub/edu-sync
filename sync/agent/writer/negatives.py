@@ -114,16 +114,26 @@ def plan_negatives(
     # фразы, — иначе рычаг платил бы за трафик, который не отсекает.
     cut_cost: Dict[str, float] = {}
     # Сколько конверсий этот трафик всё-таки приносил: вход ОЖИДАНИЯ
-    # (writer/expectation.py). У кандидата zero_conversions их нет по
-    # построению, у кандидата cpa_above_limit они есть — и отсечение их
-    # теряет. Обещать «лидов не потеряем» там, где режется конверсионный
-    # трафик, значило бы заранее назначить наблюдению провал.
+    # (writer/expectation.py) и ОСНОВАНИЯ класса 0 (writer/tier.py). У
+    # кандидата zero_conversions их нет по построению, у кандидата
+    # cpa_above_limit они есть — и отсечение их теряет. Обещать «лидов не
+    # потеряем» там, где режется конверсионный трафик, значило бы заранее
+    # назначить наблюдению провал.
     cut_conversions: Dict[str, float] = {}
+    # Кампании, у которых хоть одна вырезаемая фраза пришла строкой старого
+    # формата. Их конверсии не измерены, и подставить сюда ноль нельзя:
+    # правило трёх дало бы такой кампании класс 0 по данным, которых нет.
+    unknown: set = set()
     for candidate in taken:
         split = candidate.get("cost_by_campaign") or {}
+        conversions_split = candidate.get("conversions_by_campaign") or {}
+        measured = candidate.get("conversions") is not None
+        # Запасной путь для кандидата, у которого конверсии есть общим числом,
+        # но не разложены по кампаниям: раскладываем ПО ДЕНЬГАМ. Делить
+        # поровну значило бы приписать одинаковую потерю кампании с расходом
+        # 100 ₽ и кампании с расходом 100 000 ₽.
         cost_total = sum(float(v) for v in split.values()) or float(
             candidate.get("cost") or 0.0)
-        conversions = float(candidate.get("conversions") or 0.0)
         for campaign_id in candidate.get("campaigns") or []:
             if not campaign_id:
                 continue
@@ -132,13 +142,16 @@ def plan_negatives(
                 phrases.append(candidate["phrase"])
             campaign_cost = float(split.get(str(campaign_id), 0.0))
             cut_cost[str(campaign_id)] = cut_cost.get(str(campaign_id), 0.0) + campaign_cost
-            # Конверсии фразы разложены по кампаниям ПО ДЕНЬГАМ: разрез
-            # «фраза × кампания» их не несёт, а делить поровну значило бы
-            # приписать одинаковую потерю кампании с расходом 100 ₽ и
-            # кампании с расходом 100 000 ₽.
-            share = (campaign_cost / cost_total) if cost_total > 0 else 0.0
+            if not measured:
+                unknown.add(str(campaign_id))
+                continue
+            if conversions_split:
+                lost = float(conversions_split.get(str(campaign_id), 0.0))
+            else:
+                share = (campaign_cost / cost_total) if cost_total > 0 else 0.0
+                lost = float(candidate.get("conversions") or 0.0) * share
             cut_conversions[str(campaign_id)] = (
-                cut_conversions.get(str(campaign_id), 0.0) + conversions * share)
+                cut_conversions.get(str(campaign_id), 0.0) + lost)
     for phrases in desired.values():
         phrases.sort()
 
@@ -146,7 +159,9 @@ def plan_negatives(
         "desired": desired,
         "cut_cost": {cid: round(v, 2) for cid, v in sorted(cut_cost.items())},
         "cut_conversions": {cid: round(v, 2)
-                            for cid, v in sorted(cut_conversions.items())},
+                            for cid, v in sorted(cut_conversions.items())
+                            if cid not in unknown},
+        "unknown_conversions": sorted(unknown),
         "over_cap": over_cap,
         "invalid": invalid,
         "cost_covered": round(sum(float(c.get("cost") or 0.0) for c in taken), 2),
@@ -174,6 +189,39 @@ def merge_phrases(existing: List[str], added: List[str],
     return sorted(merged)
 
 
+def cut_evidence(cost_rub: float, conversions: Optional[float],
+                 baseline_cpa: Optional[float],
+                 window_days: int) -> Optional[Dict[str, Any]]:
+    """Основание, по которому отсечение судится классом достоверности.
+
+    Класс 0 — «утверждение о прошлом»: за зрелое окно вырезаемый трафик не дал
+    ни одной конверсии при расходе выше трёх цен конверсии. Судит об этом
+    writer/tier._is_arithmetic, и судит РОВНО по этому полю: нет поля — нет и
+    класса 0. Числа здесь те же, по которым кандидат и выбран
+    (objects.minus_word_candidates: cost / 3 против cpa_limit), поэтому агент
+    минусует и объясняет минусацию одним правилом, а не двумя.
+
+    conversions=None едет в основание КАК None: «не измеряли» обязано остаться
+    отличимым от «ноль». Ноль даёт право резать без риск-бюджета, неизвестность
+    не даёт.
+
+    Порога нет вовсе (baseline_cpa пуст) — основания нет: показать, что расход
+    превысил три цены конверсии, нечем, и выдумывать порог здесь нельзя.
+
+    Один общий вход на оба рычага-близнеца (площадки зовут его отсюда):
+    разъехавшись, два одинаковых по смыслу правила судили бы один и тот же
+    трафик по-разному в зависимости от того, где он показался.
+    """
+    if baseline_cpa is None or float(baseline_cpa) <= 0:
+        return None
+    return {
+        "cost_rub": round(float(cost_rub), 2),
+        "conversions": None if conversions is None else float(conversions),
+        "baseline_cpa": float(baseline_cpa),
+        "window_days": int(window_days),
+    }
+
+
 def _idempotency_key(campaign_id: str, phrases: List[str]) -> str:
     raw = "negatives:" + str(campaign_id) + ":" + "|".join(sorted(phrases))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
@@ -185,12 +233,18 @@ def diff_negatives(
     cut_cost: Optional[Dict[str, float]] = None,
     window_days: int = CANDIDATE_WINDOW_DAYS,
     cut_conversions: Optional[Dict[str, float]] = None,
+    baseline_cpa: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Желаемые фразы × прочитанные списки кабинета → (действия, отказы).
 
     actual_by_campaign — {campaign_id: {"negative_keywords": [...],
     "campaign_type": ...}} из свежего чтения (fetch_negatives). Кампании без
     записи не порождают ни действия, ни отказа: их не оказалось в кабинете.
+
+    baseline_cpa — цена конверсии, по которой кандидаты и отбирались. Нужна не
+    рычагу, а классу достоверности: без неё отсечение не может показать, что
+    вырезает расход выше трёх CPA, и приезжает в отбор ставкой вместо
+    арифметики — то есть платит риском и стоит в очереди позади корректировок.
     """
     actions: List[Dict[str, Any]] = []
     refused: List[Dict[str, Any]] = []
@@ -213,13 +267,19 @@ def diff_negatives(
         # Цена риска — дневной расход отсекаемого трафика. Расход кандидатов
         # собран за окно наблюдения (CANDIDATE_WINDOW_DAYS), поэтому делится
         # на него: горизонт замера риска считает дни, а не окна.
-        cut_daily = float((cut_cost or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
+        cut_window = float((cut_cost or {}).get(str(campaign_id), 0.0))
+        cut_daily = cut_window / max(1, int(window_days))
         # Конверсии вырезаемого трафика — тем же делением на окно, что и
         # деньги: обещание и цена риска обязаны стоять на одном окне.
-        lost_leads_daily = float(
-            (cut_conversions or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
+        # Отсутствие кампании в словаре означает «не измеряли» (см.
+        # plan_negatives: unknown_conversions), и в ОСНОВАНИЕ оно едет как
+        # None; ожиданию нечем заявить неизвестность, поэтому туда идёт ноль.
+        lost_window = (cut_conversions or {}).get(str(campaign_id))
+        lost_leads_daily = float(lost_window or 0.0) / max(1, int(window_days))
+        evidence = cut_evidence(cut_window, lost_window, baseline_cpa, window_days)
         actions.append(expectation.attach({
             "action_kind": NEGATIVE_KIND,
+            **({"evidence": evidence} if evidence else {}),
             "object_level": "campaign",
             "object_id": str(campaign_id),
             "exposure": exposure.traffic_cut_exposure(
@@ -269,6 +329,17 @@ def fetch_negatives(client, campaign_ids: List[str]) -> Dict[str, Dict[str, Any]
 
 NEGATIVE_SETTING_KIND = "negative_phrase"
 
+# Конверсии вырезаемого трафика едут ОТДЕЛЬНОЙ строкой, а не колонкой в
+# строке расхода. Причина — обратная совместимость, и она здесь не
+# формальность: в таблице лежат строки, записанные до 27.08.2026, у которых
+# конверсий нет вовсе. Займи конверсии колонку support_n (сегодня она дублирует
+# клики из raw_value), и старую строку стало бы нечем отличить от новой —
+# «конверсий не измеряли» читалось бы как «конверсий ноль». Разница между этими
+# двумя не косметическая: ноль даёт действию класс 0 (арифметика, риском не
+# платит, вносится весь и сразу, writer/tier.py), а неизвестность не даёт.
+# Отдельная строка снимает вопрос: её ОТСУТСТВИЕ и означает «не измеряли».
+NEGATIVE_CONVERSIONS_KIND = "negative_phrase_conversions"
+
 
 def computed_rows(candidates: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     """Кандидаты расчёта → строки edu_agent_computed_settings по кампаниям.
@@ -277,6 +348,10 @@ def computed_rows(candidates: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, 
     её надо там, а не по всему кабинету — в соседней кампании та же фраза
     может работать. Расход в value, клики в raw_value: писателю нужны оба,
     чтобы отсортировать кандидатов и объяснить решение в отчёте.
+
+    Второй строкой на ту же фразу едут её конверсии в этой кампании — включая
+    честный ноль. Ноль пишется явно именно затем, чтобы отсутствие строки
+    осталось за «не измеряли»: см. NEGATIVE_CONVERSIONS_KIND.
     """
     out: Dict[str, List[Dict[str, Any]]] = {}
     for candidate in candidates:
@@ -284,18 +359,35 @@ def computed_rows(candidates: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, 
         if not phrase:
             continue
         split = candidate.get("cost_by_campaign") or {}
+        conversions_split = candidate.get("conversions_by_campaign") or {}
         for campaign_id in candidate.get("campaigns") or []:
             if not campaign_id:
                 continue
             # Доля расхода ЭТОЙ кампании, а не общий расход фразы: иначе при
             # обратной сборке (candidates_from_computed) расход складывается
             # сам с собой столько раз, в скольких кампаниях фраза живёт.
-            out.setdefault(str(campaign_id), []).append({
+            rows = out.setdefault(str(campaign_id), [])
+            rows.append({
                 "setting_kind": NEGATIVE_SETTING_KIND,
                 "setting_key": phrase,
                 "value": float(split.get(str(campaign_id),
                                          candidate.get("cost") or 0.0)),
                 "raw_value": int(candidate.get("clicks") or 0),
+                "support_n": int(candidate.get("clicks") or 0),
+                "reason": candidate.get("reason"),
+            })
+            rows.append({
+                "setting_kind": NEGATIVE_CONVERSIONS_KIND,
+                "setting_key": phrase,
+                # Конверсии этой кампании; разреза по кампаниям нет — берётся
+                # общее число фразы, и обратная сборка сложит его столько раз,
+                # в скольких кампаниях фраза живёт. Это ЗАВЫШЕНИЕ потерь, то
+                # есть ошибка в сторону осторожности: завышенные конверсии
+                # снимают класс 0 и заставляют платить риском, заниженные —
+                # наоборот, раздали бы бесплатные отсечения.
+                "value": float(conversions_split.get(
+                    str(campaign_id), candidate.get("conversions") or 0.0)),
+                "raw_value": float(candidate.get("conversions") or 0.0),
                 "support_n": int(candidate.get("clicks") or 0),
                 "reason": candidate.get("reason"),
             })
@@ -310,21 +402,35 @@ def candidates_from_computed(
     Расход фразы складывается по всем её кампаниям: отбор за такт идёт по
     деньгам, и фраза, размазанная по трём кампаниям, стоит столько же,
     сколько собранная в одной.
+
+    conversions у кандидата — None, если строк NEGATIVE_CONVERSIONS_KIND по
+    фразе нет ни одной. Это НЕ ноль: строка старого формата означает, что
+    конверсии вырезаемого трафика не измерялись, а ноль означал бы измеренное
+    отсутствие и давал бы действию класс 0 — право резать без риск-бюджета.
     """
     by_phrase: Dict[str, Dict[str, Any]] = {}
     for campaign_id, rows in computed_by_campaign.items():
         for row in rows:
-            if str(row.get("setting_kind")) != NEGATIVE_SETTING_KIND:
+            kind = str(row.get("setting_kind"))
+            if kind not in (NEGATIVE_SETTING_KIND, NEGATIVE_CONVERSIONS_KIND):
                 continue
             phrase = normalize_phrase(row.get("setting_key"))
             if not phrase:
                 continue
             slot = by_phrase.setdefault(phrase, {
                 "query": phrase, "cost": 0.0, "clicks": 0,
-                "conversions": 0, "campaigns": [],
+                "conversions": None, "campaigns": [],
                 "cost_by_campaign": {},
+                "conversions_by_campaign": {},
                 "reason": row.get("reason"),
             })
+            if kind == NEGATIVE_CONVERSIONS_KIND:
+                conversions = float(row.get("value") or 0.0)
+                slot["conversions"] = (slot["conversions"] or 0.0) + conversions
+                slot["conversions_by_campaign"][str(campaign_id)] = (
+                    slot["conversions_by_campaign"].get(str(campaign_id), 0.0)
+                    + conversions)
+                continue
             cost = float(row.get("value") or 0.0)
             slot["cost"] += cost
             slot["clicks"] += int(row.get("raw_value") or 0)

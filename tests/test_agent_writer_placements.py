@@ -76,3 +76,66 @@ def test_computed_bridge_round_trips():
     assert back[0]["placement"] == "trash.site"
     assert sorted(back[0]["campaigns"]) == ["1", "2"]
     assert back[0]["cost"] == 60_000.0      # расход площадки по обеим кампаниям
+
+
+# ------------------- конверсии площадки доезжают через витрину
+
+
+def test_placement_conversions_survive_the_round_trip_through_computed():
+    """Уберите этот тест — и площадка с дорогими конверсиями станет «класс 0».
+
+    Тот же дефект, что у минус-фраз: витрина несла только клики, а обратная
+    сборка подставляла conversions=0. Кандидат cpa_above_limit (конверсии
+    есть, но дороже допустимого) выглядел утверждением о прошлом «конверсий
+    нет» и получал право резаться без риск-бюджета.
+    """
+    from sync.agent.writer.placements import PLACEMENT_CONVERSIONS_KIND
+    rows = computed_rows([{
+        "placement": "trash.site", "cost": 30_000.0, "clicks": 300,
+        "conversions": 3, "reason": "cpa_above_limit", "campaigns": ["1"],
+        "cost_by_campaign": {"1": 30_000.0},
+        "conversions_by_campaign": {"1": 3},
+    }])
+    assert {r["setting_kind"] for r in rows["1"]} == {"excluded_site",
+                                                     PLACEMENT_CONVERSIONS_KIND}
+    candidate = candidates_from_computed(rows)[0]
+    assert candidate["conversions"] == 3.0
+
+
+def test_old_placement_row_means_conversions_unknown():
+    # Строка витрины до 27.08.2026 конверсий не несёт. Ноль вместо «неизвестно»
+    # раздал бы бесплатные запреты всему, что успело накопиться.
+    computed = {"1": [{"setting_kind": "excluded_site",
+                       "setting_key": "trash.site", "value": 30_000.0,
+                       "raw_value": 300, "support_n": 300}]}
+    candidate = candidates_from_computed(computed)[0]
+    assert candidate["conversions"] is None
+    plan = plan_placements([candidate])
+    assert plan["unknown_conversions"] == ["1"]
+    assert plan["cut_conversions"] == {}
+
+
+# ------------------- основание класса 0 производит сам рычаг
+
+
+def test_placement_ban_carries_its_evidence():
+    """Тот же дефект, что у минус-фраз: evidence не производил никто.
+
+    Без него запрет площадки, вырезающий трафик с нулём конверсий на трёх CPA,
+    приезжает в отбор классом 2 — то есть платит риском и стоит в очереди
+    позади корректировок.
+    """
+    from sync.agent.writer import tier
+    plan = plan_placements([{
+        "placement": "trash.site", "cost": 90_000.0, "clicks": 300,
+        "conversions": 0.0, "reason": "zero_conversions", "campaigns": ["1"],
+        "cost_by_campaign": {"1": 90_000.0},
+        "conversions_by_campaign": {"1": 0.0},
+    }])
+    actions, _ = diff_placements(
+        plan["desired"], {"1": {"excluded_sites": [],
+                                "campaign_type": "TEXT_CAMPAIGN"}},
+        cut_cost=plan["cut_cost"], cut_conversions=plan["cut_conversions"],
+        baseline_cpa=2_400.0)
+    assert tier.tier_of(actions[0]) == tier.TIER_ARITHMETIC
+    assert actions[0]["evidence"]["cost_rub"] == 90_000.0

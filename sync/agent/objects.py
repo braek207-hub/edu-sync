@@ -128,6 +128,7 @@ def minus_word_candidates(
         slot = totals.setdefault(phrase, {
             "query": phrase, "cost": 0.0, "clicks": 0, "conversions": 0,
             "campaigns": set(), "cost_by_campaign": {},
+            "conversions_by_campaign": {},
         })
         clicks = int(q.get("clicks") or 0)
         conversions = int(q.get("conversions") or 0)
@@ -144,6 +145,15 @@ def minus_word_candidates(
             # отчиталась о 29,7 млн ₽ при месячном расходе кабинета 8,5 млн).
             slot["cost_by_campaign"][campaign_id] = (
                 slot["cost_by_campaign"].get(campaign_id, 0.0) + cost)
+            # Конверсии — тем же разрезом, что и деньги, и по той же причине.
+            # Без них писатель знает только «сколько денег вырезаем», а
+            # «сколько лидов при этом теряем» подставляет нулём — и кандидат
+            # cpa_above_limit, у которого конверсии ЕСТЬ, становится
+            # неотличим от zero_conversions: то есть получает класс 0
+            # (арифметика, риском не платит) и обещает «лидов не теряем»
+            # ровно там, где режется конверсионный трафик.
+            slot["conversions_by_campaign"][campaign_id] = (
+                slot["conversions_by_campaign"].get(campaign_id, 0) + conversions)
         clicks_total += clicks
         conversions_total += conversions
 
@@ -184,6 +194,8 @@ def minus_word_candidates(
             "campaigns": sorted(c for c in slot["campaigns"] if c),
             "cost_by_campaign": {c: round(v, 2)
                                  for c, v in sorted(slot["cost_by_campaign"].items())},
+            "conversions_by_campaign": dict(
+                sorted(slot["conversions_by_campaign"].items())),
         })
     out.sort(key=lambda r: -r["cost"])
     return out

@@ -26,7 +26,13 @@ from sync.agent import conflicts
 # Причины. Список закрытый: отказ без известной причины — это дефект
 # врезки, а не новое состояние, и он обязан выглядеть иначе, чем известные.
 BUDGET = "budget"                     # не влез в остаток риска (недели или дня)
-RUN_CAP = "run_cap"                   # исчерпан лимит действий на прогон
+LANE_LIMIT = "lane_limit"             # не прошёл лимит своей полосы
+PROPOSAL = "proposal"                 # рычага записи нет — это рекомендация человеку
+# Исторический код: лимит действий на прогон (guardrails.cap_actions) снят
+# вместе с самой рельсой — отбор идёт полосами. Строки с этой причиной лежат в
+# журнале за июль–август 2026, и группировка беты обязана их читать; новых не
+# появляется. Убирает его задача 9 плана беты, вместе с подписью в UI.
+RUN_CAP = "run_cap"
 NO_RED_LINE = "no_red_line"           # не с чем сравнивать исход — не применяем
 COOLDOWN = "cooldown"                 # свежий откат по этому сегменту
 ATTEMPTS_EXHAUSTED = "attempts_exhausted"   # исчерпаны попытки отправки
@@ -43,9 +49,9 @@ CONFLICT_REASONS = frozenset({conflicts.SUSPENDED_OBJECT,
                               conflicts.OPPOSING_LEVERS,
                               conflicts.DUPLICATE_SEGMENT})
 
-KNOWN_REASONS = frozenset({BUDGET, RUN_CAP, NO_RED_LINE, COOLDOWN,
-                           ATTEMPTS_EXHAUSTED, HOLDOUT, LEARNING_COOLDOWN,
-                           CLOSED_KEY, NO_GROWTH_ADDRESS,
+KNOWN_REASONS = frozenset({BUDGET, LANE_LIMIT, PROPOSAL, RUN_CAP, NO_RED_LINE,
+                           COOLDOWN, ATTEMPTS_EXHAUSTED, HOLDOUT,
+                           LEARNING_COOLDOWN, CLOSED_KEY, NO_GROWTH_ADDRESS,
                            UNKNOWN}) | CONFLICT_REASONS
 
 # Сколько знаков ключа сегмента едет в строку. Ключ бывает длинным (список

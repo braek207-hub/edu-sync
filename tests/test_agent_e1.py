@@ -668,6 +668,19 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
     return rows
 
 
+def _many_actions_per_campaign(monkeypatch):
+    """Разрешить полосе несколько правок на одной кампании за прогон.
+
+    Пока рычаг учится (ступени 1–2), полоса берёт с объекта ОДНО действие:
+    иначе неизвестно, что именно сработало. Тесты ниже про другое — про цену
+    объекта и состав отчёта, — и им нужен доказанный класс, где изоляция снята
+    (writer/lanes.py: MULTI_LEVER_LANES + TOP_STEP). Ступень приезжает из
+    панели (задача 26 плана беты); до неё все полосы стоят на DEFAULT_STEP,
+    поэтому здесь двигается он.
+    """
+    monkeypatch.setattr(agent_e1.lanes, "DEFAULT_STEP", agent_e1.lanes.TOP_STEP)
+
+
 # --------------------------------- дефект 1: настройки каждого кабинета — свои
 
 
@@ -723,15 +736,14 @@ def test_cabinet_without_computed_settings_is_visible_in_report(monkeypatch, cap
     assert reports["acc-1"]["desired"] == 1
 
 
-# ------------------------------------- дефект 3: лимит действий — на прогон
+# ------------------------------------- дефект 3: лимит полосы — на прогон
 
 
-def test_action_cap_is_shared_across_cabinets(monkeypatch, capsys):
-    # cap_actions вызывался внутри цикла по кабинетам: при четырёх кабинетах
-    # потолок был вчетверо выше заявленного. Смысл рельсы — ограничить объём
-    # изменений, которые можно проверить и осмысленно откатить, а он не
-    # зависит от числа кабинетов.
-    monkeypatch.setattr(agent_e1, "MAX_ACTIONS_PER_RUN", 2)
+def test_lane_budget_is_shared_across_cabinets(monkeypatch, capsys):
+    # Тот же дефект, что был у лимита действий (cap_actions вызывался внутри
+    # цикла по кабинетам, и при четырёх кабинетах потолок был вчетверо выше
+    # заявленного), — теперь на полосах. Остаток полосы едет между кабинетами
+    # одним словарём, поэтому второй кабинет видит то, что потратил первый.
     settings = [_setting("bid_modifier:device", "DESKTOP", 30)]
     _patch_run(
         monkeypatch,
@@ -742,11 +754,13 @@ def test_action_cap_is_shared_across_cabinets(monkeypatch, capsys):
 
     assert agent_e1.main() == 0
 
-    sent = sum(len(c.sent) for c in _MultiCabinetClient.instances)
-    assert sent == 2, "потолок прогона обязан считаться на все кабинеты сразу"
-    reports = {r["account"]: r for r in _reports(capsys) if "account" in r}
-    assert reports["acc-1"]["actions_left_in_run"] == 0
-    assert reports["acc-2"]["deferred_by_cap"] == 2
+    reports = [r for r in _reports(capsys) if "account" in r]
+    spent = [r["lanes"]["spent"] for r in reports]
+    assert spent[0] != {} or spent[1] != {}
+    # Второй кабинет продолжает счёт первого, а не начинает свой.
+    first = float((spent[0].get("tuning") or {}).get("risk_rub") or 0.0)
+    second = float((spent[1].get("tuning") or {}).get("risk_rub") or 0.0)
+    assert second >= first, "полоса начала счёт заново на втором кабинете"
 
 
 # --------------------------- дефект 4: риск кампании списывается один раз
@@ -758,6 +772,7 @@ def test_campaign_risk_is_capped_by_the_object_price(monkeypatch, capsys):
     # ценой целиком — расходом за горизонт замера. Прежде первое же действие
     # платило за всю кампанию, и бюджет исчерпывался на второй-третьей.
     journal = []
+    _many_actions_per_campaign(monkeypatch)
     _patch_run(
         monkeypatch,
         computed_by_login={"acc-1": [
@@ -791,6 +806,7 @@ def test_budget_is_not_exhausted_by_repeated_actions_on_same_campaign(monkeypatc
     # ОБЪЕКТА, и распределение недели по дням (paced_allowance) не должно
     # подмешиваться в неё днём запуска.
     journal = []
+    _many_actions_per_campaign(monkeypatch)
     _patch_run(
         monkeypatch,
         computed_by_login={"acc-1": [
@@ -984,6 +1000,7 @@ def test_no_mature_crm_day_means_no_baseline_not_a_stale_one(monkeypatch, capsys
 def test_dry_run_report_shows_what_would_be_written(monkeypatch, capsys):
     # Главный артефакт для решения «включать боевую запись» показывал нули и
     # не содержал ни числа готовых действий, ни их состава.
+    _many_actions_per_campaign(monkeypatch)
     _patch_run(
         monkeypatch,
         computed_by_login={"acc-1": [
@@ -1180,12 +1197,11 @@ def test_cooldown_is_longer_than_full_observation_cycle():
     assert agent_e1.COOLDOWN_AFTER_ROLLBACK_DAYS > 30
 
 
-def test_rolled_back_segment_is_cut_before_the_action_cap(monkeypatch, capsys):
-    # Сквозной: лимит действий равен одному, первым по порядку обхода идёт
-    # сегмент в кулдауне. Если отсев стоит ПОСЛЕ отбора по лимиту (или его нет
-    # вовсе), запертое действие занимает единственный слот и в кабинет не
-    # уходит ничего. Кулдаун обязан отсекать ДО лимита.
-    monkeypatch.setattr(agent_e1, "MAX_ACTIONS_PER_RUN", 1)
+def test_rolled_back_segment_is_cut_before_the_lane_selection(monkeypatch, capsys):
+    # Сквозной: оба сегмента живут на ОДНОЙ кампании, а полоса корректировок
+    # на своей ступени берёт с объекта одно действие — место ровно одно. Если
+    # отсев стоит ПОСЛЕ отбора (или его нет вовсе), запертое действие занимает
+    # это место и в кабинет не уходит ничего. Кулдаун обязан отсекать ДО.
     _patch_run(
         monkeypatch,
         computed_by_login={"acc-1": [
@@ -1200,7 +1216,7 @@ def test_rolled_back_segment_is_cut_before_the_action_cap(monkeypatch, capsys):
     assert agent_e1.main() == 0
 
     sent = [c for inst in _MultiCabinetClient.instances for c in inst.sent]
-    assert len(sent) == 1, "слот лимита обязан достаться незапертому сегменту"
+    assert len(sent) == 1, "место в полосе обязано достаться незапертому сегменту"
     assert "MobileAdjustment" in sent[0][2]["BidModifiers"][0]
     report = _reports(capsys)[0]
     assert report["blocked_by_cooldown"]["count"] == 1
@@ -1209,12 +1225,11 @@ def test_rolled_back_segment_is_cut_before_the_action_cap(monkeypatch, capsys):
     assert report["blocked_by_cooldown"]["segments"] == ["111:DESKTOP_ADJUSTMENT:DESKTOP"]
 
 
-def test_action_closed_by_idempotency_does_not_eat_the_cap(monkeypatch, capsys):
+def test_action_closed_by_idempotency_does_not_eat_the_lane(monkeypatch, capsys):
     # Второе следствие той же природы: действие с уже закрытым ключом
-    # доходило до применения и отсеивалось только там — а слот лимита
-    # занимало. Накопившиеся закрытые ключи стабильно съедали лимит целиком:
-    # «подготовлено пятьдесят, применено ноль».
-    monkeypatch.setattr(agent_e1, "MAX_ACTIONS_PER_RUN", 1)
+    # доходило до применения и отсеивалось только там — а место в полосе
+    # занимало. Накопившиеся закрытые ключи стабильно съедали объём прогона
+    # целиком: «подготовлено пятьдесят, применено ноль».
     closed = _bidmod_key("111", "DESKTOP_ADJUSTMENT", "DESKTOP", 30)
     _patch_run(
         monkeypatch,
@@ -1802,6 +1817,7 @@ def test_campaigns_touched_counts_campaigns_not_actions(monkeypatch, capsys):
     # Отдельное поле нужно именно потому, что ни одно соседнее число на этот
     # вопрос не отвечает: три действия по одной кампании — это одна тронутая
     # кампания, а prepared.count покажет три.
+    _many_actions_per_campaign(monkeypatch)
     _patch_run(
         monkeypatch,
         computed_by_login={"acc-1": [
@@ -1911,11 +1927,11 @@ def test_segment_out_of_attempts_is_not_sent_again(monkeypatch, capsys):
     assert report["blocked_by_attempts"]["reason"]
 
 
-def test_exhausted_segment_is_cut_before_the_action_cap(monkeypatch, capsys):
-    # Главная цена вечной переотправки — не сам запрос, а СЛОТ: порядок обхода
-    # детерминирован, и накопившиеся отказные сегменты стабильно занимали
-    # начало списка. Отсев обязан стоять до лимита, как кулдаун и закрытые ключи.
-    monkeypatch.setattr(agent_e1, "MAX_ACTIONS_PER_RUN", 1)
+def test_exhausted_segment_is_cut_before_the_lane_selection(monkeypatch, capsys):
+    # Главная цена вечной переотправки — не сам запрос, а МЕСТО В ПОЛОСЕ:
+    # порядок обхода детерминирован, и накопившиеся отказные сегменты стабильно
+    # занимали начало списка. Отсев обязан стоять до отбора, как кулдаун и
+    # закрытые ключи.
     _patch_run(
         monkeypatch,
         computed_by_login={"acc-1": [
@@ -1930,7 +1946,7 @@ def test_exhausted_segment_is_cut_before_the_action_cap(monkeypatch, capsys):
     assert agent_e1.main() == 0
 
     sent = [c for inst in _MultiCabinetClient.instances for c in inst.sent]
-    assert len(sent) == 1, "слот лимита обязан достаться живому сегменту"
+    assert len(sent) == 1, "место в полосе обязано достаться живому сегменту"
     assert "MobileAdjustment" in sent[0][2]["BidModifiers"][0]
 
 
@@ -1986,15 +2002,14 @@ def test_split_by_attempts_leaves_untouched_segments_alone():
 # =========================================================================
 
 
-def test_stuck_row_does_not_eat_the_cap_on_the_run_that_finds_it(monkeypatch, capsys):
+def test_stuck_row_does_not_eat_the_lane_on_the_run_that_finds_it(monkeypatch, capsys):
     # Список закрытых ключей читался ДО пометки зависших строк. На прогоне
     # ОБНАРУЖЕНИЯ зависшая строка ещё стояла в 'planned' — final_status_keys
-    # её не видел, действие доходило до отбора по лимиту, занимало слот и
+    # её не видел, действие доходило до отбора полосой, занимало её место и
     # помечало свой объект оплаченным риск-бюджетом.
     #
     # Журнал здесь фейковый: пометка переводит ключ в закрытые, и правильный
     # порядок обязан этот перевод УВИДЕТЬ.
-    monkeypatch.setattr(agent_e1, "MAX_ACTIONS_PER_RUN", 1)
     stuck_key = _bidmod_key("111", "DESKTOP_ADJUSTMENT", "DESKTOP", 30)
     closed = set()
 
@@ -2423,17 +2438,131 @@ def test_balance_gate_leaves_a_tact_that_does_not_cut_alone(monkeypatch, capsys)
     assert report["balance"]["blocked_without_address"] == 0
 
 
-def test_balance_gate_stands_after_the_other_gates_and_before_the_run_cap():
+def test_balance_gate_stands_after_the_other_gates_and_before_the_lanes():
     # Место гейта — не деталь. Все гейты стоят ПОСЛЕ солвера, и доливка,
     # запертая кулдауном или потолком попыток, обязана быть уже вычтенной к
     # моменту расчёта баланса: иначе её рубли считались бы назначенными.
-    # А до отбора по лимиту прогона — чтобы снятое здесь не занимало слот.
+    # А до отбора полосами — чтобы снятое здесь не занимало место в полосе.
     import inspect
 
     source = inspect.getsource(agent_e1.run_account)
     assert (source.index("split_by_final_keys")
             < source.index("require_growth_address")
-            < source.index("cap_actions("))
+            < source.index("lanes.select("))
+
+
+def test_rails_order_uses_lanes():
+    """Уберите этот тест — и полосы вернутся на место лимита прогона, а вместе
+    с ним вернётся списание риска за действия, которые в кабинет не поедут.
+
+    Порядок рельс: конфликты → красная линия → полосы → бюджет недели и дня.
+
+    Красная линия стоит ПЕРЕД полосами (в плане беты её место было после), и
+    это осознанное отклонение: отбор полосой не просто раздаёт места, он
+    СПИСЫВАЕТ риск-бюджет полосы. Действие без красной линии не применяется
+    никогда, и списать за него полосу — тот же дефект, от которого рельсы
+    защищает собственный комментарий run_account: объект помечен оплаченным,
+    а изменение по нему в кабинет не ушло.
+
+    Бюджет недели и дня — последним: он общий на все полосы и на все кабинеты
+    прогона, и считать его до отбора значило бы платить за отказанное.
+    """
+    import inspect
+
+    source = inspect.getsource(agent_e1.run_account)
+    assert (source.index("conflicts.resolve(")
+            < source.index("build_red_line(")
+            < source.index("lanes.select(")
+            < source.index("fit_week_budget("))
+
+
+def _transfer(key, campaign, rub_delta, days=14):
+    """Бюджетное действие с обещанием знака: донор (−) или получатель (+).
+
+    Знак берёт risk._moved_rub из обещания рычага — по нему и определяется
+    пара, имена кампаний в этом не участвуют.
+    """
+    return {"idempotency_key": key, "action_kind": "budget.set",
+            "object_level": "campaign", "object_id": campaign,
+            "marginal_roi": 2.0 if rub_delta > 0 else 1.0,
+            "payload": {"CampaignId": int(campaign),
+                        "expected_rub_delta": rub_delta,
+                        "expected_leads_delta": 0.0,
+                        "expectation_basis": "перенос",
+                        "expectation_days": days}}
+
+
+def test_weekly_rail_does_not_split_a_transfer_pair():
+    """Уберите этот тест — и скидку за перенос снова выдадут без компенсации.
+
+    lanes.select держит пару целиком внутри полосы, но после него стоит ещё
+    одна рельса — остаток недели и дня. Она берёт действия по порядку, пока
+    хватает денег, и способна взять получателя, а донора отложить: скидка за
+    встречное движение денег выдана, компенсации не будет, и кабинет получил
+    доливку по цене переноса.
+
+    Здесь бюджета хватает ровно на одно действие из пары. Правильный исход —
+    цена пересчитывается на выжившем наборе, и половина пары уезжает уже по
+    ПОЛНОЙ цене, а не по цене компенсированного переноса.
+    """
+    give = _transfer("g", "1", -70_000.0)
+    take = _transfer("t", "2", +70_000.0)
+    daily_cost = {"1": 10_000.0, "2": 10_000.0}
+    priced = [take, give]
+    risks = agent_e1.net_risk(priced, daily_cost)
+    assert risks["t"] < 70_000.0, "скидка за перенос не выдана — стенд не тот"
+
+    prepared, deferred = agent_e1.fit_week_budget(
+        priced, dict(risks), risks["t"] + 1.0, {}, {}, daily_cost)
+
+    assert not prepared, (
+        "получатель уехал один по цене компенсированного переноса — "
+        "кабинет получил доливку со скидкой, которую нечем компенсировать")
+    # Донор не влез по деньгам, получатель — потому что в одиночку стоит
+    # полную цену: 70 000 ₽ вместо 17 500 со скидкой за компенсацию.
+    assert sorted(a["idempotency_key"] for a in deferred) == ["g", "t"]
+
+
+def test_weekly_rail_keeps_arithmetic_free_across_repricing():
+    """Уберите этот тест — и первый же урезанный круг отправит в отложенные
+    все отсечения разом.
+
+    Кто платит риском, решил отбор полос: класс 0 приехал оттуда с нулевой
+    ценой, потому что минус-фраза снимает деньги с огня, а не ставит их под
+    удар. net_risk про классы не знает и на пересчёте назначил бы им полную
+    цену — а пересчёт случается ровно тогда, когда бюджет и так кончился.
+    Обещание «класс 0 вносится весь и сразу» умирало бы тем вернее, чем
+    больше в кабинете мусора.
+    """
+    cut = {"idempotency_key": "cut", "action_kind": "negative.add",
+           "object_level": "campaign", "object_id": "1",
+           "exposure": {"daily_rub": 300.0, "cut_daily_rub": 300.0},
+           "payload": {"CampaignId": 1, "AddedPhrases": ["мгсу"]}}
+    give = _transfer("g", "1", -70_000.0)
+    take = _transfer("t", "2", +70_000.0)
+    daily_cost = {"1": 10_000.0, "2": 10_000.0}
+    risks = agent_e1.net_risk([take, give], daily_cost)
+    risks["cut"] = 0.0  # так его оценил отбор полос
+
+    prepared, _ = agent_e1.fit_week_budget(
+        [take, give, cut], risks, risks["t"] + 1.0, {}, {}, daily_cost)
+
+    assert [a["idempotency_key"] for a in prepared] == ["cut"]
+    assert prepared[0]["risk_rub"] == 0.0
+
+def test_lane_price_is_the_net_price_of_the_tact():
+    # Цена, по которой списывается недельный бюджет, берётся из отбора полос
+    # (net_risk на наборе такта), а не считается заново по действию. Иначе
+    # перенос денег внутри кабинета платит обеими сторонами сразу: полоса
+    # видит компенсацию, а недельная рельса — нет, и 100 000 ₽ переноса стоят
+    # кабинету 200 000 ₽ лимита (дефект 8б плана беты).
+    import inspect
+
+    source = inspect.getsource(agent_e1.run_account)
+    start = source.index("lanes.select(")
+    assert "action_risk(" not in source[start:], (
+        "после отбора полос цена действия считается заново — скидка за "
+        "встречное движение денег теряется")
 
 
 def test_run_verdict_names_the_run_by_its_worst_account():
@@ -2516,3 +2645,23 @@ def test_expectation_context_omits_spend_when_the_directory_is_silent():
 
     assert "daily_cost_rub" not in context
     assert context["cpa_rub"] == 2000.0
+
+
+def test_cutting_levers_get_their_conversions_and_their_threshold():
+    """Уберите этот тест — и основание класса 0 снова не доедет до боя.
+
+    diff_negatives и diff_placements умеют собирать evidence, но собирают его
+    ТОЛЬКО из того, что им передали. До 27.08.2026 прогон звал их с одним
+    cut_cost: конверсии вырезаемого трафика оставались нулём по умолчанию, а
+    порога не было вовсе — значит evidence не производился, и каждая
+    минус-фраза приезжала в отбор классом 2. Тесты рычагов при этом зелёные:
+    они передают всё сами.
+    """
+    import inspect
+
+    source = inspect.getsource(agent_e1.run_account)
+    for call in ("negatives.diff_negatives(", "placements.diff_placements("):
+        start = source.index(call)
+        args = source[start:start + 400]
+        assert "cut_conversions=" in args, call
+        assert "baseline_cpa=" in args, call

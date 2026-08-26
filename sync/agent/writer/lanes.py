@@ -41,10 +41,11 @@ sync/agent/writer/lanes.py — полосы действий вместо одн
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent import autonomy
 from sync.agent.experiments import is_bet
+from sync.agent.writer import tier as tier_mod
 from sync.agent.writer.switch import MAX_SUSPENDS_PER_RUN
 
 LANE_HYGIENE = "hygiene"
@@ -225,3 +226,308 @@ def _max_objects(lane: str, config: Optional[Dict[str, Any]]) -> Optional[int]:
     # экономике, которой после первого уже нет (writer/switch.py).
     raw = (config or {}).get("max_suspends_per_run", MAX_SUSPENDS_PER_RUN)
     return int(raw)
+
+
+# Ступень, с которой полоса работает, пока лестница автономии не подключена к
+# прогону (autonomy.step_of — задача 26). Единица, а не ноль: ступень 0 — режим
+# приёмки нового рычага, и запертая в ней полоса не наберёт закрытых наблюдений
+# никогда. Кого держать в тени, решает человек, и решение приходит ступенью в
+# step_by_lane, а не константой отсюда.
+DEFAULT_STEP = 1
+
+# Делитель ценности, ниже которого «на рубль риска» теряет смысл: действие
+# дешевле рубля не бывает, а ноль в знаменателе сделал бы любой бесплатный
+# пустяк лучшим решением прогона.
+MIN_PRICE_RUB = 1.0
+
+
+def select(
+    actions: List[Dict[str, Any]],
+    step_by_lane: Optional[Dict[str, int]] = None,
+    weekly_spend_rub: float = 0.0,
+    daily_cost_by_campaign: Optional[Dict[str, float]] = None,
+    config: Optional[Dict[str, Any]] = None,
+    budgets: Optional[Dict[str, Dict[str, float]]] = None,
+    charged_by_object: Optional[Dict[str, float]] = None,
+    risk_budget_rub: Optional[float] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Что из плана едет в кабинет этим тактом, а что отказано с причиной.
+
+    Заменяет лимит действий на прогон (guardrails.cap_actions). Тот был срезом
+    ПЕРВЫХ пятидесяти, а план собирается в порядке рычагов, а не ценности:
+    корректировок генерится сотнями, и до бюджета очередь не доходила никогда —
+    лимит работал как выбор рычага, чего никто не задумывал. Замер за 30 дней к
+    26.08.2026: bidmodifier.add 74 строки, bidmodifier.set 24, schedule.set 14,
+    бюджет/целевая цена/минус-фразы/площадки — ноль строк в любом статусе.
+
+    Отбор идёт ПО ПОЛОСАМ, и полосы не конкурируют ни за слоты, ни за деньги:
+    у каждой своя ступень, свой лимит и свой срок замера. Внутри полосы порядок
+    — по ценности на рубль риска.
+
+    Пять ограничителей, в этом порядке:
+
+      1. КЛАСС ДОСТОВЕРНОСТИ. Предложение (класс 3) не применяется никогда и ни
+         при какой ступени — у него нет рычага; отказ несёт свою причину, а не
+         «не влезло».
+      2. ОДНО ДЕЙСТВИЕ НА ОБЪЕКТ, пока рычаг учится (ступени 1–2): иначе
+         неизвестно, что именно сработало. На верхней ступени снимается —
+         измеримость держат заповедник и замер такта (задача 25).
+      3. ЧИСЛО ОБЪЕКТОВ — только у выключений: второе выключение за прогон
+         принято по экономике, которой после первого уже нет.
+      4. РИСК-БЮДЖЕТ ПОЛОСЫ — доля недельного расхода кабинета по ступени.
+         Платят его четыре полосы и два класса из четырёх: класс 0 не платит
+         (он снимает деньги с огня, а не ставит под удар), класс 3 не
+         применяется. Сумма списаний по одному объекту ограничена ценой самого
+         объекта (risk.fit_into_budget + risk.object_cap).
+      5. ДОЛЯ ВЫРЕЗАЕМОГО РАСХОДА — только у гигиены, вместо риск-бюджета:
+         сломанный источник данных не должен вырезать кабинет за один проход.
+
+    Цена набора считается ОДИН раз на весь такт (risk.net_risk), а не по
+    действию: перенос денег внутри кабинета иначе платит обеими сторонами
+    сразу. Но скидка за встречное движение денег законна ровно тогда, когда
+    компенсация действительно произойдёт. Взять получателя, а донора отложить —
+    это доливка по цене переноса, и никакой лимит её больше не увидит. Поэтому
+    цена пересчитывается на том наборе, который реально уезжает, и отбор
+    повторяется, пока набор и его цена не сойдутся: на выходе списанные цены
+    равны net_risk ровно того набора, который вернулся во взятых. Пару
+    определяет ЗНАК движения денег (risk._moved_rub), а не имена кампаний:
+    донор и получатель могут быть в разных кабинетах и не знать друг о друге.
+
+    weekly_spend_rub — недельный расход кабинетов прогона. Ноль означает
+    «расход неизвестен», и лимит полосы падает на прежний абсолютный дефолт
+    (risk.weekly_limit), а не на ноль: нулём прогон отложил бы всё до единого
+    действия и выглядел бы в отчёте как исправно остановленный.
+
+    risk_budget_rub — недельный потолок риска прогона, если человек поставил
+    его руками (risk_budget_week в LOCKED_KEYS панели). Полоса берёт из него
+    долю СВОЕЙ ступени относительно базовой (risk.DEFAULT_RISK_SHARE_WEEK =
+    1 %), поэтому на ступени 1 ей доступен весь недельный потолок, на ступени 2
+    — втрое больше, на нулевой — ничего. Без ручного значения формула совпадает
+    с долей расхода один в один: базовый потолок и есть 1 % расхода. Смысл
+    ручного потолка в том, чтобы не зависеть ни от какой арифметики, и полоса,
+    считающая долю мимо него, этот смысл отменяла бы.
+
+    budgets — остатки полос, ОБЩИЕ на весь прогон: {полоса: {"risk_rub",
+    "cut_rub"}}. Словарь дополняется по ходу, вызывающий передаёт один и тот же
+    на все кабинеты. Без него лимит полосы при четырёх кабинетах был бы вчетверо
+    выше заявленного — дефект, который уже чинили у лимита действий.
+
+    charged_by_object — сквозной счёт риска по объектам (тот же словарь, что у
+    risk.fit_into_budget в прогоне): потолок объекта обязан помнить, сколько по
+    нему уже списано прошлыми полосами и прошлыми кабинетами.
+
+    Отложенных нет: не прошедшее лимит становится отказом с причиной
+    (rejects.LANE_LIMIT) и пересчитывается следующим тактом на свежих данных.
+    Действие, посчитанное на данных дня X и применённое через три дня, — это
+    применение вчерашнего расчёта к сегодняшнему кабинету.
+    """
+    from sync.agent import rejects
+    from sync.agent.writer import risk as risk_mod
+
+    steps = dict(step_by_lane or {})
+    costs = dict(daily_cost_by_campaign or {})
+    ledger = budgets if budgets is not None else {}
+    charged = charged_by_object if charged_by_object is not None else {}
+
+    lane_by_key: Dict[str, str] = {}
+    by_lane: Dict[str, List[Dict[str, Any]]] = {}
+    for action in actions:
+        lane = lane_of(action)
+        lane_by_key[str(action["idempotency_key"])] = lane
+        by_lane.setdefault(lane, []).append(action)
+
+    policies = {lane: policy_of(lane, steps.get(lane, DEFAULT_STEP), config)
+                for lane in by_lane}
+    caps = {risk_mod.risk_object(a): risk_mod.object_cap(a, costs)
+            for a in actions}
+
+    reasons: Dict[str, str] = {}
+    alive = {str(a["idempotency_key"]) for a in actions}
+    taken: List[Dict[str, Any]] = []
+    # Круг «цена → отбор → цена» сходится: каждый круг либо ничего не снимает и
+    # заканчивается, либо снимает хотя бы одно действие. Граница по длине —
+    # страховка на случай, если сходимость сломает будущая правка: бесконечный
+    # цикл в ночном прогоне выглядит как зависший агент, а не как дефект.
+    for _ in range(len(actions) + 1):
+        prices = risk_mod.net_risk(
+            [a for a in actions if str(a["idempotency_key"]) in alive], costs)
+        # Копия счёта объектов: круги отбора черновые, и списывать в общий счёт
+        # прогона можно только то, что уехало по-настоящему.
+        round_charged = dict(charged)
+        taken = []
+        for lane in sorted(by_lane):
+            lane_alive = [a for a in by_lane[lane]
+                          if str(a["idempotency_key"]) in alive]
+            taken += _select_lane(lane_alive, lane, policies[lane], prices,
+                                  weekly_spend_rub, risk_budget_rub,
+                                  ledger.get(lane) or {},
+                                  round_charged, caps, reasons, rejects,
+                                  risk_mod)
+        chosen = {str(a["idempotency_key"]) for a in taken}
+        if chosen == alive:
+            charged.update(round_charged)
+            break
+        alive = chosen
+
+    result = [{**a, "lane": lane_by_key[str(a["idempotency_key"])],
+               "tier": _tier_of(a)}
+              for a in taken]
+    refused = [{**a, "blocked_reason": reasons.get(str(a["idempotency_key"]),
+                                                   rejects.LANE_LIMIT)}
+               for a in actions if str(a["idempotency_key"]) not in alive]
+    _commit(ledger, result, policies)
+    return result, refused
+
+
+def _select_lane(actions, lane, policy, prices, weekly_spend, risk_budget,
+                 spent, charged, caps, reasons, rejects, risk_mod):
+    """Что полоса берёт из своих кандидатов на этом круге отбора."""
+    ranked = sorted(actions, key=lambda a: _rank(a, lane, prices))
+
+    applicable = []
+    for action in ranked:
+        if lane == LANE_PROPOSAL or _tier_of(action) not in tier_mod.APPLIED_TIERS:
+            reasons[str(action["idempotency_key"])] = rejects.PROPOSAL
+            continue
+        applicable.append(action)
+
+    seen: Dict[str, int] = {}
+    within_caps = []
+    for action in applicable:
+        obj = risk_mod.risk_object(action)
+        per_object = policy.max_actions_per_object
+        per_run = policy.max_objects_per_run
+        if per_object is not None and seen.get(obj, 0) >= per_object:
+            continue
+        if per_run is not None and obj not in seen and len(seen) >= per_run:
+            continue
+        seen[obj] = seen.get(obj, 0) + 1
+        within_caps.append(action)
+
+    risk_left = (_risk_budget(lane, policy, weekly_spend, risk_budget)
+                 - float(spent.get("risk_rub") or 0.0))
+    fits, _ = risk_mod.fit_into_budget(
+        within_caps,
+        {str(a["idempotency_key"]): _charged(a, lane, prices)
+         for a in within_caps},
+        risk_left, charged, caps)
+
+    cut_left = _cut_budget(policy, weekly_spend)
+    if cut_left is None:
+        return fits
+    cut_left -= float(spent.get("cut_rub") or 0.0)
+
+    taken = []
+    for action in fits:
+        freed = _freed_rub(action)
+        if freed > cut_left:
+            continue
+        cut_left -= freed
+        taken.append(action)
+    return taken
+
+
+def _commit(ledger: Dict[str, Dict[str, float]], taken: List[Dict[str, Any]],
+            policies: Dict[str, LanePolicy]) -> None:
+    """Списать израсходованное полосами — после того, как набор сошёлся.
+
+    До схождения списывать нельзя: промежуточный круг берёт действия, которые
+    следующий круг снимет, и остаток полосы уехал бы в минус на чужих
+    кандидатов.
+    """
+    for action in taken:
+        lane = action["lane"]
+        slot = ledger.setdefault(lane, {"risk_rub": 0.0, "cut_rub": 0.0})
+        slot["risk_rub"] = (float(slot.get("risk_rub") or 0.0)
+                            + float(action.get("risk_rub") or 0.0))
+        if policies[lane].max_cut_share is not None:
+            slot["cut_rub"] = (float(slot.get("cut_rub") or 0.0)
+                               + _freed_rub(action))
+
+
+def _risk_budget(lane: str, policy: LanePolicy, weekly_spend: float,
+                 risk_budget: Optional[float] = None) -> float:
+    """Риск-бюджет полосы на прогон. Не платит риском — значит им не ограничена.
+
+    Ноль ступени тени возвращается как есть: это решение человека, и оно
+    исполняется буквально (тот же довод, что у risk.weekly_limit про нулевую
+    долю в панели).
+    """
+    from sync.agent.writer import risk as risk_mod
+
+    if lane not in RISK_PAYING_LANES:
+        return float("inf")
+    if risk_budget is None:
+        return risk_mod.weekly_limit(weekly_spend, policy.risk_share)
+    return (float(risk_budget) * float(policy.risk_share)
+            / risk_mod.DEFAULT_RISK_SHARE_WEEK)
+
+
+def _cut_budget(policy: LanePolicy, weekly_spend: float) -> Optional[float]:
+    """Сколько рублей расхода полосе позволено вырезать за такт. None — не её ограничитель.
+
+    Расход кабинета неизвестен (пробел в витрине, лаг синка) — доли от него не
+    существует, и ограничителя нет: тот же довод, что у risk.weekly_limit. Ноль
+    остановил бы гигиену целиком при первом же пробеле, и отчёт выглядел бы как
+    у исправного агента, которому нечего резать.
+    """
+    if policy.max_cut_share is None:
+        return None
+    if float(weekly_spend or 0.0) <= 0.0:
+        return None
+    return float(weekly_spend) * float(policy.max_cut_share)
+
+
+def _pays_risk(action: Dict[str, Any], lane: str) -> bool:
+    return (lane in RISK_PAYING_LANES
+            and _tier_of(action) in tier_mod.RISK_PAYING_TIERS)
+
+
+def _charged(action: Dict[str, Any], lane: str,
+             prices: Dict[str, float]) -> float:
+    if not _pays_risk(action, lane):
+        return 0.0
+    return float(prices.get(str(action["idempotency_key"]), 0.0))
+
+
+def _tier_of(action: Dict[str, Any]) -> int:
+    return tier_mod.tier_of(action)
+
+
+def _freed_rub(action: Dict[str, Any]) -> float:
+    """Сколько рублей действие снимает с кабинета за свой горизонт замера."""
+    from sync.agent.writer import expectation
+
+    exp = expectation.of(action) or {}
+    return max(0.0, -float(exp.get("rub_delta") or 0.0))
+
+
+def _rank(action: Dict[str, Any], lane: str, prices: Dict[str, float]):
+    """Ключ сортировки полосы: сначала ценнее, при равенстве — по ключу.
+
+    Ценность меряется в единицах своей полосы и делится на цену действия —
+    отсюда «лучшее на рубль риска». Двух шкал в одной куче нет: действие,
+    обещающее ПРИРОСТ лидов, и действие, обещающее СНЯТЫЕ деньги, сравниваются
+    каждое со своими. Курса «рубль → лид» у отбора нет, и выдумать его здесь
+    значило бы решить за портфель, который этот курс как раз и считает.
+
+    Действие, которое риском не платит, делить не на что: оно ранжируется прямо
+    своей ценностью. Так гигиена и выстраивается по вырезаемому расходу — её
+    единица отбора по плану беты.
+
+    Порядок полностью определён: при равной ценности решает ключ
+    идемпотентности. Иначе один и тот же план в двух прогонах даёт разные
+    срезы, и разбор беты не с чем сверять.
+    """
+    from sync.agent.writer import expectation
+
+    exp = expectation.of(action) or {}
+    leads = float(exp.get("leads_delta") or 0.0)
+    freed = max(0.0, -float(exp.get("rub_delta") or 0.0))
+    price = _charged(action, lane, prices)
+    per_rub = 1.0 / max(price, MIN_PRICE_RUB) if price > 0.0 else 1.0
+    if leads > 0.0:
+        family, first, second = 1, leads * per_rub, freed * per_rub
+    else:
+        family, first, second = 0, freed * per_rub, 0.0
+    return (-family, -first, -second, str(action["idempotency_key"]))
