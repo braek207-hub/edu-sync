@@ -230,9 +230,24 @@ def check_bets(days: int = 30) -> Dict[str, Any]:
         """,
         {},
     )
+    # Где обрывается цепочка: расчёт → витрина настроек → payload действия.
+    # Без этой строки «ноль ставок» неотличим от «расчёт не выделил разведку».
+    computed = writer_db._fetch(
+        """
+        SELECT calc_date::text AS d, COUNT(*) AS cnt,
+               round(sum(value)::numeric, 0) AS rub
+          FROM edu_agent_computed_settings
+         WHERE setting_key = 'exploration_rub'
+         GROUP BY 1 ORDER BY 1 DESC LIMIT 5
+        """,
+        {},
+    )
     return {
         "exploration_actions": {str(r["status"]): int(r["cnt"]) for r in marked},
         "registry_by_status": {str(r["status"]): int(r["cnt"]) for r in reg},
+        "computed_exploration_rub": [
+            {"calc_date": r["d"], "campaigns": int(r["cnt"]),
+             "rub": float(r["rub"] or 0)} for r in computed],
     }
 
 
