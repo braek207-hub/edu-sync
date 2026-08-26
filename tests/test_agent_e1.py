@@ -2910,3 +2910,35 @@ def test_lane_shows_what_the_run_budget_cut_after_the_lane_let_it_through(
     assert report["lanes"]["taken"] == {"tuning": 5}
     assert report["lanes"]["cut_by_run_budget"] == {"tuning": 4}
     assert report["deferred_by_risk"] == 4
+
+
+def test_action_cut_by_the_week_budget_becomes_a_reject_not_a_queue(
+        monkeypatch, capsys):
+    # Смысл, который закрепляет имя over_budget вместо прежнего deferred:
+    # срезанное недельным бюджетом никуда не откладывается. Оно ложится
+    # строкой отказа с причиной budget и завтра пересчитывается заново на
+    # свежих данных — иначе прогон применял бы позавчерашний расчёт к
+    # сегодняшнему кабинету.
+    #
+    # Заведись здесь очередь — этот тест поймает её тем, что строк отказа
+    # окажется меньше, чем срезанных действий.
+    saved = {}
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": list(range(101, 121))},
+        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+    )
+    monkeypatch.setattr(agent_e1.blackbox, "save_run",
+                        lambda *a, **k: saved.update(k) or {
+                            "run_id": "test", "saved": True, "rejects": 0,
+                            "error": None})
+
+    assert agent_e1.main() == 0
+
+    report = [r for r in _reports(capsys) if "account" in r][0]
+    budget_rows = [r for r in saved["rejects"] if r["reason"] == rejects_mod.BUDGET]
+
+    assert report["deferred_by_risk"] == len(budget_rows) == 4
+    # У каждого отказа свой объект и своя цена: список действий, а не счётчик.
+    assert len({r["object_id"] for r in budget_rows}) == 4

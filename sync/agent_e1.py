@@ -700,12 +700,17 @@ def fit_week_budget(priced, risks, remaining, charged_risk, caps, daily_cost):
     решил отбор полос: класс 0 (арифметика — минус-фраза снимает деньги с огня,
     а не ставит под удар) уехал оттуда с нулевой ценой. net_risk про классы не
     знает и назначил бы им полную цену, так что первый же урезанный круг
-    отправил бы все отсечения в отложенные — ровно против обещания «класс 0
+    отправил бы все отсечения за бюджет — ровно против обещания «класс 0
     вносится весь и сразу», и тем заметнее, чем больше в кабинете мусора.
+
+    Второй список назван over_budget, а не deferred: срезанное никуда не
+    откладывается. Оно становится отказом с причиной budget и пересчитывается
+    следующим тактом на свежих данных — очередь означала бы применение
+    позавчерашнего расчёта к сегодняшнему кабинету.
     """
     free = {key for key, price in risks.items() if float(price or 0.0) == 0.0}
     candidates = list(priced)
-    deferred: List[Dict[str, Any]] = []
+    over_budget: List[Dict[str, Any]] = []
     prepared: List[Dict[str, Any]] = []
     # Граница по длине — страховка от бесконечного цикла в ночном прогоне:
     # каждый круг либо ничего не снимает и заканчивается, либо снимает хотя бы
@@ -718,12 +723,12 @@ def fit_week_budget(priced, risks, remaining, charged_risk, caps, daily_cost):
             charged_risk.clear()
             charged_risk.update(attempt_charged)
             break
-        deferred += dropped
+        over_budget += dropped
         kept = {a["idempotency_key"] for a in prepared}
         candidates = [a for a in candidates if a["idempotency_key"] in kept]
         risks = {key: (0.0 if key in free else price)
                  for key, price in net_risk(candidates, daily_cost).items()}
-    return prepared, deferred
+    return prepared, over_budget
 
 
 def lane_shortfall(taken: int, refused: int, wanted_rub: float,
@@ -1853,7 +1858,7 @@ def run_account(
     # донора отложить — скидка выдана, компенсации не будет. Поэтому набор,
     # который она урезала, переоценивается, и подгонка повторяется, пока не
     # сойдётся. Счёт по объектам списывается только с сошедшегося набора.
-    prepared, deferred = fit_week_budget(priced, risks, remaining,
+    prepared, over_budget = fit_week_budget(priced, risks, remaining,
                                          charged_risk, caps, daily_cost)
     ctx["run_risk_remaining"] -= sum(float(a.get("risk_rub") or 0.0) for a in prepared)
 
@@ -1886,7 +1891,7 @@ def run_account(
                               for a in lane_refused})
     ]
     account_rejects = rejects.from_groups(conflict_groups + lane_rejects + [
-        (rejects.BUDGET, deferred),
+        (rejects.BUDGET, over_budget),
         (rejects.NO_RED_LINE, no_red_line),
         (rejects.COOLDOWN, in_cooldown),
         (rejects.ATTEMPTS_EXHAUSTED, out_of_attempts),
@@ -2033,7 +2038,9 @@ def run_account(
             "blocked_without_address": len(without_address),
             "min_assigned_share": MIN_ASSIGNED_SHARE,
         },
-        "deferred_by_risk": len(deferred),
+        # Имя ключа оставлено прежним: его читает панель агента в другом
+        # репозитории, и переименование поля отчёта — её миграция, а не эта.
+        "deferred_by_risk": len(over_budget),
         "refused_by_lane": len(lane_refused),
         # Отказы строками, а не только счётчиками: они уезжают в чёрный ящик
         # (sync/agent/blackbox.py), где на истории видно, какое намерение
@@ -2064,7 +2071,7 @@ def run_account(
             # дефицит полосы, поднимет ей ступень и не получит ничего:
             # связывающим ограничителем был остаток недели, а разрешено
             # окажется больше при том же результате.
-            "cut_by_run_budget": _count_by(deferred, "lane"),
+            "cut_by_run_budget": _count_by(over_budget, "lane"),
         },
         "no_red_line": {
             "count": len(no_red_line),
