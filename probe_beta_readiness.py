@@ -182,6 +182,13 @@ def check_rejects(days: int = 7) -> List[Dict[str, Any]]:
 
 
 def check_hypotheses() -> Dict[str, Any]:
+    # Колонки реестра добавляются отдельным ALTER (sync/agent/db.py), и в
+    # базе их может не быть. Спрашивать про status вслепую — уронить отчёт
+    # ровно на том расхождении, ради которого он и написан.
+    if "status" not in _columns("edu_agent_experiments"):
+        total = writer_db._fetch(
+            "SELECT COUNT(*) AS cnt FROM edu_agent_experiments", {})[0]
+        return {"реестра нет (колонка status отсутствует)": int(total["cnt"])}
     rows = writer_db._fetch(
         """
         SELECT coalesce(status, 'посмертная запись') AS s, COUNT(*) AS cnt
@@ -248,7 +255,15 @@ def verdict(report: Dict[str, Any]) -> Dict[str, Any]:
     blockers: List[str] = []
     warnings: List[str] = []
 
+    # Упавшая проверка — сама по себе блокер: «не смогли посмотреть» это не
+    # «посмотрели и всё хорошо».
+    for name, section in report.items():
+        if isinstance(section, dict) and section.get("error"):
+            blockers.append(f"проверка «{name}» не выполнилась: {section['error']}")
+
     sch = report["schema"]
+    if sch.get("error"):
+        return {"ready": False, "blockers": blockers, "warnings": warnings}
     if sch["tables_missing"]:
         blockers.append("нет таблиц: " + ", ".join(sch["tables_missing"]))
     if sch["registry_columns_missing"]:
@@ -271,41 +286,55 @@ def verdict(report: Dict[str, Any]) -> Dict[str, Any]:
     elif str(gate.get("status")) != "GREEN":
         blockers.append(f"гейт данных {gate.get('status')}: {gate.get('reason')}")
 
-    for stage, row in report["runs"].items():
+    for stage, row in (report["runs"] if not report["runs"].get("error") else {}).items():
         if row["runs_14d"] == 0:
             blockers.append(f"такт {stage} за 14 дней не запускался ни разу")
         elif row["verdict_is_null"]:
             warnings.append(f"такт {stage}: последний прогон без вердикта в журнале")
 
-    bad = [r for r in report["write_rights"] if r["verdict"] != "WRITE_OK"]
-    if bad:
-        blockers.append("нет прав записи: "
-                        + ", ".join(f"{r['account']} {r['verdict']}" for r in bad))
-    if not report["write_rights"]:
-        blockers.append("список кабинетов пуст (DIRECT_CLIENTS_JSON)")
+    rights = report["write_rights"]
+    if isinstance(rights, list):
+        bad = [r for r in rights if r["verdict"] != "WRITE_OK"]
+        if bad:
+            blockers.append("нет прав записи: "
+                            + ", ".join(f"{r['account']} {r['verdict']}" for r in bad))
+        if not rights:
+            blockers.append("список кабинетов пуст (DIRECT_CLIENTS_JSON)")
 
-    if report["holdout"].get("campaigns", 0) == 0:
+    if report["holdout"].get("campaigns", 0) == 0 and not report["holdout"].get("error"):
         blockers.append("заповедник пуст — сравнивать эффект будет не с чем")
 
-    if report["actions"]["live_writes_total"] == 0:
+    if report["actions"].get("live_writes_total") == 0:
         warnings.append("боевой записи в кабинет не было ни разу — это предмет "
                         "этапа 1 беты, а не дефект готовности")
 
     return {"ready": not blockers, "blockers": blockers, "warnings": warnings}
 
 
+def _safe(name: str, fn) -> Any:
+    """Упавшая проверка становится строкой отчёта, а не концом отчёта.
+
+    Смысл прогона — увидеть ВСЕ расхождения разом; исключение в одной
+    проверке скрыло бы остальные девять, и следующий круг стоил бы ещё
+    одного прогона."""
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"[:400]}
+
+
 def main() -> int:
     report: Dict[str, Any] = {
         "today": date.today().isoformat(),
-        "schema": check_schema(),
-        "config": check_config(),
-        "data_gate": check_gate(),
-        "runs": check_runs(),
-        "actions": check_actions(),
-        "rejects_7d": check_rejects(),
-        "hypotheses": check_hypotheses(),
-        "holdout": check_holdout(),
-        "write_rights": check_write_rights(),
+        "schema": _safe("schema", check_schema),
+        "config": _safe("config", check_config),
+        "data_gate": _safe("data_gate", check_gate),
+        "runs": _safe("runs", check_runs),
+        "actions": _safe("actions", check_actions),
+        "rejects_7d": _safe("rejects", check_rejects),
+        "hypotheses": _safe("hypotheses", check_hypotheses),
+        "holdout": _safe("holdout", check_holdout),
+        "write_rights": _safe("write_rights", check_write_rights),
     }
     report["verdict"] = verdict(report)
     print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
