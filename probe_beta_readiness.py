@@ -403,6 +403,24 @@ def verdict(report: Dict[str, Any]) -> Dict[str, Any]:
     if report["holdout"].get("campaigns", 0) == 0 and not report["holdout"].get("error"):
         blockers.append("заповедник пуст — сравнивать эффект будет не с чем")
 
+    # Контур ставок: карман разведки выделен, а ставок нет — предупреждение
+    # с адресом, а не тишина. Бету это не останавливает (её первый этап —
+    # доверие к цепочке), но обещание «быстро проверять гипотезы» без ставок
+    # не выполняется, и узнать об этом надо до старта, а не по итогам недели.
+    bets = report.get("bets") or {}
+    if not bets.get("error"):
+        pocket = sum(r.get("rub", 0.0) for r in (bets.get("computed_exploration_rub") or []))
+        if pocket > 0 and not bets.get("exploration_actions"):
+            kinds = bets.get("action_kinds_30d") or {}
+            budgetish = [k for k in kinds if str(k).startswith("budget.")]
+            where = ("бюджетные действия до журнала не доходят вовсе "
+                     f"(в журнале только {', '.join(sorted(kinds)) or 'ничего'})"
+                     if not budgetish else
+                     "бюджетные действия в журнале есть, но без признака разведки")
+            warnings.append(
+                f"контур ставок пуст: расчёт выделил разведке {pocket:.0f} руб., "
+                f"а действий с признаком разведки за 30 дней ноль — {where}")
+
     if report["actions"].get("live_writes_total") == 0:
         warnings.append("боевой записи в кабинет не было ни разу — это предмет "
                         "этапа 1 беты, а не дефект готовности")
