@@ -111,14 +111,14 @@ def plan_switch_offs(
             "roi_at_floor": float(row.get("raw_value") or 0.0),
             "calc_date": str(row.get("calc_date") or ""),
             "p_sign": verdict["p_sign"],
-            **_window_economics(rows),
+            **window_economics(rows),
         }
 
     return {"desired": desired, "low_confidence": low_confidence,
             "confidence_unknown": confidence_unknown}
 
 
-def _window_economics(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+def window_economics(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     """Расход и лиды окна из целевой строки портфеля — или пусто.
 
     Пусто значит «строки нет»: выключение всё равно спланируется (его вердикт

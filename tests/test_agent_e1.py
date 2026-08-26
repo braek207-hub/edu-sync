@@ -2471,3 +2471,48 @@ def test_run_verdict_reaches_the_black_box():
     source = inspect.getsource(agent_e1._run_all)
     saved = source[source.index('stage="e1"'):]
     assert '"verdict": run_verdict(account_reports)' in saved
+
+
+# --- экономика кампании для ожидания: проводка в боевой прогон -------------
+
+def _portfolio_row(cost, leads):
+    return {"setting_kind": "budget_target", "setting_key": "target_28d",
+            "raw_value": cost, "support_n": leads}
+
+
+def test_expectation_context_carries_spend_and_lead_price():
+    # Без этих двух чисел expectation.of возвращает None, и семь рычагов из
+    # девяти остаются без обещания именно в проде: тесты рычагов подставляют
+    # контекст сами и ожидание видят, а прогон отдал бы в кабинет действия,
+    # которые нечем ранжировать при отборе и нечем судить в замере такта.
+    context = agent_e1.campaign_expectation_context(
+        "114057545", {"114057545": 5553.71},
+        {"114057545": [_portfolio_row(280_000.0, 140.0)]})
+
+    assert context["daily_cost_rub"] == 5553.71
+    assert context["cpa_rub"] == 2000.0
+
+
+def test_expectation_context_omits_lead_price_when_there_is_none():
+    # Строки портфеля нет или в ней ноль лидов — ключа быть не должно.
+    # Ноль означал бы «лид бесплатен», и ожидание вышло бы бесконечным;
+    # отсутствие ключа честно читается рычагом как «обещать не из чего».
+    no_row = agent_e1.campaign_expectation_context(
+        "1", {"1": 1000.0}, {})
+    no_leads = agent_e1.campaign_expectation_context(
+        "1", {"1": 1000.0}, {"1": [_portfolio_row(50_000.0, 0.0)]})
+
+    assert "cpa_rub" not in no_row
+    assert "cpa_rub" not in no_leads
+    assert no_row["daily_cost_rub"] == 1000.0
+
+
+def test_expectation_context_omits_spend_when_the_directory_is_silent():
+    # Пустой справочник расхода — пробел в витрине. Ноль рублей в день сделал
+    # бы любое ожидание нулевым, а нулевое ожидание петля обучения зачла бы
+    # сбывшимся прогнозом.
+    context = agent_e1.campaign_expectation_context(
+        "1", {}, {"1": [_portfolio_row(280_000.0, 140.0)]})
+
+    assert "daily_cost_rub" not in context
+    assert context["cpa_rub"] == 2000.0

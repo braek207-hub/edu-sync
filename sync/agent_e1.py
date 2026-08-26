@@ -130,6 +130,37 @@ def weekly_risk_limit(week_start_iso: str, daily_cost: Dict[str, float],
     return writer_db.risk_limit(week_start_iso,
                                 weekly_limit(run_weekly_spend, share))
 
+
+def campaign_expectation_context(
+        campaign_id: str,
+        daily_cost: Dict[str, float],
+        campaign_computed: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Экономика кампании для ожидания корректировок и расписания.
+
+    Без неё writer/expectation.of возвращает None, и семь рычагов из девяти
+    остались бы без обещания ИМЕННО В ПРОДЕ: тесты подставляют контекст сами и
+    ожидание видят, а боевой прогон отдал бы в кабинет действия, которые нечем
+    ранжировать при отборе (задача 7) и нечем судить в замере такта.
+
+    Цена лида берётся из той же строки портфеля, по которой планируются
+    выключения (switch.window_economics: расход и лиды окна 28 дней), — второй
+    копии экономики не заводим. Строки нет или в ней ноль лидов — ключ не
+    подставляется вовсе: ноль здесь означал бы «лид бесплатен», и ожидание
+    вышло бы бесконечным.
+    """
+    context: Dict[str, Any] = {}
+    cost_per_day = daily_cost.get(str(campaign_id))
+    if cost_per_day:
+        context["daily_cost_rub"] = float(cost_per_day)
+
+    economics = switch.window_economics(campaign_computed.get(str(campaign_id)) or [])
+    leads = float(economics.get("leads_28d") or 0.0)
+    cost = float(economics.get("cost_28d") or 0.0)
+    if leads > 0 and cost > 0:
+        context["cpa_rub"] = cost / leads
+    return context
+
+
 # --------------------------------------------- ограничение объёма прогона
 
 # Безопасность ПЕРВОГО боевого применения держится на трёх вещах сразу:
@@ -1337,13 +1368,15 @@ def run_account(
         unusable_actual += sum(1 for a in actual if a.get("unusable"))
         # Личный план кампании, если есть, иначе кабинетный (Э2.2).
         own_desired = campaign_desired.get(str(campaign_id))
+        econ = campaign_expectation_context(campaign_id, daily_cost,
+                                            fresh_campaign_computed)
         campaign_actions = list(
             diff_modifiers(own_desired if own_desired else desired,
-                           actual, campaign_id))
+                           actual, campaign_id, econ))
         if desired_items:
             campaign_actions += diff_schedule(
                 desired_items, targeting_by_campaign.get(str(campaign_id)) or {},
-                campaign_id)
+                campaign_id, econ)
         for action in campaign_actions:
             ok, reason = check_action(action)
             if not ok:
