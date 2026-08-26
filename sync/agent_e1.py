@@ -72,9 +72,8 @@ from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import apply_actions
 from sync.agent.writer.client import WriteClient, journal_writes_allowed
 from sync.agent.writer.diff import diff_modifiers, diff_schedule
+from sync.agent.writer import lanes
 from sync.agent.writer.guardrails import (
-    MAX_ACTIONS_PER_RUN,
-    cap_actions,
     check_action,
     check_holdout,
 )
@@ -89,7 +88,6 @@ from sync.agent.writer.schedule import schedule_changed, schedule_items
 from sync.agent.writer.risk import (
     DAYS_IN_WEEK,
     DEFAULT_RISK_SHARE_WEEK,
-    action_risk,
     action_risk_basis,
     fit_into_budget,
     median,
@@ -169,11 +167,12 @@ def campaign_expectation_context(
 # логинам недоступна (выяснено пробой), поэтому третье — не удобство, а
 # полноправная часть защиты, и его не было в коде вовсе.
 #
-# Что ограничивало прогон до этого: лимит действий (MAX_ACTIONS_PER_RUN = 50)
-# и риск-бюджет. Ни то, ни другое не про кампании: вычисленные настройки
+# Что ограничивало прогон до этого: лимит действий (MAX_ACTIONS_PER_RUN = 50,
+# снят вместе с cap_actions) и риск-бюджет. Ни то, ни другое не про кампании:
+# вычисленные настройки
 # лежат на уровне КАБИНЕТА, то есть один набор ключей раскатывается на все
 # его кампании сразу — первый боевой прогон тронул бы столько кампаний,
-# сколько влезет в лимит действий, а какие именно, решил бы порядок
+# сколько влезет в полосы, а какие именно, решил бы порядок
 # сортировки own_campaign_ids.
 CAMPAIGNS_ARG = "--campaigns="
 MAX_CAMPAIGNS_ARG = "--max-campaigns="
@@ -209,7 +208,7 @@ class CampaignScope:
     кампании ровно прогоном по одной кампании.
 
     Число кампаний — потолок на ПРОГОН, а не на кабинет: тем же доводом, что
-    и лимит действий (MAX_ACTIONS_PER_RUN). «Первое применение на одной
+    и риск-бюджет полосы (writer/lanes.select). «Первое применение на одной
     кампании» при потолке на кабинет означало бы четыре кампании на четырёх
     кабинетах.
 
@@ -682,6 +681,19 @@ def action_label(action: Dict[str, Any]) -> str:
     percent = int(payload.get("BidModifier") or 0)
     kind = kind_full.split(".")[-1]
     return f"{action.get('direct_type')}:{action.get('key')} {percent:+d}% ({kind})"
+
+
+def _count_by(actions: List[Dict[str, Any]], field: str) -> Dict[str, int]:
+    """Счётчик действий по полю — для отчёта прогона.
+
+    Строки отказов уезжают в чёрный ящик, но прогон обязан оставаться читаемым
+    без базы: человек, открывший лог, видит тот же расклад, что и запрос.
+    """
+    out: Dict[str, int] = {}
+    for action in actions:
+        key = str(action.get(field) or "—")
+        out[key] = out.get(key, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
 
 def _risk_pricing(prepared: List[Dict[str, Any]],
@@ -1576,10 +1588,11 @@ def run_account(
     blocked += without_address
 
     # Порядок рельс: сначала отсекается всё, что применять нельзя или
-    # незачем (лимит прогона, отсутствие красной линии), и только потом
-    # считается бюджет. Обратный порядок списывал бы риск за действия,
-    # которые дальше отваливаются, — объект помечался бы оплаченным, а
-    # изменение по нему так и не уходило бы в кабинет.
+    # незачем (конфликты, отсутствие красной линии), потом полосы выбирают
+    # лучшее на объекте, и только потом считается общий бюджет. Обратный
+    # порядок списывал бы риск за действия, которые дальше отваливаются, —
+    # объект помечался бы оплаченным, а изменение по нему так и не уходило бы
+    # в кабинет.
     # Противоречия внутри собранного плана. Каждый рычаг считает своё и
     # по-своему; несовместимость двух законных решений видна только когда они
     # оказались в одном прогоне на одном объекте. Разбор стоит ДО лимита
@@ -1590,13 +1603,16 @@ def run_account(
     blocked += [{**a, "blocked_reason": a.get("conflict_reason")}
                 for a in in_conflict]
 
-    allowed, over_cap = cap_actions(allowed, max_per_run=max(ctx["remaining_cap"], 0))
-
     # Красная линия ставится ВМЕСТЕ с действием: у каждого применённого
     # изменения заранее известно, при каком исходе оно считается провалом.
     # build_red_line возвращает None, если её посчитать не из чего — такое
     # действие не применяется, причина уходит в no_red_line, а не в тихий
     # дефолт-плейсхолдер.
+    #
+    # Стоит ПЕРЕД отбором полос (в плане беты порядок был обратным): отбор не
+    # просто раздаёт места, он списывает риск-бюджет полосы. Действие без
+    # красной линии не применяется никогда, и списать за него полосу значило
+    # бы ровно то, от чего предостерегает абзац выше.
     with_red_line: List[Dict[str, Any]] = []
     no_red_line: List[Dict[str, Any]] = []
     for a in allowed:
@@ -1608,16 +1624,43 @@ def run_account(
             continue
         with_red_line.append({**a, "red_line": red_line})
 
+    # Полосы вместо лимита действий на прогон. Лимит был срезом первых
+    # пятидесяти, а план собирается в порядке рычагов: корректировок сотнями,
+    # и до бюджета очередь не доходила никогда (замер 26.08.2026 — за 30 дней
+    # в журнале только bidmodifier.* и schedule.set). Разбор — writer/lanes.py.
+    #
+    # Ступени полос приходят конфигом панели: ступень 0 (тень) — решение
+    # человека о конкретной полосе, а не константа кода.
+    #
+    # charged_by_object отдаётся КОПИЕЙ: потолок объекта отбор обязан видеть
+    # (по объекту уже могло быть списано на прошлых прогонах недели), но
+    # списывает по-настоящему только недельная рельса ниже — иначе один и тот
+    # же рубль вычелся бы из потолка объекта дважды.
+    lane_taken, lane_refused = lanes.select(
+        with_red_line,
+        (ctx.get("config") or {}).get("lane_steps") or {},
+        weekly_spend_rub=sum(float(v) for v in daily_cost.values()) * DAYS_IN_WEEK,
+        daily_cost_by_campaign=daily_cost,
+        config=ctx.get("config"),
+        budgets=ctx["lane_budgets"],
+        charged_by_object=dict(charged_risk),
+        risk_budget_rub=weekly_risk_limit(wk, daily_cost, ctx.get("config")),
+    )
+
     # Цена действия — его ДЕЛЬТА (доля сегмента, вырезанный трафик, сдвиг
     # лимита), а не расход всей кампании; потолок объекта не даёт сумме дельт
     # превысить его расход за горизонт. Разбор — sync/agent/writer/exposure.py.
     # Базовый расход и основание цены едут со строкой в журнал: первый читает
     # красная линия обвала, второе — человек, проверяющий модель.
+    #
+    # Цена берётся ИЗ ОТБОРА (risk.net_risk на наборе такта), а не считается
+    # заново: пересчёт по действию не знает о встречном движении денег, и
+    # перенос 100 000 ₽ внутри кабинета снова платил бы обеими сторонами.
     risks: Dict[str, float] = {}
     caps: Dict[str, float] = {}
     priced: List[Dict[str, Any]] = []
-    for a in with_red_line:
-        risks[a["idempotency_key"]] = action_risk(a, daily_cost)
+    for a in lane_taken:
+        risks[a["idempotency_key"]] = float(a.get("risk_rub") or 0.0)
         caps[risk_object(a)] = object_cap(a, daily_cost)
         baseline = object_daily_cost(a, daily_cost)
         priced.append({
@@ -1634,6 +1677,8 @@ def run_account(
     # а не на кабинет, и предыдущий клиент этого же прогона мог его уже
     # частично занять (spent_risk читает applied_at из журнала, куда
     # apply_actions уже успел записать применённые действия).
+    # Тот же потолок, что отдан полосам выше: полоса берёт из него долю своей
+    # ступени, а этот остаток — общий на все полосы и на все кабинеты прогона.
     weekly_left = (weekly_risk_limit(wk, daily_cost, ctx.get("config"))
                    - writer_db.spent_risk(wk))
     # Из двух потолков берётся меньший: остаток НЕДЕЛИ и доля СЕГОДНЯШНЕГО
@@ -1642,7 +1687,6 @@ def run_account(
     remaining = min(weekly_left, ctx["run_risk_remaining"])
     prepared, deferred = fit_into_budget(priced, risks, remaining,
                                          charged_risk, caps)
-    ctx["remaining_cap"] -= len(prepared)
     ctx["run_risk_remaining"] -= sum(float(a.get("risk_rub") or 0.0) for a in prepared)
 
     # Реестр гипотез: разведочная ставка заводится ДО отправки в кабинет и
@@ -1665,9 +1709,16 @@ def run_account(
         (reason, [a for a in in_conflict if a.get("conflict_reason") == reason])
         for reason in sorted(conflicts.by_reason(in_conflict))
     ]
-    account_rejects = rejects.from_groups(conflict_groups + [
+    # Отказы полос разложены по своим причинам, а не сложены в одну:
+    # «не влезло в полосу» и «рычага записи нет вовсе» читаются по-разному, и
+    # вторая причина не лечится расширением лимита.
+    lane_rejects = [
+        (reason, [a for a in lane_refused if a.get("blocked_reason") == reason])
+        for reason in sorted({str(a.get("blocked_reason") or rejects.LANE_LIMIT)
+                              for a in lane_refused})
+    ]
+    account_rejects = rejects.from_groups(conflict_groups + lane_rejects + [
         (rejects.BUDGET, deferred),
-        (rejects.RUN_CAP, over_cap),
         (rejects.NO_RED_LINE, no_red_line),
         (rejects.COOLDOWN, in_cooldown),
         (rejects.ATTEMPTS_EXHAUSTED, out_of_attempts),
@@ -1808,7 +1859,7 @@ def run_account(
             "min_assigned_share": MIN_ASSIGNED_SHARE,
         },
         "deferred_by_risk": len(deferred),
-        "deferred_by_cap": len(over_cap),
+        "refused_by_lane": len(lane_refused),
         # Отказы строками, а не только счётчиками: они уезжают в чёрный ящик
         # (sync/agent/blackbox.py), где на истории видно, какое намерение
         # упирается в одну и ту же стену изо дня в день. Один отказ — это
@@ -1818,7 +1869,16 @@ def run_account(
         # растворяются среди бюджетных, а читать их надо иначе — это не
         # «не хватило денег», а «план сам себе противоречил».
         "conflicts": conflicts.by_reason(in_conflict),
-        "actions_left_in_run": max(ctx["remaining_cap"], 0),
+        # Полосы: что взято, что отказано и сколько полосы уже потратили за
+        # прогон. Без «взято по полосам» отчёт не отличает «полоса пуста»
+        # от «полоса выбрана до дна» — а это разные болезни: первая про
+        # источник кандидатов, вторая про ступень.
+        "lanes": {
+            "taken": _count_by(lane_taken, "lane"),
+            "refused": _count_by(lane_refused, "blocked_reason"),
+            "spent": {lane: {k: round(float(v), 2) for k, v in slot.items()}
+                      for lane, slot in sorted(ctx["lane_budgets"].items())},
+        },
         "no_red_line": {
             "count": len(no_red_line),
             "reason": NO_RED_LINE_REASON if no_red_line else None,
@@ -2030,11 +2090,6 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     # дефолт-плейсхолдер, никак не связанный с экономикой кабинета.
     absolute_max_cpa = absolute_max_cpa_from_baseline(baseline_cpa)
 
-    # Лимит действий — на ПРОГОН, а не на кабинет: рельса ограничивает объём
-    # изменений, которые человек способен проверить и осмысленно откатить, а
-    # он не зависит от того, на сколько кабинетов эти изменения разложены.
-    # Внутри цикла по четырём кабинетам потолок был вчетверо выше заявленного.
-    remaining_cap = MAX_ACTIONS_PER_RUN
     # Сколько риска по каждому объекту уже списано. Заводится из журнала
     # НЕДЕЛИ, а не пустым: потолок объекта (его расход за горизонт замера)
     # общий на все прогоны недели, иначе каждый запуск начинал бы добор
@@ -2068,7 +2123,12 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "holdout_ids": holdout_ids,
         "charged_risk": charged_risk,
         "week_start": wk,
-        "remaining_cap": remaining_cap,
+        # Потраченное полосами — на ПРОГОН, а не на кабинет: полоса ограничивает
+        # объём изменений, которые человек способен проверить и осмысленно
+        # откатить, а он не зависит от того, на сколько кабинетов они разложены.
+        # Внутри цикла по четырём кабинетам потолок был бы вчетверо выше
+        # заявленного — тот самый дефект, который чинили у лимита действий.
+        "lane_budgets": {},
         # Доля недельного риска на этот прогон. Считается ОДИН раз на весь
         # прогон: делить остаток заново на каждом кабинете значило бы выдать
         # четыре дневных доли за один день.
