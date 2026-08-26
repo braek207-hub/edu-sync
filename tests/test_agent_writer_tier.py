@@ -128,6 +128,22 @@ def test_returning_own_negative_is_not_arithmetic():
     assert tier.tier_of(action) > tier.TIER_ARITHMETIC
 
 
+def test_thresholds_hold_exactly_at_their_edge():
+    # Оба порога — на краю, иначе off-by-one живёт незамеченным: ровно три CPA
+    # это ещё не «выше трёх CPA», а зрелость окна начинается С самого порога,
+    # а не после него.
+    def is_arithmetic(**kwargs):
+        return tier.tier_of({"action_kind": "negative.add",
+                             "evidence": _cut_evidence(**kwargs)})
+
+    edge_cost = tier.CPA_MULTIPLE * 2400.0
+    assert is_arithmetic(cost_rub=edge_cost) > tier.TIER_ARITHMETIC
+    assert is_arithmetic(cost_rub=edge_cost + 1) == tier.TIER_ARITHMETIC
+
+    assert is_arithmetic(window_days=tier.MATURE_WINDOW_DAYS - 1) > tier.TIER_ARITHMETIC
+    assert is_arithmetic(window_days=tier.MATURE_WINDOW_DAYS) == tier.TIER_ARITHMETIC
+
+
 def test_three_cpa_threshold_comes_from_objects_not_from_a_local_copy():
     # Вторая копия порога разъехалась бы с кандидатами при первой же правке
     # одной из них, и агент минусовал бы по одному правилу, а объяснял другим.
