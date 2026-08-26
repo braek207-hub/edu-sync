@@ -12,6 +12,10 @@ tests/test_agent_writer_tier.py — класс достоверности дей
 остаётся нулевым.
 """
 
+import pathlib
+import subprocess
+import sys
+
 import pytest
 
 from sync.agent import objects
@@ -206,3 +210,27 @@ def test_declared_tier_can_only_tighten():
     self_declared_arithmetic = {"action_kind": "budget.set",
                                 "tier": tier.TIER_ARITHMETIC, "payload": {}}
     assert tier.tier_of(self_declared_arithmetic) == tier.TIER_BET
+
+
+# ------------------- кольцо импортов
+
+
+@pytest.mark.parametrize("module", [
+    "sync.agent.writer.tier",
+    "sync.agent.writer.lanes",
+    "sync.agent.writer.expectation",
+    "sync.agent.writer.switch",
+])
+def test_any_of_the_ring_can_be_imported_first(module):
+    """Порядок импортов не должен решать, соберётся ли пакет.
+
+    Кольцо lanes → switch → expectation → lanes уже есть и держится ленивым
+    импортом; класс достоверности добавляет к нему tier → lanes, а его
+    потребитель (lanes.select, задача 7) замкнёт lanes → tier. Проверка идёт
+    отдельным интерпретатором: внутри сессии модули уже загружены, и любой
+    порядок «работает» задним числом.
+    """
+    result = subprocess.run([sys.executable, "-c", f"import {module}"],
+                            cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+                            capture_output=True)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
