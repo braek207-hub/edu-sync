@@ -80,6 +80,12 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
     monkeypatch.setattr(agent_e1.agent_db, "load_campaign_settings_raw",
                         lambda: dict(campaign_settings or {}))
     monkeypatch.setattr(agent_e1.agent_db, "load_cost_by_campaign", lambda *_: {})
+    # Панель настроек: прогон читает её первым делом, до гейта данных. Без
+    # подмены каждый тест Э1 идёт в живую базу — прогон набора вырастал с
+    # десяти секунд до шести минут и падал там, где базы нет. Пустая панель =
+    # кодовые дефолты, то есть поведение, на которое написаны все проверки.
+    monkeypatch.setattr(agent_e1.agent_db, "load_agent_config",
+                        lambda: {"preset": None, "overrides": {}})
     monkeypatch.setattr(agent_e1, "data_gate",
                         lambda today: {"status": "GREEN", "reason": "",
                                        "checks": []})

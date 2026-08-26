@@ -52,7 +52,9 @@ import sys
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from sync.agent import config as agent_config
 from sync.agent import db as agent_db
+from sync.agent.confidence import thresholds_from_config
 from sync.agent.balance import (
     MIN_ASSIGNED_SHARE,
     balance_inputs,
@@ -1082,7 +1084,8 @@ def run_account(
     # месячные коэффициенты хуже, чем не применить ничего.
     stale_computed = (computed_freshness_refusal(computed, date.fromisoformat(today))
                       if computed else None)
-    plan = (plan_bid_modifiers(computed) if not stale_computed
+    plan = (plan_bid_modifiers(computed, thresholds=ctx["thresholds"])
+           if not stale_computed
             else {"desired": [], "unsupported": [],
                   "low_confidence": [], "confidence_unknown": 0})
     desired = plan["desired"]
@@ -1137,7 +1140,7 @@ def run_account(
             campaign_stale_dropped += 1
             continue
         fresh_campaign_computed[str(cid)] = rows
-        camp_plan = plan_bid_modifiers(rows)
+        camp_plan = plan_bid_modifiers(rows, thresholds=ctx["thresholds"])
         campaign_unsupported_rows += camp_plan["unsupported"]
         low_confidence_rows += [{**r, "campaign_id": str(cid)}
                                 for r in camp_plan["low_confidence"]]
@@ -1166,7 +1169,8 @@ def run_account(
     # и при этом быть уверенный сдвиг бюджета — «нечего делать» по
     # корректировкам ничего не говорит о бюджете. Ограничитель прогона уже
     # применён к campaign_ids, и сдвиги за его пределами не планируются.
-    budget_plan = budget.plan_budget_moves(fresh_campaign_computed)
+    budget_plan = budget.plan_budget_moves(fresh_campaign_computed,
+                                          thresholds=ctx["thresholds"])
     scoped_ids = {str(c) for c in campaign_ids}
     budget_desired = {cid: m for cid, m in budget_plan["desired"].items()
                       if cid in scoped_ids}
@@ -1179,10 +1183,11 @@ def run_account(
         budget_desired,
         writer_db.recent_action_objects(
             (budget.BUDGET_KIND, budget.BUDGET_DAILY_KIND),
-            budget.BUDGET_COOLDOWN_DAYS, account=login))
+            int(ctx["config"]["budget_cooldown_days"]), account=login))
 
     # Э3.5: цели CPA — план ДО раннего выхода, тем же правилом, что бюджет.
-    tcpa_plan = tcpa.plan_tcpa_moves(fresh_campaign_computed)
+    tcpa_plan = tcpa.plan_tcpa_moves(fresh_campaign_computed,
+                                     thresholds=ctx["thresholds"])
 
     # Э3.6: минус-фразы. Кандидатов посчитал Э0 и разложил по кампаниям
     # строками computed; здесь они собираются обратно в фразы и режутся
@@ -1197,7 +1202,8 @@ def run_account(
 
     # Э3.4: кандидаты на выключение — тем же правилом, что бюджет: план ДО
     # раннего выхода, ограничитель прогона уже в scoped_ids.
-    switch_plan = switch.plan_switch_offs(fresh_campaign_computed)
+    switch_plan = switch.plan_switch_offs(fresh_campaign_computed,
+                                          thresholds=ctx["thresholds"])
     switch_desired = {cid: m for cid, m in switch_plan["desired"].items()
                       if cid in scoped_ids}
 
@@ -1291,7 +1297,8 @@ def run_account(
         for cid, m in budget_desired.items()
     }
     budget_actions, budget_refused = budget.diff_budget(
-        budget_desired, budget_state, budget_spend_no_vat)
+        budget_desired, budget_state, budget_spend_no_vat,
+        max_write_step=float(ctx["config"]["max_write_step"]))
     budget_not_found = sorted(c for c in budget_desired if c not in budget_state)
     budget_planned_count = 0
     for action in budget_actions:
@@ -1313,8 +1320,9 @@ def run_account(
     # «не чаще раза в 14 дней» одно на обе, и второй копии ему не нужно.
     tcpa_desired, tcpa_cooled = budget.apply_cooldown(
         tcpa_desired,
-        writer_db.recent_action_objects((tcpa.TCPA_KIND,),
-                                        budget.BUDGET_COOLDOWN_DAYS, account=login))
+        writer_db.recent_action_objects(
+            (tcpa.TCPA_KIND,),
+            int(ctx["config"]["budget_cooldown_days"]), account=login))
     tcpa_state = (budget.fetch_budget_state(client, sorted(tcpa_desired))
                   if tcpa_desired else {})
     tcpa_actions, tcpa_refused = tcpa.diff_tcpa(tcpa_desired, tcpa_state)
@@ -1379,7 +1387,8 @@ def run_account(
                      if switch_desired else {})
     switch_actions, switch_refused = switch.diff_switch(switch_desired, switch_states)
     switch_not_found = sorted(c for c in switch_desired if c not in switch_states)
-    switch_actions, switch_deferred = switch.cap_suspends(switch_actions)
+    switch_actions, switch_deferred = switch.cap_suspends(
+        switch_actions, max_per_run=int(ctx["config"]["max_suspends_per_run"]))
     switch_planned_count = 0
     for action in switch_actions:
         ok, reason = check_action(action)
@@ -1784,6 +1793,45 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
              today: str, lease: Any = None,
              campaign_scope: Optional[CampaignScope] = None) -> int:
 
+    # Режим автономии из панели настроек. Читается ПЕРВЫМ — до гейта данных и
+    # до любой загрузки: "off" означает «агент не работает», и прогон, который
+    # сначала выгружает полкабинета, а потом вспоминает, что ему запрещено,
+    # тратит квоту API на решение, уже принятое человеком.
+    #
+    # Панель может только УЖЕСТОЧИТЬ то, что задано аргументами запуска:
+    # suggest_only превращает боевую запись в репетицию, обратное невозможно.
+    # Без этого правила настройка в базе поднимала бы репетицию до записи —
+    # то есть строка в таблице решала бы за две галочки в workflow.
+    try:
+        stored_config = agent_db.load_agent_config()
+    except Exception as exc:  # noqa: BLE001
+        # Панель недоступна — работаем как раньше: кодовые дефолты, то есть
+        # полный режим. Отказ базы не должен молча останавливать агента, но
+        # обязан быть виден: иначе «настройки не прочитались» и «настройки
+        # такие» выглядят в отчёте одинаково.
+        stored_config = {"preset": None, "overrides": {},
+                         "unavailable": f"{type(exc).__name__}: {exc}"[:200]}
+        print(json.dumps({"verdict": "CONFIG_UNAVAILABLE",
+                          "reason": stored_config["unavailable"]},
+                         ensure_ascii=False, indent=2))
+    active_config = agent_config.resolve(stored_config["preset"],
+                                         stored_config["overrides"])
+    autonomy = str(active_config["autonomy"])
+    if autonomy == "off":
+        print(json.dumps({
+            "verdict": "AUTONOMY_OFF",
+            "reason": "в панели настроек autonomy=off — агент не работает",
+        }, ensure_ascii=False, indent=2))
+        return 0
+    if autonomy == "suggest_only" and not dry_run:
+        print(json.dumps({
+            "verdict": "AUTONOMY_SUGGEST_ONLY",
+            "reason": "в панели настроек autonomy=suggest_only — прогон "
+                      "понижен до репетиции: план считается и печатается, "
+                      "в кабинет не уходит ничего",
+        }, ensure_ascii=False, indent=2))
+        dry_run = True
+
     # Гейт данных — ДО первого обращения к журналу и загрузок планирования:
     # e1 пишет в кабинет, а его оценка риска (дневной расход) и красная линия
     # (базовый CPA) считаны по витрине и источнику, которые до этой проверки
@@ -1867,6 +1915,14 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
 
     ctx: Dict[str, Any] = {
         "daily_cost": daily_cost,
+        # Активный конфиг едет в контекст целиком: параметры разбираются по
+        # месту применения, а не растаскиваются здесь по семи ключам — иначе
+        # добавление ручки требовало бы правки в двух местах, и забытая
+        # вторая правка выглядела бы как применённая настройка.
+        "config": active_config,
+        "config_source": stored_config,
+        # Пороги уверенности по классам действий — один раз на прогон.
+        "thresholds": thresholds_from_config(active_config),
         # Независимый расход 28 дней по кампаниям — для рельсы бюджета:
         # без него она проверяет арифметику построителя его же числом.
         # Средний дневной × 28: то же окно, что у Cost28dVat построителя,

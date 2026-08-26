@@ -226,6 +226,7 @@ def plan_bid_modifiers(
     computed: List[Dict[str, Any]],
     min_support: int = MIN_SUPPORT,
     min_abs_percent: int = MIN_ABS_PERCENT,
+    thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """План корректировок:
     {"desired": [...], "unsupported": [...], "low_confidence": [...],
@@ -272,7 +273,7 @@ def plan_bid_modifiers(
         # неуверенная строка не должна занимать место в desired независимо от
         # того, умеет ли движок её применять.
         verdict = assess(float(row.get("raw_value") or 0.0),
-                         row.get("rel_error"), "bid_modifier")
+                         row.get("rel_error"), "bid_modifier", thresholds)
         if verdict["confident"] is None:
             confidence_unknown += 1
         elif not verdict["confident"]:

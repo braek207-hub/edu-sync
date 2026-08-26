@@ -23,6 +23,7 @@ from typing import Any, Dict, List
 from sync.agent import blackbox
 from sync.agent import db as agent_db
 from sync.agent.computed import compute_schedule, compute_segment_modifiers
+from sync.agent.confidence import thresholds_from_config
 from sync.agent.coverage import blind_spend
 from sync.agent.demand import REGION as DEMAND_REGION
 from sync.agent.demand import demand_regime, directions_without_series
@@ -414,6 +415,11 @@ def main() -> int:
         active_config_rows = [{"key": "__source__", "value": "кодовые дефолты",
                                "source": "unavailable",
                                "about": stored_config["unavailable"]}] + active_config_rows
+    # Пороги уверенности по классам действий — из того же активного конфига.
+    # Считаются один раз на прогон: они не зависят ни от кабинета, ни от
+    # объекта, и пересчёт их в каждом вызове означал бы, что где-то они могут
+    # разойтись.
+    confidence_thresholds = thresholds_from_config(active_config)
 
     direct_rows = agent_db.load_direct_rows(date_from, date_to)
     lead_rows = agent_db.load_lead_rows(date_from, date_to)
@@ -1038,6 +1044,11 @@ def main() -> int:
             holdout_ids={str(h["campaign_id"]) for h in holdout},
             # Доля разведки — из панели настроек, а не из константы модуля.
             explore_share=active_config["explore_share"],
+            # Пороги уверенности — оттуда же. До 25.08.2026 панель объявляла
+            # p_sign_bid/p_sign_budget/p_sign_state, но не передавала их
+            # никуда: решали константы confidence.ACTION_CLASSES, и ручка на
+            # панели ничего не двигала.
+            thresholds=confidence_thresholds,
             # Настройки кабинета — только ради признака «лимит связывает
             # расход»: разведочная надбавка это деньги, и множитель недобора
             # трафика применяется там, где деньги действительно доедут (Э3.3).

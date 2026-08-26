@@ -389,6 +389,7 @@ def solve_threshold(
 
 def _switch_off_candidate(
     campaign: Dict[str, Any], ratio: float, lam: float, rel: float,
+    thresholds: Optional[Dict[str, float]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Кандидат на выключение (Э3.4), или None.
 
@@ -409,7 +410,7 @@ def _switch_off_candidate(
     roi_share = roi_at_floor / lam
     if roi_share >= SWITCH_OFF_ROI_SHARE:
         return None
-    verdict = assess(roi_share, rel, "campaign_state")
+    verdict = assess(roi_share, rel, "campaign_state", thresholds)
     return {
         "roi_at_floor": round(roi_at_floor, 4),
         "roi_share_of_lambda": round(roi_share, 4),
@@ -436,7 +437,9 @@ def _step_capped(campaign: Dict[str, Any], roi_ratio: float, cap_up: float) -> b
 
 
 def _move_row(campaign: Dict[str, Any], target: float, lam: float,
-              forecast_bias: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, Any]:
+              forecast_bias: Optional[Dict[str, Dict[str, float]]] = None,
+              explore_rub: float = 0.0,
+              thresholds: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
     """Строка рекомендации: дельта, ожидаемый эффект, вердикт сдвига.
 
     Ожидаемые лиды — вдоль кривой: leads·((S*/S₀)^β − 1); выручка — через
@@ -449,6 +452,14 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float,
     шаг: при β → 1 показатель 1/(1−β) раздувал шаг до капа, и p_sign выходил
     ~0.98 там, где экономическая разница тонула в шуме, — раздутая
     уверенность двигала деньги по слепой истории (аудит 2026-08-23, C2).
+
+    explore_rub — сколько рублей этой кампании дал КАРМАН РАЗВЕДКИ
+    (_apply_exploration). Признак едет в строке и дальше в витрину, потому
+    что разведочный сдвиг судится иначе всего прочего: у него уверенности нет
+    по построению (карман делится по НЕЗНАНИЮ), и такт записи обязан уметь его
+    отличить. Без признака разведочная надбавка приезжала в Э1 обычным
+    бюджетным сдвигом, глушилась порогом 0.90 и не доезжала до кабинета ни
+    разу — то есть разведки не существовало нигде, кроме отчёта расчёта.
     """
     cost = campaign["cost"]
     ratio = target / cost
@@ -456,12 +467,12 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float,
     rel = math.sqrt(campaign["value_rel_error"] ** 2
                     + campaign["marginal_rel_error"] ** 2)
     roi_ratio = campaign["value"] / (lam * campaign["marginal_cpl"])
-    verdict = assess(roi_ratio, rel, "budget_shift")
+    verdict = assess(roi_ratio, rel, "budget_shift", thresholds)
     if abs(ratio - 1.0) < 0.01:
         move = "hold"
     else:
         move = "up" if ratio > 1.0 else "down"
-    switch_off = _switch_off_candidate(campaign, ratio, lam, rel)
+    switch_off = _switch_off_candidate(campaign, ratio, lam, rel, thresholds)
     bias_k = bias_multiplier(forecast_bias, move if move != "hold" else "up")
     # Кап записи едет вместе со сдвигом и только вверх: расширенный шаг —
     # это про рост, и симметрично разжимать им кап вниз значило бы разрешить
@@ -477,6 +488,12 @@ def _move_row(campaign: Dict[str, Any], target: float, lam: float,
         **({"switch_off": switch_off} if switch_off else {}),
         **({"write_step": write_step}
            if write_step > MAX_WRITE_STEP and ratio > 1.0 else {}),
+        # Разведочная надбавка — рублями и флагом. Флаг отдельно от суммы не
+        # ради удобства: сумму округляют и складывают, а «это разведка» —
+        # свойство решения, и оно не должно выводиться сравнением с нулём в
+        # каждом следующем потребителе.
+        **({"exploration": True, "exploration_rub": round(float(explore_rub), 2)}
+           if explore_rub and float(explore_rub) > 0 else {}),
         "direction": campaign["direction"],
         "leads_28d": campaign["leads"],
         "cost_28d": round(cost, 2),
@@ -527,6 +544,12 @@ def _apply_exploration(
     наравне со всеми, а вернуть не могла: её цель уже стоит выше общего
     потолка, room выходит нулём, и заявленный ×2 садится примерно на ×1.8 —
     молча, потому что сумма кабинета при этом сходится.
+
+    Второй элемент кортежа — ВЫДАННОЕ, а не намеченное: раздача зажимается
+    потолком кампании, и невыданный остаток возвращается источникам. Пока
+    наружу уходила намётка (результат exploration_bonus), отчёт называл
+    разведкой рубли, которые кампании не достались, а признак разведки на
+    строке кампании поставить было не из чего.
     """
     floors = {cid: cost_by_id.get(cid, 0.0) * MAX_STEP_DOWN for cid in targets}
     headroom = {cid: max(0.0, targets[cid] - floors[cid]) for cid in targets}
@@ -552,16 +575,19 @@ def _apply_exploration(
                 for cid in targets}
     out = {cid: targets[cid] - withdrawn.get(cid, 0.0) for cid in targets}
     unspent = 0.0
+    granted: Dict[str, float] = {}
     for cid, extra in bonus.items():
         room = max(0.0, ceilings.get(cid, float("inf")) - out.get(cid, 0.0))
         given = min(extra, room)
         out[cid] = out.get(cid, 0.0) + given
+        if given > 0:
+            granted[cid] = given
         unspent += extra - given
     if unspent > 0 and taken > 0:
         # Возврат тем, у кого изъяли: сумма кабинета обязана сойтись.
         for cid, amount in withdrawn.items():
             out[cid] += unspent * amount / taken
-    return out, bonus
+    return out, granted
 
 
 def portfolio_targets(
@@ -575,6 +601,7 @@ def portfolio_targets(
     room_rub_by_login: Optional[Dict[str, float]] = None,
     monthly_cap_rub: Optional[float] = None,
     forecast_bias: Optional[Dict[str, Dict[str, float]]] = None,
+    thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Целевые бюджеты по кабинетам: порог λ на кабинет, сумма сохраняется.
 
@@ -599,6 +626,10 @@ def portfolio_targets(
     решает кривая насыщения, а петля обучения знает лишь то, насколько
     сбывались обещания. Сырое ожидание при этом остаётся в строке — им
     меряется сама поправка.
+
+    thresholds — пороги уверенности из панели настроек
+    (confidence.thresholds_from_config). Не передали — константы классов, то
+    есть поведение прежнее.
     """
     holdout_ids = {str(h) for h in (holdout_ids or set())}
     # Настроек нет — «связывает ли лимит» неизвестно, и множитель недобора не
@@ -676,18 +707,29 @@ def portfolio_targets(
             if sum(targets.values()) >= budget - GROWTH_RESIDUAL_RUB:
                 lam = grown_lam
         preliminary = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam,
-                                                   forecast_bias)
+                                                   forecast_bias,
+                                                   thresholds=thresholds)
                        for c in campaigns}
         # Карман изымается ПОСЛЕ решения — пропорционально у всех — и уходит
         # туда, где оценка хуже всего. Сумма целевых при этом не меняется:
         # (1−share)·Σцелей + share·бюджет = бюджет.
+        #
+        # Доля кармана — ПАРАМЕТР, а не константа модуля. До 25.08.2026 здесь
+        # стояло budget * EXPLORATION_SHARE: панель настроек передавала
+        # explore_share, солвер считал по константе, а отчёт ниже печатал
+        # переданное значение — то есть настройка «разведка 15 %» меняла
+        # только строчку отчёта. Константа осталась дефолтом сигнатуры и
+        # значением по умолчанию в панели; считает — переданное число.
         cost_by_id = {c["campaign_id"]: c["cost"] for c in campaigns}
+        explore_base = budget
         targets, bonus = _apply_exploration(
-            targets, cost_by_id, budget * EXPLORATION_SHARE,
+            targets, cost_by_id, explore_base * float(explore_share),
             [{**c, "switch_off": bool(preliminary[c["campaign_id"]].get("switch_off"))}
              for c in campaigns], lam)
         moves = {c["campaign_id"]: _move_row(c, targets[c["campaign_id"]], lam,
-                                             forecast_bias)
+                                             forecast_bias,
+                                             explore_rub=bonus.get(c["campaign_id"], 0.0),
+                                             thresholds=thresholds)
                  for c in campaigns}
         target_sum = sum(targets.values())
         # Сверка суммы — на ИТОГОВЫХ целях, тех самых, что уедут писателю:
@@ -730,7 +772,14 @@ def portfolio_targets(
             # Сколько денег кабинета ушло на разведку и кому: без этой строки
             # надбавка неотличима от решения солвера.
             "exploration": {
+                # Настройка и факт — двумя числами. Они расходятся законно:
+                # карман берётся только из запаса целей до пола капа шага, а
+                # раздаётся только до адресного потолка кампании. Одно число
+                # не отличило бы «в панели стоит 15 %» от «раздать удалось 4 %»,
+                # и молчание рычага выглядело бы как выполненная настройка.
                 "share": explore_share if bonus else 0.0,
+                "share_effective": (round(sum(bonus.values()) / explore_base, 4)
+                                    if bonus and explore_base > 0 else 0.0),
                 "rub": round(sum(bonus.values()), 2),
                 "campaigns": len(bonus),
                 # Кому недобор трафика поднял вес: замер есть, лимит
@@ -830,6 +879,23 @@ def computed_rows(section: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
                 "support_n": m["leads_28d"],
                 "rel_error": m["rel_error"],
             }]
+            if m.get("exploration_rub"):
+                # Разведочная надбавка ОТДЕЛЬНОЙ строкой, а не полем на
+                # target_28d: витрина edu_agent_computed_settings хранит
+                # (kind, key, value, raw_value, support_n, rel_error) и чужих
+                # полей не переносит — признак, приписанный к целевой строке,
+                # потерялся бы ровно на границе расчёт → запись, то есть там,
+                # где он единственно и нужен. value — рубли разведки,
+                # raw_value — целевой бюджет, в котором они сидят: по паре
+                # видно, какую часть сдвига покупает информация.
+                rows.append({
+                    "setting_kind": "budget_target",
+                    "setting_key": "exploration_rub",
+                    "value": m["exploration_rub"],
+                    "raw_value": m["target_28d"],
+                    "support_n": m["leads_28d"],
+                    "rel_error": m["rel_error"],
+                })
             if m.get("write_step"):
                 # Кап записи для ЭТОЙ кампании. Без строки писатель зажал бы
                 # цель общими ±20 % от расхода, и адресный шаг ×2 не доехал

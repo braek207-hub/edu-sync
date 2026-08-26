@@ -116,6 +116,19 @@ LOW_CONFIDENCE_REASON = (
     "λ·marginal) ниже порога класса budget_shift"
 )
 
+# Пометка разведочного сдвига в отчёте. Она заменяет собой отказ по
+# уверенности, а не прячет его: у разведки уверенности нет ПО ПОСТРОЕНИЮ —
+# карман делится пропорционально незнанию (portfolio.exploration_bonus), то
+# есть уходит ровно туда, где оценка хуже всего. Требовать от такой строки
+# p_sign ≥ 0.90 значит требовать знания там, где деньги тратятся ради его
+# получения; при этом разведочные применения обязаны быть отличимы от
+# обычных — иначе «агент подлил вслепую» и «агент подлил уверенно» читаются
+# в журнале одинаково.
+EXPLORATION_WAIVED_REASON = (
+    "разведка: уверенность не требуется — карман неопределённости идёт туда, "
+    "где оценка хуже всего, и порог класса budget_shift к нему не применяется"
+)
+
 
 def _idempotency_key(campaign_id: str, kind: str, micros: int) -> str:
     raw = f"budget:{campaign_id}:{kind}:{micros}"
@@ -209,20 +222,31 @@ def _expectation_payload(move: Dict[str, Any]) -> Dict[str, float]:
 
 def plan_budget_moves(
     computed_by_campaign: Dict[str, List[Dict[str, Any]]],
+    thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Строки budget_target → желаемые сдвиги по кампаниям.
 
     {"desired": {cid: {"target_28d", "cost_28d", "ratio", "p_sign"}},
-     "low_confidence": [...], "confidence_unknown": N, "small_shift": N}.
+     "low_confidence": [...], "confidence_unknown": N, "small_shift": N,
+     "exploration": [...]}.
 
     Пороги значимости из plan_bid_modifiers здесь не действуют: support_n у
     budget_target — лиды окна, и он уже отработал в Э3.2 (ошибка решения
     rel_error выведена из него); фильтровать второй раз по числу лидов —
     судить решение чужой линейкой. Гейт уверенности — свой класс
-    budget_shift (0.90: бюджет обратим, но затрагивает всю кампанию).
+    budget_shift (0.90 по умолчанию, порог берётся из панели настроек:
+    бюджет обратим, но затрагивает всю кампанию).
+
+    ЕДИНСТВЕННОЕ исключение из гейта уверенности — разведочный сдвиг (строка
+    budget_target/exploration_rub): см. EXPLORATION_WAIVED_REASON. Снимается
+    ровно один гейт и только он. Кап шага, кулдаун 14 дней, риск-бюджет,
+    красная линия, заповедник, лимит действий за прогон и рельсы движка
+    действуют на разведку в полном объёме: разведка — это право не знать, а
+    не право не отвечать.
     """
     desired: Dict[str, Dict[str, Any]] = {}
     low_confidence: List[Dict[str, Any]] = []
+    exploration: List[Dict[str, Any]] = []
     confidence_unknown = 0
     small_shift = 0
 
@@ -240,6 +264,15 @@ def plan_budget_moves(
         if abs(ratio - 1.0) < MIN_SHIFT:
             small_shift += 1
             continue
+        # Разведочная надбавка, назначенная солвером именно этой кампании
+        # (portfolio._apply_exploration). Читается ДО гейта уверенности:
+        # именно от неё зависит, применим ли гейт вообще.
+        explore_row = next((r for r in rows
+                            if str(r.get("setting_kind")) == "budget_target"
+                            and str(r.get("setting_key")) == "exploration_rub"), None)
+        exploration_rub = (float(explore_row.get("value") or 0.0)
+                           if explore_row is not None else 0.0)
+        is_exploration = exploration_rub > 0
         # Уверенность — по экономическому отношению value/(λ·marginal), а не
         # по размеру шага: шаг раздут показателем кривой 1/(1−β), и
         # assess(target/current) выдавал «уверенно» на слепой истории (аудит
@@ -249,17 +282,33 @@ def plan_budget_moves(
         roi_row = next((r for r in rows
                         if str(r.get("setting_kind")) == "budget_target"
                         and str(r.get("setting_key")) == "roi_vs_lambda"), None)
-        if roi_row is None or not float(roi_row.get("value") or 0.0) > 0:
-            confidence_unknown += 1
-            continue
-        verdict = assess(float(roi_row["value"]), roi_row.get("rel_error"),
-                         "budget_shift")
-        if verdict["confident"] is None:
+        roi_value = (float(roi_row["value"])
+                     if roi_row is not None and float(roi_row.get("value") or 0.0) > 0
+                     else None)
+        if roi_value is None:
+            # Экономического отношения нет — судить нечем. Для обычного сдвига
+            # это отказ «уверенность неизвестна»; для разведочного нет и
+            # предмета отказа: его основание не в отношении к λ, а в незнании.
+            if not is_exploration:
+                confidence_unknown += 1
+                continue
+            verdict = {"p_sign": None, "min_p_sign": None, "confident": None}
+        else:
+            verdict = assess(roi_value, roi_row.get("rel_error"),
+                             "budget_shift", thresholds)
+        if is_exploration:
+            exploration.append({
+                "campaign_id": str(cid), "ratio": round(ratio, 3),
+                "exploration_rub": round(exploration_rub, 2),
+                "p_sign": verdict["p_sign"], "min_p_sign": verdict["min_p_sign"],
+                "reason": EXPLORATION_WAIVED_REASON,
+            })
+        elif verdict["confident"] is None:
             confidence_unknown += 1
         elif not verdict["confident"]:
             low_confidence.append({
                 "campaign_id": str(cid), "ratio": round(ratio, 3),
-                "roi_vs_lambda": round(float(roi_row["value"]), 4),
+                "roi_vs_lambda": round(roi_value, 4),
                 "p_sign": verdict["p_sign"], "min_p_sign": verdict["min_p_sign"],
                 "reason": LOW_CONFIDENCE_REASON,
             })
@@ -268,9 +317,17 @@ def plan_budget_moves(
             "target_28d": target,
             "cost_28d": current,
             "ratio": round(ratio, 4),
-            "roi_vs_lambda": round(float(roi_row["value"]), 4),
+            "roi_vs_lambda": round(roi_value, 4) if roi_value is not None else None,
             "p_sign": verdict["p_sign"],
         }
+        if is_exploration:
+            # Признак едет ДАЛЬШЕ, в действие и в журнал: без него отчёт
+            # прогона не смог бы сказать, сколько разведочных сдвигов
+            # применено, а разбор через две недели — отличить разведку от
+            # обычной доливки.
+            desired[str(cid)]["exploration"] = True
+            desired[str(cid)]["exploration_rub"] = round(exploration_rub, 2)
+            desired[str(cid)]["confidence_waived"] = EXPLORATION_WAIVED_REASON
         expected = _expected_leads_delta(rows)
         if expected is not None:
             desired[str(cid)]["expected_leads_delta"] = expected
@@ -289,7 +346,13 @@ def plan_budget_moves(
 
     return {"desired": desired, "low_confidence": low_confidence,
             "confidence_unknown": confidence_unknown,
-            "small_shift": small_shift}
+            "small_shift": small_shift,
+            # Разведочные сдвиги — отдельным списком, а не растворёнными в
+            # desired: применение вслепую обязано быть пересчитываемым. Без
+            # этого списка «агент применил 12 сдвигов» не отличалось бы от
+            # «агент применил 9 уверенных и 3 разведочных», а через две недели
+            # именно это различие и решает, чему приписать результат.
+            "exploration": exploration}
 
 
 def _limit_holder(block: Any) -> Optional[Dict[str, Any]]:
@@ -351,6 +414,7 @@ def diff_budget(
     actual_by_campaign: Dict[str, Dict[str, Any]],
     weekly_spend_no_vat: Dict[str, float],
     binding_share: float = BINDING_SHARE,
+    max_write_step: float = MAX_WRITE_STEP,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Желаемые сдвиги × прочитанное состояние кабинета → (действия, отказы).
 
@@ -389,7 +453,12 @@ def diff_budget(
         # стратегии), больше — только там, где солвер доказал недобор
         # трафика и запас окупаемости. Оставить здесь константу значило бы
         # тихо обнулять адресный шаг ×2 на последнем метре.
-        step = float(move.get("write_step") or MAX_WRITE_STEP)
+        # Дефолт капа — из панели настроек (max_write_step), а не из
+        # константы модуля: ручка «потолок шага за одну запись» до 26.08.2026
+        # никуда не передавалась и не меняла ничего. Адресный шаг солвера
+        # (write_step) по-прежнему главнее — он назначен под доказанный
+        # недобор конкретной кампании, и общая настройка его не срезает.
+        step = float(move.get("write_step") or max_write_step)
         if spend > 0:
             # Кап применяется ДО проверки «уже стоит»: судить, стоит ли
             # лимит, надо о том значении, которое реально поедет в кабинет.

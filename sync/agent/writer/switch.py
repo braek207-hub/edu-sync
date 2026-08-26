@@ -26,7 +26,7 @@ campaign_switch Э3.2 → campaigns.suspend.
 """
 
 import hashlib
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.confidence import assess
 from sync.agent.writer import exposure
@@ -60,6 +60,7 @@ def _idempotency_key(campaign_id: str, calc_date: str) -> str:
 
 def plan_switch_offs(
     computed_by_campaign: Dict[str, List[Dict[str, Any]]],
+    thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Строки campaign_switch → желаемые выключения по кампаниям.
 
@@ -84,7 +85,8 @@ def plan_switch_offs(
         roi_share = float(row.get("value") or 0.0)
         if roi_share <= 0:
             continue
-        verdict = assess(roi_share, row.get("rel_error"), "campaign_state")
+        verdict = assess(roi_share, row.get("rel_error"), "campaign_state",
+                         thresholds)
         if verdict["confident"] is None:
             confidence_unknown += 1
             continue

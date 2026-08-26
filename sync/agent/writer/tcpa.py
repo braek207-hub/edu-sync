@@ -123,6 +123,7 @@ def clamp_step(target_rub: float, current_rub: float,
 
 def plan_tcpa_moves(
     computed_by_campaign: Dict[str, List[Dict[str, Any]]],
+    thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Строки Э3.5 → желаемые цели по кампаниям + счётчики молчания.
 
@@ -157,7 +158,7 @@ def plan_tcpa_moves(
             confidence_unknown += 1
             continue
         verdict = assess(float(roi_row["value"]), roi_row.get("rel_error"),
-                         "budget_shift")
+                         "budget_shift", thresholds)
         if verdict["confident"] is None:
             confidence_unknown += 1
             continue
