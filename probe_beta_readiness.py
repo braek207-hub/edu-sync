@@ -199,6 +199,43 @@ def check_hypotheses() -> Dict[str, Any]:
     return {str(r["s"]): int(r["cnt"]) for r in rows}
 
 
+def check_bets(days: int = 30) -> Dict[str, Any]:
+    """Заводятся ли СТАВКИ — и есть ли из чего их заводить.
+
+    Ставкой действие делает признак разведочного кармана в payload
+    (agent/experiments.is_bet), а строка реестра появляется только в боевом
+    прогоне: `if bets and not dry_run` (agent_e1). Поэтому пустой реестр при
+    одних репетициях — ожидаемое состояние, а вот ноль разведочных ДЕЙСТВИЙ
+    означал бы, что контур ставок мёртв и в бете тоже ничего не заведётся.
+    """
+    marked = writer_db._fetch(
+        """
+        SELECT status, COUNT(*) AS cnt
+          FROM edu_agent_actions
+         WHERE created_at >= now() - make_interval(days => %(days)s)
+           AND payload->>'exploration' = 'true'
+         GROUP BY status ORDER BY 2 DESC
+        """,
+        {"days": days},
+    )
+    if "status" not in _columns("edu_agent_experiments"):
+        return {"exploration_actions": {str(r["status"]): int(r["cnt"]) for r in marked},
+                "registry": "колонок реестра в базе нет"}
+    reg = writer_db._fetch(
+        """
+        SELECT status, COUNT(*) AS cnt
+          FROM edu_agent_experiments
+         WHERE status IS NOT NULL
+         GROUP BY status ORDER BY 2 DESC
+        """,
+        {},
+    )
+    return {
+        "exploration_actions": {str(r["status"]): int(r["cnt"]) for r in marked},
+        "registry_by_status": {str(r["status"]): int(r["cnt"]) for r in reg},
+    }
+
+
 def check_gate() -> Dict[str, Any]:
     try:
         gate = data_gate(date.today())
@@ -368,6 +405,7 @@ def main() -> int:
         "actions": _safe("actions", check_actions),
         "rejects_7d": _safe("rejects", check_rejects),
         "hypotheses": _safe("hypotheses", check_hypotheses),
+        "bets": _safe("bets", check_bets),
         "holdout": _safe("holdout", check_holdout),
         "write_rights": _safe("write_rights", check_write_rights),
     }
