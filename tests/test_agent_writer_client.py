@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import json
+
 import pytest
 
 import sync.agent.writer.client as client_module
@@ -248,3 +250,97 @@ def test_journal_writes_only_in_prod_apply():
     assert journal_allowed(WriteClient("l", sandbox=False, dry_run=False)) is True
     assert journal_allowed(WriteClient("l", sandbox=False, dry_run=True)) is False
     assert journal_allowed(WriteClient("l", sandbox=True, dry_run=False)) is False
+
+
+# ================== батчи записи: несколько элементов одним запросом
+
+
+def test_batch_sends_all_elements_in_one_request(monkeypatch):
+    # Уберите этот тест — и батч распадётся обратно на запрос за элементом.
+    # При 50 действиях за прогон это стоило секунд, при трёхстах прогон
+    # перестаёт помещаться между кроном Э1 и сверкой, и сверка объявляет
+    # расхождением кабинет, который прямо сейчас дописывается.
+    bodies = []
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        bodies.append(json.loads(data.decode("utf-8")))
+        return _FakeResponse(200, json_body={"result": {"AddResults": [{"Id": 1},
+                                                                       {"Id": 2}]}})
+
+    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    client = WriteClient("login-1", dry_run=False, token="t")
+
+    result = client.mutate_batch("bidmodifiers", "add", "BidModifiers",
+                                 [{"CampaignId": 1}, {"CampaignId": 2}])
+
+    assert len(bodies) == 1
+    assert bodies[0]["params"]["BidModifiers"] == [{"CampaignId": 1}, {"CampaignId": 2}]
+    assert len(result["AddResults"]) == 2
+
+
+def test_batch_refuses_to_exceed_the_request_limit():
+    # Перебор элементов Директ отвергает целиком — вместе со здоровыми
+    # соседями. Молча отправить «сколько дали» значит потерять весь запрос
+    # из-за арифметики вызывающего кода.
+    client = WriteClient("login-1", dry_run=False, token="t")
+    items = [{"CampaignId": i} for i in range(client_module.BATCH_LIMIT + 1)]
+
+    with pytest.raises(ValueError):
+        client.mutate_batch("bidmodifiers", "add", "BidModifiers", items)
+
+
+def test_empty_batch_never_goes_to_the_network(monkeypatch):
+    # Пустой запрос — это не «ничего не делаем», это трата балла и строка
+    # ошибки от Директа.
+    monkeypatch.setattr(client_module.requests, "post",
+                        lambda *a, **k: pytest.fail("пустой батч ушёл в сеть"))
+    client = WriteClient("login-1", dry_run=False, token="t")
+
+    with pytest.raises(ValueError):
+        client.mutate_batch("bidmodifiers", "add", "BidModifiers", [])
+
+
+def test_batch_in_rehearsal_stays_offline(monkeypatch):
+    # Репетиция не ходит в сеть и в батче: пометка возвращается с ПОЛНЫМ
+    # телом, иначе отчёт репетиции покажет один элемент вместо десяти.
+    monkeypatch.setattr(client_module.requests, "post",
+                        lambda *a, **k: pytest.fail("репетиция ушла в сеть"))
+    client = WriteClient("login-1", dry_run=True, token="t")
+
+    out = client.mutate_batch("bidmodifiers", "add", "BidModifiers",
+                              [{"CampaignId": 1}, {"CampaignId": 2}])
+
+    assert out["dry_run"] is True
+    assert len(out["params"]["BidModifiers"]) == 2
+
+
+def test_element_errors_do_not_raise_from_a_batch(monkeypatch):
+    # Различение уровней сохраняется и в батче: ошибка ЭЛЕМЕНТА приезжает в
+    # result (её разбирает apply.py по индексу), а исключение поднимается
+    # только на ошибке уровня ЗАПРОСА. Иначе один плохой элемент откатил бы
+    # девять применённых соседей.
+    def fake_post(url, data=None, headers=None, timeout=None):
+        return _FakeResponse(200, json_body={"result": {"AddResults": [
+            {"Id": 1},
+            {"Errors": [{"Code": 8800, "Message": "кампания не найдена"}]},
+        ]}})
+
+    monkeypatch.setattr(client_module.requests, "post", fake_post)
+    client = WriteClient("login-1", dry_run=False, token="t")
+
+    result = client.mutate_batch("bidmodifiers", "add", "BidModifiers",
+                                 [{"CampaignId": 1}, {"CampaignId": 2}])
+
+    assert result["AddResults"][0]["Id"] == 1
+    assert result["AddResults"][1]["Errors"]
+
+
+def test_split_batches_keeps_order_and_size():
+    # Порядок элементов — единственное, чем ответ Директа привязан к
+    # действию: результаты приходят позиционно. Перетасовка при нарезке
+    # приписала бы исход одного действия другому.
+    items = list(range(25))
+    chunks = client_module.split_batches(items)
+
+    assert [len(c) for c in chunks] == [10, 10, 5]
+    assert [x for c in chunks for x in c] == items
