@@ -40,6 +40,13 @@ HOLDOUT = "holdout"                   # объект в заповеднике �
 LEARNING_COOLDOWN = "learning_cooldown"     # обучение стратегии ещё не остыло
 CLOSED_KEY = "closed_key"             # ключ уже закрыт финальным статусом
 NO_GROWTH_ADDRESS = "no_growth_address"     # сокращение без адресата роста
+# Баллы кабинета кончились: остаток ниже резерва (writer/apply.UNITS_RESERVE_SHARE),
+# отправлять нечем. Причина кабинетная, а не действия: то же действие завтра
+# уедет без единой правки — но пока баллов нет, хвост такта не применяется, и
+# он обязан быть виден строками. Раньше он жил счётчиком units_low в отчёте
+# прогона и исчезал вместе с логом; при лимите в 50 действий порог не срабатывал
+# ни разу, при трёхстах срабатывает первым же тактом.
+UNITS_LOW = "units_low"
 UNKNOWN = "unknown"
 
 # Причины конфликтов берутся из sync/agent/conflicts.py, а не переписываются
@@ -52,7 +59,7 @@ CONFLICT_REASONS = frozenset({conflicts.SUSPENDED_OBJECT,
 KNOWN_REASONS = frozenset({BUDGET, LANE_LIMIT, PROPOSAL, RUN_CAP, NO_RED_LINE,
                            COOLDOWN, ATTEMPTS_EXHAUSTED, HOLDOUT,
                            LEARNING_COOLDOWN, CLOSED_KEY, NO_GROWTH_ADDRESS,
-                           UNKNOWN}) | CONFLICT_REASONS
+                           UNITS_LOW, UNKNOWN}) | CONFLICT_REASONS
 
 # Сколько знаков ключа сегмента едет в строку. Ключ бывает длинным (список
 # минус-фраз), а группировка беты идёт по объекту и причине, не по ключу.

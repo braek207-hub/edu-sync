@@ -118,3 +118,14 @@ def test_every_known_reason_survives_a_round_trip(reason):
     rows = rejects.from_groups([(reason, [_action()])])
 
     assert rows[0]["reason"] == reason
+
+
+def test_units_low_is_a_known_reason():
+    # Убрать этот тест — и исчерпание баллов Директа вернётся в тишину:
+    # apply.py кладёт хвост такта строками с этой причиной, а неизвестная
+    # причина схлопывается в UNKNOWN (row(): known = reason if ... else UNKNOWN).
+    # Тогда группировка беты увидит кучу «unknown» вместо «кабинету не хватило
+    # баллов» — а это два разных диагноза с разным лечением.
+    assert rejects.UNITS_LOW in rejects.KNOWN_REASONS
+    rows = rejects.from_groups([(rejects.UNITS_LOW, [_action()])])
+    assert rows[0]["reason"] == rejects.UNITS_LOW
