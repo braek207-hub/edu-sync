@@ -151,7 +151,8 @@ def mart_gate(mart: Dict[str, Any], today: date,
 
 
 def with_source_checks(gate: Dict[str, Any], include_volume: bool,
-                       window_days: int = GATE_WINDOW_DAYS) -> Dict[str, Any]:
+                       window_days: int = GATE_WINDOW_DAYS,
+                       today: Optional[date] = None) -> Dict[str, Any]:
     """Дополняет витринный гейт проверками ИСТОЧНИКА Директа.
 
     Сверка сумм источник↔витрина ловит витрину, собранную не из тех строк,
@@ -167,6 +168,20 @@ def with_source_checks(gate: Dict[str, Any], include_volume: bool,
     изменения, и замораживать откат по нему значило бы отключать защиту ровно
     в момент, когда она нужна.
 
+    Судит эта проверка последний ПОЛНЫЙ день, а не последний день витрины.
+    Расчёт (agent_e0) идёт в 09:30 МСК и кладёт в витрину сегодняшние строки;
+    запись (agent_e1) идёт в 11:00 МСК и видит день, прошедший на четверть.
+    Сравнение такого дня со средним по полным даёт z около шести — то есть
+    красный гейт КАЖДЫЙ день, и боевая запись запрещена навсегда. Замер
+    26.08.2026: mean 841 688 ₽, сегодня 89 138 ₽, z = 6.36 при пороге 4.
+    Та же граница, по той же причине, стоит у окна наблюдения сторожа
+    (agent_e1_watchdog.observation_window: «вчера — сегодняшний день неполон
+    по расходу»).
+
+    Отключением проверки это не является: обвал вчерашнего дня по-прежнему
+    краснеет, вердикт просто приходит на день позже — ровно тогда, когда о
+    дне вообще есть что сказать.
+
     Красный витринный гейт источником не перепроверяется: он уже красный, а
     окно сверки без последнего широкого дня не построить.
     """
@@ -178,8 +193,11 @@ def with_source_checks(gate: Dict[str, Any], include_volume: bool,
     daily = _daily_cost(agent_db.load_direct_rows(date_from, latest))
     checks: List[Dict[str, Any]] = []
     if include_volume and daily:
-        checks.append(check_volume_anomaly(
-            [cost for _, cost in daily[:-1]], daily[-1][1]))
+        complete = ([(day, cost) for day, cost in daily
+                     if day < today.isoformat()] if today else daily)
+        if complete:
+            checks.append(check_volume_anomaly(
+                [cost for _, cost in complete[:-1]], complete[-1][1]))
     if daily:
         checks.append(check_sum_reconciliation(
             sum(cost for _, cost in daily),
@@ -205,4 +223,4 @@ def data_gate(today: date, window_days: int = GATE_WINDOW_DAYS,
         (today - timedelta(days=window_days)).isoformat(), today.isoformat())
     return with_source_checks(mart_gate(mart, today, max_age_days),
                               include_volume=include_volume,
-                              window_days=window_days)
+                              window_days=window_days, today=today)
