@@ -24,6 +24,8 @@ import sync.agent.writer.apply as apply_mod
 import sync.agent.writer.db as writer_db
 from sync.agent.writer.apply import _element_errors, apply_actions, to_api_call
 from sync.agent.writer.client import DirectWriteError, is_outcome_unknown
+import sync.agent.writer.client as client_module
+from sync.agent import rejects
 from sync.agent.writer.db import ensure_writer_tables
 from sync.db import get_connection
 
@@ -154,10 +156,19 @@ class _FakeDB:
 
 
 class _FakeClient:
+    """Транспорт-протокол: считает ЗАПРОСЫ, а не действия.
+
+    mutate_batch повторяет форму настоящего клиента и сводится к одному
+    mutate — иначе счётчик calls считал бы элементы и батч был бы неотличим
+    от запроса за элементом ровно в тех тестах, ради которых он заведён.
+    """
+
     def __init__(self, response: Optional[Dict[str, Any]] = None,
-                 raises: Optional[Exception] = None):
+                 raises: Optional[Exception] = None,
+                 respond=None):
         self._response = response if response is not None else {}
         self._raises = raises
+        self._respond = respond          # callable(params) → ответ на запрос
         self.calls: List[tuple] = []
         self.units_left: Optional[int] = None
         self.units_limit: Optional[int] = None
@@ -170,7 +181,15 @@ class _FakeClient:
         self.calls.append((service, method, params))
         if self._raises is not None:
             raise self._raises
+        if self._respond is not None:
+            return self._respond(params)
         return self._response
+
+    def mutate_batch(self, service: str, method: str, collection: str,
+                     items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        assert items, "пустой батч до транспорта доходить не должен"
+        assert len(items) <= client_module.BATCH_LIMIT, "перебор элементов в запросе"
+        return self.mutate(service, method, {collection: list(items)})
 
 
 def test_apply_actions_marks_applied_on_clean_success():
@@ -181,7 +200,7 @@ def test_apply_actions_marks_applied_on_clean_success():
 
     assert report == {"applied": 1, "skipped": 0, "failed": 0, "rejected": 0,
                        "dry_run": 0, "unknown_outcome": 0, "conflicted": 0,
-                       "deferred": 0, "units_low": 0,
+                       "deferred": 0, "units_low": 0, "rejects": [],
                        "details": [{"key": "k1", "result": "applied"}]}
     assert db.rows["k1"]["status"] == "applied"
     assert len(client.calls) == 1
@@ -228,7 +247,7 @@ def test_apply_actions_repeat_run_skips_already_applied():
 
     assert report == {"applied": 0, "skipped": 1, "failed": 0, "rejected": 0,
                        "dry_run": 0, "unknown_outcome": 0, "conflicted": 0,
-                       "deferred": 0, "units_low": 0,
+                       "deferred": 0, "units_low": 0, "rejects": [],
                        "details": [{"key": "k1", "result": "skipped"}]}
     assert client.calls == []  # запрос не ушёл второй раз
 
@@ -861,6 +880,30 @@ def test_units_low_stops_before_journal():
     assert client.calls == []
 
 
+def test_units_low_lands_in_rejects_with_a_reason():
+    # Убрать этот тест — и хвост такта снова исчезнет без следа: баллы
+    # кончились, действия не отправлены, в edu_agent_rejects пусто, а в отчёте
+    # одно число units_low, которое живёт до конца лога. При лимите в 50
+    # действий порог не срабатывал ни разу; при трёхстах он срабатывает первым
+    # же тактом, и «почему агент сегодня ничего не сделал» станет неотвечаемым.
+    db = _FakeDB()
+    client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+    client.units_left = 1
+    client.units_limit = 1000
+
+    report = apply_actions(client, [_action("k1"), _action("k2")], db)
+
+    assert report["rejects"], "хвост такта исчез без причины"
+    assert all(r["reason"] == rejects.UNITS_LOW for r in report["rejects"])
+    assert [r["key"] for r in report["rejects"]] == ["", ""]
+    # Цена действия едет со строкой: отказ без денег на кону не отличить от
+    # отказа по копеечному объекту.
+    assert report["rejects"][0]["risk_rub"] == 100.0
+    assert report["rejects"][0]["account"] == "test-login"
+    assert report["rejects"][0]["stage"] == "e1"
+    assert report["units_low"] == 2
+
+
 def test_units_healthy_does_not_stop():
     db = _FakeDB()
     client = _FakeClient(response={"SetResults": [{"Id": 7}]})
@@ -896,3 +939,213 @@ def test_rehearsal_does_not_mark_sent():
     apply_actions(client, [_action()], db)
 
     assert not any(e.startswith("sent:") for e in db.events)
+
+
+# ------------------------------- батчи: много действий одним запросом
+
+
+def _bidmodifier_actions(count: int, campaign_start: int = 100
+                         ) -> List[Dict[str, Any]]:
+    """count действий bidmodifier.add, каждое на СВОЮ кампанию."""
+    return [{
+        "action_kind": "bidmodifier.add",
+        "object_level": "campaign",
+        "object_id": str(campaign_start + i),
+        "direct_type": "MOBILE_ADJUSTMENT",
+        "key": "MOBILE",
+        "payload": {"CampaignId": campaign_start + i, "Type": "MOBILE_ADJUSTMENT",
+                    "key": "MOBILE", "BidModifier": 30},
+        "previous_state": {},
+        "idempotency_key": f"k{i}",
+        "account": "test-login",
+        "risk_rub": 10.0,
+        "red_line": {},
+    } for i in range(count)]
+
+
+def _add_results(params: Dict[str, Any], errors_at: Optional[int] = None,
+                 short_by: int = 0) -> Dict[str, Any]:
+    """Ответ Директа на батч: результат на КАЖДЫЙ отправленный элемент."""
+    items = params["BidModifiers"]
+    results: List[Dict[str, Any]] = []
+    for index, _ in enumerate(items):
+        if index == errors_at:
+            results.append({"Errors": [{"Code": 8800, "Message": "не найдена"}]})
+        else:
+            results.append({"Id": 1000 + index})
+    return {"AddResults": results[:len(results) - short_by]}
+
+
+def test_same_kind_actions_are_sent_in_one_request():
+    # Уберите этот тест — и запись вернётся к запросу за действием. При
+    # трёхстах действиях это триста обращений к API в окне между кроном Э1 и
+    # сверкой: сверка начнёт читать кабинет посреди записи и объявит
+    # расхождением то, что дописывается прямо сейчас.
+    db = _FakeDB()
+    client = _FakeClient(respond=_add_results)
+
+    report = apply_actions(client, _bidmodifier_actions(10), db)
+
+    assert len(client.calls) == 1
+    assert len(client.calls[0][2]["BidModifiers"]) == 10
+    assert report["applied"] == 10
+
+
+def test_batch_is_cut_by_the_transport_limit():
+    # Размер пачки — свойство транспорта (client.BATCH_LIMIT), а не
+    # усмотрение применения: перебор Директ отвергает запрос целиком.
+    db = _FakeDB()
+    client = _FakeClient(respond=_add_results)
+
+    apply_actions(client, _bidmodifier_actions(client_module.BATCH_LIMIT + 2), db)
+
+    assert [len(call[2]["BidModifiers"]) for call in client.calls] == [
+        client_module.BATCH_LIMIT, 2]
+
+
+def test_two_actions_on_one_object_never_share_a_request():
+    # Сегодня каждый элемент едет своим запросом, и соседство двух элементов
+    # про ОДИН объект в одном теле нигде не проверено: у campaigns.update это
+    # прямо означает, что второй элемент затрёт первый. Батч меняет число
+    # запросов, а не соседство — три действия по одной кампании остаются
+    # тремя запросами.
+    db = _FakeDB()
+    client = _FakeClient(respond=_add_results)
+    actions = [{**a, "object_id": "111", "payload": {**a["payload"], "CampaignId": 111}}
+               for a in _bidmodifier_actions(3)]
+
+    report = apply_actions(client, actions, db)
+
+    assert len(client.calls) == 3
+    assert report["applied"] == 3
+
+
+def test_different_kinds_do_not_share_a_request():
+    # bidmodifiers.add и campaigns.update — разные сервисы и разные тела.
+    db = _FakeDB()
+    client = _FakeClient(respond=lambda params: (
+        _add_results(params) if "BidModifiers" in params
+        else {"UpdateResults": [{"Id": 1}]}))
+    actions = _bidmodifier_actions(2) + [{
+        **_action("budget"), "action_kind": "budget.set_daily",
+        "object_id": "900",
+        "payload": {"CampaignId": 900, "DailyBudget": {"Amount": 1_000_000}},
+    }]
+
+    report = apply_actions(client, actions, db)
+
+    assert [call[0] for call in client.calls] == ["bidmodifiers", "campaigns"]
+    assert report["applied"] == 3
+
+
+def test_element_error_in_a_batch_does_not_fail_its_neighbours():
+    # То же различение, что держит client._call: ошибка ЗАПРОСА и ошибка
+    # ЭЛЕМЕНТА — разные события. Не разбери мы батч поэлементно, один
+    # отклонённый элемент отменил бы девять применённых соседей (или, что
+    # хуже, девять отклонённых уехали бы в журнал как applied).
+    db = _FakeDB()
+    client = _FakeClient(respond=lambda params: _add_results(params, errors_at=3))
+
+    report = apply_actions(client, _bidmodifier_actions(10), db)
+
+    assert report["applied"] == 9
+    assert report["rejected"] == 1
+    assert db.rows["k3"]["status"] == "rejected"
+    assert db.rows["k4"]["status"] == "applied"
+
+
+def test_batch_row_keeps_its_own_result_not_a_neighbours_id():
+    # Откат bidmodifier.add ищет Id в response.AddResults[0].Id
+    # (writer/rollback._added_modifier_id). Положи мы в каждую строку батча
+    # ОБЩИЙ ответ — все десять строк вернули бы Id первого элемента, и сторож
+    # откатывал бы чужую корректировку, а свою оставлял жить.
+    db = _FakeDB()
+    client = _FakeClient(respond=_add_results)
+
+    apply_actions(client, _bidmodifier_actions(3), db)
+
+    assert db.rows["k0"]["response"]["AddResults"][0]["Id"] == 1000
+    assert db.rows["k1"]["response"]["AddResults"][0]["Id"] == 1001
+    assert db.rows["k2"]["response"]["AddResults"][0]["Id"] == 1002
+
+
+def test_journal_stays_one_row_per_action_even_in_batches():
+    # Батч — свойство транспорта, а не журнала: одна строка на батч сделала
+    # бы неоткатываемым каждое действие внутри него (откат идёт по строке).
+    db = _FakeDB()
+    client = _FakeClient(respond=_add_results)
+
+    apply_actions(client, _bidmodifier_actions(40), db)
+
+    assert sum(1 for e in db.events if e.startswith("insert:")) == 40
+    assert sum(1 for e in db.events if e.startswith("mark:")) == 40
+    assert sum(1 for e in db.events if e.startswith("sent:")) == 40
+
+
+def test_request_level_error_fails_every_element_of_the_batch():
+    # Ошибка уровня ЗАПРОСА означает, что не применилось НИЧЕГО: все элементы
+    # обязаны получить свой исход, а не потеряться вместе с запросом.
+    db = _FakeDB()
+    client = _FakeClient(raises=DirectWriteError("bidmodifiers", 8000,
+                                                 "Некорректный запрос"))
+
+    report = apply_actions(client, _bidmodifier_actions(5), db)
+
+    assert report["failed"] == 5
+    assert all(db.rows[f"k{i}"]["status"] == "failed" for i in range(5))
+
+
+def test_response_shorter_than_the_batch_is_unknown_not_applied():
+    # Ответ описывает не все отправленные элементы. Чем ЗАКОНЧИЛИСЬ
+    # неописанные — неизвестно, и пометить их applied значит соврать журналу
+    # о живых изменениях: 'stale' ставит их под сторожа и риск-бюджет.
+    db = _FakeDB()
+    client = _FakeClient(respond=lambda params: _add_results(params, short_by=2))
+
+    report = apply_actions(client, _bidmodifier_actions(5), db)
+
+    assert report["unknown_outcome"] == 5
+    assert report["applied"] == 0
+    assert all(db.rows[f"k{i}"]["status"] == "stale" for i in range(5))
+
+
+def test_rehearsal_batch_reports_every_action():
+    # В репетиции ответ один на батч. Разложи мы его на строки неаккуратно —
+    # отчёт репетиции показал бы одно действие вместо десяти, а именно по
+    # нему принимается решение включать боевую запись.
+    db = _FakeDB()
+    client = _FakeClient(response={"dry_run": True})
+    client.write_allowed = False
+
+    report = apply_actions(client, _bidmodifier_actions(10), db)
+
+    assert report["dry_run"] == 10
+    assert len(client.calls) == 1
+
+
+def test_run_fits_the_cron_window():
+    """Уберите этот тест — и прогон снова сможет перерасти своё окно.
+
+    Окно считается по фактам расписания (docs/AGENT-BETA-MASTER-PLAN.md,
+    строки 339–341): крон Э1 08:00 UTC, сверка 08:30 UTC, задержка
+    диспетчера GitHub 38–50 мин. Задержки такту и сверке выпадают
+    независимо, поэтому ГАРАНТИРОВАННЫЙ зазор — не 30 минут, а
+    30 − (50 − 38) = 18 минут: Э1 может стартовать в 08:50, а сверка в 09:08.
+
+    Тест не выдумывает время ответа Директа — измерить его здесь нечем. Он
+    фиксирует то, чем мы управляем: число ЗАПРОСОВ. Из него следует бюджет
+    на один запрос: при 30 запросах это 36 секунд, то есть запас к таймауту
+    транспорта (120 с) есть в типичном случае и его нет в худшем — так что
+    запросов должно быть десятки, а не сотни.
+    """
+    db = _FakeDB()
+    client = _FakeClient(respond=_add_results)
+
+    apply_actions(client, _bidmodifier_actions(300), db)
+
+    guaranteed_window_s = 18 * 60
+    budget_per_request_s = guaranteed_window_s / len(client.calls)
+    assert len(client.calls) == 30
+    assert budget_per_request_s >= 30, (
+        f"на запрос остаётся {budget_per_request_s:.0f} с при таймауте "
+        f"транспорта 120 с — прогон не укладывается в окно")

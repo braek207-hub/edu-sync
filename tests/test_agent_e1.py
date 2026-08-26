@@ -19,6 +19,7 @@ from datetime import date, timedelta
 import pytest
 
 import sync.agent_e1 as agent_e1
+from sync.agent import rejects as rejects_mod
 from sync.agent.writer.apply import SandboxApplyRefusal, apply_actions
 from sync.agent.writer import risk
 
@@ -326,6 +327,12 @@ class _FakeWriteClient:
             "быть исключено ДО apply_actions"
         )
 
+    def mutate_batch(self, service, method, collection, items):
+        # Батч — ОДИН запрос (client.WriteClient.mutate_batch). Двойник
+        # обязан повторять форму настоящего транспорта: иначе прогон в тесте
+        # ходит одним путём, а в бою другим.
+        return self.mutate(service, method, {collection: list(items)})
+
 
 def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeypatch, capsys):
     # Сквозной тест правки по код-ревью: если справочник базовых CPA пуст
@@ -389,6 +396,12 @@ class _RecordingWriteClient:
     def mutate(self, service, method, params):
         self.sent.append((service, method, params))
         return {"dry_run": True}
+
+    def mutate_batch(self, service, method, collection, items):
+        # Батч — ОДИН запрос (client.WriteClient.mutate_batch). Двойник
+        # обязан повторять форму настоящего транспорта: иначе прогон в тесте
+        # ходит одним путём, а в бою другим.
+        return self.mutate(service, method, {collection: list(items)})
 
 
 def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatch, capsys):
@@ -587,6 +600,12 @@ class _MultiCabinetClient:
     def mutate(self, service, method, params):
         self.sent.append((service, method, params))
         return {"dry_run": True}
+
+    def mutate_batch(self, service, method, collection, items):
+        # Батч — ОДИН запрос (client.WriteClient.mutate_batch). Двойник
+        # обязан повторять форму настоящего транспорта: иначе прогон в тесте
+        # ходит одним путём, а в бою другим.
+        return self.mutate(service, method, {collection: list(items)})
 
 
 def _setting(kind, key, value, support=1000, calc_date=None):
@@ -1681,6 +1700,12 @@ class _StubMutateClient:
     def mutate(self, service, method, params):
         return {"dry_run": True} if self.dry_run else {}
 
+    def mutate_batch(self, service, method, collection, items):
+        # Батч — ОДИН запрос (client.WriteClient.mutate_batch). Двойник
+        # обязан повторять форму настоящего транспорта: иначе прогон в тесте
+        # ходит одним путём, а в бою другим.
+        return self.mutate(service, method, {collection: list(items)})
+
 
 def test_apply_actions_refuses_sandbox_write_client_without_touching_db():
     # Второй рубеж инварианта «песочный клиент журнала не касается»: даже
@@ -2077,6 +2102,12 @@ class _ScheduleClient:
     def mutate(self, service, method, params):
         self.sent.append((service, method, params))
         return {"dry_run": True}
+
+    def mutate_batch(self, service, method, collection, items):
+        # Батч — ОДИН запрос (client.WriteClient.mutate_batch). Двойник
+        # обязан повторять форму настоящего транспорта: иначе прогон в тесте
+        # ходит одним путём, а в бою другим.
+        return self.mutate(service, method, {collection: list(items)})
 
 
 def _patch_schedule_run(monkeypatch, settings, learning_resets=None):
@@ -2665,3 +2696,47 @@ def test_cutting_levers_get_their_conversions_and_their_threshold():
         args = source[start:start + 400]
         assert "cut_conversions=" in args, call
         assert "baseline_cpa=" in args, call
+
+
+class _UnitsDrainedClient(_RecordingWriteClient):
+    """Тот же кабинет, но баллов почти не осталось (1 из 1000 при резерве 5 %)."""
+
+    def __init__(self, login, sandbox=True, dry_run=True):
+        super().__init__(login, sandbox=sandbox, dry_run=dry_run)
+        self.units_left = 1
+        self.units_limit = 1000
+
+
+def test_units_low_reaches_the_black_box_not_just_the_counter(monkeypatch, capsys):
+    """Уберите этот тест — и строка отказа умрёт по дороге в базу.
+
+    apply_actions умеет отдавать отказы строками, но пока run_account их не
+    подхватывает, они остаются внутри отчёта и в edu_agent_rejects не попадают:
+    ровно тот дефект, когда «зелёный тест» стоит рядом с неработающим рычагом.
+    В бою это выглядит как прогон, который ничего не применил и ничего про это
+    не сказал.
+    """
+    saved = {}
+    _patch_single_account(
+        monkeypatch,
+        computed=[_setting("bid_modifier:device", "DESKTOP", 30.0)],
+    )
+    monkeypatch.setattr(agent_e1, "WriteClient", _UnitsDrainedClient)
+    monkeypatch.setattr(agent_e1.blackbox, "save_run",
+                        lambda *a, **k: saved.update(k) or {
+                            "run_id": "test", "saved": False, "rejects": 0,
+                            "error": "тест"})
+
+    assert agent_e1.main() == 0
+    report = _reports(capsys)[0]
+
+    assert report["result"]["units_low"] == 1
+    assert _RecordingWriteClient.instances[0].sent == []
+    rows = [r for r in saved.get("rejects", [])
+            if r["reason"] == rejects_mod.UNITS_LOW]
+    assert len(rows) == 1, "отказ по баллам не доехал до чёрного ящика"
+    assert rows[0]["account"] == "acc-1"
+    assert rows[0]["stage"] == "e1"
+    # Строки отказов не дублируются в отчёт прогона: там остаются счётчики.
+    assert "rejects" not in report["result"]
+    assert report["rejects"][rejects_mod.UNITS_LOW] == 1

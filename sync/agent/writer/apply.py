@@ -14,6 +14,10 @@ applied / rolled_back / stale) пропускается. Повторный пр
 отправляем второй раз» обязаны быть одним списком, иначе повторная планировка
 затрёт previous_state строки, отправку которой пропускает apply_actions.
 
+Действия уходят батчами (client.mutate_batch), но журнал от этого не
+меняется: строка на действие, откат по строке. Всё, что батч добавляет к
+разбору, — индекс элемента в ответе; другого ключа у ответа Директа нет.
+
 Транспорт (client.py) намеренно НЕ поднимает исключение на ошибку уровня
 ЭЛЕМЕНТА (result.AddResults[]/SetResults[].Errors, например код 8800
 «кампания не найдена») — она приходит в успешном HTTP-ответе и остаётся в
@@ -30,7 +34,9 @@ apply_actions отказывается стартовать (SandboxApplyRefusal
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from sync.agent.writer.client import is_outcome_unknown, is_transient_quota
+from sync.agent import rejects
+from sync.agent.writer.client import (BATCH_LIMIT, is_outcome_unknown,
+                                      is_transient_quota)
 from sync.agent.writer.db import FINAL_STATUSES
 
 # Доля суточного лимита баллов, ниже которой запись не начинается: остаток
@@ -111,6 +117,29 @@ _DEVICE_ADJUSTMENT_FIELD = {
 _RESULT_COLLECTION = {"add": "AddResults", "set": "SetResults",
                       "update": "UpdateResults", "suspend": "SuspendResults",
                       "resume": "ResumeResults"}
+
+# (сервис, метод) → имя коллекции в ТЕЛЕ запроса, элементы которой можно
+# сложить в один запрос. Перечень закрытый и по форме тела, а не по сервису:
+# у campaigns.suspend тело — SelectionCriteria с массивом Id, то есть другая
+# форма, и класть её в общий механизм значит склеивать разные семантики.
+# Такое действие едет одно, как и раньше.
+_BATCH_COLLECTION = {("bidmodifiers", "set"): "BidModifiers",
+                     ("bidmodifiers", "add"): "BidModifiers",
+                     ("campaigns", "update"): "Campaigns"}
+
+
+def _batch_collection(service: str, method: str,
+                      params: Dict[str, Any]) -> Optional[str]:
+    """Имя коллекции, если это тело можно объединить с соседями. Иначе None."""
+    collection = _BATCH_COLLECTION.get((service, method))
+    if not collection:
+        return None
+    items = params.get(collection)
+    # to_api_call кладёт РОВНО один элемент. Тело с другим числом элементов
+    # собрал не он, и объединять его вслепую нельзя.
+    if not isinstance(items, list) or len(items) != 1:
+        return None
+    return collection
 
 
 def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
@@ -216,14 +245,25 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
     raise ValueError(f"неизвестный вид действия: {kind}")
 
 
-def _element_errors(method: str, response: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+def _element_errors(method: str, response: Dict[str, Any],
+                    index: int = 0) -> Optional[List[Dict[str, Any]]]:
     """Ошибки уровня элемента в успешном HTTP-ответе (result.*Results[].Errors).
 
-    to_api_call всегда кладёт ровно один элемент в BidModifiers, поэтому
-    результатов по элементам тоже ровно один — берём первый. Коллекция пуста
-    (известный метод, но результатов нет) — считать нечего, возвращаем None,
-    а не пустой список, чтобы вызывающий код не путал «нет данных для
-    разбора» с «разобрали, ошибок нет».
+    index — место элемента в отправленном теле. Другого ключа у ответа нет:
+    Директ отвечает позиционно, result.*Results[i] описывает i-й отправленный
+    элемент. Поэтому нарезка батчей обязана сохранять порядок
+    (сборка батча в apply_actions), а разбор — спрашивать свой индекс, а не
+    первый попавшийся результат.
+
+    Коллекция пуста (известный метод, но результатов нет) — считать нечего,
+    возвращаем None, а не пустой список, чтобы вызывающий код не путал «нет
+    данных для разбора» с «разобрали, ошибок нет».
+
+    А вот ответ КОРОЧЕ отправленного — не то же самое, что пустой: часть
+    элементов Директ не описал вовсе, и чем они закончились, неизвестно.
+    Пометить их applied значило бы соврать журналу о живых изменениях,
+    поэтому запрашивание индекса за пределами ответа падает — и весь батч
+    уходит в 'stale', под сторожа и риск-бюджет.
 
     Неизвестный method — отдельный случай: это не «ошибок нет», а «ответ не
     разобран», и трактовать его как success нельзя. Ровно этот дефект уже
@@ -238,15 +278,74 @@ def _element_errors(method: str, response: Dict[str, Any]) -> Optional[List[Dict
     if not collection_key:
         raise ValueError(f"неизвестный метод для разбора ответа уровня элемента: {method}")
     items = response.get(collection_key) or []
-    if not items:
+    if not items and index == 0:
         return None
-    errors = (items[0] or {}).get("Errors")
+    if index >= len(items):
+        raise ValueError(
+            f"ответ {method} описывает {len(items)} элементов, а спрашивают "
+            f"{index + 1}-й: чем закончились неописанные — неизвестно")
+    errors = (items[index] or {}).get("Errors")
     return errors or None
 
 
+def _element_response(method: str, response: Dict[str, Any], index: int,
+                      size: int) -> Dict[str, Any]:
+    """Часть ответа, относящаяся к ЭТОМУ элементу батча.
+
+    Класть в каждую строку журнала общий ответ нельзя: откат добавленной
+    корректировки ищет её Id в response.AddResults[0].Id
+    (writer/rollback._added_modifier_id). При общем ответе все десять строк
+    батча вернули бы Id ПЕРВОГО элемента — сторож откатывал бы чужую
+    корректировку, а свою оставлял жить.
+
+    Одиночный запрос отдаёт ответ целиком, как и раньше: у него один элемент,
+    и резать нечего.
+    """
+    if size <= 1:
+        return response
+    collection_key = _RESULT_COLLECTION.get(method)
+    items = (response.get(collection_key) or []) if collection_key else []
+    element = items[index] if index < len(items) else {}
+    return {collection_key: [element], "batch": {"size": size, "index": index}}
+
+
+def _rehearsal_response(response: Dict[str, Any], collection: Optional[str],
+                        item: Optional[Dict[str, Any]], index: int,
+                        size: int) -> Dict[str, Any]:
+    """Пометка репетиции для ОДНОЙ строки батча.
+
+    В репетиции транспорт возвращает одну пометку на весь батч. Строка
+    журнала описывает одно действие, и тело в ней должно быть тоже одно —
+    иначе отчёт репетиции (по нему принимается решение включать боевую
+    запись) показывал бы десять одинаковых строк с десятью телами каждая.
+    """
+    if size <= 1 or not collection:
+        return response
+    return {**response, "params": {collection: [item]},
+            "batch": {"size": size, "index": index}}
+
+
 def apply_actions(client, actions: List[Dict[str, Any]], db_module,
-                  lease=None) -> Dict[str, Any]:
-    """Применяет действия по одному: журнал → отправка → отметка результата.
+                  lease=None, stage: str = "e1") -> Dict[str, Any]:
+    """Применяет действия: журнал → отправка → отметка результата.
+
+    Отправка идёт БАТЧАМИ: однородные действия разных объектов едут одним
+    запросом (до client.BATCH_LIMIT штук), потому что при сотнях действий
+    запрос за действием не помещается между кроном Э1 и сверкой. Батч —
+    свойство ТРАНСПОРТА и только его: журнал остаётся построчным (иначе
+    откат одного действия внутри батча невозможен), ответ режется по
+    элементам (иначе откат добавленной корректировки взял бы Id соседа), а
+    ошибка уровня элемента не отменяет соседей по запросу.
+
+    Два элемента про ОДИН объект в одно тело не кладутся: у campaigns.update
+    второй элемент затирает первый, а у корректировок такое соседство нигде
+    не проверено — до сих пор каждый элемент ехал своим запросом. Батч меняет
+    число запросов, а не соседство элементов.
+
+    stage — код такта для строк отказов. Такт здесь один (Э1), но подписывать
+    строку журнала отказов константой внутри применения нельзя: у отказа,
+    прочитанного из базы, стадия — единственное, что отвечает на вопрос «кто
+    это не смог», и вписывать её должен тот, кто знает ответ.
 
     lease — аренда прогона (db.RunLease). Перед КАЖДЫМ изменяющим запросом
     проверяется, что она всё ещё наша: аренда берётся на час, а прогон по
@@ -308,6 +407,10 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
     applied = skipped = failed = rejected = dry_run = unknown = conflicted = 0
     deferred = units_low = 0
     details: List[Dict[str, Any]] = []
+    # Отказы строками, а не только счётчиком: причина, объект и цена уезжают в
+    # чёрный ящик, где на истории видно, упирается ли такт в баллы каждый день
+    # или это была разовая просадка кабинета.
+    reject_rows: List[Dict[str, Any]] = []
 
     def _mark(action_id: str, status: str, response: Dict[str, Any]) -> bool:
         """True — отметка легла. False — строку забрал другой контур.
@@ -318,53 +421,211 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
         """
         return db_module.mark_action(action_id, status, response) is not False
 
-    for action in actions:
-        # Порог баллов ДО записи в журнал: остаток ниже резерва — отправлять
-        # нечем, и строка 'planned' без отправки стала бы мусором, который
-        # потом закрывал бы сторож. Порог — доля от суточного ЛИМИТА из
-        # заголовка Units этого же кабинета, не магическое число: лимиты
-        # кабинетов различаются на порядок. Остаток обновляется каждым
-        # ответом API, поэтому проверка стоит в цикле, а не перед ним.
-        left, limit = (getattr(client, "units_left", None),
-                       getattr(client, "units_limit", None))
-        if left is not None and limit and left < UNITS_RESERVE_SHARE * limit:
-            units_low += 1
+    def _record(action: Dict[str, Any], action_id: str, status: str,
+                response: Dict[str, Any]) -> None:
+        """Исход одного действия: отметка в журнале + счётчик отчёта."""
+        nonlocal applied, rejected, dry_run, conflicted
+        if not _mark(action_id, status, response):
+            conflicted += 1
+            details.append({"key": action["idempotency_key"], "result": "conflicted",
+                            "attempted_status": status})
+            return
+        applied += 1 if status == "applied" else 0
+        rejected += 1 if status == "rejected" else 0
+        dry_run += 1 if status == "dry_run" else 0
+        details.append({"key": action["idempotency_key"], "result": status})
+
+    def _record_failure(action: Dict[str, Any], action_id: str,
+                        exc: Exception, sent: bool) -> None:
+        """Исход действия, которому не повезло. Граница — по факту отправки.
+
+        sent=True означает, что запрос УЖЕ состоялся, а сломалось то, что
+        было после: разбор ответа, нарезка батча. Тогда исход неизвестен по
+        определению, и 'failed' здесь означал бы переприменение уже
+        совершённого изменения (для bidmodifiers.add — второй объект в
+        кабинете).
+        """
+        nonlocal failed, deferred, unknown, conflicted
+        reason = f"{type(exc).__name__}: {exc}"[:400]
+        if sent:
+            reason = f"ответ получен, но не разобран — {reason}"
+        if sent or is_outcome_unknown(exc):
+            landed = db_module.mark_unknown_outcome(action_id, reason)
+            if landed is False:
+                conflicted += 1
+                details.append({"key": action["idempotency_key"],
+                                "result": "conflicted",
+                                "attempted_status": "stale"})
+                return
+            unknown += 1
             details.append({"key": action["idempotency_key"],
-                            "result": "units_low"})
-            continue
+                            "result": "unknown_outcome", "error": str(exc)[:200]})
+            return
+        if is_transient_quota(exc):
+            # Квота/временная недоступность: Директ отклонил вызов, не
+            # применив его. Не 'failed' — попытка не жжётся (кабинет виноват,
+            # не действие); следующий прогон переприменит.
+            if not _mark(action_id, "deferred", {"error": reason}):
+                conflicted += 1
+                details.append({"key": action["idempotency_key"],
+                                "result": "conflicted",
+                                "attempted_status": "deferred"})
+                return
+            deferred += 1
+            details.append({"key": action["idempotency_key"],
+                            "result": "deferred", "error": str(exc)[:200]})
+            return
+        if not _mark(action_id, "failed", {"error": reason}):
+            conflicted += 1
+            details.append({"key": action["idempotency_key"], "result": "conflicted",
+                            "attempted_status": "failed"})
+            return
+        failed += 1
+        details.append({"key": action["idempotency_key"], "result": "failed",
+                        "error": str(exc)[:200]})
 
-        existing = db_module.find_action_by_key(action["idempotency_key"])
-        if existing and existing.get("status") in set(FINAL_STATUSES):
-            skipped += 1
-            details.append({"key": action["idempotency_key"], "result": "skipped"})
-            continue
+    def _journal_row(action: Dict[str, Any]) -> str:
+        """Строка журнала с прошлым состоянием — до всякой отправки.
 
-        # Владение арендой перепроверяется ДО записи в журнал и до отправки:
-        # если аренда потеряна, параллельный прогон уже мог начать писать в
-        # тот же кабинет, и добавлять к этому свой запрос нельзя. Исключение
-        # намеренно не ловится ниже по стеку — прогон обязан остановиться.
+        Владение арендой перепроверяется ровно здесь: если аренда потеряна,
+        параллельный прогон уже мог начать писать в тот же кабинет, и
+        добавлять к этому свою строку нельзя. Проверка стоит перед записью,
+        а не в начале круга, чтобы действие, отложенное в следующий батч, не
+        спрашивало аренду по разу на круг. Исключение намеренно не ловится
+        ниже по стеку — прогон обязан остановиться.
+        """
         if lease is not None:
             lease.guard()
+        return db_module.insert_action(action)
 
-        action_id = db_module.insert_action(action)
-        # «Запрос отправляется» — в журнал ДО mutate: обрыв процесса между
-        # insert и отправкой оставляет строку БЕЗ sent_at, и закрывается она
-        # как никогда-не-отправленная ('aborted', db.mark_stale_planned), а
-        # не как зависшая с неизвестным исходом. Репетиция не отмечается:
-        # dry-run никуда не ходит, и sent_at лгал бы.
-        if client.is_write_allowed():
-            db_module.mark_sent(action_id)
+    def _mark_batch_sent(batch: List[Dict[str, Any]]) -> None:
+        """«Запрос отправляется» — в журнал НЕПОСРЕДСТВЕННО перед mutate.
+
+        Отметка стоит именно здесь, а не при заведении строки: между
+        заведением и отправкой теперь помещается сборка батча, и она может
+        закончиться ничем (потеряна аренда, упало тело соседнего действия).
+        Строка с sent_at, чей запрос так и не ушёл, сторож закрыл бы как
+        зависшую с неизвестным исходом — то есть как живое изменение, которого
+        в кабинете нет: она заняла бы риск-бюджет и попала под откат. Без
+        sent_at та же строка закрывается как никогда-не-отправленная
+        ('aborted', db.mark_stale_planned) и переприменяется следующим
+        прогоном.
+
+        Репетиция не отмечается: dry-run никуда не ходит, и sent_at лгал бы.
+        """
+        if not client.is_write_allowed():
+            return
+        for item in batch:
+            db_module.mark_sent(item["action_id"])
+
+    # Очередь такта. «Проверено» помнится по действию, а не проверяется заново
+    # каждый круг: действие, отложенное в следующий батч (занят объект, другой
+    # вид), иначе спрашивало бы журнал по разу на круг — при трёхстах действиях
+    # это тысячи лишних запросов к базе за прогон.
+    queue: List[Dict[str, Any]] = [{"action": a, "checked": False} for a in actions]
+
+    while queue:
+        rest: List[Dict[str, Any]] = []
+        batch: List[Dict[str, Any]] = []
+        service = method = collection = None
+
+        for entry in queue:
+            action = entry["action"]
+            # Батч закрыт: место кончилось или в нём уже лежит несбатчиваемое
+            # тело (оно едет одно). Остальное — следующим кругом, БЕЗ похода
+            # в журнал: предпроверки для этих действий ещё не делались.
+            if batch and (len(batch) >= BATCH_LIMIT or collection is None):
+                rest.append(entry)
+                continue
+
+            # Порог баллов — на КАЖДОМ круге, а не один раз за действие:
+            # остаток обновляется каждым ответом API, и действие, отложенное
+            # в третий батч, может уже не иметь на что уехать. Порог — доля
+            # от суточного ЛИМИТА из заголовка Units этого же кабинета, не
+            # магическое число: лимиты кабинетов различаются на порядок.
+            left, limit = (getattr(client, "units_left", None),
+                           getattr(client, "units_limit", None))
+            if left is not None and limit and left < UNITS_RESERVE_SHARE * limit:
+                units_low += 1
+                details.append({"key": action["idempotency_key"],
+                                "result": "units_low"})
+                # Цена берётся из самого действия: к этому моменту риск-бюджет
+                # её уже назвал (agent_e1 кладёт risk_rub в строку перед
+                # отправкой), и брать её больше неоткуда — прогон о
+                # пропущенном хвосте не знает.
+                reject_rows.append(rejects.row(
+                    action, rejects.UNITS_LOW,
+                    account=str(action.get("account") or ""), stage=stage,
+                    risk_rub=float(action.get("risk_rub") or 0.0)))
+                continue
+
+            if not entry["checked"]:
+                existing = db_module.find_action_by_key(action["idempotency_key"])
+                if existing and existing.get("status") in set(FINAL_STATUSES):
+                    skipped += 1
+                    details.append({"key": action["idempotency_key"],
+                                    "result": "skipped"})
+                    continue
+                entry["checked"] = True
+
+            try:
+                call = to_api_call(action)
+            except Exception as exc:
+                # Тело собрать не удалось (неизвестный демографический ключ,
+                # регион названием). Запрос не ушёл и уйти не мог, поэтому
+                # действие закрывается сразу и батчу не мешает.
+                _record_failure(action, _journal_row(action), exc, sent=False)
+                continue
+
+            a_service, a_method, a_params = call
+            a_collection = _batch_collection(a_service, a_method, a_params)
+            object_id = str(action.get("object_id") or "")
+            # Два элемента про ОДИН объект в одном теле — не то же самое, что
+            # два запроса подряд: у campaigns.update второй элемент затирает
+            # первый, а у корректировок такое соседство нигде не проверено.
+            # Батч меняет число запросов, а не соседство элементов.
+            if batch and ((a_service, a_method) != (service, method)
+                          or a_collection is None
+                          or object_id in {e["object_id"] for e in batch}):
+                rest.append(entry)
+                continue
+
+            service, method, collection = a_service, a_method, a_collection
+            batch.append({
+                "action": action,
+                "action_id": _journal_row(action),
+                "object_id": object_id,
+                "params": a_params,
+                "item": a_params[a_collection][0] if a_collection else None,
+            })
+
+        queue = rest
+        if not batch:
+            # Круг, не отправивший НИЧЕГО при непустом остатке, — заклинивший
+            # цикл: прогон крутился бы до конца аренды и мимо своего окна, а
+            # сверка читала бы кабинет посреди записи. По построению так быть
+            # не может (в остаток действие попадает только при непустом
+            # батче), но зависание — худший из возможных исходов, и падение
+            # здесь честнее вечного круга.
+            if queue:
+                raise RuntimeError(
+                    f"сборка батчей не продвигается: {len(queue)} действий в "
+                    f"остатке, отправлено ноль")
+            continue
+
         # Факт отправки отмечается СРАЗУ после возврата из транспорта, до
         # любого разбора ответа. Всё, что падает после этой отметки, —
         # неизвестный исход, а не «запрос не ушёл»: запрос уже состоялся, и
         # для bidmodifiers.add переприменение означало бы ВТОРОЙ объект в
-        # кабинете. Прежде обе половины докстринга статуса 'failed' («точно
-        # не ушло» И «разобрать нечем») лечились одним лекарством, и выбрано
-        # было небезопасное.
+        # кабинете.
         sent = False
         try:
-            service, method, params = to_api_call(action)
-            response = client.mutate(service, method, params)
+            _mark_batch_sent(batch)
+            if collection:
+                response = client.mutate_batch(service, method, collection,
+                                               [e["item"] for e in batch])
+            else:
+                response = client.mutate(service, method, batch[0]["params"])
             # Репетиция отправкой не считается: mutate вернул пометку, не
             # сходив в сеть (client.WriteClient.mutate). Пометь мы её как
             # отправку — исключение при разборе увело бы строку репетиции в
@@ -373,60 +634,28 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
             rehearsal = bool(isinstance(response, dict) and response.get("dry_run"))
             sent = not rehearsal
             if rehearsal:
-                status = "dry_run"
-            else:
-                errors = _element_errors(method, response)
-                status = "rejected" if errors else "applied"
-            if not _mark(action_id, status, response):
-                conflicted += 1
-                details.append({"key": action["idempotency_key"], "result": "conflicted",
-                                "attempted_status": status})
+                for index, item in enumerate(batch):
+                    _record(item["action"], item["action_id"], "dry_run",
+                            _rehearsal_response(response, collection, item["item"],
+                                                index, len(batch)))
                 continue
-            applied += 1 if status == "applied" else 0
-            rejected += 1 if status == "rejected" else 0
-            dry_run += 1 if status == "dry_run" else 0
-            details.append({"key": action["idempotency_key"], "result": status})
+            # Ответ разбирается ЦЕЛИКОМ прежде, чем лечь хоть одной отметкой:
+            # ошибка разбора на пятом элементе не должна оставлять четыре
+            # строки применёнными, а остальные — в неизвестности. Либо весь
+            # батч разобран, либо весь батч неизвестен.
+            statuses = ["rejected" if _element_errors(method, response, index) else "applied"
+                        for index in range(len(batch))]
+            for index, item in enumerate(batch):
+                _record(item["action"], item["action_id"], statuses[index],
+                        _element_response(method, response, index, len(batch)))
         except Exception as exc:
-            reason = f"{type(exc).__name__}: {exc}"[:400]
-            if sent:
-                # Запрос ушёл и вернулся — а дальше сломался разбор. Исход
-                # неизвестен по определению: 'failed' здесь означал бы
-                # переприменение уже совершённого изменения.
-                reason = f"ответ получен, но не разобран — {reason}"
-            if sent or is_outcome_unknown(exc):
-                landed = db_module.mark_unknown_outcome(action_id, reason)
-                if landed is False:
-                    conflicted += 1
-                    details.append({"key": action["idempotency_key"],
-                                    "result": "conflicted",
-                                    "attempted_status": "stale"})
-                    continue
-                unknown += 1
-                details.append({"key": action["idempotency_key"],
-                                "result": "unknown_outcome", "error": str(exc)[:200]})
-                continue
-            if not sent and is_transient_quota(exc):
-                # Квота/временная недоступность: Директ отклонил вызов, не
-                # применив его. Не 'failed' — попытка не жжётся (кабинет
-                # виноват, не действие); следующий прогон переприменит.
-                if not _mark(action_id, "deferred", {"error": reason}):
-                    conflicted += 1
-                    details.append({"key": action["idempotency_key"],
-                                    "result": "conflicted",
-                                    "attempted_status": "deferred"})
-                    continue
-                deferred += 1
-                details.append({"key": action["idempotency_key"],
-                                "result": "deferred", "error": str(exc)[:200]})
-                continue
-            if not _mark(action_id, "failed", {"error": reason}):
-                conflicted += 1
-                details.append({"key": action["idempotency_key"], "result": "conflicted",
-                                "attempted_status": "failed"})
-                continue
-            failed += 1
-            details.append({"key": action["idempotency_key"], "result": "failed",
-                            "error": str(exc)[:200]})
+            # Ошибка уровня ЗАПРОСА — общая на весь батч: не применилось
+            # НИЧЕГО, и каждый элемент обязан получить свой исход отдельной
+            # строкой. Ошибки уровня ЭЛЕМЕНТА сюда не попадают (они приезжают
+            # в result, см. client._call) — иначе один плохой элемент отменял
+            # бы применённых соседей.
+            for item in batch:
+                _record_failure(item["action"], item["action_id"], exc, sent)
 
     # dry_run — полноправный счётчик, а не «ничего не произошло»: в режиме
     # репетиции ВСЕ действия получают этот статус, и отчёт без него показывал
@@ -438,4 +667,9 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
     return {"applied": applied, "skipped": skipped, "failed": failed, "rejected": rejected,
             "dry_run": dry_run, "unknown_outcome": unknown, "conflicted": conflicted,
             "deferred": deferred, "units_low": units_low,
+            # Строки отказов — отдельным полем от счётчиков, тем же порядком,
+            # что и в agent_e1: счётчики читает человек в логе, строки едут в
+            # edu_agent_rejects. Пустой список здесь — не «поле забыли», а
+            # «отказов не было», и вызывающий код обязан видеть разницу.
+            "rejects": reject_rows,
             "details": details}
