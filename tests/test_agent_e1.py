@@ -2805,3 +2805,81 @@ def test_lane_inside_its_limit_has_no_negative_shortfall():
 
     assert section["shortfall_rub"] == 0.0
     assert section["passed_share"] == 1.0
+
+
+def test_lane_shortfall_reaches_the_run_report(monkeypatch, capsys):
+    # Боевой путь целиком: run_account → отчёт кабинета → печать. Дефицит,
+    # живущий только в юнит-тесте чистой функции, человеку не показывается
+    # никогда — а именно ради человека он и считается.
+    #
+    # Двадцать кампаний по 2 000 ₽/день, по одной корректировке на каждую:
+    # цена действия 8 400 ₽, потолок полосы 50 000 ₽ — влезает пять.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": list(range(101, 121))},
+        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+    )
+
+    assert agent_e1.main() == 0
+
+    report = [r for r in _reports(capsys) if "account" in r][0]
+    gap = report["lanes"]["shortfall"]["tuning"]
+
+    assert gap["taken"] == 5 and gap["refused"] == 15
+    assert gap["passed_share"] == 0.25
+    assert gap["wanted_rub"] == 168_000.0
+    assert gap["limit_rub"] == 50_000.0
+    assert gap["shortfall_rub"] == 118_000.0
+
+
+def test_shortfall_counts_the_same_actions_as_the_lane_block(monkeypatch, capsys):
+    # Второй счёт тех же действий — худший вид отчёта: два числа об одном, и
+    # неизвестно, какому верить. Дефицит обязан пересказывать «взято/отказано»
+    # соседнего блока, а не считать заново по своему списку.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": list(range(101, 121))},
+        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+    )
+
+    assert agent_e1.main() == 0
+
+    lanes_block = [r for r in _reports(capsys) if "account" in r][0]["lanes"]
+    gap = lanes_block["shortfall"]
+
+    assert {lane: g["taken"] for lane, g in gap.items() if g["taken"]} \
+        == lanes_block["taken"]
+    assert sum(g["refused"] for g in gap.values()) \
+        == sum(lanes_block["refused"].values())
+    # Потолок в отчёте — тот самый, которым отбор реально ограничивал полосу.
+    # Разойдись он с ним, и человек поднимал бы ступень, глядя на чужое число.
+    for lane, spent in lanes_block["spent"].items():
+        assert float(spent["risk_rub"]) <= gap[lane]["limit_rub"]
+
+
+def test_shortfall_travels_to_the_blackbox(monkeypatch, capsys):
+    # Лог GitHub Actions живёт ограниченный срок. Дефицит полосы — довод для
+    # разговора о ступени, и он обязан лежать в истории прогонов, а не только
+    # в сегодняшней консоли.
+    saved = {}
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": list(range(101, 121))},
+        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+    )
+    monkeypatch.setattr(agent_e1.blackbox, "save_run",
+                        lambda *a, **k: saved.update(k) or {
+                            "run_id": "test", "saved": True, "rejects": 0,
+                            "error": None})
+
+    assert agent_e1.main() == 0
+
+    accounts = saved["report"]["accounts"]
+    assert accounts[0]["lanes"]["shortfall"]["tuning"]["shortfall_rub"] == 118_000.0
+    # Чёрный ящик кладёт отчёт в jsonb: Infinity и NaN PostgreSQL не примет, и
+    # одно бесконечное поле стоило бы всей истории прогона.
+    text = json.dumps(saved["report"], ensure_ascii=False, default=str)
+    assert "Infinity" not in text and "NaN" not in text
