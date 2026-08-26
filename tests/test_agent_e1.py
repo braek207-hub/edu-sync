@@ -2740,3 +2740,68 @@ def test_units_low_reaches_the_black_box_not_just_the_counter(monkeypatch, capsy
     # Строки отказов не дублируются в отчёт прогона: там остаются счётчики.
     assert "rejects" not in report["result"]
     assert report["rejects"][rejects_mod.UNITS_LOW] == 1
+
+
+# =========================================================================
+# Дефицит полосы: отложенных списков нет, есть числа «хотела / позволено».
+# =========================================================================
+
+
+def test_lane_shortfall_is_reported_with_numbers():
+    # Убрать этот тест — и дефицит вернётся в слова. «Полоса переполнена» не
+    # говорит, поднимать ли ступень: между «хотела на 3 % больше лимита» и
+    # «хотела в шестнадцать раз больше» разные решения, а звучат они одинаково.
+    section = agent_e1.lane_shortfall(taken=3, refused=45, wanted_rub=921_690.0,
+                                      limit_rub=57_000.0, lane="allocation")
+
+    assert section["passed_share"] == pytest.approx(3 / 48, abs=0.01)
+    assert section["wanted_rub"] == 921_690.0
+    assert section["limit_rub"] == 57_000.0
+    assert section["shortfall_rub"] == pytest.approx(921_690.0 - 57_000.0)
+
+
+def test_empty_lane_does_not_look_like_a_perfect_pass():
+    # Полоса без кандидатов и полоса, пропустившая всё, — разные болезни:
+    # первая про источник кандидатов, вторая про ступень. Ноль в знаменателе
+    # даёт либо деление на ноль, либо выдуманную долю; здесь он даёт None.
+    section = agent_e1.lane_shortfall(taken=0, refused=0, wanted_rub=0.0,
+                                      limit_rub=57_000.0, lane="launch")
+
+    assert section["passed_share"] is None
+    assert section["shortfall_rub"] == 0.0
+
+
+def test_lane_without_a_rouble_limit_reports_no_shortfall():
+    # Гигиена и разведка риском не платят: их потолок бесконечен. Верни его
+    # числом — и json.dumps выдаст Infinity, который PostgreSQL в jsonb не
+    # примет, а blackbox.save_run проглотит ошибку полем. Отчёт прогона
+    # уцелеет, чёрный ящик — нет.
+    section = agent_e1.lane_shortfall(taken=7, refused=0, wanted_rub=0.0,
+                                      limit_rub=None, lane="hygiene")
+
+    assert section["limit_rub"] is None
+    assert section["shortfall_rub"] is None
+    assert "Infinity" not in json.dumps(section)
+
+
+def test_unpriced_actions_are_counted_not_treated_as_free():
+    # Цена действия бывает неизвестной (+inf у risk.action_risk, когда расход
+    # объекта неизвестен). Сложи её как ноль — и полоса «хотела 0 ₽» при сорока
+    # кандидатах, то есть выглядит исправной ровно тогда, когда слепа.
+    section = agent_e1.lane_shortfall(taken=1, refused=40, wanted_rub=1_000.0,
+                                      limit_rub=57_000.0, lane="tuning",
+                                      unpriced=40)
+
+    assert section["unpriced"] == 40
+    assert section["wanted_rub"] == 1_000.0
+
+
+def test_lane_inside_its_limit_has_no_negative_shortfall():
+    # Дефицит — это нехватка, а не запас. Отрицательное число здесь читалось бы
+    # как «полоса задолжала бюджету», и сумма дефицитов по прогону перестала бы
+    # что-либо значить.
+    section = agent_e1.lane_shortfall(taken=5, refused=0, wanted_rub=1_000.0,
+                                      limit_rub=57_000.0, lane="tuning")
+
+    assert section["shortfall_rub"] == 0.0
+    assert section["passed_share"] == 1.0

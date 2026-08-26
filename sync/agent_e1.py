@@ -47,6 +47,7 @@ ENV: DATABASE_URL, DIRECT_TOKEN, DIRECT_CLIENTS_JSON
 """
 
 import json
+import math
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -723,6 +724,49 @@ def fit_week_budget(priced, risks, remaining, charged_risk, caps, daily_cost):
         risks = {key: (0.0 if key in free else price)
                  for key, price in net_risk(candidates, daily_cost).items()}
     return prepared, deferred
+
+
+def lane_shortfall(taken: int, refused: int, wanted_rub: float,
+                   limit_rub: Optional[float], lane: str = "",
+                   unpriced: int = 0) -> Dict[str, Any]:
+    """Дефицит полосы четырьмя числами: хотела, позволено, прошло, не хватило.
+
+    Отложенных списков у прогона больше нет — не прошедшее лимит становится
+    отказом и пересчитывается завтра на свежих данных (writer/lanes.select).
+    Но «отказано 45» само по себе ничего не решает: между полосой, которая
+    заявила на 3 % больше своего потолка, и полосой, заявившей в шестнадцать
+    раз больше, разные выводы — первой хватит следующего прогона, второй нужна
+    другая ступень или другой источник кандидатов. Разница видна только в
+    рублях, поэтому счётчик отказов дополняется спросом и потолком.
+
+    limit_rub = None означает «полоса не ограничена деньгами риска»: гигиена,
+    разведка и предложения риск-долей не платят (writer/lanes.RISK_PAYING_LANES),
+    и у них дефицита в этом смысле не бывает. Бесконечность сюда не кладётся
+    числом: json.dumps выдал бы Infinity, а PostgreSQL не принимает его в jsonb
+    — чёрный ящик потерял бы весь отчёт прогона ради одного поля.
+
+    unpriced — сколько кандидатов полосы приехали с неизвестной ценой
+    (risk.action_risk отдаёт +inf, когда расход объекта неизвестен). Они не
+    складываются в спрос нулями: полоса, «захотевшая 0 ₽» при сорока слепых
+    кандидатах, выглядела бы исправной ровно тогда, когда она слепа.
+    """
+    total = int(taken) + int(refused)
+    wanted = float(wanted_rub or 0.0)
+    limit = None if limit_rub is None or not math.isfinite(float(limit_rub)) \
+        else float(limit_rub)
+    return {
+        "lane": str(lane or ""),
+        "taken": int(taken),
+        "refused": int(refused),
+        # Доля прошедших — по числу действий, а не по деньгам: она отвечает на
+        # вопрос «сколько замыслов полосы доехало», и один дорогой перенос не
+        # должен выглядеть как проехавшая половина плана.
+        "passed_share": (round(int(taken) / total, 4) if total else None),
+        "wanted_rub": round(wanted, 2),
+        "limit_rub": None if limit is None else round(limit, 2),
+        "shortfall_rub": None if limit is None else round(max(0.0, wanted - limit), 2),
+        "unpriced": int(unpriced),
+    }
 
 
 def _count_by(actions: List[Dict[str, Any]], field: str) -> Dict[str, int]:
