@@ -220,6 +220,27 @@ def _expectation_payload(move: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 
+def _exploration_payload(move: Dict[str, Any]) -> Dict[str, Any]:
+    """Кусок payload с признаком разведочной ставки — или пустой.
+
+    Признак объявлен в plan_budget_moves («едет ДАЛЬШЕ, в действие и в
+    журнал»), но до 26.08.2026 никуда не ехал: diff_budget собирает payload из
+    своих полей и про move["exploration"] не знал. Из-за этого разведочный
+    сдвиг был неотличим от обычного везде, где начинается его собственная
+    жизнь, — в журнале действий, в отчёте прогона и в реестре гипотез
+    (sync/agent/experiments.is_bet читает именно этот признак). То есть
+    единственное применение агента, у которого снят гейт уверенности, нельзя
+    было ни пересчитать, ни судить отдельно.
+    """
+    if not move.get("exploration"):
+        return {}
+    return {
+        "exploration": True,
+        "exploration_rub": move.get("exploration_rub"),
+        "confidence_waived": move.get("confidence_waived"),
+    }
+
+
 def plan_budget_moves(
     computed_by_campaign: Dict[str, List[Dict[str, Any]]],
     thresholds: Optional[Dict[str, float]] = None,
@@ -504,6 +525,7 @@ def diff_budget(
                     # берёт из payload только BiddingStrategy).
                     "Cost28dVat": move["cost_28d"],
                     **_expectation_payload(move),
+                    **_exploration_payload(move),
                 },
                 "previous_state": {
                     "BiddingStrategy": strategy,
@@ -539,6 +561,7 @@ def diff_budget(
                     "DailyBudget": {**daily, "Amount": target_daily_micros},
                     "Cost28dVat": move["cost_28d"],
                     **_expectation_payload(move),
+                    **_exploration_payload(move),
                 },
                 "previous_state": {"DailyBudget": daily},
                 "idempotency_key": _idempotency_key(cid, "daily", target_daily_micros),

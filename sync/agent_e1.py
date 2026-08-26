@@ -97,7 +97,7 @@ from sync.agent.writer.risk import (
     risk_object,
     week_start,
 )
-from sync.agent import blackbox, conflicts, rejects
+from sync.agent import blackbox, conflicts, experiments, rejects
 from sync.agent.writer.rollback import red_line_for
 from sync.agent.writer.units import api_to_delta
 
@@ -1540,6 +1540,20 @@ def run_account(
                                          charged_risk, caps)
     ctx["remaining_cap"] -= len(prepared)
     ctx["run_risk_remaining"] -= sum(float(a.get("risk_rub") or 0.0) for a in prepared)
+
+    # Реестр гипотез: разведочная ставка заводится ДО отправки в кабинет и
+    # ровно здесь — риск-бюджет уже назвал её цену (risk_rub), а действие ещё
+    # не ушло. Заводить раньше значило бы держать в очереди замыслы, которые
+    # срежет бюджет; позже — потерять ставку, если отправка упадёт на середине.
+    #
+    # Идентификатор ставки выводится из action_id, а тот детерминирован по
+    # ключу идемпотентности (writer_db.make_action_id), поэтому посмертная
+    # запись сторожа ляжет в ЭТУ ЖЕ строку, а не заведёт вторую.
+    bets = [experiments.open_bet(
+                a, writer_db.make_action_id(a["idempotency_key"]), today)
+            for a in prepared if experiments.is_bet(a)]
+    if bets and not dry_run:
+        agent_db.upsert_hypotheses(bets)
 
     report = apply_actions(client, prepared, writer_db, lease=lease)
 

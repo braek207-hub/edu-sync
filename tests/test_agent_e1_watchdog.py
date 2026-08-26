@@ -968,6 +968,10 @@ def _patch_watchdog_main(monkeypatch, lock):
     # обязан падать на своём утверждении, а не на живой базе.
     monkeypatch.setattr(watchdog.writer_db, "actions_awaiting_money_check",
                         lambda days: [])
+    # Реестр гипотез читается каждым прогоном — тем же доводом. Своё поведение
+    # он проверяет отдельно (test_agent_experiments.py).
+    monkeypatch.setattr(watchdog.agent_db, "load_open_hypotheses",
+                        lambda statuses: [])
     # Чёрный ящик ходит в живую базу — в тестах он молчит. Своё поведение
     # он проверяет сам (tests/test_agent_blackbox.py).
     monkeypatch.setattr(watchdog.blackbox, "save_run",

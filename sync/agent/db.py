@@ -207,6 +207,71 @@ AGENT_DDL: List[str] = [
       created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     """,
+    # РЕЕСТР ГИПОТЕЗ поверх того же блокнота (sync/agent/experiments.py).
+    # Отдельным ALTER, а не правкой CREATE TABLE выше: таблица давно живёт в
+    # бою (194 квазиэксперимента), и CREATE TABLE IF NOT EXISTS её не трогает —
+    # новая колонка в теле CREATE появилась бы только на чистой базе.
+    #
+    # До этих колонок строка была ПОСМЕРТНОЙ: сторож писал в неё исход уже
+    # случившегося действия. Ставка как замысел не существовала нигде, и связь
+    # «гипотеза → действие → замер → вердикт» негде было держать.
+    #
+    #   status            — жизненный цикл ставки (queued/running/won/lost/
+    #                       rolled_back). NULL — строка НЕ реестра: посмертная
+    #                       запись сторожа (source='action') или квазиэксперимент
+    #                       истории (source='quasi'). Значения по умолчанию нет
+    #                       намеренно: 'queued' на старых строках объявил бы
+    #                       194 давно закрытых наблюдения открытыми ставками.
+    #   status_reason     — почему статус такой; читается на разборе вместо
+    #                       восстановления причины по датам.
+    #   stake_rub         — СПИСАННАЯ цена ставки (writer/risk.fit_into_budget).
+    #                       Не новый бюджет, а запись о том, что уже списал
+    #                       недельный риск-бюджет.
+    #   stake_source      — каким карманом оплачена. Колонка нужна ровно затем,
+    #                       чтобы появление второго источника денег было видно
+    #                       в данных, а не только в диффе.
+    #   horizon_days      — горизонт замера, назначенный В МОМЕНТ ЗАПУСКА.
+    #   success_criterion — критерий успеха словами, тоже назначенный заранее:
+    #                       вердикт обязан сверяться с тем, о чём договорились,
+    #                       а не с тем, что удобно объявить успехом задним числом.
+    #   red_line          — красная линия КОПИЕЙ. Ссылка на журнал действий не
+    #                       годится: перепланировка ещё не применённого действия
+    #                       переписывает его red_line (writer/db.INSERT_ACTION_SQL),
+    #                       а ставка обязана помнить линию своего запуска.
+    #   idempotency_key   — связь с edu_agent_actions: по нему подтягивается
+    #                       состояние действия (применено, откатано, закрыто).
+    #   closed_at         — момент закрытия реестром. Не дубль measured_on: там
+    #                       конец окна наблюдения (дата, считает сторож), здесь
+    #                       отметка о смене статуса.
+    """
+    ALTER TABLE edu_agent_experiments
+      ADD COLUMN IF NOT EXISTS status            TEXT,
+      ADD COLUMN IF NOT EXISTS status_reason     TEXT,
+      ADD COLUMN IF NOT EXISTS stake_rub         DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS stake_source      TEXT,
+      ADD COLUMN IF NOT EXISTS horizon_days      INTEGER,
+      ADD COLUMN IF NOT EXISTS success_criterion TEXT,
+      ADD COLUMN IF NOT EXISTS red_line          JSONB NOT NULL DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS idempotency_key   TEXT,
+      ADD COLUMN IF NOT EXISTS closed_at         TIMESTAMPTZ
+    """,
+    # Открытые ставки читаются КАЖДЫМ прогоном сторожа, а закрытые копятся без
+    # предела — частичный индекс держит выборку размером с очередь, а не с
+    # историей. Тот же довод, что у индексов кулдауна в writer/db.py.
+    """
+    CREATE INDEX IF NOT EXISTS edu_agent_experiments_open_idx
+      ON edu_agent_experiments (status)
+      WHERE status IN ('queued', 'running')
+    """,
+    # Подтягивание состояния действия идёт по ключу идемпотентности, и он же
+    # обязан быть уникальным среди ставок: две ставки на одно действие — это
+    # двойной счёт замера. У посмертных строк ключа нет (NULL), и уникальный
+    # индекс их не ограничивает — NULL в Postgres не конфликтует с NULL.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS edu_agent_experiments_idem_idx
+      ON edu_agent_experiments (idempotency_key)
+      WHERE idempotency_key IS NOT NULL
+    """,
     # Вычисляемые настройки: посчитаны на Э0, применяются в Э1.
     """
     CREATE TABLE IF NOT EXISTS edu_agent_computed_settings (
@@ -1046,10 +1111,134 @@ def upsert_experiments(rows: List[Dict[str, Any]]) -> int:
             effect = EXCLUDED.effect,
             effect_lo = EXCLUDED.effect_lo,
             effect_hi = EXCLUDED.effect_hi,
-            verdict = EXCLUDED.verdict
+            verdict = EXCLUDED.verdict,
+            -- Замер уточняет и СПОСОБ измерения: нашёлся контроль за то же
+            -- окно — механизм становится did_holdout, а класс надёжности A.
+            -- Без этих трёх полей строка ставки, заведённая реестром до
+            -- отправки, навсегда осталась бы «before_after / B», хотя
+            -- посчитана разностью разностей.
+            measured_on = EXCLUDED.measured_on,
+            mechanism = EXCLUDED.mechanism,
+            reliability_class = EXCLUDED.reliability_class,
+            -- Слияние, а не замена: в params ставки лежат её собственные поля
+            -- (карман разведки, ожидание модели), а сторож приносит числа
+            -- замера. Замена стёрла бы половину истории каждой ставки.
+            params = edu_agent_experiments.params || EXCLUDED.params
         """,
         payload,
     )
+
+
+# ------------------------------------------------- реестр гипотез (ставки)
+
+
+UPSERT_HYPOTHESES_SQL = """
+    INSERT INTO edu_agent_experiments (
+        experiment_id, hypothesis_type, object_level, object_id, params,
+        mechanism, started_on, metric, reliability_class, source,
+        status, status_reason, stake_rub, stake_source, horizon_days,
+        success_criterion, red_line, idempotency_key
+    ) VALUES (
+        %(experiment_id)s, %(hypothesis_type)s, %(object_level)s, %(object_id)s,
+        %(params)s, %(mechanism)s, %(started_on)s, %(metric)s,
+        %(reliability_class)s, %(source)s, %(status)s, %(status_reason)s,
+        %(stake_rub)s, %(stake_source)s, %(horizon_days)s,
+        %(success_criterion)s, %(red_line)s, %(idempotency_key)s
+    )
+    ON CONFLICT (experiment_id) DO UPDATE SET
+        params            = EXCLUDED.params,
+        stake_rub         = EXCLUDED.stake_rub,
+        horizon_days      = EXCLUDED.horizon_days,
+        success_criterion = EXCLUDED.success_criterion,
+        red_line          = EXCLUDED.red_line
+    WHERE edu_agent_experiments.status = 'queued'
+"""
+
+
+def upsert_hypotheses(rows: List[Dict[str, Any]]) -> int:
+    """Заводит ставки реестра (sync/agent/experiments.open_bet).
+
+    Повторная планировка того же действия обновляет ставку свежими числами —
+    но ТОЛЬКО пока она в очереди. Условие в DO UPDATE — та же граница «ещё не
+    сделано / уже сделано», что у журнала действий
+    (writer/db.INSERT_ACTION_SQL): запущенную или закрытую ставку переписать
+    нельзя, иначе вердикт выносился бы по красной линии и горизонту, которых
+    в момент запуска не было.
+    """
+    payload = [{**r,
+                "params": json.dumps(r.get("params", {}), ensure_ascii=False),
+                "red_line": json.dumps(r.get("red_line", {}), ensure_ascii=False)}
+               for r in rows]
+    return _batch(UPSERT_HYPOTHESES_SQL, payload)
+
+
+OPEN_HYPOTHESES_SQL = """
+    SELECT e.experiment_id, e.status, e.started_on, e.horizon_days,
+           e.stake_rub, e.object_id, e.hypothesis_type, e.success_criterion,
+           e.idempotency_key,
+           a.applied_at, a.rolled_back_at, a.harmful_verdict_at,
+           a.observation_verdict, a.observation_closed_at
+      FROM edu_agent_experiments e
+      LEFT JOIN edu_agent_actions a ON a.idempotency_key = e.idempotency_key
+     WHERE e.status = ANY(%s)
+     ORDER BY e.started_on, e.experiment_id
+"""
+
+
+def load_open_hypotheses(statuses: Any) -> List[Dict[str, Any]]:
+    """Незакрытые ставки ВМЕСТЕ с состоянием своего действия.
+
+    Одним запросом с журналом, а не двумя выборками и склейкой в питоне:
+    решение о судьбе ставки принимается по паре «реестр + действие»
+    (experiments.settle), и разъехавшиеся во времени половины дали бы вердикт
+    по состоянию, которого одновременно не существовало.
+
+    LEFT JOIN, а не INNER: ставка заводится ДО записи действия в журнал, и в
+    коротком окне между двумя записями строки действия ещё нет. Для settle
+    это тот же случай, что «действие не применено», — и обрабатывается им же.
+
+    Список статусов передаёт вызывающий (experiments.OPEN_STATUSES): что
+    считать открытым, решает жизненный цикл, а не запрос.
+    """
+    return _fetch_dicts(OPEN_HYPOTHESES_SQL, (list(statuses),))
+
+
+CLOSE_HYPOTHESIS_SQL = """
+    UPDATE edu_agent_experiments
+       SET status        = %(status)s,
+           status_reason = %(reason)s,
+           closed_at     = CASE WHEN %(status)s = ANY(%(closed)s)
+                                THEN now() ELSE closed_at END
+     WHERE experiment_id = %(experiment_id)s
+       AND status = %(from_status)s
+    RETURNING experiment_id
+"""
+
+
+def move_hypothesis(experiment_id: str, from_status: str, status: str,
+                    reason: str, closed_statuses: Any) -> bool:
+    """Перевод ставки в следующий статус. True — перевод лёг.
+
+    Законность перехода проверяет experiments.check_transition ДО вызова;
+    здесь стоит гард от ГОНКИ: условие `status = from_status` не даёт двум
+    прогонам сторожа закрыть одну ставку дважды и записать два исхода. Тот же
+    приём, что у mark_observation_closed в журнале действий.
+
+    False — строку уже забрал другой прогон (или её статус успел измениться).
+    Это не ошибка: исход записан, просто не нами.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(CLOSE_HYPOTHESIS_SQL, {
+                "experiment_id": str(experiment_id),
+                "from_status": str(from_status),
+                "status": str(status),
+                "reason": str(reason)[:500],
+                "closed": list(closed_statuses),
+            })
+            landed = cur.fetchone() is not None
+        conn.commit()
+    return landed
 
 
 def upsert_computed_settings(

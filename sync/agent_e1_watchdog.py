@@ -50,6 +50,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sync.agent import blackbox
+from sync.agent import experiments
 from sync.agent import db as agent_db
 from sync.agent import gate as gate_module
 from sync.agent.gate import mart_gate, with_source_checks
@@ -1668,6 +1669,63 @@ def money_checkpoint(db_module: Any, today: date, crm_through: Optional[date],
     return out
 
 
+def settle_hypotheses(today: date, journal_ok: bool = True) -> Dict[str, Any]:
+    """Проход по открытым ставкам реестра: какие закрылись сегодня.
+
+    Живёт в стороже, а не в такте записи, по той же причине, по которой здесь
+    же считаются исходы действий: ставка закрывается ЗАМЕРОМ, а замер делает
+    сторож. Держать это в Э1 значило бы судить гипотезу в прогоне, который
+    приехал её ставить.
+
+    Судья один — economic_outcome. Реестр вердикт не пересчитывает, а переводит
+    в свой статус (experiments.settle): два независимых судьи разошлись бы на
+    первом же пограничном случае и разошлись бы молча.
+
+    journal_ok=False (репетиция) — считаем и печатаем, в базу не пишем.
+    """
+    rows = agent_db.load_open_hypotheses(experiments.OPEN_STATUSES)
+    moved: List[Dict[str, Any]] = []
+    illegal: List[Dict[str, Any]] = []
+    lost_race = 0
+    for row in rows:
+        try:
+            step = experiments.settle(row, today)
+        except experiments.IllegalTransition as exc:
+            # Не проглатываем: недопустимый переход означает, что в реестре
+            # лежит состояние, которого жизненный цикл не предусматривает, и
+            # молчание здесь пряталось бы до разбора через две недели.
+            illegal.append({"experiment_id": str(row.get("experiment_id")),
+                            "status": str(row.get("status")),
+                            "error": str(exc)[:200]})
+            continue
+        if step is None:
+            continue
+        if journal_ok and not agent_db.move_hypothesis(
+                step["experiment_id"], step["from_status"], step["status"],
+                step["reason"], experiments.CLOSED_STATUSES):
+            # Строку уже забрал другой прогон. Не ошибка: исход записан,
+            # просто не нами.
+            lost_race += 1
+            continue
+        moved.append(step)
+
+    by_status: Dict[str, int] = {}
+    for step in moved:
+        by_status[step["status"]] = by_status.get(step["status"], 0) + 1
+    out = {
+        "open_before": len(rows),
+        "moved": len(moved),
+        "by_status": by_status,
+        "still_open": len(rows) - len(moved),
+        "sample": moved[:PREVIEW_SAMPLE_LIMIT],
+    }
+    if lost_race:
+        out["lost_race"] = lost_race
+    if illegal:
+        out["illegal_transitions"] = illegal
+    return out
+
+
 def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
              fail_on_alarm: bool = False) -> int:
     # Уборка зависших — ГЛОБАЛЬНО и ДО чтения открытых действий: помечать
@@ -1747,6 +1805,11 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
         # возрасту, а не по тому, чей кабинет попал в этот прогон.
         "money_checkpoint": money_checkpoint(writer_db, today, crm_through,
                                              journal_ok=not dry_run),
+        # Реестр гипотез — тот же проход, что и по действиям, но по ЗАМЫСЛАМ:
+        # ставка закрывается вердиктом сторожа, откатом по красной линии или
+        # истёкшим горизонтом. Без этого блока «сразу увидеть результат и
+        # сразу двигаться дальше» некуда возвращаться.
+        "hypotheses": settle_hypotheses(today, journal_ok=not dry_run),
     }
     out["alarms"] = alarm_reasons(out)
     # Сторож — третья часть той же истории: расчёт решил, запись применила,
