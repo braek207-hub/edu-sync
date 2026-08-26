@@ -539,3 +539,48 @@ def test_journal_keeps_the_raw_expectation_next_to_the_calibrated_one():
     payload = actions[0]["payload"]
     assert payload["expected_leads_delta"] == 6.0
     assert payload["expected_leads_delta_calibrated"] == 3.0
+
+
+# --- окупаемость доезжает до действия --------------------------------------
+
+
+def test_move_and_action_carry_absolute_roi():
+    """Без этого числа взаимозачёт такта не срабатывает НИ РАЗУ.
+
+    risk.net_risk считает скидку за встречный перенос по разрыву
+    окупаемостей сторон. Разрыв неизвестен хотя бы у одной — скидки нет и
+    перенос платит полную цену обеими сторонами, то есть ровно тот дефект
+    8б, ради которого зачёт и написан. Отношение к λ здесь не годится: λ у
+    каждого кабинета своя, и в такте из двух кабинетов «1,2 к своей λ» —
+    разные деньги. Абсолютная окупаемость восстанавливается из той же строки
+    витрины: value = roi/λ, raw_value = λ.
+    """
+    rows = {"1": [_target_row(240_000, 480_000),
+                  {"setting_kind": "budget_target", "setting_key": "roi_vs_lambda",
+                   "value": 1.2, "raw_value": 2.0, "support_n": 100,
+                   "rel_error": 0.1}]}
+
+    move = plan_budget_moves(rows)["desired"]["1"]
+    actions, _ = diff_budget({"1": move},
+                             {"1": _state(weekly_micros=5_000_000 * M)},
+                             {"1": 100_000.0})
+
+    assert move["marginal_roi"] == 2.4
+    assert actions[0]["marginal_roi"] == 2.4
+
+
+def test_absent_lambda_leaves_roi_absent_not_zero():
+    # Ноль означал бы «кампания не окупается вовсе», и зачёт взял бы с неё
+    # полную цену как с провальной. Неизвестное — это отсутствие ключа.
+    rows = {"1": [_target_row(240_000, 480_000),
+                  {"setting_kind": "budget_target", "setting_key": "roi_vs_lambda",
+                   "value": 1.2, "raw_value": 0.0, "support_n": 100,
+                   "rel_error": 0.1}]}
+
+    move = plan_budget_moves(rows)["desired"]["1"]
+    actions, _ = diff_budget({"1": move},
+                             {"1": _state(weekly_micros=5_000_000 * M)},
+                             {"1": 100_000.0})
+
+    assert "marginal_roi" not in move
+    assert "marginal_roi" not in actions[0]

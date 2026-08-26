@@ -189,3 +189,148 @@ def test_unknown_spend_falls_back_to_default_not_to_zero():
     # Ноль означал бы «агент не работает» при первом же пробеле в витрине —
     # отказ, неотличимый от исправной остановки.
     assert risk_module.weekly_limit(0.0, 0.01, None) == risk_module.DEFAULT_WEEKLY_RISK_RUB
+
+
+# --- цена ТАКТА: перенос не платит обеими сторонами -------------------------
+# Дефект 8б плана беты: перенос 100 000 ₽ с кампании A на кампанию B стоил
+# риском обе дельты — и −100 000 у A, и +100 000 у B. Под ударом здесь не
+# 200 000 ₽ и даже не 100 000, а разрыв окупаемостей A и B на горизонте
+# замера: сумма кабинета не изменилась ни на рубль. Замер Б: полоса
+# перераспределения заявила 921 690 ₽ на 48 действиях — 16 % недельного
+# расхода кабинета за неделю переносов.
+
+import pytest
+
+from sync.agent.writer import expectation
+
+DAILY = {"A": 200_000.0, "B": 200_000.0, "C": 200_000.0}
+HORIZON = 7
+
+
+def _budget(object_id, delta_rub, roi=None, days=HORIZON, kind="budget.set"):
+    """Действие, двигающее деньги кампании на delta_rub за окно замера."""
+    action = {
+        "idempotency_key": f"k-{object_id}",
+        "action_kind": kind,
+        "object_level": "campaign",
+        "object_id": object_id,
+        "exposure": {"daily_rub": abs(delta_rub) / days,
+                     "basis": "сдвиг лимита"},
+        "payload": {
+            expectation.LEADS_KEY: 0.0,
+            expectation.RUB_KEY: delta_rub,
+            expectation.BASIS_KEY: "тестовое ожидание",
+            expectation.DAYS_KEY: days,
+        },
+    }
+    if roi is not None:
+        action["marginal_roi"] = roi
+    return action
+
+
+def test_transfer_costs_the_efficiency_gap_not_the_amount():
+    give = _budget("A", delta_rub=-100_000.0, roi=1.2)
+    take = _budget("B", delta_rub=+100_000.0, roi=2.4)
+
+    prices = risk_module.net_risk([give, take], DAILY, days=HORIZON)
+
+    assert sum(prices.values()) < 100_000.0
+
+
+def test_net_increase_pays_full_price():
+    take = _budget("B", delta_rub=+100_000.0, roi=2.4)
+
+    prices = risk_module.net_risk([take], DAILY, days=HORIZON)
+
+    assert sum(prices.values()) == pytest.approx(100_000.0, rel=0.05)
+
+
+def test_unknown_roi_gap_pays_full_price():
+    # Та же дисциплина, что у object_daily_cost: неизвестное — не ноль.
+    # Разрыв окупаемостей неизвестен, значит скидки за компенсацию нет.
+    give = _budget("A", delta_rub=-100_000.0, roi=None)
+    take = _budget("B", delta_rub=+100_000.0, roi=2.4)
+
+    assert sum(risk_module.net_risk([give, take], DAILY, HORIZON).values()) >= 100_000.0
+
+
+def test_transfer_between_equal_campaigns_is_nearly_free():
+    # Окупаемости совпали — переносить деньги между ними не значит ничем
+    # рисковать: ошибка ничего не меняет.
+    give = _budget("A", delta_rub=-100_000.0, roi=2.0)
+    take = _budget("B", delta_rub=+100_000.0, roi=2.0)
+
+    assert sum(risk_module.net_risk([give, take], DAILY, HORIZON).values()) == 0.0
+
+
+def test_neither_side_pays_the_transfer_twice():
+    # Перенос — одна ошибка, а не две: пара платит за компенсированную часть
+    # ОДИН раз, поровну, а не по полной цене каждой стороной.
+    give = _budget("A", delta_rub=-100_000.0, roi=1.2)
+    take = _budget("B", delta_rub=+100_000.0, roi=2.4)
+
+    prices = risk_module.net_risk([give, take], DAILY, HORIZON)
+
+    assert prices["k-A"] == prices["k-B"]
+    # Разрыв 1.2 против 2.4 — половина: пара стоит 50 000, а не 200 000.
+    assert sum(prices.values()) == pytest.approx(50_000.0, rel=0.01)
+
+
+def test_only_the_compensated_part_is_discounted():
+    # Такт даёт кабинету больше, чем забирает: разница — новые деньги под
+    # ударом, и они платят как доливка, без всякой компенсации.
+    give = _budget("A", delta_rub=-100_000.0, roi=1.2)
+    take = _budget("B", delta_rub=+300_000.0, roi=2.4)
+
+    total = sum(risk_module.net_risk([give, take], DAILY, HORIZON).values())
+
+    # 200 000 нескомпенсированной доливки + 100 000 переноса с разрывом 0.5.
+    assert total == pytest.approx(200_000.0 + 50_000.0, rel=0.01)
+
+
+def test_hygiene_cut_does_not_subsidise_a_budget_increase():
+    # Вырезанные гигиеной рубли — не карман, из которого доливка становится
+    # дешевле: сломанный источник данных иначе делал бы любой прирост
+    # бесплатным. Полоса гигиены риском не платит и скидки не даёт.
+    cut = _budget("C", delta_rub=-100_000.0, roi=1.2, kind="negative.add")
+    take = _budget("B", delta_rub=+100_000.0, roi=2.4)
+
+    prices = risk_module.net_risk([cut, take], DAILY, HORIZON)
+
+    assert prices["k-B"] == pytest.approx(100_000.0, rel=0.01)
+
+
+def test_action_without_expectation_pays_its_gross_price():
+    # Обещания нет — сколько денег такт двигает, неизвестно, и компенсации
+    # не бывает: действие платит свою дельту целиком.
+    lonely = _budget("B", delta_rub=+100_000.0, roi=2.4)
+    lonely["payload"] = {}
+
+    prices = risk_module.net_risk([lonely], DAILY, HORIZON)
+
+    assert prices["k-B"] == pytest.approx(100_000.0, rel=0.01)
+
+
+def test_undetermined_risk_stays_infinite_in_a_tick():
+    # Справочник расхода пуст — цена неопределена, и никакая компенсация её
+    # не превращает в конечное число: действие обязано уйти в отложенные.
+    give = _budget("A", delta_rub=-100_000.0, roi=1.2)
+    take = _budget("B", delta_rub=+100_000.0, roi=2.4)
+
+    prices = risk_module.net_risk([give, take], {}, HORIZON)
+
+    assert prices["k-A"] == float("inf")
+    assert prices["k-B"] == float("inf")
+
+
+def test_net_price_never_exceeds_the_gross_one():
+    # Нетто-цена — скидка за взаимную компенсацию, а не наценка: ни одно
+    # действие не должно подорожать оттого, что рядом оказалось другое.
+    actions = [_budget("A", delta_rub=-40_000.0, roi=1.5),
+               _budget("B", delta_rub=+120_000.0, roi=2.4)]
+
+    prices = risk_module.net_risk(actions, DAILY, HORIZON)
+
+    for action in actions:
+        key = action["idempotency_key"]
+        assert prices[key] <= action_risk(action, DAILY, HORIZON) + 0.01

@@ -24,6 +24,14 @@ sync/agent/writer/risk.py — риск-бюджет движка записи (�
 внесли; а внутри этого потолка каждое действие платит ровно свою дельту, а не
 цену всей кампании.
 
+Второй счёт — по ТАКТУ, а не по действию (net_risk). Перенос денег внутри
+кабинета платил обеими сторонами сразу: полоса перераспределения заявила
+921 690 ₽ риска на 48 действиях — 16 % недельного расхода кабинета за неделю
+переносов, при том что сумма кабинета не изменилась ни на рубль. Под ударом
+при переносе разрыв окупаемостей сторон, а не перенесённая сумма и тем более
+не удвоенная; поштучный action_risk этого не видит по построению — он знает
+одно действие, а встречное движение денег видно только на наборе.
+
 Расход известен не для всех кампаний (лаг синка, новая кампания, пробел в
 источнике). Молчаливый ноль для таких случаев — дыра в гарантии: нулевой риск
 означает «бюджет не нужен», а на деле расход просто неизвестен. Различаем:
@@ -38,6 +46,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.writer import exposure as exposure_mod
+from sync.agent.writer import expectation
 
 DEFAULT_DAYS_TO_MEASURE = 7
 
@@ -51,6 +60,12 @@ DEFAULT_WEEKLY_RISK_RUB = 50_000.0
 # при недельном расходе кабинета 5,7 млн ₽ (замер 26.08.2026): переход на
 # долю поведения не меняет, но перестаёт зависеть от размера кабинета.
 DEFAULT_RISK_SHARE_WEEK = 0.01
+
+# Где у действия лежит его предельная окупаемость. Имя — то же, что у солвера
+# портфеля (portfolio.computed_rows: marginal_roi), потому что число ровно то
+# же: второй ключ означал бы второй источник правды о том, чем кампания
+# окупается.
+ROI_KEY = "marginal_roi"
 
 
 def weekly_limit(
@@ -185,6 +200,162 @@ def action_risk(
         return float("inf")
     at_risk, _ = exposure_mod.daily_rub(action.get("exposure"), daily)
     return round(min(at_risk, daily) * days_to_measure, 2)
+
+
+
+def net_risk(
+    actions: List[Dict[str, Any]],
+    daily_cost_by_campaign: Dict[str, float],
+    days: int = DEFAULT_DAYS_TO_MEASURE,
+) -> Dict[str, float]:
+    """Цена НАБОРА действий одного такта с учётом взаимной компенсации.
+
+    Дефект 8б плана беты: перенос платил дважды. Сдвиг 100 000 ₽ с кампании A
+    на кампанию B стоил риском обе дельты — и −100 000 у A, и +100 000 у B, —
+    хотя сумма кабинета не изменилась ни на рубль. Замер Б: полоса
+    перераспределения заявила 921 690 ₽ на 48 действиях, то есть 16 %
+    недельного расхода кабинета за одну неделю переносов.
+
+    Под ударом при переносе не 200 000 ₽ и даже не 100 000, а РАЗРЫВ
+    ОКУПАЕМОСТЕЙ сторон: ошибись мы, и перенесённые деньги зарабатывают по
+    ставке донора вместо ставки получателя. Отсюда цена компенсированной части
+    = перенесённая сумма × относительный разрыв, и платится она ОДИН раз на
+    пару (поровну обеими сторонами), а не каждой стороной целиком.
+
+    Компенсация действует только на ту часть, которая реально скомпенсирована:
+    если такт даёт кабинету больше, чем забирает, разница — новые деньги под
+    ударом, и они платят как доливка. Разрыв неизвестен хотя бы у одной
+    стороны — компенсации нет вовсе: та же дисциплина, что у
+    object_daily_cost, неизвестное не ноль.
+
+    Компенсируют друг друга ТОЛЬКО действия риск-платящих полос. Гигиена
+    вырезает расход, риском не платит и скидки не даёт: иначе сломанный
+    источник данных, нагенерив минус-фраз, делал бы любую доливку бесплатной.
+
+    Неопределённая цена (+inf) остаётся неопределённой: компенсация — скидка
+    за встречное движение денег, а не способ превратить «расход неизвестен» в
+    конечное число.
+    """
+    gross = {a["idempotency_key"]: action_risk(a, daily_cost_by_campaign, days)
+             for a in actions}
+    moved = {a["idempotency_key"]: _moved_rub(a, days) for a in actions}
+
+    given = [a for a in actions if (moved[a["idempotency_key"]] or 0.0) < 0.0]
+    taken = [a for a in actions if (moved[a["idempotency_key"]] or 0.0) > 0.0]
+    given_rub = sum(-(moved[a["idempotency_key"]] or 0.0) for a in given)
+    taken_rub = sum((moved[a["idempotency_key"]] or 0.0) for a in taken)
+    compensated = min(given_rub, taken_rub)
+
+    if compensated <= 0.0:
+        return {key: round(value, 2) for key, value in gross.items()}
+
+    gap = _efficiency_gap(given, taken, moved)
+    prices: Dict[str, float] = {}
+    for action in actions:
+        key = action["idempotency_key"]
+        price = gross[key]
+        if price == float("inf"):
+            prices[key] = price
+            continue
+        delta = moved[key] or 0.0
+        side_rub = taken_rub if delta > 0 else given_rub
+        share = 0.0 if (delta == 0.0 or side_rub <= 0.0) else compensated / side_rub
+        # Половина — потому что компенсированную часть платит ПАРА, а не
+        # каждая сторона: доли донора и получателя в сумме дают два переноса,
+        # умножение на 0.5 возвращает их к одному.
+        prices[key] = round(price * (1.0 - share) + price * share * gap / 2.0, 2)
+    return prices
+
+
+def _moved_rub(action: Dict[str, Any], days: int) -> Optional[float]:
+    """Сколько рублей действие добавляет кабинету (+) или снимает (−) за окно.
+
+    Знак берётся из обещания рычага (writer/expectation.of), а не из цены
+    риска: цена — модуль дельты, по ней донора от получателя не отличить.
+    Обещание приведено к СВОЕМУ горизонту (у полосы перераспределения он
+    вдвое длиннее недельного), поэтому здесь оно пересчитывается на горизонт
+    такта — иначе компенсировались бы суммы, посчитанные на разных окнах.
+
+    None — действие в зачёт не идёт: либо его полоса риском не платит, либо
+    рычаг ничего не обещает, и сколько денег он двигает, неизвестно.
+    """
+    if not _nets(action):
+        return None
+    exp = expectation.of(action)
+    if exp is None:
+        return None
+    horizon = float(exp.get("measure_days") or 0.0)
+    rub = float(exp.get("rub_delta") or 0.0)
+    if horizon <= 0.0 or rub == 0.0:
+        return None
+    return rub / horizon * float(days)
+
+
+def _nets(action: Dict[str, Any]) -> bool:
+    """Участвует ли действие во взаимозачёте такта.
+
+    Импорт полос ВНУТРИ функции: кольцо lanes → switch → expectation →
+    (лениво) lanes уже существует, и модульный импорт отсюда добавил бы ему
+    третью сторону — порядок импортов начал бы решать, соберётся ли пакет.
+
+    Вид без полосы (lane_of падает) во взаимозачёт не идёт: у него нет ни
+    лимита, ни срока замера, и зачесть его дельту значило бы дать скидку за
+    движение денег, о котором движок ничего не знает.
+    """
+    from sync.agent.writer import lanes
+
+    try:
+        return lanes.lane_of(action) in lanes.RISK_PAYING_LANES
+    except ValueError:
+        return False
+
+
+def _efficiency_gap(given: List[Dict[str, Any]], taken: List[Dict[str, Any]],
+                    moved: Dict[str, Optional[float]]) -> float:
+    """Относительный разрыв окупаемостей сторон переноса: от 0 до 1.
+
+    Ноль — стороны окупаются одинаково, и ошибка переноса не стоит ничего:
+    деньги зарабатывают ту же ставку там, куда их перенесли. Единица — одна
+    из сторон не окупается вовсе или её окупаемость неизвестна; тогда
+    компенсации нет и перенос платит полную цену.
+
+    Окупаемости сторон взвешены по перенесённым рублям: крупный сдвиг
+    определяет разрыв сильнее мелкого, иначе одна копеечная правка с дикой
+    окупаемостью задавала бы цену всему такту.
+    """
+    give_roi = _weighted_roi(given, moved)
+    take_roi = _weighted_roi(taken, moved)
+    if give_roi is None or take_roi is None:
+        return 1.0
+    top = max(give_roi, take_roi)
+    if top <= 0.0:
+        return 1.0
+    return max(0.0, min(1.0, abs(take_roi - give_roi) / top))
+
+
+def _weighted_roi(actions: List[Dict[str, Any]],
+                  moved: Dict[str, Optional[float]]) -> Optional[float]:
+    """Средняя окупаемость стороны, взвешенная по её рублям. None — неизвестна.
+
+    Хватает ОДНОГО действия без окупаемости, чтобы сторона стала неизвестной:
+    средняя по остальным выдала бы догадку за измерение — ровно та подмена,
+    против которой стоят +inf в object_daily_cost и «весь объект» при
+    неизвестной доле сегмента.
+    """
+    total = 0.0
+    weight = 0.0
+    for action in actions:
+        roi = action.get(ROI_KEY)
+        if roi is None:
+            roi = (action.get("payload") or {}).get(ROI_KEY)
+        if roi is None:
+            return None
+        rub = abs(moved[action["idempotency_key"]] or 0.0)
+        total += float(roi) * rub
+        weight += rub
+    if weight <= 0.0:
+        return None
+    return total / weight
 
 
 def action_risk_basis(
