@@ -31,6 +31,7 @@ ENV (из .env): DIRECT_TOKEN, DIRECT_CLIENTS_JSON
 import json
 import os
 import sys
+import time
 from datetime import date, timedelta
 from typing import Any, Dict, List, Tuple
 
@@ -60,7 +61,11 @@ REPORT_CANDIDATES = [
 
 
 def classify(status: int, body: Dict[str, Any]) -> str:
-    """Вердикт по ответу. Ошибка уровня ЭЛЕМЕНТА значит, что форма верна."""
+    """Вердикт по ответу. Ошибка уровня ЭЛЕМЕНТА значит, что форма верна.
+
+    Текст отказа входит в вердикт: код 4001 одинаково означает и «нет такого
+    поля», и «критерий отбора обязателен», а чинить это разные вещи.
+    """
     if status == 403:
         return "NO_ACCESS"
     error = body.get("error") or {}
@@ -68,7 +73,8 @@ def classify(status: int, body: Dict[str, Any]) -> str:
     if code in _RIGHTS_CODES:
         return "NO_ACCESS"
     if code is not None:
-        return f"REJECTED[{code}]"
+        detail = str(error.get("error_detail") or error.get("error_string") or "")[:160]
+        return f"REJECTED[{code}] {detail}".strip()
     result = body.get("result") or {}
     if result:
         return "OK"
@@ -154,6 +160,79 @@ def probe_report_field(login: str, field: str, goals: List[str]) -> str:
     return f"REJECTED[{error.get('error_code')}] {detail}"
 
 
+def fetch_criterion_report(login: str, goals: List[str],
+                           days: int = 30) -> Dict[str, Any]:
+    """Полная выгрузка среза по критериям — и есть ли в ней ретаргетинг.
+
+    «Поле принято» и «по полю есть данные» — разные утверждения. Первое
+    отвечает 202-м на запрос отчёта, второе видно только в скачанных строках:
+    если весь срез окажется KEYWORD, корректировать по аудиториям будет
+    нечего, сколько бы списков ни висело в кабинете.
+    """
+    date_to = (date.today() - timedelta(days=1)).isoformat()
+    date_from = (date.today() - timedelta(days=days)).isoformat()
+    params: Dict[str, Any] = {
+        "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
+        "FieldNames": ["CriterionType", "CriterionId", "Criterion",
+                       "Impressions", "Clicks", "Cost"],
+        "ReportName": f"probe-criteria-{date_from}-{date_to}",
+        "ReportType": "CUSTOM_REPORT",
+        "DateRangeType": "CUSTOM_DATE",
+        "Format": "TSV",
+        "IncludeVAT": "YES",
+    }
+    if goals:
+        params["Goals"] = goals
+    headers = {
+        "Authorization": f"Bearer {os.environ['DIRECT_TOKEN']}",
+        "Client-Login": login,
+        "Accept-Language": "ru",
+        "Content-Type": "application/json; charset=utf-8",
+        "processingMode": "auto",
+        "returnMoneyInMicros": "false",
+        "skipReportHeader": "true",
+        "skipReportSummary": "true",
+    }
+    body = json.dumps({"params": params}, ensure_ascii=False).encode("utf-8")
+    for _ in range(60):
+        resp = requests.post(REPORTS_URL, data=body, headers=headers, timeout=180)
+        resp.encoding = "utf-8"
+        if resp.status_code == 200:
+            return _summarize_criteria(resp.text)
+        if resp.status_code in (201, 202):
+            time.sleep(10)
+            continue
+        return {"error": f"HTTP {resp.status_code} {resp.text[:200]}"}
+    return {"error": "отчёт не готов за 10 минут"}
+
+
+def _summarize_criteria(tsv: str) -> Dict[str, Any]:
+    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    if not lines:
+        return {"rows": 0, "by_type": {}}
+    header = lines[0].split("\t")
+    idx = {name: i for i, name in enumerate(header)}
+    by_type: Dict[str, Dict[str, Any]] = {}
+    for line in lines[1:]:
+        cells = line.split("\t")
+        if len(cells) < len(header):
+            continue
+        kind = cells[idx.get("CriterionType", 0)]
+        slot = by_type.setdefault(kind, {"rows": 0, "clicks": 0, "cost": 0.0,
+                                         "criteria": set()})
+        slot["rows"] += 1
+        slot["clicks"] += int(float(cells[idx["Clicks"]] or 0))
+        slot["cost"] += float(cells[idx["Cost"]] or 0)
+        slot["criteria"].add(cells[idx.get("CriterionId", 0)])
+    return {
+        "rows": len(lines) - 1,
+        "by_type": {k: {"rows": v["rows"], "clicks": v["clicks"],
+                        "cost": round(v["cost"], 2),
+                        "distinct_criteria": len(v["criteria"])}
+                    for k, v in sorted(by_type.items())},
+    }
+
+
 def probe_account(login: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {"account": login}
 
@@ -170,11 +249,22 @@ def probe_account(login: str) -> Dict[str, Any]:
         "by_scope": _count_by(lists, "Scope"),
     }
 
+    # Кампании кабинета: критерий отбора у audiencetargets и bidmodifiers
+    # обязателен, пустой SelectionCriteria отвергается кодом 4001.
+    s, b = _call(login, "campaigns", "get", {
+        "SelectionCriteria": {},
+        "FieldNames": ["Id"],
+        "Page": {"Limit": 100},
+    })
+    campaign_ids = [int(c["Id"]) for c in ((b.get("result") or {}).get("Campaigns") or [])]
+    out["campaigns"] = {"verdict": classify(s, b), "count": len(campaign_ids)}
+    probe_ids = campaign_ids[:10]
+
     # Привязки к группам: список без привязки не влияет ни на один показ, и
     # корректировать по нему нечего — разница между «сегменты есть» и «сегменты
     # работают» здесь и живёт.
     s, b = _call(login, "audiencetargets", "get", {
-        "SelectionCriteria": {},
+        "SelectionCriteria": {"CampaignIds": probe_ids} if probe_ids else {},
         "FieldNames": ["Id", "AdGroupId", "CampaignId", "RetargetingListId", "State"],
         "Page": {"Limit": 1000},
     })
@@ -190,7 +280,8 @@ def probe_account(login: str) -> Dict[str, Any]:
     # 2. Уже стоящие корректировки на ретаргетинг — их формат заодно показывает,
     # на каком уровне рычаг вообще живёт в этом кабинете.
     s, b = _call(login, "bidmodifiers", "get", {
-        "SelectionCriteria": {"Levels": ["CAMPAIGN", "AD_GROUP"],
+        "SelectionCriteria": {"CampaignIds": probe_ids,
+                              "Levels": ["CAMPAIGN", "AD_GROUP"],
                               "Types": ["RETARGETING_ADJUSTMENT"]},
         "FieldNames": ["Id", "CampaignId", "AdGroupId", "Type", "Level"],
         "RetargetingAdjustmentFieldNames": ["BidModifier", "RetargetingConditionId"],
@@ -232,6 +323,7 @@ def probe_account(login: str) -> Dict[str, Any]:
     goals = _goals(login)
     out["report_fields"] = {f: probe_report_field(login, f, goals)
                             for f in REPORT_CANDIDATES}
+    out["criteria_report"] = fetch_criterion_report(login, goals)
     return out
 
 
