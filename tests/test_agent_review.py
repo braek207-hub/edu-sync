@@ -6,7 +6,7 @@
 и тот же объект, который человек возвращает руками.
 """
 
-from sync.agent import review
+from sync.agent import rejects, review
 
 
 def _reject(run_id="r1", reason="cooldown", object_id="111",
@@ -43,12 +43,36 @@ def test_three_refusals_inside_one_run_are_not_history():
     assert review.walls(rows) == []
 
 
-def test_budget_and_run_cap_are_not_complaints():
+def test_working_limiters_are_not_complaints():
     # Это работающие ограничители: они обязаны срабатывать каждый день, и
     # жаловаться на них — жаловаться на замысел.
-    for reason in ("budget", "run_cap"):
+    #
+    # Убрать отсюда lane_limit или proposal — и первый же недельный разбор
+    # после снятия лимита действий превратится в свалку: полоса отказывает
+    # сотням кандидатов каждый прогон, предложение не применяется НИКОГДА по
+    # построению, и оба дают «стену» на третий день по каждому объекту.
+    # Настоящие находки (units_low, конфликты) в этой куче не найдёт никто, а
+    # с --fail-on-high разбор станет вечно красным.
+    for reason in (rejects.BUDGET, rejects.LANE_LIMIT, rejects.PROPOSAL,
+                   rejects.RUN_CAP):
         rows = [_reject(run_id=f"r{i}", reason=reason) for i in range(5)]
-        assert review.walls(rows) == []
+        assert review.walls(rows) == [], reason
+
+
+def test_expected_reasons_are_real_reason_codes():
+    # Перечень строится из констант rejects, а не из литералов: опечатка в
+    # строке не падает, она молча возвращает жалобу на работающий
+    # ограничитель — и разбор снова тонет в шуме.
+    assert review.EXPECTED_REASONS <= rejects.READABLE_REASONS
+
+
+def test_running_out_of_direct_units_stays_a_finding():
+    # Обратная граница: исчерпание баллов кабинета замыслом НЕ является.
+    # Хвост такта, который не уехал третий прогон подряд, — это находка, и
+    # расширение EXPECTED_REASONS не имеет права её проглотить.
+    rows = [_reject(run_id=f"r{i}", reason=rejects.UNITS_LOW) for i in range(3)]
+
+    assert len(review.walls(rows)) == 1
 
 
 def test_expensive_object_outranks_a_sleeping_one():

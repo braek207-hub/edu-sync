@@ -2740,3 +2740,232 @@ def test_units_low_reaches_the_black_box_not_just_the_counter(monkeypatch, capsy
     # Строки отказов не дублируются в отчёт прогона: там остаются счётчики.
     assert "rejects" not in report["result"]
     assert report["rejects"][rejects_mod.UNITS_LOW] == 1
+
+
+# =========================================================================
+# Дефицит полосы: отложенных списков нет, есть числа «хотела / позволено».
+# =========================================================================
+
+
+def test_lane_shortfall_is_reported_with_numbers():
+    # Убрать этот тест — и дефицит вернётся в слова. «Полоса переполнена» не
+    # говорит, поднимать ли ступень: между «хотела на 3 % больше лимита» и
+    # «хотела в шестнадцать раз больше» разные решения, а звучат они одинаково.
+    section = agent_e1.lane_shortfall(taken=3, refused=45, wanted_rub=921_690.0,
+                                      limit_rub=57_000.0, lane="allocation")
+
+    assert section["passed_share"] == pytest.approx(3 / 48, abs=0.01)
+    assert section["wanted_rub"] == 921_690.0
+    assert section["limit_rub"] == 57_000.0
+    assert section["shortfall_rub"] == pytest.approx(921_690.0 - 57_000.0)
+
+
+def test_empty_lane_does_not_look_like_a_perfect_pass():
+    # Полоса без кандидатов и полоса, пропустившая всё, — разные болезни:
+    # первая про источник кандидатов, вторая про ступень. Ноль в знаменателе
+    # даёт либо деление на ноль, либо выдуманную долю; здесь он даёт None.
+    section = agent_e1.lane_shortfall(taken=0, refused=0, wanted_rub=0.0,
+                                      limit_rub=57_000.0, lane="launch")
+
+    assert section["passed_share"] is None
+    assert section["shortfall_rub"] == 0.0
+
+
+def test_lane_without_a_rouble_limit_reports_no_shortfall():
+    # Гигиена и разведка риском не платят: их потолок бесконечен. Верни его
+    # числом — и json.dumps выдаст Infinity, который PostgreSQL в jsonb не
+    # примет, а blackbox.save_run проглотит ошибку полем. Отчёт прогона
+    # уцелеет, чёрный ящик — нет.
+    section = agent_e1.lane_shortfall(taken=7, refused=0, wanted_rub=0.0,
+                                      limit_rub=None, lane="hygiene")
+
+    assert section["limit_rub"] is None
+    assert section["shortfall_rub"] is None
+    assert "Infinity" not in json.dumps(section)
+
+
+def test_unpriced_actions_are_counted_not_treated_as_free():
+    # Цена действия бывает неизвестной (+inf у risk.action_risk, когда расход
+    # объекта неизвестен). Сложи её как ноль — и полоса «хотела 0 ₽» при сорока
+    # кандидатах, то есть выглядит исправной ровно тогда, когда слепа.
+    section = agent_e1.lane_shortfall(taken=1, refused=40, wanted_rub=1_000.0,
+                                      limit_rub=57_000.0, lane="tuning",
+                                      unpriced=40)
+
+    assert section["unpriced"] == 40
+    assert section["wanted_rub"] == 1_000.0
+
+
+def test_lane_inside_its_limit_has_no_negative_shortfall():
+    # Дефицит — это нехватка, а не запас. Отрицательное число здесь читалось бы
+    # как «полоса задолжала бюджету», и сумма дефицитов по прогону перестала бы
+    # что-либо значить.
+    section = agent_e1.lane_shortfall(taken=5, refused=0, wanted_rub=1_000.0,
+                                      limit_rub=57_000.0, lane="tuning")
+
+    assert section["shortfall_rub"] == 0.0
+    assert section["passed_share"] == 1.0
+
+
+def test_lane_shortfall_reaches_the_run_report(monkeypatch, capsys):
+    # Боевой путь целиком: run_account → отчёт кабинета → печать. Дефицит,
+    # живущий только в юнит-тесте чистой функции, человеку не показывается
+    # никогда — а именно ради человека он и считается.
+    #
+    # Двадцать кампаний по 2 000 ₽/день, по одной корректировке на каждую:
+    # цена действия 8 400 ₽, потолок полосы 50 000 ₽ — влезает пять.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": list(range(101, 121))},
+        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+    )
+
+    assert agent_e1.main() == 0
+
+    report = [r for r in _reports(capsys) if "account" in r][0]
+    gap = report["lanes"]["shortfall"]["tuning"]
+
+    assert gap["taken"] == 5 and gap["refused"] == 15
+    assert gap["passed_share"] == 0.25
+    assert gap["wanted_rub"] == 168_000.0
+    assert gap["limit_rub"] == 50_000.0
+    assert gap["shortfall_rub"] == 118_000.0
+
+
+def test_shortfall_counts_the_same_actions_as_the_lane_block(monkeypatch, capsys):
+    # Второй счёт тех же действий — худший вид отчёта: два числа об одном, и
+    # неизвестно, какому верить. Дефицит обязан пересказывать «взято/отказано»
+    # соседнего блока, а не считать заново по своему списку.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": list(range(101, 121))},
+        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+    )
+
+    assert agent_e1.main() == 0
+
+    lanes_block = [r for r in _reports(capsys) if "account" in r][0]["lanes"]
+    gap = lanes_block["shortfall"]
+
+    assert {lane: g["taken"] for lane, g in gap.items() if g["taken"]} \
+        == lanes_block["taken"]
+    # Отказы разложены на «зажато лимитом» и «рычага записи нет», но в сумме
+    # обязаны сходиться с соседним блоком: разложение не вправе терять строки.
+    assert sum(g["refused"] + g["not_applicable"] for g in gap.values()) \
+        == sum(lanes_block["refused"].values())
+    # Потолок в отчёте — тот самый, которым отбор реально ограничивал полосу.
+    # Разойдись он с ним, и человек поднимал бы ступень, глядя на чужое число.
+    for lane, spent in lanes_block["spent"].items():
+        assert float(spent["risk_rub"]) <= gap[lane]["limit_rub"]
+
+
+def test_shortfall_travels_to_the_blackbox(monkeypatch, capsys):
+    # Лог GitHub Actions живёт ограниченный срок. Дефицит полосы — довод для
+    # разговора о ступени, и он обязан лежать в истории прогонов, а не только
+    # в сегодняшней консоли.
+    saved = {}
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": list(range(101, 121))},
+        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+    )
+    monkeypatch.setattr(agent_e1.blackbox, "save_run",
+                        lambda *a, **k: saved.update(k) or {
+                            "run_id": "test", "saved": True, "rejects": 0,
+                            "error": None})
+
+    assert agent_e1.main() == 0
+
+    accounts = saved["report"]["accounts"]
+    assert accounts[0]["lanes"]["shortfall"]["tuning"]["shortfall_rub"] == 118_000.0
+    # Чёрный ящик кладёт отчёт в jsonb: Infinity и NaN PostgreSQL не примет, и
+    # одно бесконечное поле стоило бы всей истории прогона.
+    text = json.dumps(saved["report"], ensure_ascii=False, default=str)
+    assert "Infinity" not in text and "NaN" not in text
+
+
+def test_lane_shows_what_the_run_budget_cut_after_the_lane_let_it_through(
+        monkeypatch, capsys):
+    # Дефицит полосы — не последняя рельса на пути действия: за отбором стоит
+    # недельный риск-бюджет прогона, общий на все полосы и все кабинеты. Он
+    # срезает уже ВЗЯТОЕ полосой, и в блоке lanes этого было не видно.
+    #
+    # Убрать этот тест — и человек, увидев «полоса заявила 168 000 при потолке
+    # 50 000», поднимет ей ступень и не получит ничего: связывающим был не
+    # потолок полосы, а остаток недели. Ступень при этом уже поднята, то есть
+    # разрешено больше при том же результате.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": list(range(101, 121))},
+        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+    )
+
+    assert agent_e1.main() == 0
+
+    report = [r for r in _reports(capsys) if "account" in r][0]
+
+    # Полоса пропустила пять, недельный бюджет оставил один.
+    assert report["lanes"]["taken"] == {"tuning": 5}
+    assert report["lanes"]["cut_by_run_budget"] == {"tuning": 4}
+    assert report["deferred_by_risk"] == 4
+
+
+def test_action_cut_by_the_week_budget_becomes_a_reject_not_a_queue(
+        monkeypatch, capsys):
+    # Смысл, который закрепляет имя over_budget вместо прежнего deferred:
+    # срезанное недельным бюджетом никуда не откладывается. Оно ложится
+    # строкой отказа с причиной budget и завтра пересчитывается заново на
+    # свежих данных — иначе прогон применял бы позавчерашний расчёт к
+    # сегодняшнему кабинету.
+    #
+    # Заведись здесь очередь — этот тест поймает её тем, что строк отказа
+    # окажется меньше, чем срезанных действий.
+    saved = {}
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": list(range(101, 121))},
+        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+    )
+    monkeypatch.setattr(agent_e1.blackbox, "save_run",
+                        lambda *a, **k: saved.update(k) or {
+                            "run_id": "test", "saved": True, "rejects": 0,
+                            "error": None})
+
+    assert agent_e1.main() == 0
+
+    report = [r for r in _reports(capsys) if "account" in r][0]
+    budget_rows = [r for r in saved["rejects"] if r["reason"] == rejects_mod.BUDGET]
+
+    assert report["deferred_by_risk"] == len(budget_rows) == 4
+    # У каждого отказа свой объект и своя цена: список действий, а не счётчик.
+    assert len({r["object_id"] for r in budget_rows}) == 4
+
+
+def test_proposals_do_not_inflate_the_lane_shortfall():
+    # Отказ «рычага записи нет» (класс 3) лечится не ступенью — его не пустит
+    # ни одна. Сложи его с отказами лимита, и полоса выглядит зажатой там, где
+    # она просто получила неприменимых кандидатов: человек поднимет ступень,
+    # разрешив больше, и не получит ничего.
+    #
+    # Проверяется на чистой функции: класс 3 объявляется полем tier, лимит
+    # полосы и цены здесь ни при чём — важен только разбор счётчиков.
+    limited = {"action_kind": "bidmodifier.add", "idempotency_key": "a1",
+               "blocked_reason": rejects_mod.LANE_LIMIT}
+    proposal = {"action_kind": "bidmodifier.add", "idempotency_key": "p1",
+                "tier": 3, "blocked_reason": rejects_mod.PROPOSAL}
+    taken = {"action_kind": "bidmodifier.add", "idempotency_key": "t1",
+             "lane": "tuning"}
+
+    gap = agent_e1.lane_shortfalls([taken], [limited, proposal],
+                                   {"t1": 100.0, "a1": 100.0, "p1": 0.0},
+                                   {}, weekly_spend_rub=1_000_000.0)["tuning"]
+
+    assert gap["taken"] == 1
+    assert gap["refused"] == 1, "предложение сосчитано как зажатое лимитом"
+    assert gap["not_applicable"] == 1
+    assert gap["passed_share"] == 0.5

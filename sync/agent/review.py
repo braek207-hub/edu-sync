@@ -28,6 +28,8 @@ sync/agent/review.py — недельный разбор беты: находк�
 
 from typing import Any, Dict, Iterable, List, Optional
 
+from sync.agent import rejects
+
 WALL = "repeated_wall"
 CONFLICT = "recurring_conflict"
 HAND_ROLLBACK = "hand_rollback"
@@ -40,10 +42,25 @@ BLIND_WRITE = "blackbox_write_failed"
 # требует объяснения; меньше даёт шум из обычной работы бюджета.
 WALL_MIN_RUNS = 3
 
-# Причины отказа, повторение которых НЕ является находкой. Бюджет и лимит
-# прогона — это работающие ограничители: они обязаны срабатывать каждый
-# день, и жаловаться на них значит жаловаться на замысел.
-EXPECTED_REASONS = frozenset({"budget", "run_cap"})
+# Причины отказа, повторение которых НЕ является находкой: работающие
+# ограничители обязаны срабатывать каждый день, и жаловаться на них значит
+# жаловаться на замысел.
+#
+# Коды берутся константами из rejects, а не литералами: литерал не падает от
+# опечатки, он молча превращает ограничитель в жалобу — то есть даёт ровно
+# тот шум, ради отсутствия которого перечень и заведён.
+#
+#   budget      — недельный риск-бюджет прогона, общий на все кабинеты;
+#   lane_limit  — лимит полосы; после снятия лимита действий полоса отказывает
+#                 сотням кандидатов каждый прогон, и это её работа, а не стена;
+#   proposal    — предложение не применяется НИКОГДА и ни при какой ступени:
+#                 у него нет рычага записи (writer/lanes.LANE_PROPOSAL);
+#   run_cap     — снятая рельса «лимит действий на прогон». Строки за
+#                 июль–август 2026 ещё попадают в семидневное окно разбора,
+#                 и жалоба на ограничитель, которого больше нет, бесполезна
+#                 вдвойне (rejects.HISTORICAL_REASONS).
+EXPECTED_REASONS = frozenset({rejects.BUDGET, rejects.LANE_LIMIT,
+                              rejects.PROPOSAL, rejects.RUN_CAP})
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -59,15 +76,19 @@ def _key(row: Dict[str, Any]) -> str:
                      str(row.get("kind") or ""), str(row.get("key") or "")])
 
 
-def walls(rejects: Iterable[Dict[str, Any]],
+def walls(reject_rows: Iterable[Dict[str, Any]],
           min_runs: int = WALL_MIN_RUNS) -> List[Dict[str, Any]]:
     """Одно намерение, отказанное по одной причине в min_runs разных прогонах.
 
     Считаются именно ПРОГОНЫ, а не строки: одно действие, отклонённое трижды
     внутри одного прогона, — это особенность сборки плана, а не история.
+
+    Аргумент назван не rejects, чтобы не заслонять собой одноимённый модуль:
+    коды причин теперь приходят оттуда, и тень над импортом означала бы, что
+    первое же обращение к rejects.* внутри функции упадёт на списке строк.
     """
     groups: Dict[str, Dict[str, Any]] = {}
-    for row in rejects or ():
+    for row in reject_rows or ():
         reason = str(row.get("reason") or "")
         if reason in EXPECTED_REASONS:
             continue
@@ -207,11 +228,11 @@ def blind_writes(runs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def review(runs: List[Dict[str, Any]], rejects: List[Dict[str, Any]],
+def review(runs: List[Dict[str, Any]], reject_rows: List[Dict[str, Any]],
            expected_stages: Iterable[str]) -> Dict[str, Any]:
     """Все находки периода, отсортированные по весу."""
     findings = (silent_stages(runs, expected_stages) + hand_rollbacks(runs)
-                + walls(rejects) + conflicts_seen(runs) + unverified(runs)
+                + walls(reject_rows) + conflicts_seen(runs) + unverified(runs)
                 + blind_writes(runs))
     findings.sort(key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
     by_code: Dict[str, int] = {}
@@ -219,7 +240,7 @@ def review(runs: List[Dict[str, Any]], rejects: List[Dict[str, Any]],
         by_code[finding["code"]] = by_code.get(finding["code"], 0) + 1
     return {
         "runs": len(runs),
-        "rejects": len(rejects),
+        "rejects": len(reject_rows),
         "findings": findings,
         "by_code": by_code,
         "by_severity": {level: sum(1 for f in findings if f["severity"] == level)

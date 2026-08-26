@@ -47,6 +47,7 @@ ENV: DATABASE_URL, DIRECT_TOKEN, DIRECT_CLIENTS_JSON
 """
 
 import json
+import math
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -699,12 +700,17 @@ def fit_week_budget(priced, risks, remaining, charged_risk, caps, daily_cost):
     решил отбор полос: класс 0 (арифметика — минус-фраза снимает деньги с огня,
     а не ставит под удар) уехал оттуда с нулевой ценой. net_risk про классы не
     знает и назначил бы им полную цену, так что первый же урезанный круг
-    отправил бы все отсечения в отложенные — ровно против обещания «класс 0
+    отправил бы все отсечения за бюджет — ровно против обещания «класс 0
     вносится весь и сразу», и тем заметнее, чем больше в кабинете мусора.
+
+    Второй список назван over_budget, а не deferred: срезанное никуда не
+    откладывается. Оно становится отказом с причиной budget и пересчитывается
+    следующим тактом на свежих данных — очередь означала бы применение
+    позавчерашнего расчёта к сегодняшнему кабинету.
     """
     free = {key for key, price in risks.items() if float(price or 0.0) == 0.0}
     candidates = list(priced)
-    deferred: List[Dict[str, Any]] = []
+    over_budget: List[Dict[str, Any]] = []
     prepared: List[Dict[str, Any]] = []
     # Граница по длине — страховка от бесконечного цикла в ночном прогоне:
     # каждый круг либо ничего не снимает и заканчивается, либо снимает хотя бы
@@ -717,12 +723,123 @@ def fit_week_budget(priced, risks, remaining, charged_risk, caps, daily_cost):
             charged_risk.clear()
             charged_risk.update(attempt_charged)
             break
-        deferred += dropped
+        over_budget += dropped
         kept = {a["idempotency_key"] for a in prepared}
         candidates = [a for a in candidates if a["idempotency_key"] in kept]
         risks = {key: (0.0 if key in free else price)
                  for key, price in net_risk(candidates, daily_cost).items()}
-    return prepared, deferred
+    return prepared, over_budget
+
+
+def lane_shortfall(taken: int, refused: int, wanted_rub: float,
+                   limit_rub: Optional[float], lane: str = "",
+                   unpriced: int = 0, not_applicable: int = 0) -> Dict[str, Any]:
+    """Дефицит полосы четырьмя числами: хотела, позволено, прошло, не хватило.
+
+    Отложенных списков у прогона больше нет — не прошедшее лимит становится
+    отказом и пересчитывается завтра на свежих данных (writer/lanes.select).
+    Но «отказано 45» само по себе ничего не решает: между полосой, которая
+    заявила на 3 % больше своего потолка, и полосой, заявившей в шестнадцать
+    раз больше, разные выводы — первой хватит следующего прогона, второй нужна
+    другая ступень или другой источник кандидатов. Разница видна только в
+    рублях, поэтому счётчик отказов дополняется спросом и потолком.
+
+    limit_rub = None означает «полоса не ограничена деньгами риска»: гигиена,
+    разведка и предложения риск-долей не платят (writer/lanes.RISK_PAYING_LANES),
+    и у них дефицита в этом смысле не бывает. Бесконечность сюда не кладётся
+    числом: json.dumps выдал бы Infinity, а PostgreSQL не принимает его в jsonb
+    — чёрный ящик потерял бы весь отчёт прогона ради одного поля.
+
+    unpriced — сколько кандидатов полосы приехали с неизвестной ценой
+    (risk.action_risk отдаёт +inf, когда расход объекта неизвестен). Они не
+    складываются в спрос нулями: полоса, «захотевшая 0 ₽» при сорока слепых
+    кандидатах, выглядела бы исправной ровно тогда, когда она слепа.
+
+    not_applicable — кандидаты, которым отказано не лимитом, а отсутствием
+    рычага записи (класс достоверности 3). Ни одна ступень их не пропустит, и
+    в дефицит полосы они не входят: иначе полоса, получившая неприменимых
+    кандидатов, читалась бы как зажатая, и ступень подняли бы впустую.
+    """
+    total = int(taken) + int(refused)
+    wanted = float(wanted_rub or 0.0)
+    limit = None if limit_rub is None or not math.isfinite(float(limit_rub)) \
+        else float(limit_rub)
+    return {
+        "lane": str(lane or ""),
+        "taken": int(taken),
+        "refused": int(refused),
+        # Доля прошедших — по числу действий, а не по деньгам: она отвечает на
+        # вопрос «сколько замыслов полосы доехало», и один дорогой перенос не
+        # должен выглядеть как проехавшая половина плана.
+        "passed_share": (round(int(taken) / total, 4) if total else None),
+        "wanted_rub": round(wanted, 2),
+        "limit_rub": None if limit is None else round(limit, 2),
+        "shortfall_rub": None if limit is None else round(max(0.0, wanted - limit), 2),
+        "unpriced": int(unpriced),
+        "not_applicable": int(not_applicable),
+    }
+
+
+def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
+                    prices: Dict[str, float], step_by_lane: Dict[str, int],
+                    weekly_spend_rub: float,
+                    config: Optional[Dict[str, Any]] = None,
+                    risk_budget_rub: Optional[float] = None) -> Dict[str, Any]:
+    """Дефицит каждой полосы прогона — рядом с её «взято/отказано/потрачено».
+
+    На вход идёт РОВНО то, что видел отбор (writer/lanes.select): его взятые и
+    отказанные вместе и есть полный список кандидатов, а ступени, расход и
+    ручной потолок — те же аргументы, которыми считался сам отбор. Второго
+    источника чисел здесь нет намеренно: разойдись он с отбором хоть на рубль,
+    и отчёт объяснял бы решение, которого не было.
+
+    Цена действия и потолок полосы берутся у самого lanes
+    (charged_price, risk_budget_of), а не пересчитываются формулой отсюда:
+    копия «доли ступени от недельного потолка» тихо разъехалась бы с отбором
+    при первой же правке ставок, и отчёт продолжал бы выглядеть правдой.
+
+    Спрос считается на ПЕРВОМ круге цен, то есть на полном наборе кандидатов:
+    это и есть «сколько полоса хотела». Списанное (lanes spent) считается на
+    сошедшемся наборе и потому не обязано совпадать со спросом даже у взятых —
+    скидка за встречное движение денег тем меньше, чем больше доноров срезано.
+    """
+    steps = dict(step_by_lane or {})
+    slots: Dict[str, Dict[str, Any]] = {}
+
+    def _slot(action: Dict[str, Any]) -> Dict[str, Any]:
+        lane = lanes.lane_of(action)
+        return slots.setdefault(lane, {"taken": 0, "refused": 0, "wanted": 0.0,
+                                       "unpriced": 0, "not_applicable": 0})
+
+    for action in taken:
+        _slot(action)["taken"] += 1
+    for action in refused:
+        # Отказ «рычага записи нет» (класс достоверности 3, полоса
+        # предложений) считается ОТДЕЛЬНО от отказа лимитом. Сложи их — и
+        # полоса, получившая неприменимых кандидатов, выглядит зажатой:
+        # человек поднимет ступень, разрешив больше денег, и не получит
+        # ничего, потому что предложение не пустит никакая ступень.
+        field = ("not_applicable"
+                 if str(action.get("blocked_reason") or "") == rejects.PROPOSAL
+                 else "refused")
+        _slot(action)[field] += 1
+    for action in list(taken) + list(refused):
+        lane = lanes.lane_of(action)
+        price = lanes.charged_price(action, lane, prices)
+        if math.isfinite(price):
+            slots[lane]["wanted"] += price
+        else:
+            slots[lane]["unpriced"] += 1
+
+    out: Dict[str, Any] = {}
+    for lane, slot in sorted(slots.items()):
+        limit = lanes.risk_budget_of(lane, steps.get(lane, lanes.DEFAULT_STEP),
+                                     weekly_spend_rub, config, risk_budget_rub)
+        out[lane] = lane_shortfall(taken=slot["taken"], refused=slot["refused"],
+                                   wanted_rub=slot["wanted"], limit_rub=limit,
+                                   lane=lane, unpriced=slot["unpriced"],
+                                   not_applicable=slot["not_applicable"])
+    return out
 
 
 def _count_by(actions: List[Dict[str, Any]], field: str) -> Dict[str, int]:
@@ -1683,16 +1800,32 @@ def run_account(
     # (по объекту уже могло быть списано на прошлых прогонах недели), но
     # списывает по-настоящему только недельная рельса ниже — иначе один и тот
     # же рубль вычелся бы из потолка объекта дважды.
+    #
+    # Аргументы отбора вынесены в переменные, потому что ими же считается
+    # дефицит полос ниже: разъедься эти два вызова хоть ступенью, и отчёт
+    # объяснял бы решение, которого отбор не принимал.
+    lane_steps = (ctx.get("config") or {}).get("lane_steps") or {}
+    lane_weekly_spend = sum(float(v) for v in daily_cost.values()) * DAYS_IN_WEEK
+    lane_risk_budget = weekly_risk_limit(wk, daily_cost, ctx.get("config"))
     lane_taken, lane_refused = lanes.select(
         with_red_line,
-        (ctx.get("config") or {}).get("lane_steps") or {},
-        weekly_spend_rub=sum(float(v) for v in daily_cost.values()) * DAYS_IN_WEEK,
+        lane_steps,
+        weekly_spend_rub=lane_weekly_spend,
         daily_cost_by_campaign=daily_cost,
         config=ctx.get("config"),
         budgets=ctx["lane_budgets"],
         charged_by_object=dict(charged_risk),
-        risk_budget_rub=weekly_risk_limit(wk, daily_cost, ctx.get("config")),
+        risk_budget_rub=lane_risk_budget,
     )
+    # Дефицит полосы числами: сколько она заявила рублями, сколько ей позволено
+    # и какая доля замыслов доехала. Без этого «отказано 45» не отличает полосу,
+    # промахнувшуюся мимо потолка на три процента, от полосы, заявившей
+    # шестнадцать потолков, — а лечатся они по-разному.
+    lane_gap = lane_shortfalls(lane_taken, lane_refused,
+                               net_risk(with_red_line, daily_cost),
+                               lane_steps, lane_weekly_spend,
+                               config=ctx.get("config"),
+                               risk_budget_rub=lane_risk_budget)
 
     # Цена действия — его ДЕЛЬТА (доля сегмента, вырезанный трафик, сдвиг
     # лимита), а не расход всей кампании; потолок объекта не даёт сумме дельт
@@ -1738,7 +1871,7 @@ def run_account(
     # донора отложить — скидка выдана, компенсации не будет. Поэтому набор,
     # который она урезала, переоценивается, и подгонка повторяется, пока не
     # сойдётся. Счёт по объектам списывается только с сошедшегося набора.
-    prepared, deferred = fit_week_budget(priced, risks, remaining,
+    prepared, over_budget = fit_week_budget(priced, risks, remaining,
                                          charged_risk, caps, daily_cost)
     ctx["run_risk_remaining"] -= sum(float(a.get("risk_rub") or 0.0) for a in prepared)
 
@@ -1771,7 +1904,7 @@ def run_account(
                               for a in lane_refused})
     ]
     account_rejects = rejects.from_groups(conflict_groups + lane_rejects + [
-        (rejects.BUDGET, deferred),
+        (rejects.BUDGET, over_budget),
         (rejects.NO_RED_LINE, no_red_line),
         (rejects.COOLDOWN, in_cooldown),
         (rejects.ATTEMPTS_EXHAUSTED, out_of_attempts),
@@ -1918,7 +2051,9 @@ def run_account(
             "blocked_without_address": len(without_address),
             "min_assigned_share": MIN_ASSIGNED_SHARE,
         },
-        "deferred_by_risk": len(deferred),
+        # Имя ключа оставлено прежним: его читает панель агента в другом
+        # репозитории, и переименование поля отчёта — её миграция, а не эта.
+        "deferred_by_risk": len(over_budget),
         "refused_by_lane": len(lane_refused),
         # Отказы строками, а не только счётчиками: они уезжают в чёрный ящик
         # (sync/agent/blackbox.py), где на истории видно, какое намерение
@@ -1938,6 +2073,18 @@ def run_account(
             "refused": _count_by(lane_refused, "blocked_reason"),
             "spent": {lane: {k: round(float(v), 2) for k, v in slot.items()}
                       for lane, slot in sorted(ctx["lane_budgets"].items())},
+            # Дефицит рядом со «взято/отказано/потрачено», а не вместо них:
+            # счётчик говорит, СКОЛЬКО не прошло, дефицит — НАСКОЛЬКО не
+            # прошло. Отложенных списков у прогона нет, и «не влезло» без
+            # рублей не подсказывает ни ступень, ни источник кандидатов.
+            "shortfall": lane_gap,
+            # Сколько ВЗЯТОГО полосой срезал недельный риск-бюджет прогона —
+            # общий на все полосы и все кабинеты, он стоит за отбором и в
+            # блоке полос был не виден. Без этой строки человек, увидев
+            # дефицит полосы, поднимет ей ступень и не получит ничего:
+            # связывающим ограничителем был остаток недели, а разрешено
+            # окажется больше при том же результате.
+            "cut_by_run_budget": _count_by(over_budget, "lane"),
         },
         "no_red_line": {
             "count": len(no_red_line),

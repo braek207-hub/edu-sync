@@ -408,7 +408,7 @@ def _select_lane(actions, lane, policy, prices, weekly_spend, risk_budget,
                  - float(spent.get("risk_rub") or 0.0))
     fits, _ = risk_mod.fit_into_budget(
         within_caps,
-        {str(a["idempotency_key"]): _charged(a, lane, prices)
+        {str(a["idempotency_key"]): charged_price(a, lane, prices)
          for a in within_caps},
         risk_left, charged, caps)
 
@@ -443,6 +443,20 @@ def _commit(ledger: Dict[str, Dict[str, float]], taken: List[Dict[str, Any]],
         if policies[lane].max_cut_share is not None:
             slot["cut_rub"] = (float(slot.get("cut_rub") or 0.0)
                                + _freed_rub(action))
+
+
+def risk_budget_of(lane: str, step: int, weekly_spend: float,
+                   config: Optional[Dict[str, Any]] = None,
+                   risk_budget: Optional[float] = None) -> float:
+    """Потолок риска полосы на её ступени — тот же, по которому шёл отбор.
+
+    Публичная дверь к _risk_budget: отчёт прогона печатает этот потолок рядом
+    со спросом полосы, и брать его копией формулы нельзя — правка ставок
+    ступеней разошлась бы с отбором молча, а число в отчёте продолжало бы
+    выглядеть правдой.
+    """
+    return _risk_budget(lane, policy_of(lane, step, config), weekly_spend,
+                        risk_budget)
 
 
 def _risk_budget(lane: str, policy: LanePolicy, weekly_spend: float,
@@ -483,8 +497,16 @@ def _pays_risk(action: Dict[str, Any], lane: str) -> bool:
             and _tier_of(action) in tier_mod.RISK_PAYING_TIERS)
 
 
-def _charged(action: Dict[str, Any], lane: str,
-             prices: Dict[str, float]) -> float:
+def charged_price(action: Dict[str, Any], lane: str,
+                  prices: Dict[str, float]) -> float:
+    """Во сколько это действие обходится СВОЕЙ полосе.
+
+    Публичное, потому что цену спрашивает не только отбор: отчёт прогона
+    считает по ней спрос полосы («сколько она хотела»), и считать его копией
+    этой формулы значило бы объяснять человеку решение, которого не было.
+    Ноль здесь — не «бесплатно по недосмотру», а решение: полоса не платит
+    риском вовсе либо класс достоверности действия его не платит.
+    """
     if not _pays_risk(action, lane):
         return 0.0
     return float(prices.get(str(action["idempotency_key"]), 0.0))
@@ -524,7 +546,7 @@ def _rank(action: Dict[str, Any], lane: str, prices: Dict[str, float]):
     exp = expectation.of(action) or {}
     leads = float(exp.get("leads_delta") or 0.0)
     freed = max(0.0, -float(exp.get("rub_delta") or 0.0))
-    price = _charged(action, lane, prices)
+    price = charged_price(action, lane, prices)
     per_rub = 1.0 / max(price, MIN_PRICE_RUB) if price > 0.0 else 1.0
     if leads > 0.0:
         family, first, second = 1, leads * per_rub, freed * per_rub
