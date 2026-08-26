@@ -213,6 +213,43 @@ def test_cap_limits_actions_per_run():
     assert len(deferred) == 30
 
 
+def test_cap_does_not_let_one_lever_crowd_out_the_others():
+    """Замер 26.08.2026: за 30 дней в журнал попали ТОЛЬКО корректировки
+    ставок и расписание — 74 + 24 + 14. Бюджетных действий ноль, а
+    разведочный карман (1 507 155 руб. на 62 кампании) ездит именно на них,
+    поэтому контур ставок оказался пуст. Причина не в политике: план
+    собирается в порядке рычагов, корректировок больше лимита прогона, и
+    слепой срез actions[:50] отдавал им все слоты каждый раз. Лимит прогона
+    обязан ограничивать ОБЪЁМ, а не выбирать рычаг."""
+    actions = ([_action(kind="bidmodifier.set", object_id=str(i)) for i in range(80)]
+               + [_action(kind="budget.set", object_id=f"b{i}") for i in range(10)]
+               + [_action(kind="tcpa.set", object_id=f"t{i}") for i in range(10)])
+    applied, deferred = cap_actions(actions, max_per_run=50)
+    assert len(applied) == 50
+    assert len(applied) + len(deferred) == len(actions)
+    kinds = {a["action_kind"] for a in applied}
+    assert kinds == {"bidmodifier.set", "budget.set", "tcpa.set"}
+
+
+def test_cap_spends_slots_on_the_most_expensive_objects_first():
+    # Внутри рычага слот достаётся тому, за кем больше денег: лимит прогона
+    # отложит часть работы в любом случае, и откладывать дешёвое честнее.
+    actions = [{**_action(kind="budget.set", object_id=str(i)),
+                "baseline_daily_rub": float(i)} for i in range(10)]
+    applied, _ = cap_actions(actions, max_per_run=3)
+    assert [a["object_id"] for a in applied] == ["9", "8", "7"]
+
+
+def test_cap_is_deterministic_without_money_on_the_action():
+    # Расхода может не быть вовсе (новый объект, нет истории). Порядок всё
+    # равно обязан быть воспроизводимым, иначе один и тот же план в двух
+    # прогонах даёт разные срезы и разбор беты не с чем сверять.
+    actions = [_action(kind="budget.set", object_id=o) for o in ("c", "a", "b")]
+    first, _ = cap_actions(actions, max_per_run=2)
+    second, _ = cap_actions(list(reversed(actions)), max_per_run=2)
+    assert [a["object_id"] for a in first] == [a["object_id"] for a in second]
+
+
 def test_cap_keeps_all_when_under_limit():
     actions = [_action() for _ in range(3)]
     applied, deferred = cap_actions(actions, max_per_run=50)
