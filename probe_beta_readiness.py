@@ -16,7 +16,7 @@ ENV: DATABASE_URL, DIRECT_TOKEN, DIRECT_CLIENTS_JSON
 
 import json
 import os
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Dict, List
 
 import requests
@@ -210,6 +210,40 @@ def check_gate() -> Dict[str, Any]:
                               if c.get("status") == "FAIL"]}
 
 
+def check_gate_history(days: int = 5) -> Dict[str, Any]:
+    """Гейт, посчитанный на несколько дней назад, и дневной ряд расхода.
+
+    Красный гейт «здесь и сейчас» сам по себе ничего не говорит: он может
+    быть свойством СЕГОДНЯШНЕГО неполного дня, а не поломкой данных. Если
+    красным оказывается и вчера, и позавчера — дело в данных; если краснеет
+    только последний день — краснеть будет КАЖДЫЙ прогон, и это дефект
+    гейта, а не витрины.
+    """
+    out: Dict[str, Any] = {"by_day": {}}
+    for back in range(days):
+        day = date.today() - timedelta(days=back)
+        try:
+            gate = data_gate(day)
+            out["by_day"][day.isoformat()] = {
+                "status": gate.get("status"),
+                "latest_fact_date": gate.get("latest_fact_date"),
+                "reason": (gate.get("reason") or "")[:200],
+            }
+        except Exception as exc:  # noqa: BLE001
+            out["by_day"][day.isoformat()] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+    rows = writer_db._fetch(
+        """
+        SELECT fact_date::text AS d, round(sum(cost)::numeric, 0) AS cost
+          FROM edu_agent_facts
+         WHERE fact_date >= current_date - 14
+         GROUP BY 1 ORDER BY 1
+        """,
+        {},
+    )
+    out["daily_cost_mart"] = {r["d"]: float(r["cost"] or 0) for r in rows}
+    return out
+
+
 def check_holdout() -> Dict[str, Any]:
     try:
         return {"campaigns": len(agent_db.load_holdout_ids())}
@@ -329,6 +363,7 @@ def main() -> int:
         "schema": _safe("schema", check_schema),
         "config": _safe("config", check_config),
         "data_gate": _safe("data_gate", check_gate),
+        "gate_history": _safe("gate_history", check_gate_history),
         "runs": _safe("runs", check_runs),
         "actions": _safe("actions", check_actions),
         "rejects_7d": _safe("rejects", check_rejects),
