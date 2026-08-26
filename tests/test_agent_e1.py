@@ -2883,3 +2883,30 @@ def test_shortfall_travels_to_the_blackbox(monkeypatch, capsys):
     # одно бесконечное поле стоило бы всей истории прогона.
     text = json.dumps(saved["report"], ensure_ascii=False, default=str)
     assert "Infinity" not in text and "NaN" not in text
+
+
+def test_lane_shows_what_the_run_budget_cut_after_the_lane_let_it_through(
+        monkeypatch, capsys):
+    # Дефицит полосы — не последняя рельса на пути действия: за отбором стоит
+    # недельный риск-бюджет прогона, общий на все полосы и все кабинеты. Он
+    # срезает уже ВЗЯТОЕ полосой, и в блоке lanes этого было не видно.
+    #
+    # Убрать этот тест — и человек, увидев «полоса заявила 168 000 при потолке
+    # 50 000», поднимет ей ступень и не получит ничего: связывающим был не
+    # потолок полосы, а остаток недели. Ступень при этом уже поднята, то есть
+    # разрешено больше при том же результате.
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": list(range(101, 121))},
+        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+    )
+
+    assert agent_e1.main() == 0
+
+    report = [r for r in _reports(capsys) if "account" in r][0]
+
+    # Полоса пропустила пять, недельный бюджет оставил один.
+    assert report["lanes"]["taken"] == {"tuning": 5}
+    assert report["lanes"]["cut_by_run_budget"] == {"tuning": 4}
+    assert report["deferred_by_risk"] == 4
