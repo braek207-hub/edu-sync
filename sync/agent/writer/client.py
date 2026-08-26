@@ -73,20 +73,6 @@ WRITE_ATTEMPTS = 1
 BATCH_LIMIT = 10
 
 
-def split_batches(items, limit: int = BATCH_LIMIT):
-    """Список элементов → пачки не длиннее limit, ПОРЯДОК сохранён.
-
-    Порядок — не косметика: ответ Директа привязан к элементам позиционно
-    (result.*Results[i] описывает i-й отправленный элемент), и другого ключа
-    у него нет. Перетасовка при нарезке приписала бы исход одного действия
-    другому — то есть отметила бы применённым то, что кабинет отклонил.
-    """
-    if limit < 1:
-        raise ValueError(f"размер батча должен быть положительным: {limit}")
-    listed = list(items)
-    return [listed[start:start + limit] for start in range(0, len(listed), limit)]
-
-
 class DirectWriteError(RuntimeError):
     """Ошибка записи. outcome_unknown отделяет «запрос точно не ушёл» от
     «исход неизвестен».

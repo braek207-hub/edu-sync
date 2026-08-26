@@ -327,6 +327,12 @@ class _FakeWriteClient:
             "быть исключено ДО apply_actions"
         )
 
+    def mutate_batch(self, service, method, collection, items):
+        # Батч — ОДИН запрос (client.WriteClient.mutate_batch). Двойник
+        # обязан повторять форму настоящего транспорта: иначе прогон в тесте
+        # ходит одним путём, а в бою другим.
+        return self.mutate(service, method, {collection: list(items)})
+
 
 def test_main_excludes_action_and_reports_reason_when_baseline_cpa_empty(monkeypatch, capsys):
     # Сквозной тест правки по код-ревью: если справочник базовых CPA пуст
@@ -390,6 +396,12 @@ class _RecordingWriteClient:
     def mutate(self, service, method, params):
         self.sent.append((service, method, params))
         return {"dry_run": True}
+
+    def mutate_batch(self, service, method, collection, items):
+        # Батч — ОДИН запрос (client.WriteClient.mutate_batch). Двойник
+        # обязан повторять форму настоящего транспорта: иначе прогон в тесте
+        # ходит одним путём, а в бою другим.
+        return self.mutate(service, method, {collection: list(items)})
 
 
 def test_main_reports_unsupported_settings_instead_of_failing_on_them(monkeypatch, capsys):
@@ -588,6 +600,12 @@ class _MultiCabinetClient:
     def mutate(self, service, method, params):
         self.sent.append((service, method, params))
         return {"dry_run": True}
+
+    def mutate_batch(self, service, method, collection, items):
+        # Батч — ОДИН запрос (client.WriteClient.mutate_batch). Двойник
+        # обязан повторять форму настоящего транспорта: иначе прогон в тесте
+        # ходит одним путём, а в бою другим.
+        return self.mutate(service, method, {collection: list(items)})
 
 
 def _setting(kind, key, value, support=1000, calc_date=None):
@@ -1682,6 +1700,12 @@ class _StubMutateClient:
     def mutate(self, service, method, params):
         return {"dry_run": True} if self.dry_run else {}
 
+    def mutate_batch(self, service, method, collection, items):
+        # Батч — ОДИН запрос (client.WriteClient.mutate_batch). Двойник
+        # обязан повторять форму настоящего транспорта: иначе прогон в тесте
+        # ходит одним путём, а в бою другим.
+        return self.mutate(service, method, {collection: list(items)})
+
 
 def test_apply_actions_refuses_sandbox_write_client_without_touching_db():
     # Второй рубеж инварианта «песочный клиент журнала не касается»: даже
@@ -2078,6 +2102,12 @@ class _ScheduleClient:
     def mutate(self, service, method, params):
         self.sent.append((service, method, params))
         return {"dry_run": True}
+
+    def mutate_batch(self, service, method, collection, items):
+        # Батч — ОДИН запрос (client.WriteClient.mutate_batch). Двойник
+        # обязан повторять форму настоящего транспорта: иначе прогон в тесте
+        # ходит одним путём, а в бою другим.
+        return self.mutate(service, method, {collection: list(items)})
 
 
 def _patch_schedule_run(monkeypatch, settings, learning_resets=None):

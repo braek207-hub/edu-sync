@@ -333,14 +333,3 @@ def test_element_errors_do_not_raise_from_a_batch(monkeypatch):
 
     assert result["AddResults"][0]["Id"] == 1
     assert result["AddResults"][1]["Errors"]
-
-
-def test_split_batches_keeps_order_and_size():
-    # Порядок элементов — единственное, чем ответ Директа привязан к
-    # действию: результаты приходят позиционно. Перетасовка при нарезке
-    # приписала бы исход одного действия другому.
-    items = list(range(25))
-    chunks = client_module.split_batches(items)
-
-    assert [len(c) for c in chunks] == [10, 10, 5]
-    assert [x for c in chunks for x in c] == items
