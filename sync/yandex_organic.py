@@ -110,10 +110,15 @@ def fetch_organic(region: str, date_from: str, date_to: str, token: str) -> list
                 resp = r.json()
                 break
             # 429/5xx у Stat API транзиентны (как в lime_kz_metrika_api): ждём и повторяем.
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < RETRIES - 1:
+            # 400 тоже бывает транзиентным: прогон 26.08 (run 32977811190) получил его на
+            # KZ, а тот же запрос минутой позже вернул 200 — Метрика так отвечает на
+            # перегруз, поэтому повторяем и его, а текст ошибки кладём в исключение,
+            # иначе в логе остаётся только URL без причины.
+            if r.status_code in (400, 429, 500, 502, 503, 504) and attempt < RETRIES - 1:
                 time.sleep(RETRY_SLEEP * (attempt + 1))
                 continue
-            r.raise_for_status()
+            if r.status_code != 200:
+                raise RuntimeError(f"Stat API {r.status_code} [{region}]: {r.text[:300]}")
         if resp is None:
             break
         batch = parse_rows(resp, country_map)
