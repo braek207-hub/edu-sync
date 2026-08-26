@@ -363,3 +363,30 @@ def test_config_unavailable_is_visible_not_silent(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "CONFIG_UNAVAILABLE" in out
     assert "пулер лёг" in out
+
+
+# --- отчёт прогона -------------------------------------------------------
+
+def test_run_report_counts_exploration_separately():
+    """Разведочные сдвиги — своей строкой, а не в общем счётчике.
+
+    Они прошли планирование по другому основанию (незнание, а не доказанная
+    окупаемость). Слитые с обычными, они читались бы как уверенные решения
+    агента — и первый же недельный разбор беты приписал бы их качеству
+    модели.
+    """
+    from sync import agent_e1
+
+    plan = {"small_shift": 0, "low_confidence": [], "confidence_unknown": 0,
+            "exploration": [{"campaign_id": "1", "exploration_rub": 12_000.0},
+                            {"campaign_id": "2", "exploration_rub": 8_000.0}]}
+    report = agent_e1._budget_report(plan, {"1": {}, "2": {}}, planned_count=2)
+    assert report["exploration"]["count"] == 2
+    assert report["exploration"]["rub"] == pytest.approx(20_000.0)
+
+    quiet = agent_e1._budget_report(
+        {"small_shift": 0, "low_confidence": [], "confidence_unknown": 0,
+         "exploration": []}, {}, planned_count=0)
+    # Нулевая разведка не печатается: строка «0» в отчёте — шум без
+    # содержания, тем же правилом, что и уборка репетиционных строк.
+    assert "exploration" not in quiet

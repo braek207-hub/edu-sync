@@ -705,6 +705,17 @@ def _budget_report(
         "confidence_unknown": budget_plan["confidence_unknown"],
         "actions_planned": planned_count,
     }
+    # Разведочные сдвиги — отдельной строкой. Они прошли планирование по
+    # другому основанию (незнание, а не доказанная окупаемость), и слитые с
+    # обычными в общий счётчик выглядели бы как уверенные решения агента.
+    explored = budget_plan.get("exploration") or []
+    if explored:
+        out["exploration"] = {
+            "count": len(explored),
+            "rub": round(sum(float(r.get("exploration_rub") or 0.0)
+                             for r in explored), 2),
+            "sample": explored[:limit],
+        }
     if refused is not None:
         by_reason: Dict[str, int] = {}
         for row in refused:
