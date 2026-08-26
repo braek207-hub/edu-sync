@@ -15,6 +15,11 @@ load_dotenv()
 INCREMENTAL_WEEKS = 8
 # Регионы спроса Wordstat (ряды в lime_wordstat_demand[_daily] по колонке region).
 WORDSTAT_REGIONS = ("ru", "kz", "gcc")
+# Регионы органики Яндекса (Метрика; ряды в lime_yandex_organic). RU там не нужен —
+# в RU органику даёт Вебмастер (клики выдачи, длинная история).
+ORGANIC_REGIONS = ("kz", "gcc")
+# Окно перезаписи органики: Метрика досчитывает визиты сутки-двое, 90 дней с запасом.
+ORGANIC_WINDOW_DAYS = 90
 
 
 def main() -> None:
@@ -122,6 +127,25 @@ def main() -> None:
                 errors.append(f"gsc[{reg}]: {e}")
     else:
         print("gsc: пропуск (нет GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_SERVICE_ACCOUNT)")
+
+    # Органика Яндекса по гео (KZ, Залив) — Метрика: у API Вебмастера гео-среза нет
+    # (см. докстринг sync/yandex_organic.py). ORGANIC_FROM=YYYY-MM-DD → бэкфилл;
+    # иначе перезаписываем окно последних 90 дней (upsert идемпотентен).
+    if os.environ.get("LIME_METRIKA_TOKEN"):
+        for region in ORGANIC_REGIONS:
+            try:
+                from sync.yandex_organic import sync_yandex_organic
+
+                frm = os.environ.get("ORGANIC_FROM") or (
+                    dt.date.today() - dt.timedelta(days=ORGANIC_WINDOW_DAYS)
+                ).isoformat()
+                n = sync_yandex_organic(frm, dt.date.today().isoformat(), region)
+                print(f"yandex-organic[{region}]: {n} строк день×страна (с {frm})")
+            except Exception as e:
+                print(f"ОШИБКА yandex-organic[{region}]: {e}")
+                errors.append(f"yandex-organic[{region}]: {e}")
+    else:
+        print("yandex-organic: пропуск (нет LIME_METRIKA_TOKEN)")
 
     if errors:
         print(f"Завершено с ошибками: {errors}")

@@ -165,3 +165,31 @@ def test_subtract_days_clamps_negative():
         {"date": "2026-08-10", "clicks": 70, "impressions": 600},
         {"date": "2026-08-11", "clicks": 0, "impressions": 0},
     ]
+
+
+def test_aggregate_daily_sums_same_day_and_country():
+    """Дневная свёртка складывает строки одного дня и страны (две витрины одной страны),
+    а разные страны держит порознь — иначе executemany с ON CONFLICT записал бы
+    последнюю строку вместо суммы."""
+    from sync.gsc import aggregate_daily
+
+    rows = [
+        {"date": "2026-08-10", "clicks": 10, "impressions": 100, "country": "ОАЭ"},
+        {"date": "2026-08-10", "clicks": 5, "impressions": 50, "country": "ОАЭ"},
+        {"date": "2026-08-10", "clicks": 2, "impressions": 20, "country": "Катар"},
+        {"date": "2026-08-11", "clicks": 1, "impressions": 9, "country": "ОАЭ"},
+    ]
+    assert aggregate_daily(rows) == {
+        ("2026-08-10", "ОАЭ"): {"clicks": 15, "impressions": 150},
+        ("2026-08-10", "Катар"): {"clicks": 2, "impressions": 20},
+        ("2026-08-11", "ОАЭ"): {"clicks": 1, "impressions": 9},
+    }
+
+
+def test_aggregate_daily_defaults_country_to_empty():
+    """KZ приходит без страны (регион целиком) — ключ страны пустой, как в таблице."""
+    from sync.gsc import aggregate_daily
+
+    assert aggregate_daily([{"date": "2026-08-10", "clicks": 3, "impressions": 30}]) == {
+        ("2026-08-10", ""): {"clicks": 3, "impressions": 30},
+    }

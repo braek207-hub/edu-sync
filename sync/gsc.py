@@ -117,6 +117,22 @@ def aggregate_weekly(rows: list[dict]) -> dict[tuple, dict]:
     return out
 
 
+def aggregate_daily(rows: list[dict]) -> dict[tuple, dict]:
+    """[{date,clicks,impressions,country}] → {(day, country): {clicks, impressions}}.
+
+    Свёртка нужна, даже когда витрины страны не пересекаются: если однажды две витрины
+    получат одну страну, executemany с ON CONFLICT записал бы ПОСЛЕДНЮЮ строку вместо
+    суммы (внутри одного батча конфликт разрешается построчно).
+    """
+    out: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["date"], r.get("country", ""))
+        acc = out.setdefault(key, {"clicks": 0, "impressions": 0})
+        acc["clicks"] += int(r.get("clicks", 0) or 0)
+        acc["impressions"] += int(r.get("impressions", 0) or 0)
+    return out
+
+
 def _daily_query(service, site: str, start: str, end: str, filters: list[dict]) -> list[dict]:
     body = {
         "startDate": start,
@@ -212,6 +228,22 @@ def sync_gsc_seo(from_date: str, to_date: str, region: str = "kz") -> int:
                 """,
                 [(wk, region, country, v["clicks"], v["impressions"])
                  for (wk, country), v in sorted(weekly.items())],
+            )
+            # Дневной срез из ТЕХ ЖЕ строк — переключателю «Недели/Дни» на Google-вкладках.
+            # Отдельных запросов к API не нужно: fetch_site_totals и так снимает дни,
+            # неделя — их сумма. Пишем в одной транзакции с недельным, чтобы зерна не
+            # разъезжались (иначе после падения между двумя upsert'ами день и неделя
+            # показали бы разные числа за один и тот же период).
+            cur.executemany(
+                """
+                INSERT INTO lime_gsc_seo_daily (day, region, country, clicks, impressions, updated_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (day, region, country)
+                DO UPDATE SET clicks = EXCLUDED.clicks, impressions = EXCLUDED.impressions,
+                              updated_at = now()
+                """,
+                [(day, region, country, v["clicks"], v["impressions"])
+                 for (day, country), v in sorted(aggregate_daily(all_rows).items())],
             )
         conn.commit()
     return len(weekly)

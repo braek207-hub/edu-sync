@@ -17,6 +17,10 @@ on:
         description: "Бэкфилл GCC с даты (YYYY-MM-DD). История начинается с 2025-10-01. Пусто = инкремент."
         required: false
         default: ""
+      organic_from:
+        description: "Бэкфилл органики Яндекса (Метрика, KZ+Залив) с даты (YYYY-MM-DD). Пусто = окно 90 дней."
+        required: false
+        default: ""
 
 jobs:
   sync:
@@ -43,6 +47,8 @@ jobs:
           WORDSTAT_WEBMASTER_TOKEN: ${{ secrets.WORDSTAT_WEBMASTER_TOKEN }}
           YANDEX_SEARCHAPI_KEY: ${{ secrets.YANDEX_SEARCHAPI_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          LIME_METRIKA_TOKEN: ${{ secrets.LIME_METRIKA_TOKEN }}   # органика Яндекса по гео (KZ/Залив)
           WORDSTAT_FROM: ${{ github.event.inputs.wordstat_from }}
           GSC_FROM: ${{ github.event.inputs.gsc_from }}
           GCC_GSC_FROM: ${{ github.event.inputs.gcc_gsc_from }}
+          ORGANIC_FROM: ${{ github.event.inputs.organic_from }}
