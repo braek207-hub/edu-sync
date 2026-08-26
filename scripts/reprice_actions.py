@@ -15,9 +15,13 @@ scripts/reprice_actions.py — перевод журнала действий в
 «проверили и всё верно», поэтому второй список обязателен даже когда он
 длиннее первого.
 
-С --apply пишет новую цену только в живые строки за последние 28 дней:
-закрытые (rolled_back) и старые на недельный бюджет не влияют, трогать их
-незачем.
+С --apply пишет новую цену только в строки за последние 28 дней, которые
+РЕАЛЬНО ЗАНИМАЮТ недельный лимит, — writer_db.RISK_CHARGED_STATUSES. Это не
+то же, что LIVE_STATUSES: откатанная строка тоже платит риском, потому что
+экспозиция уже случилась и откат не возвращает деньги, потраченные за дни до
+него (см. spent_risk). Возьми фильтр по LIVE_STATUSES — и откатанные строки в
+старых ценах продолжили бы держать бюджет, а переоценка бы их не достала.
+Строки старше окна лимит уже не занимают: spent_risk считает неделю.
 
 Запуск: python scripts/reprice_actions.py [--apply] [--days 28]
 ENV: DATABASE_URL
@@ -46,17 +50,25 @@ DEFAULT_WINDOW_DAYS = 28
 # же модели, и переоценённая строка разошлась бы со строкой следующего прогона.
 COST_WINDOW_DAYS = 30
 
-SELECT_LIVE_SQL = """
+SELECT_CHARGED_SQL = """
     SELECT action_id, account, object_level, object_id, action_kind,
            direct_type, setting_key, payload, risk_rub, risk_basis,
            status, applied_at
     FROM edu_agent_actions
-    WHERE status IN (__LIVE_STATUSES__)
+    WHERE status IN (__CHARGED_STATUSES__)
       AND applied_at >= now() - make_interval(days => %s)
     ORDER BY applied_at
-""".replace("__LIVE_STATUSES__", writer_db._sql_literals(writer_db.LIVE_STATUSES))
+""".replace("__CHARGED_STATUSES__",
+            writer_db._sql_literals(writer_db.RISK_CHARGED_STATUSES))
 
-UPDATE_SQL = "UPDATE edu_agent_actions SET risk_rub = %s WHERE action_id = %s"
+# Пишется и основание цены. Пустой risk_basis — это и есть признак «строку
+# оценивала модель до дельты» (колонка появилась вместе с ней, и по ней же
+# reprice.plan отличает уже пересчитанное). Записать новую цену, оставив
+# основание пустым, значило бы сделать переоценённую строку неотличимой от
+# непереоценённой — то есть повторить ровно ту неоднозначность, ради снятия
+# которой этот скрипт написан.
+UPDATE_SQL = ("UPDATE edu_agent_actions SET risk_rub = %s, risk_basis = %s "
+              "WHERE action_id = %s")
 
 
 def _daily_cost_on(day: date, cache: Dict[date, Dict[str, float]]) -> Dict[str, float]:
@@ -108,7 +120,8 @@ def apply_plan(repriced: List[Dict[str, Any]]) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             for row in repriced:
-                cur.execute(UPDATE_SQL, (row["new"], row["action_id"]))
+                cur.execute(UPDATE_SQL,
+                            (row["new"], row["basis"], row["action_id"]))
         conn.commit()
     return len(repriced)
 
@@ -121,14 +134,14 @@ def main() -> int:
                         help="глубина окна по applied_at, дней")
     args = parser.parse_args()
 
-    rows = writer_db._fetch(SELECT_LIVE_SQL, (int(args.days),))
+    rows = writer_db._fetch(SELECT_CHARGED_SQL, (int(args.days),))
     if not rows:
-        print(f"живых строк за {args.days} дн. нет — переоценивать нечего")
+        print(f"строк под риском за {args.days} дн. нет — переоценивать нечего")
         return 0
 
     repriced, untouched = build_plan(rows)
 
-    print(f"живых строк в окне {args.days} дн.: {len(rows)}")
+    print(f"строк под риском в окне {args.days} дн.: {len(rows)}")
     print(f"\nпереоценить ({len(repriced)}):")
     for row in repriced:
         print(f"  {row['action_id']}  {row['action_kind']}  "

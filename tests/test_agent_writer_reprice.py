@@ -161,3 +161,39 @@ def test_unchanged_price_is_reported_instead_of_a_silent_no_op_update():
         [{**ACTION, "risk_rub": priced}], SHARES, DAILY)
     assert repriced == []
     assert "не изменилась" in untouched[0]["reason"]
+
+
+# --- скрипт переоценки: какие строки он вообще достаёт ---------------------
+
+def _reprice_script():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "reprice_actions.py"
+    spec = importlib.util.spec_from_file_location("reprice_actions", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_script_reprices_every_status_that_holds_the_weekly_budget():
+    # Фильтр по LIVE_STATUSES был бы уже. Откатанная строка платит риском
+    # наравне с применённой (writer/db.spent_risk: экспозиция уже случилась,
+    # откат не возвращает потраченного) — оставь её в старой цене, и она
+    # продолжит держать недельный лимит, а переоценка её не достанет.
+    from sync.agent.writer import db as writer_db
+
+    sql = _reprice_script().SELECT_CHARGED_SQL
+
+    for status in writer_db.RISK_CHARGED_STATUSES:
+        assert f"'{status}'" in sql, f"статус {status} держит бюджет, но не переоценивается"
+    assert "'rolled_back'" in sql
+
+
+def test_script_writes_the_basis_along_with_the_new_price():
+    # Пустой risk_basis — признак цены до дельта-модели, по нему же
+    # reprice.plan пропускает уже пересчитанные строки. Записать цену без
+    # основания значило бы оставить строку неотличимой от непереоценённой.
+    sql = _reprice_script().UPDATE_SQL
+
+    assert "risk_rub" in sql and "risk_basis" in sql
