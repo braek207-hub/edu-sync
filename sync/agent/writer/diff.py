@@ -13,9 +13,9 @@ previous_state заполняется ДО применения: без него
 """
 
 import hashlib
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from sync.agent.writer import exposure, schedule
+from sync.agent.writer import expectation, exposure, schedule
 
 
 def _idempotency_key(campaign_id: str, direct_type: str, key: str, percent: int) -> str:
@@ -36,7 +36,8 @@ def _schedule_idempotency_key(campaign_id: str, items: List[str]) -> str:
 
 
 def diff_schedule(
-    desired_items: List[str], time_targeting: Dict[str, Any], campaign_id: str
+    desired_items: List[str], time_targeting: Dict[str, Any], campaign_id: str,
+    context: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Действие по расписанию, если оно отличается от стоящего в кабинете.
 
@@ -47,6 +48,11 @@ def diff_schedule(
     откат обязан вернуть кампанию туда, откуда её вывели, вместе с праздничным
     режимом и учётом рабочих выходных. Сохрани мы одни часы — откат собрал бы
     блок заново и стёр бы соседние поля, которые настроил человек.
+
+    context — экономика кампании (расход в день, цена лида), из которой
+    считается ОЖИДАНИЕ действия (writer/expectation.py). Не передана —
+    действие уезжает без обещания: выдумать курс «рубли → лиды» здесь не из
+    чего, а ноль петля обучения зачла бы сбывшимся прогнозом.
     """
     if not desired_items:
         return []
@@ -57,7 +63,7 @@ def diff_schedule(
         "CampaignId": int(campaign_id),
         "TimeTargeting": schedule.time_targeting_payload(time_targeting, desired_items),
     }
-    return [{
+    return [expectation.attach({
         "action_kind": "schedule.set",
         "object_level": "campaign",
         "object_id": str(campaign_id),
@@ -73,13 +79,19 @@ def diff_schedule(
         "payload": payload,
         "previous_state": {"TimeTargeting": time_targeting or {}},
         "idempotency_key": _schedule_idempotency_key(campaign_id, desired_items),
-    }]
+    }, context)]
 
 
 def diff_modifiers(
-    desired: List[Dict[str, Any]], actual: List[Dict[str, Any]], campaign_id: str
+    desired: List[Dict[str, Any]], actual: List[Dict[str, Any]], campaign_id: str,
+    context: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """Действия, которых не хватает, чтобы факт совпал с планом."""
+    """Действия, которых не хватает, чтобы факт совпал с планом.
+
+    context — экономика кампании для ожидания, как у diff_schedule. Доля
+    сегмента к ней добавляется здесь: она своя у каждого действия, а расход и
+    цена лида — общие на кампанию.
+    """
     actual_by_key = {(a.get("Type"), str(a.get("key"))): a for a in actual}
 
     actions: List[Dict[str, Any]] = []
@@ -112,7 +124,7 @@ def diff_modifiers(
         else:
             continue
 
-        actions.append({
+        actions.append(expectation.attach({
             "action_kind": action_kind,
             "object_level": "campaign",
             "object_id": str(campaign_id),
@@ -131,5 +143,5 @@ def diff_modifiers(
             "idempotency_key": _idempotency_key(
                 campaign_id, item["direct_type"], item["key"], percent
             ),
-        })
+        }, {**(context or {}), "segment_share": item.get("share")}))
     return actions

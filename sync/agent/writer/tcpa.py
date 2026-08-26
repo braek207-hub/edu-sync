@@ -28,7 +28,7 @@ import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.confidence import assess
-from sync.agent.writer import exposure
+from sync.agent.writer import exposure, expectation
 
 MICROS = 1_000_000
 
@@ -38,6 +38,13 @@ TCPA_KIND = "tcpa.set"
 # (writer/plan.OWN_LEVER_KINDS) ссылался на один источник, а не на копию
 # строкового литерала.
 TCPA_SETTING_KIND = "tcpa_target"
+
+# Откуда рычаг берёт расход кампании для ОЖИДАНИЯ: целевая строка портфеля
+# (portfolio.computed_rows) считана Э3.2 на том же окне и по тем же фактам.
+# Своя копия этих чисел в строках Э3.5 разъехалась бы с ней при первой правке.
+BUDGET_TARGET_SETTING = "budget_target"
+BUDGET_TARGET_KEY = "target_28d"
+WINDOW_DAYS = 28.0
 
 # Кап шага НА ЗАПИСИ — от текущей цели (см. докстринг). Тот же размер, что у
 # бюджета: правило спеки «не больше ±20 % за такт» общее для денежных ручек.
@@ -171,6 +178,7 @@ def plan_tcpa_moves(
             })
             continue
         desired[str(cid)] = {
+            **_window_cost(rows),
             "target": target,
             "current": current,
             "ratio": round(ratio, 4),
@@ -185,6 +193,21 @@ def plan_tcpa_moves(
         "low_confidence": low_confidence,
         "confidence_unknown": confidence_unknown,
     }
+
+
+def _window_cost(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Расход окна из целевой строки портфеля — или пусто.
+
+    Пусто значит «строки нет», и ожидание по этой цели не заявится: ноль
+    расхода означал бы «двигать цель нечему», а это другое утверждение.
+    """
+    row = next((r for r in rows
+                if str(r.get("setting_kind")) == BUDGET_TARGET_SETTING
+                and str(r.get("setting_key")) == BUDGET_TARGET_KEY), None)
+    if row is None:
+        return {}
+    cost = float(row.get("raw_value") or 0.0)
+    return {"cost_28d": cost} if cost > 0 else {}
 
 
 def diff_tcpa(
@@ -229,7 +252,7 @@ def diff_tcpa(
         if abs(target_micros - current_micros) < ALREADY_SET_TOLERANCE * current_micros:
             continue
 
-        actions.append({
+        actions.append(expectation.attach({
             "action_kind": TCPA_KIND,
             "object_level": "campaign",
             "object_id": str(cid),
@@ -251,8 +274,19 @@ def diff_tcpa(
                 "TargetCpa": current_micros,
             },
             "idempotency_key": _idempotency_key(str(cid), target_micros),
-        })
+        }, _expectation_context(move)))
     return actions, refused
+
+
+def _expectation_context(move: Dict[str, Any]) -> Dict[str, float]:
+    """Расход кампании за день — вход ожидания (writer/expectation.py).
+
+    Цена лида отсюда не едет: прирост расхода от новой цели покупает лиды по
+    САМОЙ цели, а не по прошлой средней. Иначе повышение цели обещало бы лиды
+    по старой цене — то есть обещало бы то, ради отказа от чего его и делают.
+    """
+    cost = float(move.get("cost_28d") or 0.0)
+    return {"daily_cost_rub": cost / WINDOW_DAYS} if cost > 0 else {}
 
 
 def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:

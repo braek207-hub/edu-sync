@@ -17,7 +17,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.objects import CANDIDATE_WINDOW_DAYS
-from sync.agent.writer import exposure
+from sync.agent.writer import exposure, expectation
 
 PLACEMENT_KIND = "placement.exclude"
 PLACEMENT_SETTING_KIND = "excluded_site"
@@ -82,22 +82,33 @@ def plan_placements(
     desired: Dict[str, List[str]] = {}
     # Вырезаемый расход по кампаниям — вход цены риска, как у минус-фраз.
     cut_cost: Dict[str, float] = {}
+    # Конверсии вырезаемого трафика — вход ожидания, тем же правилом и по той
+    # же причине, что у минус-фраз (writer/negatives.plan_negatives).
+    cut_conversions: Dict[str, float] = {}
     for candidate in taken:
         split = candidate.get("cost_by_campaign") or {}
+        cost_total = sum(float(v) for v in split.values()) or float(
+            candidate.get("cost") or 0.0)
+        conversions = float(candidate.get("conversions") or 0.0)
         for campaign_id in candidate.get("campaigns") or []:
             if not campaign_id:
                 continue
             sites = desired.setdefault(str(campaign_id), [])
             if candidate["site"] not in sites:
                 sites.append(candidate["site"])
-            cut_cost[str(campaign_id)] = cut_cost.get(str(campaign_id), 0.0) + float(
-                split.get(str(campaign_id), 0.0))
+            campaign_cost = float(split.get(str(campaign_id), 0.0))
+            cut_cost[str(campaign_id)] = cut_cost.get(str(campaign_id), 0.0) + campaign_cost
+            share = (campaign_cost / cost_total) if cost_total > 0 else 0.0
+            cut_conversions[str(campaign_id)] = (
+                cut_conversions.get(str(campaign_id), 0.0) + conversions * share)
     for sites in desired.values():
         sites.sort()
 
     return {
         "desired": desired,
         "cut_cost": {cid: round(v, 2) for cid, v in sorted(cut_cost.items())},
+        "cut_conversions": {cid: round(v, 2)
+                            for cid, v in sorted(cut_conversions.items())},
         "over_cap": len(valid) - len(taken),
         "invalid": invalid,
         "cost_covered": round(sum(float(c.get("cost") or 0.0) for c in taken), 2),
@@ -132,6 +143,7 @@ def diff_placements(
     actual_by_campaign: Dict[str, Dict[str, Any]],
     cut_cost: Optional[Dict[str, float]] = None,
     window_days: int = CANDIDATE_WINDOW_DAYS,
+    cut_conversions: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Желаемые запреты × прочитанные списки кабинета → (действия, отказы)."""
     actions: List[Dict[str, Any]] = []
@@ -151,7 +163,11 @@ def diff_placements(
             continue
 
         cut_daily = float((cut_cost or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
-        actions.append({
+        # Потерянные лиды — по тому же окну, что и деньги: обещание и цена
+        # риска обязаны стоять на одном окне.
+        lost_leads_daily = float(
+            (cut_conversions or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
+        actions.append(expectation.attach({
             "action_kind": PLACEMENT_KIND,
             "object_level": "campaign",
             "object_id": str(campaign_id),
@@ -166,7 +182,7 @@ def diff_placements(
             },
             "previous_state": {"ExcludedSites": {"Items": sorted(existing)}},
             "idempotency_key": _idempotency_key(str(campaign_id), merged),
-        })
+        }, {"cut_conversions_per_day": lost_leads_daily}))
     return actions, refused
 
 

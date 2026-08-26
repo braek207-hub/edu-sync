@@ -29,10 +29,19 @@ import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.confidence import assess
-from sync.agent.writer import exposure
+from sync.agent.writer import exposure, expectation
 
 SWITCH_KIND = "campaign.suspend"
 CAMPAIGN_SWITCH_SETTING = "campaign_switch"
+
+# Откуда рычаг берёт экономику кампании для ОЖИДАНИЯ: расход окна и лиды окна
+# лежат в целевой строке портфеля (portfolio.computed_rows: value — целевой
+# расход, raw_value — текущий, support_n — лиды окна). Заводить те же числа
+# второй строкой в Э3.4 значило бы держать два источника одной правды — и
+# разъехаться на первой же правке одного из них.
+BUDGET_TARGET_SETTING = "budget_target"
+BUDGET_TARGET_KEY = "target_28d"
+WINDOW_DAYS = 28.0
 
 # Не больше одного выключения за прогон — см. докстринг модуля.
 MAX_SUSPENDS_PER_RUN = 1
@@ -102,10 +111,31 @@ def plan_switch_offs(
             "roi_at_floor": float(row.get("raw_value") or 0.0),
             "calc_date": str(row.get("calc_date") or ""),
             "p_sign": verdict["p_sign"],
+            **_window_economics(rows),
         }
 
     return {"desired": desired, "low_confidence": low_confidence,
             "confidence_unknown": confidence_unknown}
+
+
+def _window_economics(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Расход и лиды окна из целевой строки портфеля — или пусто.
+
+    Пусто значит «строки нет»: выключение всё равно спланируется (его вердикт
+    стоит на своей строке), но ожидание по нему не заявится. Подставить сюда
+    ноль нельзя — «кампания не тратит и не приносит» это другое утверждение,
+    и по нему выключение выглядело бы бесплатным.
+    """
+    row = next((r for r in rows
+                if str(r.get("setting_kind")) == BUDGET_TARGET_SETTING
+                and str(r.get("setting_key")) == BUDGET_TARGET_KEY), None)
+    if row is None:
+        return {}
+    cost = float(row.get("raw_value") or 0.0)
+    leads = float(row.get("support_n") or 0.0)
+    if cost <= 0 or leads <= 0:
+        return {}
+    return {"cost_28d": cost, "leads_28d": leads}
 
 
 def fetch_campaign_states(client, campaign_ids: List[str]) -> Dict[str, str]:
@@ -157,7 +187,7 @@ def diff_switch(
             refused.append({"campaign_id": str(cid),
                             "reason": NOT_ON_REASON.format(state=state or "—")})
             continue
-        actions.append({
+        actions.append(expectation.attach({
             "action_kind": SWITCH_KIND,
             "object_level": "campaign",
             "object_id": str(cid),
@@ -174,9 +204,19 @@ def diff_switch(
             # явного присутствия, а не выводит «раз выключали, был включён».
             "previous_state": {"State": "ON"},
             "idempotency_key": _idempotency_key(str(cid), move["calc_date"]),
-        })
+        }, _expectation_context(move)))
 
     return actions, refused
+
+
+def _expectation_context(move: Dict[str, Any]) -> Dict[str, float]:
+    """Экономика кампании за день — вход ожидания (writer/expectation.py)."""
+    cost = float(move.get("cost_28d") or 0.0)
+    leads = float(move.get("leads_28d") or 0.0)
+    if cost <= 0 or leads <= 0:
+        return {}
+    return {"daily_cost_rub": cost / WINDOW_DAYS,
+            "leads_per_day": leads / WINDOW_DAYS}
 
 
 def cap_suspends(

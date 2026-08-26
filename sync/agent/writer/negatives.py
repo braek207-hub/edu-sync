@@ -30,7 +30,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.objects import CANDIDATE_WINDOW_DAYS
-from sync.agent.writer import exposure
+from sync.agent.writer import exposure, expectation
 
 NEGATIVE_KIND = "negative.add"
 
@@ -113,22 +113,40 @@ def plan_negatives(
     # минус: вход цены риска. Считается по той же выборке taken, что и сами
     # фразы, — иначе рычаг платил бы за трафик, который не отсекает.
     cut_cost: Dict[str, float] = {}
+    # Сколько конверсий этот трафик всё-таки приносил: вход ОЖИДАНИЯ
+    # (writer/expectation.py). У кандидата zero_conversions их нет по
+    # построению, у кандидата cpa_above_limit они есть — и отсечение их
+    # теряет. Обещать «лидов не потеряем» там, где режется конверсионный
+    # трафик, значило бы заранее назначить наблюдению провал.
+    cut_conversions: Dict[str, float] = {}
     for candidate in taken:
         split = candidate.get("cost_by_campaign") or {}
+        cost_total = sum(float(v) for v in split.values()) or float(
+            candidate.get("cost") or 0.0)
+        conversions = float(candidate.get("conversions") or 0.0)
         for campaign_id in candidate.get("campaigns") or []:
             if not campaign_id:
                 continue
             phrases = desired.setdefault(str(campaign_id), [])
             if candidate["phrase"] not in phrases:
                 phrases.append(candidate["phrase"])
-            cut_cost[str(campaign_id)] = cut_cost.get(str(campaign_id), 0.0) + float(
-                split.get(str(campaign_id), 0.0))
+            campaign_cost = float(split.get(str(campaign_id), 0.0))
+            cut_cost[str(campaign_id)] = cut_cost.get(str(campaign_id), 0.0) + campaign_cost
+            # Конверсии фразы разложены по кампаниям ПО ДЕНЬГАМ: разрез
+            # «фраза × кампания» их не несёт, а делить поровну значило бы
+            # приписать одинаковую потерю кампании с расходом 100 ₽ и
+            # кампании с расходом 100 000 ₽.
+            share = (campaign_cost / cost_total) if cost_total > 0 else 0.0
+            cut_conversions[str(campaign_id)] = (
+                cut_conversions.get(str(campaign_id), 0.0) + conversions * share)
     for phrases in desired.values():
         phrases.sort()
 
     return {
         "desired": desired,
         "cut_cost": {cid: round(v, 2) for cid, v in sorted(cut_cost.items())},
+        "cut_conversions": {cid: round(v, 2)
+                            for cid, v in sorted(cut_conversions.items())},
         "over_cap": over_cap,
         "invalid": invalid,
         "cost_covered": round(sum(float(c.get("cost") or 0.0) for c in taken), 2),
@@ -166,6 +184,7 @@ def diff_negatives(
     actual_by_campaign: Dict[str, Dict[str, Any]],
     cut_cost: Optional[Dict[str, float]] = None,
     window_days: int = CANDIDATE_WINDOW_DAYS,
+    cut_conversions: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Желаемые фразы × прочитанные списки кабинета → (действия, отказы).
 
@@ -195,7 +214,11 @@ def diff_negatives(
         # собран за окно наблюдения (CANDIDATE_WINDOW_DAYS), поэтому делится
         # на него: горизонт замера риска считает дни, а не окна.
         cut_daily = float((cut_cost or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
-        actions.append({
+        # Конверсии вырезаемого трафика — тем же делением на окно, что и
+        # деньги: обещание и цена риска обязаны стоять на одном окне.
+        lost_leads_daily = float(
+            (cut_conversions or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
+        actions.append(expectation.attach({
             "action_kind": NEGATIVE_KIND,
             "object_level": "campaign",
             "object_id": str(campaign_id),
@@ -213,7 +236,7 @@ def diff_negatives(
                 "NegativeKeywords": {"Items": sorted(existing)},
             },
             "idempotency_key": _idempotency_key(str(campaign_id), merged),
-        })
+        }, {"cut_conversions_per_day": lost_leads_daily}))
     return actions, refused
 
 
