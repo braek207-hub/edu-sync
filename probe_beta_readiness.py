@@ -242,7 +242,20 @@ def check_bets(days: int = 30) -> Dict[str, Any]:
         """,
         {},
     )
+    # Голодает или сломан: если бюджетных действий в журнале нет вовсе,
+    # разведку срезали ВЫШЕ payload (кап прогона, риск-бюджет, кулдаун);
+    # если есть, а признака нет — обрыв именно в сборке payload.
+    kinds = writer_db._fetch(
+        """
+        SELECT action_kind, COUNT(*) AS cnt
+          FROM edu_agent_actions
+         WHERE created_at >= now() - make_interval(days => %(days)s)
+         GROUP BY 1 ORDER BY 2 DESC
+        """,
+        {"days": days},
+    )
     return {
+        "action_kinds_30d": {str(r["action_kind"]): int(r["cnt"]) for r in kinds},
         "exploration_actions": {str(r["status"]): int(r["cnt"]) for r in marked},
         "registry_by_status": {str(r["status"]): int(r["cnt"]) for r in reg},
         "computed_exploration_rub": [
