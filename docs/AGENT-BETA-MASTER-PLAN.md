@@ -353,10 +353,31 @@ UI — Next.js 16 в репозитории `d:\vscode\EDU v2` (`components/plat
 - Создать: `scripts/reprice_actions.py`
 - Тест: `tests/test_agent_writer_reprice.py`
 
+**Откуда берётся доля сегмента.** Блока `exposure` в журнале НЕТ: `INSERT_ACTION_SQL`
+пишет `payload`, `direct_type`, `setting_key`, `risk_basis`, `baseline_daily_rub`, но
+не сам `exposure`. Пересчёт «по правилу неизвестной доли» дал бы ту же старую цену
+(доля неизвестна → под ударом весь объект), то есть ничего бы не изменил.
+
+Доля восстанавливается из расчёта Э0 **на дату действия**:
+`edu_agent_computed_settings` хранит строки с `calc_date`, `setting_kind`,
+`setting_key`, `support_n`, а доля считается тем же `writer/plan.segment_shares`,
+что и при первичной оценке. Ключ соединения — `(direct_type, setting_key)` строки
+журнала. Это не приближение и не догадка: та же формула на тех же данных, только
+взятых из истории, а не из памяти прогона.
+
+Строка, для которой доля не нашлась (расчёт того дня не сохранился, вид действия
+доли не имеет), **не переоценивается** и уходит в отдельный список отчёта.
+Молчаливое «оставили как есть» неотличимо от «проверили и всё верно».
+
 **Интерфейсы:**
-- Потребляет: `writer/exposure.daily_rub`, `writer/risk.{object_daily_cost, action_risk}`
-- Отдаёт: `reprice.recompute(action, daily_cost_by_campaign) -> Optional[float]`,
-  `reprice.plan(rows, daily_cost) -> List[Dict]` (строки с `action_id`, `old`, `new`, `reason`)
+- Потребляет: `writer/plan.segment_shares`, `writer/exposure.daily_rub`,
+  `writer/risk.{object_daily_cost, action_risk}`, `agent_db` (чтение
+  `edu_agent_computed_settings` на дату)
+- Отдаёт: `reprice.share_for(action, computed_on_date) -> Optional[float]`,
+  `reprice.recompute(action, share, daily_cost_by_campaign) -> Optional[float]`,
+  `reprice.plan(rows, shares, daily_cost) -> Tuple[List[Dict], List[Dict]]`
+  (переоценённые строки с `action_id`/`old`/`new`/`basis`; и отдельно —
+  непереоценённые с причиной)
 
 - [ ] **Шаг 1: тест «строка старой модели переоценивается в дельту»**
 
@@ -364,51 +385,80 @@ UI — Next.js 16 в репозитории `d:\vscode\EDU v2` (`components/plat
 def test_pre_delta_row_is_repriced_to_its_delta():
     action = {"action_id": "a1", "action_kind": "bidmodifier.add",
               "object_level": "campaign", "object_id": "114057545",
-              "risk_rub": 38876.0,
-              "payload": {"BidModifier": -43},
-              "exposure": {"kind": "bid_modifier", "percent": -43,
-                           "segment_share": 0.04}}
-    new = reprice.recompute(action, {"114057545": 5553.71})
+              "risk_rub": 38876.0, "risk_basis": None,
+              "direct_type": "AGE", "setting_key": "AGE_55",
+              "payload": {"BidModifier": -43}}
+    share = reprice.share_for(action, _computed_on("2026-08-22"))   # 0.04
+    new = reprice.recompute(action, share, {"114057545": 5553.71})
     assert new is not None
     assert new < 5000.0, f"дельта сегмента 4% не может стоить {new}"
 ```
 
-- [ ] **Шаг 2: тест «переоценка идемпотентна»**
+- [ ] **Шаг 2: тест «доля берётся из расчёта на дату действия, а не из сегодняшнего»**
+
+```python
+def test_share_comes_from_the_calc_of_the_action_date():
+    action = {"direct_type": "AGE", "setting_key": "AGE_55",
+              "applied_at": "2026-08-22T08:40:00+00:00"}
+    assert reprice.share_for(action, _computed_on("2026-08-22")) == 0.04
+    assert reprice.share_for(action, _computed_on("2026-08-26")) == 0.31
+```
+
+Сегодняшняя доля сегмента — уже следствие того самого действия, которое мы
+переоцениваем. Считать по ней значило бы судить причину по её последствию.
+
+- [ ] **Шаг 3: тест «переоценка идемпотентна»**
 
 ```python
 def test_repricing_twice_changes_nothing():
-    action = {...}                       # та же строка
-    first = reprice.recompute(action, DAILY)
-    action = {**action, "risk_rub": first}
-    assert reprice.recompute(action, DAILY) == first
+    first = reprice.recompute(ACTION, SHARE, DAILY)
+    assert reprice.recompute({**ACTION, "risk_rub": first}, SHARE, DAILY) == first
 ```
 
-- [ ] **Шаг 3: тест «строка без exposure не переоценивается молча»**
+- [ ] **Шаг 4: тест «доля не нашлась — строка не трогается и попадает в список»**
 
 ```python
-def test_row_without_exposure_is_not_silently_zeroed():
+def test_row_without_a_share_is_not_repriced_and_is_named():
     action = {"action_id": "a2", "action_kind": "schedule.set",
-              "object_id": "999", "risk_rub": 12000.0, "payload": {}}
-    assert reprice.recompute(action, {"999": 1000.0}) is None
+              "object_id": "999", "risk_rub": 12000.0,
+              "direct_type": None, "setting_key": None, "payload": {}}
+    repriced, untouched = reprice.plan([action], {}, {"999": 1000.0})
+    assert repriced == []
+    assert untouched[0]["reason"], "строка исчезла из отчёта молча"
 ```
 
 Молчаливый ноль здесь — та же дыра, что в `risk.object_daily_cost`: строку без
 основания цены переоценивать не из чего, и она обязана остаться как есть, а
 скрипт обязан назвать её в отчёте.
 
-- [ ] **Шаг 4: красный прогон** — `pytest tests/test_agent_writer_reprice.py -v`,
-      ожидание FAIL «module has no attribute recompute».
-- [ ] **Шаг 5: реализация** `recompute` = `risk.action_risk` по сохранённому
-      `exposure` строки, `None` если `exposure` пуст или расход неизвестен.
-- [ ] **Шаг 6: зелёный прогон.**
-- [ ] **Шаг 7: скрипт переоценки** `scripts/reprice_actions.py`:
+- [ ] **Шаг 5: тест «строка, уже посчитанная дельта-моделью, не переоценивается»**
+
+```python
+def test_row_already_priced_by_the_delta_model_is_skipped():
+    action = {**ACTION, "risk_basis": "сегмент 4.0% объекта × сдвиг 86%"}
+    repriced, _ = reprice.plan([action], SHARES, DAILY)
+    assert repriced == []
+```
+
+Заполненный `risk_basis` — признак, что строку писала уже дельта-модель:
+колонка появилась вместе с ней. Переоценивать такую значит рисковать сдвигом
+цены при неизменной модели.
+
+- [ ] **Шаг 6: красный прогон** — `pytest tests/test_agent_writer_reprice.py -v`,
+      ожидание FAIL «module has no attribute share_for».
+- [ ] **Шаг 7: реализация.** `share_for` — `plan.segment_shares` по строкам
+      `edu_agent_computed_settings` того `calc_date`, что не позже даты действия;
+      `recompute` — `risk.action_risk` по собранному из доли `exposure`, `None`
+      если доли нет или расход неизвестен.
+- [ ] **Шаг 8: зелёный прогон.**
+- [ ] **Шаг 9: скрипт переоценки** `scripts/reprice_actions.py`:
       по умолчанию печатает план (`action_id`, было, стало, основание), с
       `--apply` пишет `UPDATE edu_agent_actions SET risk_rub = %s WHERE action_id = %s`
       **только для строк со статусом из `LIVE_STATUSES` и applied_at за последние
       28 дней** — закрытые и старые строки на бюджет не влияют, трогать их незачем.
-- [ ] **Шаг 8: прогон через Actions** (`DATABASE_URL` — секрет), сначала без
+- [ ] **Шаг 10: прогон через Actions** (`DATABASE_URL` — секрет), сначала без
       `--apply`, план в отчёт задачи; затем с `--apply`.
-- [ ] **Шаг 9: коммит**
+- [ ] **Шаг 11: коммит**
 
 ```bash
 git add sync/agent/writer/reprice.py scripts/reprice_actions.py tests/test_agent_writer_reprice.py
