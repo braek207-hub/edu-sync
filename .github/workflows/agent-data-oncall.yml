@@ -1,0 +1,82 @@
+name: Дежурный по данным
+
+# Первый кодер-агент. Сторож свежести (data-health.yml) заводит тикет с меткой
+# data-health — агент берёт этот тикет, находит причину и либо открывает PR с фиксом,
+# либо пишет разбор в комментарий. Инструкция агента — .claude/skills/data-oncall/.
+#
+# Оплата: не API-ключом, а токеном подписки (claude setup-token → секрет
+# CLAUDE_CODE_OAUTH_TOKEN). Минуты Actions здесь бесплатны — репозиторий публичный,
+# — но лимит подписки общий с интерактивной работой, поэтому max-turns и timeout
+# стоят жёстко и снимать их нельзя.
+#
+# Тикет заводит github-actions[bot], а действие по умолчанию отказывается работать
+# по триггеру от бота (защита от петли) — отсюда allowed_bots.
+on:
+  issues:
+    types: [opened, labeled]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Номер тикета для разбора"
+        required: true
+
+permissions:
+  contents: write # своя ветка под PR
+  issues: write # комментарий в тикет
+  pull-requests: write
+  actions: read # чтение логов прогонов синков — основной источник диагноза
+  id-token: write
+
+concurrency:
+  group: data-oncall-${{ github.event.issue.number || github.event.inputs.issue }}
+  cancel-in-progress: false
+
+jobs:
+  oncall:
+    # Только тикеты сторожа. Без этого условия агент просыпался бы на каждый тикет.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.issue.labels.*.name, 'data-health')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # агенту нужна история: когда именно поехало
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      # Пока токен не заведён, агента просто нет: тикет сторожа остаётся человеку.
+      # Молча пропустить, а не упасть — иначе к письму «данные протухли» добавится
+      # второе, «агент не смог», и оба перестанут читаться.
+      - name: Есть ли токен подписки
+        id: auth
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::CLAUDE_CODE_OAUTH_TOKEN не заведён — дежурный пропущен."
+            echo "Завести: claude setup-token, значение в секреты репозитория."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: anthropics/claude-code-action@v1
+        if: steps.auth.outputs.ready == 'true'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "github-actions[bot]"
+          prompt: "/data-oncall Разбери тикет #${{ github.event.issue.number || github.event.inputs.issue }}"
+          claude_args: |
+            --max-turns 40
+            --permission-mode acceptEdits
+        env:
+          # Только чтение — запрет на запись в базу прописан в инструкции агента.
+          # Отдельной read-only роли пока нет, это следующий шаг.
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
