@@ -24,6 +24,7 @@ import sync.agent.writer.apply as apply_mod
 import sync.agent.writer.db as writer_db
 from sync.agent.writer.apply import _element_errors, apply_actions, to_api_call
 from sync.agent.writer.client import DirectWriteError, is_outcome_unknown
+from sync.agent import rejects
 from sync.agent.writer.db import ensure_writer_tables
 from sync.db import get_connection
 
@@ -181,7 +182,7 @@ def test_apply_actions_marks_applied_on_clean_success():
 
     assert report == {"applied": 1, "skipped": 0, "failed": 0, "rejected": 0,
                        "dry_run": 0, "unknown_outcome": 0, "conflicted": 0,
-                       "deferred": 0, "units_low": 0,
+                       "deferred": 0, "units_low": 0, "rejects": [],
                        "details": [{"key": "k1", "result": "applied"}]}
     assert db.rows["k1"]["status"] == "applied"
     assert len(client.calls) == 1
@@ -228,7 +229,7 @@ def test_apply_actions_repeat_run_skips_already_applied():
 
     assert report == {"applied": 0, "skipped": 1, "failed": 0, "rejected": 0,
                        "dry_run": 0, "unknown_outcome": 0, "conflicted": 0,
-                       "deferred": 0, "units_low": 0,
+                       "deferred": 0, "units_low": 0, "rejects": [],
                        "details": [{"key": "k1", "result": "skipped"}]}
     assert client.calls == []  # запрос не ушёл второй раз
 
@@ -859,6 +860,30 @@ def test_units_low_stops_before_journal():
     assert report["units_low"] == 1
     assert db.events == []
     assert client.calls == []
+
+
+def test_units_low_lands_in_rejects_with_a_reason():
+    # Убрать этот тест — и хвост такта снова исчезнет без следа: баллы
+    # кончились, действия не отправлены, в edu_agent_rejects пусто, а в отчёте
+    # одно число units_low, которое живёт до конца лога. При лимите в 50
+    # действий порог не срабатывал ни разу; при трёхстах он срабатывает первым
+    # же тактом, и «почему агент сегодня ничего не сделал» станет неотвечаемым.
+    db = _FakeDB()
+    client = _FakeClient(response={"SetResults": [{"Id": 7}]})
+    client.units_left = 1
+    client.units_limit = 1000
+
+    report = apply_actions(client, [_action("k1"), _action("k2")], db)
+
+    assert report["rejects"], "хвост такта исчез без причины"
+    assert all(r["reason"] == rejects.UNITS_LOW for r in report["rejects"])
+    assert [r["key"] for r in report["rejects"]] == ["", ""]
+    # Цена действия едет со строкой: отказ без денег на кону не отличить от
+    # отказа по копеечному объекту.
+    assert report["rejects"][0]["risk_rub"] == 100.0
+    assert report["rejects"][0]["account"] == "test-login"
+    assert report["rejects"][0]["stage"] == "e1"
+    assert report["units_low"] == 2
 
 
 def test_units_healthy_does_not_stop():

@@ -30,6 +30,7 @@ apply_actions отказывается стартовать (SandboxApplyRefusal
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from sync.agent import rejects
 from sync.agent.writer.client import is_outcome_unknown, is_transient_quota
 from sync.agent.writer.db import FINAL_STATUSES
 
@@ -245,8 +246,13 @@ def _element_errors(method: str, response: Dict[str, Any]) -> Optional[List[Dict
 
 
 def apply_actions(client, actions: List[Dict[str, Any]], db_module,
-                  lease=None) -> Dict[str, Any]:
+                  lease=None, stage: str = "e1") -> Dict[str, Any]:
     """Применяет действия по одному: журнал → отправка → отметка результата.
+
+    stage — код такта для строк отказов. Такт здесь один (Э1), но подписывать
+    строку журнала отказов константой внутри применения нельзя: у отказа,
+    прочитанного из базы, стадия — единственное, что отвечает на вопрос «кто
+    это не смог», и вписывать её должен тот, кто знает ответ.
 
     lease — аренда прогона (db.RunLease). Перед КАЖДЫМ изменяющим запросом
     проверяется, что она всё ещё наша: аренда берётся на час, а прогон по
@@ -308,6 +314,10 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
     applied = skipped = failed = rejected = dry_run = unknown = conflicted = 0
     deferred = units_low = 0
     details: List[Dict[str, Any]] = []
+    # Отказы строками, а не только счётчиком: причина, объект и цена уезжают в
+    # чёрный ящик, где на истории видно, упирается ли такт в баллы каждый день
+    # или это была разовая просадка кабинета.
+    reject_rows: List[Dict[str, Any]] = []
 
     def _mark(action_id: str, status: str, response: Dict[str, Any]) -> bool:
         """True — отметка легла. False — строку забрал другой контур.
@@ -331,6 +341,13 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
             units_low += 1
             details.append({"key": action["idempotency_key"],
                             "result": "units_low"})
+            # Цена берётся из самого действия: к этому моменту риск-бюджет её
+            # уже назвал (agent_e1 кладёт risk_rub в строку перед отправкой), и
+            # брать её больше неоткуда — прогон о пропущенном хвосте не знает.
+            reject_rows.append(rejects.row(
+                action, rejects.UNITS_LOW,
+                account=str(action.get("account") or ""), stage=stage,
+                risk_rub=float(action.get("risk_rub") or 0.0)))
             continue
 
         existing = db_module.find_action_by_key(action["idempotency_key"])
@@ -438,4 +455,9 @@ def apply_actions(client, actions: List[Dict[str, Any]], db_module,
     return {"applied": applied, "skipped": skipped, "failed": failed, "rejected": rejected,
             "dry_run": dry_run, "unknown_outcome": unknown, "conflicted": conflicted,
             "deferred": deferred, "units_low": units_low,
+            # Строки отказов — отдельным полем от счётчиков, тем же порядком,
+            # что и в agent_e1: счётчики читает человек в логе, строки едут в
+            # edu_agent_rejects. Пустой список здесь — не «поле забыли», а
+            # «отказов не было», и вызывающий код обязан видеть разницу.
+            "rejects": reject_rows,
             "details": details}

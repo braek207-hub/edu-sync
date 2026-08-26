@@ -1780,6 +1780,13 @@ def run_account(
         (rejects.CLOSED_KEY, closed_keys),
         (rejects.NO_GROWTH_ADDRESS, without_address),
     ], account=login, stage="e1", risks=risks)
+    # Отказы САМОГО применения приезжают строками из apply_actions: там
+    # решается, хватает ли кабинету баллов, и знает об этом только оно. Не
+    # подхватить их здесь значит оставить хвост такта одним счётчиком в
+    # логе — ровно тем состоянием, ради выхода из которого заведён журнал
+    # отказов. pop, а не get: строки уезжают в чёрный ящик своим полем и
+    # дублировать их в отчёт прогона ("result" ниже) незачем.
+    account_rejects += list(report.pop("rejects", None) or [])
 
     return {
         "account": login,
