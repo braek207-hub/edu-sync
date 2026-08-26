@@ -684,6 +684,47 @@ def action_label(action: Dict[str, Any]) -> str:
     return f"{action.get('direct_type')}:{action.get('key')} {percent:+d}% ({kind})"
 
 
+
+def fit_week_budget(priced, risks, remaining, charged_risk, caps, daily_cost):
+    """Недельная рельса: набор урезается и переоценивается, пока не сойдётся.
+
+    Тот же довод, что в lanes.select: цена со скидкой за встречное движение
+    денег верна только для набора, который уезжает ЦЕЛИКОМ. Рельса берёт
+    действия по порядку, пока хватает денег, и способна взять получателя, а
+    донора отложить — скидка выдана, компенсации не будет, и кабинет получил
+    доливку по цене переноса. Поэтому урезанный набор переоценивается, и
+    подгонка повторяется; счёт по объектам списывается только с сошедшегося.
+
+    Бесплатные действия остаются бесплатными на всех кругах. Кто платит риском,
+    решил отбор полос: класс 0 (арифметика — минус-фраза снимает деньги с огня,
+    а не ставит под удар) уехал оттуда с нулевой ценой. net_risk про классы не
+    знает и назначил бы им полную цену, так что первый же урезанный круг
+    отправил бы все отсечения в отложенные — ровно против обещания «класс 0
+    вносится весь и сразу», и тем заметнее, чем больше в кабинете мусора.
+    """
+    free = {key for key, price in risks.items() if float(price or 0.0) == 0.0}
+    candidates = list(priced)
+    deferred: List[Dict[str, Any]] = []
+    prepared: List[Dict[str, Any]] = []
+    # Граница по длине — страховка от бесконечного цикла в ночном прогоне:
+    # каждый круг либо ничего не снимает и заканчивается, либо снимает хотя бы
+    # одно действие, так что кругов не больше числа действий.
+    for _ in range(len(priced) + 1):
+        attempt_charged = dict(charged_risk)
+        prepared, dropped = fit_into_budget(candidates, risks, remaining,
+                                            attempt_charged, caps)
+        if not dropped:
+            charged_risk.clear()
+            charged_risk.update(attempt_charged)
+            break
+        deferred += dropped
+        kept = {a["idempotency_key"] for a in prepared}
+        candidates = [a for a in candidates if a["idempotency_key"] in kept]
+        risks = {key: (0.0 if key in free else price)
+                 for key, price in net_risk(candidates, daily_cost).items()}
+    return prepared, deferred
+
+
 def _count_by(actions: List[Dict[str, Any]], field: str) -> Dict[str, int]:
     """Счётчик действий по полю — для отчёта прогона.
 
@@ -1697,21 +1738,8 @@ def run_account(
     # донора отложить — скидка выдана, компенсации не будет. Поэтому набор,
     # который она урезала, переоценивается, и подгонка повторяется, пока не
     # сойдётся. Счёт по объектам списывается только с сошедшегося набора.
-    candidates = priced
-    deferred: List[Dict[str, Any]] = []
-    prepared: List[Dict[str, Any]] = []
-    for _ in range(len(priced) + 1):
-        attempt_charged = dict(charged_risk)
-        prepared, dropped = fit_into_budget(candidates, risks, remaining,
-                                            attempt_charged, caps)
-        if not dropped:
-            charged_risk.clear()
-            charged_risk.update(attempt_charged)
-            break
-        deferred += dropped
-        kept = {a["idempotency_key"] for a in prepared}
-        candidates = [a for a in candidates if a["idempotency_key"] in kept]
-        risks = net_risk(candidates, daily_cost)
+    prepared, deferred = fit_week_budget(priced, risks, remaining,
+                                         charged_risk, caps, daily_cost)
     ctx["run_risk_remaining"] -= sum(float(a.get("risk_rub") or 0.0) for a in prepared)
 
     # Реестр гипотез: разведочная ставка заводится ДО отправки в кабинет и

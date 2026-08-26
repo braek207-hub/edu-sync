@@ -2473,7 +2473,23 @@ def test_rails_order_uses_lanes():
     assert (source.index("conflicts.resolve(")
             < source.index("build_red_line(")
             < source.index("lanes.select(")
-            < source.index("fit_into_budget("))
+            < source.index("fit_week_budget("))
+
+
+def _transfer(key, campaign, rub_delta, days=14):
+    """Бюджетное действие с обещанием знака: донор (−) или получатель (+).
+
+    Знак берёт risk._moved_rub из обещания рычага — по нему и определяется
+    пара, имена кампаний в этом не участвуют.
+    """
+    return {"idempotency_key": key, "action_kind": "budget.set",
+            "object_level": "campaign", "object_id": campaign,
+            "marginal_roi": 2.0 if rub_delta > 0 else 1.0,
+            "payload": {"CampaignId": int(campaign),
+                        "expected_rub_delta": rub_delta,
+                        "expected_leads_delta": 0.0,
+                        "expectation_basis": "перенос",
+                        "expectation_days": days}}
 
 
 def test_weekly_rail_does_not_split_a_transfer_pair():
@@ -2485,18 +2501,54 @@ def test_weekly_rail_does_not_split_a_transfer_pair():
     встречное движение денег выдана, компенсации не будет, и кабинет получил
     доливку по цене переноса.
 
-    Лечится тем же приёмом, что и в полосе: цена пересчитывается на выживших
-    (risk.net_risk), и подгонка повторяется, пока набор не сойдётся. Значит, в
-    исходнике после fit_into_budget обязан стоять пересчёт цены.
+    Здесь бюджета хватает ровно на одно действие из пары. Правильный исход —
+    цена пересчитывается на выжившем наборе, и половина пары уезжает уже по
+    ПОЛНОЙ цене, а не по цене компенсированного переноса.
     """
-    import inspect
+    give = _transfer("g", "1", -70_000.0)
+    take = _transfer("t", "2", +70_000.0)
+    daily_cost = {"1": 10_000.0, "2": 10_000.0}
+    priced = [take, give]
+    risks = agent_e1.net_risk(priced, daily_cost)
+    assert risks["t"] < 70_000.0, "скидка за перенос не выдана — стенд не тот"
 
-    source = inspect.getsource(agent_e1.run_account)
-    start = source.index("fit_into_budget(")
-    assert "net_risk(" in source[start:], (
-        "набор, урезанный недельной рельсой, не переоценивается — пара "
-        "переноса снова едет половиной")
+    prepared, deferred = agent_e1.fit_week_budget(
+        priced, dict(risks), risks["t"] + 1.0, {}, {}, daily_cost)
 
+    assert not prepared, (
+        "получатель уехал один по цене компенсированного переноса — "
+        "кабинет получил доливку со скидкой, которую нечем компенсировать")
+    # Донор не влез по деньгам, получатель — потому что в одиночку стоит
+    # полную цену: 70 000 ₽ вместо 17 500 со скидкой за компенсацию.
+    assert sorted(a["idempotency_key"] for a in deferred) == ["g", "t"]
+
+
+def test_weekly_rail_keeps_arithmetic_free_across_repricing():
+    """Уберите этот тест — и первый же урезанный круг отправит в отложенные
+    все отсечения разом.
+
+    Кто платит риском, решил отбор полос: класс 0 приехал оттуда с нулевой
+    ценой, потому что минус-фраза снимает деньги с огня, а не ставит их под
+    удар. net_risk про классы не знает и на пересчёте назначил бы им полную
+    цену — а пересчёт случается ровно тогда, когда бюджет и так кончился.
+    Обещание «класс 0 вносится весь и сразу» умирало бы тем вернее, чем
+    больше в кабинете мусора.
+    """
+    cut = {"idempotency_key": "cut", "action_kind": "negative.add",
+           "object_level": "campaign", "object_id": "1",
+           "exposure": {"daily_rub": 300.0, "cut_daily_rub": 300.0},
+           "payload": {"CampaignId": 1, "AddedPhrases": ["мгсу"]}}
+    give = _transfer("g", "1", -70_000.0)
+    take = _transfer("t", "2", +70_000.0)
+    daily_cost = {"1": 10_000.0, "2": 10_000.0}
+    risks = agent_e1.net_risk([take, give], daily_cost)
+    risks["cut"] = 0.0  # так его оценил отбор полос
+
+    prepared, _ = agent_e1.fit_week_budget(
+        [take, give, cut], risks, risks["t"] + 1.0, {}, {}, daily_cost)
+
+    assert [a["idempotency_key"] for a in prepared] == ["cut"]
+    assert prepared[0]["risk_rub"] == 0.0
 
 def test_lane_price_is_the_net_price_of_the_tact():
     # Цена, по которой списывается недельный бюджет, берётся из отбора полос
