@@ -2942,3 +2942,28 @@ def test_action_cut_by_the_week_budget_becomes_a_reject_not_a_queue(
     assert report["deferred_by_risk"] == len(budget_rows) == 4
     # У каждого отказа свой объект и своя цена: список действий, а не счётчик.
     assert len({r["object_id"] for r in budget_rows}) == 4
+
+
+def test_proposals_do_not_inflate_the_lane_shortfall():
+    # Отказ «рычага записи нет» (класс 3) лечится не ступенью — его не пустит
+    # ни одна. Сложи его с отказами лимита, и полоса выглядит зажатой там, где
+    # она просто получила неприменимых кандидатов: человек поднимет ступень,
+    # разрешив больше, и не получит ничего.
+    #
+    # Проверяется на чистой функции: класс 3 объявляется полем tier, лимит
+    # полосы и цены здесь ни при чём — важен только разбор счётчиков.
+    limited = {"action_kind": "bidmodifier.add", "idempotency_key": "a1",
+               "blocked_reason": rejects_mod.LANE_LIMIT}
+    proposal = {"action_kind": "bidmodifier.add", "idempotency_key": "p1",
+                "tier": 3, "blocked_reason": rejects_mod.PROPOSAL}
+    taken = {"action_kind": "bidmodifier.add", "idempotency_key": "t1",
+             "lane": "tuning"}
+
+    gap = agent_e1.lane_shortfalls([taken], [limited, proposal],
+                                   {"t1": 100.0, "a1": 100.0, "p1": 0.0},
+                                   {}, weekly_spend_rub=1_000_000.0)["tuning"]
+
+    assert gap["taken"] == 1
+    assert gap["refused"] == 1, "предложение сосчитано как зажатое лимитом"
+    assert gap["not_applicable"] == 1
+    assert gap["passed_share"] == 0.5

@@ -733,7 +733,7 @@ def fit_week_budget(priced, risks, remaining, charged_risk, caps, daily_cost):
 
 def lane_shortfall(taken: int, refused: int, wanted_rub: float,
                    limit_rub: Optional[float], lane: str = "",
-                   unpriced: int = 0) -> Dict[str, Any]:
+                   unpriced: int = 0, not_applicable: int = 0) -> Dict[str, Any]:
     """Дефицит полосы четырьмя числами: хотела, позволено, прошло, не хватило.
 
     Отложенных списков у прогона больше нет — не прошедшее лимит становится
@@ -754,6 +754,11 @@ def lane_shortfall(taken: int, refused: int, wanted_rub: float,
     (risk.action_risk отдаёт +inf, когда расход объекта неизвестен). Они не
     складываются в спрос нулями: полоса, «захотевшая 0 ₽» при сорока слепых
     кандидатах, выглядела бы исправной ровно тогда, когда она слепа.
+
+    not_applicable — кандидаты, которым отказано не лимитом, а отсутствием
+    рычага записи (класс достоверности 3). Ни одна ступень их не пропустит, и
+    в дефицит полосы они не входят: иначе полоса, получившая неприменимых
+    кандидатов, читалась бы как зажатая, и ступень подняли бы впустую.
     """
     total = int(taken) + int(refused)
     wanted = float(wanted_rub or 0.0)
@@ -771,6 +776,7 @@ def lane_shortfall(taken: int, refused: int, wanted_rub: float,
         "limit_rub": None if limit is None else round(limit, 2),
         "shortfall_rub": None if limit is None else round(max(0.0, wanted - limit), 2),
         "unpriced": int(unpriced),
+        "not_applicable": int(not_applicable),
     }
 
 
@@ -803,13 +809,21 @@ def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
 
     def _slot(action: Dict[str, Any]) -> Dict[str, Any]:
         lane = lanes.lane_of(action)
-        return slots.setdefault(lane, {"taken": 0, "refused": 0,
-                                       "wanted": 0.0, "unpriced": 0})
+        return slots.setdefault(lane, {"taken": 0, "refused": 0, "wanted": 0.0,
+                                       "unpriced": 0, "not_applicable": 0})
 
     for action in taken:
         _slot(action)["taken"] += 1
     for action in refused:
-        _slot(action)["refused"] += 1
+        # Отказ «рычага записи нет» (класс достоверности 3, полоса
+        # предложений) считается ОТДЕЛЬНО от отказа лимитом. Сложи их — и
+        # полоса, получившая неприменимых кандидатов, выглядит зажатой:
+        # человек поднимет ступень, разрешив больше денег, и не получит
+        # ничего, потому что предложение не пустит никакая ступень.
+        field = ("not_applicable"
+                 if str(action.get("blocked_reason") or "") == rejects.PROPOSAL
+                 else "refused")
+        _slot(action)[field] += 1
     for action in list(taken) + list(refused):
         lane = lanes.lane_of(action)
         price = lanes._charged(action, lane, prices)     # noqa: SLF001 — см. докстринг
@@ -825,7 +839,8 @@ def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
                                    risk_budget_rub)
         out[lane] = lane_shortfall(taken=slot["taken"], refused=slot["refused"],
                                    wanted_rub=slot["wanted"], limit_rub=limit,
-                                   lane=lane, unpriced=slot["unpriced"])
+                                   lane=lane, unpriced=slot["unpriced"],
+                                   not_applicable=slot["not_applicable"])
     return out
 
 
