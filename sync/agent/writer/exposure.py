@@ -185,6 +185,16 @@ def cut_exposure(cut_cost_rub: Optional[float],
     Вырезаемый расход неизвестен — доля не считается вовсе: возвращается
     «весь объект», как у неизвестной доли сегмента. Молчаливый ноль здесь был
     бы дырой в гарантии.
+
+    cut_daily_rub — СЫРОЙ вырезаемый расход в день, до всякой скидки. Он
+    нужен рядом с daily_rub потому, что эти два числа отвечают на разные
+    вопросы и расходятся в разы: daily_rub — сколько денег под ударом (доля
+    правила трёх), cut_daily_rub — сколько денег действие реально снимает с
+    кабинета. По первому считается цена риска, по второму — обещание рычага
+    (writer/expectation._cut). Читать обещание из daily_rub значило бы
+    занизить его ровно во столько раз, во сколько правило трёх скинуло цену,
+    то есть на порядок: замер такта увидел бы «обещали снять 200 ₽/дн, сняли
+    2000» и записал бы рычагу промах за собственную же скидку.
     """
     cost = _number(cut_cost_rub)
     window = _number(window_days)
@@ -192,10 +202,12 @@ def cut_exposure(cut_cost_rub: Optional[float],
         return {"share": 1.0,
                 "basis": "вырезаемый расход неизвестен — под ударом весь объект"}
     if cost <= 0:
-        return {"daily_rub": 0.0, "share": 0.0, "basis": "вырезать нечего"}
+        return {"daily_rub": 0.0, "cut_daily_rub": 0.0, "share": 0.0,
+                "basis": "вырезать нечего"}
 
     daily = cost / max(1.0, window or 0.0)
-    full = {"daily_rub": round(daily, 2), "share": 1.0}
+    full = {"daily_rub": round(daily, 2), "cut_daily_rub": round(daily, 2),
+            "share": 1.0}
 
     converted = _number(conversions)
     if converted is None:
@@ -213,6 +225,7 @@ def cut_exposure(cut_cost_rub: Optional[float],
     share = _clamp_share(ZERO_CONVERSION_RULE_OF_THREE / observations
                          if observations > 0 else 1.0)
     return {"daily_rub": round(daily * share, 2),
+            "cut_daily_rub": round(daily, 2),
             "share": share,
             "basis": (f"правило трёх: 0 конв. на ~{round(observations)} кликах "
                       f"({round(cost)} ₽ за {round(window)} дн.) — под ударом "

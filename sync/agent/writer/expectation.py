@@ -374,12 +374,22 @@ def _cut(action: Dict[str, Any], context: Dict[str, Any],
          days: int) -> Optional[Dict[str, Any]]:
     """Отсечение: вырезанный расход — точно, потерянные лиды — по кандидатам.
 
-    Вырезаемые рубли берутся из цены риска этого же действия
-    (exposure.traffic_cut_exposure): там они уже приведены к дню по окну
-    наблюдения кандидатов, и второй пересчёт по другому окну развёл бы цену
-    и обещание.
+    Вырезаемые рубли берутся из экспозиции этого же действия: там они уже
+    приведены к дню по окну наблюдения кандидатов, и второй пересчёт по
+    другому окну развёл бы цену и обещание.
+
+    Ключ cut_daily_rub — СЫРОЙ вырезаемый расход, и читается он первым.
+    daily_rub у отсечения означает другое: сколько денег под ударом, а это
+    после скидки правила трёх меньше вырезаемого потока на порядок
+    (exposure.cut_exposure). Обещание — про снятые с кабинета деньги, не про
+    поставленные под удар. Запасной путь через daily_rub оставлен для
+    экспозиций старого вида (traffic_cut_exposure), где скидки нет и оба
+    числа совпадают.
     """
-    cut_daily = _number((action.get("exposure") or {}).get("daily_rub"))
+    own = action.get("exposure") or {}
+    cut_daily = _number(own.get("cut_daily_rub"))
+    if cut_daily is None:
+        cut_daily = _number(own.get("daily_rub"))
     if cut_daily is None or cut_daily <= 0:
         return None
     lost_leads_day = _number(context.get("cut_conversions_per_day")) or 0.0

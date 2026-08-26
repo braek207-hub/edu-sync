@@ -341,6 +341,17 @@ def plan_budget_moves(
             "roi_vs_lambda": round(roi_value, 4) if roi_value is not None else None,
             "p_sign": verdict["p_sign"],
         }
+        # Абсолютная окупаемость кампании — не то же, что отношение к λ:
+        # по ней взаимозачёт такта (writer/risk.net_risk) считает разрыв
+        # окупаемостей донора и получателя. Отношение к λ для этого не
+        # годится, как только в такте больше одного кабинета: λ у каждого
+        # своя, и «1,2 к своей λ» у разных кабинетов — разные деньги.
+        # Восстанавливается из той же строки витрины: value = roi/λ,
+        # raw_value = λ кабинета, значит roi = value × raw_value. Второй
+        # строки под это не заводим — она была бы вторым источником правды.
+        lam = float(roi_row.get("raw_value") or 0.0) if roi_row is not None else 0.0
+        if roi_value is not None and lam > 0:
+            desired[str(cid)]["marginal_roi"] = round(roi_value * lam, 4)
         if is_exploration:
             # Признак едет ДАЛЬШЕ, в действие и в журнал: без него отчёт
             # прогона не смог бы сказать, сколько разведочных сдвигов
@@ -532,6 +543,13 @@ def diff_budget(
                     "WeeklySpendLimit": current_micros,
                 },
                 "idempotency_key": _idempotency_key(cid, "weekly", target_micros),
+                # Окупаемость едет НА действии, а не в payload: в кабинет она
+                # не уходит, а взаимозачёту такта нужна до всякой отправки.
+                # Без неё разрыв окупаемостей всегда неизвестен, скидка за
+                # встречный перенос не срабатывает ни разу, и полоса
+                # перераспределения снова платит обеими сторонами.
+                **({"marginal_roi": move["marginal_roi"]}
+                   if move.get("marginal_roi") else {}),
             })
             continue
 
@@ -565,6 +583,8 @@ def diff_budget(
                 },
                 "previous_state": {"DailyBudget": daily},
                 "idempotency_key": _idempotency_key(cid, "daily", target_daily_micros),
+                **({"marginal_roi": move["marginal_roi"]}
+                   if move.get("marginal_roi") else {}),
             })
             continue
 

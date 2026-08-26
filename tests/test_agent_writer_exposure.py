@@ -198,3 +198,32 @@ def test_maturity_threshold_is_the_one_from_tier_not_a_second_copy():
 
     assert exposure.cut_exposure(9000.0, 0, tier.MATURE_WINDOW_DAYS)["share"] < 1.0
     assert exposure.cut_exposure(9000.0, 0, tier.MATURE_WINDOW_DAYS - 1)["share"] == 1.0
+
+
+# --- сырой вырезаемый расход рядом со скидкой ------------------------------
+
+
+def test_cut_keeps_raw_spend_beside_the_discounted_price():
+    """Скидка правила трёх меняет ЦЕНУ, но не то, сколько денег снимается.
+
+    Два числа расходятся на порядок, и жить им надо в разных ключах: по
+    daily_rub считается риск, по cut_daily_rub — обещание рычага. Одно поле
+    на оба смысла означало бы, что замер такта судит рычаг по числу, которое
+    сам же и уценил.
+    """
+    got = exposure.cut_exposure(cut_cost_rub=30_000.0, conversions=0,
+                                window_days=28)
+
+    assert got["cut_daily_rub"] > got["daily_rub"] > 0
+    assert got["cut_daily_rub"] == round(30_000.0 / 28, 2)
+    assert got["daily_rub"] == round(got["cut_daily_rub"] * got["share"], 2)
+
+
+def test_cut_at_full_price_keeps_both_numbers_equal():
+    # Полная цена — скидки нет, и два числа обязаны совпасть: иначе обещание
+    # и риск разошлись бы там, где расходиться нечему.
+    got = exposure.cut_exposure(cut_cost_rub=30_000.0, conversions=6,
+                                window_days=28)
+
+    assert got["share"] == 1.0
+    assert got["cut_daily_rub"] == got["daily_rub"]

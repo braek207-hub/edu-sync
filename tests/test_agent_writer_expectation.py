@@ -11,7 +11,7 @@ tests/test_agent_writer_expectation.py — ожидание, которое за
 
 import pytest
 
-from sync.agent.writer import expectation, guardrails, lanes
+from sync.agent.writer import expectation, exposure, guardrails, lanes
 from sync.agent.writer.budget import diff_budget
 from sync.agent.writer.diff import diff_modifiers, diff_schedule
 from sync.agent.writer.negatives import diff_negatives, plan_negatives
@@ -308,3 +308,45 @@ def test_unknown_kind_gets_no_expectation_instead_of_a_crash():
     # прогон целиком из-за одного незнакомого вида.
     assert expectation.of({"action_kind": "proposal.campaign", "payload": {}},
                           CTX) is None
+
+
+# --- обещание отсечения читает сырой расход, а не уценённый ----------------
+
+
+def _raw_cut_action(exposure_block):
+    """Отсечение ДО attach: заявленного ожидания ещё нет, считается модель.
+
+    Именно в этот момент — между построением экспозиции и attach в
+    writer/negatives — и решается, из какого числа выйдет обещание.
+    """
+    return {"action_kind": "negative.add", "object_level": "campaign",
+            "object_id": "1", "exposure": exposure_block,
+            "payload": {"CampaignId": 1, "AddedPhrases": ["мгсу"]}}
+
+
+def test_cut_promise_is_measured_by_removed_money_not_by_risked_money():
+    """Дефект на стыке задач 8 и 8а: обещание занижалось ровно на скидку.
+
+    exposure.cut_exposure кладёт в daily_rub долю правила трёх — деньги под
+    ударом, — а снимается с кабинета весь поток. Читай обещание из daily_rub,
+    и рычаг заявил бы «сниму 71 ₽/дн» там, где снимет 1071, а замер такта
+    записал бы ему промах в пятнадцать раз за собственную же скидку движка.
+    """
+    priced = exposure.cut_exposure(cut_cost_rub=30_000.0, conversions=0,
+                                   window_days=28)
+    assert priced["daily_rub"] < priced["cut_daily_rub"]  # скидка есть
+
+    exp = expectation.of(_raw_cut_action(priced), CTX)
+
+    assert exp["rub_delta"] == -round(priced["cut_daily_rub"] * exp["measure_days"], 2)
+
+
+def test_cut_promise_falls_back_to_old_exposure_shape():
+    # Экспозиция без cut_daily_rub (traffic_cut_exposure) — там скидки нет,
+    # и daily_rub означает то же самое. Запасной путь обязан работать: иначе
+    # рычаги, не переведённые на новую цену, разом остались бы без обещания.
+    old_shape = {"daily_rub": 321.43, "basis": ""}
+
+    exp = expectation.of(_raw_cut_action(old_shape), CTX)
+
+    assert exp["rub_delta"] == -round(321.43 * exp["measure_days"], 2)
