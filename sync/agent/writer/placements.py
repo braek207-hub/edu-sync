@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.objects import CANDIDATE_WINDOW_DAYS
 from sync.agent.writer import exposure, expectation
+from sync.agent.writer.negatives import cut_evidence
 
 PLACEMENT_KIND = "placement.exclude"
 PLACEMENT_SETTING_KIND = "excluded_site"
@@ -167,8 +168,14 @@ def diff_placements(
     cut_cost: Optional[Dict[str, float]] = None,
     window_days: int = CANDIDATE_WINDOW_DAYS,
     cut_conversions: Optional[Dict[str, float]] = None,
+    baseline_cpa: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Желаемые запреты × прочитанные списки кабинета → (действия, отказы)."""
+    """Желаемые запреты × прочитанные списки кабинета → (действия, отказы).
+
+    baseline_cpa — тот же порог, по которому кандидаты и отбирались; без него
+    запрет площадки не может показать своё основание и приезжает в отбор
+    ставкой вместо арифметики (см. negatives.diff_negatives).
+    """
     actions: List[Dict[str, Any]] = []
     refused: List[Dict[str, Any]] = []
 
@@ -185,13 +192,17 @@ def diff_placements(
         if merged == sorted(existing):
             continue
 
-        cut_daily = float((cut_cost or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
+        cut_window = float((cut_cost or {}).get(str(campaign_id), 0.0))
+        cut_daily = cut_window / max(1, int(window_days))
         # Потерянные лиды — по тому же окну, что и деньги: обещание и цена
-        # риска обязаны стоять на одном окне.
-        lost_leads_daily = float(
-            (cut_conversions or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
+        # риска обязаны стоять на одном окне. Отсутствие кампании в словаре —
+        # «не измеряли», и в основание это едет как None.
+        lost_window = (cut_conversions or {}).get(str(campaign_id))
+        lost_leads_daily = float(lost_window or 0.0) / max(1, int(window_days))
+        evidence = cut_evidence(cut_window, lost_window, baseline_cpa, window_days)
         actions.append(expectation.attach({
             "action_kind": PLACEMENT_KIND,
+            **({"evidence": evidence} if evidence else {}),
             "object_level": "campaign",
             "object_id": str(campaign_id),
             "exposure": exposure.traffic_cut_exposure(

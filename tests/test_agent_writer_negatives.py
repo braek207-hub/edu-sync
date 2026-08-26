@@ -281,3 +281,92 @@ def test_one_unknown_phrase_poisons_only_its_own_campaign():
     ])
     assert plan["unknown_conversions"] == ["1"]
     assert plan["cut_conversions"] == {"2": 0.0}
+
+
+# ------------------- основание класса 0 производится, а не подставляется тестом
+
+
+def test_cut_carries_the_evidence_its_class_is_judged_by():
+    """Уберите этот тест — и класс 0 умрёт на боевом пути, оставшись зелёным.
+
+    writer/tier.tier_of считает отсечение арифметикой (риском не платит,
+    вносится всё и сразу) только по полю evidence арифметической формы. До
+    27.08.2026 evidence не производил НИКТО: ни этот рычаг, ни площадки. Тесты
+    классов при этом были зелёные, потому что подставляли evidence сами, — а в
+    бою каждая минус-фраза оказывалась классом 2 и главное обещание плана
+    («класс 0 вносится весь и сразу») не работало ни разу.
+    """
+    from sync.agent.writer import tier
+    plan = plan_negatives([{
+        "query": "мгсу", "cost": 90_000.0, "clicks": 300, "conversions": 0.0,
+        "reason": "zero_conversions", "campaigns": ["1"],
+        "cost_by_campaign": {"1": 90_000.0},
+        "conversions_by_campaign": {"1": 0.0},
+    }])
+    actions, _ = diff_negatives(
+        plan["desired"], {"1": {"negative_keywords": [],
+                                "campaign_type": "TEXT_CAMPAIGN"}},
+        cut_cost=plan["cut_cost"], cut_conversions=plan["cut_conversions"],
+        baseline_cpa=2_400.0)
+    evidence = actions[0]["evidence"]
+    assert evidence["cost_rub"] == 90_000.0
+    assert evidence["conversions"] == 0.0
+    assert evidence["baseline_cpa"] == 2_400.0
+    assert evidence["window_days"] >= tier.MATURE_WINDOW_DAYS
+    assert tier.tier_of(actions[0]) == tier.TIER_ARITHMETIC
+
+
+def test_cut_of_converting_traffic_is_not_arithmetic():
+    # Конверсии на вырезаемом трафике переводят отсечение в прогноз «дороже,
+    # чем нам надо». Право резать без риск-бюджета такое действие не получает.
+    from sync.agent.writer import tier
+    plan = plan_negatives([{
+        "query": "мгсу цена", "cost": 90_000.0, "clicks": 300,
+        "conversions": 6.0, "reason": "cpa_above_limit", "campaigns": ["1"],
+        "cost_by_campaign": {"1": 90_000.0},
+        "conversions_by_campaign": {"1": 6.0},
+    }])
+    actions, _ = diff_negatives(
+        plan["desired"], {"1": {"negative_keywords": [],
+                                "campaign_type": "TEXT_CAMPAIGN"}},
+        cut_cost=plan["cut_cost"], cut_conversions=plan["cut_conversions"],
+        baseline_cpa=2_400.0)
+    assert actions[0]["evidence"]["conversions"] == 6.0
+    assert tier.tier_of(actions[0]) != tier.TIER_ARITHMETIC
+
+
+def test_unmeasured_conversions_leave_the_evidence_incomplete():
+    """Неизвестное не даёт скидку правила трёх.
+
+    Кампания, чьи конверсии не измерены (строка витрины старого формата),
+    основания «нуль конверсий» не имеет вовсе — и класс 0 не получает.
+    """
+    from sync.agent.writer import tier
+    plan = plan_negatives([{
+        "query": "мгсу", "cost": 90_000.0, "clicks": 300, "conversions": None,
+        "reason": "zero_conversions", "campaigns": ["1"],
+        "cost_by_campaign": {"1": 90_000.0},
+    }])
+    actions, _ = diff_negatives(
+        plan["desired"], {"1": {"negative_keywords": [],
+                                "campaign_type": "TEXT_CAMPAIGN"}},
+        cut_cost=plan["cut_cost"], cut_conversions=plan["cut_conversions"],
+        baseline_cpa=2_400.0)
+    assert actions[0]["evidence"].get("conversions") is None
+    assert tier.tier_of(actions[0]) != tier.TIER_ARITHMETIC
+
+
+def test_evidence_is_absent_when_the_baseline_cpa_is_unknown():
+    # Порога, по которому кандидат и выбран, нет — значит нечем показать, что
+    # расход превысил три цены конверсии. Основание не выдумывается.
+    plan = plan_negatives([{
+        "query": "мгсу", "cost": 90_000.0, "clicks": 300, "conversions": 0.0,
+        "reason": "zero_conversions", "campaigns": ["1"],
+        "cost_by_campaign": {"1": 90_000.0},
+        "conversions_by_campaign": {"1": 0.0},
+    }])
+    actions, _ = diff_negatives(
+        plan["desired"], {"1": {"negative_keywords": [],
+                                "campaign_type": "TEXT_CAMPAIGN"}},
+        cut_cost=plan["cut_cost"], cut_conversions=plan["cut_conversions"])
+    assert actions[0].get("evidence") is None

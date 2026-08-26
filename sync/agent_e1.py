@@ -1289,6 +1289,12 @@ def run_account(
     # строками computed; здесь они собираются обратно в фразы и режутся
     # капом такта: отсечённый трафик не вернуть, и такт обязан оставаться
     # различимым в наблюдении.
+    # Порог отсечения — МЕДИАННЫЙ базовый CPA кабинета, той же формулой, что в
+    # Э0 (agent_e0: baselines[len // 2] по load_baseline_cpa). Не копия числа,
+    # а тот же расчёт на свежем окне CRM: кандидаты отбирались по нему, и класс
+    # достоверности обязан судить их по нему же, а не по второму порогу.
+    cut_baseline_cpa = median([v for v in baseline_cpa.values() if float(v) > 0])
+
     negatives_plan = negatives.plan_negatives(
         negatives.candidates_from_computed(fresh_campaign_computed))
 
@@ -1442,9 +1448,17 @@ def run_account(
                          if cid in scoped_ids}
     negatives_state = (negatives.fetch_negatives(client, sorted(negatives_desired))
                        if negatives_desired else {})
+    # cut_conversions и baseline_cpa едут вместе с расходом, а не остаются
+    # значениями по умолчанию: первое — сколько лидов отсечение теряет
+    # (обещание рычага), второе — порог, по которому кандидат и выбран. Без
+    # второго действие не может показать своё основание, и класс 0
+    # («арифметика, риском не платит, вносится весь и сразу») не наступает ни
+    # для одной минус-фразы, сколько бы их ни насчитал Э0.
     negatives_actions, negatives_refused = negatives.diff_negatives(
         negatives_desired, negatives_state,
-        cut_cost=negatives_plan.get("cut_cost"))
+        cut_cost=negatives_plan.get("cut_cost"),
+        cut_conversions=negatives_plan.get("cut_conversions"),
+        baseline_cpa=cut_baseline_cpa)
     negatives_not_found = sorted(c for c in negatives_desired
                                  if c not in negatives_state)
     negatives_planned_count = 0
@@ -1465,7 +1479,9 @@ def run_account(
         client, sorted(placements_desired)) if placements_desired else {})
     placements_actions, placements_refused = placements.diff_placements(
         placements_desired, placements_state,
-        cut_cost=placements_plan.get("cut_cost"))
+        cut_cost=placements_plan.get("cut_cost"),
+        cut_conversions=placements_plan.get("cut_conversions"),
+        baseline_cpa=cut_baseline_cpa)
     placements_not_found = sorted(c for c in placements_desired
                                   if c not in placements_state)
     placements_planned_count = 0

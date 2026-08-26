@@ -189,6 +189,39 @@ def merge_phrases(existing: List[str], added: List[str],
     return sorted(merged)
 
 
+def cut_evidence(cost_rub: float, conversions: Optional[float],
+                 baseline_cpa: Optional[float],
+                 window_days: int) -> Optional[Dict[str, Any]]:
+    """Основание, по которому отсечение судится классом достоверности.
+
+    Класс 0 — «утверждение о прошлом»: за зрелое окно вырезаемый трафик не дал
+    ни одной конверсии при расходе выше трёх цен конверсии. Судит об этом
+    writer/tier._is_arithmetic, и судит РОВНО по этому полю: нет поля — нет и
+    класса 0. Числа здесь те же, по которым кандидат и выбран
+    (objects.minus_word_candidates: cost / 3 против cpa_limit), поэтому агент
+    минусует и объясняет минусацию одним правилом, а не двумя.
+
+    conversions=None едет в основание КАК None: «не измеряли» обязано остаться
+    отличимым от «ноль». Ноль даёт право резать без риск-бюджета, неизвестность
+    не даёт.
+
+    Порога нет вовсе (baseline_cpa пуст) — основания нет: показать, что расход
+    превысил три цены конверсии, нечем, и выдумывать порог здесь нельзя.
+
+    Один общий вход на оба рычага-близнеца (площадки зовут его отсюда):
+    разъехавшись, два одинаковых по смыслу правила судили бы один и тот же
+    трафик по-разному в зависимости от того, где он показался.
+    """
+    if baseline_cpa is None or float(baseline_cpa) <= 0:
+        return None
+    return {
+        "cost_rub": round(float(cost_rub), 2),
+        "conversions": None if conversions is None else float(conversions),
+        "baseline_cpa": float(baseline_cpa),
+        "window_days": int(window_days),
+    }
+
+
 def _idempotency_key(campaign_id: str, phrases: List[str]) -> str:
     raw = "negatives:" + str(campaign_id) + ":" + "|".join(sorted(phrases))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
@@ -200,12 +233,18 @@ def diff_negatives(
     cut_cost: Optional[Dict[str, float]] = None,
     window_days: int = CANDIDATE_WINDOW_DAYS,
     cut_conversions: Optional[Dict[str, float]] = None,
+    baseline_cpa: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Желаемые фразы × прочитанные списки кабинета → (действия, отказы).
 
     actual_by_campaign — {campaign_id: {"negative_keywords": [...],
     "campaign_type": ...}} из свежего чтения (fetch_negatives). Кампании без
     записи не порождают ни действия, ни отказа: их не оказалось в кабинете.
+
+    baseline_cpa — цена конверсии, по которой кандидаты и отбирались. Нужна не
+    рычагу, а классу достоверности: без неё отсечение не может показать, что
+    вырезает расход выше трёх CPA, и приезжает в отбор ставкой вместо
+    арифметики — то есть платит риском и стоит в очереди позади корректировок.
     """
     actions: List[Dict[str, Any]] = []
     refused: List[Dict[str, Any]] = []
@@ -228,13 +267,19 @@ def diff_negatives(
         # Цена риска — дневной расход отсекаемого трафика. Расход кандидатов
         # собран за окно наблюдения (CANDIDATE_WINDOW_DAYS), поэтому делится
         # на него: горизонт замера риска считает дни, а не окна.
-        cut_daily = float((cut_cost or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
+        cut_window = float((cut_cost or {}).get(str(campaign_id), 0.0))
+        cut_daily = cut_window / max(1, int(window_days))
         # Конверсии вырезаемого трафика — тем же делением на окно, что и
         # деньги: обещание и цена риска обязаны стоять на одном окне.
-        lost_leads_daily = float(
-            (cut_conversions or {}).get(str(campaign_id), 0.0)) / max(1, int(window_days))
+        # Отсутствие кампании в словаре означает «не измеряли» (см.
+        # plan_negatives: unknown_conversions), и в ОСНОВАНИЕ оно едет как
+        # None; ожиданию нечем заявить неизвестность, поэтому туда идёт ноль.
+        lost_window = (cut_conversions or {}).get(str(campaign_id))
+        lost_leads_daily = float(lost_window or 0.0) / max(1, int(window_days))
+        evidence = cut_evidence(cut_window, lost_window, baseline_cpa, window_days)
         actions.append(expectation.attach({
             "action_kind": NEGATIVE_KIND,
+            **({"evidence": evidence} if evidence else {}),
             "object_level": "campaign",
             "object_id": str(campaign_id),
             "exposure": exposure.traffic_cut_exposure(

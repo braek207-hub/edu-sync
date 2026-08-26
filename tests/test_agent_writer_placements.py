@@ -113,3 +113,29 @@ def test_old_placement_row_means_conversions_unknown():
     plan = plan_placements([candidate])
     assert plan["unknown_conversions"] == ["1"]
     assert plan["cut_conversions"] == {}
+
+
+# ------------------- основание класса 0 производит сам рычаг
+
+
+def test_placement_ban_carries_its_evidence():
+    """Тот же дефект, что у минус-фраз: evidence не производил никто.
+
+    Без него запрет площадки, вырезающий трафик с нулём конверсий на трёх CPA,
+    приезжает в отбор классом 2 — то есть платит риском и стоит в очереди
+    позади корректировок.
+    """
+    from sync.agent.writer import tier
+    plan = plan_placements([{
+        "placement": "trash.site", "cost": 90_000.0, "clicks": 300,
+        "conversions": 0.0, "reason": "zero_conversions", "campaigns": ["1"],
+        "cost_by_campaign": {"1": 90_000.0},
+        "conversions_by_campaign": {"1": 0.0},
+    }])
+    actions, _ = diff_placements(
+        plan["desired"], {"1": {"excluded_sites": [],
+                                "campaign_type": "TEXT_CAMPAIGN"}},
+        cut_cost=plan["cut_cost"], cut_conversions=plan["cut_conversions"],
+        baseline_cpa=2_400.0)
+    assert tier.tier_of(actions[0]) == tier.TIER_ARITHMETIC
+    assert actions[0]["evidence"]["cost_rub"] == 90_000.0

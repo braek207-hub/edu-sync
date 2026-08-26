@@ -2516,3 +2516,23 @@ def test_expectation_context_omits_spend_when_the_directory_is_silent():
 
     assert "daily_cost_rub" not in context
     assert context["cpa_rub"] == 2000.0
+
+
+def test_cutting_levers_get_their_conversions_and_their_threshold():
+    """Уберите этот тест — и основание класса 0 снова не доедет до боя.
+
+    diff_negatives и diff_placements умеют собирать evidence, но собирают его
+    ТОЛЬКО из того, что им передали. До 27.08.2026 прогон звал их с одним
+    cut_cost: конверсии вырезаемого трафика оставались нулём по умолчанию, а
+    порога не было вовсе — значит evidence не производился, и каждая
+    минус-фраза приезжала в отбор классом 2. Тесты рычагов при этом зелёные:
+    они передают всё сами.
+    """
+    import inspect
+
+    source = inspect.getsource(agent_e1.run_account)
+    for call in ("negatives.diff_negatives(", "placements.diff_placements("):
+        start = source.index(call)
+        args = source[start:start + 400]
+        assert "cut_conversions=" in args, call
+        assert "baseline_cpa=" in args, call
