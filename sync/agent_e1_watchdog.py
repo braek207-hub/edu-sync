@@ -1812,6 +1812,10 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
         "hypotheses": settle_hypotheses(today, journal_ok=not dry_run),
     }
     out["alarms"] = alarm_reasons(out)
+    # Вердикт — в отчёт, а не только в код выхода: save_run читает его из
+    # report["verdict"], и без этой строки сторож ложился в историю пустым.
+    # Тревога, видимая лишь в логе прогона, живёт до следующего прогона.
+    out["verdict"] = "ALARM" if out["alarms"] else "GREEN"
     # Сторож — третья часть той же истории: расчёт решил, запись применила,
     # сторож увидел исход. В чёрном ящике они лежат рядом, иначе разбор
     # инцидента снова собирается из трёх логов разной свежести.

@@ -582,6 +582,34 @@ def _unsupported_report(unsupported: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"count": len(unsupported), "by_reason": by_reason}
 
 
+def run_verdict(account_reports: List[Dict[str, Any]]) -> str:
+    """Итог всего такта записи одним кодом — для истории прогонов.
+
+    blackbox.save_run берёт вердикт из report["verdict"], и до этой функции
+    такт записи ложился в edu_agent_runs с ПУСТЫМ вердиктом: в логе отказ
+    кабинета был виден, в истории — нет. На экране агента пустой вердикт
+    неотличим от «прошло тихо», а это ровно то состояние, ради которого
+    историю и смотрят.
+
+    Кабинетный отчёт успешного пути вердикта не содержит вовсе (там нечего
+    сообщать сверх чисел), поэтому отсутствие кода читается как работа, а не
+    как ошибка. Порядок приоритетов — от того, что требует человека, к тому,
+    что его не требует; смешанный прогон называется по худшему кабинету.
+    """
+    verdicts = [str(r.get("verdict") or "") for r in account_reports]
+    if not verdicts:
+        return "NOTHING_TO_DO"
+    failed = [v for v in verdicts if v == "ACCOUNT_FAILED"]
+    if failed:
+        return "RED" if len(failed) == len(verdicts) else "PARTIAL_FAILURE"
+    for code in ("STALE_COMPUTED_SETTINGS", "NO_COMPUTED_SETTINGS"):
+        if code in verdicts:
+            return code
+    if all(v == "NOTHING_TO_DO" for v in verdicts):
+        return "NOTHING_TO_DO"
+    return "GREEN"
+
+
 def action_label(action: Dict[str, Any]) -> str:
     """Короткая подпись действия: что и на сколько правится."""
     payload = action.get("payload") or {}
@@ -2058,7 +2086,8 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
 
     saved = blackbox.save_run(
         run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),
-        report={"accounts": account_reports, "blind_spend": blind,
+        report={"verdict": run_verdict(account_reports),
+                "accounts": account_reports, "blind_spend": blind,
                 "window": [cutoff, today], "failed_accounts": failed_accounts},
         rejects=run_rejects)
     # Итог записи печатается всегда, включая ошибку: молчащий чёрный ящик

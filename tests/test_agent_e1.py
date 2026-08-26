@@ -2434,3 +2434,40 @@ def test_balance_gate_stands_after_the_other_gates_and_before_the_run_cap():
     assert (source.index("split_by_final_keys")
             < source.index("require_growth_address")
             < source.index("cap_actions("))
+
+
+def test_run_verdict_names_the_run_by_its_worst_account():
+    # Вердикт прогона едет в edu_agent_runs и оттуда на экран агента. Пустое
+    # место читается как «прошло тихо», поэтому отказ кабинета обязан дожить
+    # до истории, а не остаться в логе Actions.
+    assert agent_e1.run_verdict([{"account": "a"}, {"account": "b"}]) == "GREEN"
+    assert agent_e1.run_verdict([]) == "NOTHING_TO_DO"
+    assert agent_e1.run_verdict(
+        [{"verdict": "NOTHING_TO_DO"}, {"verdict": "NOTHING_TO_DO"}]
+    ) == "NOTHING_TO_DO"
+    # Один работал, второму нечего делать — прогон рабочий.
+    assert agent_e1.run_verdict([{"account": "a"}, {"verdict": "NOTHING_TO_DO"}]) == "GREEN"
+    assert agent_e1.run_verdict(
+        [{"account": "a"}, {"verdict": "ACCOUNT_FAILED"}]
+    ) == "PARTIAL_FAILURE"
+    assert agent_e1.run_verdict(
+        [{"verdict": "ACCOUNT_FAILED"}, {"verdict": "ACCOUNT_FAILED"}]
+    ) == "RED"
+    # Протухший расчёт важнее молчания: он объясняет, ПОЧЕМУ прогон молчит.
+    assert agent_e1.run_verdict(
+        [{"verdict": "NOTHING_TO_DO"}, {"verdict": "STALE_COMPUTED_SETTINGS"}]
+    ) == "STALE_COMPUTED_SETTINGS"
+    assert agent_e1.run_verdict(
+        [{"verdict": "NO_COMPUTED_SETTINGS"}]
+    ) == "NO_COMPUTED_SETTINGS"
+
+
+def test_run_verdict_reaches_the_black_box():
+    # Проверка у получателя: вердикт обязан лежать в том самом словаре,
+    # который читает blackbox.save_run (report["verdict"]), а не только
+    # печататься рядом.
+    import inspect
+
+    source = inspect.getsource(agent_e1._run_all)
+    saved = source[source.index('stage="e1"'):]
+    assert '"verdict": run_verdict(account_reports)' in saved

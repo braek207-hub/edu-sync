@@ -2021,3 +2021,41 @@ def test_closing_upgrades_the_class_when_the_reserve_covers_the_window():
 
     assert db.experiments[0]["mechanism"] == "did_holdout"
     assert db.experiments[0]["reliability_class"] == "A"
+
+
+def _capture_blackbox(monkeypatch):
+    """Перехват отчёта, который сторож кладёт в чёрный ящик."""
+    seen = {}
+
+    def _save(*args, **kwargs):
+        seen["report"] = kwargs["report"]
+        return {"saved": False, "error": "тест"}
+
+    monkeypatch.setattr(watchdog.blackbox, "save_run", _save)
+    return seen
+
+
+def test_watchdog_verdict_reaches_the_black_box(monkeypatch, capsys):
+    # Тревога, видимая только в логе прогона, живёт до следующего прогона.
+    # В edu_agent_runs вердикта у сторожа не было вовсе — история такта,
+    # который ловит откаты, читалась как «всё тихо».
+    lock = _RecordingLock()
+    _patch_watchdog_main(monkeypatch, lock)
+    seen = _capture_blackbox(monkeypatch)
+
+    assert watchdog.main() == 0
+    report = seen["report"]
+    assert "verdict" in report, "сторож лёг в историю без вердикта"
+    assert report["verdict"] == ("ALARM" if report["alarms"] else "GREEN")
+
+
+def test_watchdog_verdict_turns_alarm_on_unrollbackable_rows(monkeypatch, capsys):
+    lock = _RecordingLock()
+    _patch_watchdog_main(monkeypatch, lock)
+    monkeypatch.setattr(watchdog.writer_db, "failed_rollbacks_count", lambda: 3)
+    seen = _capture_blackbox(monkeypatch)
+
+    watchdog.main()
+    report = seen["report"]
+    assert report["alarms"], "неоткатываемые строки обязаны поднимать тревогу"
+    assert report["verdict"] == "ALARM"
