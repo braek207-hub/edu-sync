@@ -310,32 +310,3 @@ def test_idea_action_is_addressed_to_its_campaign():
     assert _run()[0]["action"]["object_id"] == CAMPAIGN
 
 
-# --------------------------------------------------------------- двойник
-
-class FakeIdeas:
-    """edu_agent_ideas в памяти: те же три примитива доступа, без БД."""
-
-    def __init__(self):
-        self.table = {}
-        self.writes = 0
-
-    def read_rows(self, idea_ids):
-        return {i: dict(self.table[i]) for i in idea_ids if i in self.table}
-
-    def read_rejections(self, subject_keys):
-        return {}
-
-    def write_rows(self, rows):
-        self.writes += 1
-        for row in rows:
-            self.table[row["idea_id"]] = dict(row)
-        return len(rows)
-
-
-@pytest.fixture
-def store(monkeypatch):
-    fake = FakeIdeas()
-    monkeypatch.setattr(registry, "_read_rows", fake.read_rows)
-    monkeypatch.setattr(registry, "_read_rejections", fake.read_rejections)
-    monkeypatch.setattr(registry, "_write_rows", fake.write_rows)
-    return fake
