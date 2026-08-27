@@ -142,7 +142,8 @@ def test_each_direction_gets_its_own_address():
     ideas = consolidate.candidates(rows, _ctx())
 
     assert {i["subject"]["direction"] for i in ideas} == {"spo", "vpo"}
-    assert len({registry.idea_id(i["source"], i["subject"]) for i in ideas}) == 2
+    assert len({registry.idea_id(i["source"], i["subject"], i["account"])
+                for i in ideas}) == 2
 
 
 # --------------------------------------------------------------- объём
@@ -282,8 +283,8 @@ def test_identity_survives_a_changed_donor_set():
     one = _idea()
     two = _idea(rows=_pair() + [_q(phrase="колледж после 9", campaign="333")])
 
-    assert (registry.idea_id(one["source"], one["subject"])
-            == registry.idea_id(two["source"], two["subject"]))
+    assert (registry.idea_id(one["source"], one["subject"], one["account"])
+            == registry.idea_id(two["source"], two["subject"], two["account"]))
 
 
 def test_evidence_follows_the_donor_set():

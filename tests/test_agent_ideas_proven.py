@@ -217,8 +217,9 @@ def test_subject_carries_no_mutable_numbers():
     # окупаемость и расход — идентификатор обязан остаться прежним.
     first = _run(romi=2.6, daily_cost_rub=8_000.0)[0]
     second = _run(romi=3.4, daily_cost_rub=11_500.0)[0]
-    assert (registry.idea_id(first["source"], first["subject"])
-            == registry.idea_id(second["source"], second["subject"]))
+    assert (registry.idea_id(first["source"], first["subject"], first["account"])
+            == registry.idea_id(second["source"], second["subject"],
+                                second["account"]))
 
 
 def test_subject_separates_queries():
@@ -226,8 +227,8 @@ def test_subject_separates_queries():
     # другая идея, а не обновление той же строки.
     a = proven.candidates([_bundle(query="колледж заочно")], _ctx())[0]
     b = proven.candidates([_bundle(query="колледж дистанционно")], _ctx())[0]
-    assert registry.idea_id(a["source"], a["subject"]) != \
-        registry.idea_id(b["source"], b["subject"])
+    assert (registry.idea_id(a["source"], a["subject"], a["account"])
+            != registry.idea_id(b["source"], b["subject"], b["account"]))
 
 
 # ------------------------------------------------------------ отбраковка

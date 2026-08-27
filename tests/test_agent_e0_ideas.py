@@ -39,7 +39,7 @@ def _idea(idea_id="i-1", tier_value=tier.TIER_MEASURED, **over):
         "source": "proven",
         "account": "acc-1",
         "subject": {"campaign_id": "111"},
-        "subject_key": registry.subject_key({"campaign_id": "111"}),
+        "subject_key": registry.subject_key({"campaign_id": "111"}, "acc-1"),
         "tier": tier_value,
         "lane": lanes.LANE_ALLOCATION,
         "expected_rub": 100_000.0,
@@ -498,3 +498,224 @@ def test_applying_an_idea_marks_it_running_in_the_run(monkeypatch, capsys):
 
     assert marks == [("ok", registry.STATUS_RUNNING)]
     assert report["ideas"]["running"] == 1
+
+
+# =========================================================================
+# Генераторы включаются в расчётный такт (задача 16а).
+#
+# До этого пять генераторов Ф13 были мёртвым кодом: чистые функции есть,
+# связки не собирает никто, registry.upsert в бою не вызывается ниоткуда.
+# Реестр оставался пустым, секция ideas честно печатала нули — и путь идей
+# выглядел работающим ровно до первого вопроса «почему предложений нет».
+#
+# Проверяется здесь то, что ломается молча: находки доезжают до реестра;
+# отбракованные связки попадают в отчёт числами по причинам; кабинеты не
+# затирают друг друга в общей порции.
+# =========================================================================
+
+from datetime import date as _date
+
+from sync.agent.ideas import bundles as ideas_bundles
+
+_POOL = {"paid": 120.0, "deals": 200.0, "connected": 400.0,
+         "eff": 900.0, "leads": 1800.0, "clicks": 90_000.0}
+
+
+def _rows_of(store, source):
+    return [row for row in store.table.values() if row["source"] == source]
+
+
+def _ladder_section(campaigns=("111",), directions=("vuz",)):
+    return {
+        "window_from": "2026-05-01",
+        "window_to": "2026-07-29",
+        "by_object": {c: {"step": "eff", "events_by_step": dict(_POOL)}
+                      for c in campaigns},
+        "counts": {"by_direction": {d: dict(_POOL) for d in directions},
+                   "account": dict(_POOL)},
+        "avg_check": {c: 60_000.0 for c in campaigns},
+    }
+
+
+def _portfolio_section(moves):
+    """moves: {кабинет: {кампания: направление}}."""
+    return {"accounts": {
+        login: {"lambda": 1.0, "moves": {
+            campaign: {"direction": direction, "value_per_lead": 1_500.0,
+                       "cost_28d": 300_000.0, "leads_28d": 200,
+                       "limit_binding": True}
+            for campaign, direction in campaigns.items()}}
+        for login, campaigns in moves.items()}}
+
+
+def _run_facts(campaigns=(("111", "vuz"),)):
+    return [{"fact_date": "2026-07-01", "campaign_id": campaign,
+             "direction": direction, "cost": 10_000.0, "eff_leads": 8}
+            for campaign, direction in campaigns]
+
+
+def _slices(campaign="111"):
+    """Срез, на котором мобильные окупаются заметно лучше остального объёма."""
+    return [
+        {"campaign_id": campaign, "slice_kind": "device", "slice_key": "MOBILE",
+         "clicks": 6_000.0, "conversions": 300.0, "cost": 90_000.0},
+        {"campaign_id": campaign, "slice_kind": "device", "slice_key": "DESKTOP",
+         "clicks": 6_000.0, "conversions": 40.0, "cost": 180_000.0},
+    ]
+
+
+def _collect(**over):
+    kwargs = {
+        "facts": _run_facts(),
+        "ladder_section": _ladder_section(),
+        "portfolio_section": _portfolio_section({"acc-1": {"111": "vuz"}}),
+        "sliced_rows": _slices(),
+        "query_rows": [],
+        "expansion": [],
+        "demand": {},
+        # Витрина снята и корректировок в ней нет: связка вправе утверждать,
+        # что add применим.
+        "settings_by_campaign": {"111": {"bidModifiers": {"total": 0,
+                                                          "items": []}}},
+        "login_by_campaign": {"111": "acc-1"},
+        "direction_by_campaign": {"111": "vuz"},
+        "holdout_ids": [],
+        "learning_reset": {},
+        "quality_drift": {},
+        "config": {},
+        "slice_window_days": 90,
+        "query_window_days": 30,
+        "today": _date(2026, 8, 27),
+    }
+    kwargs.update(over)
+    return agent_e0.collect_ideas(**kwargs)
+
+
+def test_generators_findings_reach_the_registry(store):
+    # Шаг 2 плана беты дословно: расчётный такт пишет находки генераторов в
+    # реестр. Двойник — та же таблица в памяти, что у тестов реестра.
+    summary = _collect()
+
+    assert summary["by_source"]["proven"]["ideas"] == 1
+    assert summary["by_source"]["proven"]["upserted"] == 1
+    assert len(_rows_of(store, "proven")) == 1
+
+
+def test_refused_bundles_are_counted_by_reason(store):
+    # Шаг 3: отбракованные связки попадают в отчёт числами по причинам.
+    # «Поводов не нашлось» и «поводы были, но у всех не хватило рычага» ведут
+    # к разным следующим шагам, и по одному нулю их не различить.
+    summary = _collect(settings_by_campaign={})
+
+    reasons = summary["by_source"]["proven"]["skipped_by_reason"]
+    assert summary["by_source"]["proven"]["ideas"] == 0
+    assert sum(reasons.values()) == 2
+    assert any("неизвестно" in reason for reason in reasons)
+
+
+def test_a_slice_of_an_unknown_campaign_is_counted_as_a_refused_bundle(store):
+    # Отбраковка самой СБОРКИ считается отдельно от отбраковки генераторов:
+    # «связку не собрали» лечится данными такта, «генератор отказал» — нет.
+    summary = _collect(sliced_rows=_slices("999"))
+
+    assert summary["bundles"]["skipped_by_reason"] == {
+        ideas_bundles.REASON_UNKNOWN_CAMPAIGN: 2}
+    assert summary["bundles"]["segments"] == 0
+
+
+def test_the_generator_without_an_input_is_named_in_the_report(store):
+    # Ноль находок генератора аудиторий значит «спрашивать было не о чем», а
+    # не «поводов не нашлось». По пустому счётчику эти два состояния
+    # неразличимы, и дыру во входе никто бы не заметил.
+    summary = _collect()
+
+    assert "audience" in summary["sources_without_input"]
+
+
+def test_two_cabinets_with_the_same_direction_do_not_overwrite_each_other(store):
+    # Адрес идеи у половины генераторов — НАПРАВЛЕНИЕ, а «vuz» есть сразу в
+    # нескольких кабинетах. Без кабинета в идентификаторе находка второго
+    # кабинета молча затирала бы находку первого в той же порции — и отказ
+    # человека в одном кабинете глушил бы идею во всех остальных.
+    summary = _collect(
+        facts=_run_facts((("111", "vuz"), ("222", "vuz"))),
+        ladder_section=_ladder_section(("111", "222")),
+        portfolio_section=_portfolio_section({"acc-1": {"111": "vuz"},
+                                              "acc-2": {"222": "vuz"}}),
+        sliced_rows=[],
+        expansion=[{"query": "колледж заочно", "campaigns": ["111", "222"]}],
+        demand={"vuz": {"regime": "подъём", "sigma": 2.4, "frequency": 12_000,
+                        "baseline_median": 9_000, "last_week": "2026-08-17"}},
+        login_by_campaign={"111": "acc-1", "222": "acc-2"},
+        direction_by_campaign={"111": "vuz", "222": "vuz"},
+        settings_by_campaign={})
+
+    assert summary["by_source"]["market"]["ideas"] == 2
+    assert summary["by_source"]["market"]["upserted"] == 2
+    written = _rows_of(store, "market")
+    assert {row["account"] for row in written} == {"acc-1", "acc-2"}
+    assert len(written) == 2
+
+
+def test_ideas_of_a_cabinet_are_judged_by_its_own_threshold(store):
+    # Порог λ у каждого кабинета свой. Посуди связку одного порогом другого —
+    # и приговор вынесен по чужой мерке.
+    portfolio = _portfolio_section({"acc-1": {"111": "vuz"}})
+    portfolio["accounts"]["acc-1"]["lambda"] = 1_000.0
+
+    summary = _collect(portfolio_section=portfolio)
+
+    assert summary["by_source"]["proven"]["ideas"] == 0
+
+
+def test_a_rejected_portion_does_not_kill_the_run(monkeypatch, store):
+    # Расчётный такт считает деньги. Падение из-за экрана предложений
+    # оставило бы прогон без отчёта о том, что он только что посчитал, —
+    # поэтому отказ реестра становится строкой отчёта, а не трассой.
+    def _refuse(rows):
+        raise registry.InvalidIdea("порция негодна")
+
+    monkeypatch.setattr(agent_e0.ideas_registry, "upsert", _refuse)
+
+    summary = _collect()
+
+    assert "proven" in summary["failed"]
+    assert summary["by_source"]["proven"]["ideas"] == 1
+    assert summary["by_source"]["proven"]["upserted"] == 0
+
+
+def test_each_source_is_written_in_its_own_portion(monkeypatch, store):
+    # Реестр принимает порцию целиком или никак. Одна кривая находка обязана
+    # уронить находки СВОЕГО генератора, а не всего такта: общего кода и общей
+    # причины ошибиться у пяти генераторов нет.
+    portions = []
+    real = agent_e0.ideas_registry.upsert
+
+    def _spy(rows):
+        portions.append({row["source"] for row in rows})
+        return real(rows)
+
+    monkeypatch.setattr(agent_e0.ideas_registry, "upsert", _spy)
+
+    _collect(expansion=[{"query": "колледж заочно", "campaigns": ["111"]}],
+             demand={"vuz": {"regime": "подъём", "sigma": 2.4,
+                             "frequency": 12_000, "baseline_median": 9_000,
+                             "last_week": "2026-08-17"}})
+
+    assert portions and all(len(p) == 1 for p in portions)
+    assert {"proven"} in portions and {"market"} in portions
+
+
+def test_the_run_prints_what_the_generators_found_this_tact(monkeypatch, capsys):
+    # Врезка: чистая функция может считать честно, а прогон — не звать её
+    # вовсе. Ровно этим и был мёртв путь идей до сих пор. Счётчик реестра
+    # такое не ловит: реестр помнит и вчерашние находки, и по нему прогон,
+    # не позвавший ни одного генератора, неотличим от прогона без находок.
+    _patch_e0_run(monkeypatch)
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    generated = report["ideas"]["generated"]
+    assert "by_source" in generated and "bundles" in generated
+    assert "audience" in generated["sources_without_input"]

@@ -18,7 +18,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from sync.agent import blackbox
 from sync.agent import db as agent_db
@@ -67,6 +67,11 @@ from sync.agent.learning_loop import forecast_bias, track_record
 from sync.agent.mining import mine_quasi_experiments, placebo_sigma
 from sync.agent.portfolio import computed_rows as portfolio_computed_rows
 from sync.agent.portfolio import portfolio_targets
+from sync.agent.ideas import abtests as ideas_abtests
+from sync.agent.ideas import bundles as ideas_bundles
+from sync.agent.ideas import consolidate as ideas_consolidate
+from sync.agent.ideas import market as ideas_market
+from sync.agent.ideas import proven as ideas_proven
 from sync.agent.ideas import registry as ideas_registry
 from sync.agent.writer import db as writer_db
 from sync.agent.writer import tier as tier_mod
@@ -362,6 +367,198 @@ def ideas_section(ideas: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _account_value_per_payment(index: Dict[str, Any], account: str) -> Optional[float]:
+    """Средний чек кабинета — по СОСТОЯВШИМСЯ оплатам его кампаний.
+
+    Взвешивание оплатами, а не расходом и не поровну: чек кабинета — это то,
+    сколько в среднем принесла оплата, и кампания с двумя оплатами не вправе
+    тянуть его наравне с кампанией, у которой их двести. Оплат нет ни у одной
+    кампании — None, а не ноль: непосчитанная ценность и посчитанный ноль
+    стоят в очереди реестра по-разному (registry.rank).
+    """
+    revenue = 0.0
+    payments = 0.0
+    for entry in index.values():
+        if entry.get("account") != account or entry.get("avg_check") is None:
+            continue
+        paid = float((entry.get("counts") or {}).get("paid") or 0.0)
+        if paid <= 0:
+            continue
+        revenue += float(entry["avg_check"]) * paid
+        payments += paid
+    return (revenue / payments) if payments > 0 else None
+
+
+def collect_ideas(
+    *,
+    facts: List[Dict[str, Any]],
+    ladder_section: Dict[str, Any],
+    portfolio_section: Dict[str, Any],
+    sliced_rows: List[Dict[str, Any]],
+    query_rows: List[Dict[str, Any]],
+    expansion: List[Dict[str, Any]],
+    demand: Dict[str, Dict[str, Any]],
+    settings_by_campaign: Dict[str, Dict[str, Any]],
+    login_by_campaign: Dict[str, str],
+    direction_by_campaign: Dict[str, str],
+    holdout_ids: List[str],
+    learning_reset: Dict[str, Any],
+    quality_drift: Dict[str, Any],
+    config: Dict[str, Any],
+    slice_window_days: int,
+    query_window_days: int,
+    today: date = None,
+) -> Dict[str, Any]:
+    """Генераторы идей на данных такта: собрать вход, позвать, записать в реестр.
+
+    До этой функции все пять генераторов Ф13 были мёртвым кодом: чистые
+    функции существовали, а звать их было некому — registry.upsert в бою не
+    вызывался ниоткуда, реестр оставался пустым, и секция ideas честно
+    печатала нули. Отчёт при этом выглядел работающим.
+
+    Порция пишется ОТДЕЛЬНО по каждому источнику. Реестр принимает порцию
+    целиком или никак (registry.upsert), и одна кривая находка обязана уронить
+    находки своего генератора, а не всего такта: у пяти генераторов нет ни
+    общего кода, ни общей причины ошибиться. Отказ реестра при этом не роняет
+    прогон — он становится строкой отчёта: расчётный такт считает деньги, и
+    падать из-за экрана предложений ему нельзя.
+
+    Кабинет — рамка всего. Идеи считаются по кабинетам, а не по кабинету
+    вообще: порог λ, средний чек и заповедник у каждого свои, и связка одного
+    кабинета, посуженная порогом другого, — это приговор по чужой мерке.
+    Спрос рынка при этом общий (Wordstat не знает про кабинеты), поэтому
+    поводы спроса раздаются кабинету только по ЕГО направлениям: растущее
+    направление, которого в кабинете нет вовсе, адресовать некому, и выбор
+    «кому его завести» из данных не выводится.
+    """
+    today = today or date.today()
+    index = ideas_bundles.campaign_index(
+        facts, ladder_section, portfolio_section,
+        login_by_campaign=login_by_campaign,
+        settings_by_campaign=settings_by_campaign,
+        direction_by_campaign=direction_by_campaign)
+
+    segments = ideas_bundles.segment_bundles(
+        sliced_rows, index, window_days=slice_window_days)
+    donors = ideas_bundles.query_donors(
+        query_rows, index,
+        phrases=[c.get("query") for c in (expansion or ())],
+        window_days=query_window_days)
+    tests = ideas_bundles.campaign_tests(
+        index, holdout_ids=holdout_ids, learning_reset=learning_reset,
+        today=today)
+
+    # Цена эффективного лида по направлениям и живые направления кабинета —
+    # на окне лестницы, том же, на котором посчитана ценность лида. Другое
+    # окно означало бы, что критерий успеха идеи («побить нынешнюю цену»)
+    # мерит не ту цену, о которой говорит остальной отчёт.
+    window_from = ladder_section.get("window_from") or ""
+    window_to = ladder_section.get("window_to") or ""
+    cost_by_direction: Dict[str, float] = {}
+    eff_by_direction: Dict[str, float] = {}
+    live_by_account: Dict[str, set] = {}
+    for fact in facts or ():
+        fact_date = str(fact.get("fact_date"))[:10]
+        if not (window_from <= fact_date <= window_to):
+            continue
+        direction = fact.get("direction") or ""
+        if not direction:
+            continue
+        cost = float(fact.get("cost") or 0.0)
+        cost_by_direction[direction] = cost_by_direction.get(direction, 0.0) + cost
+        eff_by_direction[direction] = (eff_by_direction.get(direction, 0.0)
+                                       + float(fact.get("eff_leads") or 0.0))
+        if cost > 0:
+            login = login_by_campaign.get(str(fact.get("campaign_id")))
+            if login:
+                live_by_account.setdefault(login, set()).add(direction)
+    cpl_by_direction = {d: cost_by_direction[d] / eff_by_direction[d]
+                        for d in cost_by_direction if eff_by_direction.get(d, 0.0) > 0}
+
+    uncovered_by_direction: Dict[str, List[str]] = {}
+    for candidate in expansion or ():
+        for campaign_id in candidate.get("campaigns") or ():
+            direction = direction_by_campaign.get(str(campaign_id))
+            if not direction:
+                continue
+            phrases = uncovered_by_direction.setdefault(direction, [])
+            if candidate.get("query") and candidate["query"] not in phrases:
+                phrases.append(candidate["query"])
+
+    accounts = sorted({entry["account"] for entry in index.values()
+                       if entry.get("account")})
+    lambdas = {login: acc.get("lambda")
+               for login, acc in ((portfolio_section or {}).get("accounts") or {}).items()}
+
+    by_source: Dict[str, Dict[str, Any]] = {}
+    failed: Dict[str, str] = {}
+
+    def _run(source: str, ideas: List[Dict[str, Any]],
+             skipped: List[Dict[str, Any]]) -> None:
+        slot = by_source.setdefault(
+            source, {"ideas": 0, "upserted": 0, "skipped_by_reason": {}})
+        slot["ideas"] += len(ideas)
+        for row in skipped:
+            reason = str(row.get("reason") or "")
+            slot["skipped_by_reason"][reason] = (
+                slot["skipped_by_reason"].get(reason, 0) + 1)
+        if not ideas:
+            return
+        try:
+            slot["upserted"] += len(ideas_registry.upsert(ideas))
+        except Exception as exc:  # noqa: BLE001
+            failed[source] = f"{type(exc).__name__}: {exc}"[:300]
+
+    for account in accounts:
+        own = {cid for cid, entry in index.items() if entry["account"] == account}
+        ctx = {
+            "account": account,
+            "lambda": lambdas.get(account),
+            "quality_drift": quality_drift,
+            "holdout_ids": holdout_ids,
+            "config": config,
+            "value_per_payment_rub": _account_value_per_payment(index, account),
+        }
+        found = ideas_proven.scan(
+            [b for b in segments["bundles"] if b["campaign_id"] in own], ctx)
+        _run(ideas_proven.SOURCE, found["ideas"], found["skipped"])
+
+        found = ideas_consolidate.scan(
+            [r for r in donors["rows"] if r["campaign_id"] in own], ctx)
+        _run(ideas_consolidate.SOURCE, found["ideas"], found["skipped"])
+
+        found = ideas_abtests.scan(
+            [r for r in tests if r["campaign_id"] in own], ctx)
+        _run(ideas_abtests.SOURCE, found["ideas"], found["skipped"])
+
+        directions = live_by_account.get(account, set())
+        found = ideas_market.scan(ideas_bundles.demand_rows(
+            {d: r for d, r in (demand or {}).items() if d in directions},
+            account=account,
+            uncovered_by_direction=uncovered_by_direction,
+            cpl_by_direction=cpl_by_direction,
+            live_directions=sorted(directions)), ctx)
+        _run(ideas_market.SOURCE, found["ideas"], found["skipped"])
+
+    return {
+        "accounts": len(accounts),
+        "bundles": {
+            "segments": len(segments["bundles"]),
+            "donors": len(donors["rows"]),
+            "campaigns": len(tests),
+            "skipped_by_reason": _count_by(
+                segments["skipped"] + donors["skipped"], "reason"),
+        },
+        "by_source": by_source,
+        # Генератор, которому такт не даёт входа вовсе. Ноль находок у него —
+        # не «поводов не нашлось», а «спрашивать было не о чем», и по пустому
+        # счётчику эти два состояния неразличимы.
+        "sources_without_input": dict(ideas_bundles.SOURCES_WITHOUT_INPUT),
+        # Отказ реестра в порции. Пусто — все порции приняты.
+        "failed": failed,
+    }
+
+
 def funnel_ladder_section(
     facts: List[Dict[str, Any]],
     lead_rows: List[Dict[str, Any]],
@@ -431,6 +628,13 @@ def funnel_ladder_section(
     report["maturity_days"] = maturity_days
     report["window_from"] = window_from
     report["window_to"] = window_to
+    # Пулы и чеки — наружу, а не только внутрь отчёта. По ним генераторы идей
+    # переводят события связки (сегмента, запроса) в оплаты и выручку: своих
+    # коэффициентов перехода у связки быть не может — событий на них не
+    # набралось бы никогда, — и второй расчёт рядом означал бы, что кампанию и
+    # её сегмент такт судит по разным коэффициентам.
+    report["counts"] = {"by_direction": by_direction, "account": account}
+    report["avg_check"] = checks
     return report
 
 
@@ -1234,6 +1438,35 @@ def main() -> int:
     growth = growth_candidates(budget_threshold, headroom_section, demand,
                                expansion, quality_drift=quality["drift"])
 
+    # Ф13: генераторы идей. Считаются ПОСЛЕ итоговой раскладки — им нужен
+    # порог λ, ценность лида и признак связывающего лимита, то есть те же
+    # числа, по которым такт двигает деньги. Реестр — единственный выход
+    # генераторов наружу: применять они ничего не умеют, и всё, что найдено,
+    # уезжает человеку на экран и в очередь такта записи.
+    #
+    # Журнал сбросов обучения читается тем же способом, что и петля обучения
+    # выше: недоступность журнала расчёт не роняет, но и молча пустым не
+    # притворяется — генератор тестов обязан отличать «сбросов не было» от
+    # «журнал не прочитан», иначе срок теста поедет на две недели.
+    try:
+        learning_reset = writer_db.last_learning_reset()
+        learning_reset_error = None
+    except Exception as exc:  # noqa: BLE001
+        learning_reset, learning_reset_error = {}, f"{type(exc).__name__}: {exc}"[:200]
+    generated = collect_ideas(
+        facts=facts, ladder_section=ladder_section,
+        portfolio_section=budget_threshold, sliced_rows=sliced_rows,
+        query_rows=scored_queries, expansion=expansion, demand=demand,
+        settings_by_campaign=campaign_settings,
+        login_by_campaign=login_by_campaign_id,
+        direction_by_campaign=direction_by_campaign,
+        holdout_ids=[str(h["campaign_id"]) for h in holdout],
+        learning_reset=learning_reset, quality_drift=quality["drift"],
+        config=active_config, slice_window_days=SLICE_WINDOW_DAYS,
+        query_window_days=QUERY_WINDOW_DAYS)
+    if learning_reset_error:
+        generated["learning_reset_unavailable"] = learning_reset_error
+
     sizes = agent_db.table_sizes()
     total_mb = round(sum(int(s["size_bytes"] or 0) for s in sizes) / 1024 / 1024, 1)
 
@@ -1467,7 +1700,13 @@ def main() -> int:
         # пустая секция говорит «генераторы отработали, находок нет», а её
         # отсутствие читается как «генератор не запускался» — и восстановить,
         # что из двух было, задним числом уже нечем.
-        "ideas": ideas_section(ideas_registry.open_ideas()),
+        "ideas": {**ideas_section(ideas_registry.open_ideas()),
+                  # Что нашли ИМЕННО В ЭТОТ такт, рядом с тем, что стоит в
+                  # реестре. Одного счётчика открытых идей мало: реестр помнит
+                  # находки прошлых прогонов, и по нему не отличить «сегодня
+                  # генераторы отработали и ничего не нашли» от «сегодня
+                  # генераторы не работали вовсе».
+                  "generated": generated},
         "db_total_mb": total_mb,
         "db_tables": [{"t": s["table_name"], "size": s["size"]} for s in sizes],
     }

@@ -190,6 +190,13 @@ def _patch_e0_run(monkeypatch, reports=None):
     # уходит в БД и печатает ретраи коннекта в тот же stdout, который тест
     # парсит как JSON (та же причина, что у панели настроек выше).
     monkeypatch.setattr(agent_e0.writer_db, "closed_actions", lambda *a, **k: [])
+    # Журнал сбросов обучения — вход генератора A/B-тестов (задача 16а). Та же
+    # причина подмены: без неё прогон уходит в реальную базу и печатает ретраи
+    # коннекта в тот же stdout, который тест парсит как JSON.
+    monkeypatch.setattr(agent_e0.writer_db, "last_learning_reset", lambda *a, **k: {})
+    # Запись находок генераторов. Пусто = порция принята; настоящая запись
+    # проверяется отдельно (tests/test_agent_e0_ideas.py).
+    monkeypatch.setattr(agent_e0.ideas_registry, "upsert", lambda rows: list(rows))
     monkeypatch.setattr(
         agent_e0.agent_db, "upsert_computed_settings",
         # Значения по умолчанию намеренно: на коде ДО правки вызов идёт без

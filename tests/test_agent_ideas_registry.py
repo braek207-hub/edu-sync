@@ -25,12 +25,15 @@ import pytest
 from sync.agent.db import AGENT_DDL
 from sync.agent.ideas import registry
 
+ACCOUNT = "edu-vuz"
+
 
 def test_idea_id_is_deterministic():
     # Недетерминированный идентификатор — это новая строка реестра на каждый
     # такт: тот же объект, тот же повод, и десять строк за десять дней.
     s = {"campaign_id": "123", "query": "колледж заочно"}
-    assert registry.idea_id("consolidate", s) == registry.idea_id("consolidate", s)
+    assert (registry.idea_id("consolidate", s, ACCOUNT)
+            == registry.idea_id("consolidate", s, ACCOUNT))
 
 
 def test_idea_id_ignores_key_order_in_subject():
@@ -39,7 +42,8 @@ def test_idea_id_ignores_key_order_in_subject():
     # дала бы ту же болезнь, что и случайный id, но заметную не сразу.
     a = {"campaign_id": "123", "query": "колледж заочно"}
     b = {"query": "колледж заочно", "campaign_id": "123"}
-    assert registry.idea_id("consolidate", a) == registry.idea_id("consolidate", b)
+    assert (registry.idea_id("consolidate", a, ACCOUNT)
+            == registry.idea_id("consolidate", b, ACCOUNT))
 
 
 def test_idea_id_separates_sources():
@@ -47,7 +51,8 @@ def test_idea_id_separates_sources():
     # разными рычагами. Схлопни их в один id — и вторая идея молча затрёт
     # первую вместе с её статусом.
     s = {"campaign_id": "123"}
-    assert registry.idea_id("proven", s) != registry.idea_id("consolidate", s)
+    assert (registry.idea_id("proven", s, ACCOUNT)
+            != registry.idea_id("consolidate", s, ACCOUNT))
 
 
 def test_subject_key_is_the_same_across_sources():
@@ -55,8 +60,29 @@ def test_subject_key_is_the_same_across_sources():
     # отклонение человеком («этот объект не трогаем»), и генератор, сменивший
     # источник, не должен уметь обойти это «нет».
     s = {"campaign_id": "123"}
-    assert registry.subject_key(s) == registry.subject_key({"campaign_id": "123"})
-    assert registry.idea_id("proven", s) != registry.idea_id("abtest", s)
+    assert (registry.subject_key(s, ACCOUNT)
+            == registry.subject_key({"campaign_id": "123"}, ACCOUNT))
+    assert (registry.idea_id("proven", s, ACCOUNT)
+            != registry.idea_id("abtest", s, ACCOUNT))
+
+
+def test_identity_is_scoped_to_the_cabinet():
+    # Адрес объекта у половины генераторов — НАПРАВЛЕНИЕ (consolidate, market),
+    # а одно и то же направление есть сразу в нескольких кабинетах. Без
+    # кабинета в идентичности две разные находки схлопывались бы в одну строку
+    # внутри одной же порции.
+    s = {"kind": "demand", "direction": "vuz"}
+    assert (registry.idea_id("market", s, "edu-vuz")
+            != registry.idea_id("market", s, "edu-spo"))
+
+
+def test_a_human_no_in_one_cabinet_does_not_silence_another():
+    # Ключ объекта тоже с кабинетом: на нём держится отказ человека, и
+    # общий ключ означал бы, что «нет» по направлению в одном кабинете
+    # навсегда закрыло его во всех остальных.
+    s = {"kind": "demand", "direction": "vuz"}
+    assert (registry.subject_key(s, "edu-vuz")
+            != registry.subject_key(s, "edu-spo"))
 
 
 # ------------------------------------------------------------------ таблица
@@ -152,7 +178,7 @@ def _idea(campaign="123", source="consolidate", **over):
     """
     idea = {
         "source": source,
-        "account": "edu-vuz",
+        "account": ACCOUNT,
         "subject": {"campaign_id": campaign},
         "tier": 1,
         "lane": "allocation",
@@ -181,7 +207,7 @@ def _action(campaign="123"):
 
 
 def _id(idea):
-    return registry.idea_id(idea["source"], idea["subject"])
+    return registry.idea_id(idea["source"], idea["subject"], idea["account"])
 
 
 # ------------------------------------------- критерий успеха обязателен
@@ -248,7 +274,7 @@ def test_upsert_writes_the_idea_and_it_reads_back(store):
     assert [r["idea_id"] for r in written] == [_id(_idea())]
     assert row["status"] == "new"
     assert row["subject"] == {"campaign_id": "123"}
-    assert row["subject_key"] == registry.subject_key({"campaign_id": "123"})
+    assert row["subject_key"] == registry.subject_key({"campaign_id": "123"}, ACCOUNT)
     assert row["lane"] == "allocation"
     assert row["horizon_days"] == 14
 
@@ -563,7 +589,8 @@ def test_rejection_is_remembered_by_subject_not_by_row(store):
     row = registry.load(_id(same_subject_other_source))
 
     assert _id(same_subject_other_source) != _id(rejected)
-    assert row["subject_key"] == registry.subject_key(rejected["subject"])
+    assert row["subject_key"] == registry.subject_key(rejected["subject"],
+                                                      rejected["account"])
     assert row["status"] == registry.STATUS_DROPPED
     assert row["dropped_reason"].startswith("человек")
     assert row["rejected_by"] == "pavel"

@@ -14,10 +14,13 @@ sync/agent/ideas/registry.py — реестр идей: идея живёт до
 (writer/tier.py) вместе с полосой (writer/lanes.py) у неё те же самые, что у
 действия. Второго определения полос и классов здесь нет и быть не должно.
 
-Идентичность. idea_id выведен из пары (source, subject) — одна и та же связка
-от одного и того же генератора всегда попадает В ТУ ЖЕ СТРОКУ, а не заводит
-новую каждым тактом. subject_key выведен ТОЛЬКО из subject и одинаков у идей
-разных источников про один объект: на нём держится отклонение человеком.
+Идентичность. idea_id выведен из тройки (account, source, subject) — одна и та
+же связка от одного и того же генератора в одном кабинете всегда попадает В ТУ
+ЖЕ СТРОКУ, а не заводит новую каждым тактом. subject_key выведен из пары
+(account, subject) и одинаков у идей разных источников про один объект: на нём
+держится отклонение человеком. Кабинет входит в оба ключа потому, что адрес
+объекта у половины генераторов — направление, а направление «vuz» есть сразу в
+нескольких кабинетах.
 
 Отсюда требование к генераторам (задачи 12–15): в subject кладётся АДРЕС
 объекта и ничего кроме — кампания, сегмент, фраза, связка. Изменчивые числа
@@ -99,25 +102,37 @@ def _digest(payload: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
-def idea_id(source: str, subject: Any) -> str:
-    """Идентификатор идеи по паре (источник, объект).
+def idea_id(source: str, subject: Any, account: str) -> str:
+    """Идентификатор идеи по тройке (кабинет, источник, объект).
+
+    Кабинет входит в ключ, и это не украшение. Объект идеи адресуется тем,
+    чем её адресует генератор, а половина генераторов адресуется НАПРАВЛЕНИЕМ
+    (consolidate, market: subject = {kind, direction}). Направление «vuz» есть
+    у нескольких кабинетов сразу — без кабинета в ключе находка второго
+    кабинета молча затирала бы находку первого в той же порции, а отказ
+    человека в одном кабинете глушил бы идею во всех остальных.
 
     Длина и способ те же, что у идентификаторов действия и ставки
     (writer/db.make_action_id, experiments.experiment_id_for): реестры агента
     сшиваются между собой, и разнобой в форме ключей мешал бы читать историю.
     """
-    return _digest(f"idea:{source}:{_canonical(subject)}")
+    return _digest(f"idea:{account}:{source}:{_canonical(subject)}")
 
 
-def subject_key(subject: Any) -> str:
-    """Отпечаток ОБЪЕКТА идеи, без источника.
+def subject_key(subject: Any, account: str) -> str:
+    """Отпечаток ОБЪЕКТА идеи в его кабинете, без источника.
 
     Отдельная функция, а не часть idea_id: по ней ищется отклонение человеком,
     и она обязана совпадать у идей разных генераторов про один и тот же
     объект. Совпади она с idea_id — «нет» человека обходилось бы сменой
     источника.
+
+    Кабинет здесь по той же причине, что и в idea_id, но цена ошибки другая:
+    «нет» человека на вынос направления в одном кабинете не имеет отношения к
+    тому же направлению в соседнем — там другие кампании, другие деньги и
+    другой разговор.
     """
-    return _digest(f"subject:{_canonical(subject)}")
+    return _digest(f"subject:{account}:{_canonical(subject)}")
 
 
 # --------------------------------------------------------------- приоритет
@@ -357,7 +372,7 @@ def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
             f"статус {status!r} не бывает начальным: закрытие идеи — событие "
             "(mark, reject), а не состояние, с которого она заводится")
 
-    computed_id = idea_id(source, subject)
+    computed_id = idea_id(source, subject, account)
     given_id = _text(idea.get("idea_id"))
     if given_id and given_id != computed_id:
         raise InvalidIdea(
@@ -370,7 +385,7 @@ def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
         "source": source,
         "account": account,
         "subject": subject,
-        "subject_key": subject_key(subject),
+        "subject_key": subject_key(subject, account),
         "tier": int(tier),
         "lane": lane,
         "expected_rub": _check_price(idea, "expected_rub", non_negative=False),
