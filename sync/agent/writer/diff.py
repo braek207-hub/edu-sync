@@ -18,7 +18,16 @@ from typing import Any, Dict, List, Optional
 from sync.agent.writer import expectation, exposure, schedule
 
 
-def _idempotency_key(campaign_id: str, direct_type: str, key: str, percent: int) -> str:
+def bidmod_idempotency_key(campaign_id: str, direct_type: str, key: str, percent: int) -> str:
+    """Ключ действия-корректировки: от адреса сегмента и величины сдвига.
+
+    Публичное имя, потому что корректировку собирает не только этот модуль:
+    генератор идей «масштабирование доказанного» (ideas/proven.py) приносит
+    свою готовую нагрузку, и ключ у неё обязан считаться ТЕМ ЖЕ способом.
+    Вторая копия формулы означала бы, что одно и то же изменение приезжает под
+    двумя ключами: закрытый ключ прошлого прогона не отсёк бы повтор, а
+    счётчик попыток считал бы два разных действия.
+    """
     raw = f"bidmod:{campaign_id}:{direct_type}:{key}:{percent}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
@@ -140,7 +149,7 @@ def diff_modifiers(
             "key": item["key"],
             "payload": payload,
             "previous_state": previous_state,
-            "idempotency_key": _idempotency_key(
+            "idempotency_key": bidmod_idempotency_key(
                 campaign_id, item["direct_type"], item["key"], percent
             ),
         }, {**(context or {}), "segment_share": item.get("share")}))
