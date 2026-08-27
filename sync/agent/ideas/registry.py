@@ -627,6 +627,16 @@ def open_ideas(account: Optional[str] = None) -> List[Dict[str, Any]]:
     return rank(_read_open(account))
 
 
+def find_by_order(order_id: str,
+                  account: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Идея, чей наряд несёт этот order_id, в ЛЮБОМ статусе. None — нет такой.
+
+    Обратный путь от кампании к идее: билдер знает про вынос только order_id,
+    и вернуть исход в реестр иначе не по чему.
+    """
+    return _read_by_order(_text(order_id), account)
+
+
 # ------------------------------------------------------------ доступ к БД
 # Четыре примитива ниже — единственное место модуля, которое ходит в базу, и
 # ничего кроме хранения не делают: правило слияния живёт в Python выше, а SQL
@@ -693,6 +703,21 @@ SELECT_OPEN_SQL = """
 """
 
 
+# Идея по наряду, который она несёт. Статус в условии НЕ участвует: исход
+# нужен как раз у выносов, доживших до конца горизонта, а такая идея уже
+# закрыта, — фильтр по открытым спрятал бы именно их. Поиск по JSON-пути, а не
+# по колонке: order_id живёт внутри нагрузки действия, и своя колонка под него
+# была бы второй копией того же значения.
+SELECT_BY_ORDER_SQL = """
+    SELECT *
+      FROM edu_agent_ideas
+     WHERE action -> 'payload' -> 'order' ->> 'order_id' = %(order_id)s
+       AND (%(account)s IS NULL OR account = %(account)s)
+     ORDER BY updated_at DESC NULLS LAST
+     LIMIT 1
+"""
+
+
 def _json_params(row: Dict[str, Any]) -> Dict[str, Any]:
     """Строка → параметры запроса, ровно по объявленным колонкам.
 
@@ -735,6 +760,17 @@ def _read_open(account: Optional[str] = None) -> List[Dict[str, Any]]:
                         {"statuses": list(OPEN_STATUSES),
                          "account": None if account is None else str(account)})
             return [dict(r) for r in cur.fetchall()]
+
+
+def _read_by_order(order_id: str,
+                   account: Optional[str]) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(SELECT_BY_ORDER_SQL,
+                        {"order_id": order_id,
+                         "account": None if account is None else str(account)})
+            row = cur.fetchone()
+            return dict(row) if row else None
 
 
 def _read_rejections(subject_keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:

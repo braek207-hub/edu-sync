@@ -43,6 +43,17 @@ class FakeIdeas:
                             "dropped_reason": row.get("dropped_reason")}
         return out
 
+    def read_by_order(self, order_id, account):
+        """Условие SELECT_BY_ORDER_SQL: наряд внутри нагрузки действия."""
+        for row in self.table.values():
+            order = ((row.get("action") or {}).get("payload") or {}).get("order")
+            if str((order or {}).get("order_id") or "") != str(order_id):
+                continue
+            if account is not None and str(row.get("account")) != str(account):
+                continue
+            return dict(row)
+        return None
+
     def write_rows(self, rows):
         self.writes += 1
         for row in rows:
@@ -55,5 +66,6 @@ def store(monkeypatch):
     fake = FakeIdeas()
     monkeypatch.setattr(registry, "_read_rows", fake.read_rows)
     monkeypatch.setattr(registry, "_read_rejections", fake.read_rejections)
+    monkeypatch.setattr(registry, "_read_by_order", fake.read_by_order)
     monkeypatch.setattr(registry, "_write_rows", fake.write_rows)
     return fake

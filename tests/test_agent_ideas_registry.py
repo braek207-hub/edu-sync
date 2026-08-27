@@ -794,3 +794,33 @@ def test_initial_status_is_honoured_but_never_re_declared(store):
     registry.upsert([_idea(status=registry.STATUS_NEW)])
 
     assert registry.load(_id(_idea()))["status"] == registry.STATUS_RUNNING
+
+
+# ------------------------------------------------- поиск идеи по наряду
+
+
+def test_an_idea_is_found_by_the_order_it_carries(store):
+    # Билдер знает про идею одно — order_id кампании, которую по ней завели.
+    # Обратный путь (наряд → идея) нужен, чтобы вернуть исход в реестр.
+    order = {"order_id": "consolidate-vpo", "campaign_name": "vpo / consolidate"}
+    registry.upsert([_idea(action={"kind": "campaign.create",
+                                   "object_id": "consolidate-vpo",
+                                   "idempotency_key": "k-1",
+                                   "payload": {"order": order}})])
+
+    found = registry.find_by_order("consolidate-vpo", account=ACCOUNT)
+    assert found is not None
+    assert found["idea_id"] == _id(_idea())
+
+
+def test_an_unknown_order_is_not_found(store):
+    assert registry.find_by_order("нет-такого", account=ACCOUNT) is None
+
+
+def test_the_order_lookup_does_not_filter_by_status():
+    # Исход нужен как раз у выносов, доживших до конца, — а такая идея уже
+    # закрыта. Фильтр по статусу в этом запросе спрятал бы ровно те кампании,
+    # ради которых обратная связь и заводилась.
+    sql = " ".join(registry.SELECT_BY_ORDER_SQL.split())
+    assert "status" not in sql
+    assert "action" in sql and "order_id" in sql
