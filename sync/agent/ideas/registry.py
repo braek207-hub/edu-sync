@@ -195,15 +195,21 @@ COMPARISONS = ("<=", ">=", "<", ">")
 # генерацию, либо наоборот.
 COLUMNS = ("idea_id", "source", "account", "subject", "subject_key", "tier",
            "lane", "expected_rub", "test_cost_rub", "horizon_days",
-           "success_rule", "status", "action_id", "experiment_id",
+           "success_rule", "action", "status", "action_id", "experiment_id",
            "dropped_reason", "rejected_by", "rejected_at")
 
 # Поля, которые генератор вправе обновлять у уже существующей идеи: его
 # собственные числа и формулировки. Всего остального (статус, связи с
 # действием и ставкой, отказ человека) он не хозяин — см. _merge.
+#
+# action здесь наравне с ценностью и сметой: нагрузка рычага — такое же
+# посчитанное число, и заморозь её первой находкой, такт записи применял бы
+# ставку, посчитанную в день появления идеи. В idea_id она при этом НЕ входит
+# (см. idea_id): войди — и новая ставка заводила бы идею заново, с пустой
+# историей и снятым отказом человека.
 GENERATOR_FIELDS = ("source", "account", "subject", "subject_key", "tier",
                     "lane", "expected_rub", "test_cost_rub", "horizon_days",
-                    "success_rule")
+                    "success_rule", "action")
 
 
 class InvalidIdea(ValueError):
@@ -243,6 +249,36 @@ def _check_success_rule(rule: Any) -> Dict[str, Any]:
             f"критерий успеха: знак сравнения {op!r} машина не проверит; "
             f"допустимы {', '.join(COMPARISONS)}")
     return dict(rule)
+
+
+def _check_action(raw: Any, tier_value: int) -> Optional[Dict[str, Any]]:
+    """Нагрузка рычага у идеи: обязательна применимой, запрещена предложению.
+
+    Расчётный такт и такт записи — РАЗНЫЕ прогоны. Передать нагрузку в
+    памяти нечем: такт записи читает идеи из базы (open_ideas), и всё, чего
+    нет в колонке, для него не существует. Поэтому пустая нагрузка у
+    применимого класса — не мелочь, а идея, которая гарантированно получит
+    отказ «применять нечем» через сутки, в чужом прогоне и в чужом логе.
+    Отказ ставится ЗДЕСЬ, пока генератор ещё жив и может быть исправлен.
+
+    У класса 3 рычага нет по определению (writer/tier.py), и нагрузка у него
+    означает не «есть чем применить», а перепутанный класс: предложение,
+    притворяющееся применимым. Такое молча обрезать нельзя — обрезанная
+    нагрузка выглядела бы как честное предложение, и дефект генератора уехал
+    бы в реестр незамеченным.
+    """
+    if tier_value == tier_mod.TIER_PROPOSAL:
+        if raw:
+            raise InvalidIdea(
+                "класс 3 несёт нагрузку действия: у предложения рычага записи "
+                "нет по определению — либо это не предложение, либо нагрузка "
+                "здесь лишняя")
+        return None
+    if not isinstance(raw, dict) or not raw:
+        raise InvalidIdea(
+            f"нагрузка действия {raw!r} пуста: такт записи читает идеи из "
+            "базы, и применять такую идею будет нечем")
+    return dict(raw)
 
 
 def _check_price(idea: Dict[str, Any], field: str,
@@ -318,6 +354,7 @@ def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
         "test_cost_rub": _check_price(idea, "test_cost_rub", non_negative=True),
         "horizon_days": int(horizon),
         "success_rule": _check_success_rule(idea.get("success_rule")),
+        "action": _check_action(idea.get("action"), int(tier)),
         "status": status,
         # Связи и отказ генератору не принадлежат: их ставят применение
         # (задача 11) и человек (reject).
@@ -560,12 +597,12 @@ def open_ideas(account: Optional[str] = None) -> List[Dict[str, Any]]:
 UPSERT_SQL = """
     INSERT INTO edu_agent_ideas (
         idea_id, source, account, subject, subject_key, tier, lane,
-        expected_rub, test_cost_rub, horizon_days, success_rule, status,
+        expected_rub, test_cost_rub, horizon_days, success_rule, action, status,
         action_id, experiment_id, dropped_reason, rejected_by, rejected_at
     ) VALUES (
         %(idea_id)s, %(source)s, %(account)s, %(subject)s, %(subject_key)s,
         %(tier)s, %(lane)s, %(expected_rub)s, %(test_cost_rub)s,
-        %(horizon_days)s, %(success_rule)s, %(status)s, %(action_id)s,
+        %(horizon_days)s, %(success_rule)s, %(action)s, %(status)s, %(action_id)s,
         %(experiment_id)s, %(dropped_reason)s, %(rejected_by)s, %(rejected_at)s
     )
     ON CONFLICT (idea_id) DO UPDATE SET
@@ -579,6 +616,7 @@ UPSERT_SQL = """
         test_cost_rub  = EXCLUDED.test_cost_rub,
         horizon_days   = EXCLUDED.horizon_days,
         success_rule   = EXCLUDED.success_rule,
+        action         = EXCLUDED.action,
         status         = EXCLUDED.status,
         action_id      = EXCLUDED.action_id,
         experiment_id  = EXCLUDED.experiment_id,
@@ -625,6 +663,12 @@ def _json_params(row: Dict[str, Any]) -> Dict[str, Any]:
     params["subject"] = json.dumps(row.get("subject") or {}, ensure_ascii=False)
     params["success_rule"] = json.dumps(row.get("success_rule") or {},
                                         ensure_ascii=False)
+    # Пустая нагрузка едет NULL-ом, а не литералом 'null': колонка читается
+    # как «рычага нет» (у предложения его и не бывает), и два разных способа
+    # сказать это разъехались бы на первом же условии с IS NULL.
+    action = row.get("action")
+    params["action"] = (json.dumps(action, ensure_ascii=False)
+                        if action else None)
     return params
 
 

@@ -201,9 +201,24 @@ def _idea(campaign="123", source="consolidate", **over):
         "test_cost_rub": 10_000.0,
         "horizon_days": 14,
         "success_rule": {"metric": "eff_cpl", "op": "<=", "value": 900.0},
+        # Полезная нагрузка рычага. У применимого класса она обязательна:
+        # идея, у которой её нет, доедет до такта записи и будет отвергнута
+        # там — через сутки после того, как генератор ушёл.
+        "action": _action(campaign),
     }
     idea.update(over)
     return idea
+
+
+def _action(campaign="123"):
+    return {
+        "action_kind": "bidmodifier.add",
+        "object_level": "campaign",
+        "object_id": str(campaign),
+        "direct_type": "DEVICE_MULTIPLIER",
+        "key": "MOBILE",
+        "idempotency_key": f"idea-{campaign}-bidmodifier.add",
+    }
 
 
 def _id(idea):
@@ -285,6 +300,127 @@ def test_upsert_of_the_same_idea_does_not_create_a_second_row(store):
     registry.upsert([_idea()])
     registry.upsert([_idea()])
     assert len(store.table) == 1
+
+
+# ------------------------------------------------- нагрузка действия
+
+def _proposal(campaign="123", **over):
+    """Идея класса 3: повод для человека, рычага записи у неё нет."""
+    idea = _idea(campaign, tier=3, lane="proposal",
+                 status=registry.STATUS_PROPOSED)
+    idea.pop("action")
+    idea.update(over)
+    return idea
+
+
+def test_action_payload_survives_the_registry(store):
+    # Главный дефект задачи 11, найденный исполнением против прода: генератор
+    # отдавал идею с нагрузкой, реестр проецировал её на COLUMNS — и action
+    # терялся ещё до базы. Такт записи читает идеи ИЗ БАЗЫ, у прочитанной
+    # строки нагрузки не было НИКОГДА, и каждая идея получала отказ
+    # «применять нечем». Расчёт и запись — разные прогоны, в памяти нагрузку
+    # передать нечем: она обязана лежать в колонке.
+    registry.upsert([_idea()])
+
+    assert registry.load(_id(_idea()))["action"] == _action("123")
+
+
+def test_idea_of_an_applied_tier_without_an_action_is_refused(store):
+    # Отказ на записи, а не молчаливый через сутки в такте записи. Генератор
+    # ещё жив и обязан узнать о своём дефекте сразу; идея, доехавшая до базы
+    # без рычага, вернётся отказом в чужом прогоне и в чужом логе.
+    with pytest.raises(ValueError, match="действ"):
+        registry.upsert([_idea(action=None)])
+    assert store.table == {}
+
+
+def test_idea_of_an_applied_tier_with_an_empty_action_is_refused(store):
+    # Пустой словарь — не «нагрузка есть, она пустая», а её отсутствие:
+    # применять по нему нечего ровно так же.
+    with pytest.raises(ValueError, match="действ"):
+        registry.upsert([_idea(action={})])
+
+
+def test_arithmetic_and_bet_tiers_need_an_action_too(store):
+    # Требование держится на классе, а не на одном значении: применяются все
+    # три (tier.APPLIED_TIERS), и любой из них без рычага мёртв одинаково.
+    for tier_value in (0, 2):
+        with pytest.raises(ValueError, match="действ"):
+            registry.upsert([_idea(tier=tier_value, action=None)])
+
+
+def test_proposal_is_written_without_an_action(store):
+    # Обратная сторона: у предложения рычага нет по определению, и требовать
+    # с него нагрузку значило бы не пускать в реестр ровно те идеи, ради
+    # экрана которых он и заведён.
+    registry.upsert([_proposal()])
+
+    assert registry.load(_id(_proposal()))["action"] is None
+
+
+def test_proposal_carrying_an_action_is_refused(store):
+    # Предложение с нагрузкой — предложение, притворяющееся применимым.
+    # Класс 3 не едет в кабинет ни при какой ступени, и нагрузка у него
+    # означает, что генератор перепутал класс: это дефект, а не мелочь.
+    with pytest.raises(ValueError, match="класс 3"):
+        registry.upsert([_proposal(action=_action())])
+
+
+def test_action_is_not_part_of_the_identity(store):
+    # Идентичность — пара (источник, объект). Войди нагрузка в отпечаток, и
+    # новая ставка заводила бы идею заново: пустая история, снятый отказ
+    # человека, тот же объект под новым id.
+    a = _idea()
+    b = _idea(action={**_action(), "key": "DESKTOP"})
+
+    assert _id(a) == _id(b)
+    registry.upsert([a])
+    registry.upsert([b])
+    assert len(store.table) == 1
+
+
+def test_regeneration_refreshes_the_action_of_a_live_idea(store):
+    # Нагрузка — число генератора, как ожидаемая ценность: заморозь её, и
+    # такт записи применял бы ставку, посчитанную в день появления идеи.
+    registry.upsert([_idea()])
+    registry.upsert([_idea(action={**_action(), "key": "DESKTOP"})])
+
+    assert registry.load(_id(_idea()))["action"]["key"] == "DESKTOP"
+
+
+def test_action_is_declared_in_the_generator_fields():
+    # Тот же довод по тексту модуля: поле, забытое в GENERATOR_FIELDS,
+    # пишется первой находкой и больше никогда не обновляется.
+    assert "action" in registry.GENERATOR_FIELDS
+    assert "action" in registry.COLUMNS
+
+
+def test_action_column_is_added_to_the_live_table_by_alter():
+    # Таблица уже создана в бою: правка тела CREATE TABLE её не догонит, и
+    # первый же прогон упадёт на неизвестной колонке. Колонка добавляется
+    # отдельным идемпотентным оператором — как остальные поздние колонки
+    # схемы агента.
+    ddl = "\n".join(AGENT_DDL)
+    alters = [s for s in AGENT_DDL
+              if "ALTER TABLE edu_agent_ideas" in s and "action" in s]
+    assert alters, "нет ALTER TABLE edu_agent_ideas ... ADD COLUMN action"
+    assert "ADD COLUMN IF NOT EXISTS action" in " ".join(alters[0].split())
+    assert "JSONB" in alters[0].upper()
+    # И НЕ в теле CREATE TABLE: там она досталась бы только новым базам.
+    body = ddl.split("CREATE TABLE IF NOT EXISTS edu_agent_ideas", 1)[1]
+    assert "action " not in body.split(")", 1)[0]
+
+
+def test_action_goes_to_the_query_as_json_and_empty_one_as_null():
+    # JSONB-параметр едет строкой JSON, как subject и success_rule. Пустая
+    # нагрузка обязана лечь NULL-ом, а не литералом 'null': колонка читается
+    # как «нагрузки нет», и два разных способа сказать это разъедутся на
+    # первом же запросе с IS NULL.
+    with_action = registry._json_params({"idea_id": "x", "action": {"a": 1}})
+    without = registry._json_params({"idea_id": "x", "action": None})
+
+    assert with_action["action"] == '{"a": 1}'
+    assert without["action"] is None
 
 
 # --------------------------------------------------------- запрос и колонки
