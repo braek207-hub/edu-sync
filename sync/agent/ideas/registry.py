@@ -43,7 +43,7 @@ idea_id, обход был бы бесплатным: та же связка, н
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Dict, Iterable, List, Optional
 
 STATUS_NEW = "new"
 STATUS_QUEUED = "queued"
@@ -99,3 +99,66 @@ def subject_key(subject: Any) -> str:
     источника.
     """
     return _digest(f"subject:{_canonical(subject)}")
+
+
+# --------------------------------------------------------------- приоритет
+
+
+def _number(value: Any) -> Optional[float]:
+    """Число или None, если значения нет или оно не число.
+
+    NaN — то же «неизвестно», что и пусто: сравнение с NaN всегда ложно, и
+    попади он в ключ сортировки, порядок очереди зависел бы от порядка
+    входного списка (тот же приём, что в writer/tier._number).
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None
+
+
+def _value_per_rub(idea: Dict[str, Any]) -> Optional[float]:
+    """Ценность на рубль проверки. None — «не посчитано».
+
+    Ноль в знаменателе здесь законен и означает бесплатную проверку (идея
+    опирается на уже собранные данные), поэтому такая идея идёт впереди любой
+    платной. Отрицательная цена — не «ещё дешевле», а испорченное число, и
+    считается непосчитанной наравне с пустым.
+    """
+    expected = _number(idea.get("expected_rub"))
+    cost = _number(idea.get("test_cost_rub"))
+    if expected is None or cost is None or cost < 0:
+        return None
+    if cost == 0:
+        return float("inf")
+    return expected / cost
+
+
+def rank(ideas: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Идеи по убыванию ценности на рубль проверки.
+
+    Почему не по абсолютной ценности. Дорогая проверка съедает и риск-бюджет
+    полосы, и горизонт, за который можно было закрыть три дешёвых: очередь,
+    отсортированная по обещанию, встаёт на первой же крупной ставке.
+
+    Непосчитанная цена (пусто, не число, отрицательное) — это НЕ ноль. Прочти
+    её нулём — и незнание оказалось бы сильнейшим аргументом очереди: идея без
+    сметы выносится вперёд посчитанных. Такие идут в хвост и там сортируются
+    по обещанию, чтобы порядок оставался осмысленным и внутри хвоста.
+
+    Порядок равноценных доопределён идентификатором: генератор детерминирован,
+    и очередь обязана быть детерминирована вместе с ним — иначе на одних и тех
+    же данных человек видит разный экран.
+
+    Список не сортируется на месте: его читает и отчёт, и план записи, и
+    перестановка под ногами второго читателя — дефект, который не увидит ни
+    один из них.
+    """
+    items = list(ideas)
+    priced = [i for i in items if _value_per_rub(i) is not None]
+    unpriced = [i for i in items if _value_per_rub(i) is None]
+    priced.sort(key=lambda i: (-_value_per_rub(i), str(i.get("idea_id") or "")))
+    unpriced.sort(key=lambda i: (-(_number(i.get("expected_rub")) or 0.0),
+                                 str(i.get("idea_id") or "")))
+    return priced + unpriced

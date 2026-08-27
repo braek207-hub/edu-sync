@@ -84,3 +84,53 @@ def test_ideas_table_carries_subject_key_and_human_rejection():
     body = ddl.split("CREATE TABLE IF NOT EXISTS edu_agent_ideas", 1)[1]
     for column in ("subject_key", "rejected_by", "rejected_at"):
         assert column in body, column
+
+
+# ---------------------------------------------------------------- приоритет
+
+def test_rank_puts_cheap_high_value_first():
+    # Порядок по абсолютной ценности разорил бы очередь: дорогая проверка
+    # съедает и риск-бюджет, и горизонт, за который можно было закрыть три
+    # дешёвых. Сортировка — по ценности НА РУБЛЬ проверки.
+    a = {"idea_id": "a", "expected_rub": 100_000.0, "test_cost_rub": 10_000.0}
+    b = {"idea_id": "b", "expected_rub": 200_000.0, "test_cost_rub": 100_000.0}
+    assert [i["idea_id"] for i in registry.rank([b, a])] == ["a", "b"]
+
+
+def test_rank_puts_free_check_first():
+    # Проверка, не стоящая ничего (идея опирается на уже собранные данные),
+    # обязана идти впереди любой платной: деньги за неё не берутся вовсе.
+    free = {"idea_id": "free", "expected_rub": 1_000.0, "test_cost_rub": 0.0}
+    paid = {"idea_id": "paid", "expected_rub": 500_000.0, "test_cost_rub": 1_000.0}
+    assert [i["idea_id"] for i in registry.rank([paid, free])] == ["free", "paid"]
+
+
+def test_rank_puts_unpriced_ideas_after_priced_ones():
+    # Идея без цены проверки — не бесплатная, а НЕПОСЧИТАННАЯ. Пустое
+    # значение, прочитанное как ноль, вынесло бы её на первое место очереди и
+    # выдавило посчитанные: незнание оказалось бы сильнейшим аргументом.
+    priced = {"idea_id": "priced", "expected_rub": 10.0, "test_cost_rub": 100.0}
+    unpriced = {"idea_id": "unpriced", "expected_rub": 1_000_000.0,
+                "test_cost_rub": None}
+    assert [i["idea_id"] for i in registry.rank([unpriced, priced])] == [
+        "priced", "unpriced"]
+
+
+def test_rank_is_stable_on_equal_value():
+    # Генератор детерминирован, значит и очередь обязана быть детерминирована:
+    # плавающий порядок равноценных идей — это разный экран предложений на
+    # одних и тех же данных, и человек перестаёт верить списку.
+    a = {"idea_id": "a", "expected_rub": 100.0, "test_cost_rub": 10.0}
+    b = {"idea_id": "b", "expected_rub": 200.0, "test_cost_rub": 20.0}
+    assert [i["idea_id"] for i in registry.rank([b, a])] == ["a", "b"]
+    assert [i["idea_id"] for i in registry.rank([a, b])] == ["a", "b"]
+
+
+def test_rank_does_not_mutate_the_list_it_was_given():
+    # Отчёт и план записи читают один и тот же список идей. Сортировка на
+    # месте переставила бы его под ногами второго читателя.
+    a = {"idea_id": "a", "expected_rub": 1.0, "test_cost_rub": 1.0}
+    b = {"idea_id": "b", "expected_rub": 100.0, "test_cost_rub": 1.0}
+    given = [a, b]
+    registry.rank(given)
+    assert given == [a, b]
