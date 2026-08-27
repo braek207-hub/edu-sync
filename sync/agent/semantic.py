@@ -29,6 +29,7 @@ sync/agent/semantic.py — смысловой слой над кандидата
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 # Вердикты. UNCLEAR — безопасное умолчание: молчание модели не должно ни
@@ -44,30 +45,127 @@ KNOWN_VERDICTS = (JUNK, CORE, UNCLEAR)
 # всего батча разом.
 BATCH_SIZE = 40
 
+# Чем занимается проект, когда паспорта направления нет. Без описания модель
+# судит фразы в вакууме: «школа» для образовательного проекта ядро, для
+# магазина одежды мусор. Живёт здесь, а не у вызывающего: это умолчание САМОГО
+# слоя, и вторая его копия у каждого прогона разъехалась бы с первой.
+DEFAULT_CONTEXT = (
+    "онлайн-образование: высшее и среднее профессиональное образование, "
+    "колледж, дистанционное обучение, приём абитуриентов"
+)
+
+# Где лежат проекции паспортов: <направление>.json. Проекция, а не паспорт
+# целиком — тот весит 27 КБ и в промпт не помещается (scripts/import_passport.py).
+PASSPORTS_DIR = Path(__file__).resolve().parent / "passports"
+
+# Сколько символов паспорта едет в промпт. Предел не косметический: паспорт
+# без границы вытеснил бы список фраз за окно модели, и батч вернулся бы
+# пустым — то есть UNCLEAR по всем сорока фразам разом.
+PASSPORT_BUDGET = 2400
+_FIELD_LIMIT = 600      # на один раздел проекции
+_ITEM_LIMIT = 160       # на один пункт списка
+
+# Метка начала изменчивой части промпта. Всё до неё обязано совпадать от
+# батча к батчу: кэш модели считает общий ПРЕФИКС, и сдвиг стабильного текста
+# вниз обнуляет попадания (98 % → 0) на всём прогоне.
+PHRASES_MARKER = "Фразы:"
+
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
 
 
-def build_prompt(queries: Iterable[str], context: str) -> str:
-    """Запрос к модели: контекст проекта + список фраз + жёсткий формат ответа.
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _fit(text: str, limit: int) -> str:
+    """Усечение по длине БЕЗ схлопывания переносов: границы разделов
+    важнее экономии символов — слипшись в один абзац, «кому не подходит»
+    читается как продолжение описания продукта."""
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _bullets(items, limit: int) -> str:
+    return "\n".join(f"  - {_clip(i, _ITEM_LIMIT)}" for i in list(items)[:limit])
+
+
+def passport_block(passport: Optional[Dict[str, Any]]) -> str:
+    """Паспорт продукта → компактный блок промпта. Нет паспорта — пусто.
+
+    Едут ровно те разделы, которыми решается интент фразы: что продаём, кто
+    покупатель, кто НЕ наш, слова чужого интента и слова своего. Остальное
+    (цитаты, доказательства, оговорки) нужно объявлениям, а не разметке, и
+    заняло бы место, за которым фразы не поместятся.
+
+    Анти-маркеры отдаются С ПРИЧИНОЙ: «аспирантура» без пояснения читается
+    моделью как «слово запрещено», а нужно «это другой продукт кабинета» —
+    иначе она разметит junk-ом и «аспирантура дистанционно», и «магистратура
+    дистанционно» заодно.
+    """
+    if not passport:
+        return ""
+    anti = []
+    for item in list(passport.get("anti_markers") or ())[:30]:
+        if isinstance(item, dict):
+            word, reason = item.get("word"), item.get("reason")
+            anti.append(f"{word} ({reason})" if reason else str(word))
+        else:
+            anti.append(str(item))
+
+    parts = []
+    what = _clip(passport.get("what"), _FIELD_LIMIT)
+    if what:
+        parts.append(f"Что продаём. {what}")
+    who = _clip(passport.get("who"), _FIELD_LIMIT)
+    if who:
+        parts.append(f"Кто покупатель. {who}")
+    not_ours = _bullets(passport.get("not_ours") or (), 8)
+    if not_ours:
+        parts.append("Кому наш продукт не подходит:\n" + not_ours)
+    if anti:
+        parts.append("Слова чужого интента: " + _clip("; ".join(anti), _FIELD_LIMIT))
+    target = passport.get("target_markers") or ()
+    if target:
+        parts.append("Слова нашего интента: "
+                     + _clip(", ".join(str(t) for t in target), _FIELD_LIMIT))
+    rivals = passport.get("competitors") or ()
+    if rivals:
+        parts.append("Чужие бренды ниши: "
+                     + _clip(", ".join(str(r) for r in rivals), _FIELD_LIMIT))
+    return _fit("\n".join(parts), PASSPORT_BUDGET) if parts else ""
+
+
+def build_prompt(queries: Iterable[str], context: str = DEFAULT_CONTEXT,
+                 passport: Optional[Dict[str, Any]] = None) -> str:
+    """Запрос к модели: продукт + правила + формат ответа, и ФРАЗЫ В КОНЦЕ.
+
+    Порядок частей — не вкусовщина. Кэш модели считает совпадающий префикс, а
+    список фраз меняется каждым батчем: стоит он в середине — стабильный текст
+    ниже него кэш не увидит ни разу. Поэтому всё постоянное (роль, паспорт,
+    правила, формат ответа) идёт до PHRASES_MARKER, а после него только фразы.
 
     Формат задан явно и с примером, потому что разбор не должен зависеть от
     фантазии модели: свободный текст здесь означает UNCLEAR для всего батча.
     """
     listed = "\n".join(f"- {q}" for q in queries)
+    block = passport_block(passport)
+    product = f"{block}\n\n" if block else ""
     return (
         "Ты — маркетолог контекстной рекламы. Проект: "
         f"{context}.\n\n"
-        "Для каждой поисковой фразы ниже реши, что это за интент:\n"
+        f"{product}"
+        "Для каждой поисковой фразы из списка в конце реши, что это за интент:\n"
         "  core — человек ищет ровно наш продукт или близкое к нему; такую\n"
         "         фразу нельзя запрещать ни при какой цене;\n"
         "  junk — интент нецелевой (ищут файл, работу, чужой город, чужой\n"
         "         продукт, справку вместо обучения); деньги на неё уходят зря;\n"
         "  unclear — по фразе нельзя судить уверенно.\n\n"
         "Сомневаешься — отвечай unclear: ошибочный junk отрезает живой трафик.\n\n"
-        f"Фразы:\n{listed}\n\n"
         "Ответь ТОЛЬКО валидным JSON, без пояснений вокруг, строго в виде:\n"
         '{"verdicts": [{"query": "<фраза>", "verdict": "core|junk|unclear", '
-        '"reason": "<коротко, почему>"}]}'
+        '"reason": "<коротко, почему>"}]}\n\n'
+        f"{PHRASES_MARKER}\n{listed}"
     )
 
 
@@ -104,8 +202,9 @@ def parse_response(raw: str) -> Dict[str, Dict[str, Any]]:
 
 
 def classify(
-    queries: Iterable[str], ask: Callable[[str], str], context: str,
-    batch_size: int = BATCH_SIZE,
+    queries: Iterable[str], ask: Callable[[str], str],
+    context: str = DEFAULT_CONTEXT, batch_size: int = BATCH_SIZE,
+    passport: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Вердикты по фразам. Всё, о чём модель не ответила, — UNCLEAR.
 
@@ -122,7 +221,8 @@ def classify(
     for start in range(0, len(listed), batch_size):
         batch = listed[start:start + batch_size]
         try:
-            answered = parse_response(ask(build_prompt(batch, context)))
+            answered = parse_response(
+                ask(build_prompt(batch, context, passport=passport)))
         except Exception as exc:  # noqa: BLE001 — см. докстринг
             answered = {}
             for q in batch:
@@ -132,6 +232,84 @@ def classify(
             if query in out:
                 out[query] = verdict
     return out
+
+
+def load_passport(direction: str) -> Optional[Dict[str, Any]]:
+    """Проекция паспорта направления с диска. None — паспорта нет.
+
+    Отсутствие — рабочее состояние, а не авария: направлений десять
+    (sync/classify.py::detect_direction), а паспорт есть там, где кампанию
+    собирал билдер. Нет паспорта — слой работает на общем описании, ровно как
+    до задачи 20.
+    """
+    key = str(direction or "").strip().lower()
+    if not key or "/" in key or "\\" in key or key.startswith("."):
+        return None
+    path = Path(PASSPORTS_DIR) / f"{key}.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def group_by_direction(
+    candidates: Iterable[Dict[str, Any]], direction_by_campaign: Dict[str, str],
+) -> Dict[str, List[str]]:
+    """Фразы кандидатов → {направление: [фразы]}. Спорные — под ключом "".
+
+    Фраза, откручивавшаяся в кампаниях РАЗНЫХ направлений, паспорта не
+    получает. Паспорта соседних направлений противоречат друг другу ровно
+    там, где это опаснее всего: «после 9 класса» у высшего — анти-маркер, у
+    СПО — целевой маркер. Взять любой из двух значило бы судить фразу
+    паспортом чужого продукта, и вето «core» пришло бы не по делу.
+    """
+    groups: Dict[str, List[str]] = {}
+    for candidate in candidates:
+        query = str(candidate.get("query") or "").strip().lower()
+        if not query:
+            continue
+        seen = {str(direction_by_campaign.get(str(c)) or "")
+                for c in (candidate.get("campaigns") or ())}
+        seen.discard("")
+        key = seen.pop() if len(seen) == 1 else ""
+        listed = groups.setdefault(key, [])
+        if query not in listed:
+            listed.append(query)
+    return groups
+
+
+def classify_by_direction(
+    candidates, ask, direction_by_campaign, context: str = DEFAULT_CONTEXT,
+    load=None, batch_size: int = BATCH_SIZE,
+):
+    """Вердикты по всем кандидатам разом, каждой группе — свой паспорт.
+
+    Возвращает (вердикты, счётчики). Счётчики нужны отчёту: разметка с
+    паспортом и без — разного качества, и не видя долей, человек не отличит
+    «паспорта не понадобились» от «паспорта не завезли».
+
+    Группировка стоит денег: направлений в кабинете несколько, и каждое —
+    свой батч, то есть свой вызов. Это осознанная цена за то, чтобы фразу
+    судил паспорт её продукта, а не соседнего.
+    """
+    load = load or load_passport
+    groups = group_by_direction(candidates, direction_by_campaign)
+    verdicts: Dict[str, Dict[str, Any]] = {}
+    stats = {"with_passport": 0, "without_passport": 0,
+             "directions": {}, "passports": []}
+    for direction in sorted(groups):
+        phrases = groups[direction]
+        passport = load(direction) if direction else None
+        if passport:
+            stats["passports"].append(direction)
+            stats["with_passport"] += len(phrases)
+        else:
+            stats["without_passport"] += len(phrases)
+        if direction:
+            stats["directions"][direction] = len(phrases)
+        verdicts.update(classify(phrases, ask=ask, context=context,
+                                 batch_size=batch_size, passport=passport))
+    return verdicts, stats
 
 
 def unclear_reasons(verdicts: Dict[str, Dict[str, Any]]) -> Dict[str, int]:

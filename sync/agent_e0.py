@@ -40,13 +40,11 @@ from sync.agent.holdout import select_holdout
 from sync.agent import config as agent_config
 from sync.agent import semantic
 
-# Чем занимается проект — контекст для смыслового слоя. Без него модель судит
-# фразы в вакууме: «школа» для образовательного проекта ядро, для магазина
-# одежды мусор.
-SEMANTIC_CONTEXT = (
-    "онлайн-образование: высшее и среднее профессиональное образование, "
-    "колледж, дистанционное обучение, приём абитуриентов"
-)
+# Чем занимается проект, когда паспорта направления нет, — умолчание самого
+# слоя (semantic.DEFAULT_CONTEXT). Своей копии здесь больше нет: две строки об
+# одном продукте разъезжаются молча, и прогон судил бы фразы описанием, которое
+# правили в другом файле.
+SEMANTIC_CONTEXT = semantic.DEFAULT_CONTEXT
 
 from sync.agent.metrika import (
     EDU_COUNTERS,
@@ -1095,9 +1093,15 @@ def main() -> int:
     ask = semantic.deepseek_asker()
     semantic_verdicts = {}
     if ask is not None:
-        semantic_verdicts = semantic.classify(
-            [c["query"] for c in minus_candidates + word_candidates + expansion],
-            ask=ask, context=SEMANTIC_CONTEXT)
+        # Паспорт продукта — по направлению кампаний, где фраза откручивалась
+        # (задача 20). Фраза, стоящая в кампаниях РАЗНЫХ направлений, едет на
+        # общем описании: паспорта соседей противоречат друг другу там, где
+        # это опаснее всего («после 9 класса» — анти-маркер у ВПО и целевой
+        # маркер у СПО).
+        semantic_verdicts, passport_stats = semantic.classify_by_direction(
+            minus_candidates + word_candidates + expansion,
+            ask=ask, direction_by_campaign=direction_by_campaign,
+            context=SEMANTIC_CONTEXT)
         before_minus = len(minus_candidates) + len(word_candidates)
         minus_candidates = semantic.keep_minus_candidates(
             minus_candidates, semantic_verdicts)
@@ -1117,6 +1121,9 @@ def main() -> int:
             # не знает» и «слой упал» дают одинаковую цифру и одинаковое
             # отсутствие вето. Разводит их только причина.
             "unclear_reasons": semantic.unclear_reasons(semantic_verdicts),
+            # Разметка с паспортом и без — разного качества. Без этих долей
+            # «паспорта не понадобились» неотличимо от «паспорта не завезли».
+            "passports": passport_stats,
         }
     else:
         # Молчаливое отсутствие слоя неотличимо от «модель всё одобрила» —

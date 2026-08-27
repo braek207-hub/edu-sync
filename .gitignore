@@ -16,3 +16,4 @@ secrets-local/
 !config/edu_admission_calendar.json
 !tests/fixtures/*.json
 !docs/examples/*.json
+!sync/agent/passports/*.json
