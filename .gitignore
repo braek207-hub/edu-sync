@@ -15,3 +15,4 @@ secrets-local/
 !config/lime_sections/*.json
 !config/edu_admission_calendar.json
 !tests/fixtures/*.json
+!docs/examples/*.json

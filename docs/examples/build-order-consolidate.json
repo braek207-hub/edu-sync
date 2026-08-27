@@ -1,0 +1,56 @@
+{
+  "order_id": "consolidate-vpo-2026-09-01",
+  "idea_id": "d96b5cf53b8073c1c6d122e5",
+  "kind": "consolidate",
+  "account": "account1-506453-ln8s",
+  "level_slug": "vpo_consolidate_2026_09",
+  "campaign_name": "vpo / consolidate / consolidate-vpo-2026-09-01",
+  "direction": "vpo",
+  "queries": [
+    {
+      "phrase": "колледж заочно москва",
+      "donor_campaign_id": "111",
+      "cost_rub": 18400.0,
+      "conversions": 12
+    },
+    {
+      "phrase": "заочный колледж после 9 класса",
+      "donor_campaign_id": "111",
+      "cost_rub": 9100.0,
+      "conversions": 6
+    },
+    {
+      "phrase": "дистанционный колледж с трудоустройством",
+      "donor_campaign_id": "222",
+      "cost_rub": 12750.0,
+      "conversions": 9
+    }
+  ],
+  "donor_negatives": [
+    {
+      "campaign_id": "111",
+      "phrases": [
+        "колледж заочно москва",
+        "заочный колледж после 9 класса"
+      ]
+    },
+    {
+      "campaign_id": "222",
+      "phrases": [
+        "дистанционный колледж с трудоустройством"
+      ]
+    }
+  ],
+  "campaign": {
+    "weekly_budget": 60000,
+    "target_cpa": 1600,
+    "counter_id": 98627983,
+    "goal_id": 360811375
+  },
+  "horizon_days": 30,
+  "success_rule": {
+    "metric": "cpa",
+    "comparison": "did_vs_holdout",
+    "threshold": 1.0
+  }
+}
