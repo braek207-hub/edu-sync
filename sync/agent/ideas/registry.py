@@ -195,7 +195,8 @@ COMPARISONS = ("<=", ">=", "<", ">")
 # генерацию, либо наоборот.
 COLUMNS = ("idea_id", "source", "account", "subject", "subject_key", "tier",
            "lane", "expected_rub", "test_cost_rub", "horizon_days",
-           "success_rule", "action", "status", "action_id", "experiment_id",
+           "success_rule", "action", "detail", "status", "action_id",
+           "experiment_id",
            "dropped_reason", "rejected_by", "rejected_at")
 
 # Поля, которые генератор вправе обновлять у уже существующей идеи: его
@@ -209,7 +210,7 @@ COLUMNS = ("idea_id", "source", "account", "subject", "subject_key", "tier",
 # историей и снятым отказом человека.
 GENERATOR_FIELDS = ("source", "account", "subject", "subject_key", "tier",
                     "lane", "expected_rub", "test_cost_rub", "horizon_days",
-                    "success_rule", "action")
+                    "success_rule", "action", "detail")
 
 
 class InvalidIdea(ValueError):
@@ -278,6 +279,28 @@ def _check_action(raw: Any, tier_value: int) -> Optional[Dict[str, Any]]:
         raise InvalidIdea(
             f"нагрузка действия {raw!r} пуста: такт записи читает идеи из "
             "базы, и применять такую идею будет нечем")
+    return dict(raw)
+
+
+def _check_detail(raw: Any) -> Optional[Dict[str, Any]]:
+    """Доказательства идеи: словарь или ничего.
+
+    Свободная форма намеренно: чем идея обоснована, знает только её генератор
+    — у выноса связок это список доноров и план кросс-минусовки, у разведки
+    спроса будет что-то своё. Реестр здесь не судья содержимого, он лишь не
+    пускает в колонку то, что нельзя показать как объект.
+
+    Пусто — законно: идея, вся суть которой в её адресе и числах, ничего
+    сверх них не обязана нести. Не-словарь — отказ: список или строка в
+    колонке JSONB прочитались бы кем-то как объект и уронили бы экран, а не
+    генератор, который их туда положил.
+    """
+    if raw is None or raw == {}:
+        return None
+    if not isinstance(raw, dict):
+        raise InvalidIdea(
+            f"доказательства идеи {type(raw).__name__} — нужен словарь: "
+            "экран и разбор читают их по именам полей")
     return dict(raw)
 
 
@@ -354,6 +377,7 @@ def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
         "test_cost_rub": _check_price(idea, "test_cost_rub", non_negative=True),
         "horizon_days": int(horizon),
         "success_rule": _check_success_rule(idea.get("success_rule")),
+        "detail": _check_detail(idea.get("detail")),
         "action": _check_action(idea.get("action"), int(tier)),
         "status": status,
         # Связи и отказ генератору не принадлежат: их ставят применение
@@ -597,13 +621,15 @@ def open_ideas(account: Optional[str] = None) -> List[Dict[str, Any]]:
 UPSERT_SQL = """
     INSERT INTO edu_agent_ideas (
         idea_id, source, account, subject, subject_key, tier, lane,
-        expected_rub, test_cost_rub, horizon_days, success_rule, action, status,
-        action_id, experiment_id, dropped_reason, rejected_by, rejected_at
+        expected_rub, test_cost_rub, horizon_days, success_rule, action,
+        detail, status, action_id, experiment_id, dropped_reason, rejected_by,
+        rejected_at
     ) VALUES (
         %(idea_id)s, %(source)s, %(account)s, %(subject)s, %(subject_key)s,
         %(tier)s, %(lane)s, %(expected_rub)s, %(test_cost_rub)s,
-        %(horizon_days)s, %(success_rule)s, %(action)s, %(status)s, %(action_id)s,
-        %(experiment_id)s, %(dropped_reason)s, %(rejected_by)s, %(rejected_at)s
+        %(horizon_days)s, %(success_rule)s, %(action)s, %(detail)s,
+        %(status)s, %(action_id)s, %(experiment_id)s, %(dropped_reason)s,
+        %(rejected_by)s, %(rejected_at)s
     )
     ON CONFLICT (idea_id) DO UPDATE SET
         source         = EXCLUDED.source,
@@ -617,6 +643,7 @@ UPSERT_SQL = """
         horizon_days   = EXCLUDED.horizon_days,
         success_rule   = EXCLUDED.success_rule,
         action         = EXCLUDED.action,
+        detail         = EXCLUDED.detail,
         status         = EXCLUDED.status,
         action_id      = EXCLUDED.action_id,
         experiment_id  = EXCLUDED.experiment_id,
@@ -669,6 +696,9 @@ def _json_params(row: Dict[str, Any]) -> Dict[str, Any]:
     action = row.get("action")
     params["action"] = (json.dumps(action, ensure_ascii=False)
                         if action else None)
+    detail = row.get("detail")
+    params["detail"] = (json.dumps(detail, ensure_ascii=False)
+                        if detail else None)
     return params
 
 
