@@ -589,3 +589,24 @@ def test_params_of_the_query_are_projected_onto_the_columns():
     # уехал бы в запрос, где его никто не ждёт.
     params = registry._json_params({"idea_id": "x", "посторонний ключ": 1})
     assert set(params) == set(registry.COLUMNS)
+
+
+def test_every_placeholder_of_the_query_is_a_declared_column():
+    # Опечатка в имени подстановки не видна ничем, кроме живой базы: запрос
+    # соберётся, а на первом же прогоне упадёт KeyError-ом. Проверка дешёвая
+    # и ловит ровно этот класс.
+    import re
+
+    placeholders = set(re.findall(r"%\((\w+)\)s", registry.UPSERT_SQL))
+    assert placeholders == set(registry.COLUMNS)
+
+
+def test_insert_column_list_matches_the_declared_columns():
+    # Колонка, объявленная в COLUMNS и забытая в списке INSERT, уехала бы в
+    # базу значением по умолчанию — а на UPDATE при этом обновлялась бы:
+    # строка вела бы себя по-разному в зависимости от того, первая это запись
+    # или повторная.
+    head = registry.UPSERT_SQL.split("VALUES", 1)[0]
+    names = head.split("(", 1)[1].rsplit(")", 1)[0]
+    listed = [name.strip() for name in names.split(",")]
+    assert listed == list(registry.COLUMNS)
