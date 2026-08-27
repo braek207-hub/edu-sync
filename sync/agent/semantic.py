@@ -44,6 +44,12 @@ KNOWN_VERDICTS = (JUNK, CORE, UNCLEAR)
 # всего батча разом.
 BATCH_SIZE = 40
 
+# Алиас "deepseek-chat" провайдер снял с поддержки 24.07.2026: он ещё отвечает,
+# но только по доброй воле провайдера, и фактически указывает на облегчённую
+# модель "deepseek-v4-flash" — поэтому здесь явный идентификатор, а не алиас.
+# Пара "deepseek-v4-pro" втрое дороже и для этого слоя не нужна.
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
 
 
@@ -191,7 +197,7 @@ def keep_expansion_candidates(
 
 
 def deepseek_asker(
-    api_key: Optional[str] = None, model: str = "deepseek-chat",
+    api_key: Optional[str] = None, model: str = DEEPSEEK_MODEL,
     timeout: int = 120,
 ) -> Optional[Callable[[str], str]]:
     """Функция обращения к модели, или None, если ключа нет.
