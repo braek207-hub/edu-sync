@@ -45,6 +45,12 @@ import hashlib
 import json
 from typing import Any, Dict, Iterable, List, Optional
 
+import psycopg2.extras
+
+from sync.db import get_connection
+from sync.agent.writer import lanes as lanes_mod
+from sync.agent.writer import tier as tier_mod
+
 STATUS_NEW = "new"
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -162,3 +168,254 @@ def rank(ideas: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     unpriced.sort(key=lambda i: (-(_number(i.get("expected_rub")) or 0.0),
                                  str(i.get("idea_id") or "")))
     return priced + unpriced
+
+
+# ------------------------------------------------------- критерий и проверка
+
+# Знаки сравнения, которые умеет проверить машина. Равенства здесь нет
+# намеренно: «CPA станет ровно 900» не бывает ни истиной, ни ложью на реальных
+# данных, и критерий с ним закрывать пришлось бы человеку.
+COMPARISONS = ("<=", ">=", "<", ">")
+
+# Колонки строки реестра. Один список на запись и на слияние: колонка, забытая
+# в одном из двух мест, — это поле, которое пишется, но не переживает повторную
+# генерацию, либо наоборот.
+COLUMNS = ("idea_id", "source", "account", "subject", "subject_key", "tier",
+           "lane", "expected_rub", "test_cost_rub", "horizon_days",
+           "success_rule", "status", "action_id", "experiment_id",
+           "dropped_reason", "rejected_by", "rejected_at")
+
+# Поля, которые генератор вправе обновлять у уже существующей идеи: его
+# собственные числа и формулировки. Всего остального (статус, связи с
+# действием и ставкой, отказ человека) он не хозяин — см. _merge.
+GENERATOR_FIELDS = ("source", "account", "subject", "subject_key", "tier",
+                    "lane", "expected_rub", "test_cost_rub", "horizon_days",
+                    "success_rule")
+
+
+class InvalidIdea(ValueError):
+    """Идея, которой в реестре не место. ValueError — чтобы отказ нельзя было
+    перепутать с пустым результатом: порция не пишется вовсе."""
+
+
+def _text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _check_success_rule(rule: Any) -> Dict[str, Any]:
+    """Критерий успеха обязан быть проверяемым машиной.
+
+    Три обязательных части: метрика, знак сравнения и порог. Пустой словарь и
+    словарь-мнение («станет лучше») отвергаются одинаково — по одной причине:
+    закрыть такую идею может только человек, а реестр заведён ровно затем,
+    чтобы не гонять человека по одному и тому же списку.
+
+    Значения по умолчанию тут были бы худшим решением из возможных: реестр
+    придумал бы за генератор порог, о котором тот промолчал, и идея закрылась
+    бы по критерию, которого никто не назначал.
+    """
+    if not isinstance(rule, dict) or not rule:
+        raise InvalidIdea(
+            "критерий успеха пуст: идея без машинно проверяемого критерия "
+            "неотличима от мнения — её нельзя ни закрыть, ни засчитать")
+    metric = _text(rule.get("metric"))
+    op = _text(rule.get("op"))
+    value = _number(rule.get("value"))
+    if not metric or value is None:
+        raise InvalidIdea(
+            f"критерий успеха неполон ({rule!r}): нужны метрика, знак "
+            "сравнения и порог")
+    if op not in COMPARISONS:
+        raise InvalidIdea(
+            f"критерий успеха: знак сравнения {op!r} машина не проверит; "
+            f"допустимы {', '.join(COMPARISONS)}")
+    return dict(rule)
+
+
+def _check_price(idea: Dict[str, Any], field: str,
+                 non_negative: bool) -> Optional[float]:
+    raw = idea.get(field)
+    if raw is None:
+        return None
+    number = _number(raw)
+    if number is None or (non_negative and number < 0):
+        raise InvalidIdea(f"{field}: {raw!r} — не число, пригодное для очереди")
+    return number
+
+
+def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
+    """Идея генератора → строка реестра. Любая неполнота — отказ.
+
+    Отказ, а не запись с дырой: строка без полосы, класса или горизонта
+    доезжает до отчёта и до плана записи и там либо падает, либо трактуется
+    по умолчанию — то есть решение принимает случайный потребитель, а не
+    автор идеи.
+    """
+    source = _text(idea.get("source"))
+    account = _text(idea.get("account"))
+    subject = idea.get("subject")
+    if not source:
+        raise InvalidIdea("источник идеи пуст")
+    if not account:
+        raise InvalidIdea("кабинет идеи пуст")
+    if not isinstance(subject, dict) or not subject:
+        raise InvalidIdea("объект идеи пуст: непонятно, на что она")
+
+    tier = idea.get("tier")
+    if tier is None or int(tier) not in tier_mod.ALL_TIERS:
+        raise InvalidIdea(f"класс достоверности {tier!r} неизвестен")
+    lane = _text(idea.get("lane"))
+    if lane not in lanes_mod.ALL_LANES:
+        raise InvalidIdea(f"полоса {lane!r} неизвестна")
+
+    horizon = _number(idea.get("horizon_days"))
+    if horizon is None or horizon <= 0:
+        raise InvalidIdea(
+            f"горизонт {idea.get('horizon_days')!r}: без срока идею нечем "
+            "закрыть, критерий проверяется К КОНЦУ горизонта")
+
+    status = _text(idea.get("status")) or STATUS_NEW
+    if status not in ALL_STATUSES:
+        raise InvalidIdea(f"статус {status!r} неизвестен")
+
+    computed_id = idea_id(source, subject)
+    given_id = _text(idea.get("idea_id"))
+    if given_id and given_id != computed_id:
+        raise InvalidIdea(
+            f"идентификатор {given_id!r} не выводится из пары "
+            f"(источник, объект) — назавтра генератор посчитает другой и "
+            "заведёт вторую строку на ту же находку")
+
+    return {
+        "idea_id": computed_id,
+        "source": source,
+        "account": account,
+        "subject": subject,
+        "subject_key": subject_key(subject),
+        "tier": int(tier),
+        "lane": lane,
+        "expected_rub": _check_price(idea, "expected_rub", non_negative=False),
+        "test_cost_rub": _check_price(idea, "test_cost_rub", non_negative=True),
+        "horizon_days": int(horizon),
+        "success_rule": _check_success_rule(idea.get("success_rule")),
+        "status": status,
+        # Связи и отказ генератору не принадлежат: их ставят применение
+        # (задача 11) и человек (reject).
+        "action_id": None,
+        "experiment_id": None,
+        "dropped_reason": None,
+        "rejected_by": None,
+        "rejected_at": None,
+    }
+
+
+# ------------------------------------------------------------------- запись
+
+
+def upsert(ideas: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Пишет порцию идей генератора и возвращает строки, легшие в реестр.
+
+    Порция принимается ЦЕЛИКОМ или не принимается вовсе: половина порции —
+    состояние, которого не задавал никто (часть идей такта в реестре, часть
+    нет), и назавтра генератор досыпал бы остаток как новые идеи. Поэтому
+    сначала проверяется всё, и только потом пишется.
+    """
+    prepared = [_prepare(idea) for idea in ideas]
+    if not prepared:
+        return []
+    _write_rows(prepared)
+    return prepared
+
+
+def load(idea_id_value: str) -> Optional[Dict[str, Any]]:
+    """Строка реестра по идентификатору. None — такой идеи нет."""
+    return _read_rows([idea_id_value]).get(idea_id_value)
+
+
+# ------------------------------------------------------------ доступ к БД
+# Три примитива ниже — единственное место модуля, которое ходит в базу, и
+# ничего кроме хранения не делают: правило слияния живёт в Python выше, а SQL
+# переписывает строку тем, что ему дали. Так решено ради проверяемости —
+# правило в тексте запроса нельзя проверить иначе как живой базой.
+
+UPSERT_SQL = """
+    INSERT INTO edu_agent_ideas (
+        idea_id, source, account, subject, subject_key, tier, lane,
+        expected_rub, test_cost_rub, horizon_days, success_rule, status,
+        action_id, experiment_id, dropped_reason, rejected_by, rejected_at
+    ) VALUES (
+        %(idea_id)s, %(source)s, %(account)s, %(subject)s, %(subject_key)s,
+        %(tier)s, %(lane)s, %(expected_rub)s, %(test_cost_rub)s,
+        %(horizon_days)s, %(success_rule)s, %(status)s, %(action_id)s,
+        %(experiment_id)s, %(dropped_reason)s, %(rejected_by)s, %(rejected_at)s
+    )
+    ON CONFLICT (idea_id) DO UPDATE SET
+        source         = EXCLUDED.source,
+        account        = EXCLUDED.account,
+        subject        = EXCLUDED.subject,
+        subject_key    = EXCLUDED.subject_key,
+        tier           = EXCLUDED.tier,
+        lane           = EXCLUDED.lane,
+        expected_rub   = EXCLUDED.expected_rub,
+        test_cost_rub  = EXCLUDED.test_cost_rub,
+        horizon_days   = EXCLUDED.horizon_days,
+        success_rule   = EXCLUDED.success_rule,
+        status         = EXCLUDED.status,
+        action_id      = EXCLUDED.action_id,
+        experiment_id  = EXCLUDED.experiment_id,
+        dropped_reason = EXCLUDED.dropped_reason,
+        rejected_by    = EXCLUDED.rejected_by,
+        rejected_at    = EXCLUDED.rejected_at,
+        updated_at     = now()
+"""
+
+# Отклонения человеком: по КЛЮЧУ ОБЪЕКТА, не по идентификатору идеи.
+# DISTINCT ON оставляет последнее слово человека — отказов по одному объекту
+# может накопиться несколько (разные источники нашли его в разные дни).
+SELECT_REJECTIONS_SQL = """
+    SELECT DISTINCT ON (subject_key)
+           subject_key, rejected_by, rejected_at, dropped_reason
+      FROM edu_agent_ideas
+     WHERE rejected_by IS NOT NULL
+       AND subject_key = ANY(%s)
+     ORDER BY subject_key, rejected_at DESC NULLS LAST
+"""
+
+
+def _json_params(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {**row,
+            "subject": json.dumps(row.get("subject") or {}, ensure_ascii=False),
+            "success_rule": json.dumps(row.get("success_rule") or {},
+                                       ensure_ascii=False)}
+
+
+def _read_rows(idea_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    ids = [str(i) for i in idea_ids]
+    if not ids:
+        return {}
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM edu_agent_ideas WHERE idea_id = ANY(%s)", (ids,))
+            return {str(r["idea_id"]): dict(r) for r in cur.fetchall()}
+
+
+def _read_rejections(subject_keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    keys = [str(k) for k in subject_keys]
+    if not keys:
+        return {}
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(SELECT_REJECTIONS_SQL, (keys,))
+            return {str(r["subject_key"]): dict(r) for r in cur.fetchall()}
+
+
+def _write_rows(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(UPSERT_SQL, _json_params(row))
+        conn.commit()
+    return len(rows)
