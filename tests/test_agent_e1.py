@@ -1169,8 +1169,8 @@ def test_second_run_does_not_repeat_the_same_stuck_row(monkeypatch, capsys):
 
 
 def _bidmod_key(campaign_id, direct_type, key, percent):
-    from sync.agent.writer.diff import _idempotency_key
-    return _idempotency_key(campaign_id, direct_type, key, percent)
+    from sync.agent.writer.diff import bidmod_idempotency_key
+    return bidmod_idempotency_key(campaign_id, direct_type, key, percent)
 
 
 def test_cooldown_key_ignores_percent_drift():
