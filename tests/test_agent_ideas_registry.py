@@ -436,3 +436,122 @@ def test_mark_of_the_same_closed_status_is_idempotent(store):
 def test_mark_of_an_unknown_idea_is_refused(store):
     with pytest.raises(ValueError, match="нет в реестре"):
         registry.mark("такой-идеи-нет", registry.STATUS_RUNNING)
+
+
+# ------------------------------------------------ «нет» человека навсегда
+
+def test_human_rejection_silences_the_idea_permanently(store):
+    # Генератор детерминирован и найдёт её снова следующим тактом. Без этого
+    # экран предложений за месяц превращается в список, который человек
+    # перестаёт читать, — а вместе с ним перестаёт читать и новое.
+    registry.upsert([_idea()])
+    registry.reject(_id(_idea()), by="pavel", reason="направление закрываем")
+
+    registry.upsert([_idea()])
+    row = registry.load(_id(_idea()))
+
+    assert row["status"] == registry.STATUS_DROPPED
+    assert row["dropped_reason"].startswith("человек")
+
+
+def test_rejection_is_remembered_by_subject_not_by_row(store):
+    # Тот же объект, найденный ДРУГИМ генератором, приезжает под другим
+    # идентификатором: idea_id выведен из пары (источник, объект). Помни
+    # реестр отказ по строке — обход был бы бесплатным, и «вынести связку X»
+    # вернулось бы на экран под новым id уже назавтра.
+    rejected = _idea(source="consolidate")
+    registry.upsert([rejected])
+    registry.reject(_id(rejected), by="pavel", reason="эту связку не трогаем")
+
+    same_subject_other_source = _idea(source="proven")
+    registry.upsert([same_subject_other_source])
+    row = registry.load(_id(same_subject_other_source))
+
+    assert _id(same_subject_other_source) != _id(rejected)
+    assert row["subject_key"] == registry.subject_key(rejected["subject"])
+    assert row["status"] == registry.STATUS_DROPPED
+    assert row["dropped_reason"].startswith("человек")
+    assert row["rejected_by"] == "pavel"
+
+
+def test_rejection_silences_a_live_idea_about_the_same_subject(store):
+    # Человек — высшая инстанция: если объект закрыт, идея о нём снимается,
+    # даже если её уже успели взять в работу вторым источником.
+    live = _idea(source="proven")
+    registry.upsert([live])
+    registry.mark(_id(live), registry.STATUS_RUNNING)
+
+    other = _idea(source="consolidate")
+    registry.upsert([other])
+    registry.reject(_id(other), by="pavel", reason="объект закрыт")
+
+    registry.upsert([live])
+    assert registry.load(_id(live))["status"] == registry.STATUS_DROPPED
+
+
+def test_rejection_of_one_subject_does_not_touch_another(store):
+    # Обратная сторона: запрет по объекту не должен глушить соседей —
+    # «нет» одному объекту, а не всему источнику.
+    registry.upsert([_idea(campaign="123"), _idea(campaign="456")])
+    registry.reject(_id(_idea(campaign="123")), by="pavel", reason="не трогаем")
+
+    registry.upsert([_idea(campaign="456")])
+
+    assert registry.load(_id(_idea(campaign="456")))["status"] == (
+        registry.STATUS_NEW)
+
+
+def test_machine_drop_does_not_silence_the_object(store):
+    # Машина снимает идею по своим причинам («объект исчез», «данные не
+    # приехали»), и это НЕ запрет человека. Считай реестр любое dropped
+    # запретом — агент замолчал бы про объект после первой же технической
+    # осечки, и вернуть его было бы нечем.
+    dropped = _idea(source="consolidate")
+    registry.upsert([dropped])
+    registry.mark(_id(dropped), registry.STATUS_DROPPED, reason="объект исчез")
+
+    other_source = _idea(source="proven")
+    registry.upsert([other_source])
+
+    assert registry.load(_id(other_source))["status"] == registry.STATUS_NEW
+
+
+def test_reject_records_who_and_when(store):
+    # Признак «сказал человек» — колонка rejected_by, а не префикс
+    # свободного текста: текст однажды перепишут ради формулировки, и правило
+    # молча перестанет срабатывать.
+    registry.upsert([_idea()])
+    row = registry.reject(_id(_idea()), by="pavel", reason="направление закрываем")
+
+    assert row["rejected_by"] == "pavel"
+    assert row["rejected_at"] is not None
+    assert "направление закрываем" in row["dropped_reason"]
+
+
+def test_reject_without_a_person_is_refused(store):
+    # Отказ без автора неотличим от машинного снятия — а различие между ними
+    # и есть всё содержание этого механизма.
+    registry.upsert([_idea()])
+    with pytest.raises(ValueError, match="автор"):
+        registry.reject(_id(_idea()), by="", reason="почему-то")
+
+
+def test_reject_of_an_unknown_idea_is_refused(store):
+    with pytest.raises(ValueError, match="нет в реестре"):
+        registry.reject("такой-идеи-нет", by="pavel", reason="нет")
+
+
+def test_reject_of_a_finished_idea_keeps_its_outcome_but_silences_the_subject(store):
+    # Отказ по уже раскатанной идее не переписывает её исход — исход
+    # случился. Но объект после этого молчит: человек сказал «больше не
+    # предлагать», и относится это к объекту, а не к строке.
+    done = _idea(source="proven")
+    registry.upsert([done])
+    registry.mark(_id(done), registry.STATUS_DONE, reason="раскатано")
+    registry.reject(_id(done), by="pavel", reason="хватит")
+
+    assert registry.load(_id(done))["status"] == registry.STATUS_DONE
+
+    other_source = _idea(source="consolidate")
+    registry.upsert([other_source])
+    assert registry.load(_id(other_source))["status"] == registry.STATUS_DROPPED

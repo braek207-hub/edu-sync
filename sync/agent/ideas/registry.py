@@ -43,6 +43,7 @@ idea_id, обход был бы бесплатным: та же связка, н
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 import psycopg2.extras
@@ -361,10 +362,90 @@ def upsert(ideas: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not prepared:
         return []
     existing = _read_rows([row["idea_id"] for row in prepared])
-    merged = [_merge(existing.get(row["idea_id"]), row) for row in prepared]
-    _write_rows([row for row in merged
-                 if str(row.get("status")) not in CLOSED_STATUSES])
-    return merged
+    rejections = _read_rejections({row["subject_key"] for row in prepared})
+
+    result: List[Dict[str, Any]] = []
+    to_write: List[Dict[str, Any]] = []
+    for row in prepared:
+        old = existing.get(row["idea_id"])
+        was_closed = old is not None and str(old.get("status")) in CLOSED_STATUSES
+        merged = _merge(old, row)
+        if was_closed:
+            # Уже закрытая строка не переписывается и не пишется заново: её
+            # updated_at обязан остаться днём закрытия, иначе «эта идея
+            # закрыта два месяца назад» перестанет быть видно в данных.
+            result.append(merged)
+            continue
+        merged = _silence(merged, rejections.get(row["subject_key"]))
+        to_write.append(merged)
+        result.append(merged)
+    _write_rows(to_write)
+    return result
+
+
+def _human_reason(who: str, reason: str) -> str:
+    """Причина снятия словами человека — для отчёта и разбора.
+
+    Начинается со слова «человек» намеренно: в отчёте видно, кто закрыл идею,
+    без похода в колонки. Но ПРАВИЛОМ этот текст не служит — машинный признак
+    отказа живёт в rejected_by (см. докстринг модуля).
+    """
+    words = _text(reason)
+    tail = f": {words}" if words else ""
+    return f"человек ({who}) отклонил эту идею{tail}"
+
+
+def _silence(row: Dict[str, Any],
+             rejection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Идея про объект, по которому человек уже сказал «нет».
+
+    Строка не удаляется и не прячется: она ложится в реестр СРАЗУ снятой, с
+    именем человека и его формулировкой. Так у отказа остаётся след — видно,
+    что генератор нашёл это снова и был остановлен, а не что он вдруг
+    перестал находить.
+    """
+    if not rejection or not _text(rejection.get("rejected_by")):
+        return row
+    who = _text(rejection.get("rejected_by"))
+    reason = _text(rejection.get("dropped_reason")) or _human_reason(who, "")
+    out = dict(row)
+    out["status"] = STATUS_DROPPED
+    out["rejected_by"] = who
+    out["rejected_at"] = rejection.get("rejected_at")
+    out["dropped_reason"] = reason
+    return out
+
+
+def reject(idea_id_value: str, by: str, reason: str = "") -> Dict[str, Any]:
+    """Человек отклонил идею. Отказ помнится по ОБЪЕКТУ и переживает строку.
+
+    Автор обязателен: отказ без имени неотличим от машинного снятия (mark со
+    статусом dropped), а различие между ними и есть всё содержание механизма
+    — машина снимает идею по технической причине, и объект после этого обязан
+    оставаться живым.
+
+    Уже закрытая идея сохраняет свой исход: раскатанная остаётся done, потому
+    что раскатана. Отказ при этом всё равно записывается — он относится к
+    объекту, а не к строке, и глушит будущие находки того же объекта любым
+    генератором.
+    """
+    who = _text(by)
+    if not who:
+        raise InvalidIdea(
+            "отказ без автора: без имени он неотличим от машинного снятия, а "
+            "машинное снятие объект не глушит")
+    row = load(idea_id_value)
+    if row is None:
+        raise InvalidIdea(f"идеи {idea_id_value!r} нет в реестре: отклонять нечего")
+
+    row = dict(row)
+    row["rejected_by"] = who
+    row["rejected_at"] = datetime.now(timezone.utc)
+    row["dropped_reason"] = _human_reason(who, reason)
+    if str(row.get("status")) not in CLOSED_STATUSES:
+        row["status"] = STATUS_DROPPED
+    _write_rows([row])
+    return row
 
 
 def mark(idea_id_value: str, status: str, action_id: Optional[str] = None,
