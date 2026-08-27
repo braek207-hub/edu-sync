@@ -334,20 +334,20 @@ def ideas_section(ideas: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     items = list(ideas or [])
     queue = [i for i in items
-             if _idea_tier(i) in tier_mod.APPLIED_TIERS]
+             if ideas_registry.idea_tier(i) in tier_mod.APPLIED_TIERS]
     proposals = [i for i in items
-                 if _idea_tier(i) == tier_mod.TIER_PROPOSAL]
+                 if ideas_registry.idea_tier(i) == tier_mod.TIER_PROPOSAL]
     return {
         "open": len(items),
         "by_status": _count_by(items, "status"),
         "by_source": _count_by(items, "source"),
         "by_lane": _count_by(items, "lane"),
-        # Классы считаются через _idea_tier, а не общим _count_by: тот пишет
-        # пустую строку вместо нуля (str(0 or "")), и класс 0 — арифметика,
-        # самая массовая часть находок — исчез бы из разбивки в безымянную
-        # графу.
-        "by_tier": _count_by([{"tier": str(_idea_tier(i))} for i in items],
-                             "tier"),
+        # Классы считаются через registry.idea_tier, а не общим _count_by:
+        # тот пишет пустую строку вместо нуля (str(0 or "")), и класс 0 —
+        # арифметика, самая массовая часть находок — исчез бы из разбивки в
+        # безымянную графу.
+        "by_tier": _count_by(
+            [{"tier": str(ideas_registry.idea_tier(i))} for i in items], "tier"),
         # Обещание реестра и цена его проверки. Без них счётчик идей не
         # говорит ничего: три идеи по сто рублей и три по миллиону выглядят
         # одинаково.
@@ -360,20 +360,6 @@ def ideas_section(ideas: List[Dict[str, Any]]) -> Dict[str, Any]:
                                  for i in proposals[:IDEAS_SAMPLE_LIMIT]]},
         "queue": [_idea_line(i) for i in queue[:IDEAS_SAMPLE_LIMIT]],
     }
-
-
-def _idea_tier(idea: Dict[str, Any]) -> int:
-    """Класс идеи. Пустой класс — предложение, а не арифметика.
-
-    Умолчание тут — самый строгий конец шкалы намеренно. Ноль означает
-    «утверждение о прошлом, применяется всегда и риском не платит»; прочти
-    пустое поле нулём — и забывчивость генератора открывала бы кабинет.
-    """
-    try:
-        value = int(idea.get("tier"))
-    except (TypeError, ValueError):
-        return tier_mod.TIER_PROPOSAL
-    return value if value in tier_mod.ALL_TIERS else tier_mod.TIER_PROPOSAL
 
 
 def funnel_ladder_section(

@@ -515,6 +515,26 @@ def load(idea_id_value: str) -> Optional[Dict[str, Any]]:
     return _read_rows([idea_id_value]).get(idea_id_value)
 
 
+def idea_tier(idea: Dict[str, Any]) -> int:
+    """Класс достоверности идеи. Пустой или незнакомый класс — предложение.
+
+    Умолчание — самый строгий конец шкалы намеренно. Ноль означает
+    «утверждение о прошлом: применяется всегда и риском не платит»; прочти
+    пустое поле нулём — и забывчивость генератора открывала бы кабинет самым
+    дешёвым путём, какой в движке есть.
+
+    Правило живёт ЗДЕСЬ, а не у каждого читателя реестра. Читателей уже два —
+    отчёт такта расчёта и гейт такта записи, — и разойдись их умолчания хоть
+    на шаг, человек видел бы идею предложением на экране, пока агент считал
+    бы её измеренной и применял.
+    """
+    try:
+        value = int(idea.get("tier"))
+    except (TypeError, ValueError):
+        return tier_mod.TIER_PROPOSAL
+    return value if value in tier_mod.ALL_TIERS else tier_mod.TIER_PROPOSAL
+
+
 def open_ideas(account: Optional[str] = None) -> List[Dict[str, Any]]:
     """Открытые идеи реестра в порядке очереди. account=None — все кабинеты.
 

@@ -64,11 +64,13 @@ from sync.agent.balance import (
 )
 from sync.agent.coverage import blind_share
 from sync.agent.gate import data_gate
+from sync.agent.ideas import registry as ideas_registry
 from sync.agent.writer import budget
 from sync.agent.writer import switch
 from sync.agent.writer import negatives
 from sync.agent.writer import placements
 from sync.agent.writer import tcpa
+from sync.agent.writer import tier as tier_mod
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import apply_actions
 from sync.agent.writer.client import WriteClient, journal_writes_allowed
@@ -1142,6 +1144,134 @@ def split_by_final_keys(
     return allowed, blocked
 
 
+def _idea_refusal(idea: Dict[str, Any], reason: str, detail: str) -> Dict[str, Any]:
+    """Идея, не доехавшая до плана, с названной причиной.
+
+    Отказ здесь — не исключение и не молчание. Исключение уронило бы такт
+    записи из-за одной кривой находки, молчание оставило бы человека с
+    реестром, из которого идеи исчезают без объяснения.
+    """
+    return {
+        "idea_id": str(idea.get("idea_id") or ""),
+        "source": str(idea.get("source") or ""),
+        "account": str(idea.get("account") or ""),
+        "tier": ideas_registry.idea_tier(idea),
+        "lane": str(idea.get("lane") or ""),
+        "reason": reason,
+        "detail": detail,
+    }
+
+
+def actions_from_ideas(
+    ideas: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Идеи реестра → кандидаты в план записи и отказы с причиной.
+
+    Идея класса 3 не порождает действия НИКОГДА — ни при какой ступени полосы
+    и ни при каком остатке риск-бюджета. Формально то же самое умеет отбор
+    полос (lanes.select отказывает классу 3 причиной rejects.PROPOSAL), и
+    соблазн положиться на него велик: одна проверка вместо двух. Но между
+    планом и отбором лежит половина такта — рельсы, заповедник, кулдауны,
+    журнал, — и предложение успело бы стать строкой плана, занять слот своего
+    объекта («одно действие на объект», lanes) и вытеснить оттуда доказанное
+    действие, которое отбор взял бы. Поэтому гейт стоит на ВХОДЕ.
+
+    Полезная нагрузка приезжает ПРИ идее (ключ action), а не внутри subject.
+    Это не украшение: subject — адрес объекта, из него выведен idea_id, и
+    изменчивое число внутри (новый лимит, новая ставка) заводило бы идею
+    заново каждым прогоном — с пустой историей и снятым отказом человека
+    (докстринг registry.py). Значит, из строки реестра действие собрать
+    нельзя в принципе: сюда едет свежий выход генератора, у которого числа
+    ещё на руках, а в реестр из него ложатся только колонки (registry._prepare
+    проецирует идею на COLUMNS, лишнее не пишется).
+
+    Класс идеи ужесточает приговор действию, но не смягчает: он ставится в
+    action["tier"], а tier_of берёт максимум объявленного и вычисленного.
+    Обратное направление означало бы, что генератор выписывает своему
+    действию освобождение от риска.
+
+    Порция НЕ принимается «целиком или никак» — в отличие от registry.upsert.
+    Там половина порции была бы состоянием, которого не задавал никто; здесь
+    отказ отдельной идеи — штатный исход такта, и остановка всей порции
+    означала бы, что одна кривая находка глушит кабинет.
+    """
+    actions: List[Dict[str, Any]] = []
+    refused: List[Dict[str, Any]] = []
+
+    for idea in ideas or ():
+        status = str(idea.get("status") or "")
+        if status in ideas_registry.CLOSED_STATUSES:
+            refused.append(_idea_refusal(
+                idea, rejects.CLOSED_KEY,
+                f"идея закрыта как {status!r} — это запись о случившемся"))
+            continue
+
+        tier_value = ideas_registry.idea_tier(idea)
+        if tier_value not in tier_mod.APPLIED_TIERS:
+            refused.append(_idea_refusal(
+                idea, rejects.PROPOSAL,
+                "класс 3: рычага нет, это рекомендация человеку"))
+            continue
+
+        payload = idea.get("action")
+        if not isinstance(payload, dict) or not payload:
+            refused.append(_idea_refusal(
+                idea, rejects.PROPOSAL,
+                "идея не принесла действия: применять нечем"))
+            continue
+
+        action = {**payload, "tier": tier_value,
+                  "idea_id": str(idea.get("idea_id") or ""),
+                  "idea_source": str(idea.get("source") or "")}
+        try:
+            lane = lanes.lane_of(action)
+        except ValueError as exc:
+            # Вид действия вне карты полос — дефект генератора, и он обязан
+            # стать названным отказом: у вида без полосы нет ни лимита, ни
+            # цены, то есть он прошёл бы бесплатно.
+            refused.append(_idea_refusal(idea, rejects.PROPOSAL, str(exc)))
+            continue
+        if lane == lanes.LANE_PROPOSAL:
+            refused.append(_idea_refusal(
+                idea, rejects.PROPOSAL,
+                "полоса предложений: рычага записи у неё нет"))
+            continue
+        # Класс считается ещё раз, уже на действии: идея могла объявить себя
+        # измеренной, а её вид действия рычага не имеет (tier._has_lever).
+        # Верят здесь вычисленному, а не объявленному.
+        if tier_mod.tier_of(action) not in tier_mod.APPLIED_TIERS:
+            refused.append(_idea_refusal(
+                idea, rejects.PROPOSAL,
+                "класс действия — предложение, чем бы ни назвалась идея"))
+            continue
+        actions.append(action)
+
+    return actions, refused
+
+
+def _ideas_report(actions: List[Dict[str, Any]],
+                  refused: List[Dict[str, Any]],
+                  out_of_scope: Optional[List[Dict[str, Any]]] = None,
+                  ) -> Dict[str, Any]:
+    """Что такт записи взял из реестра идей. Печатается всегда, в том числе нулями.
+
+    Отказы — с разбивкой по причине: «идей не было» и «все идеи оказались
+    предложениями» — разные новости, а один счётчик «не взято» их сливает.
+
+    Отсечённые ограничителем прогона считаются ОТДЕЛЬНО от отказов: это не
+    приговор идее, а рамки запуска, и назавтра без --max-campaigns та же идея
+    уедет без единой правки. Смешать их значило бы читать собственное
+    ограничение как дефект генератора.
+    """
+    dropped = list(out_of_scope or ())
+    return {
+        "open": len(actions) + len(refused) + len(dropped),
+        "actions": len(actions),
+        "refused_by_reason": _count_by(refused, "reason"),
+        "out_of_scope": len(dropped),
+    }
+
+
 def computed_age_days(computed: List[Dict[str, Any]], today: date) -> Any:
     """Возраст расчёта в днях. None — даты нет, возраст неизвестен."""
     dates = []
@@ -1480,8 +1610,29 @@ def run_account(
     switch_desired = {cid: m for cid, m in switch_plan["desired"].items()
                       if cid in scoped_ids}
 
+    # Ф12: реестр идей. Читается ДО раннего выхода и входит в его условие тем
+    # же правилом, что бюджет и выключения: идея — самостоятельный повод
+    # действовать, и кабинет без вычисленных настроек (свежий, без истории —
+    # ровно тот, кому идеи нужнее всего) иначе не получил бы их никогда.
+    #
+    # Идеи спрашиваются ПО КАБИНЕТУ: реестр общий на все, а такт записи идёт
+    # по одному, и чужая идея уехала бы туда, где её объекта нет.
+    idea_actions, idea_refused = actions_from_ideas(
+        ideas_registry.open_ideas(account=login))
+    # Ограничитель прогона действует и на идеи, тем же scoped_ids, что у
+    # бюджета и выключений. Две причины, и обе достаточные: первый боевой
+    # прогон запускается по одной кампании (--max-campaigns=1), и рычаг,
+    # пришедший из реестра, не вправе обойти это ограничение; а идея на
+    # кампанию, которой в кабинете нет вовсе, — это гарантированная ошибка
+    # «объект не найден» и потраченные баллы чужого кабинета.
+    idea_out_of_scope = [a for a in idea_actions
+                         if str(a.get("object_id") or "") not in scoped_ids]
+    idea_actions = [a for a in idea_actions
+                    if str(a.get("object_id") or "") in scoped_ids]
+
     if (not desired and not desired_items and not campaign_desired
-            and not budget_desired and not switch_desired):
+            and not budget_desired and not switch_desired
+            and not idea_actions):
         if stale_computed:
             verdict, reason = "STALE_COMPUTED_SETTINGS", stale_computed
         elif not computed and not campaign_computed:
@@ -1514,6 +1665,10 @@ def run_account(
                            "cost_covered": placements_plan["cost_covered"],
                            "refused": 0, "not_found": 0, "actions_planned": 0},
             "unsupported": unsupported,
+            # Секция реестра — и в коротком отчёте тоже, тем же полем: иначе
+            # «идей не было» и «до идей прогон не дошёл» выглядят одинаково.
+            "ideas": _ideas_report(idea_actions, idea_refused,
+                                   idea_out_of_scope),
             "campaign_level": campaign_level_report,
             "confidence": confidence_report,
             # Ни одной кампании не тронуто — и это сказано явно тем же полем,
@@ -1681,6 +1836,19 @@ def run_account(
             blocked.append({**action, "blocked_reason": reason})
             continue
         switch_planned_count += 1
+        planned.append({**action, "account": login})
+
+    # Ф12: действия из реестра идей. Сам реестр прочитан выше — ДО раннего
+    # выхода, потому что идея входит в его условие; здесь идеи проходят те же
+    # рельсы, что и любой другой рычаг, и попадают в общий план.
+    for action in idea_actions:
+        # С расходом из витрины: идея вправе принести любой рычаг, в том
+        # числе бюджетный, а бюджетная рельса без независимого расхода
+        # вынуждена верить числу построителя (guardrails._check_budget).
+        ok, reason = check_action(action, cost_28d_by_campaign)
+        if not ok:
+            blocked.append({**action, "blocked_reason": reason})
+            continue
         planned.append({**action, "account": login})
 
     allowed, in_holdout = check_holdout(planned, holdout_ids)
@@ -1978,6 +2146,8 @@ def run_account(
             "not_found": len(placements_not_found),
             "actions_planned": placements_planned_count,
         },
+        "ideas": _ideas_report(idea_actions, idea_refused,
+                               idea_out_of_scope),
         "desired": len(desired),
         # Э2.2: скольким кампаниям применялся личный план, а не кабинетный.
         "campaign_level": campaign_level_report,

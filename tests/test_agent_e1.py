@@ -92,6 +92,11 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
                                        "checks": []})
     monkeypatch.setattr(agent_e1.writer_db, "recent_action_objects",
                         lambda *a, **k: set())
+    # Реестр идей (Ф12): такт записи спрашивает его по каждому кабинету. Без
+    # подмены прогон уходит в реальную базу и печатает ретраи коннекта в тот
+    # же stdout, который тесты разбирают как JSON. Пусто = реестр без
+    # открытых идей, штатное состояние кабинета до Ф13.
+    monkeypatch.setattr(agent_e1.ideas_registry, "open_ideas", lambda *a, **k: [])
     # История перезапусков обучения по кампаниям (кулдаун обучения). По
     # умолчанию пустая: кабинет, где стратегии никто не сбивал.
     monkeypatch.setattr(agent_e1.writer_db, "last_learning_reset",
