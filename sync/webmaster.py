@@ -112,6 +112,72 @@ def _fetch_all(indicator: str) -> dict[str, int]:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Гард закрытых недель.
+#
+# Каждый прогон переписывает ВСЮ доступную историю (см. шапку модуля) — это и есть
+# механизм дозревания: Вебмастер доливает клики задним числом до ~2 недель. Обратная
+# сторона того же механизма: если API однажды вернёт по старой неделе усечённое
+# значение, оно молча затрёт правильное, и заметить это будет нечем — updated_at
+# у всех строк одинаковый, история значений не хранится нигде.
+#
+# Отсюда правило: неделя, закончившаяся достаточно давно, чтобы дозреть, больше
+# не переписывается. Расхождение при перезаписи — не «свежие данные», а сигнал.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Три недели после конца недели: документированное дозревание ~2 недели, запас неделя.
+CLOSED_WEEK_MATURATION_DAYS = 21
+# Округления и мелкие пересчёты Вебмастера пропускаем, подмену значения — нет.
+CLOSED_WEEK_TOLERANCE = 0.02
+
+
+class ClosedWeekRewrite(Exception):
+    """Источник попытался переписать уже дозревшую неделю другим значением."""
+
+
+def _changed(old: int | None, new: int | None, tolerance: float) -> bool:
+    if old is None or new is None:
+        return old is not new
+    if old == new:
+        return False
+    if old == 0:
+        return new != 0
+    return abs(new - old) / abs(old) > tolerance
+
+
+def split_closed_week_rewrites(
+    incoming: dict[str, tuple[int, int | None]],
+    stored: dict[str, tuple[int, int | None]],
+    today: dt.date,
+    maturation_days: int = CLOSED_WEEK_MATURATION_DAYS,
+    tolerance: float = CLOSED_WEEK_TOLERANCE,
+) -> tuple[dict[str, tuple[int, int | None]], list[dict]]:
+    """Разделить приехавшие недели на «писать» и «переписывание закрытой недели».
+
+    Неделя, которой в базе ещё нет, пишется всегда — даже старая: это заполнение
+    пробела, а не перезапись. Открытая (не дозревшая) неделя пишется всегда: ради
+    этого синк и переписывает историю.
+    """
+    to_write: dict[str, tuple[int, int | None]] = {}
+    blocked: list[dict] = []
+    for wk, new in sorted(incoming.items()):
+        old = stored.get(wk)
+        if old is None:
+            to_write[wk] = new
+            continue
+        week_end = dt.date.fromisoformat(wk) + dt.timedelta(days=6)
+        if (today - week_end).days <= maturation_days:
+            to_write[wk] = new
+            continue
+        if _changed(old[0], new[0], tolerance) or _changed(old[1], new[1], tolerance):
+            blocked.append(
+                {"week_start": wk, "stored": old, "incoming": new, "days_closed": (today - week_end).days}
+            )
+        else:
+            to_write[wk] = new
+    return to_write, blocked
+
+
 def sync_brand_seo() -> int:
     """Синк недельных SEO-кликов (сводка, оба хоста, вся глубина API). Число недель."""
     clicks = _fetch_all("TOTAL_CLICKS")
@@ -120,22 +186,39 @@ def sync_brand_seo() -> int:
     if not weekly_c:
         return 0
     weekly_s = weekly_sums(shows)
+    incoming = {wk: (c, weekly_s.get(wk)) for wk, c in weekly_c.items()}
     from sync.db import get_connection  # ленивый импорт psycopg2
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.executemany(
-                """
-                INSERT INTO lime_brand_seo (week_start, clicks, impressions, source, updated_at)
-                VALUES (%s, %s, %s, 'webmaster', now())
-                ON CONFLICT (week_start)
-                DO UPDATE SET clicks = EXCLUDED.clicks, impressions = EXCLUDED.impressions,
-                              source = 'webmaster', updated_at = now()
-                """,
-                [(wk, c, weekly_s.get(wk)) for wk, c in sorted(weekly_c.items())],
+            cur.execute(
+                "SELECT week_start::text, clicks, impressions FROM lime_brand_seo "
+                "WHERE week_start = ANY(%s::date[])",
+                (sorted(incoming),),
             )
+            stored = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+            to_write, blocked = split_closed_week_rewrites(incoming, stored, dt.date.today())
+            if to_write:
+                cur.executemany(
+                    """
+                    INSERT INTO lime_brand_seo (week_start, clicks, impressions, source, updated_at)
+                    VALUES (%s, %s, %s, 'webmaster', now())
+                    ON CONFLICT (week_start)
+                    DO UPDATE SET clicks = EXCLUDED.clicks, impressions = EXCLUDED.impressions,
+                                  source = 'webmaster', updated_at = now()
+                    """,
+                    [(wk, c, s) for wk, (c, s) in sorted(to_write.items())],
+                )
         conn.commit()
-    return len(weekly_c)
+
+    if blocked:
+        # Годные недели уже записаны — падаем после коммита, чтобы отказ от перезаписи
+        # не стоил свежих данных. Прогон при этом краснеет: молчаливая правка истории
+        # обязана быть видна.
+        raise ClosedWeekRewrite(
+            f"источник переписывает дозревшие недели ({len(blocked)}): {blocked[:5]}"
+        )
+    return len(to_write)
 
 
 def sync_brand_seo_daily() -> int:
