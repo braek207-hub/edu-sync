@@ -610,3 +610,15 @@ def test_insert_column_list_matches_the_declared_columns():
     names = head.split("(", 1)[1].rsplit(")", 1)[0]
     listed = [name.strip() for name in names.split(",")]
     assert listed == list(registry.COLUMNS)
+
+
+def test_initial_status_is_honoured_but_never_re_declared(store):
+    # Начальный статус генератор задать вправе — предложение (класс 3)
+    # заводится сразу как proposed, оно не проходит через очередь. А вот
+    # ВТОРАЯ находка той же идеи статуса уже не касается: иначе у реестра
+    # оказалось бы два хозяина жизненного цикла — тот, кто применяет, и тот,
+    # кто генерирует.
+    registry.upsert([_idea(status=registry.STATUS_RUNNING)])
+    registry.upsert([_idea(status=registry.STATUS_NEW)])
+
+    assert registry.load(_id(_idea()))["status"] == registry.STATUS_RUNNING
