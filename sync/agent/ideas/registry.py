@@ -67,6 +67,11 @@ ALL_STATUSES = (STATUS_NEW, STATUS_QUEUED, STATUS_RUNNING, STATUS_DONE,
 # уже принято.
 CLOSED_STATUSES = (STATUS_DONE, STATUS_DROPPED)
 
+# Статусы, с которых идея НАЧИНАЕТ жизнь. Закрытие — событие, а не начальное
+# состояние: идея, заведённая сразу закрытой, никогда не была предложена, и в
+# реестре появилась бы запись о решении, которого никто не принимал.
+OPEN_STATUSES = (STATUS_NEW, STATUS_QUEUED, STATUS_RUNNING, STATUS_PROPOSED)
+
 
 def _canonical(value: Any) -> str:
     """Каноническая форма объекта идеи для отпечатка.
@@ -275,8 +280,10 @@ def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
             "закрыть, критерий проверяется К КОНЦУ горизонта")
 
     status = _text(idea.get("status")) or STATUS_NEW
-    if status not in ALL_STATUSES:
-        raise InvalidIdea(f"статус {status!r} неизвестен")
+    if status not in OPEN_STATUSES:
+        raise InvalidIdea(
+            f"статус {status!r} не бывает начальным: закрытие идеи — событие "
+            "(mark, reject), а не состояние, с которого она заводится")
 
     computed_id = idea_id(source, subject)
     given_id = _text(idea.get("idea_id"))
@@ -312,19 +319,93 @@ def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
 # ------------------------------------------------------------------- запись
 
 
+def _merge(existing: Optional[Dict[str, Any]],
+           incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """Что окажется в строке после повторной находки той же идеи.
+
+    Правило одно и держится на том, что генератор — НЕ хозяин статуса. Он
+    вправе обновлять свои числа и формулировки (GENERATOR_FIELDS); статус,
+    связи с действием и ставкой, причина снятия и отказ человека остаются
+    такими, какими их поставили применение и человек.
+
+    Закрытая строка не переписывается вовсе — даже числами. Смета закрытой
+    идеи есть основание уже принятого решения, и правка её задним числом
+    оставила бы разбор без тех чисел, по которым идею закрывали.
+
+    Живая, наоборот, числа обязана обновлять: заморозь их — и очередь
+    ранжировалась бы по ценности, посчитанной в день появления идеи.
+    """
+    if existing is None:
+        return incoming
+    if str(existing.get("status")) in CLOSED_STATUSES:
+        return dict(existing)
+    merged = dict(existing)
+    for field in GENERATOR_FIELDS:
+        merged[field] = incoming[field]
+    return merged
+
+
 def upsert(ideas: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Пишет порцию идей генератора и возвращает строки, легшие в реестр.
+    """Пишет порцию идей генератора и возвращает строки, как они теперь стоят.
 
     Порция принимается ЦЕЛИКОМ или не принимается вовсе: половина порции —
     состояние, которого не задавал никто (часть идей такта в реестре, часть
     нет), и назавтра генератор досыпал бы остаток как новые идеи. Поэтому
     сначала проверяется всё, и только потом пишется.
+
+    Закрытые строки не переписываются и не пишутся заново: их updated_at
+    обязан остаться днём закрытия, иначе «эта идея закрыта два месяца назад»
+    перестало бы быть видно в данных.
     """
     prepared = [_prepare(idea) for idea in ideas]
     if not prepared:
         return []
-    _write_rows(prepared)
-    return prepared
+    existing = _read_rows([row["idea_id"] for row in prepared])
+    merged = [_merge(existing.get(row["idea_id"]), row) for row in prepared]
+    _write_rows([row for row in merged
+                 if str(row.get("status")) not in CLOSED_STATUSES])
+    return merged
+
+
+def mark(idea_id_value: str, status: str, action_id: Optional[str] = None,
+         experiment_id: Optional[str] = None,
+         reason: Optional[str] = None) -> Dict[str, Any]:
+    """Двигает статус идеи и подшивает к ней связи. Возвращает строку.
+
+    Единственная точка, которой позволено менять жизненный цикл: применение
+    ставит queued/running и связывает идею с действием и ставкой, замер
+    закрывает её как done, машина снимает как dropped. Человек ходит через
+    reject — его отказ хранится иначе (см. докстринг модуля).
+
+    Из закрытого статуса пути нет. Отказ здесь громкий, а не тихий: молчаливое
+    «ничего не делаю» оставило бы прогон с отчётом об успехе и идею в прежнем
+    статусе — расхождение всплыло бы на разборе, когда причину восстановить уже
+    нечем (тот же довод, что у experiments.check_transition).
+    """
+    if status not in ALL_STATUSES:
+        raise InvalidIdea(f"статус {status!r} неизвестен")
+    row = load(idea_id_value)
+    if row is None:
+        raise InvalidIdea(f"идеи {idea_id_value!r} нет в реестре: двигать нечего")
+
+    current = str(row.get("status") or "")
+    if current in CLOSED_STATUSES:
+        if status == current:
+            return row
+        raise InvalidIdea(
+            f"идея {idea_id_value!r} закрыта как {current!r}: закрытая идея "
+            "не открывается заново")
+
+    row = dict(row)
+    row["status"] = status
+    if action_id is not None:
+        row["action_id"] = str(action_id)
+    if experiment_id is not None:
+        row["experiment_id"] = str(experiment_id)
+    if reason is not None:
+        row["dropped_reason"] = str(reason)
+    _write_rows([row])
+    return row
 
 
 def load(idea_id_value: str) -> Optional[Dict[str, Any]]:

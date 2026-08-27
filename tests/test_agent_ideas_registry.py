@@ -317,3 +317,122 @@ def test_rejections_are_looked_up_by_subject_not_by_idea():
     assert "subject_key = ANY(%s)" in sql
     assert "rejected_by IS NOT NULL" in sql
     assert "idea_id" not in sql
+
+
+# ------------------------------------------------- статус не едет назад
+
+def test_regenerating_a_running_idea_keeps_its_status(store):
+    # Генератор детерминирован и находит ту же идею каждым тактом. Сбрось
+    # повторная находка статус — идея, УЖЕ взятая в работу, каждое утро
+    # возвращалась бы в очередь новой и заводилась бы вторым действием.
+    registry.upsert([_idea()])
+    registry.mark(_id(_idea()), registry.STATUS_RUNNING, action_id="act-1")
+
+    registry.upsert([_idea()])
+
+    assert registry.load(_id(_idea()))["status"] == registry.STATUS_RUNNING
+
+
+def test_generator_cannot_declare_a_status_for_an_existing_idea(store):
+    # Статус двигают применение и человек, а не автор идеи. Объявленный
+    # генератором статус на существующей строке игнорируется целиком — иначе
+    # у реестра оказалось бы два хозяина жизненного цикла.
+    registry.upsert([_idea()])
+    registry.mark(_id(_idea()), registry.STATUS_RUNNING)
+
+    registry.upsert([_idea(status=registry.STATUS_QUEUED)])
+
+    assert registry.load(_id(_idea()))["status"] == registry.STATUS_RUNNING
+
+
+def test_closed_status_cannot_be_declared_at_insert(store):
+    # Закрытие — событие, а не начальное состояние. Идея, заведённая сразу
+    # закрытой, никогда не была предложена: в реестре появилась бы запись о
+    # решении, которого никто не принимал.
+    with pytest.raises(ValueError, match="статус"):
+        registry.upsert([_idea(status=registry.STATUS_DONE)])
+
+
+def test_a_finished_idea_does_not_come_back(store):
+    # done и dropped терминальны. Воскресни закрытая идея повторной
+    # генерацией — реестр перестал бы быть памятью: он показывал бы только то,
+    # что генератор нашёл сегодня, то есть ровно исходную болезнь.
+    registry.upsert([_idea()])
+    registry.mark(_id(_idea()), registry.STATUS_DONE, reason="раскатано")
+
+    registry.upsert([_idea(status=registry.STATUS_NEW)])
+
+    assert registry.load(_id(_idea()))["status"] == registry.STATUS_DONE
+
+
+def test_a_dropped_idea_does_not_come_back(store):
+    registry.upsert([_idea()])
+    registry.mark(_id(_idea()), registry.STATUS_DROPPED, reason="объект исчез")
+
+    registry.upsert([_idea(status=registry.STATUS_NEW)])
+
+    assert registry.load(_id(_idea()))["status"] == registry.STATUS_DROPPED
+
+
+def test_closed_idea_keeps_the_numbers_it_was_closed_with(store):
+    # Переписать смету закрытой идеи значит задним числом переписать
+    # основание уже принятого решения: разбор увидел бы не те числа, по
+    # которым идею закрывали.
+    registry.upsert([_idea(expected_rub=100_000.0)])
+    registry.mark(_id(_idea()), registry.STATUS_DONE)
+
+    registry.upsert([_idea(expected_rub=7.0)])
+
+    assert registry.load(_id(_idea()))["expected_rub"] == 100_000.0
+
+
+def test_regeneration_refreshes_the_numbers_of_a_live_idea(store):
+    # Обратная сторона того же правила: у ЖИВОЙ идеи свежая смета обязана
+    # доезжать. Заморозь её — и очередь ранжировалась бы по ценности,
+    # посчитанной в день появления идеи, месяц назад.
+    registry.upsert([_idea(expected_rub=100_000.0, test_cost_rub=10_000.0)])
+
+    registry.upsert([_idea(expected_rub=20_000.0, test_cost_rub=1_000.0)])
+    row = registry.load(_id(_idea()))
+
+    assert (row["expected_rub"], row["test_cost_rub"]) == (20_000.0, 1_000.0)
+
+
+def test_regeneration_keeps_the_link_to_the_action_and_the_bet(store):
+    # Связь «идея → действие → ставка» ставит такт записи. Затри её повторная
+    # генерация — и замер закрывал бы ставку, не зная, чью идею он проверял.
+    registry.upsert([_idea()])
+    registry.mark(_id(_idea()), registry.STATUS_RUNNING,
+                  action_id="act-1", experiment_id="exp-1")
+
+    registry.upsert([_idea()])
+    row = registry.load(_id(_idea()))
+
+    assert (row["action_id"], row["experiment_id"]) == ("act-1", "exp-1")
+
+
+def test_mark_refuses_to_reopen_a_closed_idea(store):
+    # Тихий отказ здесь опаснее падения: прогон отчитался бы об успехе, а
+    # идея осталась бы в прежнем статусе — расхождение всплыло бы на разборе,
+    # когда причину восстановить уже нечем (тот же довод, что у
+    # experiments.check_transition).
+    registry.upsert([_idea()])
+    registry.mark(_id(_idea()), registry.STATUS_DONE)
+
+    with pytest.raises(ValueError, match="закрыт"):
+        registry.mark(_id(_idea()), registry.STATUS_RUNNING)
+
+
+def test_mark_of_the_same_closed_status_is_idempotent(store):
+    # Повтор отметки — обычное дело при переотправке; падать на нём значит
+    # ронять прогон на том, что уже верно.
+    registry.upsert([_idea()])
+    registry.mark(_id(_idea()), registry.STATUS_DONE)
+
+    assert registry.mark(_id(_idea()), registry.STATUS_DONE)["status"] == (
+        registry.STATUS_DONE)
+
+
+def test_mark_of_an_unknown_idea_is_refused(store):
+    with pytest.raises(ValueError, match="нет в реестре"):
+        registry.mark("такой-идеи-нет", registry.STATUS_RUNNING)
