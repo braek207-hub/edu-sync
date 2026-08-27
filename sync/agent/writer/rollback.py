@@ -225,6 +225,18 @@ def _added_modifier_id(action: Dict[str, Any]) -> Optional[Any]:
     return None
 
 
+# Виды, у которых назад едет весь прежний блок BiddingStrategy. Всё, что
+# живёт ВНУТРИ стратегии, возвращается одинаково — недельный лимит, цель CPA,
+# цель оптимизации: разница между ними существует только на пути ТУДА.
+#
+# Цель CPA попала сюда с опозданием и это был дефект, а не решение: вид стоял
+# в allow-листе возврата (guardrails.ROLLBACK_ALLOWED_ACTION_KINDS) с самой
+# Э3.5, а ветки здесь не имел — то есть откат цели CPA не строился вовсе и
+# сторож хоронил его пометкой «прошлое состояние неизвестно», permanent=True.
+# В бою это не выстрелило только потому, что рычаг цели держат в тени.
+STRATEGY_BLOCK_KINDS = ("budget.set", "tcpa.set", "goal.set")
+
+
 def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[str, Any]]]:
     """Запрос, возвращающий объект в прошлое состояние.
 
@@ -253,7 +265,7 @@ def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[st
             "BidModifiers": [{"Id": modifier_id, "BidModifier": delta_to_api(0)}]
         }
 
-    if kind == "budget.set":
+    if kind in STRATEGY_BLOCK_KINDS:
         # Назад едет ВЕСЬ прежний блок BiddingStrategy из журнала — тем же
         # правилом, что у расписания ниже: пересборка из одного лимита стёрла
         # бы соседние поля стратегии (цель, BidCeiling), настроенные человеком.

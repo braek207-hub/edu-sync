@@ -91,6 +91,14 @@ MATURE_WINDOW_DAYS = 14
 # (Ф14), когда действие сможет показать, что список регионов только сужается.
 CUTTING_KINDS = frozenset({"negative.add", "placement.exclude"})
 
+# Виды, у которых доказательство ПО ПОСТРОЕНИЮ снято не с этого объекта.
+# Смена цели оптимизации обещает конверсию, которой у этой кампании никогда не
+# было: число перенесено с соседней. Обещание при этом есть и оно проверяемо —
+# то есть по общему правилу вид получил бы класс 1 «измеренное здесь» и
+# заплатил бы риском как за измерение. Это занижение цены уверенности, и
+# ошибка здесь стоит всей кампании: стратегия переучивается целиком.
+TRANSFERRED_EVIDENCE_KINDS = frozenset({"goal.set"})
+
 
 def tier_of(action: Dict[str, Any],
             context: Optional[Dict[str, Any]] = None) -> int:
@@ -125,6 +133,8 @@ def _computed(action: Dict[str, Any], context: Dict[str, Any]) -> int:
     if not _has_lever(kind):
         return TIER_PROPOSAL
     if is_bet(action):
+        return TIER_BET
+    if kind in TRANSFERRED_EVIDENCE_KINDS:
         return TIER_BET
     if kind in CUTTING_KINDS and _is_arithmetic(action.get("evidence")):
         return TIER_ARITHMETIC

@@ -36,8 +36,8 @@ MODIFIER_CAP = 50          # потолок и пол корректировки
 # "никогда", а не эвристику по подстроке.
 ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set",
                         "budget.set", "budget.set_daily", "campaign.suspend",
-                        "tcpa.set", "negative.add", "placement.exclude",
-                        "negative.remove_added"}
+                        "tcpa.set", "goal.set", "negative.add",
+                        "placement.exclude", "negative.remove_added"}
 
 # Виды, у которых рычага записи на стороне агента нет и не будет: тело
 # кампании (группы, ключи, объявления) собирает ДРУГОЙ репозиторий, и агент
@@ -107,7 +107,8 @@ SCHEDULE_STEP = 10
 ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set", "schedule.set",
                                  "budget.set", "budget.set_daily",
                                  "campaign.suspend", "tcpa.set",
-                                 "negative.add", "placement.exclude"}
+                                 "goal.set", "negative.add",
+                                 "placement.exclude"}
 
 # Куда обязан возвращать откат, в зависимости от вида ИСХОДНОГО действия.
 # Отмена добавления — нейтраль (объекта до действия не было), отмена

@@ -14,6 +14,7 @@ import pytest
 from sync.agent.writer import expectation, exposure, guardrails, lanes
 from sync.agent.writer.budget import diff_budget
 from sync.agent.writer.diff import diff_modifiers, diff_schedule
+from sync.agent.writer.goal import diff_goal
 from sync.agent.writer.negatives import (diff_negatives, plan_negatives,
                                          remove_added_action)
 from sync.agent.writer.placements import diff_placements, plan_placements
@@ -112,6 +113,21 @@ def _tcpa():
     return actions[0]
 
 
+def _goal():
+    """Смена цели: конверсия новой цели снята с другого объекта — это ставка."""
+    strategy = {"Search": {"BiddingStrategyType": "AVERAGE_CPA",
+                           "AverageCpa": {"PriorityGoals": [{"GoalId": 42}],
+                                          "AverageCpa": 2_400 * M}},
+                "Network": {"BiddingStrategyType": "SERVING_OFF"}}
+    actions, _ = diff_goal(
+        {"1": {"goal_ids": [541_664_134], "reaches": {541_664_134: 400.0},
+               "window_days": 28, "clicks_per_day": 120.0,
+               "cr_current": 0.020, "cr_new": 0.026}},
+        {"1": {"campaign_type": "TEXT_CAMPAIGN", "package_id": None,
+               "strategy": strategy}})
+    return actions[0]
+
+
 def _switch_rows(roi_share=0.3):
     return [
         {"setting_kind": "campaign_switch", "setting_key": "suspend",
@@ -146,6 +162,7 @@ _SAMPLES = {
     "budget.set_daily": lambda: _budget(daily=True),
     "campaign.suspend": _suspend,
     "tcpa.set": _tcpa,
+    "goal.set": _goal,
     "negative.add": _negative,
     "negative.remove_added": _remove_added,
     "placement.exclude": _placement,

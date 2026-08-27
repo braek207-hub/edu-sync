@@ -203,6 +203,16 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
                                "BiddingStrategy": payload["BiddingStrategy"]}}]
         }
 
+    if kind == "goal.set":
+        # Цель оптимизации живёт внутри BiddingStrategy, и блок собран планом
+        # (writer/goal.py) из ПРОЧИТАННОГО состояния с заменой одного лишь
+        # носителя цели: структура в API заменяется целиком.
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(payload["CampaignId"]),
+                           "TextCampaign": {
+                               "BiddingStrategy": payload["BiddingStrategy"]}}]
+        }
+
     if kind == "placement.exclude":
         # Список запрещённых площадок в API заменяется целиком; объединение
         # прежних и новых собрал план (writer/placements.py).

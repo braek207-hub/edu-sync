@@ -216,6 +216,10 @@ def _model(action: Dict[str, Any],
         return _budget(action, days)
     if kind == "tcpa.set":
         return _tcpa(action, context, days)
+    # Литерал, а не константа рычага: writer/goal.py сам заявляет отсюда
+    # ожидание, и импорт на уровне модуля замкнул бы кольцо goal → expectation.
+    if kind == "goal.set":
+        return _goal(action, context, days)
     if kind == "campaign.suspend":
         return _suspend(action, context, days)
     if kind in ("negative.add", "placement.exclude"):
@@ -381,6 +385,37 @@ def _tcpa(action: Dict[str, Any], context: Dict[str, Any],
         "basis": (f"цель {round(target_rub)} ₽ против {round(previous / MICROS)} ₽: "
                   f"расход следует за целью, прирост покупает лиды по новой "
                   f"цели, {days} дн."),
+        "measure_days": days,
+    }
+
+
+def _goal(action: Dict[str, Any], context: Dict[str, Any],
+          days: int) -> Optional[Dict[str, Any]]:
+    """Смена цели оптимизации: те же деньги, другая доля заявок.
+
+    Расход не трогается вовсе — ни лимит, ни цель CPA рычаг не двигает, —
+    поэтому рублёвая сторона обещания ровно ноль, а не «неизвестно»: это
+    утверждение, и замер вправе спросить с него.
+
+    Лиды считаются разностью двух конверсий на одном и том же потоке кликов.
+    Обе приходят контекстом от рычага: конверсия новой цели снята с другого
+    объекта (у ЭТОЙ кампании её по построению нет), и это ровно то, что
+    делает действие ставкой, а не измерением (writer/tier.py). Нет любой из
+    двух — обещания нет: курс «клики → лиды» не выдумывается.
+    """
+    clicks = _number(context.get("clicks_per_day"))
+    cr_new = _number(context.get("cr_new"))
+    cr_current = _number(context.get("cr_current"))
+    if None in (clicks, cr_new, cr_current):
+        return None
+    if clicks <= 0 or cr_new <= 0 or cr_current <= 0:
+        return None
+    return {
+        "leads_delta": _round(clicks * days * (cr_new - cr_current)),
+        "rub_delta": 0.0,
+        "basis": (f"смена цели: {round(clicks)} кликов/дн те же, конверсия "
+                  f"{round(cr_new * 100, 2)} % против {round(cr_current * 100, 2)} %, "
+                  f"{days} дн. Конверсия новой цели снята с другого объекта"),
         "measure_days": days,
     }
 
