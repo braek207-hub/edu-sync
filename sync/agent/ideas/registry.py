@@ -515,8 +515,44 @@ def load(idea_id_value: str) -> Optional[Dict[str, Any]]:
     return _read_rows([idea_id_value]).get(idea_id_value)
 
 
+def idea_tier(idea: Dict[str, Any]) -> int:
+    """Класс достоверности идеи. Пустой или незнакомый класс — предложение.
+
+    Умолчание — самый строгий конец шкалы намеренно. Ноль означает
+    «утверждение о прошлом: применяется всегда и риском не платит»; прочти
+    пустое поле нулём — и забывчивость генератора открывала бы кабинет самым
+    дешёвым путём, какой в движке есть.
+
+    Правило живёт ЗДЕСЬ, а не у каждого читателя реестра. Читателей уже два —
+    отчёт такта расчёта и гейт такта записи, — и разойдись их умолчания хоть
+    на шаг, человек видел бы идею предложением на экране, пока агент считал
+    бы её измеренной и применял.
+    """
+    try:
+        value = int(idea.get("tier"))
+    except (TypeError, ValueError):
+        return tier_mod.TIER_PROPOSAL
+    return value if value in tier_mod.ALL_TIERS else tier_mod.TIER_PROPOSAL
+
+
+def open_ideas(account: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Открытые идеи реестра в порядке очереди. account=None — все кабинеты.
+
+    Порядок задаёт rank, а не база. SQL-сортировка детерминирована, но
+    сортирует по идентификатору, то есть по хэшу: отчёт показывал бы человеку
+    один порядок, а такт записи брал бы идеи в другом — и объяснить, почему
+    первой поехала не верхняя строка экрана, было бы нечем.
+
+    Закрытые идеи не читаются вовсе: реестр помнит их ради истории, а не ради
+    повторного предложения. Отклонённая человеком лежит именно закрытой
+    (_silence), и попади она в этот список — его «нет» обходилось бы каждым
+    тактом.
+    """
+    return rank(_read_open(account))
+
+
 # ------------------------------------------------------------ доступ к БД
-# Три примитива ниже — единственное место модуля, которое ходит в базу, и
+# Четыре примитива ниже — единственное место модуля, которое ходит в базу, и
 # ничего кроме хранения не делают: правило слияния живёт в Python выше, а SQL
 # переписывает строку тем, что ему дали. Так решено ради проверяемости —
 # правило в тексте запроса нельзя проверить иначе как живой базой.
@@ -565,6 +601,18 @@ SELECT_REJECTIONS_SQL = """
 """
 
 
+# Открытые идеи кабинета. Фильтр по кабинету — внутри запроса, а не после
+# чтения: реестр общий на все кабинеты, а такт записи идёт по одному, и
+# вычитывать чужие строки в память ради того, чтобы тут же их выбросить, —
+# лишний трафик, растущий с числом кабинетов.
+SELECT_OPEN_SQL = """
+    SELECT *
+      FROM edu_agent_ideas
+     WHERE status = ANY(%(statuses)s)
+       AND (%(account)s IS NULL OR account = %(account)s)
+"""
+
+
 def _json_params(row: Dict[str, Any]) -> Dict[str, Any]:
     """Строка → параметры запроса, ровно по объявленным колонкам.
 
@@ -589,6 +637,15 @@ def _read_rows(idea_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
             cur.execute(
                 "SELECT * FROM edu_agent_ideas WHERE idea_id = ANY(%s)", (ids,))
             return {str(r["idea_id"]): dict(r) for r in cur.fetchall()}
+
+
+def _read_open(account: Optional[str] = None) -> List[Dict[str, Any]]:
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(SELECT_OPEN_SQL,
+                        {"statuses": list(OPEN_STATUSES),
+                         "account": None if account is None else str(account)})
+            return [dict(r) for r in cur.fetchall()]
 
 
 def _read_rejections(subject_keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:

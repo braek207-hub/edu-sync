@@ -67,7 +67,9 @@ from sync.agent.learning_loop import forecast_bias, track_record
 from sync.agent.mining import mine_quasi_experiments, placebo_sigma
 from sync.agent.portfolio import computed_rows as portfolio_computed_rows
 from sync.agent.portfolio import portfolio_targets
+from sync.agent.ideas import registry as ideas_registry
 from sync.agent.writer import db as writer_db
+from sync.agent.writer import tier as tier_mod
 from sync.agent.writer.negatives import computed_rows as negative_computed_rows
 from sync.agent.writer.placements import computed_rows as placement_computed_rows
 from sync.agent.tcpa import (
@@ -287,6 +289,77 @@ def _count_by(rows, key):
         value = str(row.get(key) or "")
         out[value] = out.get(value, 0) + 1
     return dict(sorted(out.items()))
+
+
+# Сколько идей уезжает в отчёт списком. Счётчики выше показывают весь реестр,
+# а разбирать глазами человек будет верх очереди: остальное лежит в
+# edu_agent_ideas и достаётся запросом.
+IDEAS_SAMPLE_LIMIT = 10
+
+
+def _idea_line(idea: Dict[str, Any]) -> Dict[str, Any]:
+    """Идея реестра → строка отчёта. Числа и адрес, без служебных колонок."""
+    return {
+        "idea_id": idea.get("idea_id"),
+        "source": idea.get("source"),
+        "account": idea.get("account"),
+        "tier": idea.get("tier"),
+        "lane": idea.get("lane"),
+        "status": idea.get("status"),
+        "expected_rub": idea.get("expected_rub"),
+        "test_cost_rub": idea.get("test_cost_rub"),
+        "horizon_days": idea.get("horizon_days"),
+        "subject": idea.get("subject"),
+        "success_rule": idea.get("success_rule"),
+    }
+
+
+def ideas_section(ideas: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Реестр идей в отчёте прогона. Печатается ВСЕГДА, в том числе пустым.
+
+    Пустая секция и отсутствующая — разные новости. Первая говорит
+    «генераторы отработали, находок нет», вторая читается как «генератор не
+    запускался», и различить их задним числом по логу нечем: реестр к тому
+    времени выглядит одинаково пустым в обоих случаях. Поэтому счётчики стоят
+    нулями, а не сворачиваются в отсутствие ключа.
+
+    Предложения (класс 3) считаются ОТДЕЛЬНО от очереди. Они не применяются
+    никогда (writer/tier.py) и в такт записи не едут — но это и есть тот
+    экран, ради которого реестр заведён, и смешать их с очередью значило бы
+    показывать человеку список, часть которого агент молча заберёт себе.
+
+    Порядок очереди берётся как есть: его задал реестр (registry.rank —
+    ценность на рубль проверки), и вторая сортировка здесь развела бы экран
+    человека с очередью такта записи.
+    """
+    items = list(ideas or [])
+    queue = [i for i in items
+             if ideas_registry.idea_tier(i) in tier_mod.APPLIED_TIERS]
+    proposals = [i for i in items
+                 if ideas_registry.idea_tier(i) == tier_mod.TIER_PROPOSAL]
+    return {
+        "open": len(items),
+        "by_status": _count_by(items, "status"),
+        "by_source": _count_by(items, "source"),
+        "by_lane": _count_by(items, "lane"),
+        # Классы считаются через registry.idea_tier, а не общим _count_by:
+        # тот пишет пустую строку вместо нуля (str(0 or "")), и класс 0 —
+        # арифметика, самая массовая часть находок — исчез бы из разбивки в
+        # безымянную графу.
+        "by_tier": _count_by(
+            [{"tier": str(ideas_registry.idea_tier(i))} for i in items], "tier"),
+        # Обещание реестра и цена его проверки. Без них счётчик идей не
+        # говорит ничего: три идеи по сто рублей и три по миллиону выглядят
+        # одинаково.
+        "expected_rub": round(sum(float(i.get("expected_rub") or 0.0)
+                                  for i in items), 2),
+        "test_cost_rub": round(sum(float(i.get("test_cost_rub") or 0.0)
+                                   for i in items), 2),
+        "proposals": {"count": len(proposals),
+                      "sample": [_idea_line(i)
+                                 for i in proposals[:IDEAS_SAMPLE_LIMIT]]},
+        "queue": [_idea_line(i) for i in queue[:IDEAS_SAMPLE_LIMIT]],
+    }
 
 
 def funnel_ladder_section(
@@ -1390,6 +1463,11 @@ def main() -> int:
         # Денег два числа: room_rub_budget кабинет освоит поднятием лимитов
         # сразу, room_rub_tcpa — только после эскалации цены конверсии.
         "growth": growth,
+        # Ф12: реестр идей. Печатается КАЖДЫЙ такт, в том числе пустым:
+        # пустая секция говорит «генераторы отработали, находок нет», а её
+        # отсутствие читается как «генератор не запускался» — и восстановить,
+        # что из двух было, задним числом уже нечем.
+        "ideas": ideas_section(ideas_registry.open_ideas()),
         "db_total_mb": total_mb,
         "db_tables": [{"t": s["table_name"], "size": s["size"]} for s in sizes],
     }
