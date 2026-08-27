@@ -1206,6 +1206,20 @@ def actions_from_ideas(
                 f"идея закрыта как {status!r} — это запись о случившемся"))
             continue
 
+        # Идея, чей рычаг УЖЕ уехал в кабинет. Второй раз то же действие не
+        # едет: горизонт замера не вышел, и повтор не ускорит исход, а
+        # уничтожит его — приписать изменение будет нечему.
+        #
+        # queued («человек сказал: в работу») здесь не упомянут намеренно: от
+        # new он для такта записи не отличается ничем — рычаг не применён,
+        # замер не начат. Отличай их такт, и взятая человеком в работу идея
+        # встала бы навсегда.
+        if status == ideas_registry.STATUS_RUNNING:
+            refused.append(_idea_refusal(
+                idea, rejects.IDEA_RUNNING,
+                "идея уже применена: проверка идёт, горизонт ещё не вышел"))
+            continue
+
         tier_value = ideas_registry.idea_tier(idea)
         if tier_value not in tier_mod.APPLIED_TIERS:
             refused.append(_idea_refusal(
@@ -1249,9 +1263,61 @@ def actions_from_ideas(
     return actions, refused
 
 
+# Исход применения, после которого идея считается проверяемой. Ровно один:
+# 'applied' — API принял запрос и элемент применился (writer/apply.py). Ни
+# 'dry_run' (репетиция в кабинет не ходила), ни 'rejected'/'failed' (в
+# кабинете ничего не изменилось), ни 'stale' (исход неизвестен, изменение
+# может быть живым, а может и нет — двигать по нему жизненный цикл значило бы
+# назначить идее проверку, которой, возможно, не было).
+IDEA_APPLIED_RESULT = "applied"
+
+
+def mark_applied_ideas(actions: List[Dict[str, Any]],
+                       details: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Идеи, чей рычаг доехал до кабинета, переводятся в «проверка идёт».
+
+    Единственная связь между тактом записи и жизненным циклом идеи. Без неё
+    применённая идея остаётся в статусе new, open_ideas отдаёт её снова, и
+    назавтра то же действие уезжает вторым — с тем же ключом идемпотентности,
+    но уже поверх изменённого состояния кабинета.
+
+    Отметка идёт по факту ПРИМЕНЕНИЯ, а не планирования. Между планом и
+    кабинетом лежат рельсы (заповедник, кулдауны, риск-бюджет, баллы), и
+    отмеченная при планировании идея застряла бы в реестре навсегда:
+    применять её больше нельзя, а закрывать нечем — в кабинете не менялось
+    ничего.
+
+    Отказ реестра не роняет прогон, а становится строкой. Человек мог
+    отклонить идею между чтением реестра и отправкой (registry.mark законно
+    отказывает закрытой), а действие к этому моменту УЖЕ применено: падение
+    здесь оставило бы прогон без отчёта о том, что он только что сделал в
+    кабинете, — то есть худший из возможных исходов.
+    """
+    outcomes = {str(d.get("key") or ""): str(d.get("result") or "")
+                for d in details or ()}
+    running: List[str] = []
+    failed: List[Dict[str, Any]] = []
+    for action in actions or ():
+        idea = str(action.get("idea_id") or "")
+        key = str(action.get("idempotency_key") or "")
+        # Действие без идеи реестру не принадлежит: в план едут все рычаги,
+        # а не только идейные.
+        if not idea or outcomes.get(key) != IDEA_APPLIED_RESULT:
+            continue
+        try:
+            ideas_registry.mark(idea, ideas_registry.STATUS_RUNNING,
+                                action_id=writer_db.make_action_id(key))
+        except ValueError as exc:
+            failed.append({"idea_id": idea, "detail": str(exc)[:200]})
+            continue
+        running.append(idea)
+    return {"running": running, "failed": failed}
+
+
 def _ideas_report(actions: List[Dict[str, Any]],
                   refused: List[Dict[str, Any]],
                   out_of_scope: Optional[List[Dict[str, Any]]] = None,
+                  marked: Optional[Dict[str, Any]] = None,
                   ) -> Dict[str, Any]:
     """Что такт записи взял из реестра идей. Печатается всегда, в том числе нулями.
 
@@ -1264,11 +1330,18 @@ def _ideas_report(actions: List[Dict[str, Any]],
     ограничение как дефект генератора.
     """
     dropped = list(out_of_scope or ())
+    moved = marked or {}
     return {
         "open": len(actions) + len(refused) + len(dropped),
         "actions": len(actions),
         "refused_by_reason": _count_by(refused, "reason"),
         "out_of_scope": len(dropped),
+        # Сколько идей ушло в замер этим тактом и скольким не удалось
+        # сдвинуть статус. Второе число — не мелочь: идея, чей рычаг применён,
+        # а статус остался прежним, поедет в кабинет ещё раз завтра, и
+        # молчание об этом стоило бы второго применения.
+        "running": len(moved.get("running") or ()),
+        "mark_failed": len(moved.get("failed") or ()),
     }
 
 
@@ -2059,6 +2132,12 @@ def run_account(
 
     report = apply_actions(client, prepared, writer_db, lease=lease)
 
+    # Ф12: идея, чей рычаг доехал до кабинета, уходит в замер. Место —
+    # СРАЗУ за применением и только здесь: раньше исход неизвестен (рельсы
+    # ещё могут снять действие с плана), позже — уже не с чем сверять, а
+    # отчёт прогона обязан показать, сколько идей сдвинулось.
+    marked_ideas = mark_applied_ideas(prepared, report.get("details") or [])
+
     conflict_groups = [
         (reason, [a for a in in_conflict if a.get("conflict_reason") == reason])
         for reason in sorted(conflicts.by_reason(in_conflict))
@@ -2147,7 +2226,7 @@ def run_account(
             "actions_planned": placements_planned_count,
         },
         "ideas": _ideas_report(idea_actions, idea_refused,
-                               idea_out_of_scope),
+                               idea_out_of_scope, marked_ideas),
         "desired": len(desired),
         # Э2.2: скольким кампаниям применялся личный план, а не кабинетный.
         "campaign_level": campaign_level_report,

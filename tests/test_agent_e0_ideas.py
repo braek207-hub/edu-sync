@@ -343,3 +343,157 @@ def test_open_ideas_returns_them_in_queue_order(monkeypatch):
     monkeypatch.setattr(registry, "_read_open", lambda account=None: list(rows))
 
     assert [i["idea_id"] for i in registry.open_ideas()] == ["cheap", "dear"]
+
+
+# =========================================================================
+# Идея, проверка которой уже идёт, не переигрывается каждый такт.
+#
+# registry.mark не вызывался никогда: применённая идея оставалась в статусе
+# new, open_ideas отдавал её снова, и назавтра то же действие поехало бы
+# вторым. Две половины одного механизма — отметка на выходе такта и отказ на
+# входе следующего, — и обе обязаны проверяться порознь: отметка без отказа
+# бесполезна, отказ без отметки никогда не сработает.
+# =========================================================================
+
+
+def test_running_idea_is_not_replayed_next_tact():
+    # Идея, уже уехавшая в кабинет, второй раз не едет: горизонт её проверки
+    # ещё не вышел, и повторное применение того же рычага не «ускорит»
+    # результат, а испортит замер — исход нечем будет приписать.
+    actions, refused = agent_e1.actions_from_ideas(
+        [_idea("run", status=registry.STATUS_RUNNING, action=_action())])
+
+    assert actions == []
+    assert [r["reason"] for r in refused] == [rejects.IDEA_RUNNING]
+
+
+def test_running_idea_is_refused_by_its_own_reason():
+    # Своя причина, а не чужая с другим смыслом. closed_key означает «ключ
+    # закрыт финальным статусом» и лечится ожиданием следующего окна;
+    # proposal — «рычага нет вовсе» и не лечится ничем. Идея в работе — это
+    # третье: рычаг есть, он УЖЕ применён, идёт замер.
+    assert rejects.IDEA_RUNNING in rejects.KNOWN_REASONS
+    assert rejects.IDEA_RUNNING not in {rejects.CLOSED_KEY, rejects.PROPOSAL}
+
+
+def test_queued_idea_travels_like_a_new_one():
+    # queued — «человек сказал: в работу». Для такта записи это то же самое,
+    # что new: рычаг ещё не применён, замер не начат. Отличай их такт — и
+    # взятая человеком в работу идея встала бы навсегда.
+    actions, refused = agent_e1.actions_from_ideas(
+        [_idea("q", status=registry.STATUS_QUEUED, action=_action())])
+
+    assert refused == []
+    assert [a["idea_id"] for a in actions] == ["q"]
+
+
+def _detail(action, result="applied"):
+    return {"key": action["idempotency_key"], "result": result}
+
+
+def test_applied_idea_is_marked_running(monkeypatch):
+    # Единственная связь между тактом записи и жизненным циклом идеи. Без
+    # неё реестр отдаёт применённую идею открытой каждое утро, и одно и то
+    # же действие уезжает в кабинет каждый день.
+    marks = []
+    monkeypatch.setattr(agent_e1.ideas_registry, "mark",
+                        lambda *a, **k: marks.append((a, k)) or {})
+    monkeypatch.setattr(agent_e1.writer_db, "make_action_id",
+                        lambda key: f"act:{key}")
+    action = {**_action(), "idea_id": "ok"}
+
+    outcome = agent_e1.mark_applied_ideas([action], [_detail(action)])
+
+    assert outcome["running"] == ["ok"]
+    assert marks == [(("ok", registry.STATUS_RUNNING),
+                      {"action_id": f"act:{action['idempotency_key']}"})]
+
+
+def test_idea_blocked_before_the_cabinet_is_not_marked(monkeypatch):
+    # Отметка идёт по факту ПРИМЕНЕНИЯ, а не планирования. Планирование
+    # может кончиться рельсой (заповедник, кулдаун, бюджет), и действие до
+    # кабинета не доедет — отметь такую идею running, и она застряла бы в
+    # реестре навсегда: закрывать нечего, применять нельзя.
+    marks = []
+    monkeypatch.setattr(agent_e1.ideas_registry, "mark",
+                        lambda *a, **k: marks.append(a) or {})
+    action = {**_action(), "idea_id": "blocked"}
+
+    outcome = agent_e1.mark_applied_ideas([action], [])
+
+    assert outcome["running"] == []
+    assert marks == []
+
+
+def test_rehearsal_does_not_move_the_idea(monkeypatch):
+    # Репетиция (--dry-run) в кабинет не ходит. Двинь она статус — реестр
+    # считал бы идею проверяемой, а в кабинете не изменилось бы ничего, и
+    # горизонт истёк бы впустую.
+    marks = []
+    monkeypatch.setattr(agent_e1.ideas_registry, "mark",
+                        lambda *a, **k: marks.append(a) or {})
+    action = {**_action(), "idea_id": "rehearsed"}
+
+    outcome = agent_e1.mark_applied_ideas(
+        [action], [_detail(action, result="dry_run")])
+
+    assert outcome["running"] == []
+    assert marks == []
+
+
+def test_actions_without_an_idea_are_not_marked(monkeypatch):
+    # В план едут действия всех рычагов, а не только идейные. Действие без
+    # idea_id реестру не принадлежит, и отметка по нему упала бы «идеи нет».
+    marks = []
+    monkeypatch.setattr(agent_e1.ideas_registry, "mark",
+                        lambda *a, **k: marks.append(a) or {})
+    action = dict(_action())
+
+    assert agent_e1.mark_applied_ideas([action], [_detail(action)])["running"] == []
+    assert marks == []
+
+
+def test_a_refused_mark_does_not_break_the_run(monkeypatch):
+    # Человек мог отклонить идею между чтением реестра и отправкой: строка
+    # закрыта, и mark законно отказывает. Действие при этом УЖЕ применено в
+    # кабинете — падение здесь оставило бы прогон без отчёта о том, что он
+    # только что сделал. Отказ становится видимой строкой, а не трассой.
+    def _refuse(*a, **k):
+        raise registry.InvalidIdea("идея закрыта")
+
+    monkeypatch.setattr(agent_e1.ideas_registry, "mark", _refuse)
+    monkeypatch.setattr(agent_e1.writer_db, "make_action_id", lambda key: "act")
+    action = {**_action(), "idea_id": "gone"}
+
+    outcome = agent_e1.mark_applied_ideas([action], [_detail(action)])
+
+    assert outcome["running"] == []
+    assert [f["idea_id"] for f in outcome["failed"]] == ["gone"]
+
+
+def test_applying_an_idea_marks_it_running_in_the_run(monkeypatch, capsys):
+    # Врезка: чистая функция может судить верно, а прогон — не звать её
+    # вовсе. Ровно этим и был мёртв путь идей до сих пор.
+    _patch_run(monkeypatch, {"acc-1": []}, {"acc-1": [111]}, {"111": 1000.0})
+    monkeypatch.setattr(
+        agent_e1.ideas_registry, "open_ideas",
+        lambda *a, **k: [_idea("ok", action=_action())])
+    marks = []
+    monkeypatch.setattr(agent_e1.ideas_registry, "mark",
+                        lambda *a, **k: marks.append(a) or {})
+    # Настоящее применение в тестах не ходит в кабинет (двойник клиента
+    # отвечает репетицией), а проверяется здесь именно ветка боевого исхода.
+    monkeypatch.setattr(
+        agent_e1, "apply_actions",
+        lambda client, prepared, db, **k: {
+            "applied": len(prepared), "skipped": 0, "failed": 0, "rejected": 0,
+            "dry_run": 0, "unknown_outcome": 0, "conflicted": 0, "deferred": 0,
+            "units_low": 0, "rejects": [],
+            "details": [{"key": a["idempotency_key"], "result": "applied"}
+                        for a in prepared]})
+
+    assert agent_e1.main() == 0
+    report = _reports(capsys)[0]
+
+    assert marks == [("ok", registry.STATUS_RUNNING)]
+    assert report["ideas"]["running"] == 1
