@@ -1,10 +1,10 @@
 {
-  "order_id": "consolidate-vpo-2026-09-01",
+  "order_id": "consolidate-vpo",
   "idea_id": "d96b5cf53b8073c1c6d122e5",
   "kind": "consolidate",
   "account": "account1-506453-ln8s",
-  "level_slug": "vpo_consolidate_2026_09",
-  "campaign_name": "vpo / consolidate / consolidate-vpo-2026-09-01",
+  "level_slug": "vpo_consolidate",
+  "campaign_name": "vpo / consolidate / consolidate-vpo",
   "direction": "vpo",
   "queries": [
     {
@@ -47,6 +47,7 @@
     "counter_id": 98627983,
     "goal_id": 360811375
   },
+  "window_days": 30,
   "horizon_days": 30,
   "success_rule": {
     "metric": "cpa",

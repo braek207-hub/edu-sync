@@ -66,6 +66,7 @@ from sync.agent.coverage import blind_share
 from sync.agent.gate import data_gate
 from sync.agent.ideas import registry as ideas_registry
 from sync.agent.writer import budget
+from sync.agent.writer import launch
 from sync.agent.writer import switch
 from sync.agent.writer import negatives
 from sync.agent.writer import placements
@@ -835,7 +836,7 @@ def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
 
     out: Dict[str, Any] = {}
     for lane, slot in sorted(slots.items()):
-        limit = lanes.risk_budget_of(lane, steps.get(lane, lanes.DEFAULT_STEP),
+        limit = lanes.risk_budget_of(lane, steps.get(lane, lanes.default_step_of(lane)),
                                      weekly_spend_rub, config, risk_budget_rub)
         out[lane] = lane_shortfall(taken=slot["taken"], refused=slot["refused"],
                                    wanted_rub=slot["wanted"], limit_rub=limit,
@@ -1704,10 +1705,19 @@ def run_account(
     # пришедший из реестра, не вправе обойти это ограничение; а идея на
     # кампанию, которой в кабинете нет вовсе, — это гарантированная ошибка
     # «объект не найден» и потраченные баллы чужого кабинета.
-    idea_out_of_scope = [a for a in idea_actions
-                         if str(a.get("object_id") or "") not in scoped_ids]
-    idea_actions = [a for a in idea_actions
-                    if str(a.get("object_id") or "") in scoped_ids]
+    #
+    # Запуск (Ф14) под это правило не подпадает: его object_id — order_id
+    # наряда, а не кампания кабинета, потому что кампании ещё нет. Ограничитель
+    # прогона всё равно действует, но по другому адресу — по ДОНОРАМ наряда:
+    # именно у них правится трафик, и именно они обязаны быть в scope.
+    def _in_scope(action: Dict[str, Any]) -> bool:
+        if action.get("action_kind") == launch.LAUNCH_KIND:
+            donors = launch.donor_ids(action)
+            return bool(donors) and all(d in scoped_ids for d in donors)
+        return str(action.get("object_id") or "") in scoped_ids
+
+    idea_out_of_scope = [a for a in idea_actions if not _in_scope(a)]
+    idea_actions = [a for a in idea_actions if _in_scope(a)]
 
     if (not desired and not desired_items and not campaign_desired
             and not budget_desired and not switch_desired
@@ -1851,8 +1861,16 @@ def run_account(
     negatives_desired = {cid: phrases
                          for cid, phrases in negatives_plan["desired"].items()
                          if cid in scoped_ids}
-    negatives_state = (negatives.fetch_negatives(client, sorted(negatives_desired))
-                       if negatives_desired else {})
+    # Ф14: доноры запусков читаются ТЕМ ЖЕ запросом, что и гигиена. Второй
+    # запрос за теми же списками стоил бы вторых баллов API и, что хуже, дал
+    # бы два разных снимка одного кабинета в одном такте.
+    launch_creates = [a for a in idea_actions
+                      if a.get("action_kind") == launch.LAUNCH_KIND]
+    launch_donor_ids = sorted({donor for create in launch_creates
+                               for donor in launch.donor_ids(create)})
+    negatives_read = sorted(set(negatives_desired) | set(launch_donor_ids))
+    negatives_state = (negatives.fetch_negatives(client, negatives_read)
+                       if negatives_read else {})
     # cut_conversions и baseline_cpa едут вместе с расходом, а не остаются
     # значениями по умолчанию: первое — сколько лидов отсечение теряет
     # (обещание рычага), второе — порог, по которому кандидат и выбран. Без
@@ -1874,6 +1892,29 @@ def run_account(
             continue
         negatives_planned_count += 1
         planned.append({**action, "account": login})
+
+    # Ф14: кросс-минусовка доноров запуска. Строится ЗДЕСЬ, а не в расчётном
+    # такте: она кладётся поверх свежего списка кабинета, а расчёт видел его
+    # сутки назад. Наряд (campaign.create) при этом остаётся в общем плане и
+    # проходит те же рельсы — там его и отклонит allow-лист записи с
+    # названной причиной, а drop_unlaunched ниже снимет осиротевшую минусовку.
+    launch_unread: List[Dict[str, Any]] = []
+    launch_bundled = 0
+    for create in launch_creates:
+        unread = launch.unread_donors(create, negatives_state)
+        if unread:
+            launch_unread.append({"order_id": str(create.get("object_id") or ""),
+                                  "donors": unread})
+            continue
+        for action in launch.build_all(create, negatives_state):
+            if action.get("action_kind") == launch.LAUNCH_KIND:
+                continue
+            ok, reason = check_action(action)
+            if not ok:
+                blocked.append({**action, "blocked_reason": reason})
+                continue
+            launch_bundled += 1
+            planned.append({**action, "account": login})
 
     # Э3.7: применение запретов площадок — как минус-фразы: свежее чтение,
     # объединение с прежним списком, кап такта.
@@ -2064,6 +2105,12 @@ def run_account(
         charged_by_object=dict(charged_risk),
         risk_budget_rub=lane_risk_budget,
     )
+    # Ф14: минусовка донора без своего запуска не едет. Сторож стоит ПОСЛЕ
+    # отбора, потому что полосы независимы: запуск и гигиена решаются каждая
+    # по своей ступени, и связка могла разорваться именно здесь — полоса
+    # запуска стоит в тени (lanes.default_step_of), а гигиена работает.
+    lane_taken, launch_orphans = launch.drop_unlaunched(lane_taken)
+    lane_refused += launch_orphans
     # Дефицит полосы числами: сколько она заявила рублями, сколько ей позволено
     # и какая доля замыслов доехала. Без этого «отказано 45» не отличает полосу,
     # промахнувшуюся мимо потолка на три процента, от полосы, заявившей
@@ -2233,6 +2280,15 @@ def run_account(
         },
         "ideas": _ideas_report(idea_actions, idea_refused,
                                idea_out_of_scope, marked_ideas),
+        # Ф14: связки запуска. Все три числа нулями тоже печатаются: «нарядов
+        # не было», «наряд был, доноров не прочитали» и «минусовка уехала без
+        # запуска» ведут к разным следующим шагам, а один счётчик их сливает.
+        "launch": {
+            "orders": len(launch_creates),
+            "unread_donors": launch_unread,
+            "negatives_planned": launch_bundled,
+            "negatives_dropped": len(launch_orphans),
+        },
         "desired": len(desired),
         # Э2.2: скольким кампаниям применялся личный план, а не кабинетный.
         "campaign_level": campaign_level_report,

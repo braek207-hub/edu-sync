@@ -219,6 +219,15 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
                            "NegativeKeywords": payload["NegativeKeywords"]}]
         }
 
+    if kind == "negative.remove_added":
+        # Тот же campaigns.update, что и у добавления: список в API
+        # заменяется ЦЕЛИКОМ, и разница между «добавить» и «снять» существует
+        # только в том, какой список собрал план (writer/negatives).
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(payload["CampaignId"]),
+                           "NegativeKeywords": payload["NegativeKeywords"]}]
+        }
+
     if kind == "budget.set_daily":
         return "campaigns", "update", {
             "Campaigns": [{"Id": int(payload["CampaignId"]),

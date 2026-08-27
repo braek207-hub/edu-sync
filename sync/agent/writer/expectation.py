@@ -220,7 +220,37 @@ def _model(action: Dict[str, Any],
         return _suspend(action, context, days)
     if kind in ("negative.add", "placement.exclude"):
         return _cut(action, context, days)
+    if kind == "negative.remove_added":
+        return _restore(action, context, days)
     return None
+
+
+def _restore(action: Dict[str, Any], context: Dict[str, Any],
+             days: int) -> Optional[Dict[str, Any]]:
+    """Снятие своей минус-фразы — зеркало отсечения, которое оно отменяет.
+
+    Числа приходят контекстом от отменяемого действия, а не считаются заново:
+    вырезанный поток в кабинете больше не измеряется (его же и вырезали), и
+    любая свежая оценка была бы догадкой. Зеркало же проверяемо: замер
+    положит рядом факт и увидит, вернулось ли ровно то, что уходило.
+
+    Знак противоположен отсечению: расход растёт, лиды возвращаются. Ноль
+    лидов — законный случай (отсекали нулевой по конверсиям трафик), и
+    обещание тогда чисто рублёвое.
+    """
+    daily = _number(context.get("restored_daily_rub"))
+    if daily is None or daily <= 0:
+        return None
+    leads_day = _number(context.get("restored_conversions_per_day")) or 0.0
+    removed = (action.get("payload") or {}).get("RemovedPhrases") or []
+    return {
+        "leads_delta": _round(leads_day * days),
+        "rub_delta": _round(daily * days),
+        "basis": (f"возвращается {len(removed)} шт.: +{round(daily)} ₽/дн "
+                  f"расхода и {round(leads_day * days, 2)} лида за {days} дн. "
+                  "по числам отменяемого отсечения"),
+        "measure_days": days,
+    }
 
 
 def _reallocation_leads(moved_rub: float, percent: float, cpa: float) -> float:

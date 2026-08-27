@@ -15,6 +15,7 @@ tests/test_agent_build_order.py — наряд билдеру: контракт 
 
 import json
 import os
+import re
 import subprocess
 
 import pytest
@@ -48,6 +49,10 @@ def _order(**over):
         ],
         "campaign": {"weekly_budget": 60_000, "target_cpa": 1_600,
                      "counter_id": 98_627_983, "goal_id": 360_811_375},
+        # Окно наблюдения фраз: без него расход в наряде — число без срока, и
+        # ни недельный лимит новой кампании, ни цена риска её кросс-минусовки
+        # не считаются (задача 18).
+        "window_days": 30,
         "horizon_days": 30,
         "success_rule": {"metric": "cpa", "comparison": "did_vs_holdout",
                          "threshold": 1.0},
@@ -261,14 +266,31 @@ def test_an_order_built_from_an_idea_keeps_its_link():
          "horizon_days": 30,
          "success_rule": {"metric": "cpa", "op": "<=", "value": 1_600.0,
                           "comparison": "did_vs_holdout"},
-         "detail": {"queries": _order()["queries"]}},
+         "detail": {"queries": _order()["queries"], "window_days": 30}},
         campaign={"weekly_budget": 60_000, "target_cpa": 1_600,
-                  "counter_id": 98_627_983, "goal_id": 360_811_375},
-        today="2026-09-01")
+                  "counter_id": 98_627_983, "goal_id": 360_811_375})
 
     assert order["idea_id"] == "i-1"
-    assert order["order_id"].endswith("2026-09-01")
     assert build_order.validate(order)
+
+
+def test_the_order_id_of_an_idea_carries_no_date():
+    # Заливка ищет кампанию ПО ИМЕНИ (direct/upload.py билдера), а имя
+    # собирается из order_id. Генератор переписывает нагрузку идеи каждым
+    # прогоном (registry.GENERATOR_FIELDS), и плавай в имени дата — каждый
+    # такт заводил бы новую кампанию на ту же идею, а старая тратила бы дальше.
+    idea = {"idea_id": "i-1", "account": ACCOUNT,
+            "subject": {"kind": "consolidate", "direction": "vpo"},
+            "horizon_days": 30,
+            "success_rule": {"metric": "cpa", "op": "<=", "value": 1_600.0,
+                             "comparison": "did_vs_holdout"},
+            "detail": {"queries": _order()["queries"], "window_days": 30}}
+    campaign = _order()["campaign"]
+    first = build_order.from_idea(idea, campaign=campaign)
+    second = build_order.from_idea(idea, campaign=campaign)
+    assert first["order_id"] == second["order_id"]
+    assert not re.search(r"\d{4}-\d{2}-\d{2}", first["order_id"])
+    assert not re.search(r"\d{4}_\d{2}", first["level_slug"])
 
 
 def test_an_order_from_an_idea_mutes_every_taken_phrase():
@@ -280,8 +302,8 @@ def test_an_order_from_an_idea_mutes_every_taken_phrase():
          "horizon_days": 30,
          "success_rule": {"metric": "cpa", "op": "<=", "value": 1_600.0,
                           "comparison": "did_vs_holdout"},
-         "detail": {"queries": _order()["queries"]}},
-        campaign=_order()["campaign"], today="2026-09-01")
+         "detail": {"queries": _order()["queries"], "window_days": 30}},
+        campaign=_order()["campaign"])
 
     muted = {(n["campaign_id"], p) for n in order["donor_negatives"]
              for p in n["phrases"]}

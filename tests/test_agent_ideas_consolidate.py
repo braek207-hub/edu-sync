@@ -297,14 +297,71 @@ def test_evidence_follows_the_donor_set():
 # ------------------------------------------------------------- класс
 
 
-def test_consolidation_is_a_proposal_until_the_builder_is_a_lever():
-    # Рычаг выноса — наряд билдеру (Ф14), которого ещё нет. Класс 1 здесь
-    # означал бы, что такт записи обязан что-то применить, а применять
-    # нечего: кампании ещё не существует.
+def test_consolidation_without_donor_settings_stays_a_proposal():
+    # Счётчик и цель новой кампании берутся у доноров. Не прочитаны — наряд
+    # не собирается, и вынос остаётся предложением человеку. Молча уйти в
+    # ставку он не вправе: применять было бы нечем.
     idea = _idea()
     assert idea["tier"] == tier.TIER_PROPOSAL
     assert idea["lane"] == lanes.LANE_PROPOSAL
     assert "action" not in idea
+    # Причина названа, а не подразумевается: на экране «генератор молчит» и
+    # «генератор нашёл, но не хватило настроек донора» — разные новости.
+    assert idea["detail"]["launch_refusal"]
+
+
+def _settings(goal=360_811_375, counter=98_627_983):
+    return {"TextCampaign": {
+        "CounterIds": {"Items": [counter]},
+        "BiddingStrategy": {"Search": {"AverageCpa": {
+            "GoalId": goal, "AverageCpa": 1_600_000_000}}}}}
+
+
+def test_consolidation_with_donor_settings_carries_an_order():
+    # Ф14: рычаг у выноса появился — наряд билдеру. Идея перестаёт быть
+    # предложением и несёт нагрузку в колонке action: такт записи читает
+    # идеи из базы, и всё, чего нет в колонке, для него не существует.
+    idea = _idea([_q(phrase="колледж заочно", campaign="111",
+                     settings=_settings()),
+                  _q(phrase="поступить в колледж", campaign="222",
+                     settings=_settings())])
+    assert idea["tier"] == tier.TIER_BET
+    assert idea["lane"] == lanes.LANE_LAUNCH
+    order = idea["action"]["payload"]["order"]
+    assert order["idea_id"] == idea["idea_id"]
+    assert order["campaign"]["goal_id"] == 360_811_375
+    assert {n["campaign_id"] for n in order["donor_negatives"]} == {"111", "222"}
+
+
+def test_donors_disagreeing_on_the_goal_keep_the_idea_a_proposal():
+    # Два смысла конверсии в одной кампании невозможны, и усреднять их
+    # нельзя. Находка при этом не теряется: человек видит её и причину.
+    idea = _idea([_q(phrase="колледж заочно", campaign="111",
+                     settings=_settings()),
+                  _q(phrase="поступить в колледж", campaign="222",
+                     settings=_settings(goal=111_222_333))])
+    assert idea["tier"] == tier.TIER_PROPOSAL
+    assert "цел" in idea["detail"]["launch_refusal"]
+
+
+def test_the_order_of_an_idea_is_the_same_from_run_to_run():
+    # Заливка ищет кампанию по имени, а имя несёт order_id. Плавай он от
+    # прогона к прогону — каждый такт заводил бы новую кампанию на ту же
+    # идею, а прежняя продолжала бы тратить.
+    rows = [_q(phrase="колледж заочно", campaign="111", settings=_settings()),
+            _q(phrase="поступить в колледж", campaign="222", settings=_settings())]
+    first = _idea(rows)["action"]
+    second = _idea(rows)["action"]
+    assert first["idempotency_key"] == second["idempotency_key"]
+    assert first["payload"]["CampaignName"] == second["payload"]["CampaignName"]
+
+
+def test_a_created_campaign_is_ordered_paused():
+    idea = _idea([_q(phrase="колледж заочно", campaign="111",
+                     settings=_settings()),
+                  _q(phrase="поступить в колледж", campaign="222",
+                     settings=_settings())])
+    assert idea["action"]["payload"]["state"] == "SUSPENDED"
 
 
 # ------------------------------------------------- проверка у получателя

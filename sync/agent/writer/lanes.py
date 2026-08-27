@@ -235,6 +235,23 @@ def _max_objects(lane: str, config: Optional[Dict[str, Any]]) -> Optional[int]:
 # step_by_lane, а не константой отсюда.
 DEFAULT_STEP = 1
 
+
+def default_step_of(lane: str) -> int:
+    """Ступень полосы, пока человек не назначил ей свою.
+
+    Единица для всех, кроме запуска. У запуска рычага записи на стороне
+    агента нет вовсе — тело кампании собирает другой репозиторий, — и
+    «приёмка нового рычага не заперта» про него неверно: принимать нечего.
+    Ступень 1 по умолчанию означала бы, что кросс-минусовка доноров уезжает в
+    кабинет тактом, в котором кампания заведомо не создана, а это ровно та
+    потеря трафика, ради которой минусовка и связана с созданием.
+
+    Ключ lane_steps панели перебивает это значение в обе стороны: решение
+    выпустить полосу из тени принимает человек, и оно не должно требовать
+    правки кода.
+    """
+    return 0 if lane == LANE_LAUNCH else DEFAULT_STEP
+
 # Делитель ценности, ниже которого «на рубль риска» теряет смысл: действие
 # дешевле рубля не бывает, а ноль в знаменателе сделал бы любой бесплатный
 # пустяк лучшим решением прогона.
@@ -336,7 +353,7 @@ def select(
         lane_by_key[str(action["idempotency_key"])] = lane
         by_lane.setdefault(lane, []).append(action)
 
-    policies = {lane: policy_of(lane, steps.get(lane, DEFAULT_STEP), config)
+    policies = {lane: policy_of(lane, steps.get(lane, default_step_of(lane)), config)
                 for lane in by_lane}
     caps = {risk_mod.risk_object(a): risk_mod.object_cap(a, costs)
             for a in actions}

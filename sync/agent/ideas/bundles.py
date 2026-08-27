@@ -378,6 +378,11 @@ def query_donors(
             "cost_rub": cost,
             "conversions": conversions,
             "window_days": window_days,
+            # Настройки кампании-донора: из них новая кампания берёт счётчик
+            # и цель (launch.campaign_from_donors). Не «на всякий случай» —
+            # без них наряд билдеру не собирается, и вынос остаётся
+            # предложением человеку.
+            "settings": entry.get("settings"),
         }
         result = ladder_mod.ladder(counts, entry.get("pools") or (),
                                    avg_check=entry.get("avg_check"))

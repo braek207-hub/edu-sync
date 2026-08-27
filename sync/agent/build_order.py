@@ -46,9 +46,15 @@ KIND_EXPAND = "expand"             # завести семантику, кото
 KINDS: Tuple[str, ...] = (KIND_CONSOLIDATE, KIND_REBUILD, KIND_EXPAND)
 
 # Базы сравнения исхода. Своей истории у новой кампании нет вовсе, поэтому
-# «до и после» здесь физически невозможно — только против заповедника или
-# против направления, в котором она заведена.
-COMPARISONS: Tuple[str, ...] = ("did_vs_holdout", "vs_direction")
+# «до и после» здесь физически невозможно — сравнивать можно только с
+# чем-то внешним: с заповедником, с направлением или С ДОНОРАМИ.
+#
+# vs_donors внесена не для полноты списка, а по дефекту, найденному 27.08:
+# именно эту базу выставляет генератор выноса (ideas/consolidate — «побить
+# донорскую цену конверсии, ту самую, по которой связки покупаются сейчас»),
+# и наряд из его идеи валидатором не проходил. Тесты обеих сторон при этом
+# были зелёными: они собирали наряд руками, с базой из этого же списка.
+COMPARISONS: Tuple[str, ...] = ("did_vs_holdout", "vs_direction", "vs_donors")
 
 # Предел Директа на имя кампании — 255 символов; берём с запасом на суффиксы
 # заливки. Число не наше: см. direct/upload.py билдера.
@@ -243,6 +249,16 @@ def validate(order: Dict[str, Any]) -> Dict[str, Any]:
             "наряд без горизонта: кампания живёт вечно и никогда не попадает "
             "в разбор")
 
+    # Окно, за которое собраны факты фраз. Без него cost_rub — не факт, а
+    # число: 18 400 ₽ за неделю и за квартал требуют разных лимитов новой
+    # кампании и разной цены кросс-минусовки. Пропуск этого поля в задаче 17
+    # обнаружился на первой же попытке собрать по наряду действия.
+    window = _number(order.get("window_days"))
+    if not window or window <= 0:
+        raise ValueError(
+            "наряд без окна наблюдения: расход по фразам не приведёшь ко дню, "
+            "и лимит новой кампании считать не из чего")
+
     queries = _check_queries(order)
     negatives = _check_negatives(order, queries)
     rule = _check_success_rule(order)
@@ -259,6 +275,7 @@ def validate(order: Dict[str, Any]) -> Dict[str, Any]:
         "queries": queries,
         "donor_negatives": negatives,
         "campaign": campaign,
+        "window_days": int(window),
         "horizon_days": int(horizon),
         "success_rule": rule,
     }
@@ -285,14 +302,23 @@ def campaign_name(order: Dict[str, Any]) -> str:
     return f"{human[:room].rstrip()}{tail}" if human else order_id
 
 
-def make_order_id(kind: str, direction: str, today: str) -> str:
-    """Идентификатор наряда: вид, направление, день.
+def make_order_id(kind: str, direction: str) -> str:
+    """Идентификатор наряда: вид и направление. БЕЗ ДАТЫ.
 
-    Плавающая часть в нём запрещена: идемпотентность заливки держится на
-    имени кампании (direct/upload.py ищет её по нему), и случайный суффикс
-    завёл бы вторую кампанию на тот же наряд.
+    Идемпотентность заливки держится на имени кампании (direct/upload.py ищет
+    её по нему), а имя несёт order_id. Дата в нём означала бы новую кампанию
+    каждым прогоном генератора: нагрузка идеи — поле обновляемое
+    (registry.GENERATOR_FIELDS), и наряд пересобирается ежедневно, пока идея
+    открыта. Старая кампания при этом продолжала бы тратить.
+
+    Что теряется без даты: две разные консолидации одного направления в одном
+    кабинете. Их и не бывает — у реестра ровно одна открытая идея на
+    (кабинет, вид, направление), а повторная находка полгода спустя есть та же
+    консолидация с обновлённым составом фраз. Билдер догрузит их в ту же
+    кампанию (--resume), вместо того чтобы плодить помесячные близнецы,
+    делящие между собой один аукцион.
     """
-    parts = [_text(kind), _text(direction), _text(today)]
+    parts = [_text(kind), _text(direction)]
     return "-".join(p for p in parts if p)
 
 
@@ -300,7 +326,7 @@ def make_order_id(kind: str, direction: str, today: str) -> str:
 
 
 def from_idea(idea: Dict[str, Any], *, campaign: Dict[str, Any],
-              today: str, account: Optional[str] = None) -> Dict[str, Any]:
+              account: Optional[str] = None) -> Dict[str, Any]:
     """Идея реестра → наряд. Кросс-минусовка ВЫВОДИТСЯ, а не выписывается.
 
     Донор каждой фразы уже назван в идее (генератор consolidate берёт их из
@@ -324,13 +350,13 @@ def from_idea(idea: Dict[str, Any], *, campaign: Dict[str, Any],
         rule["threshold"] = rule["value"]
 
     kind = _text(subject.get("kind")) or KIND_CONSOLIDATE
-    order_id = make_order_id(kind, direction, today)
+    order_id = make_order_id(kind, direction)
     return {
         "order_id": order_id,
         "idea_id": _text(idea.get("idea_id")) or None,
         "kind": kind,
         "account": account or _text(idea.get("account")),
-        "level_slug": _slug_for(kind, direction, today),
+        "level_slug": _slug_for(kind, direction),
         "campaign_name": campaign_name({"order_id": order_id, "kind": kind,
                                         "direction": direction}),
         "direction": direction,
@@ -338,15 +364,20 @@ def from_idea(idea: Dict[str, Any], *, campaign: Dict[str, Any],
         "donor_negatives": [{"campaign_id": donor, "phrases": phrases}
                             for donor, phrases in sorted(by_donor.items())],
         "campaign": dict(campaign or {}),
+        "window_days": (idea.get("detail") or {}).get("window_days"),
         "horizon_days": idea.get("horizon_days"),
         "success_rule": rule,
     }
 
 
-def _slug_for(kind: str, direction: str, today: str) -> str:
-    """Слаг папки уровня: только то, что переживёт файловую систему."""
-    month = _text(today)[:7].replace("-", "_")
-    raw = "_".join(p for p in (_text(direction), _text(kind), month) if p)
+def _slug_for(kind: str, direction: str) -> str:
+    """Слаг папки уровня: только то, что переживёт файловую систему.
+
+    Без даты — по той же причине, что и order_id: слаг становится именем
+    папки на диске билдера, и плавающий месяц заводил бы новый уровень
+    каждым прогоном, оставляя предыдущие мёртвыми.
+    """
+    raw = "_".join(p for p in (_text(direction), _text(kind)) if p)
     slug = re.sub(r"[^a-z0-9_]+", "_", raw.lower()).strip("_")
     return slug[:60]
 

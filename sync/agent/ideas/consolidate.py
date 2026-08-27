@@ -7,12 +7,14 @@ sync/agent/ideas/consolidate.py — генератор идей: вынос до
 «понадёргать с разных кампаний кабинета лучшие связки и потестировать
 отдельной РК».
 
-**Почему это класс 3, а не применимая идея.** Рычаг выноса — НАРЯД БИЛДЕРУ
-(Ф14, задача 17), а не запись в API Директа: новой кампании ещё нет, значит
-нет и объекта, которому можно что-то отправить. Пока наряда не существует,
-идея едет на экран предложений, человек двигает её в работу, и лишь после
-Ф14 у неё появится рычаг. Класс 3 при этом обязан нести всё, чем предложение
-проверяется: цену теста, срок, машинно проверяемый критерий и доказательства.
+**Класс идеи определяет НАРЯД.** Рычаг выноса — наряд билдеру (Ф14), а не
+запись в API Директа: новой кампании ещё нет, значит нет и объекта, которому
+можно что-то отправить. Наряд собрался целиком — идея ставка (класс 2) и
+несёт его колонкой action. Не собрался (у доноров не прочитаны цель и
+счётчик, доноры разошлись в цели) — предложение человеку, класс 3, с
+названной причиной в detail.launch_refusal. И в том, и в другом случае идея
+обязана нести всё, чем проверяется: цену теста, срок, машинно проверяемый
+критерий и доказательства.
 
 **Адрес и доказательства — разные вещи.** subject здесь предельно скупой:
 кабинет задан отдельным полем, а адресом выноса служит НАПРАВЛЕНИЕ. Состав
@@ -58,12 +60,14 @@ sync/agent/ideas/consolidate.py — генератор идей: вынос до
 import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from sync.agent import build_order
 from sync.agent import power as power_mod
 from sync.agent.db import CRM_MATURITY_WINDOW_DAYS
 from sync.agent.experiments import HORIZON_DAYS as STAKE_HORIZON_DAYS
-from sync.agent.ideas import limits
+from sync.agent.ideas import limits, registry
 from sync.agent.portfolio import GROWTH_LAMBDA_MARGIN
 from sync.agent.writer import lanes as lanes_mod
+from sync.agent.writer import launch
 from sync.agent.writer import negatives as negatives_mod
 from sync.agent.writer import tier as tier_mod
 
@@ -172,6 +176,10 @@ def _one(row: Dict[str, Any], ctx: Dict[str, Any],
         "conversions": _number(row.get("conversions")) or 0.0,
         "p_pay_sum": round(payments, 4),
         "window_days": _number(row.get("window_days")),
+        # Настройки донора едут с ним: счётчик и цель новой кампании берутся
+        # у них, а не из панели (launch.campaign_from_donors). Их отсутствие
+        # не отбраковывает связку — оно оставляет идею предложением.
+        "settings": row.get("settings"),
     }, None
 
 
@@ -229,13 +237,14 @@ def _group(direction: str, donors: List[Dict[str, Any]], ctx: Dict[str, Any],
     value_per_payment = _number(ctx.get("value_per_payment_rub"))
     expected_payments = daily_payments * horizon
 
-    return {
+    idea = {
         "source": SOURCE,
         "account": account,
         # Адрес выноса — направление кабинета, и только оно. Состав доноров
         # плавает, и войди он сюда, idea_id менялся бы каждым прогоном.
         "subject": {"kind": SOURCE, "direction": direction},
-        # Класс 3: рычага у выноса нет, пока нет наряда билдеру (Ф14).
+        # Класс идеи назначается ниже: с нарядом это ставка (рычаг есть —
+        # билдер), без наряда — предложение человеку.
         "tier": tier_mod.TIER_PROPOSAL,
         "lane": lanes_mod.LANE_PROPOSAL,
         "expected_rub": (round(expected_payments * value_per_payment, 2)
@@ -272,7 +281,54 @@ def _group(direction: str, donors: List[Dict[str, Any]], ctx: Dict[str, Any],
             "window_days": int(window),
             "cannibalization": _cannibalization(donors),
         },
-    }, None
+    }
+    return _with_order(idea, donors, donor_cpa=donor_cpa, window=int(window)), None
+
+
+def _with_order(idea: Dict[str, Any], donors: List[Dict[str, Any]], *,
+                donor_cpa: float, window: int) -> Dict[str, Any]:
+    """Идея выноса + наряд билдеру, если наряд собирается.
+
+    До Ф14 вынос был предложением по построению: рычага у него не
+    существовало. Теперь рычаг есть — наряд, — и класс идеи определяется тем,
+    собрался ли наряд ЦЕЛИКОМ. Собрался: это ставка, у неё есть чем
+    распорядиться. Не собрался (у доноров не прочитаны цель и счётчик, они
+    разошлись в цели): предложение с названной причиной, и человек видит на
+    экране не «генератор молчит», а чего именно не хватило.
+
+    Наряд кладётся в колонку action, потому что такт записи — ДРУГОЙ прогон и
+    читает идеи из базы: всё, чего нет в колонке, для него не существует.
+    Кросс-минусовка доноров туда не кладётся: её нельзя посчитать заранее —
+    она строится поверх СВЕЖЕГО чтения списков кабинета, и такт записи
+    разворачивает связку сам (launch.build_all).
+
+    idea_id считается здесь тем же реестровым правилом, которым его назначит
+    upsert: наряд без него — сирота, вердикт которой некуда вернуть, а
+    реестр сверит два числа и упадёт, если они разойдутся.
+    """
+    campaign, refusal = launch.campaign_from_donors(
+        donors, donor_cpa=donor_cpa, window_days=window)
+    if campaign is None:
+        idea["detail"]["launch_refusal"] = refusal
+        return idea
+
+    known = dict(idea)
+    known["idea_id"] = registry.idea_id(SOURCE, idea["subject"], idea["account"])
+    try:
+        order = build_order.from_idea(known, campaign=campaign,
+                                      account=idea["account"])
+        action = launch.build(order)
+    except ValueError as error:
+        # Наряд не прошёл собственный валидатор — дефект генератора, но не
+        # повод потерять находку: идея едет предложением, причина видна.
+        idea["detail"]["launch_refusal"] = str(error)
+        return idea
+
+    idea["idea_id"] = known["idea_id"]
+    idea["tier"] = tier_mod.TIER_BET
+    idea["lane"] = lanes_mod.LANE_LAUNCH
+    idea["action"] = action
+    return idea
 
 
 def scan(rows: Sequence[Dict[str, Any]],

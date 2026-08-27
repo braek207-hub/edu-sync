@@ -36,7 +36,28 @@ MODIFIER_CAP = 50          # потолок и пол корректировки
 # "никогда", а не эвристику по подстроке.
 ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set",
                         "budget.set", "budget.set_daily", "campaign.suspend",
-                        "tcpa.set", "negative.add", "placement.exclude"}
+                        "tcpa.set", "negative.add", "placement.exclude",
+                        "negative.remove_added"}
+
+# Виды, у которых рычага записи на стороне агента нет и не будет: тело
+# кампании (группы, ключи, объявления) собирает ДРУГОЙ репозиторий, и агент
+# физически не может отправить campaigns.add. Отказ им нужен свой, а не общий
+# «вне allow-листа»: общий читается как недоделка, а это устройство системы —
+# наряд едет билдеру, из кабинета кампанию заводит он.
+BUILDER_ACTION_KINDS = {"campaign.create"}
+BUILDER_REASON = (
+    "создание кампании — наряд билдеру, а не запрос к API Директа: тело "
+    "кампании собирает другой репозиторий, и отправить его агент не может"
+)
+
+# Виды со словом remove/delete в имени, которым сторож удаления объектов
+# ходу не закрывает. Здесь ровно один, и это не послабление, а различение:
+# запрет касается УДАЛЕНИЯ ОБЪЕКТОВ (кампаний, групп, объявлений,
+# корректировок) — потери, которую нечем отменить. Снятие своей же минус-фразы
+# правит ПОЛЕ живого объекта и является единственным способом отменить
+# собственное отсечение, не затирая при этом фраз человека
+# (negatives.remove_added).
+REMOVAL_ALLOWED_ACTION_KINDS = {"negative.remove_added"}
 
 # Коридор нового лимита ОТНОСИТЕЛЬНО ПРЕЖНЕГО РАСХОДА кампании (не прежнего
 # лимита: тот бывает в разы выше расхода — 5 млн/нед при расходе 616 тыс. —
@@ -116,8 +137,11 @@ def check_action(action: Dict[str, Any],
     # Отдельная явная проверка поверх allow-листа — не для защиты (её уже
     # даёт allow-лист), а чтобы в журнале была понятная причина отказа
     # именно "удаление", а не общая "вне allow-листа".
-    if _is_delete(kind_lower):
+    if _is_delete(kind_lower) and kind not in REMOVAL_ALLOWED_ACTION_KINDS:
         return False, _DELETE_REASON
+
+    if kind in BUILDER_ACTION_KINDS:
+        return False, BUILDER_REASON
 
     if kind not in ALLOWED_ACTION_KINDS:
         return False, f"вид действия вне allow-листа: {kind}"
@@ -147,6 +171,11 @@ def check_action(action: Dict[str, Any],
         if not ok:
             return False, reason
 
+    if kind == "negative.remove_added":
+        ok, reason = _check_remove_added(action)
+        if not ok:
+            return False, reason
+
     if kind == "placement.exclude":
         ok, reason = _check_placements(action)
         if not ok:
@@ -156,6 +185,54 @@ def check_action(action: Dict[str, Any],
         ok, reason = _check_suspend(action)
         if not ok:
             return False, reason
+    return True, ""
+
+
+def _check_remove_added(action: Dict[str, Any]) -> Tuple[bool, str]:
+    """Рельса снятия минус-фраз: снимаем ТОЛЬКО своё и ровно своё.
+
+    Сторож удаления объектов этот вид пропускает по явному исключению
+    (REMOVAL_ALLOWED_ACTION_KINDS), и освобождением от проверок это быть не
+    должно: снять чужую минус-фразу значит вернуть трафик, который человек
+    выключил сознательно, а в журнале это выглядит как аккуратный откат.
+
+    Три проверки, и все считаются ЗДЕСЬ, по полям самого действия, а не
+    формулой построителя:
+
+      * снимаемое — подмножество добавленного агентом (AddedByAgent);
+      * остаток совпадает с прежним списком минус снимаемое — иначе действие
+        не «убирает своё», а переписывает список чем-то ещё;
+      * список только сокращается: добавление фраз едет своим видом со своими
+        лимитами Директа, и пролезть сюда мимо них оно не должно.
+    """
+    payload = action.get("payload") or {}
+    if payload.get("CampaignId") is None:
+        return False, "в действии снятия минус-фраз нет CampaignId"
+
+    removed = [str(p) for p in (payload.get("RemovedPhrases") or ())]
+    if not removed:
+        return False, "снятие минус-фраз без списка снимаемого ничего не меняет"
+
+    ours = {str(p) for p in (payload.get("AddedByAgent") or ())}
+    stranger = sorted(set(removed) - ours)
+    if stranger:
+        return False, (f"снимаются фразы, которых агент не добавлял: "
+                       f"{', '.join(stranger[:3])} — их выключил человек")
+
+    previous = ((action.get("previous_state") or {}).get("NegativeKeywords")
+                or {}).get("Items")
+    if previous is None:
+        return False, ("снятие построено без прежнего списка: проверить, что "
+                       "убирается ровно своё, нечем")
+    previous_set = {str(p) for p in previous}
+    left = {str(p) for p in ((payload.get("NegativeKeywords") or {}).get("Items") or ())}
+
+    if not left <= previous_set:
+        return False, ("снятие добавляет фразы, которых в прежнем списке не "
+                       "было: добавление едет своим видом")
+    if left != previous_set - set(removed):
+        return False, ("остаток не равен прежнему списку минус снимаемое: "
+                       "действие переписывает список, а не убирает своё")
     return True, ""
 
 

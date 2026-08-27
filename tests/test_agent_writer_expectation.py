@@ -14,7 +14,8 @@ import pytest
 from sync.agent.writer import expectation, exposure, guardrails, lanes
 from sync.agent.writer.budget import diff_budget
 from sync.agent.writer.diff import diff_modifiers, diff_schedule
-from sync.agent.writer.negatives import diff_negatives, plan_negatives
+from sync.agent.writer.negatives import (diff_negatives, plan_negatives,
+                                         remove_added_action)
 from sync.agent.writer.placements import diff_placements, plan_placements
 from sync.agent.writer.schedule import schedule_items
 from sync.agent.writer.switch import diff_switch, plan_switch_offs
@@ -128,6 +129,15 @@ def _suspend():
     return actions[0]
 
 
+def _remove_added():
+    """Снятие своей минус-фразы: числа — зеркало отменяемого отсечения."""
+    return remove_added_action(
+        "111", current=["бесплатно", "колледж заочно москва"],
+        added=["колледж заочно москва"],
+        restores={"restored_daily_rub": 300.0,
+                  "restored_conversions_per_day": 0.4})
+
+
 _SAMPLES = {
     "bidmodifier.add": lambda: _bidmodifier("bidmodifier.add"),
     "bidmodifier.set": lambda: _bidmodifier("bidmodifier.set"),
@@ -137,6 +147,7 @@ _SAMPLES = {
     "campaign.suspend": _suspend,
     "tcpa.set": _tcpa,
     "negative.add": _negative,
+    "negative.remove_added": _remove_added,
     "placement.exclude": _placement,
 }
 

@@ -159,8 +159,22 @@ def test_shadow_lane_stays_at_zero_with_brilliant_record():
 def test_shadow_membership_is_an_argument_not_a_module_constant():
     # Список теневых полос — решение человека, оно живёт в конфиге и меняется
     # без правки кода. Модуль не имеет права знать его наизусть.
+    #
+    # Полоса взята рядовая: у запуска ноль стоит по другой причине —
+    # MANUAL_RELEASE_LANES, правило самого модуля про необратимость (Ф14), —
+    # и на нём это свойство не проверяется. Проверка запуска своя:
+    # test_agent_writer_launch::test_launch_lane_never_auto_promotes.
     record = {"closed": 200, "improved": 180, "worsened": 20,
               "money_confirmed": 150, "money_contradicted": 5}
-    assert autonomy.step_of("launch", record) == 3
-    assert autonomy.is_shadow("launch", {"launch", "suspend"}) is True
-    assert autonomy.is_shadow("launch", None) is False
+    assert autonomy.step_of("suspend", record) == 3
+    assert autonomy.is_shadow("suspend", {"launch", "suspend"}) is True
+    assert autonomy.is_shadow("suspend", None) is False
+
+
+def test_the_manual_lane_is_not_a_shadow_list_in_disguise():
+    # Тень снимается ключом панели, ручной выпуск — нет. Совпади они, Павел
+    # снял бы полосу запуска с автопилота тем же ключом, которым выпускает
+    # рычаг из приёмки, и «лестница его не поднимает» перестало бы держаться.
+    record = {"closed": 200, "improved": 180, "worsened": 20,
+              "money_confirmed": 150, "money_contradicted": 5}
+    assert autonomy.step_of("launch", record, shadow_lanes=set()) == 0

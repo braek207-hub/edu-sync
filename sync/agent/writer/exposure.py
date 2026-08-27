@@ -260,6 +260,59 @@ def whole_object_exposure(reason: str) -> Dict[str, Any]:
     return {"share": 1.0, "basis": reason}
 
 
+# Признак экспозиции запуска. Ключ, а не отдельная функция-предикат: цену
+# читает risk.py, и различать вид экспозиции он обязан по самой экспозиции —
+# по виду действия он этого сделать не может, экспозицию собирает рычаг.
+LAUNCH_KIND = "launch"
+
+DAYS_IN_WEEK = 7.0
+
+
+def launch_exposure(weekly_budget_rub: float, horizon_days: float,
+                    what: str = "новая кампания") -> Dict[str, Any]:
+    """Запуск: под ударом весь бюджет новой кампании до конца её замера.
+
+    Единственная экспозиция без доли объекта — потому что объекта ещё нет.
+    Новая кампания не двигает чужой расход, она заводит свой; у неё нет
+    прошлого, по которому можно было бы отделить «уже было» от «прирост»,
+    как это делает budget_exposure, и нет истории, которой ограничивался бы
+    потолок объекта. Под ударом ровно тот лимит, который ей открывают.
+
+    Дни едут ВНУТРИ экспозиции, а не остаются горизонтом вызывающего. У
+    прочих рычагов срок замера — свойство полосы (lanes.MEASURE_DAYS), один
+    на всех её действия. У запуска он назначен наряду: связке, которой нужно
+    накопить объём на вердикт, ставится свой горизонт (ideas/consolidate), и
+    он бывает вдвое длиннее полосного. Считай цену за срок полосы — она
+    соврала бы ровно на разницу, а платит её риск-бюджет.
+    """
+    daily = max(0.0, float(weekly_budget_rub)) / DAYS_IN_WEEK
+    days = max(0.0, float(horizon_days))
+    return {"kind": LAUNCH_KIND,
+            "daily_rub": round(daily, 2),
+            "days": days,
+            "basis": (f"{what}: лимит {round(float(weekly_budget_rub))} ₽/нед "
+                      f"({round(daily)} ₽/дн) × {round(days)} дн. замера")}
+
+
+def launch_of(exposure: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Экспозиция запуска или None. Неполная — не запуск.
+
+    Пропусти хоть одно из двух чисел, и цена посчиталась бы наполовину: без
+    дней — за срок чужой полосы, без рублей — по расходу объекта, которого
+    нет. Оба случая тише отказа, поэтому здесь именно None, а не подстановка.
+    """
+    if not isinstance(exposure, dict):
+        return None
+    if exposure.get("kind") != LAUNCH_KIND:
+        return None
+    daily = _number(exposure.get("daily_rub"))
+    days = _number(exposure.get("days"))
+    if daily is None or days is None:
+        return None
+    return {"daily_rub": max(0.0, daily), "days": max(0.0, days),
+            "basis": str(exposure.get("basis") or "")}
+
+
 def daily_rub(exposure: Optional[Dict[str, Any]],
               object_daily_cost: float) -> Tuple[float, str]:
     """Экспозиция действия → рубли в день + основание для отчёта.
