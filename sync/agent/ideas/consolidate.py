@@ -61,6 +61,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from sync.agent import power as power_mod
 from sync.agent.db import CRM_MATURITY_WINDOW_DAYS
 from sync.agent.experiments import HORIZON_DAYS as STAKE_HORIZON_DAYS
+from sync.agent.ideas import limits
 from sync.agent.portfolio import GROWTH_LAMBDA_MARGIN
 from sync.agent.writer import lanes as lanes_mod
 from sync.agent.writer import negatives as negatives_mod
@@ -70,13 +71,12 @@ from sync.agent.writer import tier as tier_mod
 # завела бы все идеи генератора заново, с пустой историей и снятым отказом.
 SOURCE = "consolidate"
 
-# Ключ настройки: сколько дней вынос вправе занять. Порога с таким смыслом в
-# коде не было, поэтому он настройка, а не константа из головы. Смысл предела:
-# эксперимент, которому на вердикт нужен больше чем квартал, соревнуется уже
-# не с донорами, а с сезоном — за это время меняются и спрос, и конкуренты, и
-# сами доноры.
-MAX_HORIZON_KEY = "consolidate_max_horizon_days"
-DEFAULT_MAX_HORIZON_DAYS = 90
+# Предел срока — общий с остальными генераторами (ideas/limits.py): смысл у
+# него один и тот же везде, а две копии одной ручки разъехались бы при первой
+# же правке одной из них. Имена оставлены здесь ссылками, чтобы читателю
+# генератора не приходилось искать, чем ограничен его горизонт.
+MAX_HORIZON_KEY = limits.MAX_HORIZON_KEY
+DEFAULT_MAX_HORIZON_DAYS = limits.DEFAULT_MAX_HORIZON_DAYS
 
 REASON_NO_ADDRESS = "у связки нет кабинета, кампании-донора или направления"
 REASON_NO_PHRASE = "у связки нет фразы: выносить в новую кампанию нечего"
@@ -129,12 +129,6 @@ def _skip(row: Dict[str, Any], reason: str) -> Dict[str, Any]:
     }
 
 
-def _max_horizon(ctx: Dict[str, Any]) -> int:
-    config = ctx.get("config") or {}
-    value = _number(config.get(MAX_HORIZON_KEY))
-    if value is None or value <= 0:
-        return DEFAULT_MAX_HORIZON_DAYS
-    return int(value)
 
 
 def _one(row: Dict[str, Any], ctx: Dict[str, Any],
@@ -224,7 +218,7 @@ def _group(direction: str, donors: List[Dict[str, Any]], ctx: Dict[str, Any],
     daily_payments = payments / float(window)
     days_to_power = int(math.ceil(power_mod.MIN_EXPECTED_PAYMENTS / daily_payments))
     horizon = max(days_to_power, STAKE_HORIZON_DAYS) + CRM_MATURITY_WINDOW_DAYS
-    if horizon > _max_horizon(ctx):
+    if horizon > limits.max_horizon(ctx):
         return None, {"direction": direction, "reason": GROUP_REASON_THIN_POWER}
 
     if conversions <= 0:
