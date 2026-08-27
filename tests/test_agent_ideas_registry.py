@@ -138,50 +138,9 @@ def test_rank_does_not_mutate_the_list_it_was_given():
 
 # ------------------------------------------------- двойник таблицы и идеи
 
-class FakeIdeas:
-    """edu_agent_ideas в памяти: те же три примитива доступа, без БД.
+# Двойник таблицы (фикстура store) — в tests/conftest.py: его просят и
+# тесты генераторов идей.
 
-    Двойник намеренно ТУПОЙ — он только хранит строки. Правило слияния
-    (статус не откатывается, закрытая идея не воскресает) живёт в Python
-    реестра, а не в тексте SQL, поэтому тесты проверяют его, а не свойства
-    этого класса. Единственное, что здесь повторяет запрос, — условие поиска
-    отклонений (subject_key + непустой rejected_by); оно же проверяется
-    отдельно по тексту SQL, чтобы копии не разъехались.
-    """
-
-    def __init__(self):
-        self.table = {}
-        self.writes = 0
-
-    def read_rows(self, idea_ids):
-        return {i: dict(self.table[i]) for i in idea_ids if i in self.table}
-
-    def read_rejections(self, subject_keys):
-        wanted = set(subject_keys)
-        out = {}
-        for row in self.table.values():
-            key = row.get("subject_key")
-            if row.get("rejected_by") and key in wanted:
-                out[key] = {"subject_key": key,
-                            "rejected_by": row.get("rejected_by"),
-                            "rejected_at": row.get("rejected_at"),
-                            "dropped_reason": row.get("dropped_reason")}
-        return out
-
-    def write_rows(self, rows):
-        self.writes += 1
-        for row in rows:
-            self.table[row["idea_id"]] = dict(row)
-        return len(rows)
-
-
-@pytest.fixture
-def store(monkeypatch):
-    fake = FakeIdeas()
-    monkeypatch.setattr(registry, "_read_rows", fake.read_rows)
-    monkeypatch.setattr(registry, "_read_rejections", fake.read_rejections)
-    monkeypatch.setattr(registry, "_write_rows", fake.write_rows)
-    return fake
 
 
 def _idea(campaign="123", source="consolidate", **over):
@@ -735,6 +694,56 @@ def test_every_placeholder_of_the_query_is_a_declared_column():
 
     placeholders = set(re.findall(r"%\((\w+)\)s", registry.UPSERT_SQL))
     assert placeholders == set(registry.COLUMNS)
+
+
+def test_detail_is_not_part_of_the_identity(store):
+    # Доказательства плавают от прогона к прогону — состав связок-доноров у
+    # выноса меняется каждый день. Войди они в отпечаток, и идея заводилась
+    # бы заново каждым прогоном: пустая история и снятый отказ человека на
+    # том же самом объекте.
+    a = _idea(detail={"queries": ["первая"]})
+    b = _idea(detail={"queries": ["первая", "вторая"]})
+
+    assert _id(a) == _id(b)
+    registry.upsert([a])
+    registry.upsert([b])
+    assert len(store.table) == 1
+
+
+def test_detail_is_refreshed_on_every_find(store):
+    # И обратное: доказательства обязаны обновляться. Заморозь их — и экран
+    # показывал бы человеку обоснование недельной давности, по которому он
+    # принимал бы сегодняшнее решение.
+    registry.upsert([_idea(detail={"queries": ["первая"]})])
+    rows = registry.upsert([_idea(detail={"queries": ["вторая"]})])
+
+    assert rows[0]["detail"] == {"queries": ["вторая"]}
+
+
+def test_detail_may_be_absent():
+    # Идея, вся суть которой в адресе и числах, доказательств сверх них не
+    # обязана нести: пустое поле — законный случай, а не недосмотр.
+    assert registry._prepare(_idea())["detail"] is None
+
+
+def test_detail_must_be_an_object():
+    # Список или строка в колонке JSONB прочитались бы потребителем как
+    # объект и уронили бы экран, а не генератор, который их туда положил.
+    with pytest.raises(registry.InvalidIdea, match="словарь"):
+        registry._prepare(_idea(detail=["первая", "вторая"]))
+
+
+def test_closed_idea_keeps_the_evidence_it_was_closed_on(store):
+    # Смета закрытой идеи — основание уже принятого решения. Обнови её
+    # задним числом, и разбор остался бы без тех доказательств, по которым
+    # идею закрывали.
+    registry.upsert([_idea(detail={"queries": ["первая"]})])
+    key = _id(_idea())
+    registry.reject(key, by="Павел", reason="не сейчас")
+
+    registry.upsert([_idea(detail={"queries": ["вторая"]})])
+
+    assert registry.load(key)["detail"] == {"queries": ["первая"]}
 
 
 def test_insert_column_list_matches_the_declared_columns():
