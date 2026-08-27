@@ -796,6 +796,23 @@ def mart_cost_total(date_from: str, date_to: str) -> float:
     return float(rows[0]["total"] or 0.0) if rows else 0.0
 
 
+def mart_last_fact_date(date_from: str, date_to: str) -> Optional[str]:
+    """Последний день, который уже лежит в витрине фактов внутри окна.
+
+    Нужен сверке сумм: витрина отстаёт от источника на прогон по построению —
+    свежие дни источник отдаёт сразу, а в витрину они попадут только текущим
+    прогоном. Сравнивать полное окно источника с недописанной витриной значит
+    мерить лаг, а не сохранность данных.
+    """
+    rows = _fetch_dicts(
+        "SELECT MAX(fact_date) AS last FROM edu_agent_facts "
+        "WHERE fact_date BETWEEN %s AND %s",
+        (date_from, date_to),
+    )
+    last = rows[0]["last"] if rows else None
+    return str(last) if last else None
+
+
 # Доля типичного дня, ниже которой день CRM считается недобравшим. Тот же
 # приём, что у ширины витрины в gate.py: эталон — медиана окна, устойчивая
 # к единичному битому дню.

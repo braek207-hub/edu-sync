@@ -23,6 +23,7 @@ from datetime import date, timedelta
 import sync.agent_e0 as agent_e0
 from sync.agent.guard import check_freshness as real_check_freshness
 from sync.agent.guard import verdict as real_verdict
+from sync.agent.guard import check_sum_reconciliation
 from sync.agent.computed import DEGENERATE_REASON, NO_CONVERSIONS_REASON
 
 
@@ -177,6 +178,9 @@ def _patch_e0_run(monkeypatch, reports=None):
     # Сверка сумм гейта ходит в витрину: без подмены тест падал бы на
     # отсутствии DATABASE_URL, а не на своём утверждении.
     monkeypatch.setattr(agent_e0.agent_db, "mart_cost_total", lambda *a, **k: 0.0)
+    # Граница витрины: сверка сумм берёт по ней общий интервал с источником.
+    # None = витрина пуста, обе стороны нули — штатное состояние тестового прогона.
+    monkeypatch.setattr(agent_e0.agent_db, "mart_last_fact_date", lambda *a, **k: None)
     # Справочник базового CPA — источник порога для кандидатов в минус-слова.
     # Пусто = порога нет, кандидаты не считаются: это штатное состояние
     # кабинета без истории, а не повод падать.
@@ -1240,3 +1244,58 @@ def test_forecast_bias_reaches_the_solver(monkeypatch, capsys):
     # запас по целям, а цели поправка не трогает.
     assert "forecast_bias" not in captured[0]
     assert captured[1]["forecast_bias"] == bias
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Сверка сумм: источник против витрины.
+#
+# Инцидент 27.08.2026: e0 упал на своей же сверке — 141 287 763 против
+# 139 824 423 (1,04 % при пороге 1 %) — и не записал факты. Разница до копейки
+# лежала в двух недописанных днях (26.08 недобран, 27.08 отсутствует), ни одна
+# кампания не терялась. Клин самоподдерживающийся: пока факты не записаны,
+# разрыв растёт, и следующий прогон падает вернее предыдущего.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_sum_check_ignores_days_the_mart_has_not_seen():
+    daily = [("2026-08-24", 1_000_000.0), ("2026-08-25", 900_000.0),
+             ("2026-08-26", 1_016_965.0), ("2026-08-27", 535_149.0)]
+    # Витрина дописана по 25.08 — свежие два дня её ещё не касались.
+    assert agent_e0._cost_up_to(daily, "2026-08-25") == 1_900_000.0
+
+
+def test_missed_run_no_longer_fails_the_gate():
+    """Пропуск прогона отставляет витрину, но сохранность данных не меняет."""
+    daily = [("2026-08-24", 1_000_000.0), ("2026-08-25", 900_000.0),
+             ("2026-08-26", 1_016_965.0), ("2026-08-27", 535_149.0)]
+    mart_last = "2026-08-25"
+    check = check_sum_reconciliation(
+        agent_e0._cost_up_to(daily, mart_last),
+        1_900_000.0,  # витрина за те же дни
+    )
+    assert check["status"] == "OK"
+
+
+def test_full_window_comparison_would_have_failed():
+    """Контроль: старая форма сверки на тех же данных краснела на ровном месте."""
+    daily = [("2026-08-24", 1_000_000.0), ("2026-08-25", 900_000.0),
+             ("2026-08-26", 1_016_965.0), ("2026-08-27", 535_149.0)]
+    check = check_sum_reconciliation(sum(c for _, c in daily), 1_900_000.0)
+    assert check["status"] == "FAIL"
+
+
+def test_lost_campaigns_still_turn_the_gate_red():
+    """Правка окна не ослабила проверку: потеря строк на общих днях краснеет."""
+    daily = [("2026-08-24", 1_000_000.0), ("2026-08-25", 900_000.0)]
+    check = check_sum_reconciliation(
+        agent_e0._cost_up_to(daily, "2026-08-25"),
+        1_700_000.0,  # в витрине не хватает 200 000 — это 10,5 %
+    )
+    assert check["status"] == "FAIL"
+    assert check["detail"]["diff_share"] > 0.01
+
+
+def test_empty_mart_is_not_a_breakage():
+    """Первый прогон: витрина пуста, сверять не с чем — это не поломка."""
+    daily = [("2026-08-24", 1_000_000.0)]
+    check = check_sum_reconciliation(agent_e0._cost_up_to(daily, None), 0.0)
+    assert check["status"] == "OK"
