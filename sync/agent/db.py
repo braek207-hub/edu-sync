@@ -305,6 +305,58 @@ AGENT_DDL: List[str] = [
       PRIMARY KEY (calc_date, campaign_id)
     )
     """,
+    # РЕЕСТР ИДЕЙ (sync/agent/ideas/registry.py). Идея жила внутри такта и
+    # умирала вместе с ним: генератор детерминирован, назавтра он находит ровно
+    # то же самое — и человек читает тот же список второй раз, третий, десятый.
+    # Реестр даёт идее срок жизни, историю и приоритет.
+    #
+    # Три колонки сверх схемы плана, и все три — про одно и то же «нет»:
+    #
+    #   subject_key — отпечаток ОБЪЕКТА идеи (registry.subject_key), без
+    #                 источника. Отклонение человеком ищется по нему, а не по
+    #                 idea_id: идентификатор строки выведен из пары
+    #                 (source, subject), и та же связка, найденная завтра
+    #                 другим генератором, приехала бы под новым id и обошла
+    #                 запрет. Отдельной таблицы отказов нет намеренно —
+    #                 второе хранилище того же факта разъезжается с первым.
+    #   rejected_by — КТО отклонил. Это и есть машинный признак «сказал
+    #                 человек»: разбирать префикс dropped_reason (свободный
+    #                 текст для отчёта) значило бы держать правило в строке,
+    #                 которую однажды перепишут ради формулировки.
+    #   rejected_at — когда. Нужен на разборе: отказ полугодовой давности —
+    #                 повод спросить человека заново, свежий — нет.
+    """
+    CREATE TABLE IF NOT EXISTS edu_agent_ideas (
+      idea_id        TEXT PRIMARY KEY,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      source         TEXT NOT NULL,
+      account        TEXT NOT NULL,
+      subject        JSONB NOT NULL,
+      subject_key    TEXT NOT NULL,
+      tier           SMALLINT NOT NULL,
+      lane           TEXT NOT NULL,
+      expected_rub   DOUBLE PRECISION,
+      test_cost_rub  DOUBLE PRECISION,
+      horizon_days   SMALLINT NOT NULL,
+      success_rule   JSONB NOT NULL,
+      status         TEXT NOT NULL DEFAULT 'new',
+      action_id      TEXT,
+      experiment_id  TEXT,
+      dropped_reason TEXT,
+      rejected_by    TEXT,
+      rejected_at    TIMESTAMPTZ
+    )
+    """,
+    # Отклонения человеком читаются КАЖДЫМ прогоном генераторов и на каждую
+    # порцию идей, а копятся без предела — частичный индекс держит выборку
+    # размером с список запретов, а не с историей реестра (тот же довод, что у
+    # индекса открытых ставок выше).
+    """
+    CREATE INDEX IF NOT EXISTS edu_agent_ideas_rejected_idx
+      ON edu_agent_ideas (subject_key)
+      WHERE rejected_by IS NOT NULL
+    """,
 ]
 
 
