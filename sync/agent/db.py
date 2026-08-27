@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 
 import psycopg2.extras
 
-from sync.db import get_connection
+from sync.db import enable_rls_for_ddl, get_connection
 
 
 def normalize_login(value: Any) -> str:
@@ -365,6 +365,7 @@ def ensure_agent_tables() -> None:
         with conn.cursor() as cur:
             for statement in AGENT_DDL:
                 cur.execute(statement)
+            enable_rls_for_ddl(cur, AGENT_DDL)
         conn.commit()
 
 
@@ -822,6 +823,7 @@ def load_agent_config() -> Dict[str, Any]:
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(AGENT_CONFIG_DDL)
+            enable_rls_for_ddl(cur, AGENT_CONFIG_DDL)
         conn.commit()
     rows = _fetch_dicts("SELECT key, value, preset FROM edu_agent_config")
     preset = None

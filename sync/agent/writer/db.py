@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import psycopg2.extras
 
-from sync.db import get_connection
+from sync.db import enable_rls_for_ddl, get_connection
 from sync.agent.writer.risk import DEFAULT_DAYS_TO_MEASURE
 
 WRITER_DDL: List[str] = [
@@ -318,6 +318,7 @@ def ensure_writer_tables() -> None:
         with conn.cursor() as cur:
             for statement in WRITER_DDL:
                 cur.execute(statement)
+            enable_rls_for_ddl(cur, WRITER_DDL)
         conn.commit()
 
 

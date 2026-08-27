@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, Dict, List
@@ -6,6 +7,40 @@ from urllib.parse import unquote, urlparse
 
 import psycopg2
 import psycopg2.extras
+
+
+_CREATE_TABLE_RE = re.compile(
+    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+
+
+def enable_rls_for_ddl(cur, ddl) -> List[str]:
+    """Включить RLS на всех таблицах, которые заводит переданный DDL.
+
+    Зачем это здесь, а не миграцией в EduDash. Гранты anon/authenticated в этом
+    проекте полные, вплоть до TRUNCATE, и доступ держит ТОЛЬКО row level security.
+    Таблицы, заведённые кодом синка без него, дважды оказывались читаемы публичным
+    ключом из браузерного бандла: аудит 20.08 (15 таблиц) и 27.08 (edu_agent_runs,
+    _rejects, _config, _run_lock, _ideas — в _rejects лежало 1619 строк).
+    Разовая миграция чинит прошлое, а дыру открывает каждая следующая новая
+    таблица, поэтому чинится источник.
+
+    Имена берутся из самих операторов DDL: новая таблица защищена самим фактом
+    добавления, отдельный список вести не нужно — именно он и разъезжается.
+
+    Политик ноль (deny-all): приложение и синк ходят ролью postgres, она владелец
+    и RLS обходит, пока не выставлен FORCE. Проверено на проде 27.08.
+    """
+    statements = [ddl] if isinstance(ddl, str) else list(ddl)
+    tables = []
+    for statement in statements:
+        found = _CREATE_TABLE_RE.search(statement)
+        if found:
+            tables.append(found.group(1))
+    for table in tables:
+        cur.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+    return tables
 
 
 def _database_url() -> str:
