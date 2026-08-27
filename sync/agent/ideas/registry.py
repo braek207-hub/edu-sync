@@ -19,6 +19,13 @@ sync/agent/ideas/registry.py — реестр идей: идея живёт до
 новую каждым тактом. subject_key выведен ТОЛЬКО из subject и одинаков у идей
 разных источников про один объект: на нём держится отклонение человеком.
 
+Отсюда требование к генераторам (задачи 12–15): в subject кладётся АДРЕС
+объекта и ничего кроме — кампания, сегмент, фраза, связка. Изменчивые числа
+(расход, ДРР, ожидаемая ценность) там смертельны: они пересчитываются каждым
+прогоном, отпечаток уезжает вместе с ними, и идея каждое утро заводится
+заново — с новым идентификатором, пустой историей и снятым отказом человека.
+Числа живут в своих колонках, где им и место.
+
 Кто хозяин статуса. Не генератор. Он вправе завести строку и обновлять свои
 числа (ожидаемая ценность, цена проверки, горизонт, критерий), но статус
 двигают применение и человек. Поэтому повторный upsert не сбрасывает running
@@ -267,9 +274,14 @@ def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(subject, dict) or not subject:
         raise InvalidIdea("объект идеи пуст: непонятно, на что она")
 
-    tier = idea.get("tier")
+    # Через _number, а не int(): список или объект уронил бы int() ошибкой
+    # типа мимо всех проверок — прогон получил бы трассу вместо внятного
+    # отказа, а порция ушла бы наполовину.
+    tier = _number(idea.get("tier"))
     if tier is None or int(tier) not in tier_mod.ALL_TIERS:
-        raise InvalidIdea(f"класс достоверности {tier!r} неизвестен")
+        raise InvalidIdea(
+            f"класс достоверности {idea.get('tier')!r} неизвестен; шкала одна "
+            "на идею и на действие — writer/tier.py")
     lane = _text(idea.get("lane"))
     if lane not in lanes_mod.ALL_LANES:
         raise InvalidIdea(f"полоса {lane!r} неизвестна")
@@ -361,6 +373,15 @@ def upsert(ideas: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     prepared = [_prepare(idea) for idea in ideas]
     if not prepared:
         return []
+    # Одна и та же находка дважды в одной порции — двойной счёт: в отчёте
+    # такта идея посчитается два раза, а в реестр ляжет одна строка, и
+    # расхождение будет нечем объяснить. Схлопнуть молча тоже нельзя:
+    # генератор обязан узнать, что нашёл одно и то же дважды.
+    seen = {row["idea_id"] for row in prepared}
+    if len(seen) != len(prepared):
+        raise InvalidIdea(
+            "порция содержит одну и ту же идею дважды: пара (источник, объект) "
+            "повторяется, а идентификатор из неё и выведен")
     existing = _read_rows([row["idea_id"] for row in prepared])
     rejections = _read_rejections({row["subject_key"] for row in prepared})
 
@@ -545,10 +566,18 @@ SELECT_REJECTIONS_SQL = """
 
 
 def _json_params(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {**row,
-            "subject": json.dumps(row.get("subject") or {}, ensure_ascii=False),
-            "success_rule": json.dumps(row.get("success_rule") or {},
-                                       ensure_ascii=False)}
+    """Строка → параметры запроса, ровно по объявленным колонкам.
+
+    Проекция на COLUMNS обязательна: строка, прочитанная из базы, несёт ещё и
+    created_at с updated_at, а слияние может дописать в неё что угодно. Лишний
+    ключ в базу молча не поедет, недостающий уехал бы как NULL — оба конца
+    держит один список.
+    """
+    params = {column: row.get(column) for column in COLUMNS}
+    params["subject"] = json.dumps(row.get("subject") or {}, ensure_ascii=False)
+    params["success_rule"] = json.dumps(row.get("success_rule") or {},
+                                        ensure_ascii=False)
+    return params
 
 
 def _read_rows(idea_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:

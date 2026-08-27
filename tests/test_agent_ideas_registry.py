@@ -555,3 +555,37 @@ def test_reject_of_a_finished_idea_keeps_its_outcome_but_silences_the_subject(st
     other_source = _idea(source="consolidate")
     registry.upsert([other_source])
     assert registry.load(_id(other_source))["status"] == registry.STATUS_DROPPED
+
+
+# ------------------------------------------------------- мелочи, но злые
+
+def test_two_ideas_with_the_same_identity_in_one_batch_are_refused(store):
+    # Одна и та же находка дважды в одной порции — это двойной счёт: в отчёте
+    # такта она посчитается два раза, а в реестр ляжет одна строка, и
+    # расхождение будет нечем объяснить. Молча схлопывать нельзя: генератор
+    # обязан узнать, что нашёл одно и то же дважды.
+    with pytest.raises(ValueError, match="дважды"):
+        registry.upsert([_idea(), _idea()])
+    assert store.table == {}
+
+
+def test_broken_tier_type_is_refused_not_crashed(store):
+    # Список вместо числа роняет int() TypeError-ом мимо всех проверок:
+    # прогон падает трассой вместо внятного отказа, и порция уходит частично.
+    with pytest.raises(ValueError, match="класс достоверности"):
+        registry.upsert([_idea(tier=["1"])])
+
+
+def test_prepared_row_has_exactly_the_declared_columns(store):
+    # Строка собирается в Python, а SQL пишет то, что дали: поле, забытое при
+    # сборке, уехало бы в базу как NULL и всплыло бы уже на отчёте.
+    registry.upsert([_idea()])
+    assert set(store.table[_id(_idea())]) == set(registry.COLUMNS)
+
+
+def test_params_of_the_query_are_projected_onto_the_columns():
+    # Строка, прочитанная из базы, несёт ещё created_at и updated_at, а
+    # слияние может дописать в неё что угодно. Без проекции лишний ключ
+    # уехал бы в запрос, где его никто не ждёт.
+    params = registry._json_params({"idea_id": "x", "посторонний ключ": 1})
+    assert set(params) == set(registry.COLUMNS)
