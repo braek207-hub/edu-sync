@@ -221,3 +221,63 @@ def test_newness_missing_metric_does_not_crash():
     del row["new_sales"]
     rows = build_rows([row], FX, {}, "2026-07-15", {})
     assert col(rows[0], "new_sales") == 0
+
+
+# ── Свёртка по ключу витрины ────────────────────────────────────────────────
+# Замер прода 28.08.2026: в lime_stats нашлось 1765 групп строк с одинаковым полным
+# кортежем ключа, все в kz_roistat, с 01.01.2025 по 27.08.2026. Из них 1002 группы —
+# строки, идентичные по метрикам: +61 332 ₽ расхода и +2 351 ₽ выручки. Базовый запрос
+# дашборда группирует по тому же кортежу и суммирует, то есть лишние строки не
+# игнорировались, а СКЛАДЫВАЛИСЬ.
+#
+# Причина здесь: build_rows писал строки API один в один, без свёртки по итоговому ключу.
+# Роистат отдаёт несколько строк, которые после map_roistat_channel и campaign_of
+# схлопываются в один кортеж. Отдельно хуже с кабинетными каналами: расход берётся
+# по campaign_id и присваивался КАЖДОЙ такой строке — отсюда идентичные пары.
+
+def test_two_api_rows_with_one_key_are_folded_into_one():
+    rows = build_rows(
+        [api_row("Yandex", level3_id="117777330", level3="МК. Бренд",
+                 visits=10.0, leads=2.0, cost=1000.0),
+         api_row("Yandex", level3_id="117777330", level3="МК. Бренд",
+                 visits=5.0, leads=1.0, cost=500.0)],
+        FX, {}, "2026-03-01", {})
+    assert len(rows) == 1
+    assert col(rows[0], "sessions") == 15
+    assert col(rows[0], "purchases_count") == 3
+    assert col(rows[0], "cost") == round(1500.0 * FX, 2)
+
+
+def test_cabinet_cost_counted_once_per_campaign_not_once_per_row():
+    """Расход кабинета берётся по campaign_id. Две строки API с одним id прежде
+    получали его каждая, и сумма дашборда удваивалась."""
+    rows = build_rows(
+        [api_row("Яндекс.Директ 1", level3_id="117777330", level3="МК. Бренд", visits=3.0),
+         api_row("Яндекс.Директ 1", level3_id="117777330", level3="МК. Бренд", visits=4.0)],
+        FX, {"117777330": 1557.53}, "2026-03-01", {})
+    assert len(rows) == 1
+    assert col(rows[0], "cost") == 1557.53
+
+
+def test_cohort_counted_once_even_when_two_rows_fold_together():
+    """Когорта лежит по своему ключу. При свёртке её нельзя складывать: это одна
+    и та же запись, прочитанная дважды."""
+    # Ключ когорты — (visit_date, campaign_id, сырое имя канала, подканал):
+    # «Яндекс.Директ 1» → SEM / «Яндекс.Директ», см. map_roistat_channel.
+    cohort = {("2026-03-01", "117777330", "Яндекс.Директ 1", "Яндекс.Директ"):
+              (7, 3, 4, 1000.0, 9, 5)}
+    rows = build_rows(
+        [api_row("Яндекс.Директ 1", level3_id="117777330", level3="МК. Бренд", visits=1.0),
+         api_row("Яндекс.Директ 1", level3_id="117777330", level3="МК. Бренд", visits=2.0)],
+        FX, {}, "2026-03-01", cohort)
+    assert len(rows) == 1
+    assert col(rows[0], "cohort_orders") == 7
+
+
+def test_different_campaigns_stay_separate():
+    """Свёртка не должна склеивать разные кампании — контроль, что тест не пуст."""
+    rows = build_rows(
+        [api_row("Yandex", level3_id="111", level3="А", visits=1.0),
+         api_row("Yandex", level3_id="222", level3="Б", visits=2.0)],
+        FX, {}, "2026-03-01", {})
+    assert len(rows) == 2
