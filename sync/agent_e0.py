@@ -38,6 +38,7 @@ from sync.agent.guard import (
 )
 from sync.agent.holdout import select_holdout
 from sync.agent import config as agent_config
+from sync.agent import manifest as agent_manifest
 from sync.agent import semantic
 
 # Чем занимается проект, когда паспорта направления нет, — умолчание самого
@@ -1828,6 +1829,22 @@ def main() -> int:
     #
     # Итог записи вкладывается в отчёт, а не печатается вторым JSON-ом: вывод
     # такта расчёта — ровно один документ, и на этом держится его разбор.
+    # Манифест устройства (полосы, классы, рычаги, панель) выгружается вместе
+    # с прогоном, а не отдельной командой: он собран из ТЕХ ЖЕ констант, по
+    # которым только что считал этот прогон, и обязан меняться вместе с кодом.
+    # Отдельное решение человека «обновить карту» — это и есть та развилка,
+    # на которой рукописное зеркало в Panda-BI разъехалось с Python.
+    #
+    # Падение выгрузки расчёт не роняет: манифест ничего не считает и ни на
+    # что не влияет, а потерять из-за него дневной расчёт — несоразмерно.
+    try:
+        agent_db.save_manifest(agent_manifest.build(
+            datetime.now(timezone.utc).isoformat()))
+        report["manifest"] = {"written": True}
+    except Exception as exc:  # noqa: BLE001
+        report["manifest"] = {"written": False,
+                              "error": f"{type(exc).__name__}: {exc}"[:200]}
+
     report["blackbox"] = blackbox.save_run(
         blackbox.new_run_id(), stage="e0",
         mode=blackbox.MODE_COMPUTE, report=report)

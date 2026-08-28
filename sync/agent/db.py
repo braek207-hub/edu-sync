@@ -1494,3 +1494,47 @@ def table_sizes() -> List[Dict[str, Any]]:
         ORDER BY pg_total_relation_size(c.oid) DESC
         """
     )
+
+
+AGENT_MANIFEST_DDL = """
+    CREATE TABLE IF NOT EXISTS edu_agent_manifest (
+        id             TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        generated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        payload        JSONB NOT NULL
+    )
+"""
+
+# Строка одна и всегда с этим ключом: манифест описывает КОД, который сейчас
+# работает, а не событие. История его версий — это история репозитория, и
+# копить её второй раз в базе значит заводить второй источник правды о том,
+# каким агент был во вторник.
+MANIFEST_ROW_ID = "current"
+
+
+def save_manifest(payload: Dict[str, Any]) -> None:
+    """Кладёт манифест устройства агента (sync/agent/manifest.build) в базу.
+
+    Пишет ПРОГОН, а не интерфейс: манифест собран из констант самого прогона,
+    и выгрузить его может только тот, кто эти константы импортировал. Экран
+    Panda-BI читает результат и своего списка полос/ключей не держит.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(AGENT_MANIFEST_DDL)
+            enable_rls_for_ddl(cur, AGENT_MANIFEST_DDL)
+            cur.execute(
+                """
+                INSERT INTO edu_agent_manifest (id, schema_version, generated_at, payload)
+                VALUES (%(id)s, %(schema_version)s, now(), %(payload)s)
+                ON CONFLICT (id) DO UPDATE
+                   SET schema_version = EXCLUDED.schema_version,
+                       generated_at   = EXCLUDED.generated_at,
+                       payload        = EXCLUDED.payload
+                """,
+                {"id": MANIFEST_ROW_ID,
+                 "schema_version": int(payload.get("schema_version") or 0),
+                 "payload": json.dumps(payload, ensure_ascii=False)},
+            )
+        conn.commit()
+

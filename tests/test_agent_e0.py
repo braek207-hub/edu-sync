@@ -102,6 +102,10 @@ _DB_NOOPS = (
     "upsert_experiments", "upsert_sliced_facts", "upsert_objects",
     "upsert_search_queries", "upsert_settings_snapshot", "upsert_profile",
     "upsert_behavior", "clear_holdout", "clear_bulk_tables",
+    # Выгрузка манифеста устройства — та же причина, что у остальных
+    # писателей: без подмены прогон уходит в реальную базу и печатает ретраи
+    # коннекта в тот же stdout, который тест парсит как JSON.
+    "save_manifest",
 )
 
 _DB_EMPTY_LOADERS = (
