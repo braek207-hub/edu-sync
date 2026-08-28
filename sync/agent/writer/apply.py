@@ -213,6 +213,16 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
                                "BiddingStrategy": payload["BiddingStrategy"]}}]
         }
 
+    if kind == "strategy.set":
+        # Стратегия целиком: блок собран планом (writer/strategy.py) из
+        # ПРОЧИТАННОГО состояния с заменой канала поиска — вместе с типом
+        # уходит подблок прежней стратегии, иначе тело противоречиво.
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(payload["CampaignId"]),
+                           "TextCampaign": {
+                               "BiddingStrategy": payload["BiddingStrategy"]}}]
+        }
+
     if kind == "placement.exclude":
         # Список запрещённых площадок в API заменяется целиком; объединение
         # прежних и новых собрал план (writer/placements.py).

@@ -97,7 +97,7 @@ CUTTING_KINDS = frozenset({"negative.add", "placement.exclude"})
 # то есть по общему правилу вид получил бы класс 1 «измеренное здесь» и
 # заплатил бы риском как за измерение. Это занижение цены уверенности, и
 # ошибка здесь стоит всей кампании: стратегия переучивается целиком.
-TRANSFERRED_EVIDENCE_KINDS = frozenset({"goal.set"})
+TRANSFERRED_EVIDENCE_KINDS = frozenset({"goal.set", "strategy.set"})
 
 
 def tier_of(action: Dict[str, Any],

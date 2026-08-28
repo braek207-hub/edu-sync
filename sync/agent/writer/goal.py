@@ -231,9 +231,14 @@ def _reach_of(reaches: Dict[Any, Any], goal_id: int) -> Optional[float]:
     return _number(reaches.get(str(goal_id)))
 
 
-def _liveness_refusal(goal_ids: List[int], move: Dict[str, Any]
-                      ) -> Optional[str]:
-    """Причина, по которой на предложенные цели переходить нельзя, или None."""
+def liveness_refusal(goal_ids: List[int], move: Dict[str, Any]
+                     ) -> Optional[str]:
+    """Причина, по которой на предложенные цели переходить нельзя, или None.
+
+    Публичная: ту же проверку делает рычаг смены стратегии (writer/strategy),
+    и вторая копия «жива ли цель» разошлась бы с этой на первой же правке —
+    а расходиться ей нельзя, обе решают один вопрос об одном кабинете.
+    """
     reaches = move.get("reaches") or {}
     days = int(_number(move.get("window_days")) or DEFAULT_WINDOW_DAYS)
     for goal_id in goal_ids:
@@ -285,7 +290,7 @@ def diff_goal(
         if not goal_ids:
             continue
 
-        reason = _liveness_refusal(goal_ids, move)
+        reason = liveness_refusal(goal_ids, move)
         if reason:
             refused.append({"campaign_id": cid, "reason": reason})
             continue

@@ -49,6 +49,7 @@ from sync.agent.writer import budget
 RESETS_LEARNING = {
     "tcpa.set",          # цель CPA — параметр целевого действия стратегии
     "goal.set",          # само целевое действие: справка называет его прямо
+    "strategy.set",      # другая стратегия — обучение с нуля, первым пунктом
     "campaign.suspend",  # остановка дольше семи дней
 }
 

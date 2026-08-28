@@ -234,7 +234,7 @@ def _added_modifier_id(action: Dict[str, Any]) -> Optional[Any]:
 # Э3.5, а ветки здесь не имел — то есть откат цели CPA не строился вовсе и
 # сторож хоронил его пометкой «прошлое состояние неизвестно», permanent=True.
 # В бою это не выстрелило только потому, что рычаг цели держат в тени.
-STRATEGY_BLOCK_KINDS = ("budget.set", "tcpa.set", "goal.set")
+STRATEGY_BLOCK_KINDS = ("budget.set", "tcpa.set", "goal.set", "strategy.set")
 
 
 def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[str, Any]]]:

@@ -42,9 +42,22 @@ AMOUNT_FIELDS = {
     "AVERAGE_CPA": "TargetCpa",
 }
 
+# Блоки кабинета, которые действие ЗАМЕНЯЕТ целиком. Два действия на один
+# блок одного объекта в одном такте — не спор рычагов, а затирание: оба
+# собраны из ОДНОГО прочитанного состояния, и второе молча возвращает то, что
+# поставило первое (стратегия и бюджет живут в BiddingStrategy вдвоём, к ним
+# же относятся цель CPA и цель оптимизации). Наблюдение потом судит обоих по
+# одному исходу.
+#
+# Читается по СОДЕРЖИМОМУ payload, а не по виду действия: модуль разбирает уже
+# собранное действие и не должен знать, какой рычаг его собрал.
+REPLACED_BLOCKS = ("BiddingStrategy", "DailyBudget", "TimeTargeting",
+                   "NegativeKeywords", "ExcludedSites")
+
 SUSPENDED_OBJECT = "conflict_suspended_object"
 OPPOSING_LEVERS = "conflict_opposing_levers"
 DUPLICATE_SEGMENT = "conflict_duplicate_segment"
+SAME_BLOCK = "conflict_same_block"
 
 
 def _amount(source: Any, field: str) -> Optional[float]:
@@ -77,6 +90,13 @@ def direction(action: Dict[str, Any]) -> int:
 
 def _object(action: Dict[str, Any]) -> str:
     return f"{action.get('object_level')}:{action.get('object_id')}"
+
+
+def _blocks(action: Dict[str, Any]) -> List[str]:
+    payload = action.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    return [name for name in REPLACED_BLOCKS if name in payload]
 
 
 def _segment(action: Dict[str, Any]) -> str:
@@ -135,9 +155,22 @@ def resolve(actions: Iterable[Dict[str, Any]]
             continue
         survivors.append(action)
 
+    # Затирание одного блока. Остаётся ПЕРВОЕ действие — вход уже отсортирован
+    # вызывающим по цене, и снимать оба здесь незачем: они не спорят о
+    # направлении, просто пишут в одно поле. Второе вернётся следующим тактом.
+    single: List[Dict[str, Any]] = []
+    taken: set = set()
+    for action in survivors:
+        blocks = [(_object(action), block) for block in _blocks(action)]
+        if any(item in taken for item in blocks):
+            dropped.append({**action, "conflict_reason": SAME_BLOCK})
+            continue
+        taken.update(blocks)
+        single.append(action)
+
     final: List[Dict[str, Any]] = []
     seen: set = set()
-    for action in survivors:
+    for action in single:
         segment = _segment(action)
         if segment in seen:
             dropped.append({**action, "conflict_reason": DUPLICATE_SEGMENT})

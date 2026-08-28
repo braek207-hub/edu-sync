@@ -219,7 +219,9 @@ def _model(action: Dict[str, Any],
     # Литерал, а не константа рычага: writer/goal.py сам заявляет отсюда
     # ожидание, и импорт на уровне модуля замкнул бы кольцо goal → expectation.
     if kind == "goal.set":
-        return _goal(action, context, days)
+        return _transferred_cr(context, days, "смена цели")
+    if kind == "strategy.set":
+        return _transferred_cr(context, days, "смена стратегии")
     if kind == "campaign.suspend":
         return _suspend(action, context, days)
     if kind in ("negative.add", "placement.exclude"):
@@ -389,9 +391,12 @@ def _tcpa(action: Dict[str, Any], context: Dict[str, Any],
     }
 
 
-def _goal(action: Dict[str, Any], context: Dict[str, Any],
-          days: int) -> Optional[Dict[str, Any]]:
-    """Смена цели оптимизации: те же деньги, другая доля заявок.
+def _transferred_cr(context: Dict[str, Any], days: int,
+                    what: str) -> Optional[Dict[str, Any]]:
+    """Перенос конверсии с другого объекта: те же деньги, другая доля заявок.
+
+    Одна модель на два рычага — смену цели и смену стратегии: обещание у них
+    устроено одинаково, и разными были бы только слова в основании.
 
     Расход не трогается вовсе — ни лимит, ни цель CPA рычаг не двигает, —
     поэтому рублёвая сторона обещания ровно ноль, а не «неизвестно»: это
@@ -413,7 +418,7 @@ def _goal(action: Dict[str, Any], context: Dict[str, Any],
     return {
         "leads_delta": _round(clicks * days * (cr_new - cr_current)),
         "rub_delta": 0.0,
-        "basis": (f"смена цели: {round(clicks)} кликов/дн те же, конверсия "
+        "basis": (f"{what}: {round(clicks)} кликов/дн те же, конверсия "
                   f"{round(cr_new * 100, 2)} % против {round(cr_current * 100, 2)} %, "
                   f"{days} дн. Конверсия новой цели снята с другого объекта"),
         "measure_days": days,

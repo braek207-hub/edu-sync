@@ -15,6 +15,7 @@ from sync.agent.writer import expectation, exposure, guardrails, lanes
 from sync.agent.writer.budget import diff_budget
 from sync.agent.writer.diff import diff_modifiers, diff_schedule
 from sync.agent.writer.goal import diff_goal
+from sync.agent.writer.strategy import diff_strategy
 from sync.agent.writer.negatives import (diff_negatives, plan_negatives,
                                          remove_added_action)
 from sync.agent.writer.placements import diff_placements, plan_placements
@@ -128,6 +129,20 @@ def _goal():
     return actions[0]
 
 
+def _strategy_switch():
+    """Смена стратегии: конверсия под новой стратегией перенесена с соседа."""
+    actions, _ = diff_strategy(
+        {"1": {"strategy_type": "AVERAGE_CPA", "goal_ids": [541_664_134],
+               "reaches": {541_664_134: 400.0}, "window_days": 28,
+               "target_cpa": 2_400.0, "weekly_limit": 80_000.0,
+               "clicks_per_day": 120.0, "cr_current": 0.020, "cr_new": 0.026}},
+        {"1": {"campaign_type": "TEXT_CAMPAIGN", "package_id": None,
+               "daily_budget": {"Amount": 12_000 * M},
+               "strategy": {"Search": {"BiddingStrategyType": "HIGHEST_POSITION"},
+                            "Network": {"BiddingStrategyType": "SERVING_OFF"}}}})
+    return actions[0]
+
+
 def _switch_rows(roi_share=0.3):
     return [
         {"setting_kind": "campaign_switch", "setting_key": "suspend",
@@ -163,6 +178,7 @@ _SAMPLES = {
     "campaign.suspend": _suspend,
     "tcpa.set": _tcpa,
     "goal.set": _goal,
+    "strategy.set": _strategy_switch,
     "negative.add": _negative,
     "negative.remove_added": _remove_added,
     "placement.exclude": _placement,
