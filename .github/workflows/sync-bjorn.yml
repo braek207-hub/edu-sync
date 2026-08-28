@@ -61,6 +61,9 @@ jobs:
       - name: Метрика — строки ecommerce
         run: python -m sync.bjorn.sync_metrica_ecommerce
 
+      - name: Метрика — товарная воронка
+        run: python -m sync.bjorn.sync_products
+
       - name: Директ — staging
         run: python -m sync.bjorn.sync_direct
 
