@@ -32,11 +32,71 @@ def _rows(costs):
             for i, c in enumerate(costs)]
 
 
+def _direct_rows_from(rows):
+    """Источник, отвечающий на ЗАПРОШЕННОЕ окно (как load_direct_rows в бою).
+
+    Заглушка, отдающая все строки при любых аргументах, скрывала бы главное:
+    источник и витрина обязаны спрашиваться ОДНИМ окном, иначе сверка сумм
+    ловит не порчу, а разъехавшиеся границы.
+    """
+    return lambda date_from, date_to: [
+        r for r in rows if date_from <= str(r["date"]) <= date_to]
+
+
+def _mart_total_from(rows, short_days=None):
+    """Витрина, отвечающая на ЗАПРОШЕННОЕ окно, а не одним числом на всё.
+
+    Прежние заглушки возвращали константу при любых аргументах, и потому ни
+    один тест не мог увидеть, каким окном гейт спрашивает витрину, — а именно
+    в границах окна и живёт вся эта проверка.
+
+    short_days — дни, собранные витриной наполовину: {день: доля}. Так
+    выглядит последний день витрины в бою (источник дописывает его ещё сутки
+    после сборки).
+    """
+    partial = dict(short_days or {})
+
+    def _total(date_from, date_to):
+        return sum(float(r["cost"]) * float(partial.get(str(r["date"]), 1.0))
+                   for r in rows if date_from <= str(r["date"]) <= date_to)
+    return _total
+
+
+def test_unsettled_last_mart_day_does_not_turn_gate_red(monkeypatch):
+    # Боевой случай 28.08.2026: витрина собирает день сразу после полуночи,
+    # источник дописывает его ещё сутки. Девятнадцать закрытых дней сходятся
+    # до рубля, а последний день витрины короче источника вдвое — 7,76 % по
+    # окну при допуске 1 %. Сверка по последнему дню витрины краснела бы
+    # КАЖДЫЙ прогон, и откат был бы заморожен навсегда.
+    costs = [900_000.0] * 13 + [1_090_223.0]
+    rows = _rows(costs)
+    last = rows[-1]["date"]
+    monkeypatch.setattr(gate.agent_db, "load_direct_rows", _direct_rows_from(rows))
+    monkeypatch.setattr(gate.agent_db, "mart_cost_total",
+                        _mart_total_from(rows, {last: 535_149.0 / 1_090_223.0}))
+    out = gate.with_source_checks(_green_gate(), include_volume=False)
+    assert out["status"] == "GREEN", out["reason"]
+
+
+def test_mismatch_on_a_settled_day_still_turns_gate_red(monkeypatch):
+    # Обратная сторона отставания на сутки: недобор на ОСЕВШЕМ дне — уже не
+    # расписание сборки, а порча, и он обязан краснеть. Иначе отставание было
+    # бы отключением проверки, а не её границей.
+    costs = [900_000.0] * 13 + [1_090_223.0]
+    rows = _rows(costs)
+    monkeypatch.setattr(gate.agent_db, "load_direct_rows", _direct_rows_from(rows))
+    monkeypatch.setattr(gate.agent_db, "mart_cost_total",
+                        _mart_total_from(rows, {rows[-2]["date"]: 0.5}))
+    out = gate.with_source_checks(_green_gate(), include_volume=False)
+    assert out["status"] == "RED"
+    assert "sums" in out["reason"]
+
+
 def test_sum_mismatch_between_source_and_mart_turns_gate_red(monkeypatch):
     # Витрина собрана не из тех строк, что сейчас отдаёт источник, — свежесть
     # и ширина этого не видят (даты у битой витрины в порядке).
     monkeypatch.setattr(gate.agent_db, "load_direct_rows",
-                        lambda a, b: _rows([100.0] * 10))
+                        _direct_rows_from(_rows([100.0] * 10)))
     monkeypatch.setattr(gate.agent_db, "mart_cost_total", lambda a, b: 500.0)
     out = gate.with_source_checks(_green_gate(), include_volume=False)
     assert out["status"] == "RED"
@@ -44,9 +104,9 @@ def test_sum_mismatch_between_source_and_mart_turns_gate_red(monkeypatch):
 
 
 def test_matching_sums_keep_gate_green(monkeypatch):
-    monkeypatch.setattr(gate.agent_db, "load_direct_rows",
-                        lambda a, b: _rows([100.0] * 10))
-    monkeypatch.setattr(gate.agent_db, "mart_cost_total", lambda a, b: 1000.0)
+    rows = _rows([100.0] * 10)
+    monkeypatch.setattr(gate.agent_db, "load_direct_rows", _direct_rows_from(rows))
+    monkeypatch.setattr(gate.agent_db, "mart_cost_total", _mart_total_from(rows))
     out = gate.with_source_checks(_green_gate(), include_volume=True)
     assert out["status"] == "GREEN"
     assert out["reason"] == ""
@@ -58,10 +118,9 @@ def test_volume_anomaly_gates_only_the_planner(monkeypatch):
     # возможное СЛЕДСТВИЕ вредного изменения, и замораживать откат по нему
     # нельзя.
     costs = [100.0] * 9 + [10000.0]
-    monkeypatch.setattr(gate.agent_db, "load_direct_rows",
-                        lambda a, b: _rows(costs))
-    monkeypatch.setattr(gate.agent_db, "mart_cost_total",
-                        lambda a, b: sum(costs))
+    rows = _rows(costs)
+    monkeypatch.setattr(gate.agent_db, "load_direct_rows", _direct_rows_from(rows))
+    monkeypatch.setattr(gate.agent_db, "mart_cost_total", _mart_total_from(rows))
     watchdog_view = gate.with_source_checks(_green_gate(), include_volume=False)
     planner_view = gate.with_source_checks(_green_gate(), include_volume=True)
     assert watchdog_view["status"] == "GREEN"
@@ -117,9 +176,9 @@ def test_partial_today_does_not_turn_the_planner_gate_red(monkeypatch):
     # Судить по нему об аномалии объёма — значит краснеть КАЖДЫЙ день в
     # момент записи, то есть запретить запись навсегда.
     costs = [900_000.0] * 14 + [89_000.0]
-    monkeypatch.setattr(gate.agent_db, "load_direct_rows",
-                        lambda a, b: _rows_through_today(costs))
-    monkeypatch.setattr(gate.agent_db, "mart_cost_total", lambda a, b: sum(costs))
+    rows = _rows_through_today(costs)
+    monkeypatch.setattr(gate.agent_db, "load_direct_rows", _direct_rows_from(rows))
+    monkeypatch.setattr(gate.agent_db, "mart_cost_total", _mart_total_from(rows))
     green = gate.mart_gate(_mart_including_today(), TODAY)
     assert green["latest_fact_date"] == TODAY.isoformat()
     out = gate.with_source_checks(green, include_volume=True, today=TODAY)
@@ -130,9 +189,9 @@ def test_collapse_on_the_last_complete_day_still_turns_gate_red(monkeypatch):
     # Обратная сторона: обвал ВЧЕРА (день полный) обязан краснеть, иначе
     # исключение сегодняшнего дня превратилось бы в отключение проверки.
     costs = [900_000.0] * 13 + [10_000.0] + [89_000.0]
-    monkeypatch.setattr(gate.agent_db, "load_direct_rows",
-                        lambda a, b: _rows_through_today(costs))
-    monkeypatch.setattr(gate.agent_db, "mart_cost_total", lambda a, b: sum(costs))
+    rows = _rows_through_today(costs)
+    monkeypatch.setattr(gate.agent_db, "load_direct_rows", _direct_rows_from(rows))
+    monkeypatch.setattr(gate.agent_db, "mart_cost_total", _mart_total_from(rows))
     out = gate.with_source_checks(gate.mart_gate(_mart_including_today(), TODAY),
                                   include_volume=True, today=TODAY)
     assert out["status"] == "RED"
@@ -146,7 +205,7 @@ def test_data_gate_passes_today_into_source_checks(monkeypatch):
     costs = [900_000.0] * 14 + [89_000.0]
     monkeypatch.setattr(gate.agent_db, "load_mart_day_breadth",
                         lambda a, b: _mart_including_today())
-    monkeypatch.setattr(gate.agent_db, "load_direct_rows",
-                        lambda a, b: _rows_through_today(costs))
-    monkeypatch.setattr(gate.agent_db, "mart_cost_total", lambda a, b: sum(costs))
+    rows = _rows_through_today(costs)
+    monkeypatch.setattr(gate.agent_db, "load_direct_rows", _direct_rows_from(rows))
+    monkeypatch.setattr(gate.agent_db, "mart_cost_total", _mart_total_from(rows))
     assert gate.data_gate(TODAY)["status"] == "GREEN"

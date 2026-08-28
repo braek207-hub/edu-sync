@@ -621,6 +621,30 @@ def test_red_data_gate_watches_but_does_not_roll_back():
     assert db.rolled_back == [] and db.failed == []
 
 
+def test_verdict_issued_earlier_is_rolled_back_under_a_red_gate():
+    # Обнаружение и исполнение — разные права. Вердикт «вредно» вынесен на
+    # прошлом прогоне (на зелёном гейте), возврат тогда не состоялся. Возврат
+    # в предыдущее состояние берётся из журнала, а не из витрины, и держать
+    # вредное изменение живым до починки данных незачем.
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    action = _action(harmful_verdict_at=APPLIED + timedelta(days=3))
+    report, client, db = _run(action, facts, gate=RED_GATE)
+
+    assert report["rolled_back"] == 1
+    assert report["blocked_data_gate"] == 0
+    assert db.rolled_back == ["act-1"]
+
+
+def test_new_verdict_is_still_not_issued_under_a_red_gate():
+    # Обратная сторона: пробой, увиденный ВПЕРВЫЕ на красном гейте, остаётся
+    # наблюдением. Иначе «покраснел гейт → сам себе разрешил откат».
+    facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
+    report, client, db = _run(_action(), facts, gate=RED_GATE)
+
+    assert report["blocked_data_gate"] == 1
+    assert db.rolled_back == [] and db.harmful == []
+
+
 def test_missing_gate_forbids_rollback():
     # Умолчание — запрет: забытый гейт не должен молча разрешать откат по
     # данным неизвестного качества.
