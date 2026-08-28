@@ -1,0 +1,60 @@
+# Все цели счётчика LIME (23504302) → витрина lime_metrika_goal_daily + справочник
+# lime_metrika_goals. Регистрация, авторизация, цели Mindbox, автоцели Директа —
+# состав спрашивается у Management API каждым прогоном, не зашит константами.
+#
+# Ежедневно скользящим окном; бэкфилл истории — через workflow_dispatch с датами.
+# Синк идемпотентен (delete+insert по дню), повтор безопасен. Токен/счётчик — общие
+# с RU- и KZ-срезами Метрики.
+name: Sync LIME Metrika Goals
+
+on:
+  schedule:
+    - cron: "10 1 * * *"   # 04:10 МСК ежедневно, после RU-среза (03:50)
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "Бэкфилл с даты (YYYY-MM-DD); пусто = скользящее окно 30 дней"
+        required: false
+        type: string
+      date_to:
+        description: "Бэкфилл по дату (YYYY-MM-DD), включительно"
+        required: false
+        type: string
+
+concurrency:
+  group: lime-metrika-goals
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Apply DB migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/apply_lime_migrations.py
+
+      - name: Sync Metrika goals
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIME_METRIKA_TOKEN: ${{ secrets.LIME_METRIKA_TOKEN }}
+          LIME_METRIKA_GOALS_FROM: ${{ github.event.inputs.date_from }}
+          LIME_METRIKA_GOALS_TO: ${{ github.event.inputs.date_to }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.lime_metrika_goals
+
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
