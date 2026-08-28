@@ -47,6 +47,12 @@ budget.set_daily получали его готовым от солвера по
     есть и теряются — их число едет в контексте отдельно. Обещать ноль там,
     где режется конверсионный трафик, значило бы сделать наблюдение заведомо
     провальным.
+  * ГЕОГРАФИЯ — ДВЕ модели на один вид действия, по направлению хода. Сужение
+    считается как отсечение, тем же кодом: убранный регион снимает с кабинета
+    свой поток. Расширение отсечением не является ни в какой части — там
+    расход РАСТЁТ, и растёт он на объёме, снятом с другого объекта: у этой
+    кампании истории по новому региону нет по определению. Одна усреднённая
+    модель на оба направления обещала бы то, чего не делает ни одно из них.
   * ЦЕЛЬ CPA — «дороже лид, больше объём» (и наоборот). Расход следует за
     целью пропорционально, а прирост расхода покупает лиды по НОВОЙ цели:
     цель и есть та цена, которую мы объявили допустимой. Обе стороны берутся
@@ -230,6 +236,8 @@ def _model(action: Dict[str, Any],
         return _suspend(action, context, days)
     if kind in ("negative.add", "placement.exclude"):
         return _cut(action, context, days)
+    if kind == "geo.set":
+        return _geo(action, context, days)
     if kind == "negative.remove_added":
         return _restore(action, context, days)
     return None
@@ -444,6 +452,79 @@ def _suspend(action: Dict[str, Any], context: Dict[str, Any],
     }
 
 
+def _geo(action: Dict[str, Any], context: Dict[str, Any],
+         days: int) -> Optional[Dict[str, Any]]:
+    """География: у одного вида действия две модели, по направлению хода.
+
+    Сужение — зеркало отсечения и считается тем же кодом: убранный регион
+    снимает с кабинета свой поток, а лиды на нём известны из тех же кандидатов.
+    Расширение отсечением не является ни в какой части, и общая модель для них
+    была бы усреднением двух разных утверждений.
+
+    Направление читается по спискам самого действия, как и класс
+    достоверности (writer/tier._direction): пометке построителя здесь верить
+    нельзя ровно по тому же доводу — AddedRegionIds и RemovedRegionIds
+    посчитал тот же код, что и сам ход, и его ошибка приехала бы в обещание
+    неотличимой от истины. Списки не читаются — обещания нет: модель выбирать
+    не по чему, а «наугад» здесь означает пообещать рост там, где идёт
+    отсечение.
+    """
+    new_regions = _region_ids((action.get("payload") or {}).get("RegionIds"))
+    old_regions = _region_ids((action.get("previous_state") or {}).get("RegionIds"))
+    if new_regions is None or old_regions is None:
+        return None
+    if old_regions - new_regions:
+        return _cut(action, context, days)
+    if new_regions - old_regions:
+        return _geo_widen(action, context, days)
+    return None
+
+
+def _region_ids(value: Any) -> Optional[frozenset]:
+    """Список регионов множеством. None — читать нечего или нечем."""
+    if not isinstance(value, (list, tuple, set, frozenset)) or not value:
+        return None
+    out = set()
+    for item in value:
+        if isinstance(item, bool):
+            return None
+        number = _number(item)
+        if number is None or number != int(number):
+            return None
+        out.add(int(number))
+    return frozenset(out)
+
+
+def _geo_widen(action: Dict[str, Any], context: Dict[str, Any],
+               days: int) -> Optional[Dict[str, Any]]:
+    """Расширение гео: перенос числа с объекта, у которого регион есть.
+
+    Расход, который новый регион возьмёт, у ЭТОЙ кампании не наблюдался ни
+    дня — она там не показывалась. Число приходит контекстом от рычага и
+    снято с другого объекта; ровно это делает действие ставкой, а не
+    измерением (writer/tier.py), и ровно поэтому оно обязано быть названо в
+    основании — иначе замер судил бы обещание, не зная, откуда оно.
+
+    Цена лида берётся СВОЯ, кампании: конверсия — свойство оффера и
+    посадочной, а не географии, и подставлять сюда чужую значило бы обещать
+    чужой результат. Нет любого из двух чисел — обещания нет: курс «рубли →
+    лиды» не выдумывается.
+    """
+    daily = _number(context.get("added_daily_rub"))
+    cpa = _cpa(context)
+    if daily is None or cpa is None or daily <= 0 or cpa <= 0:
+        return None
+    added = (action.get("payload") or {}).get("AddedRegionIds") or []
+    return {
+        "leads_delta": _round(daily / cpa * days),
+        "rub_delta": _round(daily * days),
+        "basis": (f"расширение гео на {len(added)} шт.: +{round(daily)} ₽/дн "
+                  f"при цене лида {round(cpa)} ₽, {days} дн. Расход региона "
+                  "снят с другого объекта — в этой кампании его не было"),
+        "measure_days": days,
+    }
+
+
 def _cut(action: Dict[str, Any], context: Dict[str, Any],
          days: int) -> Optional[Dict[str, Any]]:
     """Отсечение: вырезанный расход — точно, потерянные лиды — по кандидатам.
@@ -467,8 +548,13 @@ def _cut(action: Dict[str, Any], context: Dict[str, Any],
     if cut_daily is None or cut_daily <= 0:
         return None
     lost_leads_day = _number(context.get("cut_conversions_per_day")) or 0.0
-    added = ((action.get("payload") or {}).get("AddedPhrases")
-             or (action.get("payload") or {}).get("AddedSites") or [])
+    payload = action.get("payload") or {}
+    # Штук, которые режутся: фразы, площадки — или регионы, если отсечение
+    # пришло от рычага географии. Список у каждого рычага свой, потому что
+    # своё и содержимое; общего поля «сколько штук» нет намеренно — по нему
+    # нельзя было бы понять, что именно вырезано.
+    added = (payload.get("AddedPhrases") or payload.get("AddedSites")
+             or payload.get("RemovedRegionIds") or [])
     return {
         "leads_delta": _round(-lost_leads_day * days),
         "rub_delta": _round(-cut_daily * days),

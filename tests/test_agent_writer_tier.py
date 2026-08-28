@@ -114,6 +114,40 @@ def test_evidence_without_baseline_cpa_is_not_arithmetic():
     assert tier.tier_of(action) > tier.TIER_ARITHMETIC
 
 
+def _geo(new, old, evidence=True):
+    """Действие географии литералами: только списки, без рычага."""
+    action = {"action_kind": "geo.set",
+              "payload": {"RegionIds": list(new)},
+              "previous_state": {"RegionIds": list(old)}}
+    if evidence:
+        action["evidence"] = _cut_evidence()
+    return action
+
+
+def test_one_kind_gets_two_tiers_by_its_own_content():
+    """Гео — единственный вид, у которого класс НЕ выводится из имени.
+
+    Сужение — утверждение о прошлом (класс 0), расширение — ставка (класс 2),
+    и решают это сами списки регионов, а не пометка построителя: иначе
+    достаточно было бы назвать ход сужением, чтобы освободить его от риска.
+    """
+    assert tier.tier_of(_geo([213, 2], [213, 2, 65])) == tier.TIER_ARITHMETIC
+    assert tier.tier_of(_geo([213, 2, 65], [213, 2])) == tier.TIER_BET
+
+
+def test_a_geo_move_in_both_directions_shows_no_direction():
+    # Убрали одно, добавили другое: ни сужение, ни расширение — значит ни
+    # права резать без риска, ни переноса числа. Общий порядок, и класс 0
+    # такому ходу не достаётся ни при каком основании.
+    assert tier.tier_of(_geo([213, 43], [213, 65])) > tier.TIER_ARITHMETIC
+
+
+def test_a_geo_move_without_a_known_past_is_not_arithmetic():
+    # Прежний список неизвестен — сужение недоказуемо. «Не знаем» не имеет
+    # права стать правом резать без риск-бюджета.
+    assert tier.tier_of(_geo([213], [])) > tier.TIER_ARITHMETIC
+
+
 def test_only_cutting_kinds_can_be_arithmetic():
     # То же основание на доливке бюджета — не арифметика: «ноль конверсий за
     # окно» ничего не утверждает о том, что будет после доливки.

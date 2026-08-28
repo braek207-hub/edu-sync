@@ -122,7 +122,10 @@ _RESULT_COLLECTION = {"add": "AddResults", "set": "SetResults",
 # сложить в один запрос. Перечень закрытый и по форме тела, а не по сервису:
 # у campaigns.suspend тело — SelectionCriteria с массивом Id, то есть другая
 # форма, и класть её в общий механизм значит склеивать разные семантики.
-# Такое действие едет одно, как и раньше.
+# Такое действие едет одно, как и раньше. По той же причине здесь нет и
+# adgroups.update: одно действие географии несёт СТОЛЬКО элементов, сколько у
+# кампании групп, — механизм батча ждёт ровно один и слепил бы чужие группы
+# с нашими в общий ответ, позиции которого потом не разобрать.
 _BATCH_COLLECTION = {("bidmodifiers", "set"): "BidModifiers",
                      ("bidmodifiers", "add"): "BidModifiers",
                      ("campaigns", "update"): "Campaigns"}
@@ -246,6 +249,20 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
         return "campaigns", "update", {
             "Campaigns": [{"Id": int(payload["CampaignId"]),
                            "ExcludedSites": payload["ExcludedSites"]}]
+        }
+
+    if kind == "geo.set":
+        # Регионы живут в ГРУППАХ: RegionIds — поле adgroups (читатель
+        # кабинета edu_direct_settings._fetch_adgroups_by_campaign), а у
+        # campaigns такого поля нет ни в чтении, ни в записи. Список
+        # заменяется целиком, и полный новый список собрал план
+        # (writer/geo.py) из прочитанного состояния; кампания едет в теле
+        # только через свои группы — единственный адрес, который есть у этой
+        # настройки в API.
+        return "adgroups", "update", {
+            "AdGroups": [{"Id": int(group_id),
+                          "RegionIds": [int(r) for r in payload["RegionIds"]]}
+                         for group_id in payload["AdGroupIds"]]
         }
 
     if kind == "negative.add":

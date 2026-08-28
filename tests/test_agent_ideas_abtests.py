@@ -265,8 +265,8 @@ def test_campaign_listed_in_holdout_ids_gets_no_tests():
 
 
 def test_catalogue_offers_only_released_levers():
-    # До задач 21–24 рычагов goal/strategy/audience/geo нет. Идея с
-    # ненаписанным рычагом встала бы в реестр и отвергалась каждым тактом.
+    # Из задач 21–24 не написан рычаг аудиторий (23). Идея с ненаписанным
+    # рычагом встала бы в реестр и отвергалась каждым тактом.
     for idea in abtests.candidates([_campaign()], _ctx()):
         lever = idea["detail"]["change"]["lever"]
         assert lever in guardrails.ALLOWED_ACTION_KINDS
@@ -282,20 +282,21 @@ def test_unreleased_kind_is_skipped_with_a_named_reason():
     skipped = abtests.scan([_campaign()], _ctx())["skipped"]
     kinds = {row.get("test_kind") for row in skipped}
 
-    # Рычаг задачи 24 ещё не написан — его тип отбраковывается с названной
-    # причиной, а не молча. Смены цели, стратегии и аудиторий здесь больше
-    # нет: рычаги написаны (задачи 21–23), их место — среди кандидатов ниже.
-    assert {"geo"} <= kinds
-    assert "audience" not in kinds
+    # Рычаги задач 21–24 написаны все четыре, и в отбраковке «рычага нет»
+    # остался один тип — креативы: тексты и объявления собирает ДРУГОЙ
+    # репозиторий, и рычага записи у агента для них не будет вовсе. Важно, что
+    # отбраковка именована: тип, выпавший молча, неотличим от забытого.
+    assert "creatives" in kinds
+    assert not ({"goal", "strategy", "audience", "geo"} & kinds)
     assert all(row["reason"] for row in skipped)
 
 
 def test_the_goal_test_became_a_candidate_with_its_lever():
-    # Каталог обещал тесты смены цели, стратегии и аудиторий с самого начала,
-    # но до задач 21–23 обещать их было нечем. Появился рычаг — тип обязан
-    # выйти из отбраковки в кандидаты; иначе каталог остался бы списком
-    # намерений.
-    assert {"goal", "strategy", "audience"} <= _kinds()
+    # Каталог обещал тесты смены цели, стратегии, аудиторий и географии с
+    # самого начала, но до задач 21–24 обещать их было нечем. Появился рычаг —
+    # тип обязан выйти из отбраковки в кандидаты; иначе каталог остался бы
+    # списком намерений.
+    assert {"goal", "strategy", "audience", "geo"} <= _kinds()
 
 
 def test_creative_test_waits_for_the_builder_order():

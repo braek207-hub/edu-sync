@@ -877,6 +877,24 @@ def rollback_guard_form(action: Dict[str, Any], service: str, method: str,
             "payload": {"Id": campaign.get("Id")},
         }
 
+    if str(service) == "adgroups":
+        # География живёт в ГРУППАХ: campaigns поля регионов не имеет вовсе
+        # (edu_direct_settings: RegionIds спрашивается у adgroups.get). Вид
+        # выводится из СОДЕРЖИМОГО запроса, как и у campaigns выше: соберёт
+        # построитель не тот блок — allow-лист увидит не тот вид и отклонит.
+        groups = params.get("AdGroups") or []
+        has_regions = bool(groups) and all(
+            "RegionIds" in (group or {}) for group in groups)
+        return {
+            "action_kind": "geo.set" if has_regions else f"adgroups.{method}",
+            "object_level": action.get("object_level"),
+            "object_id": action.get("object_id"),
+            "api_coefficient": None,
+            "origin_action_kind": action.get("action_kind"),
+            "previous_state": action.get("previous_state") or {},
+            "payload": {"Id": (groups[0] or {}).get("Id") if groups else None},
+        }
+
     prefix = _SERVICE_KIND_PREFIX.get(str(service), str(service))
     item = ((params.get("BidModifiers") or [{}])[0]) or {}
     return {

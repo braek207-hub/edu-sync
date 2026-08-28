@@ -38,7 +38,7 @@ ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set",
                         "budget.set", "budget.set_daily", "campaign.suspend",
                         "tcpa.set", "goal.set", "strategy.set", "negative.add",
                         "placement.exclude", "negative.remove_added",
-                        "audience.add"}
+                        "audience.add", "geo.set"}
 
 # Виды, у которых рычага записи на стороне агента нет и не будет: тело
 # кампании (группы, ключи, объявления) собирает ДРУГОЙ репозиторий, и агент
@@ -94,6 +94,18 @@ PLACEMENT_MAX_SITES = 1000
 PLACEMENT_MAX_SITE_CHARS = 255
 PLACEMENT_MAX_ADDED_PER_ACTION = 10
 
+# Границы географии — СВОИ, независимые от writer/geo.py, по тому же доводу,
+# что у минус-фраз и площадок: рельса, считающая формулой построителя,
+# пропустит любую его ошибку.
+#
+# Доля, больше которой за одно действие список не сужается. Числа Директа тут
+# нет и быть не может — это не ограничение API, а физика ошибки: регион, в
+# отличие от фразы, целый рынок, и убрать больше половины прежней географии
+# значит сделать из кампании другую кампанию. Половина — граница, за которой
+# от прежнего объекта остаётся меньше, чем убрано; такое решение принимает
+# человек, а не такт.
+GEO_MAX_REMOVED_SHARE = 0.5
+
 # Границы почасового расписания — СВОИ, независимые от writer/schedule.py.
 # Дублирование намеренное: рельса обязана считать сама, иначе она проверяет
 # построитель его же формулой и пропустит любую его ошибку.
@@ -109,7 +121,7 @@ ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set", "schedule.set",
                                  "budget.set", "budget.set_daily",
                                  "campaign.suspend", "tcpa.set",
                                  "goal.set", "strategy.set", "negative.add",
-                                 "placement.exclude"}
+                                 "placement.exclude", "geo.set"}
 
 # Куда обязан возвращать откат, в зависимости от вида ИСХОДНОГО действия.
 # Отмена добавления — нейтраль (объекта до действия не было), отмена
@@ -196,10 +208,97 @@ def check_action(action: Dict[str, Any],
         if not ok:
             return False, reason
 
+    if kind == "geo.set":
+        ok, reason = _check_geo(action)
+        if not ok:
+            return False, reason
+
     if kind == "campaign.suspend":
         ok, reason = _check_suspend(action)
         if not ok:
             return False, reason
+    return True, ""
+
+
+def _geo_regions(value: Any) -> Optional[List[int]]:
+    """Список регионов целыми числами. None — читать нечего или нечем."""
+    if not isinstance(value, list) or not value:
+        return None
+    out: List[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        if float(item) != int(item):
+            return None
+        out.append(int(item))
+    return out
+
+
+def _check_geo(action: Dict[str, Any]) -> Tuple[bool, str]:
+    """Рельса географии: куда кампания вообще входит показами.
+
+    Цена ошибки здесь выше, чем у минус-фразы: та убирает запрос, а пустая или
+    подменённая география убирает рынок целиком — и вернуть открученное за это
+    время нельзя. Поэтому рельса считает НЕЗАВИСИМО от writer/geo.py и по
+    своим полям.
+
+    Пять проверок, и каждая закрывает свой способ уронить кампанию:
+
+      * СПИСОК НЕ ПУСТ. Кампания без регионов не показывается вовсе; пустой
+        список — остановка трафика под видом правки настройки, а остановку
+        агент назначает только явным выключением, с его собственной рельсой.
+      * ГРУППЫ НАЗВАНЫ. RegionIds — поле группы, и запрос без номеров групп
+        собрать не из чего: это не «поле проигнорировано», а тело, которого
+        Директ не поймёт.
+      * ПРОШЛОЕ ИЗВЕСТНО. Без прочитанного списка не сказать ни куда
+        возвращает откат, ни в какую сторону идёт ход, — то есть класс
+        достоверности считался бы по неизвестному (writer/tier._direction).
+      * ХОД НЕ СМЕШАН. Одно действие либо только убирает регионы, либо только
+        добавляет: смешанный ход — два утверждения разных классов в одной
+        строке, и замер не сказал бы, какая сторона сдвинула число.
+      * СУЖЕНИЕ НЕ БОЛЬШЕ ПОЛОВИНЫ прежнего списка.
+
+    Минус-регион (отрицательный id, «Россия − Москва») отвергается вместе с
+    нечитаемым списком: покрытие такого списка по спискам не вычисляется, и
+    направление хода — тоже.
+    """
+    payload = action.get("payload") or {}
+    if payload.get("CampaignId") is None:
+        return False, "в действии географии нет CampaignId"
+
+    regions = _geo_regions(payload.get("RegionIds"))
+    if regions is None:
+        return False, ("список регионов пуст или нечитаем: кампания без "
+                       "географии не показывается вовсе")
+    negative = next((r for r in regions if r <= 0), None)
+    if negative is not None:
+        return False, (f"номер региона {negative} не положителен: "
+                       f"минус-регион вычитает покрытие, и направление хода "
+                       f"по спискам не вычислить")
+
+    groups = payload.get("AdGroupIds")
+    if not isinstance(groups, list) or not groups:
+        return False, ("в действии географии нет групп: RegionIds — поле "
+                       "группы, и адресовать запрос нечем")
+
+    previous = _geo_regions((action.get("previous_state") or {}).get("RegionIds"))
+    if previous is None:
+        return False, ("прежняя география неизвестна: без неё не сказать ни "
+                       "куда вернёт откат, ни в какую сторону идёт ход")
+
+    added = [r for r in regions if r not in previous]
+    removed = [r for r in previous if r not in regions]
+    if not added and not removed:
+        return False, "география не меняется: действие без содержания"
+    if added and removed:
+        return False, (f"ход и добавляет регионы ({len(added)}), и убирает "
+                       f"({len(removed)}): это два разных утверждения в одной "
+                       f"строке, и замер не разделил бы их")
+    if removed and len(removed) > GEO_MAX_REMOVED_SHARE * len(previous):
+        return False, (f"убирается {len(removed)} региона(ов) из "
+                       f"{len(previous)} — больше доли "
+                       f"{GEO_MAX_REMOVED_SHARE:.0%}: это не правка "
+                       f"географии, а другая кампания")
     return True, ""
 
 
@@ -652,10 +751,11 @@ def check_rollback(request: Dict[str, Any]) -> Tuple[bool, str]:
     if kind not in ROLLBACK_ALLOWED_ACTION_KINDS:
         return False, f"вид действия вне allow-листа возврата: {kind}"
 
-    if kind in ("schedule.set", "budget.set", "budget.set_daily"):
-        # У расписания и бюджета возврат не описывается одним коэффициентом:
-        # назад едет весь прежний блок (TimeTargeting / BiddingStrategy /
-        # DailyBudget). Сверять его с прошлым состоянием здесь незачем —
+    if kind in ("schedule.set", "budget.set", "budget.set_daily", "geo.set"):
+        # У расписания, бюджета и географии возврат не описывается одним
+        # коэффициентом: назад едет весь прежний блок (TimeTargeting /
+        # BiddingStrategy / DailyBudget / RegionIds). Сверять его с прошлым
+        # состоянием здесь незачем —
         # строитель возврата (rollback_payload) берёт блок прямо из журнала
         # и не собирает его заново, поэтому «вернуть не туда» тут невозможно
         # по построению. Требовать api_coefficient — значит запретить такой

@@ -285,6 +285,21 @@ def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[st
                            "TextCampaign": {"BiddingStrategy": previous_strategy}}]
         }
 
+    if kind == "geo.set":
+        # Назад едет ВЕСЬ прежний список регионов и в те же группы: список в
+        # API заменяется целиком, и «убрать добавленное» здесь не операция —
+        # такой операции у поля нет. Прежний список неизвестен или групп нет —
+        # вслепую не пишем, по тому же правилу, что у корректировки без Id.
+        previous_regions = previous.get("RegionIds")
+        groups = previous.get("AdGroupIds") or (action.get("payload") or {}).get("AdGroupIds")
+        if not previous_regions or not groups:
+            return None
+        return "adgroups", "update", {
+            "AdGroups": [{"Id": int(group_id),
+                          "RegionIds": [int(r) for r in previous_regions]}
+                         for group_id in groups]
+        }
+
     if kind == "budget.set_daily":
         previous_daily = previous.get("DailyBudget")
         campaign_id = (action.get("payload") or {}).get("CampaignId") or action.get("object_id")

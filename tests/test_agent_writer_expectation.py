@@ -15,6 +15,7 @@ from sync.agent.writer import expectation, exposure, guardrails, lanes
 from sync.agent.writer.audience import diff_audience
 from sync.agent.writer.budget import diff_budget
 from sync.agent.writer.diff import diff_modifiers, diff_schedule
+from sync.agent.writer.geo import diff_geo
 from sync.agent.writer.goal import diff_goal
 from sync.agent.writer.strategy import diff_strategy
 from sync.agent.writer.negatives import (diff_negatives, plan_negatives,
@@ -158,6 +159,21 @@ def _strategy_switch():
     return actions[0]
 
 
+def _geo():
+    """Сужение гео: убранный регион снимает с кабинета свой поток.
+
+    Направление — сужение, потому что у одного вида действия ожидание считают
+    ДВЕ модели, и образцом обязана быть та, что заявляет отсечение: расширение
+    проверяется своим файлом (tests/test_agent_writer_geo.py).
+    """
+    actions, _ = diff_geo(
+        {"1": {"region_ids": [213, 2], "cut_cost": 12_000.0,
+               "cut_conversions": 0, "baseline_cpa": 2_400.0}},
+        {"1": {"campaign_type": "TEXT_CAMPAIGN",
+               "adgroups": [{"id": 1001, "region_ids": [213, 2, 65]}]}})
+    return actions[0]
+
+
 def _switch_rows(roi_share=0.3):
     return [
         {"setting_kind": "campaign_switch", "setting_key": "suspend",
@@ -198,6 +214,7 @@ _SAMPLES = {
     "negative.add": _negative,
     "negative.remove_added": _remove_added,
     "placement.exclude": _placement,
+    "geo.set": _geo,
 }
 
 
