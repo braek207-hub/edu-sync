@@ -2174,15 +2174,39 @@ def run_account(
     # объяснял бы решение, которого отбор не принимал.
     lane_ladder = ctx.get("lane_steps") or lane_steps_of(ctx.get("config"))
     lane_steps = {lane: int(slot["step"]) for lane, slot in lane_ladder.items()}
-    lane_weekly_spend = sum(float(v) for v in daily_cost.values()) * DAYS_IN_WEEK
-    lane_risk_budget = weekly_risk_limit(wk, daily_cost, ctx.get("config"))
+    # Карман полосы — СВОЙ у каждого кабинета, и размер его считается от
+    # расхода этого кабинета. Общий на прогон карман расходовался в порядке
+    # обхода: замер 27.08.2026, полоса тонкой настройки — account10 взял 21
+    # действие из 142 заявленных (14.8 %) и вычерпал карман досуха, а
+    # account1, account3 и account4 получили 0, 2 и 0 при 13, 175 и 5
+    # заявленных. account3 при этом крупнейший кабинет прогона (9,3 млн ₽ за
+    # 28 дней). Это ровно тот дефект «лимит выбирает первое, а не важное»,
+    # ради которого полосы и вводились, — только этажом выше.
+    #
+    # Объём изменений за прогон при этом не растёт, и довод про «сколько
+    # человек способен проверить» остаётся в силе: доли считаются от расхода
+    # кабинетов, а сумма расходов кабинетов и есть расход прогона. Четыре
+    # кармана по своей доле складываются ровно в тот один, что был раньше.
+    run_weekly_spend = sum(float(v) for v in daily_cost.values()) * DAYS_IN_WEEK
+    lane_weekly_spend = sum(float(daily_cost.get(str(cid)) or 0.0)
+                            for cid in campaign_ids) * DAYS_IN_WEEK
+    # Доля кабинета в прогоне — ею же режется и ручной абсолютный потолок
+    # недели (writer_db.risk_limit), который задан на прогон, а не на кабинет.
+    # Расход прогона нулевой (пустая витрина) — делить нечего, и кабинет
+    # получает весь потолок: это тот же случай, в котором weekly_risk_limit
+    # отдаёт абсолютный дефолт вместо нуля.
+    account_share = (lane_weekly_spend / run_weekly_spend
+                     if run_weekly_spend > 0 else 1.0)
+    lane_risk_budget = weekly_risk_limit(wk, daily_cost,
+                                         ctx.get("config")) * account_share
+    lane_budgets = ctx["lane_budgets"].setdefault(login, {})
     lane_taken, lane_refused = lanes.select(
         with_red_line,
         lane_steps,
         weekly_spend_rub=lane_weekly_spend,
         daily_cost_by_campaign=daily_cost,
         config=ctx.get("config"),
-        budgets=ctx["lane_budgets"],
+        budgets=lane_budgets,
         charged_by_object=dict(charged_risk),
         risk_budget_rub=lane_risk_budget,
     )
@@ -2481,7 +2505,11 @@ def run_account(
             "taken": _count_by(lane_taken, "lane"),
             "refused": _count_by(lane_refused, "blocked_reason"),
             "spent": {lane: {k: round(float(v), 2) for k, v in slot.items()}
-                      for lane, slot in sorted(ctx["lane_budgets"].items())},
+                      for lane, slot in sorted(lane_budgets.items())},
+            # Доля кабинета в кармане прогона: без неё «полоса выбрана до дна»
+            # не отличает крупный кабинет от мелкого, которому и полагалась
+            # десятая часть.
+            "account_share": round(account_share, 4),
             # Дефицит рядом со «взято/отказано/потрачено», а не вместо них:
             # счётчик говорит, СКОЛЬКО не прошло, дефицит — НАСКОЛЬКО не
             # прошло. Отложенных списков у прогона нет, и «не влезло» без
@@ -2744,11 +2772,12 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "holdout_ids": holdout_ids,
         "charged_risk": charged_risk,
         "week_start": wk,
-        # Потраченное полосами — на ПРОГОН, а не на кабинет: полоса ограничивает
-        # объём изменений, которые человек способен проверить и осмысленно
-        # откатить, а он не зависит от того, на сколько кабинетов они разложены.
-        # Внутри цикла по четырём кабинетам потолок был бы вчетверо выше
-        # заявленного — тот самый дефект, который чинили у лимита действий.
+        # Потраченное полосами — {кабинет: {полоса: остатки}}. Карман у каждого
+        # кабинета свой, и размер его считается от расхода этого кабинета
+        # (run_account: account_share), поэтому четыре кармана складываются
+        # ровно в тот один, что был бы посчитан на прогон целиком: объём
+        # изменений за прогон не растёт, а порядок обхода перестаёт решать,
+        # кому достанется лимит.
         "lane_budgets": {},
         # Доля недельного риска на этот прогон. Считается ОДИН раз на весь
         # прогон: делить остаток заново на каждом кабинете значило бы выдать

@@ -2497,6 +2497,34 @@ def test_balance_gate_stands_after_the_other_gates_and_before_the_lanes():
             < source.index("lanes.select("))
 
 
+def test_lane_pocket_is_sized_by_the_account_not_by_the_run():
+    """Уберите этот тест — и карман полосы снова достанется первому кабинету
+    по порядку обхода, а не важнейшему.
+
+    Замер 27.08.2026, полоса тонкой настройки: account10 взял 21 действие из
+    142 и вычерпал общий карман, account1/account3/account4 получили 0/2/0 при
+    13/175/5 заявленных. account3 при этом крупнейший кабинет прогона — 9,3
+    млн ₽ за 28 дней. Ровно тот дефект «лимит выбирает первое, а не важное»,
+    ради которого полосы и вводились.
+
+    Две половины одной починки, и обе обязаны стоять вместе: своя тетрадь
+    остатков на кабинет И недельный расход ЭТОГО кабинета. Общая тетрадь с
+    личным расходом раздала бы лимит по-прежнему по порядку; личная тетрадь с
+    расходом прогона подняла бы потолок вчетверо.
+    """
+    import inspect
+
+    source = inspect.getsource(agent_e1.run_account)
+    # Расход полосы считается по кампаниям кабинета, а не по всему справочнику.
+    assert "for cid in campaign_ids) * DAYS_IN_WEEK" in source
+    # Тетрадь остатков — своя на кабинет.
+    assert 'ctx["lane_budgets"].setdefault(login, {})' in source
+    assert "budgets=lane_budgets," in source
+    assert 'budgets=ctx["lane_budgets"]' not in source
+    # Ручной абсолютный потолок недели задан на прогон и режется той же долей.
+    assert "* account_share" in source
+
+
 def test_rails_order_uses_lanes():
     """Уберите этот тест — и полосы вернутся на место лимита прогона, а вместе
     с ним вернётся списание риска за действия, которые в кабинет не поедут.
