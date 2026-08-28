@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """Тесты витрины целей Метрики: разбор ответа Stat API и свёртка в строки витрины."""
-from sync.lime_metrika_goals import COLUMNS, build_rows
-from sync.lime_metrika_goals_api import chunk_goals, fetch_goal_catalog, parse_goal_rows
+from sync.lime_metrika_goals import COLUMNS, build_rows, group_by_day
+from sync.lime_metrika_goals_api import (
+    chunk_goals,
+    fetch_goal_catalog,
+    fetch_goal_reaches,
+    parse_goal_rows,
+)
 
 
 def _col(row, name):
@@ -121,6 +126,55 @@ def test_build_rows_keeps_channels_separate():
     assert sorted((_col(r, "channel"), _col(r, "reaches")) for r in rows) == [
         ("Direct", 2), ("SEM", 5),
     ]
+
+
+def test_group_by_day_splits_period_response():
+    # Период тянется одним запросом, поэтому дни разъезжаются здесь, а не в API-слое.
+    by_day = group_by_day([
+        {"date": "2026-08-01", "goal_id": "111", "reaches": 1.0},
+        {"date": "2026-08-02", "goal_id": "111", "reaches": 2.0},
+        {"date": "2026-08-01", "goal_id": "222", "reaches": 3.0},
+        {"date": "", "goal_id": "333", "reaches": 9.0},
+        {"goal_id": "444", "reaches": 9.0},
+    ])
+    assert sorted(by_day) == ["2026-08-01", "2026-08-02"]
+    assert [g["goal_id"] for g in by_day["2026-08-01"]] == ["111", "222"]
+
+
+def test_fetch_goal_reaches_one_request_per_chunk_for_whole_period(monkeypatch):
+    # Запросов должно быть по числу пачек целей, а не пачек × дней: посуточный цикл
+    # упирался в квоту Метрики на середине месяца.
+    calls = []
+
+    def fake(url, params, token):
+        calls.append(params)
+        return {**_resp([_item("2026-08-01", "ad", "Yandex.Direct", "709091521",
+                               [1.0] * len(params["metrics"].split(",")))]),
+                "total_rows": 1}
+
+    monkeypatch.setattr("sync.lime_metrika_goals_api._request", fake)
+    fetch_goal_reaches("23504302", "token", "2026-08-01", "2026-08-30",
+                       [str(i) for i in range(40)])
+    assert len(calls) == 3
+    assert calls[0]["date1"] == "2026-08-01" and calls[0]["date2"] == "2026-08-30"
+
+
+def test_fetch_goal_reaches_reads_all_pages(monkeypatch):
+    # Ответ длиннее лимита дочитывается смещением: иначе хвост периода терялся бы молча.
+    pages = [
+        {**_resp([_item("2026-08-01", "ad", "Yandex.Direct", "A", [1.0])]), "total_rows": 2},
+        {**_resp([_item("2026-08-02", "ad", "Yandex.Direct", "B", [2.0])]), "total_rows": 2},
+    ]
+    seen = []
+
+    def fake(url, params, token):
+        seen.append(params["offset"])
+        return pages[len(seen) - 1]
+
+    monkeypatch.setattr("sync.lime_metrika_goals_api._request", fake)
+    rows = fetch_goal_reaches("23504302", "token", "2026-08-01", "2026-08-02", ["111"])
+    assert seen == [1, 2]
+    assert [r["utm_campaign"] for r in rows] == ["A", "B"]
 
 
 def test_goal_catalog_marks_autogoals(monkeypatch):

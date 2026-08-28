@@ -35,6 +35,9 @@ DIMENSIONS = (
 
 GEO_FILTER = "ym:s:regionCountryName=='Russia'"
 
+# Максимум строк в ответе Stat API; длиннее — дочитываем смещением.
+PAGE_LIMIT = 100000
+
 
 def _request(url: str, params: dict, token: str) -> dict:
     headers = {"Authorization": f"OAuth {token}"}
@@ -44,10 +47,14 @@ def _request(url: str, params: dict, token: str) -> dict:
         if resp.status_code == 200:
             return resp.json()
         if attempt < RETRIES:
-            time.sleep(RETRY_SLEEP)
+            # 429 — квота запросов Метрики: она отпускает по времени, а не по удаче,
+            # поэтому ждём дольше с каждой попыткой, а не фиксированные RETRY_SLEEP.
+            time.sleep(RETRY_SLEEP * attempt * (4 if resp.status_code == 429 else 1))
+    # `if resp` НЕ работает: Response.__bool__ ложен при статусе ≥400 — то есть ровно
+    # в том случае, ради которого пишется это сообщение, и код ошибки терялся.
     raise RuntimeError(
-        f"Метрика {url}: HTTP {resp.status_code if resp else '?'} "
-        f"{(resp.text[:300] if resp else '')}"
+        f"Метрика {url}: HTTP {resp.status_code if resp is not None else '?'} "
+        f"{(resp.text[:300] if resp is not None else '')}"
     )
 
 
@@ -114,18 +121,36 @@ def parse_goal_rows(resp: dict, goal_ids: list[str]) -> list[dict]:
 
 def fetch_goal_reaches(counter_id, token: str, date_from: str, date_to: str,
                        goal_ids: list[str]) -> list[dict]:
-    """Достижения целей за период по каналу/кампании. Цели тянутся пачками."""
+    """Достижения целей за ВЕСЬ период по каналу/кампании. Цели тянутся пачками.
+
+    Период берётся одним запросом на пачку, а не днём за днём: ym:s:date — измерение,
+    и день в ответе приходит своей строкой. Посуточный цикл давал (целей / 18) × дней
+    запросов — на 110 целях и месяце это 210 обращений, и Метрика обрывала прогон
+    квотой на середине. Здесь их 7.
+
+    Ответ длиннее PAGE_LIMIT дочитывается смещением: total_rows Метрика возвращает сама.
+    """
     out: list[dict] = []
     for chunk in chunk_goals(goal_ids):
-        params = {
-            "ids": counter_id,
-            "date1": date_from,
-            "date2": date_to,
-            "metrics": ",".join(f"ym:s:goal{gid}reaches" for gid in chunk),
-            "dimensions": ",".join(DIMENSIONS),
-            "filters": GEO_FILTER,
-            "accuracy": "full",
-            "limit": 100000,
-        }
-        out.extend(parse_goal_rows(_request(STAT_URL, params, token), chunk))
+        offset = 1
+        while True:
+            params = {
+                "ids": counter_id,
+                "date1": date_from,
+                "date2": date_to,
+                "metrics": ",".join(f"ym:s:goal{gid}reaches" for gid in chunk),
+                "dimensions": ",".join(DIMENSIONS),
+                "filters": GEO_FILTER,
+                "accuracy": "full",
+                "limit": PAGE_LIMIT,
+                "offset": offset,
+            }
+            resp = _request(STAT_URL, params, token)
+            page = resp.get("data") or []
+            out.extend(parse_goal_rows(resp, chunk))
+            offset += len(page)
+            # total_rows — сколько строк у запроса всего; без явной остановки по нему
+            # хвост периода молча терялся бы, а данные выглядели бы целыми.
+            if not page or offset > int(resp.get("total_rows") or 0):
+                break
     return out

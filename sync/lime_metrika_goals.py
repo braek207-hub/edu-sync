@@ -121,6 +121,20 @@ def build_rows(goal_rows, date_s: str) -> list[tuple]:
     ]
 
 
+def group_by_day(goal_rows) -> dict[str, list[dict]]:
+    """Строки ответа за период → {'YYYY-MM-DD': [строки этого дня]}.
+
+    Строки без даты отбрасываются: писать их некуда, а в «сегодня» они бы соврали.
+    """
+    out: dict[str, list[dict]] = {}
+    for g in goal_rows:
+        day = (g.get("date") or "").strip()
+        if not day:
+            continue
+        out.setdefault(day, []).append(g)
+    return out
+
+
 def _write_catalog(conn, catalog: list[dict]) -> None:
     if not catalog:
         return
@@ -147,11 +161,17 @@ def _sync_range(frm: date, to: date, conn) -> int:
     if conn is not None:
         _write_catalog(conn, catalog)
 
+    # Весь период — одним обращением на пачку целей: день приходит измерением.
+    # Посуточный цикл на 110 целях давал 7 запросов × число дней, и Метрика рубила
+    # прогон квотой на середине месяца.
+    api_rows = fetch_goal_reaches(COUNTER_ID, token, frm.isoformat(), to.isoformat(), goal_ids)
+    by_day = group_by_day(api_rows)
+
     total = 0
     day = frm
     while day <= to:
         day_s = day.isoformat()
-        rows = build_rows(fetch_goal_reaches(COUNTER_ID, token, day_s, day_s, goal_ids), day_s)
+        rows = build_rows(by_day.get(day_s, []), day_s)
 
         if conn is None:
             i_r = COLUMNS.index("reaches")
