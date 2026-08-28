@@ -44,9 +44,18 @@ def _truthy(v) -> bool:
     return str(v).strip() in ("1", "true", "True", "yes")
 
 
-def first_install_per_device(installs: list[dict], keep_reattribution: bool,
-                             keep_reinstall: bool) -> dict[str, dict]:
-    best: dict[str, dict] = {}
+def first_install_attribution(installs: list[dict], keep_reattribution: bool,
+                              keep_reinstall: bool,
+                              entity_map: dict | None = None) -> dict[str, tuple]:
+    """device → (install_dt, publisher, detail, campaign_id) его ПЕРВОЙ установки.
+
+    Единственное место, где считается когортная привязка устройства: на неё опираются
+    и месячные когорты, и дневные cohort_orders, и циклы покупки. Раньше тот же цикл
+    был выписан дважды с разным набором полей — расхождение фильтров дало бы разные
+    когорты в соседних витринах.
+    """
+    entity_map = entity_map or {}
+    best: dict[str, tuple] = {}
     for r in installs:
         if not keep_reinstall and _truthy(r.get("is_reinstallation")):
             continue
@@ -57,9 +66,22 @@ def first_install_per_device(installs: list[dict], keep_reattribution: bool,
             continue
         dt = parse_dt(r["install_datetime"])
         cur = best.get(dev)
-        if cur is None or dt < cur["install_dt"]:
-            best[dev] = {"install_dt": dt, "publisher": r.get("publisher_name") or "unknown"}
+        if cur is None or dt < cur[0]:
+            params = r.get("click_url_parameters") or ""
+            pub = r.get("publisher_name") or "unknown"
+            best[dev] = (dt, pub, param_of(params, "utm_source"),
+                         install_campaign(pub, params, entity_map))
     return best
+
+
+def first_install_per_device(installs: list[dict], keep_reattribution: bool,
+                             keep_reinstall: bool) -> dict[str, dict]:
+    """Когортная привязка в виде, который ждут месячные когорты (build_cohorts)."""
+    return {
+        dev: {"install_dt": dt, "publisher": pub}
+        for dev, (dt, pub, _detail, _campaign)
+        in first_install_attribution(installs, keep_reattribution, keep_reinstall).items()
+    }
 
 
 def param_of(raw: str, key: str) -> str:
@@ -263,27 +285,11 @@ def build_installs_daily_with_cohort(installs: list[dict], purchases: list[tuple
     entity_map = entity_map or {}
     base = build_installs_daily(installs, keep_reattribution, keep_reinstall, entity_map)
 
-    # Первая установка устройства → её день/партнёр/метки (когортная привязка).
-    first: dict[str, tuple] = {}
-    for r in installs:
-        if not keep_reinstall and _truthy(r.get("is_reinstallation")):
-            continue
-        if not keep_reattribution and _truthy(r.get("is_reattribution")):
-            continue
-        dev = r.get("appmetrica_device_id")
-        if not dev:
-            continue
-        dt = parse_dt(r["install_datetime"])
-        cur = first.get(dev)
-        if cur is None or dt < cur[0]:
-            params = r.get("click_url_parameters") or ""
-            pub = r.get("publisher_name") or "unknown"
-            first[dev] = (dt, pub, param_of(params, "utm_source"),
-                          install_campaign(pub, params, entity_map))
+    first = first_install_attribution(installs, keep_reattribution, keep_reinstall, entity_map)
 
     orders: dict[tuple, int] = defaultdict(int)
     revenue: dict[tuple, float] = defaultdict(float)
-    for dev, _pmonth, _txn, amount in purchases:
+    for dev, _purchase_dt, _txn, amount in purchases:
         f = first.get(dev)
         if not f:
             continue
@@ -297,7 +303,10 @@ def build_installs_daily_with_cohort(installs: list[dict], purchases: list[tuple
 
 
 def purchase_facts(events: list[dict]) -> list[tuple]:
-    """Сырые события покупки → факты (device, месяц покупки, transaction_id, сумма).
+    """Сырые события покупки → факты (device, время покупки, transaction_id, сумма).
+
+    Время, а не месяц: месяц из него получается на месте (month_start), а обратно —
+    нет, и без времени не посчитать лаг «установка → покупка» (циклы покупки).
 
     Дедуп по transaction_id: одно и то же событие иногда приходит дважды (0.4% на
     замере), и без дедупа задваивались бы и заказы, и выручка. Событие без
@@ -323,7 +332,7 @@ def purchase_facts(events: list[dict]) -> list[tuple]:
             seen.add(txn)
         value = payload.get("value")
         amount = float(value) if isinstance(value, (int, float)) else 0.0
-        out.append((dev, month_start(parse_dt(e["event_datetime"])), txn, amount))
+        out.append((dev, parse_dt(e["event_datetime"]), txn, amount))
     return out
 
 
@@ -345,11 +354,11 @@ def build_cohorts(first_installs: dict[str, dict], purchases: list[tuple],
     new_orders: dict[tuple, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     new_revenue: dict[tuple, dict[int, float]] = defaultdict(lambda: defaultdict(float))
 
-    for dev, pmonth, _txn, amount in purchases:
+    for dev, purchase_dt, _txn, amount in purchases:
         ck = device_cohort.get(dev)
         if not ck:
             continue
-        lm = month_diff(pmonth, ck[0])
+        lm = month_diff(month_start(purchase_dt), ck[0])
         if lm < 0 or lm > max_life:
             continue
         if dev not in first_life or lm < first_life[dev]:
@@ -375,6 +384,74 @@ def build_cohorts(first_installs: dict[str, dict], purchases: list[tuple],
             revenue += new_revenue[key].get(lm, 0.0)
             out.append((cm, pub, lm, size, buyers, orders, round(revenue, 2)))
     return out
+
+
+# Шаги цикла покупки. Порядковый номер = индекс покупки, от которой считается лаг:
+# 0 — от установки до 1-й покупки, 1 — от 1-й до 2-й, 2 — от 2-й до 3-й.
+CYCLE_STEPS = ("install_p1", "p1_p2", "p2_p3")
+# Лаг больше года — мусор (сбитое время устройства): в окно синка он всё равно не влезает.
+CYCLE_MAX_DAYS = 366
+
+
+def build_purchase_cycles(installs: list[dict], purchases: list[tuple],
+                          keep_reattribution: bool, keep_reinstall: bool,
+                          entity_map: dict | None = None) -> tuple[list[tuple], list[tuple]]:
+    """Лаги «установка → 1-я покупка» и «покупка N → покупка N+1» + знаменатели когорт.
+
+    Возвращает две пачки строк:
+      • cycle: (cohort_date, publisher, detail, campaign_id, step, days, devices) —
+        сколько устройств когорты прошли шаг ровно за `days` дней. Лаг ТОЧНЫЙ, не бакет:
+        медиана и перцентили тогда считаются точно на любом уровне свёртки.
+      • cohort: (cohort_date, publisher, detail, campaign_id, devices, buyers1..3) —
+        размер когорты и сколько её устройств дошло до 1/2/3-й покупки. Без этого
+        знаменателя «доля купивших за N дней» не посчитать: в lime_app_installs.installs
+        дневной дедуп, а здесь нужна именно первая установка.
+
+    Привязка — к ПЕРВОЙ установке устройства, как у месячных когорт: иначе повторная
+    установка приписала бы один и тот же лаг дважды.
+
+    ВАЖНО про цензурирование: устройство, установившееся вчера, не могло купить через
+    30 дней. Поэтому «средний лаг свежих когорт» всегда меньше — это артефакт наблюдения.
+    Витрина отдаёт сырое распределение и размер когорты; отсечку по зрелости делает
+    читатель (дашборд считает долю купивших за фиксированное окно).
+
+    Дни считаются по КАЛЕНДАРНЫМ датам (0 = покупка в день установки), а не по часам:
+    так лаг совпадает с тем, что видно в отчётах, и не зависит от времени суток.
+    """
+    first = first_install_attribution(installs, keep_reattribution, keep_reinstall, entity_map)
+
+    # device → отсортированные даты покупок (дедуп по transaction_id уже сделан выше).
+    by_device: dict[str, list] = defaultdict(list)
+    for dev, purchase_dt, _txn, _amount in purchases:
+        if dev in first:
+            by_device[dev].append(purchase_dt)
+
+    cycle: dict[tuple, int] = defaultdict(int)
+    cohort_devices: dict[tuple, int] = defaultdict(int)
+    cohort_buyers: dict[tuple, list] = defaultdict(lambda: [0, 0, 0])
+
+    for dev, (install_dt, pub, detail, campaign) in first.items():
+        key = (install_dt.date(), pub, detail, campaign)
+        cohort_devices[key] += 1
+        times = sorted(by_device.get(dev, ()))
+        if not times:
+            continue
+        for i in range(min(len(times), 3)):
+            cohort_buyers[key][i] += 1
+        prev = install_dt
+        for i, t in enumerate(times[: len(CYCLE_STEPS)]):
+            days = (t.date() - prev.date()).days
+            prev = t
+            # Отрицательный лаг = покупка раньше своей же установки: рассинхрон времени
+            # приёма события и времени установки. Такое устройство шаг не проходило.
+            if 0 <= days <= CYCLE_MAX_DAYS:
+                cycle[(*key, CYCLE_STEPS[i], days)] += 1
+
+    cycle_rows = [(*k, n) for k, n in cycle.items()]
+    cohort_rows = [
+        (*k, n, *cohort_buyers[k]) for k, n in cohort_devices.items()
+    ]
+    return cycle_rows, cohort_rows
 
 
 def sync_window(months: int, today: date) -> tuple[str, str]:
@@ -407,10 +484,58 @@ def _pg_url() -> str:
     return os.environ["DATABASE_URL"].split("?")[0]
 
 
-def _write(installs_rows: list[tuple], cohort_rows: list[tuple]) -> None:
+# Зеркало migrations/lime/027_app_purchase_cycles.sql: синк создаёт свои витрины сам,
+# чтобы новая грань не требовала ручного шага в проде. Идемпотентно.
+_CYCLE_DDL = (
+    """CREATE TABLE IF NOT EXISTS lime_app_cycle_daily (
+      cohort_date date NOT NULL,
+      publisher   text NOT NULL,
+      detail      text NOT NULL DEFAULT '',
+      campaign_id text NOT NULL DEFAULT '',
+      step        text NOT NULL,
+      days        integer NOT NULL,
+      devices     integer NOT NULL DEFAULT 0,
+      updated_at  timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (cohort_date, publisher, detail, campaign_id, step, days))""",
+    """CREATE INDEX IF NOT EXISTS idx_lime_app_cycle_daily_date_step
+      ON lime_app_cycle_daily (cohort_date, step)""",
+    """CREATE INDEX IF NOT EXISTS idx_lime_app_cycle_daily_campaign
+      ON lime_app_cycle_daily (campaign_id, cohort_date)""",
+    """CREATE TABLE IF NOT EXISTS lime_app_cycle_cohort (
+      cohort_date date NOT NULL,
+      publisher   text NOT NULL,
+      detail      text NOT NULL DEFAULT '',
+      campaign_id text NOT NULL DEFAULT '',
+      devices     integer NOT NULL DEFAULT 0,
+      buyers1     integer NOT NULL DEFAULT 0,
+      buyers2     integer NOT NULL DEFAULT 0,
+      buyers3     integer NOT NULL DEFAULT 0,
+      updated_at  timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (cohort_date, publisher, detail, campaign_id))""",
+    """CREATE INDEX IF NOT EXISTS idx_lime_app_cycle_cohort_date
+      ON lime_app_cycle_cohort (cohort_date)""",
+    # ENABLE RLS берёт ACCESS EXCLUSIVE lock даже когда RLS уже включён → условно.
+    """DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = 'public' AND c.relname = 'lime_app_cycle_daily'
+                       AND c.relrowsecurity)
+      THEN EXECUTE 'ALTER TABLE lime_app_cycle_daily ENABLE ROW LEVEL SECURITY'; END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = 'public' AND c.relname = 'lime_app_cycle_cohort'
+                       AND c.relrowsecurity)
+      THEN EXECUTE 'ALTER TABLE lime_app_cycle_cohort ENABLE ROW LEVEL SECURITY'; END IF;
+    END $$""",
+)
+
+
+def _write(installs_rows: list[tuple], cohort_rows: list[tuple],
+           cycle_rows: list[tuple], cycle_cohort_rows: list[tuple]) -> None:
     conn = psycopg2.connect(_pg_url(), connect_timeout=30)
     try:
         with conn.cursor() as cur:
+            for stmt in _CYCLE_DDL:
+                cur.execute(stmt)
             cur.execute("DELETE FROM lime_app_installs")
             psycopg2.extras.execute_values(
                 cur,
@@ -426,6 +551,22 @@ def _write(installs_rows: list[tuple], cohort_rows: list[tuple]) -> None:
                 "(cohort_month, publisher, life_month, cohort_size, buyers, orders, revenue) "
                 "VALUES %s",
                 cohort_rows, page_size=500,
+            )
+            cur.execute("DELETE FROM lime_app_cycle_daily")
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO lime_app_cycle_daily "
+                "(cohort_date, publisher, detail, campaign_id, step, days, devices) "
+                "VALUES %s",
+                cycle_rows, page_size=2000,
+            )
+            cur.execute("DELETE FROM lime_app_cycle_cohort")
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO lime_app_cycle_cohort "
+                "(cohort_date, publisher, detail, campaign_id, devices, buyers1, buyers2, buyers3) "
+                "VALUES %s",
+                cycle_cohort_rows, page_size=2000,
             )
         conn.commit()
     except Exception:
@@ -487,6 +628,8 @@ def sync_lime_appmetrica() -> None:
     installs_rows = build_installs_daily_with_cohort(
         installs_raw, purchases_raw, keep_reattr, keep_reinstall, entity_map)
     cohort_rows = build_cohorts(first, purchases_raw, max_life)
+    cycle_rows, cycle_cohort_rows = build_purchase_cycles(
+        installs_raw, purchases_raw, keep_reattr, keep_reinstall, entity_map)
 
     if not installs_rows:
         raise RuntimeError(
@@ -496,6 +639,7 @@ def sync_lime_appmetrica() -> None:
             f"({since}..{until})."
         )
 
-    _write(installs_rows, cohort_rows)
+    _write(installs_rows, cohort_rows, cycle_rows, cycle_cohort_rows)
     print(f"[lime-appmetrica] записано: install-строк={len(installs_rows)}, "
-          f"cohort-строк={len(cohort_rows)}")
+          f"cohort-строк={len(cohort_rows)}, cycle-строк={len(cycle_rows)}, "
+          f"cycle-cohort-строк={len(cycle_cohort_rows)}")

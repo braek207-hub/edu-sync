@@ -35,10 +35,10 @@ def test_first_install_filters_reinstall():
     assert fi == {}                                           # переустановка отфильтрована
 
 
-def _buy(dev, ym, amount=1000.0, txn=None):
-    """Факт покупки: (device, месяц покупки, transaction_id, сумма)."""
+def _buy(dev, ym, amount=1000.0, txn=None, day=1):
+    """Факт покупки: (device, время покупки, transaction_id, сумма)."""
     y, mo = ym
-    return (dev, date(y, mo, 1), txn or f"{dev}-{y}{mo:02d}", amount)
+    return (dev, datetime(y, mo, day), txn or f"{dev}-{y}{mo:02d}-{day}", amount)
 
 
 def _by_pub(rows):
@@ -475,3 +475,95 @@ def test_warn_if_vk_entities_stale():
     assert m.warn_if_vk_entities_stale(10, stale, now) is True
     fresh = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)           # сутки
     assert m.warn_if_vk_entities_stale(10, fresh, now) is False
+
+
+def _cyc_inst(dev, dt, publisher="Yandex.Direct", params=""):
+    return {"appmetrica_device_id": dev, "install_datetime": dt, "publisher_name": publisher,
+            "click_url_parameters": params, "is_reattribution": "0", "is_reinstallation": "0"}
+
+
+def _cycles_by_step(rows):
+    """(step → {days: устройств}) — свёртка витрины циклов для проверок."""
+    out = {}
+    for _d, _pub, _det, _camp, step, days, devices in rows:
+        out.setdefault(step, {})[days] = out.setdefault(step, {}).get(days, 0) + devices
+    return out
+
+
+def test_purchase_cycles_lags_from_install_and_between_purchases():
+    installs = [_cyc_inst("d1", "2026-03-01 10:00:00")]
+    purchases = [
+        (("d1"), datetime(2026, 3, 8, 9, 0), "t1", 100.0),    # +7 дней от установки
+        (("d1"), datetime(2026, 3, 26, 9, 0), "t2", 100.0),   # +18 дней от первой покупки
+    ]
+    cycle, cohort = m.build_purchase_cycles(installs, purchases, True, False)
+    steps = _cycles_by_step(cycle)
+    assert steps["install_p1"] == {7: 1}
+    assert steps["p1_p2"] == {18: 1}
+    assert "p2_p3" not in steps
+    assert cohort == [(date(2026, 3, 1), "Yandex.Direct", "", "", 1, 1, 1, 0)]
+
+
+def test_purchase_cycles_same_day_purchase_is_zero_days():
+    installs = [_cyc_inst("d1", "2026-03-01 08:00:00")]
+    purchases = [("d1", datetime(2026, 3, 1, 23, 30), "t1", 100.0)]
+    cycle, _cohort = m.build_purchase_cycles(installs, purchases, True, False)
+    assert _cycles_by_step(cycle)["install_p1"] == {0: 1}   # календарный день, не 24 часа
+
+
+def test_purchase_cycles_cohort_counts_devices_without_purchases():
+    """Знаменатель обязан включать устройства БЕЗ покупок — иначе доля купивших = 100%."""
+    installs = [_cyc_inst("d1", "2026-03-01 10:00:00"), _cyc_inst("d2", "2026-03-01 11:00:00")]
+    purchases = [("d1", datetime(2026, 3, 3), "t1", 100.0)]
+    _cycle, cohort = m.build_purchase_cycles(installs, purchases, True, False)
+    assert cohort == [(date(2026, 3, 1), "Yandex.Direct", "", "", 2, 1, 0, 0)]
+
+
+def test_purchase_cycles_bind_to_first_install_not_repeat():
+    """Повторная установка не создаёт вторую когорту — иначе лаг посчитался бы дважды."""
+    installs = [
+        _cyc_inst("d1", "2026-03-01 10:00:00"),
+        _cyc_inst("d1", "2026-04-10 10:00:00", publisher="VK Ads (ex. myTarget)"),
+    ]
+    purchases = [("d1", datetime(2026, 3, 11), "t1", 100.0)]
+    cycle, cohort = m.build_purchase_cycles(installs, purchases, True, False)
+    assert len(cohort) == 1
+    assert cohort[0][:2] == (date(2026, 3, 1), "Yandex.Direct")
+    assert _cycles_by_step(cycle)["install_p1"] == {10: 1}
+
+
+def test_purchase_cycles_drop_purchase_before_install():
+    """Покупка раньше собственной установки — рассинхрон времён, шаг не пройден."""
+    installs = [_cyc_inst("d1", "2026-03-10 10:00:00")]
+    purchases = [("d1", datetime(2026, 3, 1), "t1", 100.0)]
+    cycle, cohort = m.build_purchase_cycles(installs, purchases, True, False)
+    assert cycle == []
+    assert cohort[0][5] == 1        # покупателем устройство всё равно остаётся
+
+
+def test_purchase_cycles_ignore_device_installed_outside_window():
+    installs = [_cyc_inst("d1", "2026-03-01 10:00:00")]
+    purchases = [("d_old", datetime(2026, 3, 5), "t1", 100.0)]
+    cycle, cohort = m.build_purchase_cycles(installs, purchases, True, False)
+    assert cycle == []
+    assert cohort == [(date(2026, 3, 1), "Yandex.Direct", "", "", 1, 0, 0, 0)]
+
+
+def test_purchase_cycles_split_by_detail_and_campaign():
+    installs = [
+        _cyc_inst("d1", "2026-03-01 10:00:00", params="utm_source=google&campaign_id=111"),
+        _cyc_inst("d2", "2026-03-01 10:00:00", params="utm_source=ig&campaign_id=222"),
+    ]
+    purchases = [
+        ("d1", datetime(2026, 3, 3), "t1", 100.0),
+        ("d2", datetime(2026, 3, 9), "t2", 100.0),
+    ]
+    cycle, _cohort = m.build_purchase_cycles(installs, purchases, True, False)
+    by_key = {(r[2], r[3]): r[5] for r in cycle if r[4] == "install_p1"}
+    assert by_key == {("google", "111"): 2, ("ig", "222"): 8}
+
+
+def test_purchase_facts_keeps_event_time():
+    events = [{"appmetrica_device_id": "d1", "event_datetime": "2026-01-10 10:30:00",
+               "event_json": '{"transaction_id": 1, "value": 100}'}]
+    assert m.purchase_facts(events)[0][1] == datetime(2026, 1, 10, 10, 30)
