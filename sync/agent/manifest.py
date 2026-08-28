@@ -161,7 +161,8 @@ def settings() -> List[Dict[str, Any]]:
 
 def locked() -> List[Dict[str, str]]:
     """Пороги защиты: их нет в панели, и это утверждение, а не пробел."""
-    return [{"key": key} for key in config.LOCKED_KEYS]
+    return [{"key": key, "about": config.LOCKED_ABOUT[key]}
+            for key in config.LOCKED_KEYS]
 
 
 def presets() -> Dict[str, Dict[str, Any]]:

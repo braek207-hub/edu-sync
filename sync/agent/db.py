@@ -872,6 +872,15 @@ def _parse_config_value(raw: str) -> Any:
     text = str(raw).strip()
     if text == "":
         return None
+    # Составные настройки (lane_steps, shadow_lanes) хранятся в той же
+    # текстовой колонке как JSON. Без этой ветки они приезжали строкой, и
+    # _lane_steps ронял разбор словами «нужен словарь» — то есть выпустить
+    # полосу из тени через панель было нельзя вовсе, при живом ключе в SPEC.
+    if text[0] in "{[":
+        try:
+            return json.loads(text)
+        except ValueError:
+            return text
     try:
         return float(text)
     except ValueError:

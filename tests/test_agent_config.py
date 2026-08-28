@@ -143,3 +143,26 @@ def test_risk_budget_week_stays_locked():
     assert "risk_budget_week" not in DEFAULTS
     with pytest.raises(ValueError, match="не переопределяется"):
         resolve(overrides={"risk_budget_week": 500_000.0})
+
+
+def test_composite_settings_survive_the_text_column():
+    # Сквозной путь ровно тот, которым идёт прогон: текст колонки
+    # edu_agent_config.value → _parse_config_value → resolve. Раньше он
+    # обрывался посередине: разбор возвращал строку, и _lane_steps ронял
+    # прогон словами «нужен словарь». То есть выпустить полосу из тени
+    # настройкой было нельзя — при живом ключе в SPEC и живой ручке в панели.
+    from sync.agent.db import _parse_config_value
+
+    steps = _parse_config_value('{"suspend": 1}')
+    assert steps == {"suspend": 1}
+    assert resolve(overrides={"lane_steps": steps})["lane_steps"] == {"suspend": 1}
+
+    lanes = _parse_config_value('["suspend", "allocation"]')
+    assert resolve(overrides={"shadow_lanes": lanes})["shadow_lanes"] == [
+        "allocation", "suspend"]
+
+    # Обычные значения разбираются как прежде, а битый JSON не притворяется
+    # значением: он доедет до валидации и там честно упадёт.
+    assert _parse_config_value("0.07") == 0.07
+    assert _parse_config_value("full") == "full"
+    assert _parse_config_value("{сломано") == "{сломано"

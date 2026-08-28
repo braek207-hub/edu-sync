@@ -44,6 +44,13 @@ def test_locked_keys_are_listed_as_locked(built):
                 & {row["key"] for row in built["settings"]})
 
 
+def test_locked_keys_carry_the_reason(built):
+    # Без причины запертый ключ читается как недоделка экрана. Причина живёт
+    # у агента и едет в манифест — панель её не сочиняет.
+    for row in built["locked"]:
+        assert row.get("about"), row["key"]
+
+
 def test_number_settings_carry_their_range(built):
     for row in built["settings"]:
         if row["kind"] != "number":
