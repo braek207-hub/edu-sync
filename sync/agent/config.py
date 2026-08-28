@@ -31,6 +31,12 @@ from sync.agent.writer.budget import BUDGET_COOLDOWN_DAYS, MAX_WRITE_STEP
 from sync.agent.writer.risk import DEFAULT_RISK_SHARE_WEEK
 from sync.agent.writer.switch import MAX_SUSPENDS_PER_RUN
 
+# Виды значений, которые не описываются диапазоном чисел или перечнем строк.
+# Заведены здесь, а не проверкой по имени ключа: имя проверяется в одном месте,
+# а вид — в двух (валидация и подпись), и разъехаться им нельзя.
+KIND_LANE_STEPS = "lane_steps"   # {полоса: ступень}
+KIND_LANE_LIST = "lane_list"     # [полоса, полоса]
+
 # Что регулируется. Значение по умолчанию = константа кода, диапазон — границы,
 # внутри которых параметр остаётся осмысленным (а не «лишь бы не падало»).
 #
@@ -88,6 +94,25 @@ SPEC: Dict[str, Dict[str, Any]] = {
     "target_romi": {
         "default": 1.0, "min": 1.0, "max": 5.0,
         "about": "требуемая окупаемость целевого CPA (1.0 — безубыточность)",
+    },
+    "lane_steps": {
+        # Ступень полосы вручную. Обычно её выдаёт лестница автономии по
+        # послужному списку (writer/lanes.steps_by_lane), и этот ключ —
+        # единственный способ её перебить: им ВЫПУСКАЮТ полосу из тени и им же
+        # сажают обратно, не дожидаясь, пока накопленная история переварит
+        # свежий провал. Пусто — лестница решает сама.
+        "default": None, "nullable": True, "kind": KIND_LANE_STEPS,
+        "about": "ступень полосы вручную: 0 — тень, 1–3 — доля недельного "
+                 "расхода на риск полосы",
+    },
+    "shadow_lanes": {
+        # Полосы, которые человек держит в ТЕНИ: они пишут намерения в журнал
+        # и не применяют ничего. Список приходит настройкой, а не константой
+        # кода, ровно потому, что выпуск рычага — решение человека, и оно не
+        # должно требовать правки кода и деплоя.
+        "default": None, "nullable": True, "kind": KIND_LANE_LIST,
+        "about": "полосы на приёмке: пишут «сделал бы X, жду Y», ничего не "
+                 "применяя",
     },
     "monthly_budget_cap_rub": {
         # Единственный параметр, у которого пусто — законное состояние, а не
@@ -152,6 +177,12 @@ def _validate(key: str, value: Any) -> Any:
         # иначе параметр нельзя ни оставить пустым, ни вернуть в пустое.
         return None
 
+    kind = spec.get("kind")
+    if kind == KIND_LANE_STEPS:
+        return _lane_steps(key, value)
+    if kind == KIND_LANE_LIST:
+        return _lane_list(key, value)
+
     choices = spec.get("choices")
     if choices is not None:
         if value not in choices:
@@ -167,6 +198,49 @@ def _validate(key: str, value: Any) -> Any:
         raise ValueError(
             f"{key}={value} вне допустимого диапазона [{spec['min']}, {spec['max']}]")
     return type(spec["default"])(number) if isinstance(spec["default"], int) else number
+
+
+def _known_lane(key: str, lane: Any) -> str:
+    """Имя полосы, проверенное по перечню. Опечатка — ошибка, а не умолчание.
+
+    Полоса с опечаткой молча не нашлась бы ни в одном месте: «suspand» в
+    списке тени означал бы, что выключения продолжают применяться, а человек
+    считает, что убрал их на приёмку.
+    """
+    from sync.agent.writer.lanes import ALL_LANES
+
+    name = str(lane)
+    if name not in ALL_LANES:
+        raise ValueError(f"{key}: неизвестная полоса {lane!r}; "
+                         f"есть {', '.join(ALL_LANES)}")
+    return name
+
+
+def _lane_steps(key: str, value: Any) -> Dict[str, int]:
+    """{полоса: ступень} — обе стороны проверены по своим перечням."""
+    from sync.agent.autonomy import STEPS
+
+    if not isinstance(value, dict):
+        raise ValueError(f"{key}={value!r}: нужен словарь «полоса: ступень»")
+    allowed = {candidate.step for candidate in STEPS}
+    out: Dict[str, int] = {}
+    for lane, step in value.items():
+        try:
+            number = int(step)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key}[{lane}]={step!r}: ступень — целое число")
+        if number not in allowed:
+            raise ValueError(
+                f"{key}[{lane}]={step}: нет такой ступени; "
+                f"есть {', '.join(str(s) for s in sorted(allowed))}")
+        out[_known_lane(key, lane)] = number
+    return out
+
+
+def _lane_list(key: str, value: Any) -> List[str]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple, set)):
+        raise ValueError(f"{key}={value!r}: нужен список полос")
+    return sorted({_known_lane(key, lane) for lane in value})
 
 
 def resolve(preset: Optional[str] = None,

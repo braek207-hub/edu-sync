@@ -979,6 +979,12 @@ def _patch_watchdog_main(monkeypatch, lock):
     # он проверяет отдельно (test_agent_experiments.py).
     monkeypatch.setattr(watchdog.agent_db, "load_open_hypotheses",
                         lambda statuses: [])
+    # Очередь теневых намерений — тем же доводом: сверка идёт каждым прогоном,
+    # и без подмены тест про аренду падал бы на живой базе. Пусто = полос в
+    # тени нет или их намерения уже сверены.
+    monkeypatch.setattr(watchdog.writer_db, "shadow_actions", lambda *a, **k: [])
+    monkeypatch.setattr(watchdog.writer_db, "mark_shadow_outcome",
+                        lambda *a, **k: True)
     # Чёрный ящик ходит в живую базу — в тестах он молчит. Своё поведение
     # он проверяет сам (tests/test_agent_blackbox.py).
     monkeypatch.setattr(watchdog.blackbox, "save_run",

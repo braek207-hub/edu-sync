@@ -56,7 +56,9 @@ from sync.agent import gate as gate_module
 from sync.agent import holdout
 from sync.agent import tact_effect
 from sync.agent.gate import mart_gate, with_source_checks
+from sync.agent.learning_loop import MIN_EXPECTED_LEADS
 from sync.agent.writer import db as writer_db
+from sync.agent.writer import expectation
 from sync.agent.writer.apply import _element_errors
 # journal_allowed — общее правило движка (writer/client.py), а не местное
 # решение сторожа: журнал ОДИН на оба окружения, и тем же правилом
@@ -206,7 +208,8 @@ def _as_date(value: Any) -> Optional[date]:
 
 
 def observation_window(
-    action: Dict[str, Any], today: date, crm_through: Optional[date]
+    action: Dict[str, Any], today: date, crm_through: Optional[date],
+    horizon_days: int = OBSERVATION_HORIZON_DAYS
 ) -> Optional[Tuple[date, date, bool]]:
     """Окно наблюдения действия: (первый день, последний день, закрыто ли).
 
@@ -223,6 +226,12 @@ def observation_window(
     None — окно ещё не открылось: ни одного полного дня после применения не
     прошло. «Закрыто» значит, что горизонт исчерпан и новых данных в окно уже
     не добавится.
+
+    horizon_days — длина горизонта. По умолчанию общий горизонт наблюдения;
+    сверка теневых намерений передаёт сюда срок ИХ СОБСТВЕННОГО обещания
+    (expectation_days полосы), потому что «жду Y за три дня» и «жду Y за
+    тридцать» — разные утверждения, и мерить их одним окном значит спрашивать
+    с трёхдневного обещания месячный дрейф объекта.
     """
     applied = _as_date(action.get("applied_at")) or _as_date(action.get("created_at"))
     if applied is None:
@@ -233,7 +242,7 @@ def observation_window(
         # CPA бесконечен, красная линия пробита на ровном месте.
         return None
     start = applied + timedelta(days=OBSERVATION_LAG_DAYS)
-    horizon_end = start + timedelta(days=OBSERVATION_HORIZON_DAYS - 1)
+    horizon_end = start + timedelta(days=int(horizon_days) - 1)
     # Три ограничителя, и каждый отвечает за своё: горизонт — чтобы не судить
     # об изменении по кварталу дрейфа; вчера — сегодняшний день неполон по
     # расходу; граница зрелости CRM — дальше неё лежат дни с расходом и нулём
@@ -691,6 +700,135 @@ def money_check_due(action: Dict[str, Any], today: date) -> bool:
 # заповедник: контролем он работает и здесь, и в замере такта целиком
 # (tact_effect), а две копии порога однажды назвали бы контролем разное. Имя
 # здесь оставлено прежним: на него ссылаются читатели сторожа.
+# ---------------------------------------- сверка теневых намерений (Ф9)
+
+SHADOW_HIT = "shadow_hit"
+SHADOW_MISS = "shadow_miss"
+SHADOW_UNKNOWN = "shadow_unknown"
+
+# Причины молчать. Каждая названа, потому что чинятся они по-разному: одна
+# ждёт времени, вторая — данных, третья не чинится вовсе.
+SHADOW_OPEN_REASON = "горизонт обещания ещё не закрыт — сверять рано"
+SHADOW_NO_PROMISE_REASON = ("намерение не заявило обещания в заявках — "
+                            "сверять нечего")
+SHADOW_SMALL_PROMISE_REASON = (
+    f"обещание меньше {MIN_EXPECTED_LEADS:.0f} заявки — счётчик заявок такую "
+    "разницу не различает")
+SHADOW_NO_BASE_REASON = ("в красной линии нет темпа базы — не с чем сравнивать "
+                         "наблюдённые заявки")
+
+
+def shadow_check(action: Dict[str, Any], rows: List[Dict[str, Any]],
+                 today: date, crm_through: Optional[date]) -> Dict[str, Any]:
+    """Сбылось ли обещание теневого намерения САМО, без вмешательства агента.
+
+    Намерение записано полосой на ступени 0: «сделал бы X, жду Y заявок к дате
+    D». Действия не было, значит эффекта действия не существует — и сверять
+    здесь можно ровно одно: пошёл ли объект туда, куда обещал рычаг, пока его
+    никто не трогал.
+
+    Что означает каждый исход, и чего он НЕ означает:
+
+      shadow_hit  — объект сам ушёл в обещанную сторону не меньше, чем на
+                    обещанную величину. Это довод ПРОТИВ выпуска рычага: он
+                    предсказывает дрейф, который случился бы и без него, и
+                    применение приписало бы себе чужое движение.
+      shadow_miss — не ушёл. Это не доказательство, что рычаг сработал бы, —
+                    контрфактического наблюдения не существует. Это лишь
+                    означает, что обещание не сбывается само по себе, то есть
+                    рычагу есть что добавить.
+
+    Ни один из двух исходов не решает за человека: решение о выпуске из тени —
+    его, а это материал под решение (autonomy.py, правило 1).
+
+    Возвращает {"verdict", "reason", "final", ...}. final=False — вердикт не
+    записывается в журнал: намерение вернётся на сверку следующим прогоном.
+    """
+    payload = action.get("payload") or {}
+    # Обещание читается СВОИМИ ключами, а не expectation.of: у того есть
+    # ветка расчёта по модели, и на обеднённой строке журнала она выдумала бы
+    # обещание, которого рычаг не заявлял. Здесь сверяется заявленное.
+    if payload.get(expectation.BASIS_KEY) is None:
+        return {"verdict": SHADOW_UNKNOWN, "reason": SHADOW_NO_PROMISE_REASON,
+                "final": True}
+    promised = float(payload.get(expectation.LEADS_KEY) or 0.0)
+    days = int(payload.get(expectation.DAYS_KEY) or 0)
+    if days <= 0:
+        return {"verdict": SHADOW_UNKNOWN, "reason": SHADOW_NO_PROMISE_REASON,
+                "final": True}
+    if abs(promised) < MIN_EXPECTED_LEADS:
+        return {"verdict": SHADOW_UNKNOWN,
+                "reason": SHADOW_SMALL_PROMISE_REASON, "final": True}
+
+    window = observation_window(action, today, crm_through, horizon_days=days)
+    if window is None or not window[2]:
+        return {"verdict": SHADOW_UNKNOWN, "reason": SHADOW_OPEN_REASON,
+                "final": False}
+
+    observed = observed_metrics(rows, window)
+    drift = observed_leads_delta(observed, action)
+    if drift is None:
+        return {"verdict": SHADOW_UNKNOWN,
+                "reason": SHADOW_NO_BASE_REASON, "final": True}
+
+    start, end, _ = window
+    # «Сбылось само» — тот же знак И не меньше по модулю. Знак отдельно от
+    # модуля: объект, ушедший в обещанную сторону на десятую часть обещания,
+    # обещания не исполнил, а объект, ушедший в противоположную, тем более.
+    same_way = (drift > 0) == (promised > 0)
+    hit = same_way and abs(drift) >= abs(promised)
+    return {
+        "verdict": SHADOW_HIT if hit else SHADOW_MISS,
+        "reason": "",
+        "final": True,
+        "promised_leads": round(promised, 2),
+        "observed_leads_delta": drift,
+        "horizon_days": days,
+        "window": {"from": start.isoformat(), "to": end.isoformat()},
+    }
+
+
+def shadow_report(db_module: Any, facts_by_campaign: Dict[str, List[Dict[str, Any]]],
+                  today: date, crm_through: Optional[date],
+                  journal_ok: bool = True) -> Dict[str, Any]:
+    """Сверка всех ждущих намерений: счётчики исходов и образцы для человека.
+
+    Вердикт кладётся в журнал ОДИН раз и только окончательный: намерение с
+    незакрытым горизонтом остаётся в очереди, иначе каждый прогон судил бы его
+    своим — с каждым днём всё более широким — окном, и «не сбылось» тихо
+    превращалось бы в «сбылось» от накопленного дрейфа.
+    """
+    try:
+        rows = db_module.shadow_actions()
+    except Exception as exc:  # noqa: BLE001
+        return {"unavailable": f"{type(exc).__name__}: {exc}"[:200]}
+
+    counts: Dict[str, int] = {}
+    reasons: Dict[str, int] = {}
+    sample: List[Dict[str, Any]] = []
+    marked = 0
+    for action in rows:
+        result = shadow_check(
+            action, facts_by_campaign.get(str(action.get("object_id"))) or [],
+            today, crm_through)
+        counts[result["verdict"]] = counts.get(result["verdict"], 0) + 1
+        if result.get("reason"):
+            reasons[result["reason"]] = reasons.get(result["reason"], 0) + 1
+        if not result.pop("final", False):
+            continue
+        if journal_ok and db_module.mark_shadow_outcome(
+                action["action_id"], result["verdict"],
+                {k: v for k, v in result.items() if k != "verdict"}):
+            marked += 1
+        if len(sample) < PREVIEW_SAMPLE_LIMIT:
+            sample.append({"object_id": str(action.get("object_id")),
+                           "action_kind": str(action.get("action_kind")),
+                           **result})
+    return {"waiting": len(rows), "verdicts": dict(sorted(counts.items())),
+            "reasons": dict(sorted(reasons.items())), "marked": marked,
+            "sample": sample}
+
+
 MIN_CONTROL_LEADS = holdout.MIN_CONTROL_LEADS
 
 
@@ -1795,6 +1933,19 @@ def settle_hypotheses(today: date, journal_ok: bool = True) -> Dict[str, Any]:
     return out
 
 
+def _shadow_rows() -> List[Dict[str, Any]]:
+    """Ждущие сверки намерения, или пусто, если журнал недоступен.
+
+    Падение здесь означало бы, что откат по красным линиям не состоялся из-за
+    отчётного блока. Причина видна в самом блоке (shadow_report повторит
+    запрос и напишет unavailable), а наблюдение идёт своим ходом.
+    """
+    try:
+        return list(writer_db.shadow_actions())
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
              fail_on_alarm: bool = False) -> int:
     # Уборка зависших — ГЛОБАЛЬНО и ДО чтения открытых действий: помечать
@@ -1812,7 +1963,12 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
     # расход Директа уже приехал, а лиды ещё нет: 19.08.2026 — 927 945 рублей
     # и НОЛЬ лидов. Судить по таким дням значит откатывать здоровое.
     crm_through = agent_db.crm_maturity_date()
-    facts_by_campaign = load_facts(actions, today, crm_through)
+    # Намерения полос, стоящих в тени. Читаются ДО фактов, потому что их
+    # объекты обязаны попасть в тот же запрос: в кабинете они не менялись, под
+    # наблюдением не стоят, и отдельного запроса фактов ради них заводить
+    # незачем — как и оставлять сверку без данных.
+    shadow_rows = _shadow_rows()
+    facts_by_campaign = load_facts(actions + shadow_rows, today, crm_through)
     # Полнота данных — по витрине, наблюдаемые метрики — по кампаниям
     # действий. Два разных запроса намеренно: см. mart_filled_days.
     mart = load_mart_breadth(actions, today, crm_through)
@@ -1874,6 +2030,12 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
         # возрасту, а не по тому, чей кабинет попал в этот прогон.
         "money_checkpoint": money_checkpoint(writer_db, today, crm_through,
                                              journal_ok=not dry_run),
+        # Сверка теневых намерений: «сделал бы X, жду Y» против того, что
+        # случилось с объектом без вмешательства. Блок прогона, а не кабинета,
+        # по тому же доводу, что и второй чекпоинт: намерение сверяется по
+        # своему горизонту, а не по тому, чей кабинет попал в этот прогон.
+        "shadow": shadow_report(writer_db, facts_by_campaign, today,
+                                crm_through, journal_ok=not dry_run),
         # Реестр гипотез — тот же проход, что и по действиям, но по ЗАМЫСЛАМ:
         # ставка закрывается вердиктом сторожа, откатом по красной линии или
         # истёкшим горизонтом. Без этого блока «сразу увидеть результат и

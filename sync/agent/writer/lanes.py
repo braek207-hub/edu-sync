@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent import autonomy
+from sync.agent import learning_loop
 from sync.agent.experiments import is_bet
 from sync.agent.writer import tier as tier_mod
 from sync.agent.writer.switch import MAX_SUSPENDS_PER_RUN
@@ -142,6 +143,11 @@ class LanePolicy:
     risk_share: float                        # доля недельного расхода; 0.0 — не платит
     max_cut_share: Optional[float]           # только гигиена: доля расхода кабинета
     measure_days: int
+    # Ступень полосы едет В САМОЙ политике, а не остаётся у вызывающего:
+    # отбор обязан отличать «полоса в тени» от «полоса не влезла в свой
+    # потолок». Нули лимитов у этих двух случаев одинаковые, а причина отказа
+    # и лечение — разные: первую выпускает человек, второй помогает ступень.
+    step: int = 1
 
 
 def lane_of(action: Dict[str, Any]) -> str:
@@ -194,6 +200,7 @@ def policy_of(lane: str, step: int,
             risk_share=0.0,
             max_cut_share=0.0 if lane == LANE_HYGIENE else None,
             measure_days=MEASURE_DAYS[lane],
+            step=int(step),
         )
 
     per_object: Optional[int] = 1
@@ -212,6 +219,7 @@ def policy_of(lane: str, step: int,
         risk_share=share if lane in RISK_PAYING_LANES else 0.0,
         max_cut_share=HYGIENE_MAX_CUT_SHARE if lane == LANE_HYGIENE else None,
         measure_days=MEASURE_DAYS[lane],
+        step=int(step),
     )
 
 
@@ -251,6 +259,100 @@ def default_step_of(lane: str) -> int:
     правки кода.
     """
     return 0 if lane == LANE_LAUNCH else DEFAULT_STEP
+
+
+# Счётчики послужного списка, которые складываются при сборке ВИДОВ действий в
+# ПОЛОСУ. Список закрытый и с именами из learning_loop: слот там ключуется
+# видом (bidmodifier.add), а ступень выдаётся полосе, и складывать их надо
+# ровно по этим полям — доли (hit_rate) складывать нельзя, они пересчитываются
+# из сумм.
+_SUMMED_COUNTERS = ("closed", learning_loop.SUCCESS,
+                    "money_confirmed", "money_contradicted",
+                    "recent_closed", "recent_improved")
+
+
+def lane_records(track_record: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    """Послужной список ВИДОВ действий → послужной список ПОЛОС.
+
+    learning_loop.track_record ключуется видом действия, а свободу зарабатывает
+    полоса: у сдвига бюджета и у целевой цены общая физика ошибки, общий срок
+    замера и общий карман, и разделять их послужные списки значило бы держать
+    обоих в тени вдвое дольше при том же объёме доказательств.
+
+    Виды без полосы (их в карте нет) пропускаются молча — в отличие от
+    lane_of, который на таком падает. Здесь читается ИСТОРИЯ, и в ней лежат
+    виды снятых рычагов: уронить прогон из-за строки полугодовой давности —
+    цена, несопоставимая с пользой от строгости.
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    for kind, slot in (track_record or {}).items():
+        lane = LANE_OF_KIND.get(str(kind))
+        if lane is None:
+            continue
+        target = out.setdefault(lane, {name: 0.0 for name in _SUMMED_COUNTERS})
+        for name in _SUMMED_COUNTERS:
+            try:
+                target[name] += float((slot or {}).get(name) or 0.0)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+# Откуда взялась ступень полосы. Едет в отчёт рядом с числом: «полоса на
+# ступени 1» не отличает заработанную пробу от полосы, которую человек туда
+# посадил руками, а решения по этим двум случаям разные.
+STEP_EARNED = "track_record"     # выдала лестница по послужному списку
+STEP_FLOOR = "default"           # послужного списка ещё нет — пол полосы
+STEP_HUMAN = "config"            # назначено ключом lane_steps панели
+STEP_SHADOW = "shadow"           # человек держит полосу в тени
+
+
+def steps_by_lane(track_record: Optional[Dict[str, Any]] = None,
+                  config: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    """Ступень каждой полосы и её происхождение: {полоса: {"step", "source"}}.
+
+    Порядок разрешения — от самого сильного источника к самому слабому:
+
+      1. lane_steps панели. Слово человека перебивает лестницу В ОБЕ СТОРОНЫ:
+         им и выпускают из тени, и им же сажают обратно, не дожидаясь, пока
+         накопленная история переварит свежий провал.
+      2. Тень — shadow_lanes панели и полосы ручного выпуска
+         (autonomy.MANUAL_RELEASE_LANES). Пол ступени сюда НЕ применяется:
+         иначе тень означала бы «работай на 1 %», то есть ничего.
+      3. Лестница по послужному списку полосы (autonomy.step_of).
+      4. Пол полосы (default_step_of) — пока послужного списка не хватает на
+         первую ступень. Без пола лестница заперла бы агента навсегда:
+         ступень 1 требует 12 закрытых наблюдений, а закрытых наблюдений не
+         появится, пока полоса не применяет. Пол — не подарок, а вход в
+         лестницу: рычаги С ИСТОРИЕЙ стартуют со своей ступени, рычаги без
+         истории — с минимального живого следа, а те, чья ошибка не
+         отматывается, стоят в тени по пункту 2.
+    """
+    config = config or {}
+    overrides = config.get("lane_steps") or {}
+    shadow_lanes = config.get("shadow_lanes") or ()
+    records = lane_records(track_record)
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for lane in ALL_LANES:
+        if lane in overrides:
+            out[lane] = {"step": int(overrides[lane]), "source": STEP_HUMAN}
+            continue
+        if (autonomy.is_shadow(lane, shadow_lanes)
+                or lane in autonomy.MANUAL_RELEASE_LANES):
+            out[lane] = {"step": 0, "source": STEP_SHADOW}
+            continue
+        record = records.get(lane)
+        earned = autonomy.step_of(lane, record)
+        floor = default_step_of(lane)
+        # «Заработано» — только когда лестнице БЫЛО ЧЕМ высказаться и её ответ
+        # не пришлось подпирать полом. Иначе в отчёте ступень 1 у полосы без
+        # единого закрытого наблюдения выглядела бы как заслуженная проба.
+        if record and earned >= floor:
+            out[lane] = {"step": earned, "source": STEP_EARNED}
+        else:
+            out[lane] = {"step": floor, "source": STEP_FLOOR}
+    return out
 
 # Делитель ценности, ниже которого «на рубль риска» теряет смысл: действие
 # дешевле рубля не бывает, а ноль в знаменателе сделал бы любой бесплатный
@@ -405,6 +507,14 @@ def _select_lane(actions, lane, policy, prices, weekly_spend, risk_budget,
     for action in ranked:
         if lane == LANE_PROPOSAL or _tier_of(action) not in tier_mod.APPLIED_TIERS:
             reasons[str(action["idempotency_key"])] = rejects.PROPOSAL
+            continue
+        # Тень — ПОСЛЕ предложения и до всех потолков. После, потому что у
+        # класса 3 рычага нет вовсе и ступень его судьбы не меняет; до, потому
+        # что «полосу не выпустил человек» не лечится ни рублём лимита, ни
+        # порядком ценности, а действие в тени обязано уехать в журнал
+        # намерением, а не раствориться в общем lane_limit.
+        if policy.step == 0:
+            reasons[str(action["idempotency_key"])] = rejects.SHADOW
             continue
         applicable.append(action)
 

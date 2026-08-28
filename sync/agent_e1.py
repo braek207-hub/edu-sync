@@ -103,7 +103,7 @@ from sync.agent.writer.risk import (
     week_start,
     weekly_limit,
 )
-from sync.agent import blackbox, conflicts, experiments, rejects
+from sync.agent import blackbox, conflicts, experiments, learning_loop, rejects
 from sync.agent.writer.rollback import red_line_for
 from sync.agent.writer.units import api_to_delta
 
@@ -781,6 +781,88 @@ def lane_shortfall(taken: int, refused: int, wanted_rub: float,
         "unpriced": int(unpriced),
         "not_applicable": int(not_applicable),
     }
+
+
+def lane_steps_of(config: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    """Ступень каждой полосы на этом прогоне — из её ПОСЛУЖНОГО СПИСКА.
+
+    Раньше ступени приходили только конфигом панели, а ключа lane_steps в
+    панели не было, — то есть все полосы стояли на одной константе и лестница
+    автономии, посчитанная и покрытая тестами, в бою не участвовала.
+
+    Журнал недоступен — прогон идёт по полу полос (lanes.default_step_of), как
+    до лестницы, а причина видна в отчёте. Останавливать запись из-за
+    недоступной калибровки нельзя: это отчётный слой поверх решения, а не
+    само решение. Поднять ступень без журнала лестница и не может — без
+    закрытых наблюдений она возвращает пол, — так что отказ читается в
+    безопасную сторону сам собой.
+    """
+    try:
+        record = learning_loop.track_record(writer_db.closed_actions())
+        source = None
+    except Exception as exc:  # noqa: BLE001
+        record, source = {}, f"{type(exc).__name__}: {exc}"[:200]
+    steps = lanes.steps_by_lane(record, config)
+    if source is not None:
+        for slot in steps.values():
+            slot["journal_unavailable"] = source
+    return steps
+
+
+def record_shadow_intents(actions: List[Dict[str, Any]],
+                          journal_ok: bool = True) -> Dict[str, Any]:
+    """Намерения полос из тени — в журнал, статусом shadow, без отправки.
+
+    Полоса на ступени 0 не применяет, но и молчать не вправе: приёмка рычага в
+    том и состоит, что агент две недели пишет «сделал бы X, жду Y к дате D», а
+    человек читает совпадения с фактом и решает, выпускать ли (autonomy.py,
+    правило 1). Без записи режим приёмки был бы неотличим от выключенного
+    рычага.
+
+    Строка заводится тем же insert_action и с тем же ключом идемпотентности:
+    выпуск полосы из тени завтра перепишет ЭТУ ЖЕ строку в planned, а не
+    заведёт вторую. Риск-бюджет не трогается ни на рубль — экспозиции не было.
+
+    journal_ok — репетиция журнал не трогает (writer/client.journal_writes_
+    allowed): намерение, записанное репетицией, ждало бы сверки с фактом,
+    которого не будет.
+    """
+    if not actions:
+        return {"intents": 0, "by_lane": {}, "written": 0, "sample": []}
+    by_lane: Dict[str, int] = {}
+    written = 0
+    for action in actions:
+        lane = str(action.get("lane") or lanes.lane_of(action))
+        by_lane[lane] = by_lane.get(lane, 0) + 1
+        if not journal_ok:
+            continue
+        try:
+            writer_db.insert_action(_shadow_row(action),
+                                    status=writer_db.SHADOW_STATUS)
+            written += 1
+        except Exception:  # noqa: BLE001
+            # Одно неудачное намерение не отменяет остальные и тем более не
+            # отменяет прогон: в кабинет оно всё равно не едет, а расхождение
+            # видно разностью intents и written.
+            continue
+    return {"intents": len(actions), "by_lane": dict(sorted(by_lane.items())),
+            "written": written,
+            "sample": [{"object_id": str(a.get("object_id")),
+                        "action_kind": str(a.get("action_kind")),
+                        "lane": str(a.get("lane") or "")}
+                       for a in actions[:PREVIEW_SAMPLE_LIMIT]]}
+
+
+def _shadow_row(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Строка журнала для намерения: то же действие с обнулённой ценой.
+
+    risk_rub — ноль явно, а не то, что насчитал отбор: цена действия это цена
+    ЭКСПОЗИЦИИ, а её не было. Ненулевое число в строке, за которой ничего не
+    стоит, читалось бы риск-бюджетом недели как занятые деньги, стоило бы
+    места настоящим изменениям и попало бы в худший недельный исход.
+    """
+    return {**action, "risk_rub": 0.0, "learning_impact": learning_impact(action),
+            "baseline_daily_rub": None, "risk_basis": None}
 
 
 def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
@@ -2076,13 +2158,11 @@ def run_account(
     # и до бюджета очередь не доходила никогда (замер 26.08.2026 — за 30 дней
     # в журнале только bidmodifier.* и schedule.set). Разбор — writer/lanes.py.
     #
-    # Ступени полос приходят конфигом панели: ступень 0 (тень) — решение
-    # человека о конкретной полосе, а не константа кода. Ключа lane_steps в
-    # панели ПОКА НЕТ (его заводит задача 26 плана беты вместе с лестницей
-    # автономии), и до тех пор все полосы стоят на lanes.DEFAULT_STEP. Чтение
-    # оставлено здесь, чтобы появление ключа в панели не требовало правки
-    # прогона: config.resolve роняет вызов на неизвестном ключе, поэтому
-    # мимо этого места настройка не проедет.
+    # Ступени полос приходят ЛЕСТНИЦЕЙ АВТОНОМИИ, посчитанной один раз на
+    # прогон (lane_steps_of): свободу зарабатывает послужной список самой
+    # полосы, а не константа кода и не одна лишь панель. Слово человека
+    # (ключи lane_steps / shadow_lanes панели) лестницу перебивает — из тени
+    # выпускает только он.
     #
     # charged_by_object отдаётся КОПИЕЙ: потолок объекта отбор обязан видеть
     # (по объекту уже могло быть списано на прошлых прогонах недели), но
@@ -2092,7 +2172,8 @@ def run_account(
     # Аргументы отбора вынесены в переменные, потому что ими же считается
     # дефицит полос ниже: разъедься эти два вызова хоть ступенью, и отчёт
     # объяснял бы решение, которого отбор не принимал.
-    lane_steps = (ctx.get("config") or {}).get("lane_steps") or {}
+    lane_ladder = ctx.get("lane_steps") or lane_steps_of(ctx.get("config"))
+    lane_steps = {lane: int(slot["step"]) for lane, slot in lane_ladder.items()}
     lane_weekly_spend = sum(float(v) for v in daily_cost.values()) * DAYS_IN_WEEK
     lane_risk_budget = weekly_risk_limit(wk, daily_cost, ctx.get("config"))
     lane_taken, lane_refused = lanes.select(
@@ -2111,6 +2192,14 @@ def run_account(
     # запуска стоит в тени (lanes.default_step_of), а гигиена работает.
     lane_taken, launch_orphans = launch.drop_unlaunched(lane_taken)
     lane_refused += launch_orphans
+    # Тень — не отказ, а вторая судьба действия: полоса на ступени 0 пишет
+    # намерение в журнал и не едет в кабинет. Отвод стоит ЗДЕСЬ, после
+    # сторожа связок запуска: намерение о минусовке донора, чей запуск не
+    # состоялся, — намерение о том, чего агент бы не сделал.
+    shadow_intents = [a for a in lane_refused
+                      if a.get("blocked_reason") == rejects.SHADOW]
+    shadow = record_shadow_intents(
+        shadow_intents, journal_ok=journal_writes_allowed(sandbox, dry_run))
     # Дефицит полосы числами: сколько она заявила рублями, сколько ей позволено
     # и какая доля замыслов доехала. Без этого «отказано 45» не отличает полосу,
     # промахнувшуюся мимо потолка на три процента, от полосы, заявившей
@@ -2280,6 +2369,15 @@ def run_account(
         },
         "ideas": _ideas_report(idea_actions, idea_refused,
                                idea_out_of_scope, marked_ideas),
+        # Ступени полос печатаются КАЖДЫЙ такт, вместе с происхождением
+        # каждой. Ступень, видимая только в коде, не является решением, о
+        # котором можно спорить: «полоса взяла пять действий» без ступени не
+        # отвечает, мало ей потолка или мало кандидатов.
+        "autonomy": {"steps": lane_ladder},
+        # Намерения полос из тени: сколько записано и по каким полосам. Ноль
+        # печатается тоже — «в тени никого» и «тень молчит» ведут к разным
+        # следующим шагам.
+        "shadow": shadow,
         # Ф14: связки запуска. Все три числа нулями тоже печатаются: «нарядов
         # не было», «наряд был, доноров не прочитали» и «минусовка уехала без
         # запуска» ведут к разным следующим шагам, а один счётчик их сливает.
@@ -2616,6 +2714,11 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     charged_risk: Dict[str, float] = writer_db.charged_risk_by_object(wk)
 
     ctx: Dict[str, Any] = {
+        # Ступени полос — ОДИН раз на прогон, а не на кабинет: свободу
+        # зарабатывает полоса на всей своей истории, и считать её заново по
+        # каждому кабинету значило бы выдать четырём кабинетам четыре разные
+        # лестницы из одного и того же журнала.
+        "lane_steps": lane_steps_of(active_config),
         "daily_cost": daily_cost,
         # Активный конфиг едет в контекст целиком: параметры разбираются по
         # месту применения, а не растаскиваются здесь по семи ключам — иначе

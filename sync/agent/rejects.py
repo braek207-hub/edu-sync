@@ -55,6 +55,12 @@ UNITS_LOW = "units_low"
 # на разборе «идея честно проверяется» выглядело бы как стена, в которую
 # агент бьётся каждый прогон.
 IDEA_RUNNING = "idea_running"
+# Полоса стоит на ступени 0 — в тени: агент записал намерение в журнал
+# (статус writer/db.SHADOW_STATUS) и не поехал в кабинет. Своя причина, а не
+# lane_limit, потому что расширение потолка тут не поможет ничем: из тени
+# выводит человек, прочитав совпадения намерений с фактом. Слей их — и
+# «рычаг на приёмке» на разборе выглядело бы как «полосе мало денег».
+SHADOW = "shadow"
 UNKNOWN = "unknown"
 
 # Причины конфликтов берутся из sync/agent/conflicts.py, а не переписываются
@@ -80,7 +86,8 @@ CONFLICT_REASONS = frozenset({conflicts.SUSPENDED_OBJECT,
 KNOWN_REASONS = frozenset({BUDGET, LANE_LIMIT, PROPOSAL, NO_RED_LINE,
                            COOLDOWN, ATTEMPTS_EXHAUSTED, HOLDOUT,
                            LEARNING_COOLDOWN, CLOSED_KEY, NO_GROWTH_ADDRESS,
-                           UNITS_LOW, IDEA_RUNNING, UNKNOWN}) | CONFLICT_REASONS
+                           UNITS_LOW, IDEA_RUNNING, SHADOW,
+                           UNKNOWN}) | CONFLICT_REASONS
 
 HISTORICAL_REASONS = frozenset({RUN_CAP})
 

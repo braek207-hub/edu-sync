@@ -92,6 +92,11 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
                                        "checks": []})
     monkeypatch.setattr(agent_e1.writer_db, "recent_action_objects",
                         lambda *a, **k: set())
+    # Послужной список полос: прогон читает его первым делом, чтобы выдать
+    # каждой полосе ступень (lane_steps_of). Пусто = ни одного закрытого
+    # наблюдения, то есть все полосы на своём полу — поведение, на которое
+    # написаны остальные проверки набора.
+    monkeypatch.setattr(agent_e1.writer_db, "closed_actions", lambda *a, **k: [])
     # Реестр идей (Ф12): такт записи спрашивает его по каждому кабинету. Без
     # подмены прогон уходит в реальную базу и печатает ретраи коннекта в тот
     # же stdout, который тесты разбирают как JSON. Пусто = реестр без
@@ -676,8 +681,13 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
     monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: list(stale))
     monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
     rows = journal if journal is not None else []
-    monkeypatch.setattr(agent_e1.writer_db, "insert_action",
-                        lambda row: (rows.append(row), row["idempotency_key"])[1])
+    # Двойник журнала знает про статус: заведение строки и заведение НАМЕРЕНИЯ
+    # (полоса в тени) — один и тот же вызов с разным статусом, и двойник,
+    # который его теряет, показывал бы намерение как обычное планирование.
+    monkeypatch.setattr(
+        agent_e1.writer_db, "insert_action",
+        lambda row, status=agent_e1.writer_db.PLANNED_STATUS:
+            (rows.append({**row, "status": status}), row["idempotency_key"])[1])
     monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1.writer_db, "mark_unknown_outcome", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1, "WriteClient", _MultiCabinetClient)
