@@ -23,8 +23,10 @@ import requests
 
 from sync.agent import config as agent_config
 from sync.agent import db as agent_db
+from sync.agent import learning_loop
 from sync.agent.gate import data_gate
 from sync.agent.writer import db as writer_db
+from sync.agent.writer import lanes as lanes_mod
 
 PROD = "https://api.direct.yandex.com/json/v5"
 NONEXISTENT_ID = 999_999_999
@@ -352,6 +354,38 @@ def check_holdout() -> Dict[str, Any]:
         return {"error": f"{type(exc).__name__}: {exc}"[:300]}
 
 
+def check_lanes() -> Dict[str, Any]:
+    """Ступень каждой полосы и послужной список, которым она заработана.
+
+    Спрашивается ЖИВАЯ система тем же путём, каким её спрашивает прогон
+    записи: журнал закрытых действий → learning_loop.track_record →
+    lanes.lane_records → lanes.steps_by_lane с активным конфигом панели.
+    Второго счёта ступеней здесь нет намеренно — разойдись он с прогоном хоть
+    на ступень, и проверка готовности подтверждала бы состояние, которого у
+    агента нет.
+    """
+    record = learning_loop.track_record(writer_db.closed_actions())
+    stored = agent_db.load_agent_config()
+    config = agent_config.resolve(stored.get("preset"), stored.get("overrides"))
+    by_lane = lanes_mod.lane_records(record)
+    steps = lanes_mod.steps_by_lane(record, config)
+
+    out: Dict[str, Any] = {}
+    for lane, slot in sorted(steps.items()):
+        history = by_lane.get(lane) or {}
+        closed = float(history.get("closed") or 0.0)
+        improved = float(history.get(learning_loop.SUCCESS) or 0.0)
+        out[lane] = {
+            "step": int(slot["step"]),
+            "source": str(slot.get("source") or ""),
+            "closed": closed,
+            "improved": improved,
+            "hit_rate": round(improved / closed, 4) if closed else None,
+            "journal_unavailable": slot.get("journal_unavailable"),
+        }
+    return out
+
+
 def check_write_rights() -> List[Dict[str, Any]]:
     """Право писать проверяется у ПОЛУЧАТЕЛЯ — у API, а не по наличию токена."""
     raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
@@ -436,6 +470,33 @@ def verdict(report: Dict[str, Any]) -> Dict[str, Any]:
         if not rights:
             blockers.append("список кабинетов пуст (DIRECT_CLIENTS_JSON)")
 
+    # Полоса без послужного списка выше тени — это ступень, выданная полом
+    # (lanes.default_step_of), а не заработанная. Пол — вход в лестницу, и на
+    # обычном такте он законен; на ПЕРВОМ боевом прогоне беты он означает
+    # деньги под рычагом, о котором ещё ничего не известно. Решение поднять
+    # такую полосу вправе принять человек — тогда источник ступени «config», и
+    # проверка говорит об этом предупреждением, а не блокером: своё решение
+    # человек принял осознанно, и отменять его за него нечем.
+    lanes_report = report.get("lanes") or {}
+    if isinstance(lanes_report, dict) and not lanes_report.get("error"):
+        for lane, slot in sorted(lanes_report.items()):
+            if slot.get("journal_unavailable"):
+                blockers.append(
+                    f"полоса {lane}: журнал закрытых действий недоступен "
+                    f"({slot['journal_unavailable']}) — ступень посчитать нечем")
+                continue
+            if slot["step"] <= 0 or slot["closed"] > 0:
+                continue
+            if slot["source"] == lanes_mod.STEP_HUMAN:
+                warnings.append(
+                    f"полоса {lane} на ступени {slot['step']} по решению человека, "
+                    "закрытых наблюдений ноль — доля улучшений неизвестна")
+            else:
+                blockers.append(
+                    f"полоса {lane} на ступени {slot['step']} без единого закрытого "
+                    "наблюдения: ступень выдана полом, а не заработана — "
+                    "на первый боевой прогон её место в тени (ступень 0)")
+
     if report["holdout"].get("campaigns", 0) == 0 and not report["holdout"].get("error"):
         blockers.append("заповедник пуст — сравнивать эффект будет не с чем")
 
@@ -490,6 +551,7 @@ def main() -> int:
         "bets": _safe("bets", check_bets),
         "risk_budget": _safe("risk_budget", check_risk_budget),
         "holdout": _safe("holdout", check_holdout),
+        "lanes": _safe("lanes", check_lanes),
         "write_rights": _safe("write_rights", check_write_rights),
     }
     report["verdict"] = verdict(report)
