@@ -54,6 +54,29 @@ class FakeIdeas:
             return dict(row)
         return None
 
+    def read_by_experiment(self, experiment_id):
+        """Условие SELECT_BY_EXPERIMENT_SQL: идея, связанная с этой ставкой."""
+        for row in self.table.values():
+            if str(row.get("experiment_id") or "") == str(experiment_id):
+                return dict(row)
+        return None
+
+    def read_settled(self, bet_statuses, days, account):
+        """SELECT_SETTLED_SQL: исход ставки приходит из таблицы гипотез.
+
+        В памяти второй таблицы нет, поэтому двойник держит исход в самой
+        строке (bet_status); сам JOIN проверяется по тексту запроса.
+        """
+        wanted = set(bet_statuses)
+        out = []
+        for row in self.table.values():
+            if str(row.get("bet_status") or "") not in wanted:
+                continue
+            if account is not None and str(row.get("account")) != str(account):
+                continue
+            out.append(dict(row))
+        return out
+
     def write_rows(self, rows):
         self.writes += 1
         for row in rows:
@@ -67,5 +90,7 @@ def store(monkeypatch):
     monkeypatch.setattr(registry, "_read_rows", fake.read_rows)
     monkeypatch.setattr(registry, "_read_rejections", fake.read_rejections)
     monkeypatch.setattr(registry, "_read_by_order", fake.read_by_order)
+    monkeypatch.setattr(registry, "_read_by_experiment", fake.read_by_experiment)
+    monkeypatch.setattr(registry, "_read_settled", fake.read_settled)
     monkeypatch.setattr(registry, "_write_rows", fake.write_rows)
     return fake

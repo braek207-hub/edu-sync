@@ -115,6 +115,9 @@ REASON_NO_COMPARISON = (
     "сравнивать не с чем: ни заповедника, ни парной кампании направления, а "
     "сравнение «было/стало» на одной кампании меряет сезон и переобучение, "
     "а не наше изменение")
+REASON_LOST_BEFORE = (
+    "этот тест на этой кампании уже проигран своей же ставкой: повтор "
+    "опровергнутой гипотезы стоит денег и не покупает ответа")
 REASON_NO_LEVER = "рычага записи у типа теста ещё нет — предлагать нечем"
 REASON_LIMIT_NOT_BINDING = (
     "лимит расход не связывает: прибавка не изменит ничего — кампания не "
@@ -217,11 +220,39 @@ def _horizon(daily_leads: float, resets: bool) -> int:
     return horizon
 
 
+def lost_before(ctx: Dict[str, Any]) -> set:
+    """Пары (кампания, тип теста), проигранные своей же ставкой.
+
+    Вход — registry.lost_lessons (ctx["lost_tests"]): адреса опровергнутых
+    гипотез, без чисел. Генератор детерминирован, и без этой памяти он
+    предложит проигравший тест тем же тактом — агент будет вечно проверять
+    одну и ту же опровергнутую гипотезу.
+
+    Запрет АДРЕСНЫЙ: проигрыш одного типа теста не запрещает остальные, а
+    проигрыш на одной кампании — тот же тест на другой. Иначе первая же
+    неудача выключала бы генератор целиком.
+    """
+    out = set()
+    for lesson in (ctx or {}).get("lost_tests") or ():
+        subject = lesson.get("subject") if isinstance(lesson, dict) else None
+        subject = subject if isinstance(subject, dict) else lesson
+        if not isinstance(subject, dict):
+            continue
+        campaign_id = _text(subject.get("campaign_id"))
+        test_kind = _text(subject.get("test_kind"))
+        if campaign_id and test_kind:
+            out.add((campaign_id, test_kind))
+    return out
+
+
 def _one(row: Dict[str, Any], test_kind: str, entry: Dict[str, Any],
          ctx: Dict[str, Any], facts: Dict[str, Any],
          ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Кампания × тип теста → (идея, отбраковка)."""
     campaign_id = facts["campaign_id"]
+    if (campaign_id, test_kind) in facts["lost_before"]:
+        return None, _skip(campaign_id, REASON_LOST_BEFORE, test_kind)
+
     lever = entry.get("lever")
     if not lever or lever not in guardrails.ALLOWED_ACTION_KINDS:
         return None, _skip(campaign_id, REASON_NO_LEVER, test_kind)
@@ -333,6 +364,7 @@ def _facts(row: Dict[str, Any], ctx: Dict[str, Any],
         "comparison_object_id": against,
         "days_since_learning_reset": None if since is None else int(since),
         "limit_binds": None if binds is None else bool(binds),
+        "lost_before": lost_before(ctx),
     }, None
 
 

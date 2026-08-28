@@ -59,6 +59,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import psycopg2.extras
 
 from sync.db import get_connection
+from sync.agent import experiments as experiments_mod
 from sync.agent.writer import lanes as lanes_mod
 from sync.agent.writer import tier as tier_mod
 
@@ -627,6 +628,79 @@ def open_ideas(account: Optional[str] = None) -> List[Dict[str, Any]]:
     return rank(_read_open(account))
 
 
+def find_by_experiment(experiment_id: str) -> Optional[Dict[str, Any]]:
+    """Идея, за которой стоит эта ставка, в ЛЮБОМ статусе. None — нет такой.
+
+    Половина ставок заводится рычагами расчёта, а не идеями, и отсутствие
+    строки здесь — штатное состояние, а не поломка.
+    """
+    return _read_by_experiment(_text(experiment_id))
+
+
+# Исход ставки → статус её идеи. Таблица явная, потому что вердикт выносит
+# ОДИН судья (experiments.settle по замеру сторожа), а реестр его лишь
+# переводит в свой словарь: второе слово для того же исхода означало бы, что
+# часть выигрышей не зачтётся никогда.
+#
+# Проигрыш и досрочный откат ведут в один статус намеренно: для реестра оба
+# означают «эта идея больше не предлагается», а РАЗЛИЧИЕ между ними живёт в
+# таблице гипотез, где ему и место (status + status_reason).
+IDEA_STATUS_BY_BET: Dict[str, str] = {
+    experiments_mod.STATUS_WON: STATUS_DONE,
+    experiments_mod.STATUS_LOST: STATUS_DROPPED,
+    experiments_mod.STATUS_ROLLED_BACK: STATUS_DROPPED,
+}
+
+
+def settle_by_experiment(experiment_id: str, bet_status: str,
+                         reason: str = "") -> Optional[Dict[str, Any]]:
+    """Исход ставки закрывает её идею. None — идеи за ставкой нет.
+
+    До этого исход гипотезы оставался в таблице гипотез, а идея висела в
+    running вечно: очередь реестра копила замыслы, которых уже нет, а
+    выигранное доказательство никуда не шло.
+
+    Машинное снятие, а не отказ человека: rejected_by не ставится, и объект
+    после проигрыша остаётся живым — запрет адресный (см. lost_lessons), а не
+    вечное «нет» по всему объекту.
+    """
+    status = IDEA_STATUS_BY_BET.get(_text(bet_status))
+    if status is None:
+        raise InvalidIdea(
+            f"исход ставки {bet_status!r} неизвестен; жизненный цикл ставки "
+            "объявлен в agent/experiments.py")
+    row = find_by_experiment(experiment_id)
+    if row is None:
+        return None
+    return mark(str(row["idea_id"]), status,
+                reason=_text(reason) or f"ставка закрыта как {bet_status}")
+
+
+# Окно свежести исхода. Три горизонта ставки: замыкание работает по недавним
+# исходам, а не по всей истории — иначе первый же прогон после месяца молчания
+# завёл бы масштабирование по каждой победе за всё время.
+CLOSURE_WINDOW_DAYS = experiments_mod.HORIZON_DAYS * 3
+
+
+def recently_settled(bet_statuses: Iterable[str],
+                     days: int = CLOSURE_WINDOW_DAYS,
+                     account: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Идеи, чьи ставки закрылись за окно, с исходом ставки в поле bet_status.
+
+    Исход берётся из таблицы гипотез, а не из статуса идеи, и это
+    принципиально: dropped ставит и машина по технической причине, и
+    закрытие проигравшей ставки — разные события с одинаковым статусом.
+    Судья один, и живёт он там, где вердикт вынесен.
+    """
+    return _read_settled([str(s) for s in bet_statuses], int(days),
+                         None if account is None else str(account))
+
+
+LOST_BET_STATUSES = (experiments_mod.STATUS_LOST,
+                     experiments_mod.STATUS_ROLLED_BACK)
+WON_BET_STATUSES = (experiments_mod.STATUS_WON,)
+
+
 def find_by_order(order_id: str,
                   account: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Идея, чей наряд несёт этот order_id, в ЛЮБОМ статусе. None — нет такой.
@@ -718,6 +792,32 @@ SELECT_BY_ORDER_SQL = """
 """
 
 
+# Идея по своей ставке. Статус идеи в условии не участвует: закрывать её
+# приходят как раз тогда, когда ставка дошла до конца, — фильтр по открытым
+# спрятал бы половину случаев (ставка может закрыться досрочно откатом).
+SELECT_BY_EXPERIMENT_SQL = """
+    SELECT *
+      FROM edu_agent_ideas
+     WHERE experiment_id = %(experiment_id)s
+     ORDER BY updated_at DESC NULLS LAST
+     LIMIT 1
+"""
+
+# Идеи с исходом ставки. JOIN, а не два запроса: вердикт живёт в таблице
+# гипотез, адрес — в реестре идей, и склейка в питоне дала бы пару, которой
+# одновременно не существовало. Окно считается по closed_at ставки — моменту
+# вердикта, а не по updated_at идеи, который двигает любая запись строки.
+SELECT_SETTLED_SQL = """
+    SELECT i.*, e.status AS bet_status, e.closed_at AS bet_closed_at
+      FROM edu_agent_ideas i
+      JOIN edu_agent_experiments e ON e.experiment_id = i.experiment_id
+     WHERE e.status = ANY(%(statuses)s)
+       AND e.closed_at >= now() - make_interval(days => %(days)s)
+       AND (%(account)s IS NULL OR i.account = %(account)s)
+     ORDER BY e.closed_at DESC
+"""
+
+
 def _json_params(row: Dict[str, Any]) -> Dict[str, Any]:
     """Строка → параметры запроса, ровно по объявленным колонкам.
 
@@ -771,6 +871,29 @@ def _read_by_order(order_id: str,
                          "account": None if account is None else str(account)})
             row = cur.fetchone()
             return dict(row) if row else None
+
+
+def _read_by_experiment(experiment_id: str) -> Optional[Dict[str, Any]]:
+    if not experiment_id:
+        return None
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(SELECT_BY_EXPERIMENT_SQL,
+                        {"experiment_id": experiment_id})
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def _read_settled(bet_statuses: List[str], days: int,
+                  account: Optional[str]) -> List[Dict[str, Any]]:
+    if not bet_statuses:
+        return []
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(SELECT_SETTLED_SQL,
+                        {"statuses": list(bet_statuses), "days": int(days),
+                         "account": account})
+            return [dict(r) for r in cur.fetchall()]
 
 
 def _read_rejections(subject_keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:

@@ -55,6 +55,7 @@ from sync.agent import db as agent_db
 from sync.agent import gate as gate_module
 from sync.agent import holdout
 from sync.agent import tact_effect
+from sync.agent.ideas import registry as ideas_registry
 from sync.agent.gate import mart_gate, with_source_checks
 from sync.agent.learning_loop import MIN_EXPECTED_LEADS
 from sync.agent.writer import db as writer_db
@@ -1894,6 +1895,8 @@ def settle_hypotheses(today: date, journal_ok: bool = True) -> Dict[str, Any]:
     moved: List[Dict[str, Any]] = []
     illegal: List[Dict[str, Any]] = []
     lost_race = 0
+    ideas_closed = 0
+    idea_errors: List[Dict[str, Any]] = []
     for row in rows:
         try:
             step = experiments.settle(row, today)
@@ -1915,6 +1918,21 @@ def settle_hypotheses(today: date, journal_ok: bool = True) -> Dict[str, Any]:
             lost_race += 1
             continue
         moved.append(step)
+        if journal_ok:
+            # Исход ставки закрывает СВОЮ идею. Без этого шага выигрыш
+            # оставался в таблице гипотез, а идея висела в running вечно:
+            # очередь реестра копила замыслы, которых уже нет, а доказанное
+            # нашими же деньгами никуда не шло.
+            try:
+                if ideas_registry.settle_by_experiment(
+                        step["experiment_id"], step["status"], step["reason"]):
+                    ideas_closed += 1
+            except Exception as exc:  # noqa: BLE001
+                # Реестр — слой поверх ставок, а не их условие: недоступность
+                # реестра не имеет права отменить закрытие самой ставки.
+                # Причина при этом видна в отчёте, а не молчит.
+                idea_errors.append({"experiment_id": step["experiment_id"],
+                                    "error": f"{type(exc).__name__}: {exc}"[:200]})
 
     by_status: Dict[str, int] = {}
     for step in moved:
@@ -1930,6 +1948,10 @@ def settle_hypotheses(today: date, journal_ok: bool = True) -> Dict[str, Any]:
         out["lost_race"] = lost_race
     if illegal:
         out["illegal_transitions"] = illegal
+    if ideas_closed:
+        out["ideas_closed"] = ideas_closed
+    if idea_errors:
+        out["idea_errors"] = idea_errors
     return out
 
 

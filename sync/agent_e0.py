@@ -520,10 +520,26 @@ def collect_ideas(
         except Exception as exc:  # noqa: BLE001
             failed[source] = f"{type(exc).__name__}: {exc}"[:300]
 
+    # Исходы своих же ставок за окно свежести: выигрыши питают масштабирование,
+    # проигрыши становятся адресным запретом. Реестр недоступен — генераторы
+    # работают как раньше, но причина видна строкой, а не молчит.
+    settled: List[Dict[str, Any]] = []
+    settled_error = None
+    try:
+        settled = list(ideas_registry.recently_settled(
+            ideas_registry.WON_BET_STATUSES + ideas_registry.LOST_BET_STATUSES))
+    except Exception as exc:  # noqa: BLE001
+        settled_error = f"{type(exc).__name__}: {exc}"[:300]
+
     for account in accounts:
         own = {cid for cid, entry in index.items() if entry["account"] == account}
+        mine = [row for row in settled if str(row.get("account")) == account]
         ctx = {
             "account": account,
+            # Опровергнутые гипотезы кабинета: тест, проигранный на кампании,
+            # второй раз не предлагается (abtests.lost_before).
+            "lost_tests": [row for row in mine
+                           if str(row.get("bet_status")) in ideas_registry.LOST_BET_STATUSES],
             "lambda": lambdas.get(account),
             "quality_drift": quality_drift,
             "holdout_ids": holdout_ids,
@@ -532,6 +548,12 @@ def collect_ideas(
         }
         found = ideas_proven.scan(
             [b for b in segments["bundles"] if b["campaign_id"] in own], ctx)
+        _run(ideas_proven.SOURCE, found["ideas"], found["skipped"])
+
+        # Замыкание реестра: выигранная ставка — вход генератора, а не конец
+        # истории. Доказательство получено нашими же деньгами, и лучшего входа
+        # у масштабирования нет.
+        found = ideas_proven.scan_closed(mine, ctx)
         _run(ideas_proven.SOURCE, found["ideas"], found["skipped"])
 
         found = ideas_consolidate.scan(
@@ -561,6 +583,18 @@ def collect_ideas(
                 segments["skipped"] + donors["skipped"], "reason"),
         },
         "by_source": by_source,
+        # Замыкание: сколько исходов своих ставок такт увидел и чем они
+        # кончились. Ноль выигрышей и ноль уроков — законное состояние
+        # кабинета без закрытых ставок, но недоступный реестр выглядит так же,
+        # и различить их можно только по названной причине.
+        "closure": {
+            "settled": len(settled),
+            "won": sum(1 for row in settled
+                       if str(row.get("bet_status")) in ideas_registry.WON_BET_STATUSES),
+            "lost": sum(1 for row in settled
+                        if str(row.get("bet_status")) in ideas_registry.LOST_BET_STATUSES),
+            "unavailable": settled_error,
+        },
         # Генератор, которому такт не даёт входа вовсе. Ноль находок у него —
         # не «поводов не нашлось», а «спрашивать было не о чем», и по пустому
         # счётчику эти два состояния неразличимы.

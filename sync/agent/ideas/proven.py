@@ -80,6 +80,7 @@ scan() возвращает их списком с названной причи
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sync.agent import computed as computed_mod
+from sync.agent.experiments import STATUS_WON as BET_WON
 from sync.agent import ladder as ladder_mod
 from sync.agent.portfolio import GROWTH_LAMBDA_MARGIN
 from sync.agent.writer import exposure as exposure_mod
@@ -409,3 +410,130 @@ def candidates(bundles: Sequence[Dict[str, Any]],
                ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Только идеи — форма вызова для реестра (registry.upsert)."""
     return scan(bundles, ctx)["ideas"]
+
+
+# --------------------------------------------- масштабирование доказанного
+# Выигравшая гипотеза закрывалась вердиктом и на этом заканчивалась. Между
+# тем «связка сработала» — лучший вход этого генератора: доказательство
+# получено НАШИМИ ЖЕ деньгами, а не выведено из витрины.
+
+SCALING_KIND = "scale"
+
+# Глубина цепочки масштабирований. Второе звено ещё опирается на замер (его
+# родитель выиграл ставку), третье опиралось бы уже на обоснование второго —
+# масштабирование масштабирования масштабирования съедает кабинет, а факта под
+# ним нет.
+MAX_CHAIN_DEPTH = 2
+
+CHAIN_DEPTH_KEY = "chain_depth"
+
+REASON_NOT_WON = (
+    "ставка идеи не выиграна: масштабировать нечего — деньги потрачены, "
+    "утверждение не подтвердилось")
+REASON_OTHER_ACCOUNT = (
+    "идея другого кабинета: доказательство одного кабинета доказательством "
+    "для другого не является — кабинет входит в идентичность идеи")
+REASON_NO_PARENT_ADDRESS = "у закрытой идеи нет адреса объекта или своего идентификатора"
+REASON_CHAIN_DEPTH = (
+    f"цепочка масштабирований глубже {MAX_CHAIN_DEPTH}: каждое следующее звено "
+    "обосновано предыдущим, а не замером")
+
+
+def _closed_skip(row: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    return {"idea_id": _text(row.get("idea_id")),
+            "account": _text(row.get("account")),
+            "reason": reason}
+
+
+def _chain_depth(row: Dict[str, Any]) -> int:
+    detail = row.get("detail")
+    depth = _number((detail or {}).get(CHAIN_DEPTH_KEY)) if isinstance(detail, dict) else None
+    return int(depth) if depth is not None and depth > 0 else 0
+
+
+def _scaling_idea(row: Dict[str, Any], depth: int) -> Dict[str, Any]:
+    """Закрытая выигравшая идея → предложение масштабировать её место.
+
+    Класс 3, и это не осторожность. Нагрузку рычага расчётный такт собрать не
+    может: `bidmodifiers.add` поверх УЖЕ поставленной корректировки Директ
+    отвергает, а перезапись требует Id и прежнего значения из ПРОЧИТАННОГО
+    состояния кабинета (шапка модуля). Идея едет человеку на экран со всем,
+    чем предложение проверяется, — адресом, родителем и выигравшим изменением.
+
+    Критерий успеха наследуется от родителя целиком: масштабирование обязано
+    побить ту же цену, по которой выигрыш и засчитан, иначе «победа» второго
+    звена мерилась бы другой линейкой.
+    """
+    parent_subject = row.get("subject") or {}
+    subject: Dict[str, Any] = {
+        "kind": SCALING_KIND,
+        "parent_idea_id": _text(row.get("idea_id")),
+    }
+    # Адрес доказанного места переносится целиком: масштабируется ОНО, а не
+    # абстрактный рост. Служебные ключи родителя (его собственный вид и
+    # ссылка на деда) в новый адрес не идут — иначе отпечаток нёс бы историю,
+    # а не место.
+    for key, value in parent_subject.items():
+        if key in ("kind", "parent_idea_id"):
+            continue
+        subject[key] = value
+
+    detail: Dict[str, Any] = {
+        CHAIN_DEPTH_KEY: depth,
+        "parent_idea_id": _text(row.get("idea_id")),
+        "parent_source": _text(row.get("source")),
+        "parent_experiment_id": _text(row.get("experiment_id")),
+        "proved_by": _text(row.get("bet_status")),
+    }
+    won_change = row.get("action") or row.get("detail")
+    if isinstance(won_change, dict) and won_change:
+        detail["won_change"] = won_change
+
+    return {
+        "source": SOURCE,
+        "account": _text(row.get("account")),
+        "subject": subject,
+        "tier": tier_mod.TIER_PROPOSAL,
+        "lane": lanes_mod.LANE_PROPOSAL,
+        # Ценность масштабирования — не копия ценности родителя: та уже
+        # получена. Выдуманное число здесь вынесло бы предложение в начало
+        # очереди обещанием, которого никто не считал.
+        "expected_rub": None,
+        "test_cost_rub": row.get("test_cost_rub"),
+        "horizon_days": row.get("horizon_days"),
+        "success_rule": row.get("success_rule"),
+        "detail": detail,
+    }
+
+
+def scan_closed(settled: Sequence[Dict[str, Any]],
+                ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Закрытые идеи с исходом ставки → {"ideas": [...], "skipped": [...]}.
+
+    На вход подают строки registry.recently_settled: поля идеи плюс исход её
+    ставки (bet_status). Судья один — сторож, вынесший вердикт; здесь его
+    только читают.
+    """
+    ctx = ctx or {}
+    account = _text(ctx.get("account"))
+    ideas: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    for row in settled or ():
+        if not isinstance(row, dict):
+            continue
+        if _text(row.get("bet_status")) != BET_WON:
+            skipped.append(_closed_skip(row, REASON_NOT_WON))
+            continue
+        if account and _text(row.get("account")) != account:
+            skipped.append(_closed_skip(row, REASON_OTHER_ACCOUNT))
+            continue
+        if not _text(row.get("idea_id")) or not isinstance(row.get("subject"), dict):
+            skipped.append(_closed_skip(row, REASON_NO_PARENT_ADDRESS))
+            continue
+        depth = _chain_depth(row) + 1
+        if depth > MAX_CHAIN_DEPTH:
+            skipped.append(_closed_skip(row, REASON_CHAIN_DEPTH))
+            continue
+        ideas.append(_scaling_idea(row, depth))
+    return {"ideas": ideas, "skipped": skipped}
+
