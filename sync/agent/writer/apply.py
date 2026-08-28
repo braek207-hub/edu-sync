@@ -182,6 +182,23 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
             raise ValueError(f"неизвестный тип корректировки: {direct_type}")
         return "bidmodifiers", "add", {"BidModifiers": [item]}
 
+    if kind == "audience.add":
+        # Корректировка на условие ретаргетинга — то же семейство
+        # bidmodifiers.add, что у устройств и демографии, со своим блоком.
+        # Форма подтверждена дважды: её читает из кабинета
+        # sync/edu_direct_settings.py (:886, :927), и её принял на запись
+        # probe_retargeting_lever.py 26.08.2026 — отказ 8800 «объект не
+        # найден» пришёл уровнем ЭЛЕМЕНТА, то есть тело разобрано.
+        return "bidmodifiers", "add", {
+            "BidModifiers": [{
+                "CampaignId": int(payload["CampaignId"]),
+                "RetargetingAdjustments": [{
+                    "RetargetingConditionId": int(payload["key"]),
+                    "BidModifier": delta_to_api(payload["BidModifier"]),
+                }],
+            }]
+        }
+
     if kind == "budget.set":
         # Блок BiddingStrategy собран планом (writer/budget.py) из
         # ПРОЧИТАННОГО состояния с заменой одного лишь WeeklySpendLimit:

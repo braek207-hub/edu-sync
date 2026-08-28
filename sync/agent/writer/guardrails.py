@@ -37,7 +37,8 @@ MODIFIER_CAP = 50          # потолок и пол корректировки
 ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set",
                         "budget.set", "budget.set_daily", "campaign.suspend",
                         "tcpa.set", "goal.set", "strategy.set", "negative.add",
-                        "placement.exclude", "negative.remove_added"}
+                        "placement.exclude", "negative.remove_added",
+                        "audience.add"}
 
 # Виды, у которых рычага записи на стороне агента нет и не будет: тело
 # кампании (группы, ключи, объявления) собирает ДРУГОЙ репозиторий, и агент
@@ -115,6 +116,14 @@ ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set", "schedule.set",
 # перезаписи — прежний коэффициент из previous_state журнала.
 ROLLBACK_ORIGIN_ADD = "bidmodifier.add"
 ROLLBACK_ORIGIN_SET = "bidmodifier.set"
+
+# Виды, создающие НОВЫЙ объект-корректировку. Их отмена возвращает нейтраль,
+# и разбираться, какой именно сегмент был адресован, рельсе незачем: до
+# действия объекта не было, каким бы ни был его тип. Корректировка на
+# аудиторию (writer/audience.py) — тот же add в bidmodifiers, просто по
+# условию ретаргетинга; без записи здесь её откат объявлялся бы
+# неоткатываемым навсегда, и изменение агента осталось бы в кабинете вечно.
+ROLLBACK_ORIGIN_ADD_KINDS = frozenset({ROLLBACK_ORIGIN_ADD, "audience.add"})
 
 _DELETE_REASON = "удаление объектов запрещено: агент только паузит"
 
@@ -583,7 +592,7 @@ def expected_rollback_coefficient(
     origin = str(origin_action_kind or "")
     previous = previous_state if isinstance(previous_state, dict) else {}
 
-    if origin == ROLLBACK_ORIGIN_ADD:
+    if origin in ROLLBACK_ORIGIN_ADD_KINDS:
         return API_NEUTRAL, ""
 
     if origin == ROLLBACK_ORIGIN_SET:

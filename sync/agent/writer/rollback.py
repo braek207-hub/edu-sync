@@ -204,6 +204,13 @@ def is_spend_collapsed(
     return False, ""
 
 
+# Виды, создающие новый объект-корректировку. Отменяются одинаково — set
+# нейтрали по Id из ответа API: корректировка на аудиторию
+# (writer/audience.py) отличается от корректировки сегмента только адресуемым
+# измерением, а путь назад у обеих один.
+ADDED_MODIFIER_KINDS = ("bidmodifier.add", "audience.add")
+
+
 def _added_modifier_id(action: Dict[str, Any]) -> Optional[Any]:
     """Id корректировки, добавленной действием bidmodifier.add.
 
@@ -257,7 +264,7 @@ def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[st
                               "BidModifier": delta_to_api(previous["percent"])}]
         }
 
-    if kind == "bidmodifier.add":
+    if kind in ADDED_MODIFIER_KINDS:
         modifier_id = _added_modifier_id(action)
         if modifier_id is None:
             return None

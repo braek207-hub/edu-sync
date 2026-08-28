@@ -12,6 +12,7 @@ tests/test_agent_writer_expectation.py — ожидание, которое за
 import pytest
 
 from sync.agent.writer import expectation, exposure, guardrails, lanes
+from sync.agent.writer.audience import diff_audience
 from sync.agent.writer.budget import diff_budget
 from sync.agent.writer.diff import diff_modifiers, diff_schedule
 from sync.agent.writer.goal import diff_goal
@@ -46,6 +47,20 @@ def _schedule():
     items = schedule_items([{"setting_key": "3", "value": -40},
                             {"setting_key": "4", "value": -40}])
     return diff_schedule(items, {}, "111", context=CTX)[0]
+
+
+def _audience(percent=30, share=0.25):
+    """Корректировка на условие ретаргетинга: та же модель переноса.
+
+    Экономика кампании едет внутри desired, а не отдельным контекстом: у
+    рычага аудиторий подпись diff_*(desired, actual) без третьего аргумента.
+    """
+    desired = {"111": {"audiences": [{"condition_id": 4_400_001,
+                                      "percent": percent, "share": share,
+                                      "attached_ad_groups": 2}],
+                       **CTX}}
+    actions, _ = diff_audience(desired, {"111": {"retargeting_modifiers": []}})
+    return actions[0]
 
 
 def _negative(cut_cost=9_000.0, conversions=0):
@@ -172,6 +187,7 @@ def _remove_added():
 _SAMPLES = {
     "bidmodifier.add": lambda: _bidmodifier("bidmodifier.add"),
     "bidmodifier.set": lambda: _bidmodifier("bidmodifier.set"),
+    "audience.add": _audience,
     "schedule.set": _schedule,
     "budget.set": lambda: _budget(daily=False),
     "budget.set_daily": lambda: _budget(daily=True),

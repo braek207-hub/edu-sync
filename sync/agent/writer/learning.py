@@ -56,6 +56,11 @@ RESETS_LEARNING = {
 SAFE_FOR_LEARNING = {
     "bidmodifier.set",
     "bidmodifier.add",
+    # Корректировка на условие ретаргетинга — та же ручка ставки, только
+    # адресованная сегменту аудитории (writer/audience.py). Списка справки
+    # она не касается ничем: ни стратегии, ни модели оплаты, ни ограничения
+    # расхода, ни целевого действия.
+    "audience.add",
     "negative.add",
     "placement.exclude",
 }

@@ -208,7 +208,11 @@ def _model(action: Dict[str, Any],
     if days is None or days <= 0:
         return None
     kind = str(action.get("action_kind") or "")
-    if kind in ("bidmodifier.add", "bidmodifier.set"):
+    # Корректировка на аудиторию считается той же моделью, что корректировка
+    # сегмента, и это не экономия кода: деньги переносятся ВНУТРИ объекта
+    # ровно так же — из сегмента с другой конверсией в остальной объект, — а
+    # вторая модель того же переноса разошлась бы с первой на первой правке.
+    if kind in ("bidmodifier.add", "bidmodifier.set", "audience.add"):
         return _bid_modifier(action, context, days)
     if kind == "schedule.set":
         return _schedule(action, context, days)
