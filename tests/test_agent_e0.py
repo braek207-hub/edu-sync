@@ -185,6 +185,10 @@ def _patch_e0_run(monkeypatch, reports=None):
     # Пусто = порога нет, кандидаты не считаются: это штатное состояние
     # кабинета без истории, а не повод падать.
     monkeypatch.setattr(agent_e0.agent_db, "load_baseline_cpa", lambda *a, **k: {})
+    # Факт месяца по кампаниям — вход пейсинга. Без подмены прогон уходит в
+    # реальную базу и печатает ретраи коннекта в тот же stdout, который тест
+    # парсит как JSON. Пусто = месяц ещё ничего не выбрал: план целиком впереди.
+    monkeypatch.setattr(agent_e0.agent_db, "load_cost_by_campaign", lambda *a, **k: {})
     # Реестр идей: секция ideas печатается каждым прогоном, и без подмены
     # чтение уходит в реальную базу и печатает ретраи коннекта в тот же
     # stdout, который тест парсит как JSON. Пусто = реестр без открытых идей,
@@ -1203,6 +1207,72 @@ def test_monthly_cap_from_the_panel_reaches_the_solver(monkeypatch, capsys):
 
     assert captured[1]["monthly_cap_rub"] == 3_000_000.0
     assert captured[1]["target_romi"] == 2.0
+
+
+def test_the_month_plan_reaches_the_solver_by_account(monkeypatch, capsys):
+    # Пейсинг считается в такте, а работает у солвера: план, который никуда
+    # не доехал, выглядит применённым и молча оставляет кабинет на трейлинге.
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(
+        agent_e0.agent_db, "load_agent_config",
+        lambda *a, **k: {"preset": None,
+                         "overrides": {"monthly_budget_cap_rub": 3_000_000.0}})
+    captured = _spy_portfolio(monkeypatch)
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+
+    pace = captured[1]["pace_by_login"]
+    assert pace, "план месяца обязан доехать до итоговой раскладки"
+    assert all(plan["target_rub"] == 3_000_000.0 for plan in pace.values())
+    assert all(plan["daily_allowance"] > 0 for plan in pace.values())
+    # Первая раскладка идёт БЕЗ плана намеренно: она считает запас по целям,
+    # а запас — вход самого плана. План там означал бы, что потолок окна
+    # посчитан по числам, которых ещё нет.
+    assert "pace_by_login" not in captured[0]
+
+
+def test_the_month_plan_is_printed_with_what_is_already_spent(monkeypatch, capsys):
+    # Число «бюджет кабинета» без плана месяца — число ниоткуда: непонятно,
+    # догоняет агент отставание или тормозит перебор. Факт месяца берётся ПО
+    # ВЧЕРАШНИЙ день: сегодняшний ещё идёт и в остатке дней уже учтён.
+    import json as _json
+    from datetime import date as _date
+
+    _patch_e0_run(monkeypatch)
+    windows = []
+    monkeypatch.setattr(agent_e0.agent_db, "load_cost_by_campaign",
+                        lambda *a, **k: (windows.append(a), {})[1])
+    monkeypatch.setattr(
+        agent_e0.agent_db, "load_agent_config",
+        lambda *a, **k: {"preset": None,
+                         "overrides": {"monthly_budget_cap_rub": 3_000_000.0}})
+
+    assert agent_e0.main() == 0
+    report = _json.JSONDecoder().raw_decode(capsys.readouterr().out.lstrip())[0]
+
+    assert report["pacing"]["month"] == _date.today().strftime("%Y-%m")
+    assert report["pacing"]["unavailable"] is None
+    month_window = [w for w in windows
+                    if w[0] == _date.today().replace(day=1).isoformat()]
+    assert month_window and month_window[0][1] < _date.today().isoformat()
+
+
+def test_a_month_without_facts_does_not_break_the_tact(monkeypatch, capsys):
+    # Витрина недоступна — плана нет, и солвер считает потолок окна
+    # по-старому. Падать такт не имеет права: пейсинг это слой поверх
+    # раскладки, а не её условие.
+    import json as _json
+
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0.agent_db, "load_cost_by_campaign",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("нет связи")))
+
+    assert agent_e0.main() == 0
+    report = _json.JSONDecoder().raw_decode(capsys.readouterr().out.lstrip())[0]
+
+    assert report["pacing"]["accounts"] == {}
+    assert "нет связи" in report["pacing"]["unavailable"]
 
 
 def test_blind_share_is_measured_on_both_windows(monkeypatch, capsys):

@@ -54,6 +54,7 @@ from sync.agent.metrika import (
     resolve_counter_account,
 )
 from sync.agent.growth import LEVER_BUDGET, growth_candidates
+from sync.agent.pacing import dominant_regime, month_plan
 from sync.agent.quality import (
     QUALITY_WINDOW_DAYS,
     lead_quality_section,
@@ -1443,9 +1444,45 @@ def main() -> int:
         room_by_login[login] = (room_by_login.get(login, 0.0)
                                 + float(candidate["room_rub"] or 0.0))
 
+    # Пейсинг месяца: план освоения берётся у владельца потолком, а не у
+    # прошедших 28 дней. Факт месяца считается ПО ВЧЕРАШНИЙ день: сегодняшний
+    # входит в остаток дней, и неполный день, зачтённый в трату, каждый прогон
+    # занижал бы остаток. Витрина недоступна — плана нет, и солвер считает
+    # потолок окна по-старому.
+    month_first = date.today().replace(day=1)
+    month_spent: Dict[str, float] = {}
+    pacing_reason = None
+    try:
+        # Первое число месяца окно вырождается (конец раньше начала) и витрина
+        # честно отдаёт пусто. Ветки «сегодня первое» здесь нет намеренно:
+        # она исполнялась бы раз в месяц и ровно там ломалась бы молча.
+        for campaign_id, cost in agent_db.load_cost_by_campaign(
+                month_first.isoformat(),
+                (date.today() - timedelta(days=1)).isoformat()).items():
+            login = login_by_campaign_id.get(str(campaign_id)) or "unmapped"
+            month_spent[login] = month_spent.get(login, 0.0) + float(cost or 0.0)
+    except Exception as exc:  # noqa: BLE001
+        pacing_reason = f"{type(exc).__name__}: {exc}"[:200]
+    account_regime = dominant_regime(demand)
+    # План считается по КАБИНЕТАМ такта, а не по тем, у кого солвер нашёл
+    # кривые: кабинет без раскладки — это кабинет, которому нечем осваивать
+    # план, и видеть его в отчёте пустой строкой полезнее, чем не видеть.
+    pace_logins = ({str(c["login"]) for c in clients}
+                   | set(preliminary_threshold["accounts"]))
+    pace_by_login = {} if pacing_reason else {
+        login: month_plan(month_first.strftime("%Y-%m"),
+                          month_spent.get(login, 0.0),
+                          active_config["monthly_budget_cap_rub"],
+                          account_regime)
+        for login in sorted(pace_logins)
+    }
+
     budget_threshold = _solve_portfolio(
         target_romi=active_config["target_romi"],
         room_rub_by_login=room_by_login,
+        # План месяца по кабинетам: он и задаёт потолок окна, когда потолок
+        # месяца назван. Недобор начала месяца догоняется, перебор тормозится.
+        pace_by_login=pace_by_login,
         # Потолок месячного освоения — деньги владельца. Ключ пуст: рост
         # только предлагается числом в отчёте, сумма кабинета не меняется.
         monthly_cap_rub=active_config["monthly_budget_cap_rub"],
@@ -1659,6 +1696,15 @@ def main() -> int:
                     "monthly_cap_rub": active_config["monthly_budget_cap_rub"],
                     "lambda": acc["lambda"]}
             for login, acc in budget_threshold["accounts"].items()
+        },
+        # План освоения месяца: цель, выбранное и дневная доля по кабинетам.
+        # Без него «бюджет кабинета» в отчёте — число ниоткуда: непонятно,
+        # догоняет агент месяц или тормозит его.
+        "pacing": {
+            "month": month_first.strftime("%Y-%m"),
+            "regime": account_regime,
+            "unavailable": pacing_reason,
+            "accounts": pace_by_login,
         },
         "budget_target_rows": budget_target_count,
         "computed_settings": computed_count,

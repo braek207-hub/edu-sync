@@ -34,6 +34,7 @@ import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent.confidence import assess
+from sync.agent.pacing import CAPPED_BY_PACING
 from sync.agent.tcpa import DEFAULT_TARGET_ROMI
 # Признак «лимит связывает расход» задан рычагом записи, и второго определения
 # у него быть не должно: разойдись они — расчёт поднимал бы вес кампании,
@@ -106,7 +107,8 @@ GROWTH_RESIDUAL_RUB = 1.0
 
 def account_budget(current_cost: float, lam: float, target_romi: float,
                    room_rub: float,
-                   monthly_cap: Optional[float]) -> Dict[str, Any]:
+                   monthly_cap: Optional[float],
+                   pace: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Бюджет кабинета на такт: держим или растим, и чем ограничены.
 
     Три условия роста, и каждое закрывает свой способ сжечь деньги:
@@ -121,8 +123,14 @@ def account_budget(current_cost: float, lam: float, target_romi: float,
         считается и печатается, но сумма не меняется: решение «тратить
         больше» принимает владелец денег, агент приносит ему цифру.
 
+    pace — план освоения месяца (pacing.month_plan) этого кабинета. Он и
+    задаёт потолок окна, когда известен: ровная доля месячного потолка не
+    знает, сколько от плана уже выбрано, и недобор начала месяца не
+    догоняется ею никогда. Плана нет (витрина месяца недоступна) — потолок
+    считается по-старому, а не исчезает.
+
     capped_by называет ограничитель: "lambda" | "room" | "step" |
-    "monthly_cap".
+    "monthly_cap" | "pacing".
     """
     def hold(reason: str, proposed: float = 0.0) -> Dict[str, Any]:
         return {"budget": round(current_cost, 2), "growth_rub": 0.0,
@@ -140,16 +148,24 @@ def account_budget(current_cost: float, lam: float, target_romi: float,
     step_rub = current_cost * ACCOUNT_GROWTH_STEP
     growth = min(step_rub, float(room_rub))
     capped_by = "step" if step_rub <= room_rub else "room"
-    if monthly_cap is None:
+
+    # Потолок окна: дневная доля пейсинга, если план месяца известен, иначе
+    # ровная доля месячного потолка. Пейсинг знает то, чего ровная доля не
+    # знает никогда, — сколько от плана УЖЕ выбрано: вяло начатый месяц он
+    # догоняет, обогнавший план тормозит сам.
+    paced = float(pace["daily_allowance"]) * WINDOW_DAYS if (
+        pace and pace.get("daily_allowance") is not None) else None
+    if paced is None and monthly_cap is None:
         return hold(capped_by, proposed=growth)
 
     # Потолок ниже факта — это команда сокращать общую сумму, а сокращения по
     # кабинету агент не делает: перенос внутри кабинета решает солвер, а
     # объём освоения — владелец. Сумма остаётся, упор в потолок виден.
-    cap_window = float(monthly_cap) * WINDOW_DAYS / DAYS_IN_MONTH
+    cap_window = (paced if paced is not None
+                  else float(monthly_cap) * WINDOW_DAYS / DAYS_IN_MONTH)
     budget = max(current_cost, min(current_cost + growth, cap_window))
     if budget < current_cost + growth - 1e-6:
-        capped_by = "monthly_cap"
+        capped_by = CAPPED_BY_PACING if paced is not None else "monthly_cap"
     return {"budget": round(budget, 2),
             "growth_rub": round(budget - current_cost, 2),
             "proposed_growth_rub": round(growth, 2),
@@ -600,6 +616,7 @@ def portfolio_targets(
     target_romi: float = DEFAULT_TARGET_ROMI,
     room_rub_by_login: Optional[Dict[str, float]] = None,
     monthly_cap_rub: Optional[float] = None,
+    pace_by_login: Optional[Dict[str, Dict[str, Any]]] = None,
     forecast_bias: Optional[Dict[str, Dict[str, float]]] = None,
     thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
@@ -694,7 +711,8 @@ def portfolio_targets(
         # её не оправдывает.
         growth_plan = account_budget(fact_cost, lam, target_romi,
                                      float(room_rub_by_login.get(login) or 0.0),
-                                     monthly_cap_rub)
+                                     monthly_cap_rub,
+                                     (pace_by_login or {}).get(login))
         budget = growth_plan["budget"]
         if budget > fact_cost:
             grown_lam, targets = solve_threshold(campaigns, budget)
