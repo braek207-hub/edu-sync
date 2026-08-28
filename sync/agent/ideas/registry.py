@@ -213,7 +213,8 @@ COLUMNS = ("idea_id", "source", "account", "subject", "subject_key", "tier",
            "lane", "expected_rub", "test_cost_rub", "horizon_days",
            "success_rule", "action", "detail", "status", "action_id",
            "experiment_id",
-           "dropped_reason", "rejected_by", "rejected_at")
+           "dropped_reason", "rejected_by", "rejected_at",
+           "queued_by", "queued_at")
 
 # Поля, которые генератор вправе обновлять у уже существующей идеи: его
 # собственные числа и формулировки. Всего остального (статус, связи с
@@ -403,6 +404,11 @@ def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
         "dropped_reason": None,
         "rejected_by": None,
         "rejected_at": None,
+        # Взятие человеком в работу — решение, которого генератор не
+        # принимает: у новой идеи его нет, у существующей его сохраняет
+        # слияние (_merge копирует строку и обновляет только свои поля).
+        "queued_by": None,
+        "queued_at": None,
     }
 
 
@@ -542,6 +548,43 @@ def reject(idea_id_value: str, by: str, reason: str = "") -> Dict[str, Any]:
     row["dropped_reason"] = _human_reason(who, reason)
     if str(row.get("status")) not in CLOSED_STATUSES:
         row["status"] = STATUS_DROPPED
+    _write_rows([row])
+    return row
+
+
+def take_into_work(idea_id_value: str, by: str) -> Dict[str, Any]:
+    """Человек берёт идею в работу: статус queued и имя того, кто взял.
+
+    Зеркало reject: то же право человека, только с обратным знаком. Нужно оно
+    ровно предложениям (класс достоверности 3) — рычага записи у них нет, и
+    сделать такую идею может только человек. Без пометки автора экран
+    предложений через неделю показывал бы очередь, про которую никто не помнит,
+    взялся за неё кто-нибудь или она просто висит.
+
+    Автор обязателен по той же причине, что и в reject: queued без имени
+    неотличим от queued, поставленного тактом записи, — а это разные вещи, и
+    ждать их исполнения надо от разных исполнителей.
+
+    Закрытая идея в работу не берётся: закрытая строка есть запись о
+    случившемся, и открывать её заново значило бы переписывать исход.
+    """
+    who = _text(by)
+    if not who:
+        raise InvalidIdea(
+            "взятие в работу без автора: queued без имени неотличим от "
+            "queued, поставленного тактом записи")
+    row = load(idea_id_value)
+    if row is None:
+        raise InvalidIdea(f"идеи {idea_id_value!r} нет в реестре: брать нечего")
+    if str(row.get("status")) in CLOSED_STATUSES:
+        raise InvalidIdea(
+            f"идея {idea_id_value!r} закрыта как {row.get('status')!r}: "
+            "закрытая идея в работу не берётся")
+
+    row = dict(row)
+    row["status"] = STATUS_QUEUED
+    row["queued_by"] = who
+    row["queued_at"] = datetime.now(timezone.utc)
     _write_rows([row])
     return row
 
@@ -722,13 +765,13 @@ UPSERT_SQL = """
         idea_id, source, account, subject, subject_key, tier, lane,
         expected_rub, test_cost_rub, horizon_days, success_rule, action,
         detail, status, action_id, experiment_id, dropped_reason, rejected_by,
-        rejected_at
+        rejected_at, queued_by, queued_at
     ) VALUES (
         %(idea_id)s, %(source)s, %(account)s, %(subject)s, %(subject_key)s,
         %(tier)s, %(lane)s, %(expected_rub)s, %(test_cost_rub)s,
         %(horizon_days)s, %(success_rule)s, %(action)s, %(detail)s,
         %(status)s, %(action_id)s, %(experiment_id)s, %(dropped_reason)s,
-        %(rejected_by)s, %(rejected_at)s
+        %(rejected_by)s, %(rejected_at)s, %(queued_by)s, %(queued_at)s
     )
     ON CONFLICT (idea_id) DO UPDATE SET
         source         = EXCLUDED.source,
@@ -749,6 +792,8 @@ UPSERT_SQL = """
         dropped_reason = EXCLUDED.dropped_reason,
         rejected_by    = EXCLUDED.rejected_by,
         rejected_at    = EXCLUDED.rejected_at,
+        queued_by      = EXCLUDED.queued_by,
+        queued_at      = EXCLUDED.queued_at,
         updated_at     = now()
 """
 

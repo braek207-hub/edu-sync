@@ -658,6 +658,40 @@ def test_reject_without_a_person_is_refused(store):
         registry.reject(_id(_idea()), by="", reason="почему-то")
 
 
+def test_taking_into_work_records_who_and_when(store):
+    # Предложение (класс 3) применить нечем: рычага записи у него нет, и
+    # сделать его может только человек. Имя взявшего — не украшение: без него
+    # очередь через неделю не отвечает, взялся за идею кто-нибудь или она
+    # просто висит.
+    registry.upsert([_idea()])
+    row = registry.take_into_work(_id(_idea()), by="pavel")
+
+    assert row["status"] == registry.STATUS_QUEUED
+    assert row["queued_by"] == "pavel"
+    assert row["queued_at"] is not None
+    # Взятие в работу — не отказ: объект остаётся живым для генераторов.
+    assert not row.get("rejected_by")
+
+
+def test_taking_into_work_without_a_person_is_refused(store):
+    # queued без имени неотличим от queued, поставленного тактом записи, — а
+    # ждать их исполнения надо от разных исполнителей.
+    registry.upsert([_idea()])
+    with pytest.raises(ValueError, match="автор"):
+        registry.take_into_work(_id(_idea()), by="")
+
+
+def test_a_closed_idea_is_not_taken_into_work(store):
+    # Закрытая строка есть запись о случившемся: взять её в работу значило бы
+    # переписать исход задним числом.
+    done = _idea()
+    registry.upsert([done])
+    registry.mark(_id(done), registry.STATUS_DONE, reason="раскатано")
+
+    with pytest.raises(ValueError, match="закрыта"):
+        registry.take_into_work(_id(done), by="pavel")
+
+
 def test_reject_of_an_unknown_idea_is_refused(store):
     with pytest.raises(ValueError, match="нет в реестре"):
         registry.reject("такой-идеи-нет", by="pavel", reason="нет")

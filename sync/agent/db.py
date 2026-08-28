@@ -384,6 +384,19 @@ AGENT_DDL: List[str] = [
     ALTER TABLE edu_agent_ideas
       ADD COLUMN IF NOT EXISTS detail JSONB
     """,
+    # Кто из людей взял идею в работу и когда (registry.take_into_work).
+    # Отдельно от rejected_by, потому что это противоположное решение, и
+    # отдельно от статуса, потому что queued ставит и такт записи: без имени
+    # взятая человеком идея неотличима от идеи, поставленной в очередь
+    # машиной, — а ждать их исполнения надо от разных исполнителей.
+    """
+    ALTER TABLE edu_agent_ideas
+      ADD COLUMN IF NOT EXISTS queued_by TEXT
+    """,
+    """
+    ALTER TABLE edu_agent_ideas
+      ADD COLUMN IF NOT EXISTS queued_at TIMESTAMPTZ
+    """,
     # Отклонения человеком читаются КАЖДЫМ прогоном генераторов и на каждую
     # порцию идей, а копятся без предела — частичный индекс держит выборку
     # размером с список запретов, а не с историей реестра (тот же довод, что у

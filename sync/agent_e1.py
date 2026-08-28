@@ -2845,6 +2845,13 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     saved = blackbox.save_run(
         run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),
         report={"verdict": run_verdict(account_reports),
+                # Ступени полос — в отчёт ПРОГОНА, а не кабинета: свободу
+                # зарабатывает полоса на всей своей истории, одна на все
+                # кабинеты. Без этой строки экран агента (задача 27) видит
+                # «взято/отказано/дефицит» и не видит ступень, с которой шёл
+                # отбор, — то есть не может отличить полосу, зажатую своим
+                # потолком, от полосы, стоящей в тени.
+                "lane_steps": ctx["lane_steps"],
                 "accounts": account_reports, "blind_spend": blind,
                 "window": [cutoff, today], "failed_accounts": failed_accounts},
         rejects=run_rejects)

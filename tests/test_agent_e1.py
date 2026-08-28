@@ -2902,6 +2902,33 @@ def test_shortfall_travels_to_the_blackbox(monkeypatch, capsys):
     assert "Infinity" not in text and "NaN" not in text
 
 
+def test_the_lane_steps_reach_the_saved_report(monkeypatch, capsys):
+    # Ступень — то, чем объясняется дефицит полосы. Экран агента читает
+    # сохранённый отчёт прогона, и без этой строки он показывал бы «заявлено
+    # 168 000 при потолке 50 000», не отличая полосу, зажатую своей ступенью,
+    # от полосы, стоящей в тени: у обеих отказано всё, а лечатся они
+    # противоположным — первой поднимают ступень, вторую выпускает человек.
+    saved = {}
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [101]},
+        daily_cost={"101": 2000.0},
+    )
+    monkeypatch.setattr(agent_e1.blackbox, "save_run",
+                        lambda *a, **k: saved.update(k) or {
+                            "run_id": "test", "saved": True, "rejects": 0,
+                            "error": None})
+
+    assert agent_e1.main() == 0
+
+    steps = saved["report"]["lane_steps"]
+    assert set(steps) == set(agent_e1.lanes.ALL_LANES)
+    # Ступень и её происхождение — оба: число без источника не отвечает, кто
+    # его поставил (человек панелью, лестница послужным списком или пол).
+    assert steps["tuning"]["step"] >= 0 and steps["tuning"]["source"]
+
+
 def test_lane_shows_what_the_run_budget_cut_after_the_lane_let_it_through(
         monkeypatch, capsys):
     # Дефицит полосы — не последняя рельса на пути действия: за отбором стоит
