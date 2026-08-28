@@ -47,6 +47,20 @@ NO_GROWTH_ADDRESS = "no_growth_address"     # сокращение без адр
 # прогона и исчезал вместе с логом; при лимите в 50 действий порог не срабатывал
 # ни разу, при трёхстах срабатывает первым же тактом.
 UNITS_LOW = "units_low"
+# Идея реестра уже применена, идёт замер: горизонт её проверки не вышел
+# (registry.STATUS_RUNNING). Своя причина, а не одна из соседних, потому что
+# лечится она третьим способом: closed_key говорит «ключ закрыт финальным
+# статусом» и снимается следующим окном, proposal — «рычага записи нет вовсе»
+# и не снимается ничем, а здесь рычаг есть и УЖЕ уехал в кабинет. Слей их — и
+# на разборе «идея честно проверяется» выглядело бы как стена, в которую
+# агент бьётся каждый прогон.
+IDEA_RUNNING = "idea_running"
+# Полоса стоит на ступени 0 — в тени: агент записал намерение в журнал
+# (статус writer/db.SHADOW_STATUS) и не поехал в кабинет. Своя причина, а не
+# lane_limit, потому что расширение потолка тут не поможет ничем: из тени
+# выводит человек, прочитав совпадения намерений с фактом. Слей их — и
+# «рычаг на приёмке» на разборе выглядело бы как «полосе мало денег».
+SHADOW = "shadow"
 UNKNOWN = "unknown"
 
 # Причины конфликтов берутся из sync/agent/conflicts.py, а не переписываются
@@ -72,7 +86,8 @@ CONFLICT_REASONS = frozenset({conflicts.SUSPENDED_OBJECT,
 KNOWN_REASONS = frozenset({BUDGET, LANE_LIMIT, PROPOSAL, NO_RED_LINE,
                            COOLDOWN, ATTEMPTS_EXHAUSTED, HOLDOUT,
                            LEARNING_COOLDOWN, CLOSED_KEY, NO_GROWTH_ADDRESS,
-                           UNITS_LOW, UNKNOWN}) | CONFLICT_REASONS
+                           UNITS_LOW, IDEA_RUNNING, SHADOW,
+                           UNKNOWN}) | CONFLICT_REASONS
 
 HISTORICAL_REASONS = frozenset({RUN_CAP})
 

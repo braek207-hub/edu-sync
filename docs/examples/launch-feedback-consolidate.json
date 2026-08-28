@@ -1,0 +1,54 @@
+{
+  "order_id": "consolidate-vpo",
+  "idea_id": "d96b5cf53b8073c1c6d122e5",
+  "account": "account1-506453-ln8s",
+  "level_slug": "vpo_consolidate",
+  "campaign_name": "vpo / consolidate / consolidate-vpo",
+  "campaign_id": "555",
+  "verdict": "improved",
+  "reason": "цена конверсии 1200 ₽ против донорской 1600 ₽ за 30 дн.",
+  "horizon_days": 30,
+  "days_live": 30,
+  "window": {
+    "from": "2026-09-01",
+    "to": "2026-09-30"
+  },
+  "baseline": {
+    "metric": "cpa_rub",
+    "op": "<=",
+    "threshold": 1600.0,
+    "comparison": "vs_donors"
+  },
+  "fact": {
+    "cost_rub": 36000.0,
+    "eff_leads": 30.0,
+    "cpa_rub": 1200.0,
+    "expected_payments": 30.0
+  },
+  "queries": [
+    {
+      "query": "колледж заочно москва",
+      "clicks": 120,
+      "cost_rub": 18400.0,
+      "conversions": 12
+    },
+    {
+      "query": "заочный колледж после 9 класса",
+      "clicks": 74,
+      "cost_rub": 9100.0,
+      "conversions": 6
+    },
+    {
+      "query": "колледж бесплатно скачать программу",
+      "clicks": 40,
+      "cost_rub": 5100.0,
+      "conversions": 0
+    },
+    {
+      "query": "колледж отзывы студентов форум",
+      "clicks": 31,
+      "cost_rub": 3400.0,
+      "conversions": 0
+    }
+  ]
+}

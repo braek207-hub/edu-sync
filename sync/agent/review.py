@@ -28,6 +28,7 @@ sync/agent/review.py — недельный разбор беты: находк�
 
 from typing import Any, Dict, Iterable, List, Optional
 
+from sync.agent import autonomy
 from sync.agent import rejects
 
 WALL = "repeated_wall"
@@ -36,6 +37,10 @@ HAND_ROLLBACK = "hand_rollback"
 SILENT_STAGE = "silent_stage"
 UNVERIFIED = "unverified_kind"
 BLIND_WRITE = "blackbox_write_failed"
+TACT_HARM = "tact_harmful"
+TACT_BLIND = "tact_unmeasured"
+SHADOW_READY = "shadow_ready"
+SHADOW_IDLE = "shadow_idle"
 
 # Сколько РАЗНЫХ прогонов подряд должно упереться в одну стену, чтобы это
 # перестало быть случайностью дня. Три — минимум, при котором совпадение уже
@@ -58,9 +63,15 @@ WALL_MIN_RUNS = 3
 #   run_cap     — снятая рельса «лимит действий на прогон». Строки за
 #                 июль–август 2026 ещё попадают в семидневное окно разбора,
 #                 и жалоба на ограничитель, которого больше нет, бесполезна
-#                 вдвойне (rejects.HISTORICAL_REASONS).
+#                 вдвойне (rejects.HISTORICAL_REASONS);
+#   shadow      — полоса стоит на ступени 0, и это режим приёмки рычага, а не
+#                 сбой: намерение записано в журнал и ждёт сверки с фактом.
+#                 Каждый теневой рычаг отказывает по своему объекту каждый
+#                 прогон — на третий такт разбор состоял бы из одних стен.
+#                 Молчащая тень при этом видна отдельной находкой (shadow_idle).
 EXPECTED_REASONS = frozenset({rejects.BUDGET, rejects.LANE_LIMIT,
-                              rejects.PROPOSAL, rejects.RUN_CAP})
+                              rejects.PROPOSAL, rejects.RUN_CAP,
+                              rejects.SHADOW})
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -228,10 +239,127 @@ def blind_writes(runs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def tact_effects(runs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Что показал замер такта целиком (agent_e1_watchdog.tact_effect_report).
+
+    Частные вердикты отвечают на вопрос «выдержало ли ЭТО изменение», и
+    четыреста таких ответов не складываются в ответ о работе системы: они
+    сняты на объёмах, где каждый по отдельности — шум. Замер такта отвечает
+    одним числом, и разбору нужны из него ровно две вещи.
+
+    ВРЕДНЫЙ ТАКТ — находка высшего веса, и не потому, что «стало дороже»
+    (дороже бывает от рынка), а потому, что дороже стало ОТНОСИТЕЛЬНО
+    заповедника, весь доверительный интервал по одну сторону нуля. Это
+    единственное утверждение о вреде, которое агент умеет доказать.
+
+    СЛЕПОЙ ЗАМЕР — находка о самом наблюдении. Такты идут, а сказать о них
+    нечего: нет заповедника, он мал, фактов не хватило. Молчание замера
+    выглядит ровно как «всё хорошо», и именно поэтому его печатают отдельной
+    строкой. Одиночное «unknown» законно (в такте могло не быть действий) —
+    находкой становится период, где НИ ОДИН такт не измерен.
+    """
+    measured: List[Dict[str, Any]] = []
+    for report in _reports(runs, "watchdog"):
+        for account in report.get("accounts") or []:
+            effect = account.get("tact_effect") or {}
+            if effect:
+                measured.append({"account": account.get("account"), **effect})
+
+    out: List[Dict[str, Any]] = []
+    for effect in measured:
+        if str(effect.get("verdict")) != "worsened":
+            continue
+        out.append(_finding(
+            TACT_HARM, "high", str(effect.get("account") or ""),
+            f"такт {effect.get('tact_date')} ухудшил цену лида на "
+            f"{round(float(effect.get('did') or 0.0) * 100)}% относительно "
+            f"заповедника",
+            {"tact_date": effect.get("tact_date"), "did": effect.get("did"),
+             "ci": effect.get("ci"), "treated_delta": effect.get("treated_delta"),
+             "holdout_delta": effect.get("holdout_delta")}))
+
+    verdicts = {str(e.get("verdict")) for e in measured}
+    if measured and verdicts == {"unknown"}:
+        reasons = sorted({str(e.get("reason")) for e in measured if e.get("reason")})
+        out.append(_finding(
+            TACT_BLIND, "medium", "tact_effect",
+            f"за период ни один такт не измерен ({len(measured)} прогонов): "
+            + "; ".join(reasons),
+            {"runs": len(measured), "reasons": reasons}))
+    return out
+
+
+# Сколько окончательных вердиктов сверки должно накопиться, чтобы разговор о
+# выпуске рычага из тени был разговором о числах. То же, что требует лестница
+# от первой ступени: приёмка не может быть дешевле входа, который она заменяет
+# собой для рычагов без истории.
+MIN_SHADOW_VERDICTS = autonomy.STEPS[1].min_closed
+
+# Исходы сверки, которые СЧИТАЮТСЯ материалом. «unknown» — не материал:
+# у намерения не было обещания в заявках, или горизонт ещё открыт.
+SHADOW_JUDGED = ("shadow_hit", "shadow_miss")
+
+
+def shadow_intents(runs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Что происходит с рычагами на приёмке.
+
+    Тень — единственное состояние агента, из которого он не выходит сам: 0 → 1
+    делает человек, прочитав совпадения намерений с фактом. У такого устройства
+    есть ровно два способа сломаться молча, и обе находки здесь про них.
+
+    ПРИЁМКА НАБРАЛА МАТЕРИАЛ — намерений сверено достаточно, а рычаг всё ещё в
+    тени. Это не дефект, это ожидающее решение; но решение, о котором никто не
+    напомнил, не принимается никогда, и рычаг стоит в тени вечно при готовых
+    числах.
+
+    ПРИЁМКА НЕ ДВИЖЕТСЯ — намерения пишутся, а вердиктов нет. Снаружи это
+    выглядит как «рычаг проверяется» и может выглядеть так месяцами: обещания
+    без сроков, обещания меньше заявки, пустая витрина по объекту. Разница с
+    первой находкой в том, что здесь решать человеку НЕЧЕГО, и чинить надо
+    сверку, а не ждать.
+    """
+    judged: Dict[str, int] = {}
+    verdict_runs = 0
+    for report in _reports(runs, "watchdog"):
+        block = report.get("shadow") or {}
+        counts = block.get("verdicts") or {}
+        if not counts:
+            continue
+        verdict_runs += 1
+        for verdict, count in counts.items():
+            judged[str(verdict)] = judged.get(str(verdict), 0) + int(count or 0)
+
+    intents = 0
+    for report in _reports(runs, "e1"):
+        for account in report.get("accounts") or []:
+            intents += int((account.get("shadow") or {}).get("intents") or 0)
+
+    material = sum(judged.get(v, 0) for v in SHADOW_JUDGED)
+    out: List[Dict[str, Any]] = []
+    if material >= MIN_SHADOW_VERDICTS:
+        out.append(_finding(
+            SHADOW_READY, "medium", "shadow",
+            f"приёмка набрала {material} сверенных намерений "
+            f"(порог {MIN_SHADOW_VERDICTS}): "
+            f"совпало {judged.get('shadow_hit', 0)}, не совпало "
+            f"{judged.get('shadow_miss', 0)} — решение о выпуске за человеком",
+            {"judged": material, "verdicts": dict(sorted(judged.items())),
+             "threshold": MIN_SHADOW_VERDICTS}))
+    elif intents > 0 and material == 0:
+        out.append(_finding(
+            SHADOW_IDLE, "low", "shadow",
+            f"намерений записано {intents}, вердиктов сверки ноль "
+            f"({verdict_runs} прогонов сторожа со сверкой) — приёмка не движется",
+            {"intents": intents, "verdict_runs": verdict_runs,
+             "verdicts": dict(sorted(judged.items()))}))
+    return out
+
+
 def review(runs: List[Dict[str, Any]], reject_rows: List[Dict[str, Any]],
            expected_stages: Iterable[str]) -> Dict[str, Any]:
     """Все находки периода, отсортированные по весу."""
     findings = (silent_stages(runs, expected_stages) + hand_rollbacks(runs)
+                + tact_effects(runs) + shadow_intents(runs)
                 + walls(reject_rows) + conflicts_seen(runs) + unverified(runs)
                 + blind_writes(runs))
     findings.sort(key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))

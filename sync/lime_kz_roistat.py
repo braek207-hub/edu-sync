@@ -104,18 +104,37 @@ def build_rows(api_rows, fx_rate: float, cabinet_cost: dict, date_s: str, cohort
     Returns:
         Список кортежей в порядке COLUMNS.
     """
-    out: list[tuple] = []
+    # Свёртка по ключу витрины, а не запись строк API один в один. Несколько строк
+    # Роистата после map_roistat_channel и campaign_of дают один и тот же кортеж —
+    # и до 28.08.2026 они ложились в базу отдельными строками. Базовый запрос дашборда
+    # группирует по тому же кортежу и СУММИРУЕТ, поэтому лишние строки не пропадали,
+    # а удваивали числа: замер прода нашёл 1765 таких групп с 01.01.2025, из них 1002
+    # полностью идентичных (+61 332 ₽ расхода, +2 351 ₽ выручки).
+    #
+    # Две вещи при свёртке складывать нельзя, и обе — не аддитивные по построению:
+    #   • расход кабинетных каналов берётся по campaign_id, то есть у двух строк с одним
+    #     id он ОДИН И ТОТ ЖЕ (отсюда и брались идентичные пары);
+    #   • когорта лежит по своему ключу и при совпадении читается дважды.
+    # Обе учитываются один раз — по множеству уже учтённых ключей.
+    acc: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    counted_cabinet: set[tuple] = set()
+    counted_cohort: set[tuple] = set()
+
     for r in api_rows:
         name = r["channel"]
         channel, subchannel, traffic_type = map_roistat_channel(
             name, r.get("level2", ""), r.get("level2_id", "")
         )
         campaign_id, campaign_name = campaign_of(name, r)
+        key = (channel, subchannel, traffic_type, campaign_id, campaign_name)
 
         if name in CABINET_COST_CHANNELS:
             # Из Роистата этот расход брать нельзя (валюта), поэтому нет кампании в
             # кабинете → ноль. Ноль честнее числа, заниженного в 6.6 раза.
-            cost = float(cabinet_cost.get(campaign_id, 0.0))
+            cab_key = (name, campaign_id)
+            cost = 0.0 if cab_key in counted_cabinet else float(cabinet_cost.get(campaign_id, 0.0))
+            counted_cabinet.add(cab_key)
         else:
             cost = float(r["cost"]) * fx_rate
 
@@ -123,7 +142,12 @@ def build_rows(api_rows, fx_rate: float, cabinet_cost: dict, date_s: str, cohort
                          + float(r["canceled_revenue"])) * fx_rate
         visits = int(r["visits"])
 
-        cohort = cohort_map.get((date_s, campaign_id, name, subchannel))
+        cohort_key = (date_s, campaign_id, name, subchannel)
+        cohort = cohort_map.get(cohort_key)
+        if cohort_key in counted_cohort:
+            cohort = None
+        elif cohort:
+            counted_cohort.add(cohort_key)
         c_orders = int(cohort[0]) if cohort else None
         c_new = int(cohort[1]) if cohort else None
         c_repeat = int(cohort[2]) if cohort else None
@@ -131,24 +155,52 @@ def build_rows(api_rows, fx_rate: float, cabinet_cost: dict, date_s: str, cohort
         c_leads = int(cohort[4]) if cohort else None
         c_clients = int(cohort[5]) if cohort else None
 
+        if key not in acc:
+            acc[key] = {"cost": 0.0, "visits": 0, "leads": 0, "gross": 0.0, "clients": 0,
+                        "paid_leads": 0, "paid_revenue": 0.0, "new_sales": 0,
+                        "repeat_sales": 0, "repeat_leads": 0,
+                        "c_orders": None, "c_rev": None, "c_new": None,
+                        "c_repeat": None, "c_leads": None, "c_clients": None}
+            order.append(key)
+        a = acc[key]
+        a["cost"] += cost
+        a["visits"] += visits
+        a["leads"] += int(r["leads"])
+        a["gross"] += gross_revenue
+        a["clients"] += int(r["paid_clients"])
+        a["paid_leads"] += int(r["paid_leads"])
+        a["paid_revenue"] += float(r["paid_revenue"]) * fx_rate
+        # .get: метрику могут отключить в проекте Роистата — тогда пишем 0, а не падаем.
+        a["new_sales"] += int(r.get("new_sales") or 0)
+        a["repeat_sales"] += int(r.get("repeat_sales") or 0)
+        a["repeat_leads"] += int(r.get("repeat_leads") or 0)
+        for dst, val in (("c_orders", c_orders), ("c_rev", c_rev), ("c_new", c_new),
+                         ("c_repeat", c_repeat), ("c_leads", c_leads),
+                         ("c_clients", c_clients)):
+            if val is not None:
+                a[dst] = (a[dst] or 0) + val
+
+    out: list[tuple] = []
+    for key in order:
+        channel, subchannel, traffic_type, campaign_id, campaign_name = key
+        a = acc[key]
         out.append((
             date_s, "web", REGION, channel, subchannel, traffic_type,
             campaign_id, campaign_name,
-            round(cost, 2), 0.0, 0.0,
+            round(a["cost"], 2), 0.0, 0.0,
             # users=0, а НЕ visits: уникальных посетителей у Roistat API нет вовсе —
             # 48 метрик, и ни одной про посетителей (в интерфейсе колонка есть, наружу
             # не отдаётся). Приравняв их к визитам, я получил ровно 1.000 посетителя на
             # визит против настоящих 0.757 у Метрики — цифра выглядела как данные, но
             # была выдумкой. Ноль честнее: ячейка покажет прочерк, а пользователей для
             # свода берём у Метрики, которая их знает.
-            visits, 0, 0,
-            int(r["leads"]), round(gross_revenue, 2), int(r["paid_clients"]),
+            a["visits"], 0, 0,
+            a["leads"], round(a["gross"], 2), a["clients"],
             0, 0, 0.0,
-            int(r["paid_leads"]), round(float(r["paid_revenue"]) * fx_rate, 2),
-            c_orders, c_rev, c_new, c_repeat, c_leads, c_clients,
-            # .get: метрику могут отключить в проекте Роистата — тогда пишем 0, а не падаем.
-            int(r.get("new_sales") or 0), int(r.get("repeat_sales") or 0),
-            int(r.get("repeat_leads") or 0),
+            a["paid_leads"], round(a["paid_revenue"], 2),
+            a["c_orders"], (round(a["c_rev"], 2) if a["c_rev"] is not None else None),
+            a["c_new"], a["c_repeat"], a["c_leads"], a["c_clients"],
+            a["new_sales"], a["repeat_sales"], a["repeat_leads"],
         ))
     return out
 

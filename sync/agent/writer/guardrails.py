@@ -36,7 +36,29 @@ MODIFIER_CAP = 50          # потолок и пол корректировки
 # "никогда", а не эвристику по подстроке.
 ALLOWED_ACTION_KINDS = {"bidmodifier.add", "bidmodifier.set", "schedule.set",
                         "budget.set", "budget.set_daily", "campaign.suspend",
-                        "tcpa.set", "negative.add", "placement.exclude"}
+                        "tcpa.set", "goal.set", "strategy.set", "negative.add",
+                        "placement.exclude", "negative.remove_added",
+                        "audience.add", "geo.set"}
+
+# Виды, у которых рычага записи на стороне агента нет и не будет: тело
+# кампании (группы, ключи, объявления) собирает ДРУГОЙ репозиторий, и агент
+# физически не может отправить campaigns.add. Отказ им нужен свой, а не общий
+# «вне allow-листа»: общий читается как недоделка, а это устройство системы —
+# наряд едет билдеру, из кабинета кампанию заводит он.
+BUILDER_ACTION_KINDS = {"campaign.create"}
+BUILDER_REASON = (
+    "создание кампании — наряд билдеру, а не запрос к API Директа: тело "
+    "кампании собирает другой репозиторий, и отправить его агент не может"
+)
+
+# Виды со словом remove/delete в имени, которым сторож удаления объектов
+# ходу не закрывает. Здесь ровно один, и это не послабление, а различение:
+# запрет касается УДАЛЕНИЯ ОБЪЕКТОВ (кампаний, групп, объявлений,
+# корректировок) — потери, которую нечем отменить. Снятие своей же минус-фразы
+# правит ПОЛЕ живого объекта и является единственным способом отменить
+# собственное отсечение, не затирая при этом фраз человека
+# (negatives.remove_added).
+REMOVAL_ALLOWED_ACTION_KINDS = {"negative.remove_added"}
 
 # Коридор нового лимита ОТНОСИТЕЛЬНО ПРЕЖНЕГО РАСХОДА кампании (не прежнего
 # лимита: тот бывает в разы выше расхода — 5 млн/нед при расходе 616 тыс. —
@@ -72,6 +94,18 @@ PLACEMENT_MAX_SITES = 1000
 PLACEMENT_MAX_SITE_CHARS = 255
 PLACEMENT_MAX_ADDED_PER_ACTION = 10
 
+# Границы географии — СВОИ, независимые от writer/geo.py, по тому же доводу,
+# что у минус-фраз и площадок: рельса, считающая формулой построителя,
+# пропустит любую его ошибку.
+#
+# Доля, больше которой за одно действие список не сужается. Числа Директа тут
+# нет и быть не может — это не ограничение API, а физика ошибки: регион, в
+# отличие от фразы, целый рынок, и убрать больше половины прежней географии
+# значит сделать из кампании другую кампанию. Половина — граница, за которой
+# от прежнего объекта остаётся меньше, чем убрано; такое решение принимает
+# человек, а не такт.
+GEO_MAX_REMOVED_SHARE = 0.5
+
 # Границы почасового расписания — СВОИ, независимые от writer/schedule.py.
 # Дублирование намеренное: рельса обязана считать сама, иначе она проверяет
 # построитель его же формулой и пропустит любую его ошибку.
@@ -86,13 +120,22 @@ SCHEDULE_STEP = 10
 ROLLBACK_ALLOWED_ACTION_KINDS = {"bidmodifier.set", "schedule.set",
                                  "budget.set", "budget.set_daily",
                                  "campaign.suspend", "tcpa.set",
-                                 "negative.add", "placement.exclude"}
+                                 "goal.set", "strategy.set", "negative.add",
+                                 "placement.exclude", "geo.set"}
 
 # Куда обязан возвращать откат, в зависимости от вида ИСХОДНОГО действия.
 # Отмена добавления — нейтраль (объекта до действия не было), отмена
 # перезаписи — прежний коэффициент из previous_state журнала.
 ROLLBACK_ORIGIN_ADD = "bidmodifier.add"
 ROLLBACK_ORIGIN_SET = "bidmodifier.set"
+
+# Виды, создающие НОВЫЙ объект-корректировку. Их отмена возвращает нейтраль,
+# и разбираться, какой именно сегмент был адресован, рельсе незачем: до
+# действия объекта не было, каким бы ни был его тип. Корректировка на
+# аудиторию (writer/audience.py) — тот же add в bidmodifiers, просто по
+# условию ретаргетинга; без записи здесь её откат объявлялся бы
+# неоткатываемым навсегда, и изменение агента осталось бы в кабинете вечно.
+ROLLBACK_ORIGIN_ADD_KINDS = frozenset({ROLLBACK_ORIGIN_ADD, "audience.add"})
 
 _DELETE_REASON = "удаление объектов запрещено: агент только паузит"
 
@@ -116,8 +159,11 @@ def check_action(action: Dict[str, Any],
     # Отдельная явная проверка поверх allow-листа — не для защиты (её уже
     # даёт allow-лист), а чтобы в журнале была понятная причина отказа
     # именно "удаление", а не общая "вне allow-листа".
-    if _is_delete(kind_lower):
+    if _is_delete(kind_lower) and kind not in REMOVAL_ALLOWED_ACTION_KINDS:
         return False, _DELETE_REASON
+
+    if kind in BUILDER_ACTION_KINDS:
+        return False, BUILDER_REASON
 
     if kind not in ALLOWED_ACTION_KINDS:
         return False, f"вид действия вне allow-листа: {kind}"
@@ -142,8 +188,18 @@ def check_action(action: Dict[str, Any],
         if not ok:
             return False, reason
 
+    if kind == "strategy.set":
+        ok, reason = _check_strategy(action, cost_28d_by_campaign)
+        if not ok:
+            return False, reason
+
     if kind == "negative.add":
         ok, reason = _check_negatives(action)
+        if not ok:
+            return False, reason
+
+    if kind == "negative.remove_added":
+        ok, reason = _check_remove_added(action)
         if not ok:
             return False, reason
 
@@ -152,10 +208,145 @@ def check_action(action: Dict[str, Any],
         if not ok:
             return False, reason
 
+    if kind == "geo.set":
+        ok, reason = _check_geo(action)
+        if not ok:
+            return False, reason
+
     if kind == "campaign.suspend":
         ok, reason = _check_suspend(action)
         if not ok:
             return False, reason
+    return True, ""
+
+
+def _geo_regions(value: Any) -> Optional[List[int]]:
+    """Список регионов целыми числами. None — читать нечего или нечем."""
+    if not isinstance(value, list) or not value:
+        return None
+    out: List[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        if float(item) != int(item):
+            return None
+        out.append(int(item))
+    return out
+
+
+def _check_geo(action: Dict[str, Any]) -> Tuple[bool, str]:
+    """Рельса географии: куда кампания вообще входит показами.
+
+    Цена ошибки здесь выше, чем у минус-фразы: та убирает запрос, а пустая или
+    подменённая география убирает рынок целиком — и вернуть открученное за это
+    время нельзя. Поэтому рельса считает НЕЗАВИСИМО от writer/geo.py и по
+    своим полям.
+
+    Пять проверок, и каждая закрывает свой способ уронить кампанию:
+
+      * СПИСОК НЕ ПУСТ. Кампания без регионов не показывается вовсе; пустой
+        список — остановка трафика под видом правки настройки, а остановку
+        агент назначает только явным выключением, с его собственной рельсой.
+      * ГРУППЫ НАЗВАНЫ. RegionIds — поле группы, и запрос без номеров групп
+        собрать не из чего: это не «поле проигнорировано», а тело, которого
+        Директ не поймёт.
+      * ПРОШЛОЕ ИЗВЕСТНО. Без прочитанного списка не сказать ни куда
+        возвращает откат, ни в какую сторону идёт ход, — то есть класс
+        достоверности считался бы по неизвестному (writer/tier._direction).
+      * ХОД НЕ СМЕШАН. Одно действие либо только убирает регионы, либо только
+        добавляет: смешанный ход — два утверждения разных классов в одной
+        строке, и замер не сказал бы, какая сторона сдвинула число.
+      * СУЖЕНИЕ НЕ БОЛЬШЕ ПОЛОВИНЫ прежнего списка.
+
+    Минус-регион (отрицательный id, «Россия − Москва») отвергается вместе с
+    нечитаемым списком: покрытие такого списка по спискам не вычисляется, и
+    направление хода — тоже.
+    """
+    payload = action.get("payload") or {}
+    if payload.get("CampaignId") is None:
+        return False, "в действии географии нет CampaignId"
+
+    regions = _geo_regions(payload.get("RegionIds"))
+    if regions is None:
+        return False, ("список регионов пуст или нечитаем: кампания без "
+                       "географии не показывается вовсе")
+    negative = next((r for r in regions if r <= 0), None)
+    if negative is not None:
+        return False, (f"номер региона {negative} не положителен: "
+                       f"минус-регион вычитает покрытие, и направление хода "
+                       f"по спискам не вычислить")
+
+    groups = payload.get("AdGroupIds")
+    if not isinstance(groups, list) or not groups:
+        return False, ("в действии географии нет групп: RegionIds — поле "
+                       "группы, и адресовать запрос нечем")
+
+    previous = _geo_regions((action.get("previous_state") or {}).get("RegionIds"))
+    if previous is None:
+        return False, ("прежняя география неизвестна: без неё не сказать ни "
+                       "куда вернёт откат, ни в какую сторону идёт ход")
+
+    added = [r for r in regions if r not in previous]
+    removed = [r for r in previous if r not in regions]
+    if not added and not removed:
+        return False, "география не меняется: действие без содержания"
+    if added and removed:
+        return False, (f"ход и добавляет регионы ({len(added)}), и убирает "
+                       f"({len(removed)}): это два разных утверждения в одной "
+                       f"строке, и замер не разделил бы их")
+    if removed and len(removed) > GEO_MAX_REMOVED_SHARE * len(previous):
+        return False, (f"убирается {len(removed)} региона(ов) из "
+                       f"{len(previous)} — больше доли "
+                       f"{GEO_MAX_REMOVED_SHARE:.0%}: это не правка "
+                       f"географии, а другая кампания")
+    return True, ""
+
+
+def _check_remove_added(action: Dict[str, Any]) -> Tuple[bool, str]:
+    """Рельса снятия минус-фраз: снимаем ТОЛЬКО своё и ровно своё.
+
+    Сторож удаления объектов этот вид пропускает по явному исключению
+    (REMOVAL_ALLOWED_ACTION_KINDS), и освобождением от проверок это быть не
+    должно: снять чужую минус-фразу значит вернуть трафик, который человек
+    выключил сознательно, а в журнале это выглядит как аккуратный откат.
+
+    Три проверки, и все считаются ЗДЕСЬ, по полям самого действия, а не
+    формулой построителя:
+
+      * снимаемое — подмножество добавленного агентом (AddedByAgent);
+      * остаток совпадает с прежним списком минус снимаемое — иначе действие
+        не «убирает своё», а переписывает список чем-то ещё;
+      * список только сокращается: добавление фраз едет своим видом со своими
+        лимитами Директа, и пролезть сюда мимо них оно не должно.
+    """
+    payload = action.get("payload") or {}
+    if payload.get("CampaignId") is None:
+        return False, "в действии снятия минус-фраз нет CampaignId"
+
+    removed = [str(p) for p in (payload.get("RemovedPhrases") or ())]
+    if not removed:
+        return False, "снятие минус-фраз без списка снимаемого ничего не меняет"
+
+    ours = {str(p) for p in (payload.get("AddedByAgent") or ())}
+    stranger = sorted(set(removed) - ours)
+    if stranger:
+        return False, (f"снимаются фразы, которых агент не добавлял: "
+                       f"{', '.join(stranger[:3])} — их выключил человек")
+
+    previous = ((action.get("previous_state") or {}).get("NegativeKeywords")
+                or {}).get("Items")
+    if previous is None:
+        return False, ("снятие построено без прежнего списка: проверить, что "
+                       "убирается ровно своё, нечем")
+    previous_set = {str(p) for p in previous}
+    left = {str(p) for p in ((payload.get("NegativeKeywords") or {}).get("Items") or ())}
+
+    if not left <= previous_set:
+        return False, ("снятие добавляет фразы, которых в прежнем списке не "
+                       "было: добавление едет своим видом")
+    if left != previous_set - set(removed):
+        return False, ("остаток не равен прежнему списку минус снимаемое: "
+                       "действие переписывает список, а не убирает своё")
     return True, ""
 
 
@@ -357,6 +548,88 @@ def _check_tcpa(action: Dict[str, Any]) -> Tuple[bool, str]:
     return True, ""
 
 
+def _check_strategy(action: Dict[str, Any],
+                    cost_28d_by_campaign: Optional[Dict[str, float]] = None,
+                    ) -> Tuple[bool, str]:
+    """Рельса смены стратегии: форма тела и деньги, которые она уносит с собой.
+
+    Проверяется не «правильно ли решение» (этого рельса не знает), а три вещи,
+    которыми смена стратегии отличается от прочих правок:
+
+      * ТЕЛО СОГЛАСОВАНО С САМИМ СОБОЙ. Тип в payload и тип, записанный в блок,
+        обязаны совпадать: разойдись они — в кабинет уедет одно, а в журнал
+        ляжет другое, и откат вернёт не туда.
+      * ФОРМА ИЗВЕСТНА. Имя подблока параметров выводится из типа стратегии;
+        тип вне справочника форм означает тело, собранное по догадке.
+      * ОГРАНИЧИТЕЛЬ РАСХОДА НА МЕСТЕ. Конверсионная стратегия держит деньги
+        внутри себя (WeeklySpendLimit), и переход без лимита оставляет кампанию
+        без ограничения вовсе. Сам лимит сверяется с НЕЗАВИСИМЫМ расходом
+        витрины по тому же коридору, что у бюджета: слом единиц (рубли вместо
+        микрорублей) выносит соотношение за края немедленно.
+
+    Справочник форм берётся у рычага (writer/strategy.STRATEGY_FORMS) — это
+    описание API, а не решение построителя, и вторая его копия здесь
+    разъехалась бы с первой. Импорт ленивый: writer/strategy тянет ожидание и
+    полосы, и модульный импорт замкнул бы кольцо на полуготовом пакете.
+    """
+    from sync.agent.writer.strategy import STRATEGY_FORMS
+
+    payload = action.get("payload") or {}
+    block = payload.get("BiddingStrategy")
+    if not isinstance(block, dict) or not isinstance(block.get("Search"), dict):
+        return False, "в теле смены стратегии нет блока BiddingStrategy"
+
+    declared = str(payload.get("BiddingStrategyType") or "")
+    written = str((block["Search"] or {}).get("BiddingStrategyType") or "")
+    if declared != written:
+        return False, (f"тип в теле ({written or '—'}) не совпадает с типом "
+                       f"действия ({declared or '—'}): в кабинет уедет одно, "
+                       f"а в журнал ляжет другое")
+
+    form = STRATEGY_FORMS.get(written)
+    if form is None:
+        return False, f"тип стратегии {written or '—'} вне справочника форм"
+
+    sub_name = form.get("block")
+    params = (block["Search"] or {}).get(sub_name) if sub_name else None
+    if sub_name and not isinstance(params, dict):
+        return False, (f"у стратегии {written} нет подблока параметров "
+                       f"{sub_name}: тело неполное")
+    if not sub_name:
+        leftovers = [k for k in block["Search"] if k != "BiddingStrategyType"]
+        if leftovers:
+            return False, (f"в теле стратегии {written} остались поля прежней "
+                           f"стратегии: {', '.join(sorted(leftovers))}")
+        return True, ""
+
+    limit = params.get("WeeklySpendLimit")
+    target = params.get("AverageCpa")
+    try:
+        limit_v = int(limit)
+        target_v = int(target)
+    except (TypeError, ValueError):
+        return False, (f"поля рельсы стратегии нечитаемы: лимит {limit!r}, "
+                       f"цель CPA {target!r}")
+    if limit_v <= 0 or target_v <= 0:
+        return False, (f"лимит и цель CPA обязаны быть положительными: "
+                       f"лимит {limit_v}, цель {target_v}")
+    if target_v > limit_v:
+        return False, (f"цель CPA {target_v / _BUDGET_MICROS:.0f} ₽ больше "
+                       f"недельного лимита {limit_v / _BUDGET_MICROS:.0f} ₽: "
+                       f"похоже на слом единиц, а не на решение")
+
+    mart_cost = (cost_28d_by_campaign or {}).get(str(action.get("object_id")))
+    if mart_cost is not None and float(mart_cost) > 0:
+        implied_28d = limit_v / _BUDGET_MICROS * _BUDGET_WEEKS * _BUDGET_VAT
+        ratio = implied_28d / float(mart_cost)
+        if not (BUDGET_RATIO_MIN <= ratio <= BUDGET_RATIO_MAX):
+            return False, (f"лимит новой стратегии ×{ratio:.2f} от прежнего "
+                           f"расхода — вне коридора {BUDGET_RATIO_MIN}–"
+                           f"{BUDGET_RATIO_MAX}: похоже на слом конверсии "
+                           f"единиц, а не на решение")
+    return True, ""
+
+
 def _check_schedule(action: Dict[str, Any]) -> Tuple[bool, str]:
     """Рельса расписания: цена ошибки здесь выше, чем у корректировки сегмента.
 
@@ -418,7 +691,7 @@ def expected_rollback_coefficient(
     origin = str(origin_action_kind or "")
     previous = previous_state if isinstance(previous_state, dict) else {}
 
-    if origin == ROLLBACK_ORIGIN_ADD:
+    if origin in ROLLBACK_ORIGIN_ADD_KINDS:
         return API_NEUTRAL, ""
 
     if origin == ROLLBACK_ORIGIN_SET:
@@ -478,10 +751,11 @@ def check_rollback(request: Dict[str, Any]) -> Tuple[bool, str]:
     if kind not in ROLLBACK_ALLOWED_ACTION_KINDS:
         return False, f"вид действия вне allow-листа возврата: {kind}"
 
-    if kind in ("schedule.set", "budget.set", "budget.set_daily"):
-        # У расписания и бюджета возврат не описывается одним коэффициентом:
-        # назад едет весь прежний блок (TimeTargeting / BiddingStrategy /
-        # DailyBudget). Сверять его с прошлым состоянием здесь незачем —
+    if kind in ("schedule.set", "budget.set", "budget.set_daily", "geo.set"):
+        # У расписания, бюджета и географии возврат не описывается одним
+        # коэффициентом: назад едет весь прежний блок (TimeTargeting /
+        # BiddingStrategy / DailyBudget / RegionIds). Сверять его с прошлым
+        # состоянием здесь незачем —
         # строитель возврата (rollback_payload) берёт блок прямо из журнала
         # и не собирает его заново, поэтому «вернуть не туда» тут невозможно
         # по построению. Требовать api_coefficient — значит запретить такой

@@ -387,20 +387,33 @@ def test_selection_is_deterministic():
            [a["idempotency_key"] for a in second]
 
 
-def test_lane_budget_is_shared_across_the_accounts_of_one_run():
-    # Лимит полосы ограничивает ПРОГОН, а не кабинет: иначе при четырёх
-    # кабинетах он вчетверо выше заявленного — ровно тот дефект, который уже
-    # чинили у лимита действий.
-    budgets = {}
+def test_lane_budget_is_per_account_and_sums_to_the_run():
+    # Карман полосы у каждого кабинета свой, и доля считается от расхода
+    # ЭТОГО кабинета (agent_e1.run_account: account_share). Поэтому карманы
+    # складываются ровно в тот один, что был бы посчитан на прогон целиком:
+    # объём изменений за прогон не растёт, а порядок обхода перестаёт решать,
+    # кому достанется лимит.
     first = [_budget("b1", leads=5.0, daily=1_000_000.0)]
     second = [_budget("b2", leads=5.0, daily=1_000_000.0)]
     price = risk.action_risk(first[0], BIG_COST)
-    taken1, _ = _select(first, {lanes.LANE_ALLOCATION: 1}, spend=price * 100.0,
-                        budgets=budgets)
+    own_spend = price * 100.0
+
+    taken1, _ = _select(first, {lanes.LANE_ALLOCATION: 1},
+                        spend=own_spend, budgets={})
     taken2, refused2 = _select(second, {lanes.LANE_ALLOCATION: 1},
-                               spend=price * 100.0, budgets=budgets)
+                               spend=own_spend, budgets={})
     assert len(taken1) == 1
-    assert taken2 == [] and len(refused2) == 1
+    assert len(taken2) == 1 and refused2 == []
+
+    # Одна тетрадь на оба кабинета — и второй голодает независимо от того,
+    # насколько он крупный: карман вычерпан порядком обхода. Замер
+    # 27.08.2026: крупнейший кабинет прогона получил 2 действия из 177
+    # заявленных, потому что до него дошла очередь третьим.
+    shared: dict = {}
+    _select(first, {lanes.LANE_ALLOCATION: 1}, spend=own_spend, budgets=shared)
+    starved_taken, starved_refused = _select(
+        second, {lanes.LANE_ALLOCATION: 1}, spend=own_spend, budgets=shared)
+    assert starved_taken == [] and len(starved_refused) == 1
 
 
 def test_cap_actions_is_gone():

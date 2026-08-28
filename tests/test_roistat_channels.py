@@ -126,3 +126,33 @@ def test_campaign_of_survives_nbsp_in_channel():
                                        "120254142253190405", "CPO_Ж"))[1] == "CPO: ТЕСТ"
     assert campaign_of("Google\xa0Ads\xa01", lvl("g", "Поиск", "111", "Кампания"))[1] == \
         "Кампания"
+
+
+# ── UTM-каналы: платность решает level_2, а не имя ───────────────────────────
+# Замер W34 2026 (проект 235593): «instagram» приходит с level_2=cpc|cpa и level_3
+# «instagram_stories-cpo» — это Meta Ads с UTM-меткой вместо автометки, и ручной
+# отчёт агентства складывает их с Facebook (35 + 5 = 40 продаж за неделю). Пока
+# канал считался органикой, строка FB/Instagram расходилась с ручной на пять
+# продаж и 143 930 ₸.
+
+def test_utm_instagram_with_paid_level2_is_meta_ads():
+    assert map_roistat_channel("instagram", "cpc") == ("SMM paid", "Meta Ads", "Платный")
+    assert map_roistat_channel("instagram", "cpa") == ("SMM paid", "Meta Ads", "Платный")
+
+
+def test_utm_instagram_social_stays_organic():
+    """«ig» с level_2=social и level_3=link_in_bio — ссылка в шапке профиля, не реклама."""
+    assert map_roistat_channel("ig", "social") == ("SMM (organic)", "Instagram", "Бесплатный")
+    assert map_roistat_channel("instagram", "social")[2] == "Бесплатный"
+
+
+def test_search_engines_split_by_level2():
+    assert map_roistat_channel("google", "cpc") == ("SEM", "Google.Adwords", "Платный")
+    assert map_roistat_channel("google", "organic") == ("SEO", "SEO Google", "Бесплатный")
+    assert map_roistat_channel("yandex", "organic") == ("SEO", "SEO Yandex", "Бесплатный")
+
+
+def test_unknown_level2_keeps_previous_mapping():
+    """Канал без level_2 ведёт себя как до правки — гадать по имени не начинаем."""
+    assert map_roistat_channel("google") == ("SEM", "Google.Adwords", "Платный")
+    assert map_roistat_channel("instagram") == ("SMM (organic)", "Instagram", "Бесплатный")

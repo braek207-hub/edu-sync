@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 
 import psycopg2.extras
 
-from sync.db import get_connection
+from sync.db import enable_rls_for_ddl, get_connection
 
 # Ставится в mode, когда прогон ничего не пишет в кабинет. Три режима, а не
 # флаг «боевой»: репетиция по боевому кабинету и прогон по песочнице
@@ -111,6 +111,7 @@ def ensure_blackbox_tables() -> None:
         with conn.cursor() as cur:
             for statement in BLACKBOX_DDL:
                 cur.execute(statement)
+            enable_rls_for_ddl(cur, BLACKBOX_DDL)
         conn.commit()
 
 

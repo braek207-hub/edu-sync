@@ -56,7 +56,35 @@ EMERGENCY_KINDS: frozenset = frozenset()
 # ровно затем, чтобы отнять расход, — считать их нейтральными из-за пустого
 # expected_leads_delta значило бы не заметить единственный вид сжатия,
 # который агент сегодня умеет делать массово.
+#
+# «Даже когда ожидания лидов нет» — здесь ключевое. Правило написано под ноль,
+# который означает «не мерили»: у такого действия объём никем не посчитан, и
+# единственная защита от сжатия — рубли. Там, где потеря объёма ИЗМЕРЕНА
+# (leads_measured, см. ниже), этого основания нет, и плата берётся один раз —
+# лидами.
 SHRINKING_KINDS = frozenset({SWITCH_KIND, NEGATIVE_KIND, PLACEMENT_KIND})
+
+# Отсечение трафика с ИЗМЕРЕННОЙ потерей конверсий рублей не освобождает.
+#
+# Два довода, и оба проверяемые. Первый — механика Директа: недельный лимит
+# кампании отсечение не трогает, и стратегия перекладывает те же деньги на
+# оставшиеся запросы в тот же день. Освобождением это выглядит только в
+# арифметике такта, а в кабинете расход кампании не падает. Второй — двойная
+# плата: объём, который отсечение отнимает, уже посчитан в expected_leads_delta
+# и уже участвует в вердикте; рублёвое требование адресата берёт с того же
+# действия вторую плату.
+#
+# Цена ошибки была измерена 28.08.2026: гигиена делала КАЖДЫЙ такт сжимающим
+# (доля адресата 0.34 при требуемых 0.90), require_growth_address снимала
+# самые дешёвые действия — то есть ровно её, — и за всё время агента не
+# применилось НИ ОДНОЙ минус-фразы и НИ ОДНОГО запрета площадки:
+# no_growth_address по EXCLUDED_SITES 20, по NEGATIVE_KEYWORDS 15.
+#
+# Неизмеренное отсечение (leads_measured=False, кампания в unknown_conversions)
+# по-прежнему освобождает деньги и требует адресата: там ноль в лидах — это
+# незнание, и рубли остаются единственной защитой.
+def _cut_frees_money(entry: Dict[str, Any]) -> bool:
+    return not bool(entry.get("leads_measured"))
 
 BUDGET_KINDS = frozenset({BUDGET_KIND, BUDGET_DAILY_KIND})
 
@@ -105,6 +133,7 @@ def tact_balance(moves: List[Dict[str, Any]], suspends: List[Dict[str, Any]],
     added = 0.0
     leads_delta = 0.0
     emergency_freed = 0.0
+    reallocated = 0.0
     # Сколько денег вернёт снятие каждого отдельного действия. Без этой карты
     # гейт не может остановиться на первом достаточном снятии и вынужден
     # резать весь список.
@@ -135,7 +164,10 @@ def tact_balance(moves: List[Dict[str, Any]], suspends: List[Dict[str, Any]],
         if not _is_emergency(suspend):
             leads_delta += _leads_delta(suspend)
     for cut in cuts:
-        _free(cut, _num(cut.get("cost_saved")))
+        if _cut_frees_money(cut):
+            _free(cut, _num(cut.get("cost_saved")))
+        else:
+            reallocated += _num(cut.get("cost_saved"))
         if not _is_emergency(cut):
             leads_delta += _leads_delta(cut)
 
@@ -151,6 +183,11 @@ def tact_balance(moves: List[Dict[str, Any]], suspends: List[Dict[str, Any]],
         # права, иначе «такт ничего не освободил» и «такт освободил аварийно»
         # выглядят одинаково.
         "emergency_freed_rub": round(emergency_freed, 2),
+        # Переложенное внутри кампаний — отдельным числом. В требование
+        # адресата оно не входит, но пропасть из отчёта не имеет права:
+        # «гигиена ничего не вырезала» и «гигиена вырезала на 200 тыс ₽,
+        # которые остались в тех же кампаниях» — разные новости.
+        "reallocated_rub": round(reallocated, 2),
         "freed_by_key": freed_by_key,
         "expected_leads_delta": round(leads_delta, 1),
         "shrinking": bool(leads_delta < 0
@@ -185,7 +222,12 @@ def require_growth_address(
             return False
         if _leads_delta(action) < 0:
             return True
-        if str(action.get("action_kind") or "") in SHRINKING_KINDS:
+        # Отсечение с измеренным нулём потерь сжатием не является: объём оно
+        # не отнимает (это и есть измерение), а деньги оставляет внутри
+        # кампании. Снимать его ради баланса значит платить объёмом,
+        # которого оно не трогало.
+        if (str(action.get("action_kind") or "") in SHRINKING_KINDS
+                and _cut_frees_money(action)):
             return True
         return freed_by_key.get(str(action.get("idempotency_key")), 0.0) > 0
 
@@ -254,6 +296,12 @@ def balance_inputs(
             cuts.append({**common, "kind": kind,
                          "cost_saved": _num(
                              (cut_cost_by_kind.get(kind) or {}).get(cid)),
+                         # Признак приходит с самого действия: его ставит тот,
+                         # кто знает, измерялись ли конверсии вырезаемого
+                         # (writer/negatives.py, writer/placements.py).
+                         # Восстанавливать его здесь по нулю в лидах нельзя —
+                         # ноль как раз и двузначен.
+                         "leads_measured": bool(action.get("leads_measured")),
                          "expected_leads_delta": _leads_delta(action)})
 
     # Запертая доливка в moves не попадает — и это не потеря, а требуемое

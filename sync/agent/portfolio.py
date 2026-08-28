@@ -34,6 +34,7 @@ import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent.confidence import assess
+from sync.agent.pacing import CAPPED_BY_PACING
 from sync.agent.tcpa import DEFAULT_TARGET_ROMI
 # Признак «лимит связывает расход» задан рычагом записи, и второго определения
 # у него быть не должно: разойдись они — расчёт поднимал бы вес кампании,
@@ -93,6 +94,28 @@ ACCOUNT_GROWTH_STEP = BUDGET_SAFE_DELTA
 # сдвинет кабинет за него — кривая насыщения на то и кривая.
 GROWTH_LAMBDA_MARGIN = 1.2
 
+# Требование к предельному рублю при росте — БЕЗУБЫТОЧНОСТЬ с запасом, и
+# только она. До 28.08.2026 здесь стояло target_romi * GROWTH_LAMBDA_MARGIN, и
+# это было умножение двух разных требований друг на друга.
+#
+# target_romi — контракт владельца: «выручка вдвое от бюджета». Контракт
+# описывает СРЕДНЮЮ окупаемость всех денег кабинета. λ — отдача СЛЕДУЮЩЕГО
+# рубля. На вогнутой кривой предельная всегда ниже средней, поэтому требовать
+# от предельного рубля контрактную двойку значит останавливать рост задолго до
+# того, как контракт нарушится: кабинет со средней 2.5 и предельной 1.5
+# приносит вдвое и растить ему можно, а порог 2.4 запрещал.
+#
+# Замер 28.08.2026: при target_romi=2.0 порог был 2.40 при живых λ 0.70–2.27 —
+# ноль роста у всех пяти кабинетов, capped_by="lambda" у всех. Контракт при
+# этом проверялся ровно нигде.
+#
+# Теперь требований два, и они разные: предельный рубль не должен уходить в
+# убыток (здесь), а контракт проверяется там, где живёт, — у средней
+# окупаемости кабинета (account_romi_cap ниже).
+GROWTH_LAMBDA_BREAKEVEN = GROWTH_LAMBDA_MARGIN
+
+CAPPED_BY_ROMI = "romi"
+
 # Потолок владелец называет за МЕСЯЦ, а солвер считает окном в 28 дней
 # (WEEKS_IN_WINDOW недель). Сравнивать их напрямую значит разрешить перерасход
 # на 8,6 %: 28 дней подряд по потолку — это 30,44/28 потолка за месяц.
@@ -104,15 +127,48 @@ WINDOW_DAYS = WEEKS_IN_WINDOW * 7.0
 GROWTH_RESIDUAL_RUB = 1.0
 
 
+def account_romi_cap(current_cost: float, revenue: float, lam: float,
+                     target_romi: float) -> Optional[float]:
+    """Сколько рублей можно долить, не уронив среднюю окупаемость ниже контракта.
+
+    Контракт задан средней: (выручка + λ·g) / (расход + g) ≥ target_romi.
+    Отсюда предел прямо:
+
+      * λ ≥ target_romi — каждый доливаемый рубль возвращает не меньше
+        контракта, и средняя от долива РАСТЁТ. Ограничения нет (None);
+      * λ < target_romi — долив тянет среднюю вниз, и предел ровно один:
+        g ≤ (выручка − target·расход) / (target − λ). Кабинет уже ниже
+        контракта — числитель отрицателен, предел отрицателен: расти нельзя.
+        Это не осторожность механизма, а арифметика контракта.
+
+    Выручка неизвестна — сюда не подаётся. Ноль запретил бы рост по незнанию,
+    бесконечность разрешила бы его по незнанию; врут оба одинаково, и
+    различать «ограничения нет» от «не посчитали» обязан вызывающий.
+    """
+    target = float(target_romi)
+    if target <= 0.0 or lam >= target:
+        return None
+    return (float(revenue) - target * float(current_cost)) / (target - lam)
+
+
 def account_budget(current_cost: float, lam: float, target_romi: float,
                    room_rub: float,
-                   monthly_cap: Optional[float]) -> Dict[str, Any]:
+                   monthly_cap: Optional[float],
+                   pace: Optional[Dict[str, Any]] = None,
+                   revenue: Optional[float] = None) -> Dict[str, Any]:
     """Бюджет кабинета на такт: держим или растим, и чем ограничены.
 
-    Три условия роста, и каждое закрывает свой способ сжечь деньги:
+    Четыре условия роста, и каждое закрывает свой способ сжечь деньги:
 
-      * λ выше требуемой окупаемости С ЗАПАСОМ — иначе прибавка уходит за
-        порог сразу, ещё до того как кривая насыщения её отработает;
+      * предельный рубль не в убыток С ЗАПАСОМ (GROWTH_LAMBDA_BREAKEVEN) —
+        иначе прибавка уходит за порог сразу, ещё до того как кривая
+        насыщения её отработает;
+      * контракт по СРЕДНЕЙ окупаемости не нарушается доливом
+        (account_romi_cap). Требование к среднему и требование к предельному
+        рублю — разные вещи, и до 28.08.2026 они были перемножены в одно
+        недостижимое: см. GROWTH_LAMBDA_BREAKEVEN. Выручка кабинета
+        неизвестна — контракт не проверяется, и это видно полем
+        romi_known, а не молчанием;
       * есть куда потратить СЕГОДНЯ (room_rub — запас кампаний, у которых
         лимит связывает расход, growth.room_rub_budget). Запас, доступный
         только через эскалацию цены, сюда не подаётся: эти деньги кабинет
@@ -121,18 +177,23 @@ def account_budget(current_cost: float, lam: float, target_romi: float,
         считается и печатается, но сумма не меняется: решение «тратить
         больше» принимает владелец денег, агент приносит ему цифру.
 
-    capped_by называет ограничитель: "lambda" | "room" | "step" |
-    "monthly_cap".
+    pace — план освоения месяца (pacing.month_plan) этого кабинета. Он и
+    задаёт потолок окна, когда известен: ровная доля месячного потолка не
+    знает, сколько от плана уже выбрано, и недобор начала месяца не
+    догоняется ею никогда. Плана нет (витрина месяца недоступна) — потолок
+    считается по-старому, а не исчезает.
+
+    capped_by называет ограничитель: "lambda" | "romi" | "room" | "step" |
+    "monthly_cap" | "pacing".
     """
+    romi_known = revenue is not None
+
     def hold(reason: str, proposed: float = 0.0) -> Dict[str, Any]:
         return {"budget": round(current_cost, 2), "growth_rub": 0.0,
-                "proposed_growth_rub": round(proposed, 2), "capped_by": reason}
+                "proposed_growth_rub": round(proposed, 2), "capped_by": reason,
+                "romi_known": romi_known}
 
-    # Безубыточность предельного рубля (lambda_breakeven) и запас над целью —
-    # два разных требования. Второе при цели от 1.0 строже первого, но
-    # условие роста должно читаться целиком, а не опираться на текущий
-    # минимум панели настроек.
-    if lam < 1.0 or lam < float(target_romi) * GROWTH_LAMBDA_MARGIN:
+    if lam < GROWTH_LAMBDA_BREAKEVEN:
         return hold("lambda")
     if room_rub <= 0:
         return hold("room")
@@ -140,20 +201,41 @@ def account_budget(current_cost: float, lam: float, target_romi: float,
     step_rub = current_cost * ACCOUNT_GROWTH_STEP
     growth = min(step_rub, float(room_rub))
     capped_by = "step" if step_rub <= room_rub else "room"
-    if monthly_cap is None:
+
+    # Контракт владельца — про среднюю окупаемость кабинета, и проверяется он
+    # здесь, а не подмешивается в порог предельного рубля. Предел долива
+    # может оказаться и нулевым (кабинет уже ниже контракта), и мягче шага
+    # (контракт есть куда просаживать) — оба случая называются одним именем.
+    if romi_known:
+        romi_cap = account_romi_cap(current_cost, float(revenue), lam, target_romi)
+        if romi_cap is not None and romi_cap < growth:
+            if romi_cap <= 0.0:
+                return hold(CAPPED_BY_ROMI)
+            growth = romi_cap
+            capped_by = CAPPED_BY_ROMI
+
+    # Потолок окна: дневная доля пейсинга, если план месяца известен, иначе
+    # ровная доля месячного потолка. Пейсинг знает то, чего ровная доля не
+    # знает никогда, — сколько от плана УЖЕ выбрано: вяло начатый месяц он
+    # догоняет, обогнавший план тормозит сам.
+    paced = float(pace["daily_allowance"]) * WINDOW_DAYS if (
+        pace and pace.get("daily_allowance") is not None) else None
+    if paced is None and monthly_cap is None:
         return hold(capped_by, proposed=growth)
 
     # Потолок ниже факта — это команда сокращать общую сумму, а сокращения по
     # кабинету агент не делает: перенос внутри кабинета решает солвер, а
     # объём освоения — владелец. Сумма остаётся, упор в потолок виден.
-    cap_window = float(monthly_cap) * WINDOW_DAYS / DAYS_IN_MONTH
+    cap_window = (paced if paced is not None
+                  else float(monthly_cap) * WINDOW_DAYS / DAYS_IN_MONTH)
     budget = max(current_cost, min(current_cost + growth, cap_window))
     if budget < current_cost + growth - 1e-6:
-        capped_by = "monthly_cap"
+        capped_by = CAPPED_BY_PACING if paced is not None else "monthly_cap"
     return {"budget": round(budget, 2),
             "growth_rub": round(budget - current_cost, 2),
             "proposed_growth_rub": round(growth, 2),
-            "capped_by": capped_by}
+            "capped_by": capped_by,
+            "romi_known": romi_known}
 
 
 # Границы поправки прогноза. Медиана факт/ожидание живёт на десятке
@@ -600,6 +682,7 @@ def portfolio_targets(
     target_romi: float = DEFAULT_TARGET_ROMI,
     room_rub_by_login: Optional[Dict[str, float]] = None,
     monthly_cap_rub: Optional[float] = None,
+    pace_by_login: Optional[Dict[str, Dict[str, Any]]] = None,
     forecast_bias: Optional[Dict[str, Dict[str, float]]] = None,
     thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
@@ -692,9 +775,18 @@ def portfolio_targets(
         # Растить или держать общую сумму — решается по порогу ПРИ ТЕКУЩЕМ
         # расходе: λ выросшего бюджета уже учитывает прибавку и сам по себе
         # её не оправдывает.
+        # Выручка кабинета на ОКНЕ ПОРТФЕЛЯ, из тех же чисел, которыми
+        # солвер двигает деньги: ценность эффективного лида × лиды окна.
+        # Брать её с окна лестницы (90 зрелых дней) значило бы делить выручку
+        # мая на расход августа — контракт получил бы сезон в числителе.
+        # Кампании без ценности лида сюда не попадают вовсе (fixed_by_login),
+        # поэтому их расхода нет и в fact_cost: окно у обеих сторон одно.
+        revenue = sum(c["value"] * c["leads"] for c in campaigns)
         growth_plan = account_budget(fact_cost, lam, target_romi,
                                      float(room_rub_by_login.get(login) or 0.0),
-                                     monthly_cap_rub)
+                                     monthly_cap_rub,
+                                     (pace_by_login or {}).get(login),
+                                     revenue=revenue)
         budget = growth_plan["budget"]
         if budget > fact_cost:
             grown_lam, targets = solve_threshold(campaigns, budget)
@@ -754,6 +846,11 @@ def portfolio_targets(
             # бюджет — план освоения B задаёт Павел, — но состояние обязано
             # быть видно флагом, а не прятаться в числе (аудит 2026-08-23, C6).
             "lambda_breakeven": bool(lam >= 1.0),
+            # Средняя окупаемость кабинета — то, о чём контракт. Без неё
+            # capped_by="romi" читается как «механизм не пустил», хотя это
+            # ответ арифметики: столько кабинет и возвращает.
+            "account_romi": round(revenue / fact_cost, 4) if fact_cost > 0 else None,
+            "target_romi": round(float(target_romi), 4),
             "budget_28d": round(budget, 2),
             # Факт окна и прибавка к нему — двумя числами: «бюджет кабинета»
             # больше не равен расходу, и без обеих сторон непонятно, откуда

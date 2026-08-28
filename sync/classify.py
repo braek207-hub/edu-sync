@@ -256,6 +256,15 @@ def resolve_row_project(
     return detect_project(campaign_name)
 
 
+# Направления кампаний — закрытый перечень (docs/edu-reference.md: SPO, VPO,
+# Дистанс, МТИ, НТБ, Медицина, Перевод, IT, Школа, Остальное). Под этими же
+# именами лежат паспорта продукта смыслового слоя (sync/agent/passports/),
+# поэтому перечень сверяется тестом с кодом функции ниже: разъедься они —
+# паспорт лежал бы под ключом, которого прогон никогда не спросит.
+DIRECTIONS = ("school", "mti", "ntb", "med", "transfer", "it", "dist", "spo",
+              "vpo", "other")
+
+
 def detect_direction(campaign_name: str) -> str:
     s = str(campaign_name or "").lower()
     # Школа — свой уровень образования (в ряду СПО/ВПО), а не «Дистанс»:

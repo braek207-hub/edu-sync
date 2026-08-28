@@ -174,6 +174,21 @@ def test_map_app_publisher_unknown_partner_is_referral():
     assert ch == "Referrals" and sub == "Website" and tt == "Бесплатный"
 
 
+def test_map_app_publisher_free_partners_match_tw_channels():
+    """Бесплатные партнёры ложатся в те же каналы, что заказы TW, — иначе трафик и заказы
+    одного явления оказываются в разных строках отчёта (Referrals/Mindbox против CRM/Mindbox)."""
+    assert map_app_publisher("Mindbox") == ("CRM", "Mindbox", "Бесплатный")
+    assert map_app_publisher("Maestra") == ("CRM", "Mindbox", "Бесплатный")
+    assert map_app_publisher("Google Search") == ("SEO", "SEO Google", "Бесплатный")
+    assert map_app_publisher("Yandex Search") == ("SEO", "SEO Yandex", "Бесплатный")
+    assert map_app_publisher("Telegram") == ("SMM (organic)", "Telegram", "Бесплатный")
+
+
+def test_map_app_publisher_google_ads_not_shadowed_by_search():
+    """«Google Ads» остаётся платным SEM, несмотря на соседнее правило «google search»."""
+    assert map_app_publisher("Google Ads") == ("SEM", "Google.Adwords", "Платный")
+
+
 def test_build_app_traffic_rows_residual_in_direct():
     """Тотал страны = Reporting; размеченные каналы из Logs; остаток — в Direct."""
     total = {"2026-08-10": {"UAE": 100}}

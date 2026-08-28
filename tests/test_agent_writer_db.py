@@ -139,10 +139,95 @@ def test_insert_action_never_touches_row_in_final_status():
 
 
 def test_insert_action_resets_stale_response_and_status():
+    # Прежняя посылка «в SQL стоит литерал 'planned'» истекла: статус стал
+    # параметром — тем же запросом заводится НАМЕРЕНИЕ полосы из тени
+    # (SHADOW_STATUS). Проверяется то же самое свойство: повторная планировка
+    # возвращает строку в исходное состояние, а не оставляет на ней ответ
+    # прошлой попытки.
     sql = " ".join(writer_db.INSERT_ACTION_SQL.split())
-    assert "status = 'planned'" in sql
+    assert "status = %(status)s" in sql
     assert "response = '{}'::jsonb" in sql
     assert "created_at = now()" in sql
+
+
+def _capture_execute(monkeypatch) -> dict:
+    """Перехват запроса, который уходит в БД через get_connection."""
+    captured: dict = {}
+
+    class _Cursor:
+        def execute(self, sql, params=None):
+            captured.update(sql=sql, params=params)
+
+        def fetchone(self):
+            return ("act-1",)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Conn:
+        def cursor(self, **kwargs):
+            return _Cursor()
+
+        def commit(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(writer_db, "get_connection", lambda: _Conn())
+    return captured
+
+
+def test_insert_action_writes_planned_unless_asked_otherwise(monkeypatch):
+    # Умолчание — не мелочь оформления: заведение действия зовут из полудюжины
+    # мест, и статус, забытый в одном из них, увёл бы настоящее изменение в
+    # тень, где его никто не отправит и никто не откатит.
+    seen = _capture_execute(monkeypatch)
+
+    writer_db.insert_action(_journal_row("k-1", "acc-1"))
+    assert seen["params"]["status"] == writer_db.PLANNED_STATUS
+
+    writer_db.insert_action(_journal_row("k-2", "acc-1"),
+                            status=writer_db.SHADOW_STATUS)
+    assert seen["params"]["status"] == writer_db.SHADOW_STATUS
+
+
+def test_the_shadow_status_is_in_none_of_the_status_tuples():
+    # Утверждение, а не умолчание. Попади тень в финальные — выпуск полосы из
+    # тени больше не переписал бы строку и действие не уехало бы никогда; в
+    # живые — сторож начал бы откатывать изменение, которого в кабинете нет;
+    # в платящие — риск-бюджет недели считал бы занятыми деньги, которыми
+    # никто не рисковал.
+    shadow = writer_db.SHADOW_STATUS
+    assert shadow not in writer_db.FINAL_STATUSES
+    assert shadow not in writer_db.LIVE_STATUSES
+    assert shadow not in writer_db.RISK_CHARGED_STATUSES
+    assert shadow not in writer_db.REATTEMPTED_STATUSES
+
+
+def test_shadow_actions_asks_only_for_unjudged_intents():
+    sql = " ".join(writer_db.SHADOW_ACTIONS_SQL.split())
+
+    assert "status = %s" in sql
+    # Вердикт выносится ОДИН раз: окно сверки с каждым днём шире, и повторный
+    # проход тихо превращал бы «не сбылось» в «сбылось» накопленным дрейфом.
+    assert "response->>'shadow_verdict' IS NULL" in sql
+
+
+def test_shadow_outcome_never_touches_a_row_that_left_the_shadow():
+    # Полосу выпустили из тени, и та же строка уехала в кабинет статусом
+    # planned. Её обещание судит наблюдение, а не сверка намерений: запись
+    # вердикта поверх была бы вердиктом о том, чего не происходило.
+    sql = " ".join(writer_db.MARK_SHADOW_SQL.split())
+
+    assert "status = %(shadow)s" in sql
+    assert "response = response || %(response)s::jsonb" in sql
 
 
 # ------------------------------------- обрыв ПОСЛЕ отправки виден в отчёте

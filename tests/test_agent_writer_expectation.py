@@ -12,9 +12,14 @@ tests/test_agent_writer_expectation.py — ожидание, которое за
 import pytest
 
 from sync.agent.writer import expectation, exposure, guardrails, lanes
+from sync.agent.writer.audience import diff_audience
 from sync.agent.writer.budget import diff_budget
 from sync.agent.writer.diff import diff_modifiers, diff_schedule
-from sync.agent.writer.negatives import diff_negatives, plan_negatives
+from sync.agent.writer.geo import diff_geo
+from sync.agent.writer.goal import diff_goal
+from sync.agent.writer.strategy import diff_strategy
+from sync.agent.writer.negatives import (diff_negatives, plan_negatives,
+                                         remove_added_action)
 from sync.agent.writer.placements import diff_placements, plan_placements
 from sync.agent.writer.schedule import schedule_items
 from sync.agent.writer.switch import diff_switch, plan_switch_offs
@@ -43,6 +48,20 @@ def _schedule():
     items = schedule_items([{"setting_key": "3", "value": -40},
                             {"setting_key": "4", "value": -40}])
     return diff_schedule(items, {}, "111", context=CTX)[0]
+
+
+def _audience(percent=30, share=0.25):
+    """Корректировка на условие ретаргетинга: та же модель переноса.
+
+    Экономика кампании едет внутри desired, а не отдельным контекстом: у
+    рычага аудиторий подпись diff_*(desired, actual) без третьего аргумента.
+    """
+    desired = {"111": {"audiences": [{"condition_id": 4_400_001,
+                                      "percent": percent, "share": share,
+                                      "attached_ad_groups": 2}],
+                       **CTX}}
+    actions, _ = diff_audience(desired, {"111": {"retargeting_modifiers": []}})
+    return actions[0]
 
 
 def _negative(cut_cost=9_000.0, conversions=0):
@@ -111,6 +130,50 @@ def _tcpa():
     return actions[0]
 
 
+def _goal():
+    """Смена цели: конверсия новой цели снята с другого объекта — это ставка."""
+    strategy = {"Search": {"BiddingStrategyType": "AVERAGE_CPA",
+                           "AverageCpa": {"PriorityGoals": [{"GoalId": 42}],
+                                          "AverageCpa": 2_400 * M}},
+                "Network": {"BiddingStrategyType": "SERVING_OFF"}}
+    actions, _ = diff_goal(
+        {"1": {"goal_ids": [541_664_134], "reaches": {541_664_134: 400.0},
+               "window_days": 28, "clicks_per_day": 120.0,
+               "cr_current": 0.020, "cr_new": 0.026}},
+        {"1": {"campaign_type": "TEXT_CAMPAIGN", "package_id": None,
+               "strategy": strategy}})
+    return actions[0]
+
+
+def _strategy_switch():
+    """Смена стратегии: конверсия под новой стратегией перенесена с соседа."""
+    actions, _ = diff_strategy(
+        {"1": {"strategy_type": "AVERAGE_CPA", "goal_ids": [541_664_134],
+               "reaches": {541_664_134: 400.0}, "window_days": 28,
+               "target_cpa": 2_400.0, "weekly_limit": 80_000.0,
+               "clicks_per_day": 120.0, "cr_current": 0.020, "cr_new": 0.026}},
+        {"1": {"campaign_type": "TEXT_CAMPAIGN", "package_id": None,
+               "daily_budget": {"Amount": 12_000 * M},
+               "strategy": {"Search": {"BiddingStrategyType": "HIGHEST_POSITION"},
+                            "Network": {"BiddingStrategyType": "SERVING_OFF"}}}})
+    return actions[0]
+
+
+def _geo():
+    """Сужение гео: убранный регион снимает с кабинета свой поток.
+
+    Направление — сужение, потому что у одного вида действия ожидание считают
+    ДВЕ модели, и образцом обязана быть та, что заявляет отсечение: расширение
+    проверяется своим файлом (tests/test_agent_writer_geo.py).
+    """
+    actions, _ = diff_geo(
+        {"1": {"region_ids": [213, 2], "cut_cost": 12_000.0,
+               "cut_conversions": 0, "baseline_cpa": 2_400.0}},
+        {"1": {"campaign_type": "TEXT_CAMPAIGN",
+               "adgroups": [{"id": 1001, "region_ids": [213, 2, 65]}]}})
+    return actions[0]
+
+
 def _switch_rows(roi_share=0.3):
     return [
         {"setting_kind": "campaign_switch", "setting_key": "suspend",
@@ -128,16 +191,30 @@ def _suspend():
     return actions[0]
 
 
+def _remove_added():
+    """Снятие своей минус-фразы: числа — зеркало отменяемого отсечения."""
+    return remove_added_action(
+        "111", current=["бесплатно", "колледж заочно москва"],
+        added=["колледж заочно москва"],
+        restores={"restored_daily_rub": 300.0,
+                  "restored_conversions_per_day": 0.4})
+
+
 _SAMPLES = {
     "bidmodifier.add": lambda: _bidmodifier("bidmodifier.add"),
     "bidmodifier.set": lambda: _bidmodifier("bidmodifier.set"),
+    "audience.add": _audience,
     "schedule.set": _schedule,
     "budget.set": lambda: _budget(daily=False),
     "budget.set_daily": lambda: _budget(daily=True),
     "campaign.suspend": _suspend,
     "tcpa.set": _tcpa,
+    "goal.set": _goal,
+    "strategy.set": _strategy_switch,
     "negative.add": _negative,
+    "negative.remove_added": _remove_added,
     "placement.exclude": _placement,
+    "geo.set": _geo,
 }
 
 

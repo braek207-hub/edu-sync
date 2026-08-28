@@ -50,6 +50,25 @@ _MAP = {
     "pinterest":        ("SMM (organic)", "Pinterest", FREE),
 }
 
+# UTM-каналы, у которых платность решает level_2, а не имя канала. Замер W34 2026:
+# «instagram» приходит с level_2=cpc|cpa и level_3 вида «instagram_stories-cpo» — это
+# те же Meta Ads, только с UTM-меткой вместо автометки, и ручной отчёт складывает их
+# в строку FB/Instagram (5 продаж, 143 930 ₸ за неделю). «ig» с level_2=social и
+# level_3=link_in_bio — настоящая органика. «google»/«yandex» приходят и как cpc
+# (id кампании на level_3), и как organic — то есть поиск.
+_BY_LEVEL2 = {
+    "instagram": {"paid": ("SMM paid", "Meta Ads", PAID),
+                  "free": ("SMM (organic)", "Instagram", FREE)},
+    "tiktok":    {"paid": ("SMM paid", "TikTok Ads", PAID),
+                  "free": ("SMM (organic)", "TikTok", FREE)},
+    "google":    {"paid": ("SEM", "Google.Adwords", PAID),
+                  "free": ("SEO", "SEO Google", FREE)},
+    "yandex":    {"paid": ("SEM", "Яндекс.Директ", PAID),
+                  "free": ("SEO", "SEO Yandex", FREE)},
+}
+_PAID_LEVEL2 = frozenset({"cpc", "cpa", "cpm", "paid", "ppc", "search", "context", "display"})
+_FREE_LEVEL2 = frozenset({"organic", "social", "referral", "email", "none"})
+
 # Каналы, у которых кампания лежит на level_2, а level_3 — это адсет. Проверено на июне
 # 2026: Facebook › «CPO: ЛЕТНИЙ SALE_ЖЕНЩИНЫ» › «CPO_Ж». У Google и Директа наоборот —
 # level_2 это код типа кампании (g / d / x / search / context), а сама кампания на level_3.
@@ -99,6 +118,14 @@ def map_roistat_channel(name: str, level2: str = "", level2_id: str = "") -> tup
     if key.lower().startswith(("mindbox", "manual_mindbox")):
         # level_2 у рассылок = «email»; канон витрины называет систему — Mindbox.
         return ("CRM", "Mindbox", FREE)
+
+    variants = _BY_LEVEL2.get(key.lower())
+    if variants:
+        lvl = _norm(level2).lower()
+        if lvl in _PAID_LEVEL2:
+            return variants["paid"]
+        if lvl in _FREE_LEVEL2:
+            return variants["free"]
 
     if key in _MAP:
         return _MAP[key]

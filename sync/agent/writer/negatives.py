@@ -34,6 +34,19 @@ from sync.agent.writer import exposure, expectation
 
 NEGATIVE_KIND = "negative.add"
 
+# Снятие СВОЕЙ ЖЕ минус-фразы — обратная половина рычага (задача 18).
+#
+# Зачем отдельный вид, если есть откат. Общий механизм отката возвращает
+# объект в previous_state, то есть в список, прочитанный в момент применения.
+# Для минус-фраз это неверно: между тактами список правят руками, и возврат
+# снимка стёр бы фразу, которую человек добавил после нас. Поэтому здесь не
+# «вернуть прежнее», а «вычесть ровно своё» из СВЕЖЕГО чтения.
+#
+# Слово remove в имени вида намеренно: сторож удаления объектов
+# (guardrails._is_delete) обязан его увидеть и пропустить по явному
+# исключению, а не потому, что вид назвали обтекаемо.
+REMOVE_KIND = "negative.remove_added"
+
 # Ограничения Директа (ref-v5/campaigns/update): не больше 7 слов во фразе,
 # 35 символов в слове, 20 000 символов суммарно на кампанию.
 MAX_WORDS_PER_PHRASE = 7
@@ -189,6 +202,80 @@ def merge_phrases(existing: List[str], added: List[str],
     return sorted(merged)
 
 
+def remove_added(current, added) -> set:
+    """Свежий список минус СВОИ фразы. Чужие остаются все до одной.
+
+    Не «вернуть прежний список», а «вычесть ровно добавленное». Разница не
+    стилистическая: между применением и откатом человек правит список руками,
+    и возврат снимка previous_state снёс бы его фразы — то есть откат сам стал
+    бы правкой. Здесь вычитается только то, что положил агент.
+
+    Фразы, которой в списке уже нет, вычитание не замечает: её мог снять
+    человек, и это не ошибка и не повод трогать остальное.
+    """
+    stay = {normalize_phrase(p) for p in (current or ())}
+    ours = {normalize_phrase(p) for p in (added or ())}
+    return {phrase for phrase in stay if phrase and phrase not in ours}
+
+
+def remove_added_action(campaign_id: str, current: List[str],
+                        added: List[str],
+                        restores: Optional[Dict[str, Any]] = None,
+                        ) -> Optional[Dict[str, Any]]:
+    """Действие «снять свои минус-фразы» или None, если снимать нечего.
+
+    None — законный исход, а не ошибка: фразу мог снять человек, а откат мог
+    приехать вторым тактом подряд. Пустое действие уехало бы в кабинет
+    запросом, который ничего не меняет, и заняло бы слот объекта.
+
+    В payload едут ТРИ списка, и каждый нужен рельсе (guardrails):
+    NegativeKeywords — что останется, RemovedPhrases — что снимаем,
+    AddedByAgent — что мы когда-то добавили. По последнему рельса независимо
+    проверяет, что снимается своё: без него «снять чужую фразу человека» и
+    «снять свою» выглядят для неё одинаково.
+
+    restores — числа ОТМЕНЯЕМОГО отсечения: {"restored_daily_rub",
+    "restored_conversions_per_day"}. Обещание снятия не выводится из самого
+    действия — в нём только список фраз, — а является зеркалом того, что
+    отсечение обещало убрать. Берутся они у применённого действия
+    (exposure.cut_daily_rub и payload.expected_leads_delta), а не считаются
+    заново: пересчёт на свежих данных сравнивал бы замер с обещанием, которого
+    отсечение не давало.
+    """
+    stay = sorted(normalize_phrase(p) for p in (current or ()) if normalize_phrase(p))
+    ours = sorted({normalize_phrase(p) for p in (added or ()) if normalize_phrase(p)})
+    left = sorted(remove_added(stay, ours))
+    removed = [phrase for phrase in stay if phrase not in left]
+    if not removed:
+        return None
+    return expectation.attach({
+        "action_kind": REMOVE_KIND,
+        "object_level": "campaign",
+        "object_id": str(campaign_id),
+        # Экспозиция не указана намеренно: снятие ВОЗВРАЩАЕТ трафик, и
+        # «сколько денег под ударом» здесь неизвестно — сколько поток
+        # потратит снова, покажет только сам поток. Общее правило
+        # (exposure.daily_rub) прочитает это как «весь объект», и это
+        # честная сторона: полоса гигиены риском не платит, а занижать
+        # неизвестное нулём нельзя нигде.
+        "direct_type": "NEGATIVE_KEYWORDS",
+        "key": "campaign",
+        "payload": {
+            "CampaignId": int(campaign_id),
+            "NegativeKeywords": {"Items": left},
+            "RemovedPhrases": removed,
+            "AddedByAgent": ours,
+        },
+        "previous_state": {"NegativeKeywords": {"Items": stay}},
+        "idempotency_key": _remove_key(str(campaign_id), removed),
+    }, restores or {})
+
+
+def _remove_key(campaign_id: str, removed: List[str]) -> str:
+    raw = "negatives-remove:" + campaign_id + ":" + "|".join(sorted(removed))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
 def cut_evidence(cost_rub: float, conversions: Optional[float],
                  baseline_cpa: Optional[float],
                  window_days: int) -> Optional[Dict[str, Any]]:
@@ -280,6 +367,13 @@ def diff_negatives(
         actions.append(expectation.attach({
             "action_kind": NEGATIVE_KIND,
             **({"evidence": evidence} if evidence else {}),
+            # Измерена ли потеря объёма этим отсечением. Ноль в
+            # expected_leads_delta двузначен — «вырезаем трафик без
+            # конверсий» и «конверсии вырезаемого не считали», — и баланс
+            # такта (balance.py) обязан их различать: у первого объём уже
+            # посчитан, и брать с него ВТОРУЮ плату рублёвым требованием
+            # адресата значит платить за одно действие дважды.
+            "leads_measured": lost_window is not None,
             "object_level": "campaign",
             "object_id": str(campaign_id),
             "exposure": exposure.traffic_cut_exposure(

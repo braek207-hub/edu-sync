@@ -18,7 +18,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from sync.agent import blackbox
 from sync.agent import db as agent_db
@@ -38,15 +38,14 @@ from sync.agent.guard import (
 )
 from sync.agent.holdout import select_holdout
 from sync.agent import config as agent_config
+from sync.agent import manifest as agent_manifest
 from sync.agent import semantic
 
-# Чем занимается проект — контекст для смыслового слоя. Без него модель судит
-# фразы в вакууме: «школа» для образовательного проекта ядро, для магазина
-# одежды мусор.
-SEMANTIC_CONTEXT = (
-    "онлайн-образование: высшее и среднее профессиональное образование, "
-    "колледж, дистанционное обучение, приём абитуриентов"
-)
+# Чем занимается проект, когда паспорта направления нет, — умолчание самого
+# слоя (semantic.DEFAULT_CONTEXT). Своей копии здесь больше нет: две строки об
+# одном продукте разъезжаются молча, и прогон судил бы фразы описанием, которое
+# правили в другом файле.
+SEMANTIC_CONTEXT = semantic.DEFAULT_CONTEXT
 
 from sync.agent.metrika import (
     EDU_COUNTERS,
@@ -56,6 +55,7 @@ from sync.agent.metrika import (
     resolve_counter_account,
 )
 from sync.agent.growth import LEVER_BUDGET, growth_candidates
+from sync.agent.pacing import dominant_regime, month_plan
 from sync.agent.quality import (
     QUALITY_WINDOW_DAYS,
     lead_quality_section,
@@ -67,7 +67,14 @@ from sync.agent.learning_loop import forecast_bias, track_record
 from sync.agent.mining import mine_quasi_experiments, placebo_sigma
 from sync.agent.portfolio import computed_rows as portfolio_computed_rows
 from sync.agent.portfolio import portfolio_targets
+from sync.agent.ideas import abtests as ideas_abtests
+from sync.agent.ideas import bundles as ideas_bundles
+from sync.agent.ideas import consolidate as ideas_consolidate
+from sync.agent.ideas import market as ideas_market
+from sync.agent.ideas import proven as ideas_proven
+from sync.agent.ideas import registry as ideas_registry
 from sync.agent.writer import db as writer_db
+from sync.agent.writer import tier as tier_mod
 from sync.agent.writer.negatives import computed_rows as negative_computed_rows
 from sync.agent.writer.placements import computed_rows as placement_computed_rows
 from sync.agent.tcpa import (
@@ -222,6 +229,18 @@ def _daily_cost(direct_rows: List[Dict[str, Any]]) -> List[tuple]:
     return sorted(by_day.items())
 
 
+def _cost_up_to(daily_cost: List[tuple], last_day: Optional[str]) -> float:
+    """Расход источника по дням не позже last_day — сторона сверки сумм.
+
+    last_day = None означает пустую витрину: сверять не с чем, отдаём ноль, и
+    сверка уходит в свою ветку «обе стороны нули». Иначе сравнивались бы полное
+    окно источника и пустая витрина — «поломка» на первом же прогоне.
+    """
+    if not last_day:
+        return 0.0
+    return sum(cost for day, cost in daily_cost if str(day) <= last_day)
+
+
 # Окно лестницы: 90 дней зрелых данных. Длиннее — глубокие ступени набираются
 # лучше, но оценка тянет прошлый сезон; 90 совпадает с SLICE_WINDOW_DAYS срезов.
 LADDER_WINDOW_DAYS = 90
@@ -287,6 +306,303 @@ def _count_by(rows, key):
         value = str(row.get(key) or "")
         out[value] = out.get(value, 0) + 1
     return dict(sorted(out.items()))
+
+
+# Сколько идей уезжает в отчёт списком. Счётчики выше показывают весь реестр,
+# а разбирать глазами человек будет верх очереди: остальное лежит в
+# edu_agent_ideas и достаётся запросом.
+IDEAS_SAMPLE_LIMIT = 10
+
+
+def _idea_line(idea: Dict[str, Any]) -> Dict[str, Any]:
+    """Идея реестра → строка отчёта. Числа и адрес, без служебных колонок."""
+    return {
+        "idea_id": idea.get("idea_id"),
+        "source": idea.get("source"),
+        "account": idea.get("account"),
+        "tier": idea.get("tier"),
+        "lane": idea.get("lane"),
+        "status": idea.get("status"),
+        "expected_rub": idea.get("expected_rub"),
+        "test_cost_rub": idea.get("test_cost_rub"),
+        "horizon_days": idea.get("horizon_days"),
+        "subject": idea.get("subject"),
+        "success_rule": idea.get("success_rule"),
+    }
+
+
+def ideas_section(ideas: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Реестр идей в отчёте прогона. Печатается ВСЕГДА, в том числе пустым.
+
+    Пустая секция и отсутствующая — разные новости. Первая говорит
+    «генераторы отработали, находок нет», вторая читается как «генератор не
+    запускался», и различить их задним числом по логу нечем: реестр к тому
+    времени выглядит одинаково пустым в обоих случаях. Поэтому счётчики стоят
+    нулями, а не сворачиваются в отсутствие ключа.
+
+    Предложения (класс 3) считаются ОТДЕЛЬНО от очереди. Они не применяются
+    никогда (writer/tier.py) и в такт записи не едут — но это и есть тот
+    экран, ради которого реестр заведён, и смешать их с очередью значило бы
+    показывать человеку список, часть которого агент молча заберёт себе.
+
+    Порядок очереди берётся как есть: его задал реестр (registry.rank —
+    ценность на рубль проверки), и вторая сортировка здесь развела бы экран
+    человека с очередью такта записи.
+    """
+    items = list(ideas or [])
+    queue = [i for i in items
+             if ideas_registry.idea_tier(i) in tier_mod.APPLIED_TIERS]
+    proposals = [i for i in items
+                 if ideas_registry.idea_tier(i) == tier_mod.TIER_PROPOSAL]
+    return {
+        "open": len(items),
+        "by_status": _count_by(items, "status"),
+        "by_source": _count_by(items, "source"),
+        "by_lane": _count_by(items, "lane"),
+        # Классы считаются через registry.idea_tier, а не общим _count_by:
+        # тот пишет пустую строку вместо нуля (str(0 or "")), и класс 0 —
+        # арифметика, самая массовая часть находок — исчез бы из разбивки в
+        # безымянную графу.
+        "by_tier": _count_by(
+            [{"tier": str(ideas_registry.idea_tier(i))} for i in items], "tier"),
+        # Обещание реестра и цена его проверки. Без них счётчик идей не
+        # говорит ничего: три идеи по сто рублей и три по миллиону выглядят
+        # одинаково.
+        "expected_rub": round(sum(float(i.get("expected_rub") or 0.0)
+                                  for i in items), 2),
+        "test_cost_rub": round(sum(float(i.get("test_cost_rub") or 0.0)
+                                   for i in items), 2),
+        "proposals": {"count": len(proposals),
+                      "sample": [_idea_line(i)
+                                 for i in proposals[:IDEAS_SAMPLE_LIMIT]]},
+        "queue": [_idea_line(i) for i in queue[:IDEAS_SAMPLE_LIMIT]],
+    }
+
+
+def _account_value_per_payment(index: Dict[str, Any], account: str) -> Optional[float]:
+    """Средний чек кабинета — по СОСТОЯВШИМСЯ оплатам его кампаний.
+
+    Взвешивание оплатами, а не расходом и не поровну: чек кабинета — это то,
+    сколько в среднем принесла оплата, и кампания с двумя оплатами не вправе
+    тянуть его наравне с кампанией, у которой их двести. Оплат нет ни у одной
+    кампании — None, а не ноль: непосчитанная ценность и посчитанный ноль
+    стоят в очереди реестра по-разному (registry.rank).
+    """
+    revenue = 0.0
+    payments = 0.0
+    for entry in index.values():
+        if entry.get("account") != account or entry.get("avg_check") is None:
+            continue
+        paid = float((entry.get("counts") or {}).get("paid") or 0.0)
+        if paid <= 0:
+            continue
+        revenue += float(entry["avg_check"]) * paid
+        payments += paid
+    return (revenue / payments) if payments > 0 else None
+
+
+def collect_ideas(
+    *,
+    facts: List[Dict[str, Any]],
+    ladder_section: Dict[str, Any],
+    portfolio_section: Dict[str, Any],
+    sliced_rows: List[Dict[str, Any]],
+    query_rows: List[Dict[str, Any]],
+    expansion: List[Dict[str, Any]],
+    demand: Dict[str, Dict[str, Any]],
+    settings_by_campaign: Dict[str, Dict[str, Any]],
+    login_by_campaign: Dict[str, str],
+    direction_by_campaign: Dict[str, str],
+    holdout_ids: List[str],
+    learning_reset: Dict[str, Any],
+    quality_drift: Dict[str, Any],
+    config: Dict[str, Any],
+    slice_window_days: int,
+    query_window_days: int,
+    today: date = None,
+) -> Dict[str, Any]:
+    """Генераторы идей на данных такта: собрать вход, позвать, записать в реестр.
+
+    До этой функции все пять генераторов Ф13 были мёртвым кодом: чистые
+    функции существовали, а звать их было некому — registry.upsert в бою не
+    вызывался ниоткуда, реестр оставался пустым, и секция ideas честно
+    печатала нули. Отчёт при этом выглядел работающим.
+
+    Порция пишется ОТДЕЛЬНО по каждому источнику. Реестр принимает порцию
+    целиком или никак (registry.upsert), и одна кривая находка обязана уронить
+    находки своего генератора, а не всего такта: у пяти генераторов нет ни
+    общего кода, ни общей причины ошибиться. Отказ реестра при этом не роняет
+    прогон — он становится строкой отчёта: расчётный такт считает деньги, и
+    падать из-за экрана предложений ему нельзя.
+
+    Кабинет — рамка всего. Идеи считаются по кабинетам, а не по кабинету
+    вообще: порог λ, средний чек и заповедник у каждого свои, и связка одного
+    кабинета, посуженная порогом другого, — это приговор по чужой мерке.
+    Спрос рынка при этом общий (Wordstat не знает про кабинеты), поэтому
+    поводы спроса раздаются кабинету только по ЕГО направлениям: растущее
+    направление, которого в кабинете нет вовсе, адресовать некому, и выбор
+    «кому его завести» из данных не выводится.
+    """
+    today = today or date.today()
+    index = ideas_bundles.campaign_index(
+        facts, ladder_section, portfolio_section,
+        login_by_campaign=login_by_campaign,
+        settings_by_campaign=settings_by_campaign,
+        direction_by_campaign=direction_by_campaign)
+
+    segments = ideas_bundles.segment_bundles(
+        sliced_rows, index, window_days=slice_window_days)
+    donors = ideas_bundles.query_donors(
+        query_rows, index,
+        phrases=[c.get("query") for c in (expansion or ())],
+        window_days=query_window_days)
+    tests = ideas_bundles.campaign_tests(
+        index, holdout_ids=holdout_ids, learning_reset=learning_reset,
+        today=today)
+
+    # Цена эффективного лида по направлениям и живые направления кабинета —
+    # на окне лестницы, том же, на котором посчитана ценность лида. Другое
+    # окно означало бы, что критерий успеха идеи («побить нынешнюю цену»)
+    # мерит не ту цену, о которой говорит остальной отчёт.
+    window_from = ladder_section.get("window_from") or ""
+    window_to = ladder_section.get("window_to") or ""
+    cost_by_direction: Dict[str, float] = {}
+    eff_by_direction: Dict[str, float] = {}
+    live_by_account: Dict[str, set] = {}
+    for fact in facts or ():
+        fact_date = str(fact.get("fact_date"))[:10]
+        if not (window_from <= fact_date <= window_to):
+            continue
+        direction = fact.get("direction") or ""
+        if not direction:
+            continue
+        cost = float(fact.get("cost") or 0.0)
+        cost_by_direction[direction] = cost_by_direction.get(direction, 0.0) + cost
+        eff_by_direction[direction] = (eff_by_direction.get(direction, 0.0)
+                                       + float(fact.get("eff_leads") or 0.0))
+        if cost > 0:
+            login = login_by_campaign.get(str(fact.get("campaign_id")))
+            if login:
+                live_by_account.setdefault(login, set()).add(direction)
+    cpl_by_direction = {d: cost_by_direction[d] / eff_by_direction[d]
+                        for d in cost_by_direction if eff_by_direction.get(d, 0.0) > 0}
+
+    uncovered_by_direction: Dict[str, List[str]] = {}
+    for candidate in expansion or ():
+        for campaign_id in candidate.get("campaigns") or ():
+            direction = direction_by_campaign.get(str(campaign_id))
+            if not direction:
+                continue
+            phrases = uncovered_by_direction.setdefault(direction, [])
+            if candidate.get("query") and candidate["query"] not in phrases:
+                phrases.append(candidate["query"])
+
+    accounts = sorted({entry["account"] for entry in index.values()
+                       if entry.get("account")})
+    lambdas = {login: acc.get("lambda")
+               for login, acc in ((portfolio_section or {}).get("accounts") or {}).items()}
+
+    by_source: Dict[str, Dict[str, Any]] = {}
+    failed: Dict[str, str] = {}
+
+    def _run(source: str, ideas: List[Dict[str, Any]],
+             skipped: List[Dict[str, Any]]) -> None:
+        slot = by_source.setdefault(
+            source, {"ideas": 0, "upserted": 0, "skipped_by_reason": {}})
+        slot["ideas"] += len(ideas)
+        for row in skipped:
+            reason = str(row.get("reason") or "")
+            slot["skipped_by_reason"][reason] = (
+                slot["skipped_by_reason"].get(reason, 0) + 1)
+        if not ideas:
+            return
+        try:
+            slot["upserted"] += len(ideas_registry.upsert(ideas))
+        except Exception as exc:  # noqa: BLE001
+            failed[source] = f"{type(exc).__name__}: {exc}"[:300]
+
+    # Исходы своих же ставок за окно свежести: выигрыши питают масштабирование,
+    # проигрыши становятся адресным запретом. Реестр недоступен — генераторы
+    # работают как раньше, но причина видна строкой, а не молчит.
+    settled: List[Dict[str, Any]] = []
+    settled_error = None
+    try:
+        settled = list(ideas_registry.recently_settled(
+            ideas_registry.WON_BET_STATUSES + ideas_registry.LOST_BET_STATUSES))
+    except Exception as exc:  # noqa: BLE001
+        settled_error = f"{type(exc).__name__}: {exc}"[:300]
+
+    for account in accounts:
+        own = {cid for cid, entry in index.items() if entry["account"] == account}
+        mine = [row for row in settled if str(row.get("account")) == account]
+        ctx = {
+            "account": account,
+            # Опровергнутые гипотезы кабинета: тест, проигранный на кампании,
+            # второй раз не предлагается (abtests.lost_before).
+            "lost_tests": [row for row in mine
+                           if str(row.get("bet_status")) in ideas_registry.LOST_BET_STATUSES],
+            "lambda": lambdas.get(account),
+            "quality_drift": quality_drift,
+            "holdout_ids": holdout_ids,
+            "config": config,
+            "value_per_payment_rub": _account_value_per_payment(index, account),
+        }
+        found = ideas_proven.scan(
+            [b for b in segments["bundles"] if b["campaign_id"] in own], ctx)
+        _run(ideas_proven.SOURCE, found["ideas"], found["skipped"])
+
+        # Замыкание реестра: выигранная ставка — вход генератора, а не конец
+        # истории. Доказательство получено нашими же деньгами, и лучшего входа
+        # у масштабирования нет.
+        found = ideas_proven.scan_closed(mine, ctx)
+        _run(ideas_proven.SOURCE, found["ideas"], found["skipped"])
+
+        found = ideas_consolidate.scan(
+            [r for r in donors["rows"] if r["campaign_id"] in own], ctx)
+        _run(ideas_consolidate.SOURCE, found["ideas"], found["skipped"])
+
+        found = ideas_abtests.scan(
+            [r for r in tests if r["campaign_id"] in own], ctx)
+        _run(ideas_abtests.SOURCE, found["ideas"], found["skipped"])
+
+        directions = live_by_account.get(account, set())
+        found = ideas_market.scan(ideas_bundles.demand_rows(
+            {d: r for d, r in (demand or {}).items() if d in directions},
+            account=account,
+            uncovered_by_direction=uncovered_by_direction,
+            cpl_by_direction=cpl_by_direction,
+            live_directions=sorted(directions)), ctx)
+        _run(ideas_market.SOURCE, found["ideas"], found["skipped"])
+
+    return {
+        "accounts": len(accounts),
+        "bundles": {
+            "segments": len(segments["bundles"]),
+            "donors": len(donors["rows"]),
+            "campaigns": len(tests),
+            "skipped_by_reason": _count_by(
+                segments["skipped"] + donors["skipped"], "reason"),
+        },
+        "by_source": by_source,
+        # Замыкание: сколько исходов своих ставок такт увидел и чем они
+        # кончились. Ноль выигрышей и ноль уроков — законное состояние
+        # кабинета без закрытых ставок, но недоступный реестр выглядит так же,
+        # и различить их можно только по названной причине.
+        "closure": {
+            "settled": len(settled),
+            "won": sum(1 for row in settled
+                       if str(row.get("bet_status")) in ideas_registry.WON_BET_STATUSES),
+            "lost": sum(1 for row in settled
+                        if str(row.get("bet_status")) in ideas_registry.LOST_BET_STATUSES),
+            "unavailable": settled_error,
+        },
+        # Генератор, которому такт не даёт входа вовсе. Ноль находок у него —
+        # не «поводов не нашлось», а «спрашивать было не о чем», и по пустому
+        # счётчику эти два состояния неразличимы.
+        "sources_without_input": dict(ideas_bundles.SOURCES_WITHOUT_INPUT),
+        # Отказ реестра в порции. Пусто — все порции приняты.
+        "failed": failed,
+    }
 
 
 def funnel_ladder_section(
@@ -358,6 +674,13 @@ def funnel_ladder_section(
     report["maturity_days"] = maturity_days
     report["window_from"] = window_from
     report["window_to"] = window_to
+    # Пулы и чеки — наружу, а не только внутрь отчёта. По ним генераторы идей
+    # переводят события связки (сегмента, запроса) в оплаты и выручку: своих
+    # коэффициентов перехода у связки быть не может — событий на них не
+    # набралось бы никогда, — и второй расчёт рядом означал бы, что кампанию и
+    # её сегмент такт судит по разным коэффициентам.
+    report["counts"] = {"by_direction": by_direction, "account": account}
+    report["avg_check"] = checks
     return report
 
 
@@ -450,11 +773,24 @@ def main() -> int:
     if daily_cost:
         history = [cost for _, cost in daily_cost[:-1]]
         checks.append(check_volume_anomaly(history, daily_cost[-1][1]))
-        # Расход по источнику против расхода, уже лежащего в витрине за то же
-        # окно: расхождение означает, что витрина собрана не из этих строк.
+        # Расход по источнику против расхода, уже лежащего в витрине: расхождение
+        # означает, что витрина собрана не из этих строк.
+        #
+        # Сверяется ОБЩИЙ интервал, а не полное окно. Витрина отстаёт от источника
+        # на прогон по построению: свежие дни источник отдаёт сразу, а записывает
+        # их только текущий прогон — ниже по коду. Сравнение полного окна с
+        # недописанной витриной меряет лаг, а не сохранность данных, и 27.08.2026
+        # уронило e0 на ровном месте: 141 287 763 против 139 824 423 (1,04 % при
+        # пороге 1 %). Вся разница до копейки лежала в двух недописанных днях
+        # (26.08 недобран, 27.08 отсутствует), ни одна кампания не терялась.
+        # Хуже того, клин самоподдерживающийся: пока факты не записаны, разрыв
+        # растёт с каждым днём, и следующий прогон падает вернее предыдущего.
+        # Обе стороны берутся от одной границы: пустая витрина — это ноль против
+        # нуля, а не полное окно источника против неизвестно чего.
+        mart_last = agent_db.mart_last_fact_date(date_from, date_to)
         checks.append(check_sum_reconciliation(
-            sum(cost for _, cost in daily_cost),
-            agent_db.mart_cost_total(date_from, date_to),
+            _cost_up_to(daily_cost, mart_last),
+            agent_db.mart_cost_total(date_from, mart_last) if mart_last else 0.0,
         ))
 
     checks.append(check_continuity(
@@ -818,9 +1154,15 @@ def main() -> int:
     ask = semantic.deepseek_asker()
     semantic_verdicts = {}
     if ask is not None:
-        semantic_verdicts = semantic.classify(
-            [c["query"] for c in minus_candidates + word_candidates + expansion],
-            ask=ask, context=SEMANTIC_CONTEXT)
+        # Паспорт продукта — по направлению кампаний, где фраза откручивалась
+        # (задача 20). Фраза, стоящая в кампаниях РАЗНЫХ направлений, едет на
+        # общем описании: паспорта соседей противоречат друг другу там, где
+        # это опаснее всего («после 9 класса» — анти-маркер у ВПО и целевой
+        # маркер у СПО).
+        semantic_verdicts, passport_stats = semantic.classify_by_direction(
+            minus_candidates + word_candidates + expansion,
+            ask=ask, direction_by_campaign=direction_by_campaign,
+            context=SEMANTIC_CONTEXT)
         before_minus = len(minus_candidates) + len(word_candidates)
         minus_candidates = semantic.keep_minus_candidates(
             minus_candidates, semantic_verdicts)
@@ -840,6 +1182,9 @@ def main() -> int:
             # не знает» и «слой упал» дают одинаковую цифру и одинаковое
             # отсутствие вето. Разводит их только причина.
             "unclear_reasons": semantic.unclear_reasons(semantic_verdicts),
+            # Разметка с паспортом и без — разного качества. Без этих долей
+            # «паспорта не понадобились» неотличимо от «паспорта не завезли».
+            "passports": passport_stats,
         }
     else:
         # Молчаливое отсутствие слоя неотличимо от «модель всё одобрила» —
@@ -1134,9 +1479,45 @@ def main() -> int:
         room_by_login[login] = (room_by_login.get(login, 0.0)
                                 + float(candidate["room_rub"] or 0.0))
 
+    # Пейсинг месяца: план освоения берётся у владельца потолком, а не у
+    # прошедших 28 дней. Факт месяца считается ПО ВЧЕРАШНИЙ день: сегодняшний
+    # входит в остаток дней, и неполный день, зачтённый в трату, каждый прогон
+    # занижал бы остаток. Витрина недоступна — плана нет, и солвер считает
+    # потолок окна по-старому.
+    month_first = date.today().replace(day=1)
+    month_spent: Dict[str, float] = {}
+    pacing_reason = None
+    try:
+        # Первое число месяца окно вырождается (конец раньше начала) и витрина
+        # честно отдаёт пусто. Ветки «сегодня первое» здесь нет намеренно:
+        # она исполнялась бы раз в месяц и ровно там ломалась бы молча.
+        for campaign_id, cost in agent_db.load_cost_by_campaign(
+                month_first.isoformat(),
+                (date.today() - timedelta(days=1)).isoformat()).items():
+            login = login_by_campaign_id.get(str(campaign_id)) or "unmapped"
+            month_spent[login] = month_spent.get(login, 0.0) + float(cost or 0.0)
+    except Exception as exc:  # noqa: BLE001
+        pacing_reason = f"{type(exc).__name__}: {exc}"[:200]
+    account_regime = dominant_regime(demand)
+    # План считается по КАБИНЕТАМ такта, а не по тем, у кого солвер нашёл
+    # кривые: кабинет без раскладки — это кабинет, которому нечем осваивать
+    # план, и видеть его в отчёте пустой строкой полезнее, чем не видеть.
+    pace_logins = ({str(c["login"]) for c in clients}
+                   | set(preliminary_threshold["accounts"]))
+    pace_by_login = {} if pacing_reason else {
+        login: month_plan(month_first.strftime("%Y-%m"),
+                          month_spent.get(login, 0.0),
+                          active_config["monthly_budget_cap_rub"],
+                          account_regime)
+        for login in sorted(pace_logins)
+    }
+
     budget_threshold = _solve_portfolio(
         target_romi=active_config["target_romi"],
         room_rub_by_login=room_by_login,
+        # План месяца по кабинетам: он и задаёт потолок окна, когда потолок
+        # месяца назван. Недобор начала месяца догоняется, перебор тормозится.
+        pace_by_login=pace_by_login,
         # Потолок месячного освоения — деньги владельца. Ключ пуст: рост
         # только предлагается числом в отчёте, сумма кабинета не меняется.
         monthly_cap_rub=active_config["monthly_budget_cap_rub"],
@@ -1160,6 +1541,35 @@ def main() -> int:
     # печатать её значило бы отчитываться числами, которых писатель не увидит.
     growth = growth_candidates(budget_threshold, headroom_section, demand,
                                expansion, quality_drift=quality["drift"])
+
+    # Ф13: генераторы идей. Считаются ПОСЛЕ итоговой раскладки — им нужен
+    # порог λ, ценность лида и признак связывающего лимита, то есть те же
+    # числа, по которым такт двигает деньги. Реестр — единственный выход
+    # генераторов наружу: применять они ничего не умеют, и всё, что найдено,
+    # уезжает человеку на экран и в очередь такта записи.
+    #
+    # Журнал сбросов обучения читается тем же способом, что и петля обучения
+    # выше: недоступность журнала расчёт не роняет, но и молча пустым не
+    # притворяется — генератор тестов обязан отличать «сбросов не было» от
+    # «журнал не прочитан», иначе срок теста поедет на две недели.
+    try:
+        learning_reset = writer_db.last_learning_reset()
+        learning_reset_error = None
+    except Exception as exc:  # noqa: BLE001
+        learning_reset, learning_reset_error = {}, f"{type(exc).__name__}: {exc}"[:200]
+    generated = collect_ideas(
+        facts=facts, ladder_section=ladder_section,
+        portfolio_section=budget_threshold, sliced_rows=sliced_rows,
+        query_rows=scored_queries, expansion=expansion, demand=demand,
+        settings_by_campaign=campaign_settings,
+        login_by_campaign=login_by_campaign_id,
+        direction_by_campaign=direction_by_campaign,
+        holdout_ids=[str(h["campaign_id"]) for h in holdout],
+        learning_reset=learning_reset, quality_drift=quality["drift"],
+        config=active_config, slice_window_days=SLICE_WINDOW_DAYS,
+        query_window_days=QUERY_WINDOW_DAYS)
+    if learning_reset_error:
+        generated["learning_reset_unavailable"] = learning_reset_error
 
     sizes = agent_db.table_sizes()
     total_mb = round(sum(int(s["size_bytes"] or 0) for s in sizes) / 1024 / 1024, 1)
@@ -1322,6 +1732,15 @@ def main() -> int:
                     "lambda": acc["lambda"]}
             for login, acc in budget_threshold["accounts"].items()
         },
+        # План освоения месяца: цель, выбранное и дневная доля по кабинетам.
+        # Без него «бюджет кабинета» в отчёте — число ниоткуда: непонятно,
+        # догоняет агент месяц или тормозит его.
+        "pacing": {
+            "month": month_first.strftime("%Y-%m"),
+            "regime": account_regime,
+            "unavailable": pacing_reason,
+            "accounts": pace_by_login,
+        },
         "budget_target_rows": budget_target_count,
         "computed_settings": computed_count,
         "computed_settings_by_account": {k: len(v) for k, v in computed_by_account.items()},
@@ -1390,6 +1809,17 @@ def main() -> int:
         # Денег два числа: room_rub_budget кабинет освоит поднятием лимитов
         # сразу, room_rub_tcpa — только после эскалации цены конверсии.
         "growth": growth,
+        # Ф12: реестр идей. Печатается КАЖДЫЙ такт, в том числе пустым:
+        # пустая секция говорит «генераторы отработали, находок нет», а её
+        # отсутствие читается как «генератор не запускался» — и восстановить,
+        # что из двух было, задним числом уже нечем.
+        "ideas": {**ideas_section(ideas_registry.open_ideas()),
+                  # Что нашли ИМЕННО В ЭТОТ такт, рядом с тем, что стоит в
+                  # реестре. Одного счётчика открытых идей мало: реестр помнит
+                  # находки прошлых прогонов, и по нему не отличить «сегодня
+                  # генераторы отработали и ничего не нашли» от «сегодня
+                  # генераторы не работали вовсе».
+                  "generated": generated},
         "db_total_mb": total_mb,
         "db_tables": [{"t": s["table_name"], "size": s["size"]} for s in sizes],
     }
@@ -1399,6 +1829,22 @@ def main() -> int:
     #
     # Итог записи вкладывается в отчёт, а не печатается вторым JSON-ом: вывод
     # такта расчёта — ровно один документ, и на этом держится его разбор.
+    # Манифест устройства (полосы, классы, рычаги, панель) выгружается вместе
+    # с прогоном, а не отдельной командой: он собран из ТЕХ ЖЕ констант, по
+    # которым только что считал этот прогон, и обязан меняться вместе с кодом.
+    # Отдельное решение человека «обновить карту» — это и есть та развилка,
+    # на которой рукописное зеркало в Panda-BI разъехалось с Python.
+    #
+    # Падение выгрузки расчёт не роняет: манифест ничего не считает и ни на
+    # что не влияет, а потерять из-за него дневной расчёт — несоразмерно.
+    try:
+        agent_db.save_manifest(agent_manifest.build(
+            datetime.now(timezone.utc).isoformat()))
+        report["manifest"] = {"written": True}
+    except Exception as exc:  # noqa: BLE001
+        report["manifest"] = {"written": False,
+                              "error": f"{type(exc).__name__}: {exc}"[:200]}
+
     report["blackbox"] = blackbox.save_run(
         blackbox.new_run_id(), stage="e0",
         mode=blackbox.MODE_COMPUTE, report=report)

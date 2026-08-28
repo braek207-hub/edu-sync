@@ -637,16 +637,75 @@ def test_budget_grows_when_lambda_has_margin():
     assert out["capped_by"] == "step"
 
 
-def test_no_growth_without_lambda_margin():
-    # Ровно на цели растить нечего: предельный рубль уже стоит на пороге, и
-    # прибавка уводит кабинет за него.
+def test_marginal_ruble_is_not_measured_against_the_contract():
+    # До 28.08.2026 порог роста был target_romi × 1.2, то есть контрактная
+    # двойка требовалась от ПРЕДЕЛЬНОГО рубля. Кабинет со средней 3.0 и
+    # предельной 1.5 приносит втрое — растить ему можно, и старый порог 2.4
+    # запрещал это на ровном месте.
     from sync.agent.portfolio import account_budget
 
-    out = account_budget(current_cost=1_000_000.0, lam=2.1, target_romi=2.0,
-                         room_rub=500_000.0, monthly_cap=5_000_000.0)
+    out = account_budget(current_cost=1_000_000.0, lam=1.5, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=5_000_000.0,
+                         revenue=3_000_000.0)
+    assert out["growth_rub"] == 200_000.0
+    assert out["capped_by"] == "step"
+
+
+def test_no_growth_when_account_is_below_contract():
+    # Контракт — про СРЕДНЮЮ окупаемость. Кабинет возвращает 1.4 при
+    # требуемых 2.0, и предельный рубль (1.5) контракта тоже не даёт: долив
+    # уводит среднюю ещё дальше вниз. Запрет приходит от арифметики
+    # контракта, а не от порога предельного рубля.
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=1.5, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=5_000_000.0,
+                         revenue=1_400_000.0)
     assert out["budget"] == 1_000_000.0
     assert out["growth_rub"] == 0.0
-    assert out["capped_by"] == "lambda"
+    assert out["capped_by"] == "romi"
+    assert out["romi_known"] is True
+
+
+def test_contract_caps_growth_without_forbidding_it():
+    # Средняя 2.1 при контракте 2.0 и предельной 1.3: долить можно ровно
+    # столько, чтобы средняя села на контракт, — (2.1−2.0)·10⁶ / (2.0−1.3).
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=1.3, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=5_000_000.0,
+                         revenue=2_100_000.0)
+    assert out["capped_by"] == "romi"
+    assert round(out["growth_rub"]) == 142_857
+    # Средняя после долива села ровно на контракт, а не под него.
+    assert round((2_100_000.0 + 1.3 * out["growth_rub"])
+                 / (1_000_000.0 + out["growth_rub"]), 6) == 2.0
+
+
+def test_contract_does_not_cap_when_marginal_beats_it():
+    # λ ≥ контракта: каждый доливаемый рубль возвращает не меньше требуемого,
+    # и средняя от долива РАСТЁТ. Кабинет ниже контракта (1.4) при этом
+    # растить не только можно, но и нужно — это его способ дойти до
+    # контракта. Ограничивать здесь нечего.
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=2.5, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=5_000_000.0,
+                         revenue=1_400_000.0)
+    assert out["growth_rub"] == 200_000.0
+    assert out["capped_by"] == "step"
+
+
+def test_unknown_revenue_leaves_the_contract_unchecked_and_says_so():
+    # Выручки нет — контракт не проверяется. Запретить рост по незнанию и
+    # разрешить его по незнанию врут одинаково, поэтому незнание не решает
+    # ничего, а едет в отчёт полем.
+    from sync.agent.portfolio import account_budget
+
+    out = account_budget(current_cost=1_000_000.0, lam=1.5, target_romi=2.0,
+                         room_rub=500_000.0, monthly_cap=5_000_000.0)
+    assert out["romi_known"] is False
+    assert out["capped_by"] == "step"
 
 
 def test_no_growth_below_marginal_breakeven():
@@ -806,18 +865,27 @@ def test_without_the_monthly_plan_growth_is_only_proposed():
     assert acc["proposed_growth_rub"] == 20_000.0
 
 
-def test_target_romi_raises_the_bar_for_growth():
-    # Требование окупаемости из панели настроек: λ = 8 проходит с запасом
-    # при цели 1.0 и не проходит при цели 8.0.
+def test_target_romi_is_checked_against_the_account_average():
+    # Кабинет фикстуры возвращает 10.0 (выручка 1 млн на расход 100 тыс).
+    # Контракт 8.0 он выполняет — рост разрешён; контракт 12.0 нарушает —
+    # рост запрещён, и причина названа своим именем, а не «lambda».
     saturation = {"1": _curve()}
     ladder = {"1": _ladder()}
-    section = portfolio_targets(saturation, ladder, {"1": "acc"},
-                                target_romi=8.0,
-                                room_rub_by_login={"acc": 50_000.0},
-                                monthly_cap_rub=5_000_000.0)
-    acc = section["accounts"]["acc"]
-    assert acc["budget_28d"] == 100_000.0
-    assert acc["growth_capped_by"] == "lambda"
+
+    ok = portfolio_targets(saturation, ladder, {"1": "acc"},
+                           target_romi=8.0,
+                           room_rub_by_login={"acc": 50_000.0},
+                           monthly_cap_rub=5_000_000.0)["accounts"]["acc"]
+    assert ok["account_romi"] == 10.0
+    assert ok["growth_rub"] > 0.0
+
+    over = portfolio_targets(saturation, ladder, {"1": "acc"},
+                             target_romi=12.0,
+                             room_rub_by_login={"acc": 50_000.0},
+                             monthly_cap_rub=5_000_000.0)["accounts"]["acc"]
+    assert over["budget_28d"] == 100_000.0
+    assert over["growth_capped_by"] == "romi"
+    assert over["target_romi"] == 12.0
 
 
 def test_bias_multiplier_is_one_without_history():

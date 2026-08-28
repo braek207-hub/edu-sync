@@ -204,6 +204,13 @@ def is_spend_collapsed(
     return False, ""
 
 
+# Виды, создающие новый объект-корректировку. Отменяются одинаково — set
+# нейтрали по Id из ответа API: корректировка на аудиторию
+# (writer/audience.py) отличается от корректировки сегмента только адресуемым
+# измерением, а путь назад у обеих один.
+ADDED_MODIFIER_KINDS = ("bidmodifier.add", "audience.add")
+
+
 def _added_modifier_id(action: Dict[str, Any]) -> Optional[Any]:
     """Id корректировки, добавленной действием bidmodifier.add.
 
@@ -223,6 +230,18 @@ def _added_modifier_id(action: Dict[str, Any]) -> Optional[Any]:
         first = add_results[0] or {}
         return first.get("Id")
     return None
+
+
+# Виды, у которых назад едет весь прежний блок BiddingStrategy. Всё, что
+# живёт ВНУТРИ стратегии, возвращается одинаково — недельный лимит, цель CPA,
+# цель оптимизации: разница между ними существует только на пути ТУДА.
+#
+# Цель CPA попала сюда с опозданием и это был дефект, а не решение: вид стоял
+# в allow-листе возврата (guardrails.ROLLBACK_ALLOWED_ACTION_KINDS) с самой
+# Э3.5, а ветки здесь не имел — то есть откат цели CPA не строился вовсе и
+# сторож хоронил его пометкой «прошлое состояние неизвестно», permanent=True.
+# В бою это не выстрелило только потому, что рычаг цели держат в тени.
+STRATEGY_BLOCK_KINDS = ("budget.set", "tcpa.set", "goal.set", "strategy.set")
 
 
 def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[str, Any]]]:
@@ -245,7 +264,7 @@ def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[st
                               "BidModifier": delta_to_api(previous["percent"])}]
         }
 
-    if kind == "bidmodifier.add":
+    if kind in ADDED_MODIFIER_KINDS:
         modifier_id = _added_modifier_id(action)
         if modifier_id is None:
             return None
@@ -253,7 +272,7 @@ def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[st
             "BidModifiers": [{"Id": modifier_id, "BidModifier": delta_to_api(0)}]
         }
 
-    if kind == "budget.set":
+    if kind in STRATEGY_BLOCK_KINDS:
         # Назад едет ВЕСЬ прежний блок BiddingStrategy из журнала — тем же
         # правилом, что у расписания ниже: пересборка из одного лимита стёрла
         # бы соседние поля стратегии (цель, BidCeiling), настроенные человеком.
@@ -264,6 +283,21 @@ def rollback_payload(action: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[st
         return "campaigns", "update", {
             "Campaigns": [{"Id": int(campaign_id),
                            "TextCampaign": {"BiddingStrategy": previous_strategy}}]
+        }
+
+    if kind == "geo.set":
+        # Назад едет ВЕСЬ прежний список регионов и в те же группы: список в
+        # API заменяется целиком, и «убрать добавленное» здесь не операция —
+        # такой операции у поля нет. Прежний список неизвестен или групп нет —
+        # вслепую не пишем, по тому же правилу, что у корректировки без Id.
+        previous_regions = previous.get("RegionIds")
+        groups = previous.get("AdGroupIds") or (action.get("payload") or {}).get("AdGroupIds")
+        if not previous_regions or not groups:
+            return None
+        return "adgroups", "update", {
+            "AdGroups": [{"Id": int(group_id),
+                          "RegionIds": [int(r) for r in previous_regions]}
+                         for group_id in groups]
         }
 
     if kind == "budget.set_daily":

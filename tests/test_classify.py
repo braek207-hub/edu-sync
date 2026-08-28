@@ -3,6 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from sync import classify
 from sync.classify import detect_direction, detect_project
 
 
@@ -107,3 +108,20 @@ def test_normalize_plan_keys_school():
     assert normalize_plan_project("Онлайн-школа") == "eduschool"
     assert normalize_plan_project("eduschool") == "eduschool"
     assert normalize_plan_direction("Школа") == "school"
+
+
+def test_the_direction_list_matches_what_the_classifier_returns():
+    """Перечень направлений — закрытый, и это проверяется по КОДУ функции.
+
+    Паспорта продукта (sync/agent/passports/) лежат под именем направления.
+    Разъедься перечень с тем, что возвращает detect_direction, — паспорт уехал
+    бы под ключ, которого прогон никогда не спросит, и молча не применялся бы.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(classify.detect_direction))
+    returned = {node.value.value for node in ast.walk(tree)
+                if isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Constant)}
+    assert returned == set(classify.DIRECTIONS)

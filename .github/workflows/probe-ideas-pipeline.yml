@@ -1,0 +1,20 @@
+name: probe-ideas-pipeline
+# Доезжает ли находка генератора до РЕАЛЬНОЙ edu_agent_ideas. Тесты идут на
+# двойнике таблицы и о SQL ничего не знают. Пишет одну строку под кабинетом
+# «__probe_16a__», которого нет в Директе, и убирает её за собой в finally.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Связка → генератор → реестр → чтение обратно
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python probe_ideas_pipeline.py

@@ -64,11 +64,14 @@ from sync.agent.balance import (
 )
 from sync.agent.coverage import blind_share
 from sync.agent.gate import data_gate
+from sync.agent.ideas import registry as ideas_registry
 from sync.agent.writer import budget
+from sync.agent.writer import launch
 from sync.agent.writer import switch
 from sync.agent.writer import negatives
 from sync.agent.writer import placements
 from sync.agent.writer import tcpa
+from sync.agent.writer import tier as tier_mod
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import apply_actions
 from sync.agent.writer.client import WriteClient, journal_writes_allowed
@@ -100,7 +103,7 @@ from sync.agent.writer.risk import (
     week_start,
     weekly_limit,
 )
-from sync.agent import blackbox, conflicts, experiments, rejects
+from sync.agent import blackbox, conflicts, experiments, learning_loop, rejects
 from sync.agent.writer.rollback import red_line_for
 from sync.agent.writer.units import api_to_delta
 
@@ -780,6 +783,88 @@ def lane_shortfall(taken: int, refused: int, wanted_rub: float,
     }
 
 
+def lane_steps_of(config: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    """Ступень каждой полосы на этом прогоне — из её ПОСЛУЖНОГО СПИСКА.
+
+    Раньше ступени приходили только конфигом панели, а ключа lane_steps в
+    панели не было, — то есть все полосы стояли на одной константе и лестница
+    автономии, посчитанная и покрытая тестами, в бою не участвовала.
+
+    Журнал недоступен — прогон идёт по полу полос (lanes.default_step_of), как
+    до лестницы, а причина видна в отчёте. Останавливать запись из-за
+    недоступной калибровки нельзя: это отчётный слой поверх решения, а не
+    само решение. Поднять ступень без журнала лестница и не может — без
+    закрытых наблюдений она возвращает пол, — так что отказ читается в
+    безопасную сторону сам собой.
+    """
+    try:
+        record = learning_loop.track_record(writer_db.closed_actions())
+        source = None
+    except Exception as exc:  # noqa: BLE001
+        record, source = {}, f"{type(exc).__name__}: {exc}"[:200]
+    steps = lanes.steps_by_lane(record, config)
+    if source is not None:
+        for slot in steps.values():
+            slot["journal_unavailable"] = source
+    return steps
+
+
+def record_shadow_intents(actions: List[Dict[str, Any]],
+                          journal_ok: bool = True) -> Dict[str, Any]:
+    """Намерения полос из тени — в журнал, статусом shadow, без отправки.
+
+    Полоса на ступени 0 не применяет, но и молчать не вправе: приёмка рычага в
+    том и состоит, что агент две недели пишет «сделал бы X, жду Y к дате D», а
+    человек читает совпадения с фактом и решает, выпускать ли (autonomy.py,
+    правило 1). Без записи режим приёмки был бы неотличим от выключенного
+    рычага.
+
+    Строка заводится тем же insert_action и с тем же ключом идемпотентности:
+    выпуск полосы из тени завтра перепишет ЭТУ ЖЕ строку в planned, а не
+    заведёт вторую. Риск-бюджет не трогается ни на рубль — экспозиции не было.
+
+    journal_ok — репетиция журнал не трогает (writer/client.journal_writes_
+    allowed): намерение, записанное репетицией, ждало бы сверки с фактом,
+    которого не будет.
+    """
+    if not actions:
+        return {"intents": 0, "by_lane": {}, "written": 0, "sample": []}
+    by_lane: Dict[str, int] = {}
+    written = 0
+    for action in actions:
+        lane = str(action.get("lane") or lanes.lane_of(action))
+        by_lane[lane] = by_lane.get(lane, 0) + 1
+        if not journal_ok:
+            continue
+        try:
+            writer_db.insert_action(_shadow_row(action),
+                                    status=writer_db.SHADOW_STATUS)
+            written += 1
+        except Exception:  # noqa: BLE001
+            # Одно неудачное намерение не отменяет остальные и тем более не
+            # отменяет прогон: в кабинет оно всё равно не едет, а расхождение
+            # видно разностью intents и written.
+            continue
+    return {"intents": len(actions), "by_lane": dict(sorted(by_lane.items())),
+            "written": written,
+            "sample": [{"object_id": str(a.get("object_id")),
+                        "action_kind": str(a.get("action_kind")),
+                        "lane": str(a.get("lane") or "")}
+                       for a in actions[:PREVIEW_SAMPLE_LIMIT]]}
+
+
+def _shadow_row(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Строка журнала для намерения: то же действие с обнулённой ценой.
+
+    risk_rub — ноль явно, а не то, что насчитал отбор: цена действия это цена
+    ЭКСПОЗИЦИИ, а её не было. Ненулевое число в строке, за которой ничего не
+    стоит, читалось бы риск-бюджетом недели как занятые деньги, стоило бы
+    места настоящим изменениям и попало бы в худший недельный исход.
+    """
+    return {**action, "risk_rub": 0.0, "learning_impact": learning_impact(action),
+            "baseline_daily_rub": None, "risk_basis": None}
+
+
 def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
                     prices: Dict[str, float], step_by_lane: Dict[str, int],
                     weekly_spend_rub: float,
@@ -833,7 +918,7 @@ def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
 
     out: Dict[str, Any] = {}
     for lane, slot in sorted(slots.items()):
-        limit = lanes.risk_budget_of(lane, steps.get(lane, lanes.DEFAULT_STEP),
+        limit = lanes.risk_budget_of(lane, steps.get(lane, lanes.default_step_of(lane)),
                                      weekly_spend_rub, config, risk_budget_rub)
         out[lane] = lane_shortfall(taken=slot["taken"], refused=slot["refused"],
                                    wanted_rub=slot["wanted"], limit_rub=limit,
@@ -1140,6 +1225,213 @@ def split_by_final_keys(
     blocked = [{**a, "blocked_reason": ALREADY_FINAL_REASON}
                for a in actions if a["idempotency_key"] in final_keys]
     return allowed, blocked
+
+
+def _idea_refusal(idea: Dict[str, Any], reason: str, detail: str) -> Dict[str, Any]:
+    """Идея, не доехавшая до плана, с названной причиной.
+
+    Отказ здесь — не исключение и не молчание. Исключение уронило бы такт
+    записи из-за одной кривой находки, молчание оставило бы человека с
+    реестром, из которого идеи исчезают без объяснения.
+    """
+    return {
+        "idea_id": str(idea.get("idea_id") or ""),
+        "source": str(idea.get("source") or ""),
+        "account": str(idea.get("account") or ""),
+        "tier": ideas_registry.idea_tier(idea),
+        "lane": str(idea.get("lane") or ""),
+        "reason": reason,
+        "detail": detail,
+    }
+
+
+def actions_from_ideas(
+    ideas: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Идеи реестра → кандидаты в план записи и отказы с причиной.
+
+    Идея класса 3 не порождает действия НИКОГДА — ни при какой ступени полосы
+    и ни при каком остатке риск-бюджета. Формально то же самое умеет отбор
+    полос (lanes.select отказывает классу 3 причиной rejects.PROPOSAL), и
+    соблазн положиться на него велик: одна проверка вместо двух. Но между
+    планом и отбором лежит половина такта — рельсы, заповедник, кулдауны,
+    журнал, — и предложение успело бы стать строкой плана, занять слот своего
+    объекта («одно действие на объект», lanes) и вытеснить оттуда доказанное
+    действие, которое отбор взял бы. Поэтому гейт стоит на ВХОДЕ.
+
+    Полезная нагрузка приезжает ПРИ идее, в СВОЕЙ колонке action, а не внутри
+    subject. Это не украшение: subject — адрес объекта, из него выведен
+    idea_id, и изменчивое число внутри (новый лимит, новая ставка) заводило
+    бы идею заново каждым прогоном — с пустой историей и снятым отказом
+    человека (докстринг registry.py). Нагрузка живёт рядом, в колонке, и на
+    идентичность не влияет.
+
+    Сюда едут идеи ИЗ БАЗЫ (registry.open_ideas), а не свежий выход
+    генератора: расчётный такт (agent_e0) и такт записи — разные прогоны, и
+    передать нагрузку в памяти между ними нечем. Ровно на этом путь идей и
+    был мёртв: нагрузка не входила в COLUMNS, до базы не доезжала, и каждая
+    прочитанная идея получала здесь отказ «применять нечем». Поэтому колонка
+    action обязательна для применимых классов на самой записи в реестр
+    (registry._check_action), а не только проверяется тут.
+
+    Класс идеи ужесточает приговор действию, но не смягчает: он ставится в
+    action["tier"], а tier_of берёт максимум объявленного и вычисленного.
+    Обратное направление означало бы, что генератор выписывает своему
+    действию освобождение от риска.
+
+    Порция НЕ принимается «целиком или никак» — в отличие от registry.upsert.
+    Там половина порции была бы состоянием, которого не задавал никто; здесь
+    отказ отдельной идеи — штатный исход такта, и остановка всей порции
+    означала бы, что одна кривая находка глушит кабинет.
+    """
+    actions: List[Dict[str, Any]] = []
+    refused: List[Dict[str, Any]] = []
+
+    for idea in ideas or ():
+        status = str(idea.get("status") or "")
+        if status in ideas_registry.CLOSED_STATUSES:
+            refused.append(_idea_refusal(
+                idea, rejects.CLOSED_KEY,
+                f"идея закрыта как {status!r} — это запись о случившемся"))
+            continue
+
+        # Идея, чей рычаг УЖЕ уехал в кабинет. Второй раз то же действие не
+        # едет: горизонт замера не вышел, и повтор не ускорит исход, а
+        # уничтожит его — приписать изменение будет нечему.
+        #
+        # queued («человек сказал: в работу») здесь не упомянут намеренно: от
+        # new он для такта записи не отличается ничем — рычаг не применён,
+        # замер не начат. Отличай их такт, и взятая человеком в работу идея
+        # встала бы навсегда.
+        if status == ideas_registry.STATUS_RUNNING:
+            refused.append(_idea_refusal(
+                idea, rejects.IDEA_RUNNING,
+                "идея уже применена: проверка идёт, горизонт ещё не вышел"))
+            continue
+
+        tier_value = ideas_registry.idea_tier(idea)
+        if tier_value not in tier_mod.APPLIED_TIERS:
+            refused.append(_idea_refusal(
+                idea, rejects.PROPOSAL,
+                "класс 3: рычага нет, это рекомендация человеку"))
+            continue
+
+        payload = idea.get("action")
+        if not isinstance(payload, dict) or not payload:
+            refused.append(_idea_refusal(
+                idea, rejects.PROPOSAL,
+                "идея не принесла действия: применять нечем"))
+            continue
+
+        action = {**payload, "tier": tier_value,
+                  "idea_id": str(idea.get("idea_id") or ""),
+                  "idea_source": str(idea.get("source") or "")}
+        try:
+            lane = lanes.lane_of(action)
+        except ValueError as exc:
+            # Вид действия вне карты полос — дефект генератора, и он обязан
+            # стать названным отказом: у вида без полосы нет ни лимита, ни
+            # цены, то есть он прошёл бы бесплатно.
+            refused.append(_idea_refusal(idea, rejects.PROPOSAL, str(exc)))
+            continue
+        if lane == lanes.LANE_PROPOSAL:
+            refused.append(_idea_refusal(
+                idea, rejects.PROPOSAL,
+                "полоса предложений: рычага записи у неё нет"))
+            continue
+        # Класс считается ещё раз, уже на действии: идея могла объявить себя
+        # измеренной, а её вид действия рычага не имеет (tier._has_lever).
+        # Верят здесь вычисленному, а не объявленному.
+        if tier_mod.tier_of(action) not in tier_mod.APPLIED_TIERS:
+            refused.append(_idea_refusal(
+                idea, rejects.PROPOSAL,
+                "класс действия — предложение, чем бы ни назвалась идея"))
+            continue
+        actions.append(action)
+
+    return actions, refused
+
+
+# Исход применения, после которого идея считается проверяемой. Ровно один:
+# 'applied' — API принял запрос и элемент применился (writer/apply.py). Ни
+# 'dry_run' (репетиция в кабинет не ходила), ни 'rejected'/'failed' (в
+# кабинете ничего не изменилось), ни 'stale' (исход неизвестен, изменение
+# может быть живым, а может и нет — двигать по нему жизненный цикл значило бы
+# назначить идее проверку, которой, возможно, не было).
+IDEA_APPLIED_RESULT = "applied"
+
+
+def mark_applied_ideas(actions: List[Dict[str, Any]],
+                       details: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Идеи, чей рычаг доехал до кабинета, переводятся в «проверка идёт».
+
+    Единственная связь между тактом записи и жизненным циклом идеи. Без неё
+    применённая идея остаётся в статусе new, open_ideas отдаёт её снова, и
+    назавтра то же действие уезжает вторым — с тем же ключом идемпотентности,
+    но уже поверх изменённого состояния кабинета.
+
+    Отметка идёт по факту ПРИМЕНЕНИЯ, а не планирования. Между планом и
+    кабинетом лежат рельсы (заповедник, кулдауны, риск-бюджет, баллы), и
+    отмеченная при планировании идея застряла бы в реестре навсегда:
+    применять её больше нельзя, а закрывать нечем — в кабинете не менялось
+    ничего.
+
+    Отказ реестра не роняет прогон, а становится строкой. Человек мог
+    отклонить идею между чтением реестра и отправкой (registry.mark законно
+    отказывает закрытой), а действие к этому моменту УЖЕ применено: падение
+    здесь оставило бы прогон без отчёта о том, что он только что сделал в
+    кабинете, — то есть худший из возможных исходов.
+    """
+    outcomes = {str(d.get("key") or ""): str(d.get("result") or "")
+                for d in details or ()}
+    running: List[str] = []
+    failed: List[Dict[str, Any]] = []
+    for action in actions or ():
+        idea = str(action.get("idea_id") or "")
+        key = str(action.get("idempotency_key") or "")
+        # Действие без идеи реестру не принадлежит: в план едут все рычаги,
+        # а не только идейные.
+        if not idea or outcomes.get(key) != IDEA_APPLIED_RESULT:
+            continue
+        try:
+            ideas_registry.mark(idea, ideas_registry.STATUS_RUNNING,
+                                action_id=writer_db.make_action_id(key))
+        except ValueError as exc:
+            failed.append({"idea_id": idea, "detail": str(exc)[:200]})
+            continue
+        running.append(idea)
+    return {"running": running, "failed": failed}
+
+
+def _ideas_report(actions: List[Dict[str, Any]],
+                  refused: List[Dict[str, Any]],
+                  out_of_scope: Optional[List[Dict[str, Any]]] = None,
+                  marked: Optional[Dict[str, Any]] = None,
+                  ) -> Dict[str, Any]:
+    """Что такт записи взял из реестра идей. Печатается всегда, в том числе нулями.
+
+    Отказы — с разбивкой по причине: «идей не было» и «все идеи оказались
+    предложениями» — разные новости, а один счётчик «не взято» их сливает.
+
+    Отсечённые ограничителем прогона считаются ОТДЕЛЬНО от отказов: это не
+    приговор идее, а рамки запуска, и назавтра без --max-campaigns та же идея
+    уедет без единой правки. Смешать их значило бы читать собственное
+    ограничение как дефект генератора.
+    """
+    dropped = list(out_of_scope or ())
+    moved = marked or {}
+    return {
+        "open": len(actions) + len(refused) + len(dropped),
+        "actions": len(actions),
+        "refused_by_reason": _count_by(refused, "reason"),
+        "out_of_scope": len(dropped),
+        # Сколько идей ушло в замер этим тактом и скольким не удалось
+        # сдвинуть статус. Второе число — не мелочь: идея, чей рычаг применён,
+        # а статус остался прежним, поедет в кабинет ещё раз завтра, и
+        # молчание об этом стоило бы второго применения.
+        "running": len(moved.get("running") or ()),
+        "mark_failed": len(moved.get("failed") or ()),
+    }
 
 
 def computed_age_days(computed: List[Dict[str, Any]], today: date) -> Any:
@@ -1480,8 +1772,38 @@ def run_account(
     switch_desired = {cid: m for cid, m in switch_plan["desired"].items()
                       if cid in scoped_ids}
 
+    # Ф12: реестр идей. Читается ДО раннего выхода и входит в его условие тем
+    # же правилом, что бюджет и выключения: идея — самостоятельный повод
+    # действовать, и кабинет без вычисленных настроек (свежий, без истории —
+    # ровно тот, кому идеи нужнее всего) иначе не получил бы их никогда.
+    #
+    # Идеи спрашиваются ПО КАБИНЕТУ: реестр общий на все, а такт записи идёт
+    # по одному, и чужая идея уехала бы туда, где её объекта нет.
+    idea_actions, idea_refused = actions_from_ideas(
+        ideas_registry.open_ideas(account=login))
+    # Ограничитель прогона действует и на идеи, тем же scoped_ids, что у
+    # бюджета и выключений. Две причины, и обе достаточные: первый боевой
+    # прогон запускается по одной кампании (--max-campaigns=1), и рычаг,
+    # пришедший из реестра, не вправе обойти это ограничение; а идея на
+    # кампанию, которой в кабинете нет вовсе, — это гарантированная ошибка
+    # «объект не найден» и потраченные баллы чужого кабинета.
+    #
+    # Запуск (Ф14) под это правило не подпадает: его object_id — order_id
+    # наряда, а не кампания кабинета, потому что кампании ещё нет. Ограничитель
+    # прогона всё равно действует, но по другому адресу — по ДОНОРАМ наряда:
+    # именно у них правится трафик, и именно они обязаны быть в scope.
+    def _in_scope(action: Dict[str, Any]) -> bool:
+        if action.get("action_kind") == launch.LAUNCH_KIND:
+            donors = launch.donor_ids(action)
+            return bool(donors) and all(d in scoped_ids for d in donors)
+        return str(action.get("object_id") or "") in scoped_ids
+
+    idea_out_of_scope = [a for a in idea_actions if not _in_scope(a)]
+    idea_actions = [a for a in idea_actions if _in_scope(a)]
+
     if (not desired and not desired_items and not campaign_desired
-            and not budget_desired and not switch_desired):
+            and not budget_desired and not switch_desired
+            and not idea_actions):
         if stale_computed:
             verdict, reason = "STALE_COMPUTED_SETTINGS", stale_computed
         elif not computed and not campaign_computed:
@@ -1514,6 +1836,10 @@ def run_account(
                            "cost_covered": placements_plan["cost_covered"],
                            "refused": 0, "not_found": 0, "actions_planned": 0},
             "unsupported": unsupported,
+            # Секция реестра — и в коротком отчёте тоже, тем же полем: иначе
+            # «идей не было» и «до идей прогон не дошёл» выглядят одинаково.
+            "ideas": _ideas_report(idea_actions, idea_refused,
+                                   idea_out_of_scope),
             "campaign_level": campaign_level_report,
             "confidence": confidence_report,
             # Ни одной кампании не тронуто — и это сказано явно тем же полем,
@@ -1617,8 +1943,16 @@ def run_account(
     negatives_desired = {cid: phrases
                          for cid, phrases in negatives_plan["desired"].items()
                          if cid in scoped_ids}
-    negatives_state = (negatives.fetch_negatives(client, sorted(negatives_desired))
-                       if negatives_desired else {})
+    # Ф14: доноры запусков читаются ТЕМ ЖЕ запросом, что и гигиена. Второй
+    # запрос за теми же списками стоил бы вторых баллов API и, что хуже, дал
+    # бы два разных снимка одного кабинета в одном такте.
+    launch_creates = [a for a in idea_actions
+                      if a.get("action_kind") == launch.LAUNCH_KIND]
+    launch_donor_ids = sorted({donor for create in launch_creates
+                               for donor in launch.donor_ids(create)})
+    negatives_read = sorted(set(negatives_desired) | set(launch_donor_ids))
+    negatives_state = (negatives.fetch_negatives(client, negatives_read)
+                       if negatives_read else {})
     # cut_conversions и baseline_cpa едут вместе с расходом, а не остаются
     # значениями по умолчанию: первое — сколько лидов отсечение теряет
     # (обещание рычага), второе — порог, по которому кандидат и выбран. Без
@@ -1640,6 +1974,29 @@ def run_account(
             continue
         negatives_planned_count += 1
         planned.append({**action, "account": login})
+
+    # Ф14: кросс-минусовка доноров запуска. Строится ЗДЕСЬ, а не в расчётном
+    # такте: она кладётся поверх свежего списка кабинета, а расчёт видел его
+    # сутки назад. Наряд (campaign.create) при этом остаётся в общем плане и
+    # проходит те же рельсы — там его и отклонит allow-лист записи с
+    # названной причиной, а drop_unlaunched ниже снимет осиротевшую минусовку.
+    launch_unread: List[Dict[str, Any]] = []
+    launch_bundled = 0
+    for create in launch_creates:
+        unread = launch.unread_donors(create, negatives_state)
+        if unread:
+            launch_unread.append({"order_id": str(create.get("object_id") or ""),
+                                  "donors": unread})
+            continue
+        for action in launch.build_all(create, negatives_state):
+            if action.get("action_kind") == launch.LAUNCH_KIND:
+                continue
+            ok, reason = check_action(action)
+            if not ok:
+                blocked.append({**action, "blocked_reason": reason})
+                continue
+            launch_bundled += 1
+            planned.append({**action, "account": login})
 
     # Э3.7: применение запретов площадок — как минус-фразы: свежее чтение,
     # объединение с прежним списком, кап такта.
@@ -1681,6 +2038,19 @@ def run_account(
             blocked.append({**action, "blocked_reason": reason})
             continue
         switch_planned_count += 1
+        planned.append({**action, "account": login})
+
+    # Ф12: действия из реестра идей. Сам реестр прочитан выше — ДО раннего
+    # выхода, потому что идея входит в его условие; здесь идеи проходят те же
+    # рельсы, что и любой другой рычаг, и попадают в общий план.
+    for action in idea_actions:
+        # С расходом из витрины: идея вправе принести любой рычаг, в том
+        # числе бюджетный, а бюджетная рельса без независимого расхода
+        # вынуждена верить числу построителя (guardrails._check_budget).
+        ok, reason = check_action(action, cost_28d_by_campaign)
+        if not ok:
+            blocked.append({**action, "blocked_reason": reason})
+            continue
         planned.append({**action, "account": login})
 
     allowed, in_holdout = check_holdout(planned, holdout_ids)
@@ -1788,13 +2158,11 @@ def run_account(
     # и до бюджета очередь не доходила никогда (замер 26.08.2026 — за 30 дней
     # в журнале только bidmodifier.* и schedule.set). Разбор — writer/lanes.py.
     #
-    # Ступени полос приходят конфигом панели: ступень 0 (тень) — решение
-    # человека о конкретной полосе, а не константа кода. Ключа lane_steps в
-    # панели ПОКА НЕТ (его заводит задача 26 плана беты вместе с лестницей
-    # автономии), и до тех пор все полосы стоят на lanes.DEFAULT_STEP. Чтение
-    # оставлено здесь, чтобы появление ключа в панели не требовало правки
-    # прогона: config.resolve роняет вызов на неизвестном ключе, поэтому
-    # мимо этого места настройка не проедет.
+    # Ступени полос приходят ЛЕСТНИЦЕЙ АВТОНОМИИ, посчитанной один раз на
+    # прогон (lane_steps_of): свободу зарабатывает послужной список самой
+    # полосы, а не константа кода и не одна лишь панель. Слово человека
+    # (ключи lane_steps / shadow_lanes панели) лестницу перебивает — из тени
+    # выпускает только он.
     #
     # charged_by_object отдаётся КОПИЕЙ: потолок объекта отбор обязан видеть
     # (по объекту уже могло быть списано на прошлых прогонах недели), но
@@ -1804,19 +2172,58 @@ def run_account(
     # Аргументы отбора вынесены в переменные, потому что ими же считается
     # дефицит полос ниже: разъедься эти два вызова хоть ступенью, и отчёт
     # объяснял бы решение, которого отбор не принимал.
-    lane_steps = (ctx.get("config") or {}).get("lane_steps") or {}
-    lane_weekly_spend = sum(float(v) for v in daily_cost.values()) * DAYS_IN_WEEK
-    lane_risk_budget = weekly_risk_limit(wk, daily_cost, ctx.get("config"))
+    lane_ladder = ctx.get("lane_steps") or lane_steps_of(ctx.get("config"))
+    lane_steps = {lane: int(slot["step"]) for lane, slot in lane_ladder.items()}
+    # Карман полосы — СВОЙ у каждого кабинета, и размер его считается от
+    # расхода этого кабинета. Общий на прогон карман расходовался в порядке
+    # обхода: замер 27.08.2026, полоса тонкой настройки — account10 взял 21
+    # действие из 142 заявленных (14.8 %) и вычерпал карман досуха, а
+    # account1, account3 и account4 получили 0, 2 и 0 при 13, 175 и 5
+    # заявленных. account3 при этом крупнейший кабинет прогона (9,3 млн ₽ за
+    # 28 дней). Это ровно тот дефект «лимит выбирает первое, а не важное»,
+    # ради которого полосы и вводились, — только этажом выше.
+    #
+    # Объём изменений за прогон при этом не растёт, и довод про «сколько
+    # человек способен проверить» остаётся в силе: доли считаются от расхода
+    # кабинетов, а сумма расходов кабинетов и есть расход прогона. Четыре
+    # кармана по своей доле складываются ровно в тот один, что был раньше.
+    run_weekly_spend = sum(float(v) for v in daily_cost.values()) * DAYS_IN_WEEK
+    lane_weekly_spend = sum(float(daily_cost.get(str(cid)) or 0.0)
+                            for cid in campaign_ids) * DAYS_IN_WEEK
+    # Доля кабинета в прогоне — ею же режется и ручной абсолютный потолок
+    # недели (writer_db.risk_limit), который задан на прогон, а не на кабинет.
+    # Расход прогона нулевой (пустая витрина) — делить нечего, и кабинет
+    # получает весь потолок: это тот же случай, в котором weekly_risk_limit
+    # отдаёт абсолютный дефолт вместо нуля.
+    account_share = (lane_weekly_spend / run_weekly_spend
+                     if run_weekly_spend > 0 else 1.0)
+    lane_risk_budget = weekly_risk_limit(wk, daily_cost,
+                                         ctx.get("config")) * account_share
+    lane_budgets = ctx["lane_budgets"].setdefault(login, {})
     lane_taken, lane_refused = lanes.select(
         with_red_line,
         lane_steps,
         weekly_spend_rub=lane_weekly_spend,
         daily_cost_by_campaign=daily_cost,
         config=ctx.get("config"),
-        budgets=ctx["lane_budgets"],
+        budgets=lane_budgets,
         charged_by_object=dict(charged_risk),
         risk_budget_rub=lane_risk_budget,
     )
+    # Ф14: минусовка донора без своего запуска не едет. Сторож стоит ПОСЛЕ
+    # отбора, потому что полосы независимы: запуск и гигиена решаются каждая
+    # по своей ступени, и связка могла разорваться именно здесь — полоса
+    # запуска стоит в тени (lanes.default_step_of), а гигиена работает.
+    lane_taken, launch_orphans = launch.drop_unlaunched(lane_taken)
+    lane_refused += launch_orphans
+    # Тень — не отказ, а вторая судьба действия: полоса на ступени 0 пишет
+    # намерение в журнал и не едет в кабинет. Отвод стоит ЗДЕСЬ, после
+    # сторожа связок запуска: намерение о минусовке донора, чей запуск не
+    # состоялся, — намерение о том, чего агент бы не сделал.
+    shadow_intents = [a for a in lane_refused
+                      if a.get("blocked_reason") == rejects.SHADOW]
+    shadow = record_shadow_intents(
+        shadow_intents, journal_ok=journal_writes_allowed(sandbox, dry_run))
     # Дефицит полосы числами: сколько она заявила рублями, сколько ей позволено
     # и какая доля замыслов доехала. Без этого «отказано 45» не отличает полосу,
     # промахнувшуюся мимо потолка на три процента, от полосы, заявившей
@@ -1890,6 +2297,12 @@ def run_account(
         agent_db.upsert_hypotheses(bets)
 
     report = apply_actions(client, prepared, writer_db, lease=lease)
+
+    # Ф12: идея, чей рычаг доехал до кабинета, уходит в замер. Место —
+    # СРАЗУ за применением и только здесь: раньше исход неизвестен (рельсы
+    # ещё могут снять действие с плана), позже — уже не с чем сверять, а
+    # отчёт прогона обязан показать, сколько идей сдвинулось.
+    marked_ideas = mark_applied_ideas(prepared, report.get("details") or [])
 
     conflict_groups = [
         (reason, [a for a in in_conflict if a.get("conflict_reason") == reason])
@@ -1977,6 +2390,26 @@ def run_account(
             "refused": len(placements_refused),
             "not_found": len(placements_not_found),
             "actions_planned": placements_planned_count,
+        },
+        "ideas": _ideas_report(idea_actions, idea_refused,
+                               idea_out_of_scope, marked_ideas),
+        # Ступени полос печатаются КАЖДЫЙ такт, вместе с происхождением
+        # каждой. Ступень, видимая только в коде, не является решением, о
+        # котором можно спорить: «полоса взяла пять действий» без ступени не
+        # отвечает, мало ей потолка или мало кандидатов.
+        "autonomy": {"steps": lane_ladder},
+        # Намерения полос из тени: сколько записано и по каким полосам. Ноль
+        # печатается тоже — «в тени никого» и «тень молчит» ведут к разным
+        # следующим шагам.
+        "shadow": shadow,
+        # Ф14: связки запуска. Все три числа нулями тоже печатаются: «нарядов
+        # не было», «наряд был, доноров не прочитали» и «минусовка уехала без
+        # запуска» ведут к разным следующим шагам, а один счётчик их сливает.
+        "launch": {
+            "orders": len(launch_creates),
+            "unread_donors": launch_unread,
+            "negatives_planned": launch_bundled,
+            "negatives_dropped": len(launch_orphans),
         },
         "desired": len(desired),
         # Э2.2: скольким кампаниям применялся личный план, а не кабинетный.
@@ -2072,7 +2505,11 @@ def run_account(
             "taken": _count_by(lane_taken, "lane"),
             "refused": _count_by(lane_refused, "blocked_reason"),
             "spent": {lane: {k: round(float(v), 2) for k, v in slot.items()}
-                      for lane, slot in sorted(ctx["lane_budgets"].items())},
+                      for lane, slot in sorted(lane_budgets.items())},
+            # Доля кабинета в кармане прогона: без неё «полоса выбрана до дна»
+            # не отличает крупный кабинет от мелкого, которому и полагалась
+            # десятая часть.
+            "account_share": round(account_share, 4),
             # Дефицит рядом со «взято/отказано/потрачено», а не вместо них:
             # счётчик говорит, СКОЛЬКО не прошло, дефицит — НАСКОЛЬКО не
             # прошло. Отложенных списков у прогона нет, и «не влезло» без
@@ -2305,6 +2742,11 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     charged_risk: Dict[str, float] = writer_db.charged_risk_by_object(wk)
 
     ctx: Dict[str, Any] = {
+        # Ступени полос — ОДИН раз на прогон, а не на кабинет: свободу
+        # зарабатывает полоса на всей своей истории, и считать её заново по
+        # каждому кабинету значило бы выдать четырём кабинетам четыре разные
+        # лестницы из одного и того же журнала.
+        "lane_steps": lane_steps_of(active_config),
         "daily_cost": daily_cost,
         # Активный конфиг едет в контекст целиком: параметры разбираются по
         # месту применения, а не растаскиваются здесь по семи ключам — иначе
@@ -2330,11 +2772,12 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "holdout_ids": holdout_ids,
         "charged_risk": charged_risk,
         "week_start": wk,
-        # Потраченное полосами — на ПРОГОН, а не на кабинет: полоса ограничивает
-        # объём изменений, которые человек способен проверить и осмысленно
-        # откатить, а он не зависит от того, на сколько кабинетов они разложены.
-        # Внутри цикла по четырём кабинетам потолок был бы вчетверо выше
-        # заявленного — тот самый дефект, который чинили у лимита действий.
+        # Потраченное полосами — {кабинет: {полоса: остатки}}. Карман у каждого
+        # кабинета свой, и размер его считается от расхода этого кабинета
+        # (run_account: account_share), поэтому четыре кармана складываются
+        # ровно в тот один, что был бы посчитан на прогон целиком: объём
+        # изменений за прогон не растёт, а порядок обхода перестаёт решать,
+        # кому достанется лимит.
         "lane_budgets": {},
         # Доля недельного риска на этот прогон. Считается ОДИН раз на весь
         # прогон: делить остаток заново на каждом кабинете значило бы выдать
@@ -2431,6 +2874,13 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     saved = blackbox.save_run(
         run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),
         report={"verdict": run_verdict(account_reports),
+                # Ступени полос — в отчёт ПРОГОНА, а не кабинета: свободу
+                # зарабатывает полоса на всей своей истории, одна на все
+                # кабинеты. Без этой строки экран агента (задача 27) видит
+                # «взято/отказано/дефицит» и не видит ступень, с которой шёл
+                # отбор, — то есть не может отличить полосу, зажатую своим
+                # потолком, от полосы, стоящей в тени.
+                "lane_steps": ctx["lane_steps"],
                 "accounts": account_reports, "blind_spend": blind,
                 "window": [cutoff, today], "failed_accounts": failed_accounts},
         rejects=run_rejects)

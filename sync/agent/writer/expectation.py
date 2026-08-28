@@ -47,6 +47,12 @@ budget.set_daily получали его готовым от солвера по
     есть и теряются — их число едет в контексте отдельно. Обещать ноль там,
     где режется конверсионный трафик, значило бы сделать наблюдение заведомо
     провальным.
+  * ГЕОГРАФИЯ — ДВЕ модели на один вид действия, по направлению хода. Сужение
+    считается как отсечение, тем же кодом: убранный регион снимает с кабинета
+    свой поток. Расширение отсечением не является ни в какой части — там
+    расход РАСТЁТ, и растёт он на объёме, снятом с другого объекта: у этой
+    кампании истории по новому региону нет по определению. Одна усреднённая
+    модель на оба направления обещала бы то, чего не делает ни одно из них.
   * ЦЕЛЬ CPA — «дороже лид, больше объём» (и наоборот). Расход следует за
     целью пропорционально, а прирост расхода покупает лиды по НОВОЙ цели:
     цель и есть та цена, которую мы объявили допустимой. Обе стороны берутся
@@ -208,7 +214,11 @@ def _model(action: Dict[str, Any],
     if days is None or days <= 0:
         return None
     kind = str(action.get("action_kind") or "")
-    if kind in ("bidmodifier.add", "bidmodifier.set"):
+    # Корректировка на аудиторию считается той же моделью, что корректировка
+    # сегмента, и это не экономия кода: деньги переносятся ВНУТРИ объекта
+    # ровно так же — из сегмента с другой конверсией в остальной объект, — а
+    # вторая модель того же переноса разошлась бы с первой на первой правке.
+    if kind in ("bidmodifier.add", "bidmodifier.set", "audience.add"):
         return _bid_modifier(action, context, days)
     if kind == "schedule.set":
         return _schedule(action, context, days)
@@ -216,11 +226,49 @@ def _model(action: Dict[str, Any],
         return _budget(action, days)
     if kind == "tcpa.set":
         return _tcpa(action, context, days)
+    # Литерал, а не константа рычага: writer/goal.py сам заявляет отсюда
+    # ожидание, и импорт на уровне модуля замкнул бы кольцо goal → expectation.
+    if kind == "goal.set":
+        return _transferred_cr(context, days, "смена цели")
+    if kind == "strategy.set":
+        return _transferred_cr(context, days, "смена стратегии")
     if kind == "campaign.suspend":
         return _suspend(action, context, days)
     if kind in ("negative.add", "placement.exclude"):
         return _cut(action, context, days)
+    if kind == "geo.set":
+        return _geo(action, context, days)
+    if kind == "negative.remove_added":
+        return _restore(action, context, days)
     return None
+
+
+def _restore(action: Dict[str, Any], context: Dict[str, Any],
+             days: int) -> Optional[Dict[str, Any]]:
+    """Снятие своей минус-фразы — зеркало отсечения, которое оно отменяет.
+
+    Числа приходят контекстом от отменяемого действия, а не считаются заново:
+    вырезанный поток в кабинете больше не измеряется (его же и вырезали), и
+    любая свежая оценка была бы догадкой. Зеркало же проверяемо: замер
+    положит рядом факт и увидит, вернулось ли ровно то, что уходило.
+
+    Знак противоположен отсечению: расход растёт, лиды возвращаются. Ноль
+    лидов — законный случай (отсекали нулевой по конверсиям трафик), и
+    обещание тогда чисто рублёвое.
+    """
+    daily = _number(context.get("restored_daily_rub"))
+    if daily is None or daily <= 0:
+        return None
+    leads_day = _number(context.get("restored_conversions_per_day")) or 0.0
+    removed = (action.get("payload") or {}).get("RemovedPhrases") or []
+    return {
+        "leads_delta": _round(leads_day * days),
+        "rub_delta": _round(daily * days),
+        "basis": (f"возвращается {len(removed)} шт.: +{round(daily)} ₽/дн "
+                  f"расхода и {round(leads_day * days, 2)} лида за {days} дн. "
+                  "по числам отменяемого отсечения"),
+        "measure_days": days,
+    }
 
 
 def _reallocation_leads(moved_rub: float, percent: float, cpa: float) -> float:
@@ -355,6 +403,40 @@ def _tcpa(action: Dict[str, Any], context: Dict[str, Any],
     }
 
 
+def _transferred_cr(context: Dict[str, Any], days: int,
+                    what: str) -> Optional[Dict[str, Any]]:
+    """Перенос конверсии с другого объекта: те же деньги, другая доля заявок.
+
+    Одна модель на два рычага — смену цели и смену стратегии: обещание у них
+    устроено одинаково, и разными были бы только слова в основании.
+
+    Расход не трогается вовсе — ни лимит, ни цель CPA рычаг не двигает, —
+    поэтому рублёвая сторона обещания ровно ноль, а не «неизвестно»: это
+    утверждение, и замер вправе спросить с него.
+
+    Лиды считаются разностью двух конверсий на одном и том же потоке кликов.
+    Обе приходят контекстом от рычага: конверсия новой цели снята с другого
+    объекта (у ЭТОЙ кампании её по построению нет), и это ровно то, что
+    делает действие ставкой, а не измерением (writer/tier.py). Нет любой из
+    двух — обещания нет: курс «клики → лиды» не выдумывается.
+    """
+    clicks = _number(context.get("clicks_per_day"))
+    cr_new = _number(context.get("cr_new"))
+    cr_current = _number(context.get("cr_current"))
+    if None in (clicks, cr_new, cr_current):
+        return None
+    if clicks <= 0 or cr_new <= 0 or cr_current <= 0:
+        return None
+    return {
+        "leads_delta": _round(clicks * days * (cr_new - cr_current)),
+        "rub_delta": 0.0,
+        "basis": (f"{what}: {round(clicks)} кликов/дн те же, конверсия "
+                  f"{round(cr_new * 100, 2)} % против {round(cr_current * 100, 2)} %, "
+                  f"{days} дн. Конверсия новой цели снята с другого объекта"),
+        "measure_days": days,
+    }
+
+
 def _suspend(action: Dict[str, Any], context: Dict[str, Any],
              days: int) -> Optional[Dict[str, Any]]:
     cost = _number(context.get("daily_cost_rub"))
@@ -366,6 +448,79 @@ def _suspend(action: Dict[str, Any], context: Dict[str, Any],
         "rub_delta": _round(-cost * days),
         "basis": (f"выключение: кампания перестаёт тратить {round(cost)} ₽/дн и "
                   f"приносить лиды по {round(cpa)} ₽, {days} дн."),
+        "measure_days": days,
+    }
+
+
+def _geo(action: Dict[str, Any], context: Dict[str, Any],
+         days: int) -> Optional[Dict[str, Any]]:
+    """География: у одного вида действия две модели, по направлению хода.
+
+    Сужение — зеркало отсечения и считается тем же кодом: убранный регион
+    снимает с кабинета свой поток, а лиды на нём известны из тех же кандидатов.
+    Расширение отсечением не является ни в какой части, и общая модель для них
+    была бы усреднением двух разных утверждений.
+
+    Направление читается по спискам самого действия, как и класс
+    достоверности (writer/tier._direction): пометке построителя здесь верить
+    нельзя ровно по тому же доводу — AddedRegionIds и RemovedRegionIds
+    посчитал тот же код, что и сам ход, и его ошибка приехала бы в обещание
+    неотличимой от истины. Списки не читаются — обещания нет: модель выбирать
+    не по чему, а «наугад» здесь означает пообещать рост там, где идёт
+    отсечение.
+    """
+    new_regions = _region_ids((action.get("payload") or {}).get("RegionIds"))
+    old_regions = _region_ids((action.get("previous_state") or {}).get("RegionIds"))
+    if new_regions is None or old_regions is None:
+        return None
+    if old_regions - new_regions:
+        return _cut(action, context, days)
+    if new_regions - old_regions:
+        return _geo_widen(action, context, days)
+    return None
+
+
+def _region_ids(value: Any) -> Optional[frozenset]:
+    """Список регионов множеством. None — читать нечего или нечем."""
+    if not isinstance(value, (list, tuple, set, frozenset)) or not value:
+        return None
+    out = set()
+    for item in value:
+        if isinstance(item, bool):
+            return None
+        number = _number(item)
+        if number is None or number != int(number):
+            return None
+        out.add(int(number))
+    return frozenset(out)
+
+
+def _geo_widen(action: Dict[str, Any], context: Dict[str, Any],
+               days: int) -> Optional[Dict[str, Any]]:
+    """Расширение гео: перенос числа с объекта, у которого регион есть.
+
+    Расход, который новый регион возьмёт, у ЭТОЙ кампании не наблюдался ни
+    дня — она там не показывалась. Число приходит контекстом от рычага и
+    снято с другого объекта; ровно это делает действие ставкой, а не
+    измерением (writer/tier.py), и ровно поэтому оно обязано быть названо в
+    основании — иначе замер судил бы обещание, не зная, откуда оно.
+
+    Цена лида берётся СВОЯ, кампании: конверсия — свойство оффера и
+    посадочной, а не географии, и подставлять сюда чужую значило бы обещать
+    чужой результат. Нет любого из двух чисел — обещания нет: курс «рубли →
+    лиды» не выдумывается.
+    """
+    daily = _number(context.get("added_daily_rub"))
+    cpa = _cpa(context)
+    if daily is None or cpa is None or daily <= 0 or cpa <= 0:
+        return None
+    added = (action.get("payload") or {}).get("AddedRegionIds") or []
+    return {
+        "leads_delta": _round(daily / cpa * days),
+        "rub_delta": _round(daily * days),
+        "basis": (f"расширение гео на {len(added)} шт.: +{round(daily)} ₽/дн "
+                  f"при цене лида {round(cpa)} ₽, {days} дн. Расход региона "
+                  "снят с другого объекта — в этой кампании его не было"),
         "measure_days": days,
     }
 
@@ -393,8 +548,13 @@ def _cut(action: Dict[str, Any], context: Dict[str, Any],
     if cut_daily is None or cut_daily <= 0:
         return None
     lost_leads_day = _number(context.get("cut_conversions_per_day")) or 0.0
-    added = ((action.get("payload") or {}).get("AddedPhrases")
-             or (action.get("payload") or {}).get("AddedSites") or [])
+    payload = action.get("payload") or {}
+    # Штук, которые режутся: фразы, площадки — или регионы, если отсечение
+    # пришло от рычага географии. Список у каждого рычага свой, потому что
+    # своё и содержимое; общего поля «сколько штук» нет намеренно — по нему
+    # нельзя было бы понять, что именно вырезано.
+    added = (payload.get("AddedPhrases") or payload.get("AddedSites")
+             or payload.get("RemovedRegionIds") or [])
     return {
         "leads_delta": _round(-lost_leads_day * days),
         "rub_delta": _round(-cut_daily * days),

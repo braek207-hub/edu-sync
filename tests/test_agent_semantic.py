@@ -201,3 +201,208 @@ def test_a_key_of_only_invisible_characters_counts_as_no_key():
     # Пустой после чистки ключ — это «ключа нет», а не «ключ есть, но
     # сломан»: отчёт обязан сказать про отсутствие, а не молчать вердиктами.
     assert semantic.deepseek_asker(api_key="﻿\n ") is None
+
+
+# ======================================================= паспорт продукта
+# Контекст одной строкой («онлайн-образование…») судит фразы почти в вакууме:
+# по нему «аспирантура дистанционно» неотличима от «высшее дистанционно», хотя
+# первое — другой продукт кабинета. Паспорт (builder/passport.py) знает и кто
+# наш, и кто НЕ наш, и слова-маркеры чужого интента — 43 позиции на замере
+# ВПО-дистанта. Задача 20 плана беты: довезти это до промпта.
+
+PASSPORT = {
+    "what": "Дистанционное высшее образование: подбор вуза и сопровождение "
+            "поступления, обучение из любого города.",
+    "who": "Взрослый 20–40 лет: работает, доучивается заочно.",
+    "not_ours": ["Девятиклассник, который выбирает колледж после школы: ему "
+                 "нужно СПО, эту ступень ведёт соседняя кампания кабинета",
+                 "Человек, которому нужно медицинское образование"],
+    "anti_markers": [{"word": "аспирантура", "reason": "другой продукт"},
+                     {"word": "автошкола", "reason": "другой продукт"},
+                     {"word": "реферат", "reason": "ищут файл, а не обучение"}],
+    "target_markers": ["дистанционно", "заочно", "бакалавриат", "вуз"],
+    "competitors": ["МФЮА", "Росдистант (ТГУ)"],
+}
+
+
+def _phrases():
+    return ["аспирантура дистанционно", "высшее образование заочно"]
+
+
+def test_passport_reaches_the_prompt():
+    # Шаг 1 задачи 20 дословно: паспорт направления доезжает до промпта —
+    # и то, что важнее всего, доезжает целиком: кто НЕ наш и слова-маркеры.
+    prompt = build_prompt(_phrases(), passport=PASSPORT)
+    assert "не подходит" in prompt
+    assert PASSPORT["anti_markers"][0]["word"] in prompt
+    assert "Девятиклассник" in prompt
+    assert "дистанционно" in prompt
+
+
+def test_a_missing_passport_falls_back_to_the_general_description():
+    # Шаг 2: паспорта нет — работаем на общем описании проекта, а не падаем.
+    # Паспорт есть не у всех направлений (их десять, а уровней у билдера
+    # семь), и отсутствие обязано быть рабочим состоянием, а не аварией.
+    prompt = build_prompt(_phrases())
+    assert semantic.DEFAULT_CONTEXT in prompt
+    assert "аспирантура дистанционно" in prompt
+
+
+def test_the_passport_does_not_replace_the_verdict_rules():
+    # Паспорт добавляет знание о продукте, но правило слоя прежнее: сомнение
+    # → unclear. Потеряй промпт эту строку — модель начала бы гадать, а её
+    # догадка в позиции «junk» режет живой трафик.
+    prompt = build_prompt(_phrases(), passport=PASSPORT)
+    assert "unclear" in prompt and "Сомневаешься" in prompt
+
+
+# ----------------------------------------------------- кэш и порядок частей
+
+
+def _tail_free(prompt):
+    """Всё до списка фраз: та часть, которая обязана быть одинаковой."""
+    return prompt.split(semantic.PHRASES_MARKER, 1)[0]
+
+
+def test_the_variable_part_of_the_prompt_is_the_tail():
+    # Шаг 3. Кэш DeepSeek считает совпадающий ПРЕФИКС; при 40 фразах в батче
+    # и десятках батчей за прогон это разница между 98 % попаданий и нулём.
+    # Значит всё стабильное (роль, паспорт, правила, формат ответа) стоит до
+    # списка фраз, а меняется только хвост.
+    first = build_prompt(["первая фраза"], passport=PASSPORT)
+    second = build_prompt(["вторая фраза", "третья фраза"], passport=PASSPORT)
+
+    assert _tail_free(first) == _tail_free(second)
+    assert first.index("первая фраза") > first.index("аспирантура")
+
+
+def test_the_answer_format_is_stated_before_the_phrases():
+    # Формат ответа — самая стабильная часть промпта и раньше стояла ПОСЛЕ
+    # списка фраз: любой новый батч сдвигал её и обнулял кэш.
+    prompt = build_prompt(_phrases(), passport=PASSPORT)
+    assert prompt.index("verdicts") < prompt.index(semantic.PHRASES_MARKER)
+
+
+def test_a_big_passport_does_not_blow_up_the_prompt():
+    # Паспорт целиком — 27 КБ; в промпт едет проекция. Без предела длинный
+    # паспорт вытеснил бы фразы за окно модели, и батч вернулся бы пустым.
+    big = dict(PASSPORT, anti_markers=[{"word": f"слово{i}", "reason": "мусор"}
+                                       for i in range(200)],
+               not_ours=[f"не наш номер {i} " * 20 for i in range(50)])
+    prompt = build_prompt(_phrases(), passport=big)
+    assert len(prompt) < semantic.PASSPORT_BUDGET * 2
+
+
+# ------------------------------------------------ доставка паспорта в слой
+
+
+def test_classify_carries_the_passport_into_every_batch():
+    seen = []
+
+    def _spy(prompt):
+        seen.append(prompt)
+        return "{}"
+
+    classify(_phrases(), ask=_spy, context="онлайн-образование",
+             passport=PASSPORT, batch_size=1)
+    assert len(seen) == 2
+    assert all("аспирантура" in p for p in seen)
+
+
+def test_an_unknown_direction_has_no_passport():
+    assert semantic.load_passport("направления-нет") is None
+
+
+def test_the_passport_of_a_direction_is_read_from_disk(tmp_path, monkeypatch):
+    (tmp_path / "vpo.json").write_text(json.dumps(PASSPORT, ensure_ascii=False),
+                                       encoding="utf-8")
+    monkeypatch.setattr(semantic, "PASSPORTS_DIR", tmp_path)
+    assert semantic.load_passport("vpo")["what"] == PASSPORT["what"]
+
+
+# --------------------------------------------- какой паспорт какой фразе
+
+
+def _candidate(query, campaigns):
+    return {"query": query, "campaigns": set(campaigns)}
+
+
+def test_phrases_are_grouped_by_the_direction_of_their_campaigns():
+    groups = semantic.group_by_direction(
+        [_candidate("высшее заочно", ["1"]), _candidate("колледж заочно", ["2"])],
+        {"1": "vpo", "2": "spo"})
+    assert groups["vpo"] == ["высшее заочно"]
+    assert groups["spo"] == ["колледж заочно"]
+
+
+def test_a_phrase_spanning_directions_gets_no_passport():
+    # «Дистанционно» стоит и в ВПО, и в СПО. Паспорта этих направлений
+    # противоречат друг другу ровно там, где это опаснее всего: «после 9
+    # класса» у ВПО — анти-маркер, у СПО — целевой маркер. Взять любой из
+    # двух значило бы судить фразу паспортом чужого продукта.
+    groups = semantic.group_by_direction(
+        [_candidate("учиться дистанционно", ["1", "2"])],
+        {"1": "vpo", "2": "spo"})
+    assert groups[""] == ["учиться дистанционно"]
+
+
+def test_a_phrase_of_an_unknown_campaign_gets_no_passport():
+    groups = semantic.group_by_direction([_candidate("что-то", ["999"])], {})
+    assert groups[""] == ["что-то"]
+
+
+# ------------------------------------ разметка кандидатов паспортами разом
+
+
+def test_candidates_are_classified_with_the_passport_of_their_direction():
+    seen = {}
+
+    def _spy(prompt):
+        # Ключ — фраза из хвоста промпта: по ней видно, с каким паспортом
+        # уехал каждый батч.
+        tail = prompt.split(semantic.PHRASES_MARKER, 1)[1]
+        seen[tail.strip()] = prompt
+        return "{}"
+
+    verdicts, stats = semantic.classify_by_direction(
+        [_candidate("высшее заочно", ["1"]), _candidate("колледж заочно", ["2"])],
+        ask=_spy, direction_by_campaign={"1": "vpo", "2": "spo"},
+        load=lambda d: PASSPORT if d == "vpo" else None)
+
+    assert "аспирантура" in seen["- высшее заочно"]
+    assert "аспирантура" not in seen["- колледж заочно"]
+    assert stats["with_passport"] == 1 and stats["without_passport"] == 1
+    assert set(verdicts) == {"высшее заочно", "колледж заочно"}
+
+
+def test_the_report_names_which_directions_had_a_passport():
+    # Паспорт есть не у всех направлений, и это влияет на разметку. Молчание
+    # тут неотличимо от «паспорта не понадобились».
+    _, stats = semantic.classify_by_direction(
+        [_candidate("высшее заочно", ["1"])], ask=lambda p: "{}",
+        direction_by_campaign={"1": "vpo"}, load=lambda d: PASSPORT)
+    assert stats["directions"] == {"vpo": 1}
+    assert stats["passports"] == ["vpo"]
+
+
+def test_the_passport_block_keeps_its_line_breaks():
+    # Усечение по общему пределу не имеет права схлопывать переносы: слипшись
+    # в один абзац, разделы теряют границы, и «кому не подходит» читается как
+    # продолжение описания продукта.
+    block = semantic.passport_block(PASSPORT)
+    assert "\nКому наш продукт не подходит:" in block
+    assert block.count("\n  - ") == len(PASSPORT["not_ours"])
+
+
+def test_the_shipped_passport_is_in_the_checkout():
+    """Паспорт «Школы» должен доезжать до прогона, а прогон идёт в Actions.
+
+    Проверка не декоративная: в .gitignore репозитория стоит правило на все
+    файлы .json, и паспорт по умолчанию не коммитится вовсе. Локально при этом
+    всё зелено — файл лежит на диске. Тест падает именно там, где дефект и
+    проявляется: на чекауте, где есть только версионированное.
+    """
+    passport = semantic.load_passport("school")
+    assert passport is not None, (
+        "sync/agent/passports/school.json не в чекауте — проверь .gitignore")
+    assert semantic.passport_block(passport)

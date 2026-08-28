@@ -40,6 +40,11 @@ sync/agent/learning_loop.py — обучение на СВОИХ закрыты�
 import statistics
 from typing import Any, Dict, List, Optional
 
+# Длина свежего окна — у ПОТРЕБИТЕЛЯ (лестница автономии): это её правило
+# «падение мгновенное, подъём медленный», и число обязано быть одно на оба
+# конца. Импорт безопасен: autonomy ничего не импортирует из расчётного слоя.
+from sync.agent.autonomy import RECENT_WINDOW
+
 # Сила приора усадки смещения: при n наблюдениях вес факта n/(n+BIAS_PRIOR_N).
 # Десять — примерно такт-два боевой работы движка записи: до этого поправку
 # применять рано, и усадка держит множитель около единицы сама собой.
@@ -101,9 +106,25 @@ def _rate(hits: int, closed: int) -> Optional[float]:
     return round(hits / closed, 4) if closed else None
 
 
-def track_record(actions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Доля попаданий по видам действий среди ЗАКРЫТЫХ наблюдений."""
+def track_record(actions: List[Dict[str, Any]],
+                 recent_window: int = RECENT_WINDOW) -> Dict[str, Dict[str, Any]]:
+    """Доля попаданий по видам действий среди ЗАКРЫТЫХ наблюдений.
+
+    Кроме накопленных счётчиков считается СВЕЖЕЕ окно — последние
+    recent_window закрытых наблюдений вида (recent_closed / recent_improved).
+    Накопленная доля падает медленно: у рычага с сотней наблюдений две плохие
+    недели не сдвинут её и на процент, а лестница обязана уронить ступень В
+    ТОМ ЖЕ ТАКТЕ, что и провал. Разделять эти два счёта — не удобство отчёта:
+    на одном числе «упал только что» и «был плох всегда» неразличимы.
+
+    «Последние» — по порядку строк на входе, а он задан выборкой журнала
+    (writer/db.CLOSED_ACTIONS_SQL: ORDER BY applied_at). Сортировать здесь
+    заново нечем: у строки, пришедшей не из журнала, отметки времени может
+    не быть вовсе, и молчаливая пересортировка по отсутствующему полю
+    перемешала бы окно, вместо того чтобы упасть.
+    """
     out: Dict[str, Dict[str, Any]] = {}
+    verdicts: Dict[str, List[str]] = {}
     for action in actions:
         verdict = _verdict(action)
         if verdict not in CLOSED_VERDICTS:
@@ -116,6 +137,7 @@ def track_record(actions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         })
         slot["closed"] += 1
         slot[verdict] += 1
+        verdicts.setdefault(kind, []).append(verdict)
         direction = _direction(action)
         if direction is not None:
             slot[f"closed_{direction}"] += 1
@@ -127,7 +149,10 @@ def track_record(actions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         elif verdict == SUCCESS and money == FAILURE:
             slot["money_contradicted"] += 1
 
-    for slot in out.values():
+    for kind, slot in out.items():
+        window = verdicts.get(kind, [])[-int(recent_window):] if recent_window > 0 else []
+        slot["recent_closed"] = len(window)
+        slot["recent_improved"] = sum(1 for v in window if v == SUCCESS)
         slot["hit_rate"] = _rate(slot[SUCCESS], slot["closed"]) or 0.0
         # Раздельно — и без общего знаменателя: доливка и срезание отвечают
         # на разные обещания, и складывать их попадания в одну дробь значит

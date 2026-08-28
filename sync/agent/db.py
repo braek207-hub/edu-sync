@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 
 import psycopg2.extras
 
-from sync.db import get_connection
+from sync.db import enable_rls_for_ddl, get_connection
 
 
 def normalize_login(value: Any) -> str:
@@ -305,6 +305,107 @@ AGENT_DDL: List[str] = [
       PRIMARY KEY (calc_date, campaign_id)
     )
     """,
+    # РЕЕСТР ИДЕЙ (sync/agent/ideas/registry.py). Идея жила внутри такта и
+    # умирала вместе с ним: генератор детерминирован, назавтра он находит ровно
+    # то же самое — и человек читает тот же список второй раз, третий, десятый.
+    # Реестр даёт идее срок жизни, историю и приоритет.
+    #
+    # Три колонки сверх схемы плана, и все три — про одно и то же «нет»:
+    #
+    #   subject_key — отпечаток ОБЪЕКТА идеи (registry.subject_key), без
+    #                 источника. Отклонение человеком ищется по нему, а не по
+    #                 idea_id: идентификатор строки выведен из пары
+    #                 (source, subject), и та же связка, найденная завтра
+    #                 другим генератором, приехала бы под новым id и обошла
+    #                 запрет. Отдельной таблицы отказов нет намеренно —
+    #                 второе хранилище того же факта разъезжается с первым.
+    #   rejected_by — КТО отклонил. Это и есть машинный признак «сказал
+    #                 человек»: разбирать префикс dropped_reason (свободный
+    #                 текст для отчёта) значило бы держать правило в строке,
+    #                 которую однажды перепишут ради формулировки.
+    #   rejected_at — когда. Нужен на разборе: отказ полугодовой давности —
+    #                 повод спросить человека заново, свежий — нет.
+    """
+    CREATE TABLE IF NOT EXISTS edu_agent_ideas (
+      idea_id        TEXT PRIMARY KEY,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      source         TEXT NOT NULL,
+      account        TEXT NOT NULL,
+      subject        JSONB NOT NULL,
+      subject_key    TEXT NOT NULL,
+      tier           SMALLINT NOT NULL,
+      lane           TEXT NOT NULL,
+      expected_rub   DOUBLE PRECISION,
+      test_cost_rub  DOUBLE PRECISION,
+      horizon_days   SMALLINT NOT NULL,
+      success_rule   JSONB NOT NULL,
+      status         TEXT NOT NULL DEFAULT 'new',
+      action_id      TEXT,
+      experiment_id  TEXT,
+      dropped_reason TEXT,
+      rejected_by    TEXT,
+      rejected_at    TIMESTAMPTZ
+    )
+    """,
+    # Полезная нагрузка рычага. Отдельным оператором, а не строкой в теле
+    # CREATE TABLE выше: таблица уже создана в бою, и правка тела её не
+    # догонит — CREATE TABLE IF NOT EXISTS промолчит, а первый же прогон
+    # упадёт на неизвестной колонке (тот же приём, что у поздних колонок
+    # edu_agent_experiments и edu_agent_computed_settings).
+    #
+    # Зачем колонка вообще. Расчётный такт (agent_e0) и такт записи
+    # (agent_e1) — РАЗНЫЕ прогоны: первый заводит идею, второй читает её из
+    # базы (registry.open_ideas). Всё, чего нет в колонке, для такта записи
+    # не существует — и до этой правки нагрузка терялась на проекции идеи
+    # на COLUMNS, а каждая идея получала назавтра отказ «применять нечем».
+    #
+    # NULL здесь законен и означает «рычага нет»: у предложения (класс 3)
+    # его не бывает по определению, и требовать с него нагрузку значило бы
+    # не пускать в реестр ровно те идеи, ради экрана которых он и заведён.
+    """
+    ALTER TABLE edu_agent_ideas
+      ADD COLUMN IF NOT EXISTS action JSONB
+    """,
+    # Доказательства идеи: чем генератор её обосновал — список связок-доноров,
+    # план кросс-минусовки, замеренные числа. Отдельно от subject, и это
+    # принципиально: subject — АДРЕС, из него выведен idea_id, и любое число
+    # внутри заводило бы идею заново каждым прогоном, а вместе с ней теряло
+    # бы отказ человека (он помнится по отпечатку subject).
+    #
+    # Доказательства, наоборот, обязаны обновляться каждым прогоном: состав
+    # связок-доноров плавает, и заморозь его — экран показывал бы человеку
+    # обоснование недельной давности. Поэтому detail входит в GENERATOR_FIELDS,
+    # но не входит в идентичность.
+    #
+    # Отдельным ALTER, а не правкой CREATE TABLE выше: таблица заведена в бою
+    # 27.08, и новая колонка в теле CREATE появилась бы только на чистой базе.
+    """
+    ALTER TABLE edu_agent_ideas
+      ADD COLUMN IF NOT EXISTS detail JSONB
+    """,
+    # Кто из людей взял идею в работу и когда (registry.take_into_work).
+    # Отдельно от rejected_by, потому что это противоположное решение, и
+    # отдельно от статуса, потому что queued ставит и такт записи: без имени
+    # взятая человеком идея неотличима от идеи, поставленной в очередь
+    # машиной, — а ждать их исполнения надо от разных исполнителей.
+    """
+    ALTER TABLE edu_agent_ideas
+      ADD COLUMN IF NOT EXISTS queued_by TEXT
+    """,
+    """
+    ALTER TABLE edu_agent_ideas
+      ADD COLUMN IF NOT EXISTS queued_at TIMESTAMPTZ
+    """,
+    # Отклонения человеком читаются КАЖДЫМ прогоном генераторов и на каждую
+    # порцию идей, а копятся без предела — частичный индекс держит выборку
+    # размером с список запретов, а не с историей реестра (тот же довод, что у
+    # индекса открытых ставок выше).
+    """
+    CREATE INDEX IF NOT EXISTS edu_agent_ideas_rejected_idx
+      ON edu_agent_ideas (subject_key)
+      WHERE rejected_by IS NOT NULL
+    """,
 ]
 
 
@@ -313,6 +414,7 @@ def ensure_agent_tables() -> None:
         with conn.cursor() as cur:
             for statement in AGENT_DDL:
                 cur.execute(statement)
+            enable_rls_for_ddl(cur, AGENT_DDL)
         conn.commit()
 
 
@@ -707,6 +809,23 @@ def mart_cost_total(date_from: str, date_to: str) -> float:
     return float(rows[0]["total"] or 0.0) if rows else 0.0
 
 
+def mart_last_fact_date(date_from: str, date_to: str) -> Optional[str]:
+    """Последний день, который уже лежит в витрине фактов внутри окна.
+
+    Нужен сверке сумм: витрина отстаёт от источника на прогон по построению —
+    свежие дни источник отдаёт сразу, а в витрину они попадут только текущим
+    прогоном. Сравнивать полное окно источника с недописанной витриной значит
+    мерить лаг, а не сохранность данных.
+    """
+    rows = _fetch_dicts(
+        "SELECT MAX(fact_date) AS last FROM edu_agent_facts "
+        "WHERE fact_date BETWEEN %s AND %s",
+        (date_from, date_to),
+    )
+    last = rows[0]["last"] if rows else None
+    return str(last) if last else None
+
+
 # Доля типичного дня, ниже которой день CRM считается недобравшим. Тот же
 # приём, что у ширины витрины в gate.py: эталон — медиана окна, устойчивая
 # к единичному битому дню.
@@ -770,6 +889,7 @@ def load_agent_config() -> Dict[str, Any]:
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(AGENT_CONFIG_DDL)
+            enable_rls_for_ddl(cur, AGENT_CONFIG_DDL)
         conn.commit()
     rows = _fetch_dicts("SELECT key, value, preset FROM edu_agent_config")
     preset = None
@@ -1374,3 +1494,47 @@ def table_sizes() -> List[Dict[str, Any]]:
         ORDER BY pg_total_relation_size(c.oid) DESC
         """
     )
+
+
+AGENT_MANIFEST_DDL = """
+    CREATE TABLE IF NOT EXISTS edu_agent_manifest (
+        id             TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        generated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        payload        JSONB NOT NULL
+    )
+"""
+
+# Строка одна и всегда с этим ключом: манифест описывает КОД, который сейчас
+# работает, а не событие. История его версий — это история репозитория, и
+# копить её второй раз в базе значит заводить второй источник правды о том,
+# каким агент был во вторник.
+MANIFEST_ROW_ID = "current"
+
+
+def save_manifest(payload: Dict[str, Any]) -> None:
+    """Кладёт манифест устройства агента (sync/agent/manifest.build) в базу.
+
+    Пишет ПРОГОН, а не интерфейс: манифест собран из констант самого прогона,
+    и выгрузить его может только тот, кто эти константы импортировал. Экран
+    Panda-BI читает результат и своего списка полос/ключей не держит.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(AGENT_MANIFEST_DDL)
+            enable_rls_for_ddl(cur, AGENT_MANIFEST_DDL)
+            cur.execute(
+                """
+                INSERT INTO edu_agent_manifest (id, schema_version, generated_at, payload)
+                VALUES (%(id)s, %(schema_version)s, now(), %(payload)s)
+                ON CONFLICT (id) DO UPDATE
+                   SET schema_version = EXCLUDED.schema_version,
+                       generated_at   = EXCLUDED.generated_at,
+                       payload        = EXCLUDED.payload
+                """,
+                {"id": MANIFEST_ROW_ID,
+                 "schema_version": int(payload.get("schema_version") or 0),
+                 "payload": json.dumps(payload, ensure_ascii=False)},
+            )
+        conn.commit()
+

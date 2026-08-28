@@ -92,6 +92,16 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
                                        "checks": []})
     monkeypatch.setattr(agent_e1.writer_db, "recent_action_objects",
                         lambda *a, **k: set())
+    # Послужной список полос: прогон читает его первым делом, чтобы выдать
+    # каждой полосе ступень (lane_steps_of). Пусто = ни одного закрытого
+    # наблюдения, то есть все полосы на своём полу — поведение, на которое
+    # написаны остальные проверки набора.
+    monkeypatch.setattr(agent_e1.writer_db, "closed_actions", lambda *a, **k: [])
+    # Реестр идей (Ф12): такт записи спрашивает его по каждому кабинету. Без
+    # подмены прогон уходит в реальную базу и печатает ретраи коннекта в тот
+    # же stdout, который тесты разбирают как JSON. Пусто = реестр без
+    # открытых идей, штатное состояние кабинета до Ф13.
+    monkeypatch.setattr(agent_e1.ideas_registry, "open_ideas", lambda *a, **k: [])
     # История перезапусков обучения по кампаниям (кулдаун обучения). По
     # умолчанию пустая: кабинет, где стратегии никто не сбивал.
     monkeypatch.setattr(agent_e1.writer_db, "last_learning_reset",
@@ -671,8 +681,13 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
     monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: list(stale))
     monkeypatch.setattr(agent_e1.writer_db, "find_action_by_key", lambda *_: None)
     rows = journal if journal is not None else []
-    monkeypatch.setattr(agent_e1.writer_db, "insert_action",
-                        lambda row: (rows.append(row), row["idempotency_key"])[1])
+    # Двойник журнала знает про статус: заведение строки и заведение НАМЕРЕНИЯ
+    # (полоса в тени) — один и тот же вызов с разным статусом, и двойник,
+    # который его теряет, показывал бы намерение как обычное планирование.
+    monkeypatch.setattr(
+        agent_e1.writer_db, "insert_action",
+        lambda row, status=agent_e1.writer_db.PLANNED_STATUS:
+            (rows.append({**row, "status": status}), row["idempotency_key"])[1])
     monkeypatch.setattr(agent_e1.writer_db, "mark_action", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1.writer_db, "mark_unknown_outcome", lambda *a, **k: True)
     monkeypatch.setattr(agent_e1, "WriteClient", _MultiCabinetClient)
@@ -1164,8 +1179,8 @@ def test_second_run_does_not_repeat_the_same_stuck_row(monkeypatch, capsys):
 
 
 def _bidmod_key(campaign_id, direct_type, key, percent):
-    from sync.agent.writer.diff import _idempotency_key
-    return _idempotency_key(campaign_id, direct_type, key, percent)
+    from sync.agent.writer.diff import bidmod_idempotency_key
+    return bidmod_idempotency_key(campaign_id, direct_type, key, percent)
 
 
 def test_cooldown_key_ignores_percent_drift():
@@ -2482,6 +2497,34 @@ def test_balance_gate_stands_after_the_other_gates_and_before_the_lanes():
             < source.index("lanes.select("))
 
 
+def test_lane_pocket_is_sized_by_the_account_not_by_the_run():
+    """Уберите этот тест — и карман полосы снова достанется первому кабинету
+    по порядку обхода, а не важнейшему.
+
+    Замер 27.08.2026, полоса тонкой настройки: account10 взял 21 действие из
+    142 и вычерпал общий карман, account1/account3/account4 получили 0/2/0 при
+    13/175/5 заявленных. account3 при этом крупнейший кабинет прогона — 9,3
+    млн ₽ за 28 дней. Ровно тот дефект «лимит выбирает первое, а не важное»,
+    ради которого полосы и вводились.
+
+    Две половины одной починки, и обе обязаны стоять вместе: своя тетрадь
+    остатков на кабинет И недельный расход ЭТОГО кабинета. Общая тетрадь с
+    личным расходом раздала бы лимит по-прежнему по порядку; личная тетрадь с
+    расходом прогона подняла бы потолок вчетверо.
+    """
+    import inspect
+
+    source = inspect.getsource(agent_e1.run_account)
+    # Расход полосы считается по кампаниям кабинета, а не по всему справочнику.
+    assert "for cid in campaign_ids) * DAYS_IN_WEEK" in source
+    # Тетрадь остатков — своя на кабинет.
+    assert 'ctx["lane_budgets"].setdefault(login, {})' in source
+    assert "budgets=lane_budgets," in source
+    assert 'budgets=ctx["lane_budgets"]' not in source
+    # Ручной абсолютный потолок недели задан на прогон и режется той же долей.
+    assert "* account_share" in source
+
+
 def test_rails_order_uses_lanes():
     """Уберите этот тест — и полосы вернутся на место лимита прогона, а вместе
     с ним вернётся списание риска за действия, которые в кабинет не поедут.
@@ -2885,6 +2928,33 @@ def test_shortfall_travels_to_the_blackbox(monkeypatch, capsys):
     # одно бесконечное поле стоило бы всей истории прогона.
     text = json.dumps(saved["report"], ensure_ascii=False, default=str)
     assert "Infinity" not in text and "NaN" not in text
+
+
+def test_the_lane_steps_reach_the_saved_report(monkeypatch, capsys):
+    # Ступень — то, чем объясняется дефицит полосы. Экран агента читает
+    # сохранённый отчёт прогона, и без этой строки он показывал бы «заявлено
+    # 168 000 при потолке 50 000», не отличая полосу, зажатую своей ступенью,
+    # от полосы, стоящей в тени: у обеих отказано всё, а лечатся они
+    # противоположным — первой поднимают ступень, вторую выпускает человек.
+    saved = {}
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
+        campaigns_by_login={"acc-1": [101]},
+        daily_cost={"101": 2000.0},
+    )
+    monkeypatch.setattr(agent_e1.blackbox, "save_run",
+                        lambda *a, **k: saved.update(k) or {
+                            "run_id": "test", "saved": True, "rejects": 0,
+                            "error": None})
+
+    assert agent_e1.main() == 0
+
+    steps = saved["report"]["lane_steps"]
+    assert set(steps) == set(agent_e1.lanes.ALL_LANES)
+    # Ступень и её происхождение — оба: число без источника не отвечает, кто
+    # его поставил (человек панелью, лестница послужным списком или пол).
+    assert steps["tuning"]["step"] >= 0 and steps["tuning"]["source"]
 
 
 def test_lane_shows_what_the_run_budget_cut_after_the_lane_let_it_through(

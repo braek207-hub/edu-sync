@@ -122,7 +122,10 @@ _RESULT_COLLECTION = {"add": "AddResults", "set": "SetResults",
 # сложить в один запрос. Перечень закрытый и по форме тела, а не по сервису:
 # у campaigns.suspend тело — SelectionCriteria с массивом Id, то есть другая
 # форма, и класть её в общий механизм значит склеивать разные семантики.
-# Такое действие едет одно, как и раньше.
+# Такое действие едет одно, как и раньше. По той же причине здесь нет и
+# adgroups.update: одно действие географии несёт СТОЛЬКО элементов, сколько у
+# кампании групп, — механизм батча ждёт ровно один и слепил бы чужие группы
+# с нашими в общий ответ, позиции которого потом не разобрать.
 _BATCH_COLLECTION = {("bidmodifiers", "set"): "BidModifiers",
                      ("bidmodifiers", "add"): "BidModifiers",
                      ("campaigns", "update"): "Campaigns"}
@@ -182,6 +185,23 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
             raise ValueError(f"неизвестный тип корректировки: {direct_type}")
         return "bidmodifiers", "add", {"BidModifiers": [item]}
 
+    if kind == "audience.add":
+        # Корректировка на условие ретаргетинга — то же семейство
+        # bidmodifiers.add, что у устройств и демографии, со своим блоком.
+        # Форма подтверждена дважды: её читает из кабинета
+        # sync/edu_direct_settings.py (:886, :927), и её принял на запись
+        # probe_retargeting_lever.py 26.08.2026 — отказ 8800 «объект не
+        # найден» пришёл уровнем ЭЛЕМЕНТА, то есть тело разобрано.
+        return "bidmodifiers", "add", {
+            "BidModifiers": [{
+                "CampaignId": int(payload["CampaignId"]),
+                "RetargetingAdjustments": [{
+                    "RetargetingConditionId": int(payload["key"]),
+                    "BidModifier": delta_to_api(payload["BidModifier"]),
+                }],
+            }]
+        }
+
     if kind == "budget.set":
         # Блок BiddingStrategy собран планом (writer/budget.py) из
         # ПРОЧИТАННОГО состояния с заменой одного лишь WeeklySpendLimit:
@@ -203,6 +223,26 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
                                "BiddingStrategy": payload["BiddingStrategy"]}}]
         }
 
+    if kind == "goal.set":
+        # Цель оптимизации живёт внутри BiddingStrategy, и блок собран планом
+        # (writer/goal.py) из ПРОЧИТАННОГО состояния с заменой одного лишь
+        # носителя цели: структура в API заменяется целиком.
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(payload["CampaignId"]),
+                           "TextCampaign": {
+                               "BiddingStrategy": payload["BiddingStrategy"]}}]
+        }
+
+    if kind == "strategy.set":
+        # Стратегия целиком: блок собран планом (writer/strategy.py) из
+        # ПРОЧИТАННОГО состояния с заменой канала поиска — вместе с типом
+        # уходит подблок прежней стратегии, иначе тело противоречиво.
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(payload["CampaignId"]),
+                           "TextCampaign": {
+                               "BiddingStrategy": payload["BiddingStrategy"]}}]
+        }
+
     if kind == "placement.exclude":
         # Список запрещённых площадок в API заменяется целиком; объединение
         # прежних и новых собрал план (writer/placements.py).
@@ -211,9 +251,32 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
                            "ExcludedSites": payload["ExcludedSites"]}]
         }
 
+    if kind == "geo.set":
+        # Регионы живут в ГРУППАХ: RegionIds — поле adgroups (читатель
+        # кабинета edu_direct_settings._fetch_adgroups_by_campaign), а у
+        # campaigns такого поля нет ни в чтении, ни в записи. Список
+        # заменяется целиком, и полный новый список собрал план
+        # (writer/geo.py) из прочитанного состояния; кампания едет в теле
+        # только через свои группы — единственный адрес, который есть у этой
+        # настройки в API.
+        return "adgroups", "update", {
+            "AdGroups": [{"Id": int(group_id),
+                          "RegionIds": [int(r) for r in payload["RegionIds"]]}
+                         for group_id in payload["AdGroupIds"]]
+        }
+
     if kind == "negative.add":
         # Список минус-фраз в API заменяется ЦЕЛИКОМ, и план (writer/negatives)
         # уже собрал объединение прежних и новых: здесь только упаковка.
+        return "campaigns", "update", {
+            "Campaigns": [{"Id": int(payload["CampaignId"]),
+                           "NegativeKeywords": payload["NegativeKeywords"]}]
+        }
+
+    if kind == "negative.remove_added":
+        # Тот же campaigns.update, что и у добавления: список в API
+        # заменяется ЦЕЛИКОМ, и разница между «добавить» и «снять» существует
+        # только в том, какой список собрал план (writer/negatives).
         return "campaigns", "update", {
             "Campaigns": [{"Id": int(payload["CampaignId"]),
                            "NegativeKeywords": payload["NegativeKeywords"]}]

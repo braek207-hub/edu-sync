@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import psycopg2.extras
 
-from sync.db import get_connection
+from sync.db import enable_rls_for_ddl, get_connection
 from sync.agent.writer.risk import DEFAULT_DAYS_TO_MEASURE
 
 WRITER_DDL: List[str] = [
@@ -293,6 +293,27 @@ RISK_CHARGED_STATUSES = LIVE_STATUSES + ("rolled_back",)
 #   failed   — запрос точно не ушёл (ошибка сборки тела, отказ уровня запроса).
 REATTEMPTED_STATUSES = ("rejected", "failed")
 
+# Статус НАМЕРЕНИЯ: полоса стоит на ступени 0 (тень), и агент записал
+# «сделал бы X, жду Y к дате D», никуда не поехав. Строка нужна ровно затем,
+# чтобы через горизонт сверить заявленное с тем, что случилось с объектом БЕЗ
+# вмешательства, — это и есть материал, по которому человек решает выпускать
+# рычаг из тени (autonomy.py, правило 1).
+#
+# Статус не входит НИ В ОДИН из кортежей выше, и это утверждение, а не
+# умолчание:
+#   не финальный — ключ не закрыт, и полоса, выпущенная из тени завтра,
+#                  спланирует то же действие заново (INSERT_ACTION_SQL
+#                  перепишет эту же строку в 'planned');
+#   не живой     — в кабинете ничего не изменилось, наблюдать и откатывать
+#                  нечего;
+#   не платящий  — риск-бюджет платят за экспозицию, а её не было;
+#   не отказной  — повторной отправки нет, потому что не было первой.
+SHADOW_STATUS = "shadow"
+
+# Статус строки до отправки. Литералом он стоял внутри INSERT_ACTION_SQL —
+# ровно до тех пор, пока статус у заведения был один.
+PLANNED_STATUS = "planned"
+
 # Сколько прогонов подряд один СЕГМЕНТ вправе получать отказ, прежде чем
 # движок перестанет его переотправлять. Столько же, сколько у отката
 # (MAX_ROLLBACK_ATTEMPTS), и по той же причине: разовый сбой стоит повторить,
@@ -318,6 +339,7 @@ def ensure_writer_tables() -> None:
         with conn.cursor() as cur:
             for statement in WRITER_DDL:
                 cur.execute(statement)
+            enable_rls_for_ddl(cur, WRITER_DDL)
         conn.commit()
 
 
@@ -363,7 +385,7 @@ INSERT_ACTION_SQL = """
         %(action_id)s, %(idempotency_key)s, %(account)s, %(object_level)s,
         %(object_id)s, %(action_kind)s, %(direct_type)s, %(setting_key)s,
         %(payload)s, %(previous_state)s, %(red_line)s, %(risk_rub)s,
-        %(baseline_daily_rub)s, %(risk_basis)s, %(learning_impact)s, 'planned'
+        %(baseline_daily_rub)s, %(risk_basis)s, %(learning_impact)s, %(status)s
     )
     ON CONFLICT (idempotency_key) DO UPDATE SET
         account        = EXCLUDED.account,
@@ -379,7 +401,7 @@ INSERT_ACTION_SQL = """
         baseline_daily_rub = EXCLUDED.baseline_daily_rub,
         risk_basis     = EXCLUDED.risk_basis,
         learning_impact = EXCLUDED.learning_impact,
-        status         = 'planned',
+        status         = %(status)s,
         response       = '{}'::jsonb,
         sent_at        = NULL,
         created_at     = now()
@@ -387,19 +409,27 @@ INSERT_ACTION_SQL = """
 """.replace("__FINAL_STATUSES__", _sql_literals(FINAL_STATUSES))
 
 
-def insert_action(row: Dict[str, Any]) -> str:
-    """Пишет действие в статусе planned.
+def insert_action(row: Dict[str, Any], status: str = PLANNED_STATUS) -> str:
+    """Пишет действие в журнал — по умолчанию в статусе planned.
 
     Повторный вызов с тем же ключом обновляет ещё не применённую строку
     свежими данными (previous_state, red_line, risk_rub) и возвращает тот же
     action_id. Уже применённую или откатанную строку не трогает — см.
     INSERT_ACTION_SQL.
+
+    status — SHADOW_STATUS для намерения полосы, стоящей в тени. Один и тот же
+    запрос на оба случая намеренно: у намерения ровно те же поля, тот же ключ
+    идемпотентности и тот же гард «финальную строку не трогаем». Заведи для
+    тени вторую вставку — и она разошлась бы с этой на первой же новой колонке,
+    а разойтись ей нельзя: выпуск полосы из тени переписывает ЭТУ ЖЕ строку
+    в planned, и переписывать он обязан всё.
     """
     action_id = make_action_id(row["idempotency_key"])
     sql = INSERT_ACTION_SQL
     params = {
         **row,
         "action_id": action_id,
+        "status": str(status),
         # Сегмент — в собственные колонки. В действии он лежит на верхнем
         # уровне (diff.py кладёт direct_type/key рядом с payload); ключ
         # называется "key", потому что это ключ настройки, а не действия.
@@ -685,6 +715,70 @@ CLOSED_ACTIONS_DAYS = 180
 def closed_actions(days: int = CLOSED_ACTIONS_DAYS) -> List[Dict[str, Any]]:
     """Применённые действия с вынесенным вердиктом — вход петли обучения."""
     return _fetch(CLOSED_ACTIONS_SQL, (int(days),))
+
+
+# Намерения полос, стоящих в тени: агент записал «сделал бы X, жду Y», не
+# поехав в кабинет. Сторож сверяет их с фактом через горизонт обещания.
+#
+# Две границы у выборки, и обе обязательны. Верхняя — по времени: намерение
+# старше окна сверять уже не по чему, факты за горизонт из витрины уходят.
+# Вторая — по УЖЕ ВЫНЕСЕННОМУ вердикту: сверка идёт один раз, иначе каждый
+# прогон переписывал бы одно и то же намерение своим окном (а окно с каждым
+# днём шире, и вердикт «не сбылось» тихо превращался бы в «сбылось» просто от
+# накопленного дрейфа).
+SHADOW_ACTIONS_SQL = """
+    SELECT action_id, idempotency_key, account, object_level, object_id,
+           action_kind, direct_type, setting_key, payload, previous_state,
+           red_line, risk_rub, created_at
+      FROM edu_agent_actions
+     WHERE status = %s
+       AND response->>'shadow_verdict' IS NULL
+       AND created_at >= now() - make_interval(days => %s)
+     ORDER BY created_at
+"""
+
+# Сколько дней намерение ждёт сверки. Самый длинный горизонт обещания — 30
+# дней у полосы запуска (writer/lanes.MEASURE_DAYS), плюс хвост на зрелость
+# CRM и на прогон, который не состоялся.
+SHADOW_ACTIONS_DAYS = 45
+
+
+def shadow_actions(days: int = SHADOW_ACTIONS_DAYS) -> List[Dict[str, Any]]:
+    """Намерения из тени, по которым вердикт ещё не вынесен."""
+    return _fetch(SHADOW_ACTIONS_SQL, (SHADOW_STATUS, int(days)))
+
+
+# Вердикт сверки ложится в response, а не в свой столбец: колонка потребовала
+# бы миграции ради поля, которое читает один экран, а форма записи здесь уже
+# есть и уже переживает эволюцию (response — jsonb).
+#
+# Гард по статусу — тот же довод, что у MARK_ACTION_SQL: строку, которую
+# выпуск полосы из тени успел переписать в 'planned', сверка трогать не
+# вправе. Её обещание уже уехало в кабинет по-настоящему, и там его судит
+# наблюдение, а не эта функция.
+MARK_SHADOW_SQL = """
+    UPDATE edu_agent_actions
+       SET response = response || %(response)s::jsonb
+     WHERE action_id = %(action_id)s
+       AND status = %(shadow)s
+    RETURNING action_id
+"""
+
+
+def mark_shadow_outcome(action_id: str, verdict: str,
+                        detail: Optional[Dict[str, Any]] = None) -> bool:
+    """Записывает исход сверки намерения. False — строку забрал другой контур."""
+    payload = {"shadow_verdict": str(verdict), **(detail or {})}
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(MARK_SHADOW_SQL, {
+                "action_id": action_id,
+                "shadow": SHADOW_STATUS,
+                "response": json.dumps(payload, ensure_ascii=False),
+            })
+            landed = cur.fetchone() is not None
+        conn.commit()
+    return landed
 
 
 def record_experiments(rows: List[Dict[str, Any]]) -> int:

@@ -108,6 +108,17 @@ jobs:
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.lime_kz_roistat
 
+      # Витрина — снимок поверх этих же таблиц. Без пересчёта прямо здесь дашборд до
+      # ночного крона (05:20 UTC) показывал бы расход на момент прошлого пересчёта при
+      # уже свежем сырье. refresh_mart в той же транзакции пишет mart_refresh_log,
+      # откуда приложение берёт версию данных, — то есть пересчёт двигает и ключ кэша.
+      - name: Refresh Panda-BI marts
+        if: success()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PYTHONIOENCODING: "utf-8"
+        run: python -m sync.refresh_marts
+
       - name: Revalidate dashboard cache
         if: success()
         run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
