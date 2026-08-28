@@ -153,14 +153,16 @@ def probe_direct_images() -> None:
         camp_ids = [c["Id"] for c in camps["result"].get("Campaigns", [])]
         print(f"  кампаний={len(camp_ids)}")
 
-        print("\n--- B5. ads.get: типы объявлений и хеши картинок ---")
+        print("\n--- B5. ads.get: типы объявлений и хеши картинок (батчи по 10 кампаний) ---")
         all_ads: list[dict] = []
-        offset = 0
-        while True:
+        for batch_start in range(0, len(camp_ids), 10):
+          batch = camp_ids[batch_start:batch_start + 10]
+          offset = 0
+          while True:
             ads = direct_call(
                 "ads",
                 {
-                    "SelectionCriteria": {"CampaignIds": camp_ids[:1000]},
+                    "SelectionCriteria": {"CampaignIds": batch},
                     "FieldNames": ["Id", "CampaignId", "AdGroupId", "Type", "Subtype", "State", "Status"],
                     "TextAdFieldNames": ["Title", "Title2", "Text", "Href", "AdImageHash"],
                     "TextImageAdFieldNames": ["AdImageHash", "Href"],
@@ -254,5 +256,6 @@ def probe_direct_images() -> None:
 
 
 if __name__ == "__main__":
-    probe_metrika_ads()
+    if os.environ.get("PROBE_SKIP_METRIKA") != "1":
+        probe_metrika_ads()
     probe_direct_images()
