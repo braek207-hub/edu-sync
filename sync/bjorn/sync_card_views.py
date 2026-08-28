@@ -179,7 +179,13 @@ def build_rows(
     products: dict[str, str],
 ) -> list[dict[str, Any]]:
     """Свёртка просмотров в строки витрины. Товар берётся из справочника товарной витрины:
-    имя должно совпасть с ней символ в символ, иначе ступень не приклеится к воронке."""
+    имя должно совпасть с ней символ в символ, иначе ступень не приклеится к воронке.
+
+    Строка с пустым product_name — итог источника за день: сколько РАЗНЫХ людей открыли
+    хоть какую-то карточку. Без неё ступень воронки приходится складывать по товарам, а
+    один человек за визит открывает несколько карточек — сумма даёт 5 792 «человека» там,
+    где их 2 382 (замер 29.08.2026), и конверсия ступени вылезает за 100%. Итог считается по
+    ВСЕМ просмотрам /product/, включая товары без строки в товарной витрине."""
     agg: dict[tuple[str, str, str, str], dict[str, Any]] = defaultdict(
         lambda: {"card_views": 0, "visit_ids": set()}
     )
@@ -187,11 +193,15 @@ def build_rows(
 
     for attribution, visit_source in visits_by_attribution.items():
         for day, visit_id, product_key in views:
+            source = visit_source.get(visit_id, "Не определено")
+            total = agg[(day, attribution, source, "")]
+            total["card_views"] += 1
+            total["visit_ids"].add(visit_id)
+
             product_name = products.get(product_key)
             if product_name is None:
                 unknown[product_key] += 1
                 continue
-            source = visit_source.get(visit_id, "Не определено")
             bucket = agg[(day, attribution, source, product_name)]
             bucket["card_views"] += 1
             bucket["visit_ids"].add(visit_id)
