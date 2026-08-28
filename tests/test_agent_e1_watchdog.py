@@ -652,6 +652,12 @@ def test_load_facts_asks_the_mart_up_to_today(monkeypatch):
     # Свежесть витрины видна только за верхней границей окна: окно отодвинуто
     # от сегодня на запас под лаг лидов. Спрашивай мы ровно окно — «витрина
     # мертва неделю» и «мы спросили только про старые дни» были бы неотличимы.
+    #
+    # Нижняя граница с задачи 25 не равна началу окон наблюдения: замер такта
+    # целиком (tact_effect_report) сравнивает окно наблюдения с равным ему
+    # окном ДО такта, а окна наблюдения начинаются днём применения. Прежняя
+    # посылка «спрашиваем ровно от 2026-08-02» означала бы, что базы у такта
+    # нет никогда и замер отказывает «мерить нечем» каждый прогон.
     seen = {}
 
     def fake_load(ids, date_from, date_to):
@@ -661,7 +667,8 @@ def test_load_facts_asks_the_mart_up_to_today(monkeypatch):
     monkeypatch.setattr(watchdog.agent_db, "load_daily_facts", fake_load)
     watchdog.load_facts([_action()], TODAY, DEFAULT_CRM_THROUGH)
 
-    assert seen["from"] == "2026-08-02"
+    assert seen["from"] == (
+        TODAY - timedelta(days=2 * watchdog.OBSERVATION_HORIZON_DAYS)).isoformat()
     assert seen["to"] == TODAY.isoformat()
 
 

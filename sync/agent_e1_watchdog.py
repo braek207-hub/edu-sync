@@ -53,6 +53,8 @@ from sync.agent import blackbox
 from sync.agent import experiments
 from sync.agent import db as agent_db
 from sync.agent import gate as gate_module
+from sync.agent import holdout
+from sync.agent import tact_effect
 from sync.agent.gate import mart_gate, with_source_checks
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.apply import _element_errors
@@ -685,10 +687,45 @@ def money_check_due(action: Dict[str, Any], today: date) -> bool:
 
 
 # Минимум эффективных лидов заповедника в окне наблюдения, чтобы контроль
-# вообще считался контролем. Тот же порог, что у сезонной поправки
-# (SEASONAL_MIN_LEADS): на десятке лидов CPA — шум, и «сезон», вычтенный по
-# такому контролю, добавил бы к оценке случайное число вместо поправки.
-MIN_CONTROL_LEADS = 20
+# вообще считался контролем. Число живёт в holdout.py — там же, где сам
+# заповедник: контролем он работает и здесь, и в замере такта целиком
+# (tact_effect), а две копии порога однажды назвали бы контролем разное. Имя
+# здесь оставлено прежним: на него ссылаются читатели сторожа.
+MIN_CONTROL_LEADS = holdout.MIN_CONTROL_LEADS
+
+
+def tact_effect_report(actions: List[Dict[str, Any]],
+                       facts_by_campaign: Dict[str, List[Dict[str, Any]]],
+                       holdout_facts: Optional[List[Dict[str, Any]]],
+                       holdout_ids: Iterable[str],
+                       today: date) -> Dict[str, Any]:
+    """Эффект ТАКТА, чей горизонт наблюдения закрывается сегодня.
+
+    Зачем рядом с индивидуальным DiD. Тот судит одно действие по одной
+    кампании, и при четырёхстах одновременных правках у каждого своего
+    контроля слишком мало. Общий сдвиг кабинета при этом складывается не в
+    четыреста маленьких провалов, а в один — общий, которого агент не делал.
+    Замер такта спрашивает с одного решения одним числом и там, где объёма
+    хватает: все обработанные разом против заповедника разом.
+
+    Такт определяется днём ПРИМЕНЕНИЯ, а не днём планирования: отложенное
+    риск-бюджетом действие уезжает в кабинет следующим прогоном и работает
+    вместе с ним, а не с тем тактом, где было задумано.
+
+    Факты обеих групп идут в замер одним списком — разделяет их он сам по
+    спискам кампаний. Делить снаружи значило бы однажды положить кампанию в
+    обе стороны сразу, и заповедник перестал бы быть контролем ровно там, где
+    это важнее всего заметить.
+    """
+    tact_day = today - timedelta(days=OBSERVATION_HORIZON_DAYS)
+    applied = sorted({str(action.get("object_id")) for action in actions or ()
+                      if _as_date(action.get("applied_at")) == tact_day})
+    facts: List[Dict[str, Any]] = []
+    for rows in (facts_by_campaign or {}).values():
+        facts.extend(rows)
+    facts.extend(holdout_facts or [])
+    return tact_effect.measure(tact_day, facts, holdout_ids, applied,
+                               OBSERVATION_HORIZON_DAYS)
 
 
 def holdout_control(rows: Iterable[Dict[str, Any]],
@@ -1364,6 +1401,13 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
 
     return {
         "under_watch": len(actions),
+        # Эффект такта целиком — одно число на всё сегодняшнее решение, а не
+        # четыреста частных вердиктов, каждый из которых на своём объёме
+        # означает шум. Считается всегда, в том числе при красном гейте:
+        # замер ничего не пишет в кабинет, а знать, что делал такт двухнедельной
+        # давности, нужно тем сильнее, чем хуже данные.
+        "tact_effect": tact_effect_report(actions, facts_by_campaign,
+                                          holdout_facts, holdout_ids, today),
         "states": dict(sorted(states.items())),
         "breached": len(breached),
         "breached_sample": breached[:PREVIEW_SAMPLE_LIMIT],
@@ -1440,8 +1484,15 @@ def load_facts(actions: List[Dict[str, Any]], today: date,
     span = facts_window(actions, today, crm_through)
     if span is None:
         return {}
+    # Нижняя граница отодвинута на ДВА горизонта назад: замер такта целиком
+    # (tact_effect_report) сравнивает окно наблюдения с равным ему окном ДО
+    # такта, а окна наблюдения начинаются днём применения. Спрашивай мы ровно
+    # их — базы у такта не было бы никогда, и замер честно отказывал бы
+    # «мерить нечем» каждый прогон. Лишние дни на вердикты действий не влияют:
+    # observed_metrics режет строки по собственному окну.
+    earliest = min(span[0], today - timedelta(days=2 * OBSERVATION_HORIZON_DAYS))
     rows = agent_db.load_daily_facts(
-        [str(a.get("object_id")) for a in actions], span[0].isoformat(), today.isoformat())
+        [str(a.get("object_id")) for a in actions], earliest.isoformat(), today.isoformat())
     out: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         out.setdefault(str(row["campaign_id"]), []).append(row)

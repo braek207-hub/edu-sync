@@ -148,3 +148,72 @@ def test_empty_period_is_not_an_error():
 
     assert out["findings"] == []
     assert out["runs"] == 0
+
+
+# --------------------------------------------- эффект такта целиком (Ф16)
+
+
+def _watchdog_run(effect, run_id="w1", account="acc"):
+    """Прогон сторожа с замером такта в отчёте кабинета."""
+    return _run(stage="watchdog", run_id=run_id,
+                report={"accounts": [{"account": account, "tact_effect": effect}]})
+
+
+def _effect(verdict="improved", did=-0.12, reason=""):
+    # did=None — форма замера, который ничего не сказал: интервала у него нет
+    # тоже, и подставлять сюда числа значило бы проверять разбор на входе,
+    # которого он никогда не увидит.
+    ci = None if did is None else (did - 0.05, did + 0.05)
+    return {"tact_date": "2026-09-01", "verdict": verdict, "did": did,
+            "ci": ci, "treated_delta": 0.08,
+            "holdout_delta": 0.20, "reason": reason}
+
+
+def test_a_harmful_tact_is_the_heaviest_finding():
+    # Единственное утверждение о вреде, которое агент умеет доказать: цена
+    # выросла относительно заповедника, и весь интервал лежит выше нуля.
+    found = review.tact_effects([_watchdog_run(_effect("worsened", did=0.18))])
+
+    assert len(found) == 1
+    assert found[0]["code"] == review.TACT_HARM
+    assert found[0]["severity"] == "high"
+    assert found[0]["evidence"]["did"] == 0.18
+
+
+def test_a_good_tact_is_not_a_finding():
+    # Разбор — список того, что требует вмешательства, а не отчёт об успехах.
+    assert review.tact_effects([_watchdog_run(_effect("improved"))]) == []
+
+
+def test_a_period_where_no_tact_was_measured_is_a_finding():
+    # Молчащий замер выглядит ровно как «всё хорошо». Период, в котором ни
+    # один такт не измерен, обязан быть виден строкой — иначе агент неделями
+    # работает вслепую и никто об этом не узнает.
+    runs = [_watchdog_run(_effect("unknown", did=None,
+                                  reason="заповедник пуст"), run_id=f"w{i}")
+            for i in range(3)]
+
+    found = review.tact_effects(runs)
+
+    assert [f["code"] for f in found] == [review.TACT_BLIND]
+    assert found[0]["evidence"]["runs"] == 3
+    assert "заповедник пуст" in found[0]["detail"]
+
+
+def test_one_unknown_among_measured_tacts_is_not_a_finding():
+    # Одиночное «unknown» законно: в такте могло не быть действий вовсе.
+    # Находка — только сплошная слепота периода.
+    runs = [_watchdog_run(_effect("improved"), run_id="w1"),
+            _watchdog_run(_effect("unknown", did=None, reason="нет действий"),
+                          run_id="w2")]
+
+    assert review.tact_effects(runs) == []
+
+
+def test_the_tact_finding_reaches_the_review():
+    # Секция обязана быть в общем разборе, а не только в своей функции:
+    # находка, до которой не доходит review(), не доходит и до человека.
+    result = review.review([_watchdog_run(_effect("worsened", did=0.18))], [],
+                           ("watchdog",))
+
+    assert review.TACT_HARM in result["by_code"]

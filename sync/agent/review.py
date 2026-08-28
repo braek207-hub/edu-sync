@@ -36,6 +36,8 @@ HAND_ROLLBACK = "hand_rollback"
 SILENT_STAGE = "silent_stage"
 UNVERIFIED = "unverified_kind"
 BLIND_WRITE = "blackbox_write_failed"
+TACT_HARM = "tact_harmful"
+TACT_BLIND = "tact_unmeasured"
 
 # Сколько РАЗНЫХ прогонов подряд должно упереться в одну стену, чтобы это
 # перестало быть случайностью дня. Три — минимум, при котором совпадение уже
@@ -228,10 +230,61 @@ def blind_writes(runs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def tact_effects(runs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Что показал замер такта целиком (agent_e1_watchdog.tact_effect_report).
+
+    Частные вердикты отвечают на вопрос «выдержало ли ЭТО изменение», и
+    четыреста таких ответов не складываются в ответ о работе системы: они
+    сняты на объёмах, где каждый по отдельности — шум. Замер такта отвечает
+    одним числом, и разбору нужны из него ровно две вещи.
+
+    ВРЕДНЫЙ ТАКТ — находка высшего веса, и не потому, что «стало дороже»
+    (дороже бывает от рынка), а потому, что дороже стало ОТНОСИТЕЛЬНО
+    заповедника, весь доверительный интервал по одну сторону нуля. Это
+    единственное утверждение о вреде, которое агент умеет доказать.
+
+    СЛЕПОЙ ЗАМЕР — находка о самом наблюдении. Такты идут, а сказать о них
+    нечего: нет заповедника, он мал, фактов не хватило. Молчание замера
+    выглядит ровно как «всё хорошо», и именно поэтому его печатают отдельной
+    строкой. Одиночное «unknown» законно (в такте могло не быть действий) —
+    находкой становится период, где НИ ОДИН такт не измерен.
+    """
+    measured: List[Dict[str, Any]] = []
+    for report in _reports(runs, "watchdog"):
+        for account in report.get("accounts") or []:
+            effect = account.get("tact_effect") or {}
+            if effect:
+                measured.append({"account": account.get("account"), **effect})
+
+    out: List[Dict[str, Any]] = []
+    for effect in measured:
+        if str(effect.get("verdict")) != "worsened":
+            continue
+        out.append(_finding(
+            TACT_HARM, "high", str(effect.get("account") or ""),
+            f"такт {effect.get('tact_date')} ухудшил цену лида на "
+            f"{round(float(effect.get('did') or 0.0) * 100)}% относительно "
+            f"заповедника",
+            {"tact_date": effect.get("tact_date"), "did": effect.get("did"),
+             "ci": effect.get("ci"), "treated_delta": effect.get("treated_delta"),
+             "holdout_delta": effect.get("holdout_delta")}))
+
+    verdicts = {str(e.get("verdict")) for e in measured}
+    if measured and verdicts == {"unknown"}:
+        reasons = sorted({str(e.get("reason")) for e in measured if e.get("reason")})
+        out.append(_finding(
+            TACT_BLIND, "medium", "tact_effect",
+            f"за период ни один такт не измерен ({len(measured)} прогонов): "
+            + "; ".join(reasons),
+            {"runs": len(measured), "reasons": reasons}))
+    return out
+
+
 def review(runs: List[Dict[str, Any]], reject_rows: List[Dict[str, Any]],
            expected_stages: Iterable[str]) -> Dict[str, Any]:
     """Все находки периода, отсортированные по весу."""
     findings = (silent_stages(runs, expected_stages) + hand_rollbacks(runs)
+                + tact_effects(runs)
                 + walls(reject_rows) + conflicts_seen(runs) + unverified(runs)
                 + blind_writes(runs))
     findings.sort(key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
