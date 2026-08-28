@@ -216,6 +216,14 @@ _APP_PUBLISHER_RULES = (
     ("vk ads", ("SMM paid", "VK.Ads", "Платный")),
     ("vkads", ("SMM paid", "VK.Ads", "Платный")),
     ("mytarget", ("SMM paid", "VK.Ads", "Платный")),
+    # Бесплатные партнёры. Без этих правил они падали в Referrals, а заказы тех же людей
+    # TW клал в CRM/SEO/SMM (organic) — одно явление в двух разных строках отчёта.
+    # «google search» ниже «google ads»: подстроки не пересекаются, порядок не важен.
+    ("mindbox", ("CRM", "Mindbox", "Бесплатный")),
+    ("maestra", ("CRM", "Mindbox", "Бесплатный")),
+    ("google search", ("SEO", "SEO Google", "Бесплатный")),
+    ("yandex search", ("SEO", "SEO Yandex", "Бесплатный")),
+    ("telegram", ("SMM (organic)", "Telegram", "Бесплатный")),
 )
 
 
