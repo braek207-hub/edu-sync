@@ -1,0 +1,32 @@
+name: probe-bjorn-products-ads
+on:
+  workflow_dispatch:
+    inputs:
+      date1:
+        description: "Начало периода (YYYY-MM-DD)"
+        required: false
+        default: "2026-07-01"
+      date2:
+        description: "Конец периода (YYYY-MM-DD)"
+        required: false
+        default: "2026-08-25"
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Probe BJORN products funnel + ad images
+        env:
+          METRICA_TOKEN: ${{ secrets.BJORN_METRICA_TOKEN }}
+          METRICA_COUNTER_ID: ${{ secrets.BJORN_METRICA_COUNTER_ID }}
+          DIRECT_TOKEN: ${{ secrets.BJORN_DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.BJORN_DIRECT_CLIENTS_JSON }}
+          PROBE_DATE1: ${{ github.event.inputs.date1 }}
+          PROBE_DATE2: ${{ github.event.inputs.date2 }}
+          PYTHONIOENCODING: "utf-8"
+        run: python probe_bjorn_products_ads.py
