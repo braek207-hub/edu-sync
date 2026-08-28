@@ -47,11 +47,59 @@ def test_suspend_without_reassignment_leaves_money_unassigned():
 
 
 def test_negative_and_placement_cuts_count_as_shrink():
+    # Потеря объёма НЕ измерена (leads_measured отсутствует): ноль в лидах
+    # означает «не мерили», и рубли остаются единственной защитой от сжатия.
     balance = tact_balance([], suspends=[],
                            cuts=[{"kind": "negative.add", "cost_saved": 12_000.0,
                                   "expected_leads_delta": -1.0}])
     assert balance["freed_rub"] == 12_000.0
     assert balance["shrinking"] is True
+
+
+def test_measured_cut_reallocates_instead_of_freeing():
+    # Отсечение с ИЗМЕРЕННОЙ потерей объёма недельный лимит кампании не
+    # трогает: те же деньги стратегия перекладывает на оставшиеся запросы.
+    # Освобождением это не является, адресата не требует, и такт от него
+    # сжимающим не становится.
+    balance = tact_balance([], suspends=[],
+                           cuts=[{"kind": "negative.add", "cost_saved": 12_000.0,
+                                  "leads_measured": True,
+                                  "expected_leads_delta": 0.0}])
+    assert balance["freed_rub"] == 0.0
+    assert balance["reallocated_rub"] == 12_000.0
+    assert balance["shrinking"] is False
+
+
+def test_measured_cut_that_loses_volume_still_shrinks():
+    # Измерение показало, что вырезаемое давало конверсии, — это сжатие, и
+    # плата берётся объёмом. Рубли при этом по-прежнему не «освобождаются»:
+    # лимит кампании не изменился.
+    balance = tact_balance([], suspends=[],
+                           cuts=[{"kind": "negative.add", "cost_saved": 12_000.0,
+                                  "leads_measured": True,
+                                  "expected_leads_delta": -3.0}])
+    assert balance["freed_rub"] == 0.0
+    assert balance["reallocated_rub"] == 12_000.0
+    assert balance["expected_leads_delta"] == -3.0
+    assert balance["shrinking"] is True
+
+
+def test_gate_keeps_measured_cuts_while_dropping_unmeasured_ones():
+    # Живой случай 27–28.08.2026: такт сжимался доливкой без адресата, и
+    # require_growth_address снимала самые дешёвые действия — то есть всю
+    # гигиену. Измеренное отсечение объёма не отнимает и сниматься не должно.
+    actions = [
+        {"action_kind": "negative.add", "object_id": "111",
+         "leads_measured": True, "expected_leads_delta": 0.0,
+         "expected_gain_rub": 200.0},
+        {"action_kind": "campaign.suspend", "object_id": "222",
+         "expected_leads_delta": -4.0, "expected_gain_rub": 50_000.0},
+    ]
+    balance = {"shrinking": True, "expected_leads_delta": -4.0,
+               "freed_rub": 50_000.0, "added_rub": 0.0, "freed_by_key": {}}
+    allowed, blocked = require_growth_address(actions, balance)
+    assert [a["object_id"] for a in blocked] == ["222"]
+    assert [a["object_id"] for a in allowed] == ["111"]
 
 
 def test_small_unassigned_tail_is_not_a_shrink():
@@ -75,6 +123,23 @@ def test_emergency_entry_does_not_make_tact_shrinking():
     assert balance["emergency_freed_rub"] == 50_000.0
     assert balance["expected_leads_delta"] == 0.0
     assert balance["shrinking"] is False
+
+
+def test_balance_inputs_carry_measurement_flag_from_the_action():
+    # Признак ставит тот, кто знает: writer/negatives.py и
+    # writer/placements.py. Восстановить его здесь по нулю в лидах нельзя —
+    # ноль двузначен, — поэтому он обязан доехать с самим действием.
+    rows = balance_inputs(
+        [{"action_kind": "negative.add", "object_id": "111",
+          "leads_measured": True, "expected_leads_delta": 0.0},
+         {"action_kind": "placement.exclude", "object_id": "222",
+          "expected_leads_delta": 0.0}],
+        moves_by_campaign={},
+        cost_28d_by_campaign={},
+        cut_cost_by_kind={"negative.add": {"111": 9_000.0},
+                          "placement.exclude": {"222": 4_000.0}})
+    measured = {c["campaign_id"]: c["leads_measured"] for c in rows["cuts"]}
+    assert measured == {"111": True, "222": False}
 
 
 def test_freed_money_is_addressable_per_action():
