@@ -64,6 +64,9 @@ jobs:
       - name: Метрика — товарная воронка
         run: python -m sync.bjorn.sync_products
 
+      - name: Метрика — просмотры карточек (Logs API)
+        run: python -m sync.bjorn.sync_card_views
+
       - name: Директ — staging
         run: python -m sync.bjorn.sync_direct
 
