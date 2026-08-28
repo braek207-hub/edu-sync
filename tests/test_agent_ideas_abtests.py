@@ -265,8 +265,8 @@ def test_campaign_listed_in_holdout_ids_gets_no_tests():
 
 
 def test_catalogue_offers_only_released_levers():
-    # До задач 21–24 рычагов goal/strategy/audience/geo нет. Идея с
-    # ненаписанным рычагом встала бы в реестр и отвергалась каждым тактом.
+    # Из задач 21–24 не написан рычаг аудиторий (23). Идея с ненаписанным
+    # рычагом встала бы в реестр и отвергалась каждым тактом.
     for idea in abtests.candidates([_campaign()], _ctx()):
         lever = idea["detail"]["change"]["lever"]
         assert lever in guardrails.ALLOWED_ACTION_KINDS
@@ -282,18 +282,20 @@ def test_unreleased_kind_is_skipped_with_a_named_reason():
     skipped = abtests.scan([_campaign()], _ctx())["skipped"]
     kinds = {row.get("test_kind") for row in skipped}
 
-    # Рычаги задач 23–24 ещё не написаны — их типы отбраковываются с
-    # названной причиной, а не молча. Смены цели и стратегии здесь больше
-    # нет: рычаги написаны (задачи 21 и 22), их место — среди кандидатов ниже.
-    assert {"audience", "geo"} <= kinds
+    # Рычаг задачи 23 ещё не написан — его тип отбраковывается с названной
+    # причиной, а не молча. Смены цели, стратегии и географии здесь больше
+    # нет: рычаги написаны (задачи 21, 22 и 24), их место — среди кандидатов
+    # ниже.
+    assert "audience" in kinds
     assert all(row["reason"] for row in skipped)
 
 
 def test_the_goal_test_became_a_candidate_with_its_lever():
-    # Каталог обещал тесты смены цели и стратегии с самого начала, но до задач
-    # 21–22 обещать их было нечем. Появился рычаг — тип обязан выйти из
-    # отбраковки в кандидаты; иначе каталог остался бы списком намерений.
-    assert {"goal", "strategy"} <= _kinds()
+    # Каталог обещал тесты смены цели, стратегии и географии с самого начала,
+    # но до задач 21–22 и 24 обещать их было нечем. Появился рычаг — тип
+    # обязан выйти из отбраковки в кандидаты; иначе каталог остался бы списком
+    # намерений.
+    assert {"goal", "strategy", "geo"} <= _kinds()
 
 
 def test_creative_test_waits_for_the_builder_order():

@@ -39,7 +39,9 @@ sync/agent/writer/tier.py — класс достоверности: плати�
   2. ставка (experiments.is_bet) — перебивает арифметику: у разведочного
      действия снят гейт уверенности, и похожесть на утверждение о прошлом его
      не возвращает;
-  3. арифметика — только для видов, вырезающих трафик ПО ПОСТРОЕНИЮ;
+  3. арифметика — только для видов, вырезающих трафик ПО ПОСТРОЕНИЮ, и для
+     того, у кого вырезание доказано СОДЕРЖИМЫМ действия (география: список
+     регионов запроса — строгое подмножество прочитанного из кабинета);
   4. измерение — рычаг заявил обещание (writer/expectation.of);
   5. иначе ставка.
 
@@ -87,9 +89,31 @@ MATURE_WINDOW_DAYS = 14
 # Виды, вырезающие трафик ПО ПОСТРОЕНИЮ, — только они могут оказаться классом 0.
 # Полосой этот список не выражается: negative.remove_added живёт в той же
 # полосе гигиены, но трафик ВОЗВРАЩАЕТ, и «ноль конверсий в прошлом» о его
-# будущем не утверждает ничего. geo.set войдёт сюда вместе со своим рычагом
-# (Ф14), когда действие сможет показать, что список регионов только сужается.
+# будущем не утверждает ничего.
 CUTTING_KINDS = frozenset({"negative.add", "placement.exclude"})
+
+# Вид, у которого направление читается не из имени, а из СОДЕРЖИМОГО действия:
+# география и вырезает трафик, и наливает его — одним и тем же видом.
+#
+# Списком видов это не выражается вовсе, и попытка выразить была бы дырой:
+# запиши geo.set в CUTTING_KINDS — и расширение гео получило бы право резать
+# без риск-бюджета, запиши в TRANSFERRED_EVIDENCE_KINDS — и сужение с нулём
+# конверсий платило бы как ставка за утверждение о прошлом. Поэтому класс
+# спрашивает сами списки регионов: тот, что уезжает в кабинет (payload), и
+# тот, что прочитан оттуда (previous_state). Строгое подмножество —
+# доказанное сужение, надмножество — расширение; всё остальное направления не
+# показывает и разбирается общим порядком.
+#
+# Пометка построителя на это место НЕ ГОДИТСЯ: достаточно было бы назвать ход
+# сужением, чтобы освободить его от риска, — то самое «действие выписывает
+# себе класс», от которого защищает правило «объявленный класс вправе только
+# ужесточить».
+DIRECTIONAL_KINDS = frozenset({"geo.set"})
+
+# Поле списка регионов — литералом, а не импортом из writer/geo: рычаг тянет
+# ожидание и экспозицию, и модульный импорт замкнул бы кольцо tier → geo →
+# expectation → ... → tier. Тот же приём, что у expectation с "goal.set".
+REGION_FIELD = "RegionIds"
 
 # Виды, у которых доказательство ПО ПОСТРОЕНИЮ снято не с этого объекта.
 # Смена цели оптимизации обещает конверсию, которой у этой кампании никогда не
@@ -134,9 +158,11 @@ def _computed(action: Dict[str, Any], context: Dict[str, Any]) -> int:
         return TIER_PROPOSAL
     if is_bet(action):
         return TIER_BET
-    if kind in TRANSFERRED_EVIDENCE_KINDS:
+    direction = _direction(kind, action)
+    if kind in TRANSFERRED_EVIDENCE_KINDS or direction == "widen":
         return TIER_BET
-    if kind in CUTTING_KINDS and _is_arithmetic(action.get("evidence")):
+    if (kind in CUTTING_KINDS or direction == "cut") and _is_arithmetic(
+            action.get("evidence")):
         return TIER_ARITHMETIC
     if expectation.of(action, context) is not None:
         return TIER_MEASURED
@@ -161,6 +187,44 @@ def _has_lever(kind: str) -> bool:
     if kind.startswith(lanes.PROPOSAL_KIND_PREFIX):
         return False
     return kind in lanes.LANE_OF_KIND
+
+
+def _direction(kind: str, action: Dict[str, Any]) -> Optional[str]:
+    """'cut' | 'widen' | None — куда двигает действие своё покрытие.
+
+    Считается по двум спискам самого действия: тому, что уезжает в кабинет, и
+    тому, что оттуда прочитан. Сужением признаётся только СТРОГОЕ
+    подмножество — единственная форма, в которой «список только сужается»
+    доказуема без дерева регионов. Ход, где что-то и убрали, и добавили,
+    направления не показывает: None, и класс считается общим порядком.
+
+    Нечитаемый или пустой список — тоже None: «неизвестно» здесь не имеет
+    права стать ни правом резать без риска, ни ставкой.
+    """
+    if kind not in DIRECTIONAL_KINDS:
+        return None
+    new = _region_set((action.get("payload") or {}).get(REGION_FIELD))
+    old = _region_set((action.get("previous_state") or {}).get(REGION_FIELD))
+    if not new or not old or new == old:
+        return None
+    if new < old:
+        return "cut"
+    if new > old:
+        return "widen"
+    return None
+
+
+def _region_set(value: Any) -> Optional[frozenset]:
+    """Список регионов множеством. None — читать нечего или нечем."""
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return None
+    out = set()
+    for item in value:
+        number = _number(item)
+        if number is None or number != int(number):
+            return None
+        out.add(int(number))
+    return frozenset(out)
 
 
 def _is_arithmetic(evidence: Optional[Dict[str, Any]]) -> bool:
