@@ -70,6 +70,9 @@ jobs:
       - name: Директ — staging
         run: python -m sync.bjorn.sync_direct
 
+      - name: Директ — объявления и картинки
+        run: python -m sync.bjorn.sync_ads
+
       - name: Сборка витрины
         run: python -m sync.bjorn.build_fact
 

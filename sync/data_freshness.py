@@ -188,6 +188,8 @@ SOURCES: list[Source] = [
     Source("bjorn", "marketing_daily_fact", max_lag_days=2),
     Source("bjorn", "marketing_ecom_lines", max_lag_days=2),
     Source("bjorn", "bjorn_product_daily", max_lag_days=2),
+    Source("bjorn", "bjorn_card_views_daily", max_lag_days=2),
+    Source("bjorn", "bjorn_ad_daily", max_lag_days=2, volume_floor=5),
     # Polina Repik.
     Source("polinarepik", "polinarepik_direct_stats"),
     Source("polinarepik", "polinarepik_metrica_visits"),
