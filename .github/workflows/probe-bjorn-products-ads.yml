@@ -6,6 +6,10 @@ on:
         description: "Начало периода (YYYY-MM-DD)"
         required: false
         default: "2026-07-01"
+      script:
+        description: "Файл пробы"
+        required: false
+        default: "probe_bjorn_products_ads.py"
       date2:
         description: "Конец периода (YYYY-MM-DD)"
         required: false
@@ -29,4 +33,4 @@ jobs:
           PROBE_DATE1: ${{ github.event.inputs.date1 }}
           PROBE_DATE2: ${{ github.event.inputs.date2 }}
           PYTHONIOENCODING: "utf-8"
-        run: python probe_bjorn_products_ads.py
+        run: python ${{ github.event.inputs.script || 'probe_bjorn_products_ads.py' }}
