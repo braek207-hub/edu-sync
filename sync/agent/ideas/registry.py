@@ -60,6 +60,7 @@ import psycopg2.extras
 
 from sync.db import get_connection
 from sync.agent import experiments as experiments_mod
+from sync.agent.ideas import limits
 from sync.agent.writer import lanes as lanes_mod
 from sync.agent.writer import tier as tier_mod
 
@@ -481,6 +482,7 @@ def upsert(ideas: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             result.append(merged)
             continue
         merged = _silence(merged, rejections.get(row["subject_key"]))
+        merged = _drop_unprofitable(merged)
         to_write.append(merged)
         result.append(merged)
     _write_rows(to_write)
@@ -516,6 +518,31 @@ def _silence(row: Dict[str, Any],
     out["status"] = STATUS_DROPPED
     out["rejected_by"] = who
     out["rejected_at"] = rejection.get("rejected_at")
+    out["dropped_reason"] = reason
+    return out
+
+
+def _drop_unprofitable(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Идея, которая не окупает собственную проверку.
+
+    Снимается тем же способом, что и отказ человека, и по той же причине:
+    строка не исчезает, а ложится в реестр СРАЗУ снятой, с названной
+    причиной. Молчаливый отсев сделал бы «генератор перестал находить» и
+    «генератор находит убыточное» неотличимыми по данным, а лечатся они
+    по-разному.
+
+    Уже снятое человеком не переписывается: его причина сильнее и должна
+    остаться в строке — иначе разбор увидит машинный отказ там, где было
+    решение человека.
+    """
+    if str(row.get("status")) == STATUS_DROPPED:
+        return row
+    reason = limits.unprofitable_reason(row.get("expected_rub"),
+                                        row.get("test_cost_rub"))
+    if reason is None:
+        return row
+    out = dict(row)
+    out["status"] = STATUS_DROPPED
     out["dropped_reason"] = reason
     return out
 

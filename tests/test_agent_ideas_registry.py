@@ -559,6 +559,50 @@ def test_mark_of_an_unknown_idea_is_refused(store):
         registry.mark("такой-идеи-нет", registry.STATUS_RUNNING)
 
 
+# ------------------------------------------- идея обязана окупать проверку
+
+def test_idea_that_costs_more_than_it_promises_is_dropped_on_arrival(store):
+    # Очередь ранжируется отношением «ожидание ÷ цена проверки», но пола у
+    # отношения не было, и она честно сортировала идеи, из которых ни одна не
+    # окупалась. Замер 28.08.2026 у генератора proven: 17 живых идей,
+    # Σ ожидания 2 669 ₽ против Σ цены проверки 22 094 ₽, окупается ноль.
+    registry.upsert([_idea(expected_rub=400.0, test_cost_rub=500.0)])
+    row = registry.load(_id(_idea()))
+
+    assert row["status"] == registry.STATUS_DROPPED
+    assert "не окупает" in row["dropped_reason"]
+
+
+def test_free_check_is_not_judged_by_the_threshold(store):
+    # Ноль в цене — проверка бесплатна: идея опирается на уже собранные
+    # данные и окупается любым неотрицательным ожиданием.
+    registry.upsert([_idea(expected_rub=1.0, test_cost_rub=0.0)])
+    assert registry.load(_id(_idea()))["status"] == registry.STATUS_NEW
+
+
+def test_unpriced_idea_is_not_dropped_by_the_threshold(store):
+    # Непосчитанное — не ноль. Идея без ожидания не «бесценна», она
+    # непроверяема этим правилом: её судьбу решает очередь (rank отправляет
+    # такие в хвост), а не порог. Прочти незнание нулём — и генератор,
+    # забывший посчитать ожидание, снимался бы весь скопом.
+    registry.upsert([_idea(expected_rub=None, test_cost_rub=500.0)])
+    assert registry.load(_id(_idea()))["status"] == registry.STATUS_NEW
+
+
+def test_human_reason_survives_the_threshold(store):
+    # Убыточная идея по объекту, который человек уже отклонил: причина
+    # человека сильнее и обязана остаться в строке — иначе разбор увидит
+    # машинный отказ там, где было решение человека.
+    registry.upsert([_idea()])
+    registry.reject(_id(_idea()), by="pavel", reason="направление закрываем")
+
+    registry.upsert([_idea(expected_rub=400.0, test_cost_rub=500.0)])
+    row = registry.load(_id(_idea()))
+
+    assert row["status"] == registry.STATUS_DROPPED
+    assert row["dropped_reason"].startswith("человек")
+
+
 # ------------------------------------------------ «нет» человека навсегда
 
 def test_human_rejection_silences_the_idea_permanently(store):

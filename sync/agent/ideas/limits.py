@@ -22,6 +22,10 @@ from typing import Any, Dict, Optional
 MAX_HORIZON_KEY = "idea_max_horizon_days"
 DEFAULT_MAX_HORIZON_DAYS = 90
 
+UNPROFITABLE_REASON = (
+    "проверка дороже находки: ожидание {expected:.0f} ₽ против {cost:.0f} ₽ "
+    "цены теста — идея не окупает собственный замер")
+
 
 def _number(value: Any) -> Optional[float]:
     try:
@@ -38,3 +42,34 @@ def max_horizon(ctx: Optional[Dict[str, Any]]) -> int:
     if value is None or value <= 0:
         return DEFAULT_MAX_HORIZON_DAYS
     return int(value)
+
+
+def unprofitable_reason(expected_rub: Any, test_cost_rub: Any) -> Optional[str]:
+    """Причина снятия, если идея не окупает собственную проверку. Иначе None.
+
+    **Порог не свой, а тождественный.** Очередь и так ранжируется отношением
+    «ожидание ÷ цена проверки» (registry.rank), но пола у отношения не было, и
+    очередь честно сортировала идеи, из которых ни одна не окупалась. Замер
+    28.08.2026: у генератора proven 17 живых идей — Σ ожидания 2 669 ₽ против
+    Σ цены проверки 22 094 ₽, окупается ноль. Лучшая идея очереди обещала
+    431 ₽ при цене замера 473 ₽.
+
+    Ноль в знаменателе — бесплатная проверка (идея опирается на уже собранные
+    данные): она окупается любым неотрицательным ожиданием, и порог её не
+    касается. Строгое «дороже», а не «не дешевле»: идея, ровно окупающая
+    замер, ничего не приносит, но и ничего не стоит — снимать её значит
+    спорить с округлением.
+
+    Непосчитанная величина порогом не судится. Идея без сметы или без
+    ожидания не «бесплатна» и не «бесценна» — она непроверяема этим правилом,
+    и решает её судьбу очередь (rank отправляет такие в хвост), а не порог.
+    Прочти незнание нулём — и генератор, забывший посчитать ожидание,
+    выносился бы вперёд посчитанных или снимался бы весь скопом.
+    """
+    expected = _number(expected_rub)
+    cost = _number(test_cost_rub)
+    if expected is None or cost is None or cost <= 0:
+        return None
+    if expected > cost:
+        return None
+    return UNPROFITABLE_REASON.format(expected=expected, cost=cost)
