@@ -67,6 +67,18 @@ REPORT_FIELDS = [
 # Лимит API — десять кампаний на запрос. Не поднимать: одиннадцатая роняет весь вызов.
 CAMPAIGNS_PER_CALL = 10
 
+# Поля, которые приходят из Метрики. Ноль показов визитов — это ноль, а вот отказы и глубина
+# без визитов не измерены вовсе, поэтому None, а не 0.
+METRICA_DEFAULTS: dict[str, Any] = {
+    "visits": 0,
+    "users": 0,
+    "bounce_rate": None,
+    "page_depth": None,
+    "baskets_uniq": 0,
+    "purchased": 0,
+    "revenue": 0.0,
+}
+
 AD_FIELD_BLOCKS = {
     "TextAdFieldNames": ["Title", "Title2", "Text", "Href", "AdImageHash"],
     "TextImageAdFieldNames": ["AdImageHash", "Href"],
@@ -339,7 +351,10 @@ def main() -> None:
         if row is not None:
             row.update(extra)
 
-    rows = list(daily.values())
+    # PostgREST требует одинаковый набор ключей во ВСЕХ объектах пачки, иначе 400 на весь
+    # запрос. Объявление без строки в Метрике (показы были, визитов нет) приходит короче
+    # обогащённого — поэтому недостающие поля добиваются явно, а не остаются отсутствующими.
+    rows = [{**METRICA_DEFAULTS, **row} for row in daily.values()]
     entities = fetch_entities(client["login"], client["token"], {r["ad_id"] for r in rows})
 
     supabase = SupabaseRest()

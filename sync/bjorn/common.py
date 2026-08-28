@@ -308,7 +308,7 @@ class SupabaseRest:
         if headers:
             merged_headers.update(headers)
 
-        last_error: Exception | None = None
+        last_error: object | None = None
         for attempt in range(retries):
             try:
                 response = requests.request(
@@ -323,7 +323,11 @@ class SupabaseRest:
                     return response
                 response.raise_for_status()
             except Exception as exc:
-                last_error = exc
+                # Тело ответа PostgREST — единственное место, где написана ПРИЧИНА («столбца
+                # нет», «ключи объектов не совпадают»). Без него 400 читается как загадка,
+                # и на разбор уходит лишний прогон синка.
+                detail = getattr(getattr(exc, "response", None), "text", "") or ""
+                last_error = exc if not detail else f"{exc}: {detail[:400]}"
                 if attempt == retries - 1:
                     break
                 time.sleep(min(2 ** attempt, 20))
