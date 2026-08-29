@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, List, Mapping
 SAMPLE_LIMIT = 10
 
 
-def _known_campaign_ids(settings_rows: Any) -> set:
+def known_campaign_ids(settings_rows: Any) -> set:
     """Идентификаторы кампаний, настройки которых агент видел.
 
     Витрину настроек отдают в двух формах: agent_db.load_campaign_settings_raw()
@@ -50,7 +50,7 @@ def blind_share(cost_by_campaign: Mapping[str, float], settings_rows: Any,
     двух тактах две реализации одной доли значит однажды напечатать в отчётах
     два разных числа под одним именем.
     """
-    known = _known_campaign_ids(settings_rows)
+    known = known_campaign_ids(settings_rows)
     names = name_by_campaign or {}
 
     total = sum(cost_by_campaign.values())

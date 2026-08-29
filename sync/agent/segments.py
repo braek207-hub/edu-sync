@@ -363,6 +363,70 @@ def fetch_campaign_ids(login: str) -> List[int]:
     return out
 
 
+# Состояния, которыми кампанию из кабинета уже не спрятать. Список полный
+# намеренно: у вопроса «отдаёт ли API эту кампанию вообще» фильтр состояний —
+# ложный отрицательный ответ. Замер 25.08.2026 (probe_blind_campaigns_api,
+# run 32866947540) показал цену такого ответа: 12 из 15 кампаний, считавшихся
+# слепой зоной, API отдавал — просто синк спрашивал их с фильтром
+# ON/OFF/SUSPENDED/ENDED и не находил.
+ALL_CAMPAIGN_STATES = ["ON", "OFF", "SUSPENDED", "ENDED", "CONVERTED", "ARCHIVED"]
+
+
+def fetch_campaigns_by_ids(login: str, campaign_ids: List[Any],
+                           ) -> Dict[str, Dict[str, Any]]:
+    """Что кабинет знает о конкретных кампаниях: {campaign_id: {name, type, ...}}.
+
+    Отличается от fetch_campaign_ids не формой, а вопросом. Тот спрашивает
+    «кто есть в кабинете» и годится, чтобы перечислить объекты; этот
+    спрашивает «знаешь ли ты вот эту» и годится, чтобы РАЗЛИЧИТЬ два случая,
+    которые снаружи выглядят одинаково — кампания есть в кабинете, но не
+    доехала до витрины (дефект синка, чинится кодом), и кампании нет в API
+    вовсе (Мастер кампаний, чинится человеком).
+
+    Различение не теоретическое. 25.08.2026 всю слепую зону списывали на
+    Мастер кампаний, а замер по явным Id показал, что две трети её —
+    обычные TEXT_CAMPAIGN, которые синк ронял на форме массивов. Вопрос без
+    фильтра состояний задавать обязательно: с фильтром ответ «нет» означает
+    «нет в этих состояниях», и оба случая снова сливаются.
+
+    Отсутствующий в ответе Id — это НЕ ошибка и исключением не становится:
+    именно молчание API и есть искомый факт. Кампания одного кабинета,
+    спрошенная у другого, отвечает тем же молчанием, поэтому вызывающий
+    обходит логины и складывает ответы (sync/agent/master.py).
+
+    Форма запроса взята из probe_blind_campaigns_api.py, которым замер и
+    сделан: гадать про формы запросов Директа в этом репозитории уже стоило
+    восьми упавших прогонов (см. fetch_account_goal_ids).
+    """
+    ids = [int(cid) for cid in campaign_ids or ()]
+    out: Dict[str, Dict[str, Any]] = {}
+    for start in range(0, len(ids), PAGE_LIMIT):
+        chunk = ids[start:start + PAGE_LIMIT]
+        result = _api_post(
+            CAMPAIGNS_URL,
+            login,
+            {
+                "method": "get",
+                "params": {
+                    "SelectionCriteria": {"Ids": chunk,
+                                          "States": ALL_CAMPAIGN_STATES},
+                    "FieldNames": ["Id", "Name", "Type", "State", "Status"],
+                    "Page": {"Limit": PAGE_LIMIT},
+                },
+            },
+            "campaigns.get by ids",
+        )
+        for campaign in result.get("Campaigns") or []:
+            out[str(campaign.get("Id"))] = {
+                "login": login,
+                "campaign_name": campaign.get("Name"),
+                "campaign_type": campaign.get("Type"),
+                "state": campaign.get("State"),
+                "status": campaign.get("Status"),
+            }
+    return out
+
+
 # Ключи, под которыми в блоке стратегии лежит цель оптимизации. PriorityGoals —
 # список (у кампании их бывает несколько), GoalId — одиночная цель у стратегий
 # вида MaximumConversionRate / PayForConversion.

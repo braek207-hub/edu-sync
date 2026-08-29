@@ -719,3 +719,62 @@ def test_the_run_prints_what_the_generators_found_this_tact(monkeypatch, capsys)
     generated = report["ideas"]["generated"]
     assert "by_source" in generated and "bundles" in generated
     assert "audience" in generated["sources_without_input"]
+
+
+def test_master_campaign_cards_reach_the_registry(store):
+    """Шестой генератор позван тактом, а не остался чистой функцией.
+
+    Ровно этой болезнью пять первых генераторов болели до задачи: код
+    существовал, звать его было некому, реестр оставался пустым, и отчёт при
+    этом выглядел работающим. Проверяем сквозняк: карточка Мастера кампаний
+    из sync/agent/master.py доезжает до строки реестра — с полосой 7, классом
+    3 и без нагрузки рычага.
+    """
+    card = {
+        "account": "acc-1",
+        "campaign_id": "705571231",
+        "campaign_name": "vsekolledzhi_postupi  / Общее / МК / МСК",
+        "direction": "other",
+        "cost_rub": 1_256_175.0,
+        "clicks": 21_105.0,
+        "leads": 691.0,
+        "eff_leads": 623.0,
+        "revenue_rub": 532_000.0,
+        "window_days": 28,
+        "account_cost_rub": 12_776_230.0,
+        "share_of_account": 0.0983,
+        "base_cpl_rub": 1_500.0,
+        "api": None,
+    }
+
+    summary = _collect(master_rows=[card])
+
+    assert summary["by_source"]["master_campaign"]["upserted"] == 1
+    rows = _rows_of(store, "master_campaign")
+    assert len(rows) == 1
+    assert rows[0]["lane"] == "proposal"
+    assert rows[0]["tier"] == 3
+    assert rows[0]["action"] is None
+
+
+def test_master_cards_of_another_account_do_not_leak(store):
+    """Карточка чужого кабинета в очередь этого не попадает.
+
+    Порог доли, цена лида и заповедник у каждого кабинета свои, и идея,
+    посчитанная по чужой мерке, — приговор не тому кабинету.
+    """
+    card = {
+        "account": "acc-2",
+        "campaign_id": "705571231",
+        "cost_rub": 1_256_175.0,
+        "eff_leads": 623.0,
+        "window_days": 28,
+        "share_of_account": 0.0983,
+        "base_cpl_rub": 1_500.0,
+        "api": None,
+    }
+
+    summary = _collect(master_rows=[card])
+
+    assert summary["by_source"]["master_campaign"]["ideas"] == 0
+    assert _rows_of(store, "master_campaign") == []

@@ -63,6 +63,7 @@ from sync.agent.quality import (
 from sync.agent.hierarchy import hierarchical_modifiers
 from sync.agent.ladder import ladder_report
 from sync.agent.history import budget_response
+from sync.agent import master as master_mod
 from sync.agent.learning_loop import forecast_bias, track_record
 from sync.agent.mining import mine_quasi_experiments, placebo_sigma
 from sync.agent.portfolio import computed_rows as portfolio_computed_rows
@@ -71,6 +72,7 @@ from sync.agent.ideas import abtests as ideas_abtests
 from sync.agent.ideas import bundles as ideas_bundles
 from sync.agent.ideas import consolidate as ideas_consolidate
 from sync.agent.ideas import market as ideas_market
+from sync.agent.ideas import master as ideas_master
 from sync.agent.ideas import proven as ideas_proven
 from sync.agent.ideas import registry as ideas_registry
 from sync.agent.writer import db as writer_db
@@ -419,6 +421,10 @@ def collect_ideas(
     config: Dict[str, Any],
     slice_window_days: int,
     query_window_days: int,
+    # Карточки кампаний вне витрины настроек (sync/agent/master.py). Приходят
+    # готовыми, а не собираются здесь: их сборка спрашивает API Директа, а
+    # collect_ideas обязана считаться на словарях в тесте.
+    master_rows: Optional[List[Dict[str, Any]]] = None,
     today: date = None,
 ) -> Dict[str, Any]:
     """Генераторы идей на данных такта: собрать вход, позвать, записать в реестр.
@@ -573,6 +579,15 @@ def collect_ideas(
             cpl_by_direction=cpl_by_direction,
             live_directions=sorted(directions)), ctx)
         _run(ideas_market.SOURCE, found["ideas"], found["skipped"])
+
+        # Мастер кампаний: единственный генератор, чей вход — не находка
+        # ВНУТРИ кампании, а сама кампания, которой нет в витрине настроек.
+        # Отбор по кабинету здесь такой же, как у остальных: порог доли и цена
+        # эффективного лида у каждого кабинета свои.
+        found = ideas_master.scan(
+            [r for r in (master_rows or ()) if str(r.get("account")) == account],
+            ctx)
+        _run(ideas_master.SOURCE, found["ideas"], found["skipped"])
 
     return {
         "accounts": len(accounts),
@@ -1437,6 +1452,31 @@ def main() -> int:
                                      ladder_section["window_to"]),
     }
 
+    # Мастер кампаний в контуре: слепую долю мало ПОСЧИТАТЬ. Счётчик выше
+    # говорит «10 % расхода мимо», и на этом разговор кончался — кампании
+    # оставались строкой в отчёте, а деньги росли сами по себе (замер
+    # 29.08.2026: те же три кампании за два месяца выросли с 1 098 164 ₽ до
+    # 2 437 394 ₽). Здесь зона разбирается на две: кампании, которые API
+    # ОТДАЁТ (дефект синка, чинится кодом) и кампании, про которые он молчит
+    # (Мастер кампаний, чинится человеком) — и вторые уезжают генератору идей
+    # предложениями полосы 7.
+    #
+    # Окно то же, что у слепой доли решений: два числа под одним разговором
+    # обязаны быть посчитаны на одном окне, иначе «10 % мимо» и «столько-то
+    # рублей Мастера» не сходятся и оба перестают читаться.
+    #
+    # Опрос API кабинетов расчёт не роняет: это отчётный слой поверх него, и
+    # недоступный токен обязан стать видимой причиной, а не упавшим тактом.
+    try:
+        master_view = master_mod.view(
+            facts=facts, settings_rows=campaign_settings,
+            login_by_campaign=login_by_campaign_id,
+            logins=[c["login"] for c in clients],
+            window_from=decision_from, window_to=ladder_section["window_to"])
+    except Exception as exc:  # noqa: BLE001
+        master_view = {"unavailable": f"{type(exc).__name__}: {exc}"[:200],
+                       "rows": []}
+
     # Петля обучения на СВОИХ действиях: послужной список рычагов и смещение
     # прогноза по журналу применённых изменений. Недоступность журнала расчёт
     # не роняет — это отчётный слой поверх него, ровно как настройки выше;
@@ -1582,7 +1622,8 @@ def main() -> int:
         holdout_ids=[str(h["campaign_id"]) for h in holdout],
         learning_reset=learning_reset, quality_drift=quality["drift"],
         config=active_config, slice_window_days=SLICE_WINDOW_DAYS,
-        query_window_days=QUERY_WINDOW_DAYS)
+        query_window_days=QUERY_WINDOW_DAYS,
+        master_rows=master_view.get("rows") or [])
     if learning_reset_error:
         generated["learning_reset_unavailable"] = learning_reset_error
 
@@ -1604,6 +1645,11 @@ def main() -> int:
         # от отсутствия слепой зоны, а решения принимаются по числам рядом с
         # ней. Смотреть на decision_window — по нему агент двигает деньги.
         "blind_spend": blind,
+        # Разбор слепой зоны на два непохожих случая. Печатается всегда:
+        # ноль в visible_in_api — единственное доказательство, что синк
+        # настроек донёс всё, что API отдаёт, а cost_silent_in_api_rub — размер
+        # зоны, которая кодом не лечится и уходит рекомендациями человеку.
+        "master": master_mod.report_section(master_view),
         "sliced_rows": len(sliced_rows),
         "objects": len(object_rows),
         "search_queries": len(query_rows),
