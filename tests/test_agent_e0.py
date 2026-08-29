@@ -1283,6 +1283,26 @@ def test_monthly_cap_from_the_panel_reaches_the_solver(monkeypatch, capsys):
     assert captured[1]["target_romi"] == 2.0
 
 
+def test_target_romi_from_the_panel_reaches_tcpa(monkeypatch, capsys):
+    # Протокол беты обещает: target_romi «прямо влияет на допустимый CPA».
+    # До 29.08 tcpa_targets звался без него и считал на 1.0 (безубыточность).
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(
+        agent_e0.agent_db, "load_agent_config",
+        lambda *a, **k: {"preset": None, "overrides": {"target_romi": 2.0}})
+    captured = []
+    real = agent_e0.tcpa_targets
+
+    def spy(*args, **kwargs):
+        captured.append(kwargs)
+        return real(*args, **kwargs)
+    monkeypatch.setattr(agent_e0, "tcpa_targets", spy)
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+    assert captured and captured[0]["target_romi"] == 2.0
+
+
 def test_the_month_plan_reaches_the_solver_by_account(monkeypatch, capsys):
     # Пейсинг считается в такте, а работает у солвера: план, который никуда
     # не доехал, выглядит применённым и молча оставляет кабинет на трейлинге.
