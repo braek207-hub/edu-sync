@@ -584,7 +584,7 @@ def test_live_mark_stale_reports_finding_once_and_keeps_it_visible():
     try:
         writer_db.mark_sent(writer_db.insert_action(_journal_row(key, account)))
         _backdate(key, minutes=90)
-        created_at = _read_row(key)["created_at"]
+        sent_at = _read_row(key)["sent_at"]
 
         first = writer_db.mark_stale_planned(60, account=account)
         second = writer_db.mark_stale_planned(60, account=account)
@@ -595,8 +595,8 @@ def test_live_mark_stale_reports_finding_once_and_keeps_it_visible():
         row = _read_row(key)
         assert row["status"] == "stale"
         # Момент отправки, а не момент обнаружения: изменение прошлой недели не
-        # должно съедать риск-бюджет текущей.
-        assert row["applied_at"] == created_at
+        # должно съедать риск-бюджет текущей (MARK_STALE_SQL: applied_at ← sent_at).
+        assert row["applied_at"] == sent_at
         assert row["response"]["stale"] is True
     finally:
         _cleanup(key)
