@@ -65,6 +65,9 @@ def _campaign(**over):
         # черновик звал поле days_since_budget_change; сбрасывает обучение не
         # только бюджет (writer/learning.py), и поле названо по смыслу.
         "days_since_learning_reset": 60,
+        # Прочитан ли журнал сбросов. Отдельно от срока: «строки нет» и
+        # «журнал недоступен» ведут к разным решениям.
+        "learning_reset_read": True,
     }
     row.update(over)
     return row
@@ -195,12 +198,24 @@ def test_cooldown_window_is_the_learning_one():
                for i in abtests.candidates([just_out], _ctx()))
 
 
-def test_unknown_reset_date_blocks_resetting_tests():
-    # «Не знаем, когда сбрасывали» — не то же самое, что «давно». Подмена
-    # первого вторым предложила бы сбрасывающий тест поверх свежего сброса.
-    unknown = _campaign(days_since_learning_reset=None)
+def test_unread_journal_blocks_resetting_tests():
+    # «Читать было нечем» — не то же самое, что «давно». Подмена первого
+    # вторым предложила бы сбрасывающий тест поверх свежего сброса.
+    unknown = _campaign(days_since_learning_reset=None,
+                        learning_reset_read=False)
     assert all(not i["subject"]["resets_learning"]
                for i in abtests.candidates([unknown], _ctx()))
+
+
+def test_a_campaign_the_agent_never_touched_is_not_in_cooldown():
+    # Журнал прочитан, строки нет — агент кампанию не трогал, значит и
+    # обучения не сбрасывал: охранять кулдауну нечего. До 29.08.2026 оба
+    # состояния были неотличимы, и на кабинете без единого применённого
+    # действия это давало 300 отказов — главный стопор генератора.
+    untouched = _campaign(days_since_learning_reset=None,
+                          learning_reset_read=True)
+    assert any(i["subject"]["resets_learning"]
+               for i in abtests.candidates([untouched], _ctx()))
 
 
 def test_resetting_class_comes_from_the_learning_module():

@@ -454,6 +454,7 @@ def campaign_tests(
     *,
     holdout_ids: Sequence[str],
     learning_reset: Dict[str, Any],
+    learning_reset_read: bool,
     today: date,
 ) -> List[Dict[str, Any]]:
     """Справочник кампаний → строки для генератора A/B-тестов.
@@ -463,6 +464,15 @@ def campaign_tests(
     устраивает изменение, а не время. Кампании, которую агент не трогал, ключ
     не проставляется вовсе — иначе «никогда не трогали» читалось бы как
     «сбросили сегодня» или наоборот, и обе подмены двигают срок теста.
+
+    learning_reset_read — прочитан ли журнал вообще. Без этого флага «агент
+    эту кампанию не трогал» и «журнал недоступен» выглядят одинаково — пустым
+    местом, — и генератор теста отказывал в обоих случаях. Цена измерена на
+    прогоне 29.08.2026: агент не применял ещё ни одного действия, журнал пуст
+    у ВСЕХ кампаний, и 300 отказов «неизвестно, когда сбрасывалось обучение»
+    были главным стопором генератора. Журнал полон по действиям агента —
+    больше он ничего и не обещает: правку рукой он не видел никогда, ни у
+    кампании со строкой, ни у кампании без неё.
     """
     guarded = {str(h) for h in (holdout_ids or ())}
     rows: List[Dict[str, Any]] = []
@@ -475,6 +485,7 @@ def campaign_tests(
             "cost_rub": entry.get("cost_28d"),
             "window_days": PORTFOLIO_WINDOW_DAYS,
             "in_holdout": campaign_id in guarded,
+            "learning_reset_read": bool(learning_reset_read),
         }
         if "limit_binds" in entry:
             row["limit_binds"] = entry["limit_binds"]

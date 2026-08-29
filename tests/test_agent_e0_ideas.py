@@ -581,6 +581,7 @@ def _collect(**over):
         "direction_by_campaign": {"111": "vuz"},
         "holdout_ids": [],
         "learning_reset": {},
+        "learning_reset_read": True,
         "quality_drift": {},
         "config": {},
         "slice_window_days": 90,

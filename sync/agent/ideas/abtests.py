@@ -278,8 +278,13 @@ def _one(row: Dict[str, Any], test_kind: str, entry: Dict[str, Any],
     if resets:
         since = facts["days_since_learning_reset"]
         if since is None:
-            return None, _skip(campaign_id, REASON_RESET_UNKNOWN, test_kind)
-        if since < learning_mod.LEARNING_COOLDOWN_DAYS:
+            # Пусто по двум разным причинам, и решения по ним разные.
+            # Журнал прочитан, строки нет — агент эту кампанию не трогал,
+            # значит и обучения не сбрасывал: кулдауну нечего охранять.
+            # Журнал не прочитан — состояние действительно неизвестно.
+            if not facts["learning_reset_read"]:
+                return None, _skip(campaign_id, REASON_RESET_UNKNOWN, test_kind)
+        elif since < learning_mod.LEARNING_COOLDOWN_DAYS:
             return None, _skip(campaign_id, REASON_LEARNING_COOLDOWN, test_kind)
 
     horizon = _horizon(facts["daily_leads"], resets)
@@ -385,6 +390,9 @@ def _facts(row: Dict[str, Any], ctx: Dict[str, Any],
         "comparison": comparison,
         "comparison_object_id": against,
         "days_since_learning_reset": None if since is None else int(since),
+        # Прочитан ли журнал сбросов. Отдельно от самого срока: «строки нет»
+        # и «читать было нечем» ведут к разным решениям (см. _one).
+        "learning_reset_read": bool(row.get("learning_reset_read")),
         "limit_binds": None if binds is None else bool(binds),
         "lost_before": lost_before(ctx),
     }, None

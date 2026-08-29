@@ -376,11 +376,11 @@ def test_donor_without_an_average_check_names_the_missing_numerator():
 # ============================================== кампании тестов (abtest)
 
 
-def _tests(index=None, holdout=(), reset=None, today=None):
+def _tests(index=None, holdout=(), reset=None, today=None, reset_read=True):
     from datetime import date
     return bundles.campaign_tests(
         index or _index(), holdout_ids=holdout, learning_reset=reset or {},
-        today=today or date(2026, 8, 27))
+        learning_reset_read=reset_read, today=today or date(2026, 8, 27))
 
 
 def test_campaign_row_carries_the_portfolio_numbers():

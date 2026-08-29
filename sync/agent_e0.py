@@ -445,6 +445,10 @@ def collect_ideas(
     direction_by_campaign: Dict[str, str],
     holdout_ids: List[str],
     learning_reset: Dict[str, Any],
+    # Прочитан ли журнал сбросов вообще. Без флага «агент кампанию не трогал»
+    # и «журнал недоступен» неразличимы, и генератор теста отказывал в обоих
+    # случаях (29.08.2026 — 300 отказов, главный стопор генератора).
+    learning_reset_read: bool,
     quality_drift: Dict[str, Any],
     config: Dict[str, Any],
     slice_window_days: int,
@@ -492,7 +496,7 @@ def collect_ideas(
         window_days=query_window_days)
     tests = ideas_bundles.campaign_tests(
         index, holdout_ids=holdout_ids, learning_reset=learning_reset,
-        today=today)
+        learning_reset_read=learning_reset_read, today=today)
 
     # Цена эффективного лида по направлениям и живые направления кабинета —
     # на окне лестницы, том же, на котором посчитана ценность лида. Другое
@@ -1814,7 +1818,9 @@ def main() -> int:
         login_by_campaign=login_by_campaign_id,
         direction_by_campaign=direction_by_campaign,
         holdout_ids=[str(h["campaign_id"]) for h in holdout],
-        learning_reset=learning_reset, quality_drift=quality["drift"],
+        learning_reset=learning_reset,
+        learning_reset_read=learning_reset_error is None,
+        quality_drift=quality["drift"],
         config=active_config, slice_window_days=SLICE_WINDOW_DAYS,
         query_window_days=QUERY_WINDOW_DAYS,
         master_rows=master_view.get("rows") or [])
