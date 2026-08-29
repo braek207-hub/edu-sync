@@ -271,3 +271,34 @@ def test_calculation_campaign_list_asks_for_names_and_drops_foreign(monkeypatch)
 
     assert ids == [1]
     assert "Name" in captured["payload"]["params"]["FieldNames"]
+
+
+# --------------------------------------------- подключение: журнальные стадии
+
+
+def test_watchdog_ignores_actions_of_the_excluded_account():
+    import sync.agent_e1_watchdog as watchdog
+
+    actions = [{"action_id": "a", "account": "account10-506462-fqs4"},
+               {"action_id": "b", "account": " account4-506456-gsrr "}]
+
+    assert [a["action_id"] for a in watchdog.own_actions(actions)] == ["a"]
+
+
+def test_drift_ignores_actions_of_the_excluded_account():
+    import sync.agent_drift as agent_drift
+
+    actions = [{"action_id": "a", "account": "account1-506453-ln8s"},
+               {"action_id": "b", "account": "ACCOUNT4-506456-GSRR"}]
+
+    assert [a["action_id"] for a in agent_drift.own_actions(actions)] == ["a"]
+
+
+def test_review_ignores_rejects_of_the_excluded_account():
+    import sync.agent_review as agent_review
+
+    rejects = [{"account": "account1-506453-ln8s", "kind": "bid"},
+               {"account": "account4-506456-gsrr", "kind": "bid"}]
+
+    assert [r["account"] for r in agent_review.own_rejects(rejects)] == [
+        "account1-506453-ln8s"]

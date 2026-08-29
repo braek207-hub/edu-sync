@@ -55,6 +55,7 @@ from sync.agent import db as agent_db
 from sync.agent import gate as gate_module
 from sync.agent import holdout
 from sync.agent import notify
+from sync.agent import scope as agent_scope
 from sync.agent import tact_effect
 from sync.agent.ideas import registry as ideas_registry
 from sync.agent.gate import mart_gate, with_source_checks
@@ -1646,6 +1647,18 @@ def watch(client, actions: List[Dict[str, Any]], db_module, holdout_ids: set,
     }
 
 
+def own_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Строки журнала своих кабинетов (sync/agent/scope.py).
+
+    Журнал — общая таблица, и кабинет в ней всего лишь колонка: прогон,
+    который перестали запускать по кабинету, продолжает видеть его прошлые
+    строки и продолжает их судить. Исключение поэтому стоит и здесь, а не
+    только на входе кабинетов, — иначе граница держалась бы на том, что
+    кто-то не забыл убрать логин из секрета.
+    """
+    return [a for a in actions if not agent_scope.is_excluded_account(a.get("account"))]
+
+
 def facts_window(actions: List[Dict[str, Any]], today: date,
                  crm_through: Optional[date]) -> Optional[Tuple[date, date]]:
     """Общий отрезок дат, покрывающий окна наблюдения всех действий.
@@ -2030,7 +2043,7 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
     if not dry_run:
         stale_found = writer_db.mark_stale_planned(STALE_SWEEP_MINUTES)
 
-    actions = writer_db.open_actions()
+    actions = own_actions(writer_db.open_actions())
     holdout_ids = {str(h) for h in agent_db.load_holdout_ids()}
     # Граница зрелости CRM — один запрос на прогон. Дальше неё лежат дни, где
     # расход Директа уже приехал, а лиды ещё нет: 19.08.2026 — 927 945 рублей
