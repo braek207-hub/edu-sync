@@ -486,9 +486,44 @@ def test_a_finished_idea_does_not_come_back(store):
     assert registry.load(_id(_idea()))["status"] == registry.STATUS_DONE
 
 
-def test_a_dropped_idea_does_not_come_back(store):
+def test_a_machine_drop_is_revisited_on_the_next_pass(store):
+    # Измеренный дефект 29.08.2026: генератор abtest ставил предложениям
+    # смету, которой у них нет, и порог парности снял 94 идеи. Дефект
+    # починили в тот же день — идеи не вернулись: следующий прогон нашёл те
+    # же находки, но 34 из них легли на снятые строки и остались снятыми.
+    # Машинное снятие есть вердикт правил, а правила поменялись.
     registry.upsert([_idea()])
-    registry.mark(_id(_idea()), registry.STATUS_DROPPED, reason="объект исчез")
+    registry.mark(_id(_idea()), registry.STATUS_DROPPED, reason="смета без ожидания")
+
+    registry.upsert([_idea(status=registry.STATUS_NEW)])
+
+    row = registry.load(_id(_idea()))
+    assert row["status"] == registry.STATUS_NEW
+    # Причина уходит вместе со статусом: живая идея с текстом «снята» —
+    # это строка, которую разбор прочтёт неверно.
+    assert not row["dropped_reason"]
+
+
+def test_a_human_rejection_survives_regeneration(store):
+    # Отказ человека машине не отменять: это решение, а не вердикт правил.
+    registry.upsert([_idea()])
+    registry.reject(_id(_idea()), by="Павел", reason="не наш продукт")
+
+    registry.upsert([_idea(status=registry.STATUS_NEW)])
+
+    row = registry.load(_id(_idea()))
+    assert row["status"] == registry.STATUS_DROPPED
+    assert "Павел" in row["dropped_reason"]
+
+
+def test_a_lost_bet_does_not_come_back(store):
+    # Снятая ПРИМЕНЁННАЯ идея — исход состоявшегося замера (experiments:
+    # lost, rolled_back). Вернуть её в очередь значило бы переставить ту же
+    # ставку, забыв результат, и заплатить за повтор замера деньгами.
+    registry.upsert([_idea()])
+    registry.mark(_id(_idea()), registry.STATUS_RUNNING, action_id="a-1",
+                  experiment_id="e-1")
+    registry.mark(_id(_idea()), registry.STATUS_DROPPED, reason="ставка проиграна")
 
     registry.upsert([_idea(status=registry.STATUS_NEW)])
 
@@ -577,6 +612,55 @@ def test_free_check_is_not_judged_by_the_threshold(store):
     # Ноль в цене — проверка бесплатна: идея опирается на уже собранные
     # данные и окупается любым неотрицательным ожиданием.
     registry.upsert([_idea(expected_rub=1.0, test_cost_rub=0.0)])
+    assert registry.load(_id(_idea()))["status"] == registry.STATUS_NEW
+
+
+def _spending(rub_delta, campaign="123"):
+    """Действие с обещанием: сколько РАСХОДА оно добавляет."""
+    action = _action(campaign)
+    action["expected"] = {"leads_delta": 1.0, "rub_delta": rub_delta,
+                          "measure_days": 7}
+    return action
+
+
+def test_a_reallocation_is_not_cut_by_the_profitability_floor(store):
+    # Корректировка ставки не тратит лишнего: расход кампании тот же, меняется
+    # раскладка по сегментам (rub_delta = 0). Порог же сравнивал среднее
+    # ожидание с ХУДШИМ случаем сметы (risk.action_risk, запас ×2), а для
+    # корректировки это требование «сдвиг × окупаемость > 2» — при сдвиге 20 %
+    # нужна окупаемость больше десяти. Замер 29.08.2026 (прод): 67 идей
+    # генератора proven, 64 сняты «проверка дороже находки», живых ноль.
+    registry.upsert([_idea(expected_rub=303.0, test_cost_rub=6_204.0,
+                           action=_spending(0.0))])
+    assert registry.load(_id(_idea()))["status"] == registry.STATUS_NEW
+
+
+def test_an_idea_that_really_spends_still_has_to_pay_for_itself(store):
+    # Подъём бюджета и запуск тратят деньги, которых иначе бы не потратили:
+    # там смета и трата — одно число, и вопрос «вернёт ли идея потраченное»
+    # имеет смысл. Порог остаётся ровно здесь.
+    registry.upsert([_idea(expected_rub=400.0, test_cost_rub=500.0,
+                           action=_spending(500.0))])
+    row = registry.load(_id(_idea()))
+
+    assert row["status"] == registry.STATUS_DROPPED
+    assert "не окупает" in row["dropped_reason"]
+
+
+def test_an_action_without_an_expectation_is_judged_as_before(store):
+    # Обещания нет — трата неизвестна, а не равна нулю. Незнание не повод
+    # снимать гарантию: такая строка судится по-старому.
+    registry.upsert([_idea(expected_rub=400.0, test_cost_rub=500.0)])
+    assert registry.load(_id(_idea()))["status"] == registry.STATUS_DROPPED
+
+
+def test_the_sweep_uses_the_same_rule_as_the_write(store):
+    # Проход по живому реестру судит теми же тремя величинами. Разъедься они —
+    # идея, принятая тактом, закрывалась бы проходом через минуту, и по данным
+    # это выглядело бы как «генератор пишет убыточное».
+    registry.upsert([_idea(expected_rub=303.0, test_cost_rub=6_204.0,
+                           action=_spending(0.0))])
+    assert registry.sweep_open() == []
     assert registry.load(_id(_idea()))["status"] == registry.STATUS_NEW
 
 

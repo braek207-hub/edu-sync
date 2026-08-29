@@ -431,6 +431,56 @@ def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
 # ------------------------------------------------------------------- запись
 
 
+def is_final(existing: Optional[Dict[str, Any]]) -> bool:
+    """Закрыта ли строка НАВСЕГДА, или её вердикт подлежит пересмотру.
+
+    Разница не формальная, и цена её измерена. 29.08.2026 генератор abtest
+    ставил предложениям класса 3 смету — оборот кампании за срок замера, —
+    и порог парности снял 94 идеи. Дефект починили в тот же день (abtests.py:
+    у предложения сметы нет, оно риск-бюджетом не платит), но идеи не
+    вернулись: следующий прогон нашёл те же 57 находок, а 34 из них легли на
+    уже снятые строки и остались снятыми. Экран показывал 23 идеи из 57, и
+    прочитать причину было неоткуда — генератор отчитался, что нашёл все.
+
+    Навсегда закрыто то, что СЛУЧИЛОСЬ, — а случилось ровно три вещи:
+
+      * done — идея прожила свой путь, у неё есть исход;
+      * отказ ЧЕЛОВЕКА (rejected_by) — решение, которое машине не отменять;
+      * снятие УЖЕ ПРИМЕНЁННОЙ идеи (есть action_id или experiment_id) —
+        ставка была сделана и проиграна (experiments: lost, rolled_back).
+        Вернуть такую в очередь значило бы переставить ту же ставку, забыв
+        её исход, и замер повторился бы деньгами.
+
+    Машинное снятие НЕПРИМЕНЁННОЙ идеи — не событие, а вердикт сегодняшних
+    правил: порог, контракт величин, предел срока. Правила меняются (сегодня
+    их поменяли трижды), и вердикт обязан пересчитаться на новых. Строка при
+    этом не теряется и историю не подделывает: она лежит снятой ровно до того
+    такта, в котором генератор находит её снова и новые правила её принимают.
+    """
+    if existing is None:
+        return False
+    status = str(existing.get("status"))
+    if status == STATUS_DONE:
+        return True
+    if status != STATUS_DROPPED:
+        return False
+    return any(_text(existing.get(field))
+               for field in ("rejected_by", "action_id", "experiment_id"))
+
+
+def _reopen(existing: Dict[str, Any]) -> Dict[str, Any]:
+    """Снятая машиной строка возвращается в очередь чистой.
+
+    Причина снятия стирается вместе со статусом: оставь её — и живая идея
+    несла бы в экране объяснение, по которому её когда-то сняли, а разбор
+    читал бы «снята» у строки со статусом new.
+    """
+    out = dict(existing)
+    out["status"] = STATUS_NEW
+    out["dropped_reason"] = None
+    return out
+
+
 def _merge(existing: Optional[Dict[str, Any]],
            incoming: Dict[str, Any]) -> Dict[str, Any]:
     """Что окажется в строке после повторной находки той же идеи.
@@ -440,21 +490,28 @@ def _merge(existing: Optional[Dict[str, Any]],
     связи с действием и ставкой, причина снятия и отказ человека остаются
     такими, какими их поставили применение и человек.
 
-    Закрытая строка не переписывается вовсе — даже числами. Смета закрытой
-    идеи есть основание уже принятого решения, и правка её задним числом
-    оставила бы разбор без тех чисел, по которым идею закрывали.
+    Окончательно закрытая строка (is_final) не переписывается вовсе — даже
+    числами. Смета такой идеи есть основание уже принятого решения, и правка
+    её задним числом оставила бы разбор без тех чисел, по которым идею
+    закрывали.
 
-    Живая, наоборот, числа обязана обновлять: заморозь их — и очередь
-    ранжировалась бы по ценности, посчитанной в день появления идеи.
+    Снятая машиной — наоборот: её вердикт пересматривается, поэтому строка
+    возвращается в очередь и числа обновляются. Пройдут ли новые правила,
+    решают _silence и _drop_unprofitable ниже по потоку; не пройдут — она
+    ляжет снятой снова, уже с сегодняшней причиной.
+
+    Живая числа обязана обновлять: заморозь их — и очередь ранжировалась бы
+    по ценности, посчитанной в день появления идеи.
     """
     if existing is None:
         return incoming
-    if str(existing.get("status")) in CLOSED_STATUSES:
+    if is_final(existing):
         return dict(existing)
-    merged = dict(existing)
+    base = (_reopen(existing)
+            if str(existing.get("status")) == STATUS_DROPPED else dict(existing))
     for field in GENERATOR_FIELDS:
-        merged[field] = incoming[field]
-    return merged
+        base[field] = incoming[field]
+    return base
 
 
 def upsert(ideas: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -465,9 +522,11 @@ def upsert(ideas: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     нет), и назавтра генератор досыпал бы остаток как новые идеи. Поэтому
     сначала проверяется всё, и только потом пишется.
 
-    Закрытые строки не переписываются и не пишутся заново: их updated_at
-    обязан остаться днём закрытия, иначе «эта идея закрыта два месяца назад»
-    перестало бы быть видно в данных.
+    Окончательно закрытые строки (is_final) не переписываются и не пишутся
+    заново: их updated_at обязан остаться днём закрытия, иначе «эта идея
+    закрыта два месяца назад» перестало бы быть видно в данных. Снятая
+    машиной, но не применённая идея — не из них: её вердикт пересматривается,
+    и такт пишет её заново.
     """
     prepared = [_prepare(idea) for idea in ideas]
     if not prepared:
@@ -488,12 +547,11 @@ def upsert(ideas: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     to_write: List[Dict[str, Any]] = []
     for row in prepared:
         old = existing.get(row["idea_id"])
-        was_closed = old is not None and str(old.get("status")) in CLOSED_STATUSES
         merged = _merge(old, row)
-        if was_closed:
-            # Уже закрытая строка не переписывается и не пишется заново: её
-            # updated_at обязан остаться днём закрытия, иначе «эта идея
-            # закрыта два месяца назад» перестанет быть видно в данных.
+        if is_final(old):
+            # Окончательно закрытая строка не переписывается и не пишется
+            # заново: её updated_at обязан остаться днём закрытия, иначе «эта
+            # идея закрыта два месяца назад» перестанет быть видно в данных.
             result.append(merged)
             continue
         merged = _silence(merged, rejections.get(row["subject_key"]))
@@ -537,6 +595,28 @@ def _silence(row: Dict[str, Any],
     return out
 
 
+def _spend_delta(row: Dict[str, Any]) -> Optional[float]:
+    """Насколько действие идеи меняет РАСХОД. None — обещания нет вовсе.
+
+    Отдельная величина от сметы: смета говорит, сколько денег под ударом,
+    а эта — сколько денег вообще уйдёт сверх того, что и так тратится.
+    У корректировки ставки она ноль (раскладка меняется, лимит нет), у
+    подъёма бюджета и запуска — положительна. Порог окупаемости смотрит
+    именно сюда (ideas/limits.unprofitable_reason).
+    """
+    action = row.get("action")
+    if not isinstance(action, dict):
+        return None
+    expected = action.get("expected")
+    if not isinstance(expected, dict):
+        return None
+    try:
+        value = float(expected.get("rub_delta"))
+    except (TypeError, ValueError):
+        return None
+    return value if value == value else None
+
+
 def _drop_unprofitable(row: Dict[str, Any]) -> Dict[str, Any]:
     """Идея, которая не окупает собственную проверку.
 
@@ -548,12 +628,14 @@ def _drop_unprofitable(row: Dict[str, Any]) -> Dict[str, Any]:
 
     Уже снятое человеком не переписывается: его причина сильнее и должна
     остаться в строке — иначе разбор увидит машинный отказ там, где было
-    решение человека.
+    решение человека. Признак — rejected_by, а не статус: статус dropped
+    ставит и машина, и по нему эти два случая неразличимы.
     """
-    if str(row.get("status")) == STATUS_DROPPED:
+    if str(row.get("status")) == STATUS_DROPPED and _text(row.get("rejected_by")):
         return row
     reason = limits.unprofitable_reason(row.get("expected_rub"),
-                                        row.get("test_cost_rub"))
+                                        row.get("test_cost_rub"),
+                                        _spend_delta(row))
     if reason is None:
         return row
     out = dict(row)
@@ -745,7 +827,8 @@ def sweep_open(account: Optional[str] = None) -> List[Dict[str, Any]]:
         if str(row.get("status")) not in SWEEPABLE_STATUSES:
             continue
         reason = limits.closing_reason(row.get("expected_rub"),
-                                       row.get("test_cost_rub"))
+                                       row.get("test_cost_rub"),
+                                       _spend_delta(row))
         if reason is None:
             continue
         out = dict(row)

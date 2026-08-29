@@ -53,8 +53,41 @@ def max_horizon(ctx: Optional[Dict[str, Any]]) -> int:
     return int(value)
 
 
-def unprofitable_reason(expected_rub: Any, test_cost_rub: Any) -> Optional[str]:
+def unprofitable_reason(expected_rub: Any, test_cost_rub: Any,
+                        spend_delta_rub: Any = None) -> Optional[str]:
     """Причина снятия, если идея не окупает собственную проверку. Иначе None.
+
+    **Порог судит ПОТРАЧЕННОЕ, а не выставленное под удар.** Третья величина
+    появилась не для гибкости, а потому что без неё порог сравнивал разное:
+    ожидание — это среднее (expectation: перенос moved ₽ по измеренной
+    разнице окупаемостей), а смета — сознательный ХУДШИЙ случай
+    (writer/risk.action_risk: «сколько денег МАКСИМУМ уйдёт неоптимально»,
+    exposure.BID_ELASTICITY = 2.0 запасом, неизвестная доля = весь объект).
+
+    Для корректировки ставки это сравнение невыполнимо арифметически, а не по
+    слабости идей. Ожидание = moved × сдвиг × (ценность лида ÷ CPA); смета =
+    moved × 2. Отношение = сдвиг × окупаемость ÷ 2, то есть порог требует
+    «сдвиг × ROMI > 2»: при корректировке 20 % — окупаемости больше десяти.
+    Замер 29.08.2026 (прод): у генератора proven 67 идей, 64 сняты как
+    «проверка дороже находки», живых ноль. Порог не отсеивал слабое — он
+    отсекал весь класс рычага.
+
+    Что порогу окупать. Корректировка НЕ тратит лишнего: расход кампании тот
+    же, меняется его раскладка по сегментам (expectation._bid_modifier:
+    rub_delta = 0). Ошибись мы — потеряем зеркало обещания, и эта потеря уже
+    накрыта двумя другими механизмами: риск-бюджет полосы считает её худшим
+    случаем и держит недельный предел (writer/risk), а очередь ранжирует
+    обещанием на рубль под ударом (registry.rank). Третий раз то же самое, но
+    порогом-обрывом, — не осторожность, а глухота.
+
+    Поэтому порог остаётся там, где проверка ЖРЁТ деньги, которых иначе бы не
+    потратили: подъём бюджета, запуск кампании. Там смета и трата — одно и то
+    же число, и вопрос «вернёт ли идея потраченное» имеет смысл.
+
+    spend_delta_rub — изменение расхода, которое обещает действие
+    (expectation: rub_delta). Не больше нуля — тратить нечего, и порог
+    молчит. None значит «неизвестно», и тогда судится по-старому: незнание не
+    повод снимать гарантию.
 
     **Порог не свой, а тождественный.** Очередь и так ранжируется отношением
     «ожидание ÷ цена проверки» (registry.rank), но пола у отношения не было, и
@@ -78,6 +111,9 @@ def unprofitable_reason(expected_rub: Any, test_cost_rub: Any) -> Optional[str]:
     expected = _number(expected_rub)
     cost = _number(test_cost_rub)
     if expected is None or cost is None or cost <= 0:
+        return None
+    spend = _number(spend_delta_rub)
+    if spend is not None and spend <= 0:
         return None
     if expected > cost:
         return None
@@ -125,7 +161,8 @@ def unpaired_reason(expected_rub: Any, test_cost_rub: Any) -> Optional[str]:
     return UNPAIRED_REASON.format(cost=cost)
 
 
-def closing_reason(expected_rub: Any, test_cost_rub: Any) -> Optional[str]:
+def closing_reason(expected_rub: Any, test_cost_rub: Any,
+                   spend_delta_rub: Any = None) -> Optional[str]:
     """Причина закрыть УЖЕ принятую строку реестра. Иначе None.
 
     Одна дверь на оба правила — для прохода по живому реестру
@@ -140,4 +177,5 @@ def closing_reason(expected_rub: Any, test_cost_rub: Any) -> Optional[str]:
     сказать про неё «не окупает» значило бы придумать за генератор число.
     """
     return (unpaired_reason(expected_rub, test_cost_rub)
-            or unprofitable_reason(expected_rub, test_cost_rub))
+            or unprofitable_reason(expected_rub, test_cost_rub,
+                                   spend_delta_rub))
