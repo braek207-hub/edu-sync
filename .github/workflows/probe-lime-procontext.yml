@@ -1,0 +1,45 @@
+name: Probe LIME PROCONTEXT vs lime_stats
+
+# Только чтение: сравнивает MySQL PROCONTEXT (lc_simple_view — источник Power BI)
+# с нашей витриной lime_stats. Запускается руками, ничего не пишет.
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe_from:
+        description: "Начало окна (YYYY-MM-DD, пусто — последние 30 дней)"
+        required: false
+        default: ""
+      probe_to:
+        description: "Конец окна (YYYY-MM-DD)"
+        required: false
+        default: ""
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run probe
+        env:
+          LIME_DB_HOST: ${{ secrets.LIME_DB_HOST }}
+          LIME_DB_PORT: ${{ secrets.LIME_DB_PORT }}
+          LIME_DB_SCHEMA: ${{ secrets.LIME_DB_SCHEMA }}
+          LIME_DB_USER: ${{ secrets.LIME_DB_USER }}
+          LIME_DB_PASSWORD: ${{ secrets.LIME_DB_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PROBE_FROM: ${{ github.event.inputs.probe_from }}
+          PROBE_TO: ${{ github.event.inputs.probe_to }}
+          PYTHONIOENCODING: "utf-8"
+        run: python probe_lime_procontext.py
