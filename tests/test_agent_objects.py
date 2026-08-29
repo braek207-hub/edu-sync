@@ -411,7 +411,9 @@ def test_expansion_candidates_are_converting_queries_we_do_not_buy():
         {"campaign_id": "1", "query": "случайный запрос", "matched_key": "вуз москва",
          "cost": 300.0, "clicks": 5, "conversions": 1},
     ]
-    out = expansion_candidates(queries, cpa_limit=1700.0)
+    from sync.agent.objects import own_semantics
+    bought = own_semantics(queries, {"1": ["вуз москва"]})[1]
+    out = expansion_candidates(queries, cpa_limit=1700.0, bought=bought)
     assert [c["query"] for c in out] == ["кинорежиссер москва"]
     row = out[0]
     assert row["conversions"] == 12
@@ -430,7 +432,10 @@ def test_expansion_candidates_rank_by_headroom_not_by_volume():
         {"campaign_id": "1", "query": "средний", "matched_key": "ключ",
          "cost": 12_000.0, "clicks": 40, "conversions": 10},  # CPA 1200
     ]
-    out = expansion_candidates(queries, cpa_limit=1700.0)
+    from sync.agent.objects import own_semantics
+    out = expansion_candidates(
+        queries, cpa_limit=1700.0,
+        bought=own_semantics(queries, {"1": ["ключ"]})[1])
     assert [c["query"] for c in out] == ["дешёвый", "средний"]
 
 
@@ -442,7 +447,10 @@ def test_expansion_ignores_queries_already_bought_in_another_campaign():
         {"campaign_id": "2", "query": "другой запрос", "matched_key": "заочное обучение",
          "cost": 1000.0, "clicks": 20, "conversions": 5},
     ]
-    out = expansion_candidates(queries, cpa_limit=1700.0)
+    from sync.agent.objects import own_semantics
+    bought = own_semantics(queries, {"1": ["вуз"],
+                                     "2": ["заочное обучение"]})[1]
+    out = expansion_candidates(queries, cpa_limit=1700.0, bought=bought)
     assert [c["query"] for c in out] == ["другой запрос"]
 
 
@@ -457,7 +465,10 @@ def test_expansion_cpa_never_counts_more_conversions_than_clicks():
         {"campaign_id": "1", "query": "странная фраза", "matched_key": "ключ",
          "cost": 900.0, "clicks": 3, "conversions": 12},
     ]
-    out = expansion_candidates(queries, cpa_limit=1700.0)
+    from sync.agent.objects import own_semantics
+    out = expansion_candidates(
+        queries, cpa_limit=1700.0,
+        bought=own_semantics(queries, {"1": ["ключ"]})[1])
     assert out[0]["conversions"] == 12          # факт не переписываем
     assert out[0]["proven_conversions"] == 3    # но считаем по кликам
     assert out[0]["cpa"] == 300.0               # 900 / 3, а не 900 / 12
@@ -471,4 +482,39 @@ def test_expansion_needs_a_few_clicks_of_its_own():
         {"campaign_id": "1", "query": "один клик", "matched_key": "ключ",
          "cost": 90.0, "clicks": 1, "conversions": 5},
     ]
-    assert expansion_candidates(queries, cpa_limit=1700.0) == []
+    from sync.agent.objects import own_semantics
+    assert expansion_candidates(
+        queries, cpa_limit=1700.0,
+        bought=own_semantics(queries, {"1": ["ключ"]})[1]) == []
+
+
+def test_expansion_does_not_take_autotargeting_matches_for_our_own_keys():
+    # Дефект, измеренный 29.08.2026: «уже куплено» бралось из колонки
+    # matched_key отчёта запросов, а Директ возвращает в ней и подбор
+    # автотаргетинга — запрос слово в слово. Из 31 745 запросов окна 27 520
+    # снимались как «наши ключи», и генератор запусков оставался без входа:
+    # 35 запросов с двумя конверсиями вместо 281. Источник правды — снимок
+    # структуры кабинета, и запрос, которого в снимке нет, остаётся кандидатом
+    # сколько бы раз отчёт ни повторил его в matched_key.
+    from sync.agent.objects import expansion_candidates, own_semantics
+    queries = [
+        {"campaign_id": "1", "query": "колледж дизайна заочно",
+         "matched_key": "колледж дизайна заочно",
+         "cost": 1200.0, "clicks": 20, "conversions": 4},
+    ]
+    bought = own_semantics(queries, {"1": ["колледж"]})[1]
+    out = expansion_candidates(queries, cpa_limit=1700.0, bought=bought)
+    assert [c["query"] for c in out] == ["колледж дизайна заочно"]
+
+
+def test_expansion_falls_back_to_the_report_when_the_snapshot_missed_a_campaign():
+    # Кампания, которой снимок не видел, откатывается на matched_key
+    # (own_semantics). Пустая защита на пробеле данных предлагала бы докупить
+    # собственные ключи.
+    from sync.agent.objects import expansion_candidates, own_semantics
+    queries = [
+        {"campaign_id": "9", "query": "вуз заочно", "matched_key": "вуз заочно",
+         "cost": 1200.0, "clicks": 20, "conversions": 4},
+    ]
+    bought = own_semantics(queries, {"1": ["колледж"]})[1]
+    assert expansion_candidates(queries, cpa_limit=1700.0, bought=bought) == []
