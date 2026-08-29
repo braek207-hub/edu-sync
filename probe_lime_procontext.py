@@ -227,6 +227,26 @@ def main():
         )
         print(f"  {stype[:28]:<30} → {parts}")
 
+    # ── 8. Из чего собран наш SEO и что лежит под source_type = (not set) ────
+    print("\n=== 8. Топ source/medium внутри нашего канала SEO (заказы) ===")
+    seo = [r for r in raw if classify(r["source"] or "", r["medium"] or "")[0] == "SEO"]
+    seo.sort(key=lambda r: float(r["purchases_count"] or 0), reverse=True)
+    for r in seo[:12]:
+        print(
+            f"  {str(r['source'])[:26]:<28} / {str(r['medium'])[:14]:<16} "
+            f"визиты {fmt(r['sessions']):>11} заказы {fmt(r['purchases_count']):>9}"
+        )
+
+    print("\n=== 9. Топ source/medium при source_type = '(not set)' (заказы) ===")
+    ns = [r for r in cross if str(r["source_type"]) == "(not set)"]
+    ns.sort(key=lambda r: float(r["purchases_count"] or 0), reverse=True)
+    for r in ns[:15]:
+        ch, sub = classify(r["source"] or "", r["medium"] or "")
+        print(
+            f"  {str(r['source'])[:24]:<26} / {str(r['medium'])[:14]:<16} "
+            f"→ {ch}/{sub[:18]:<20} заказы {fmt(r['purchases_count']):>9}"
+        )
+
     my.close()
     pg.close()
 
