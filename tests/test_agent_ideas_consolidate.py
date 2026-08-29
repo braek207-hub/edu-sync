@@ -490,13 +490,28 @@ def test_group_without_an_average_check_names_the_missing_numerator():
     assert result["skipped"], "отказ группы обязан быть назван"
 
 
-def test_computed_romi_below_the_margin_still_drops_the_query():
-    # Трёхзначность окупаемости не отменяет отказа: посчитанная и низкая
+def test_computed_romi_below_lambda_still_drops_the_query():
+    # Трёхзначность окупаемости не отменяет отказа: посчитанная и НИЖЕ порога
     # окупаемость — приговор связке, она не станет лучше в новой кампании.
-    rows = [dict(row, romi=LAMBDA * 1.01, p_pay_sum=12.0)
+    rows = [dict(row, romi=LAMBDA * 0.99, p_pay_sum=12.0)
             for row in _mute_pair()]
     result = consolidate.scan(rows, _ctx())
 
     assert result["ideas"] == []
     assert all(row["reason"] == consolidate.REASON_THIN_MARGIN
                for row in result["skipped"])
+
+
+def test_growth_margin_is_charged_once_on_the_group_not_on_the_donor():
+    # Связка между λ и λ×запас доходит до группы: она ничего не финансирует,
+    # деньги решаются на кампании направления. Запас, взятый и на связке, и на
+    # группе, вычитал бы из группы ровно те доноры, которыми она набирает
+    # объём на вердикт, — и отказ приходил бы под именем связки, а не денег.
+    rows = [dict(row, romi=LAMBDA * 1.01, p_pay_sum=12.0)
+            for row in _mute_pair()]
+    result = consolidate.scan(rows, _ctx())
+
+    assert result["ideas"] == []
+    reasons = {row["reason"] for row in result["skipped"]}
+    assert consolidate.REASON_THIN_MARGIN not in reasons, (
+        "запас роста взят дважды: связка отсеяна порогом кампании")
