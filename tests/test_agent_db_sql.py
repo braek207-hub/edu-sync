@@ -332,3 +332,38 @@ def test_direct_rows_carry_conversions(monkeypatch):
 def test_facts_upsert_writes_conversions():
     assert "conversions" in agent_db.UPSERT_FACTS_SQL
     assert "conversions = EXCLUDED.conversions" in agent_db.UPSERT_FACTS_SQL
+
+
+def test_exclude_holdout_stamps_the_date_and_keeps_the_reason(monkeypatch):
+    # Колонка excluded_at не заполнялась ниоткуда, и мёртвые кампании
+    # оставались контролем навсегда: когорта заповедника за месяц теряла
+    # четыре кампании из девяти, а по девяти продолжал вычитаться «сезон»
+    # (docs/AGENT-TICK-POWER.md). Причина отбора при этом дополняется, а не
+    # затирается: «почему взяли» нужно, чтобы понять «почему вывели».
+    captured = {}
+    monkeypatch.setattr(
+        agent_db, "_batch",
+        lambda sql, rows, **kw: captured.update(sql=sql, rows=rows) or len(rows),
+    )
+
+    agent_db.exclude_holdout(["c-1", "c-2"], excluded_on="2026-08-29")
+
+    assert "UPDATE edu_agent_holdout" in captured["sql"]
+    assert "excluded_at = %(excluded_at)s" in captured["sql"]
+    assert "reason = reason || %(note)s" in captured["sql"]
+    assert {r["excluded_at"] for r in captured["rows"]} == {"2026-08-29"}
+
+
+def test_exclude_holdout_does_not_move_an_earlier_exit_date(monkeypatch):
+    # Прогон ежедневный, а дата выбытия — та, в которую кампания умерла.
+    # Без условия excluded_at IS NULL она уезжала бы на сегодня каждый день, и
+    # по журналу нельзя было бы понять, когда контроль начал разваливаться.
+    captured = {}
+    monkeypatch.setattr(
+        agent_db, "_batch",
+        lambda sql, rows, **kw: captured.update(sql=sql) or len(rows),
+    )
+
+    agent_db.exclude_holdout(["c-1"], excluded_on="2026-08-29")
+
+    assert "excluded_at IS NULL" in captured["sql"]

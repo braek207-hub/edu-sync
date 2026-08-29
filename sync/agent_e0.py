@@ -36,7 +36,7 @@ from sync.agent.guard import (
     check_volume_anomaly,
     verdict,
 )
-from sync.agent.holdout import select_holdout
+from sync.agent.holdout import dead_holdout_ids, select_holdout
 from sync.agent import config as agent_config
 from sync.agent import manifest as agent_manifest
 from sync.agent import semantic
@@ -932,6 +932,17 @@ def main() -> int:
     # 4. Заповедник. Состав держится весь сезон — пересборка только по явному флагу.
     if "--rebuild-holdout" in sys.argv:
         agent_db.clear_holdout()
+    # Сначала выбытие, потом пополнение. Кампания без лидов за окно решений
+    # перестала быть контролем: она не двигается вместе с кабинетом, а стоит.
+    # Замер (docs/AGENT-TICK-POWER.md) проследил когорту вперёд — из девяти
+    # кампаний за ОДИН месяц живыми остались пять, эффективный размер контроля
+    # упал с 5,19 до 2,93, а к +60 дням до 1,47; разрыв цены лида с остальным
+    # кабинетом при этом уехал на 44 процентных пункта, хотя именно его
+    # постоянство и предполагает разность разностей. Пока колонка excluded_at
+    # не заполнялась ниоткуда, мёртвые оставались контролем навсегда.
+    dead = dead_holdout_ids(agent_db.load_holdout_ids(), list(aggregates.values()))
+    if dead:
+        agent_db.exclude_holdout(dead, excluded_on=today_iso)
     holdout = select_holdout(list(aggregates.values()))
     agent_db.upsert_holdout(holdout, included_on=today_iso)
 
@@ -1797,6 +1808,11 @@ def main() -> int:
         },
         "settings_snapshots": len(snapshot_rows),
         "holdout": len(holdout),
+        # Сколько кампаний выведено из заповедника этим прогоном. Счётчик
+        # обязан быть виден: заповедник, который тает быстрее, чем
+        # пополняется, перестаёт быть контролем молча — за месяц из девяти
+        # кампаний выбывало четыре (docs/AGENT-TICK-POWER.md).
+        "holdout_retired": len(dead),
         "quasi_experiments": len(quasi),
         # Сколько из них деклассировано фильтром предыстории: правку сделали
         # в ответ на всплеск, и её эффект неотличим от возврата к среднему.

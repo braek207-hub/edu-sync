@@ -19,8 +19,16 @@ tests/test_agent_tact_effect.py — эффект ТАКТА ЦЕЛИКОМ пр�
   * интервал считается, а не подразумевается. Вердикт «улучшил» законен
     только тогда, когда весь доверительный интервал лежит по одну сторону
     нуля: точечная оценка на шумных данных всегда чем-то да отличается от
-    нуля.
+    нуля;
+  * интервал считается ЧЕСТНО. Пуассоновская ошибка счётчиков лидов занижала
+    разброс вдвое (6,7 % против замеренных на проде 13,2 %,
+    docs/AGENT-TICK-POWER.md), и на данных БЕЗ эффекта замер выносил уверенный
+    вердикт в каждом пятом такте вместо каждого двадцатого. Вердикты такта
+    зачитываются в ставки (experiments.WINNING_VERDICTS), то есть агент
+    повышал бы ставки по шуму.
 """
+
+import random
 
 import pytest
 
@@ -29,7 +37,11 @@ from sync.agent import experiments, holdout, tact_effect
 TACT = "2026-09-01"
 
 TREATED = ("101", "102", "103")
-HOLDOUT = ("901", "902")
+# Заповедник из пяти кампаний, а не из двух: контроль обязан стоять на
+# эффективном размере не ниже holdout.MIN_CONTROL_NEFF. Две кампании дают
+# Kish n_eff = 2 — по такому «контролю» вычитается не сезон, а история одной
+# из них (docs/AGENT-TICK-POWER.md: когорта с n_eff 1,47 при 453 лидах).
+HOLDOUT = ("901", "902", "903", "904", "905")
 
 
 def _days(start, count):
@@ -99,9 +111,14 @@ def test_before_after_would_have_blamed_the_tact():
 
 
 def test_a_real_improvement_survives_the_season():
-    # Заповедник подорожал на 20 %, обработанные — только на 8 %: такт
-    # отыграл 12 процентных пунктов у рынка, и это его заслуга.
-    facts = (_facts(TREATED, base_cpa=1_000.0, obs_cpa=1_080.0, leads_per_day=40)
+    # Заповедник подорожал на 20 %, обработанные подешевели на 40 %: такт
+    # отыграл у рынка 60 процентных пунктов, и это его заслуга.
+    #
+    # Почему эффект такой крупный. Наименьшее, что один такт различает при
+    # честном интервале, — 37 % изменения цены лида (docs/AGENT-TICK-POWER.md);
+    # прежние 12 п.п. этого теста лежали внутри шума, и «improved» на них
+    # означал не заслугу, а заниженный вдвое интервал.
+    facts = (_facts(TREATED, base_cpa=1_000.0, obs_cpa=600.0, leads_per_day=40)
              + _facts(HOLDOUT, base_cpa=1_000.0, obs_cpa=1_200.0, leads_per_day=40))
     out = _measure(facts)
 
@@ -112,12 +129,24 @@ def test_a_real_improvement_survives_the_season():
 def test_a_real_worsening_is_not_hidden_by_the_season():
     # Обратный случай: рынок подешевел, а обработанные подорожали. Замер
     # обязан назвать это ухудшением, а не спрятать за «зато у всех плохо».
-    facts = (_facts(TREATED, base_cpa=1_000.0, obs_cpa=1_400.0, leads_per_day=40)
+    facts = (_facts(TREATED, base_cpa=1_000.0, obs_cpa=1_600.0, leads_per_day=40)
              + _facts(HOLDOUT, base_cpa=1_000.0, obs_cpa=900.0, leads_per_day=40))
     out = _measure(facts)
 
     assert out["did"] > 0
     assert out["verdict"] == "worsened"
+
+
+def test_a_twelve_point_move_is_no_longer_a_verdict():
+    # Ровно тот вход, который до правки читался как «improved»: заповедник
+    # +20 %, обработанные +8 %. Разность 12 п.п. меньше разброса самого
+    # оценщика на пустом месте (13,2 %), и утверждать по ней нечего.
+    facts = (_facts(TREATED, base_cpa=1_000.0, obs_cpa=1_080.0, leads_per_day=40)
+             + _facts(HOLDOUT, base_cpa=1_000.0, obs_cpa=1_200.0, leads_per_day=40))
+    out = _measure(facts)
+
+    assert out["did"] == pytest.approx(-0.12, abs=0.01)
+    assert out["verdict"] == "inconclusive"
 
 
 # ---------------------------------------- шаг 2: пустой заповедник — unknown
@@ -201,18 +230,24 @@ def test_confidence_interval_is_computed_not_implied():
     assert low == pytest.approx(out["did"] - (high - out["did"]), abs=1e-9)
 
 
-def test_more_leads_make_the_interval_narrower():
-    # Ширина интервала обязана падать с объёмом: иначе это константа, и
-    # вердикт по ней ничего не значит.
-    thin = (_facts(TREATED, base_cpa=1_000.0, obs_cpa=1_080.0, leads_per_day=2)
-            + _facts(HOLDOUT, base_cpa=1_000.0, obs_cpa=1_200.0, leads_per_day=2))
+def test_more_leads_make_the_interval_narrower_but_only_to_the_floor():
+    # Ширина интервала падает с объёмом ровно до пола: лидов может быть
+    # сколько угодно, но цена лида группы за две недели гуляет сама по себе, и
+    # никакой счётчик об этом не знает. Прежняя редакция теста требовала
+    # только «шире/уже» — и была одинаково верна для интервала, который
+    # схлопывается в ноль на больших объёмах.
+    thin = (_facts(TREATED, base_cpa=1_000.0, obs_cpa=1_080.0, leads_per_day=1)
+            + _facts(HOLDOUT, base_cpa=1_000.0, obs_cpa=1_200.0, leads_per_day=1))
     fat = (_facts(TREATED, base_cpa=1_000.0, obs_cpa=1_080.0, leads_per_day=200)
            + _facts(HOLDOUT, base_cpa=1_000.0, obs_cpa=1_200.0, leads_per_day=200))
 
-    thin_ci = _measure(thin)["ci"]
-    fat_ci = _measure(fat)["ci"]
+    thin_out, fat_out = _measure(thin), _measure(fat)
+    thin_ci, fat_ci = thin_out["ci"], fat_out["ci"]
 
     assert (fat_ci[1] - fat_ci[0]) < (thin_ci[1] - thin_ci[0])
+    assert thin_out["error"]["standard_error"] == thin_out["error"]["poisson"]
+    assert (fat_out["error"]["standard_error"]
+            == tact_effect.MEASURED_PLACEBO_SIGMA)
 
 
 def test_a_difference_inside_the_noise_is_inconclusive():
@@ -260,7 +295,7 @@ def test_horizon_comes_from_the_bet_registry():
 def test_a_shorter_horizon_moves_both_windows():
     # Горизонт — параметр, а не константа замера: разбор может посмотреть
     # такт короче, но обе стороны обязаны поехать вместе.
-    facts = (_facts(TREATED, base_cpa=1_000.0, obs_cpa=1_080.0,
+    facts = (_facts(TREATED, base_cpa=1_000.0, obs_cpa=600.0,
                     leads_per_day=40, horizon=7)
              + _facts(HOLDOUT, base_cpa=1_000.0, obs_cpa=1_200.0,
                       leads_per_day=40, horizon=7))
@@ -268,6 +303,157 @@ def test_a_shorter_horizon_moves_both_windows():
 
     assert out["windows"]["horizon_days"] == 7
     assert out["verdict"] == "improved"
+
+
+# ------------------------------- честность интервала: пол ошибки из плацебо
+
+
+def _noisy_history(days=200, leads_per_day=20, sigma=0.30, seed=20260829,
+                   start="2026-01-01"):
+    """Кабинет, в котором агент не делал НИЧЕГО.
+
+    Цена лида каждой кампании гуляет сама по себе: спрос, аукцион, состав
+    трафика. Обе группы живут одним и тем же процессом, поэтому истинный
+    эффект любого «такта» здесь равен нулю по построению — ровно так же, как
+    в плацебо-замере на прод-данных (docs/AGENT-TICK-POWER.md), где 168 точек
+    истории дали разброс 13,2 % при пуассоновской оценке 6,7 %.
+
+    Лидов в день намеренно много: пуассоновская ошибка на таком объёме почти
+    нулевая, и всё, что останется в интервале, — честный разброс цены.
+    """
+    import math
+    from datetime import date, timedelta
+
+    rng = random.Random(seed)
+    first = date.fromisoformat(start)
+    rows = []
+    for campaign_id in tuple(TREATED) + tuple(HOLDOUT):
+        for i in range(days):
+            cpa = 1_000.0 * math.exp(rng.gauss(0.0, sigma))
+            rows.append({"campaign_id": campaign_id,
+                         "fact_date": (first + timedelta(days=i)).isoformat(),
+                         "cost": cpa * leads_per_day,
+                         "eff_leads": leads_per_day})
+    return rows
+
+
+def _placebo_tacts(count=40, step=3, offset=60, start="2026-01-01"):
+    """Дни такта внутри истории: обе стороны окон в витрине, плацебо позади."""
+    from datetime import date, timedelta
+
+    first = date.fromisoformat(start)
+    return [(first + timedelta(days=offset + i * step)).isoformat()
+            for i in range(count)]
+
+
+def _naive_verdict(out):
+    """Вердикт по ПРЕЖНЕМУ правилу: интервал из одной пуассоновской ошибки.
+
+    Ошибка пересчитывается из счётчиков лидов самого отчёта, а не читается из
+    нового поля error: правило воспроизводится буква в букву таким, каким оно
+    было до правки, и тест сравнивает два правила, а не правило с самим собой.
+    """
+    import math
+
+    half = tact_effect.Z_95 * math.sqrt(
+        1.0 / max(int(out["treated"]["leads"]), 1)
+        + 1.0 / max(int(out["holdout"]["leads"]), 1))
+    if out["did"] + half < 0:
+        return "improved"
+    if out["did"] - half > 0:
+        return "worsened"
+    return "inconclusive"
+
+
+def test_noise_alone_does_not_buy_a_verdict():
+    # Главная проверка правки. На истории БЕЗ единого действия доля уверенных
+    # вердиктов обязана держаться заявленных 5 %: замер, который на пустом
+    # месте говорит «improved» в каждом пятом такте, не слаб — он выдаёт шум
+    # за результат, а experiments.WINNING_VERDICTS зачитывает такие вердикты
+    # в ставки (замер на проде: 20,8 % против заявленных 5 %).
+    facts = _noisy_history()
+    outs = [tact_effect.measure(tact, facts, HOLDOUT, TREATED)
+            for tact in _placebo_tacts()]
+
+    assert all(o["did"] is not None for o in outs), "замер отказал, а не судил"
+    confident = [o for o in outs if o["verdict"] in ("improved", "worsened")]
+    assert len(confident) / len(outs) <= 0.05
+
+    # И доказательство, что вход был бы обманчив для старого правила: на тех
+    # же числах пуассоновский интервал раздаёт вердикты пачками. Без этой
+    # половины теста «уверенных нет» означало бы лишь «данные скучные».
+    naive = [o for o in outs
+             if _naive_verdict(o) in ("improved", "worsened")]
+    assert len(naive) / len(outs) > 0.15
+
+
+def test_the_floor_is_measured_on_the_history_at_hand():
+    # Пол считается прогоном по истории (mining.placebo_sigma, поднятый на
+    # уровень групп), а не берётся константой: кабинет шумнее замеренного —
+    # интервал обязан расшириться вслед за ним, а не остаться на числе,
+    # снятом 29.08.2026.
+    facts = _noisy_history(sigma=0.9, seed=20260830)
+    out = tact_effect.measure(_placebo_tacts(count=1)[0], facts, HOLDOUT, TREATED)
+
+    assert out["error"]["placebo"] > tact_effect.MEASURED_PLACEBO_SIGMA
+    assert out["error"]["standard_error"] == out["error"]["placebo"]
+
+
+def test_without_history_the_floor_is_the_one_measured_on_production():
+    # Прогон сторожа держит в памяти ровно два окна такта (load_facts:
+    # 2 × 14 дней), и плацебо-точек в них нет. «Не смогли посчитать разброс» —
+    # не повод вернуться к вдвое заниженному интервалу.
+    out = _measure()
+
+    assert out["error"]["placebo"] is None
+    assert out["error"]["standard_error"] == tact_effect.MEASURED_PLACEBO_SIGMA
+    assert out["error"]["poisson"] < tact_effect.MEASURED_PLACEBO_SIGMA
+
+
+def test_the_floor_can_be_computed_once_for_many_tacts():
+    # Разбор считает пол один раз на десятки тактов — проход по истории
+    # дорогой, а разброс кабинета у них общий. Переданный пол обязан
+    # применяться как свой.
+    from datetime import date
+
+    facts = _noisy_history()
+    floor = tact_effect.placebo_sigma(facts, TREATED, HOLDOUT,
+                                      before=date(2026, 7, 1))
+    out = tact_effect.measure(_placebo_tacts(count=1)[0], facts, HOLDOUT,
+                              TREATED, error_floor=0.5)
+
+    assert floor is not None
+    assert out["error"]["standard_error"] == 0.5
+
+
+# ------------------------------ годность контроля: эффективный размер группы
+
+
+def test_a_control_carried_by_a_single_campaign_is_unknown():
+    # Сумма лидов о годности контроля не говорит: 616 лидов, из них 560 у
+    # одной кампании, — это контроль из ОДНОЙ кампании (Kish n_eff 1,2), и
+    # вычитается по нему не сезон, а её собственная история. Ровно это
+    # случилось с когортой заповедника за два месяца: 453 лида при n_eff 1,47
+    # (docs/AGENT-TICK-POWER.md).
+    lopsided = (_facts(TREATED, base_cpa=1_000.0, obs_cpa=600.0, leads_per_day=40)
+                + _facts(HOLDOUT[:1], base_cpa=1_000.0, obs_cpa=1_200.0,
+                         leads_per_day=40)
+                + _facts(HOLDOUT[1:], base_cpa=1_000.0, obs_cpa=1_200.0,
+                         leads_per_day=1))
+    out = _measure(lopsided)
+
+    assert out["holdout"]["leads"] >= holdout.MIN_CONTROL_LEADS
+    assert out["verdict"] == "unknown"
+    assert "эффективный размер" in out["reason"]
+
+
+def test_an_evenly_spread_control_passes():
+    # Обратная сторона порога: пять кампаний с равным весом дают n_eff 5 и
+    # контролем работают. Порог обязан отсекать перекос, а не размер группы.
+    out = _measure()
+
+    assert out["holdout"]["n_eff"] == pytest.approx(len(HOLDOUT), abs=0.01)
+    assert out["verdict"] != "unknown"
 
 
 # ------------------------------------------------- шаг 8: врезка в сторожа
@@ -282,7 +468,7 @@ def _watchdog_inputs(tact=TACT, horizon=experiments.HORIZON_DAYS):
     """Вход сторожа: факты обработанных по кампаниям и факты заповедника."""
     from datetime import date, timedelta
 
-    treated_rows = _facts(TREATED, base_cpa=1_000.0, obs_cpa=1_080.0,
+    treated_rows = _facts(TREATED, base_cpa=1_000.0, obs_cpa=600.0,
                           leads_per_day=40, horizon=horizon, tact=tact)
     by_campaign = {}
     for row in treated_rows:

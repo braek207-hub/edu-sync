@@ -1334,6 +1334,34 @@ def upsert_holdout(rows: List[Dict[str, Any]], included_on: str) -> int:
     )
 
 
+def exclude_holdout(campaign_ids: List[str], excluded_on: str,
+                    note: str = "выбыла из заповедника: нет лидов за окно решений") -> int:
+    """Пометить кампании заповедника выбывшими (excluded_at).
+
+    Без этого состав заповедника только растёт, а живым он от этого не
+    становится: фактическая когорта из девяти кампаний за месяц потеряла
+    четыре, и её эффективный размер упал с 5,19 до 2,93 — контроль, по
+    которому вычитается сезон, превратился в три кампании, а к +60 дням в
+    полторы (docs/AGENT-TICK-POWER.md, 29.08.2026).
+
+    Причина отбора не затирается, а дополняется: строка заповедника — это
+    история «почему взяли» и «почему вывели» сразу, и первая половина нужна,
+    чтобы понять вторую. Уже выведенные не трогаются (excluded_at IS NULL):
+    дата выбытия должна остаться той, в которую кампания умерла.
+    """
+    payload = [{"campaign_id": str(i), "excluded_at": excluded_on,
+                "note": f"; {note} ({excluded_on})"} for i in campaign_ids]
+    return _batch(
+        """
+        UPDATE edu_agent_holdout
+           SET excluded_at = %(excluded_at)s,
+               reason = reason || %(note)s
+         WHERE campaign_id = %(campaign_id)s AND excluded_at IS NULL
+        """,
+        payload,
+    )
+
+
 def upsert_experiments(rows: List[Dict[str, Any]]) -> int:
     payload = [{**r, "params": json.dumps(r.get("params", {}), ensure_ascii=False)} for r in rows]
     return _batch(

@@ -102,6 +102,9 @@ _DB_NOOPS = (
     "upsert_experiments", "upsert_sliced_facts", "upsert_objects",
     "upsert_search_queries", "upsert_settings_snapshot", "upsert_profile",
     "upsert_behavior", "clear_holdout", "clear_bulk_tables",
+    # Выбытие мёртвых кампаний из заповедника: прогон помечает excluded_at, и
+    # без подмены запись ушла бы в реальную базу.
+    "exclude_holdout",
     # Выгрузка манифеста устройства — та же причина, что у остальных
     # писателей: без подмены прогон уходит в реальную базу и печатает ретраи
     # коннекта в тот же stdout, который тест парсит как JSON.
@@ -120,6 +123,9 @@ _DB_EMPTY_LOADERS = (
     # (objects.own_semantics). Пусто здесь означает «снимка структуры нет»,
     # и защита откатывается на matched_key, как было до перехода на снимок.
     "load_keywords_by_campaign",
+    # Состав заповедника: прогон читает его, чтобы вывести мёртвых. Пусто =
+    # заповедника ещё нет, выводить некого — штатное состояние первого прогона.
+    "load_holdout_ids",
 )
 
 # Отчёты Директа по кабинетам: у каждого свои сегменты и своя конверсионность —
@@ -271,6 +277,28 @@ def test_main_saves_each_account_settings_under_its_own_key(monkeypatch, capsys)
     # кабинетов разные, и перепутать их нельзя ни в одну сторону.
     assert keys_1 == {"MOBILE", "DESKTOP"}
     assert keys_2 == {"TABLET", "DESKTOP"}
+
+
+def test_main_retires_dead_campaigns_from_the_holdout(monkeypatch, capsys):
+    # Заповедник пополнялся, но никогда не редел: колонка excluded_at не
+    # заполнялась ниоткуда. Замер проследил когорту вперёд — девять кампаний
+    # превращались в пять за месяц, а эффективный размер контроля падал с 5,19
+    # до 1,47 (docs/AGENT-TICK-POWER.md). Прогон обязан выводить мёртвых сам,
+    # иначе «сезон» вычитается по кампаниям, которых уже нет.
+    _patch_e0_run(monkeypatch)
+    excluded = []
+    monkeypatch.setattr(agent_e0.agent_db, "load_holdout_ids",
+                        lambda *a, **k: ["111", "999"])
+    monkeypatch.setattr(
+        agent_e0.agent_db, "exclude_holdout",
+        lambda ids, excluded_on: excluded.extend(ids) or len(ids))
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+
+    # 111 — единственная кампания с фактами окна (см. _fact), 999 фактов не
+    # имеет вовсе: она и выбывает.
+    assert excluded == ["999"]
 
 
 # --------------- дефект 2, сквозная половина: до записи доезжают РАЗНЫЕ числа
