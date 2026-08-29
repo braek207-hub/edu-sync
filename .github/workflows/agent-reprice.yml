@@ -11,6 +11,8 @@ on:
         type: boolean
         default: false
 
+permissions: {}
+
 jobs:
   reprice:
     runs-on: ubuntu-latest

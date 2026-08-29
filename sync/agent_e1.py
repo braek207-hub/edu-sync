@@ -2596,6 +2596,19 @@ def refusal(sandbox: bool, dry_run: bool) -> Optional[str]:
     return None
 
 
+def _notify_abort(verdict: str, reason: str, dry_run: bool) -> None:
+    """Уведомление о раннем прерывании такта — до отчёта по кабинетам.
+
+    Пять точек выхода в этом модуле (RUN_LOCKED, RUN_LEASE_LOST,
+    CONFIG_UNAVAILABLE в боевой записи, AUTONOMY_OFF, DATA_GATE_RED)
+    возвращаются раньше NOTIFY в конце _run_all, и без вызова здесь молчат
+    в Telegram — а тишина неотличима от того, что крон не отработал вовсе.
+    """
+    print(json.dumps({"verdict": "NOTIFY",
+                      **notify.send(notify.abort_summary(verdict, reason, dry_run))},
+                     ensure_ascii=False, indent=2))
+
+
 def main() -> int:
     sandbox = "--prod" not in sys.argv
     dry_run = "--apply" not in sys.argv
@@ -2647,6 +2660,7 @@ def main() -> int:
     except writer_db.RunLockBusy as exc:
         print(json.dumps({"verdict": "RUN_LOCKED", "reason": str(exc)},
                          ensure_ascii=False, indent=2))
+        _notify_abort("RUN_LOCKED", str(exc), dry_run)
         return 1
     except writer_db.RunLeaseLost as exc:
         # Аренда потеряна на ходу: с этого момента в кабинет мог начать писать
@@ -2654,6 +2668,7 @@ def main() -> int:
         # кабинета, а условие, при котором писать нельзя вообще.
         print(json.dumps({"verdict": "RUN_LEASE_LOST", "reason": str(exc)},
                          ensure_ascii=False, indent=2))
+        _notify_abort("RUN_LEASE_LOST", str(exc), dry_run)
         return 1
 
 
@@ -2686,15 +2701,18 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
                           "reason": stored_config["unavailable"]},
                          ensure_ascii=False, indent=2))
         if not dry_run:
+            _notify_abort("CONFIG_UNAVAILABLE", stored_config["unavailable"], dry_run)
             return 1
     active_config = agent_config.resolve(stored_config["preset"],
                                          stored_config["overrides"])
     autonomy = str(active_config["autonomy"])
     if autonomy == "off":
+        reason = "в панели настроек autonomy=off — агент не работает"
         print(json.dumps({
             "verdict": "AUTONOMY_OFF",
-            "reason": "в панели настроек autonomy=off — агент не работает",
+            "reason": reason,
         }, ensure_ascii=False, indent=2))
+        _notify_abort("AUTONOMY_OFF", reason, dry_run)
         return 0
     if autonomy == "suggest_only" and not dry_run:
         print(json.dumps({
@@ -2716,6 +2734,7 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         if not dry_run:
             print(json.dumps({"verdict": "DATA_GATE_RED", "data_gate": gate},
                              ensure_ascii=False, indent=2))
+            _notify_abort("DATA_GATE_RED", gate.get("reason"), dry_run)
             return 1
         # Репетиция продолжается — но красный гейт обязан быть виден и в ней:
         # «ноль находок по плохим данным» и «данные в порядке» — разные

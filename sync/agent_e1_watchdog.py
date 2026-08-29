@@ -1241,6 +1241,7 @@ def rollback_one(client, action: Dict[str, Any], db_module,
         return {"result": "blocked_holdout", "action_id": action.get("action_id"),
                 "object_id": action.get("object_id"), "reason": HOLDOUT_REASON}
 
+    unreachable_reason = None
     try:
         request = rollback_payload(action)
         if request is None:
@@ -1249,12 +1250,15 @@ def rollback_one(client, action: Dict[str, Any], db_module,
             state, recovered = resolve_added_modifier_id(client, action)
             if state == "unreachable":
                 # Кабинет не ответил — это не «Id не существует». Пометка
-                # временная: строка остаётся под наблюдением и получит
-                # ещё одну попытку на следующем прогоне.
-                return _fail(db_module, action,
-                            f"{READ_FAILED_REASON} ({recovered})", False,
-                            journal_ok)
-            if recovered is not None:
+                # временная: строка остаётся под наблюдением и получит ещё
+                # одну попытку на следующем прогоне. Сам _fail() строится
+                # НИЖЕ, вне этого try: если пометка (журнальная запись)
+                # споткнётся, внешний except обязан не перехватить её —
+                # иначе временный сбой журнала перелейблился бы в постоянный
+                # («запрос на возврат не строится»), хотя запрос тут ни при
+                # чём вовсе.
+                unreachable_reason = f"{READ_FAILED_REASON} ({recovered})"
+            elif recovered is not None:
                 request = rollback_payload({
                     **action,
                     "payload": {**(action.get("payload") or {}), "Id": recovered},
@@ -1264,6 +1268,9 @@ def rollback_one(client, action: Dict[str, Any], db_module,
         # прошлое состояние испорчено, и повтор его не починит.
         return _fail(db_module, action, f"запрос на возврат не строится: {exc}"[:300],
                      True, journal_ok)
+
+    if unreachable_reason is not None:
+        return _fail(db_module, action, unreachable_reason, False, journal_ok)
 
     if request is None:
         return _fail(db_module, action, NO_ID_REASON, True, journal_ok)

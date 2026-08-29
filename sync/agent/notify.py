@@ -47,7 +47,13 @@ def send(text: str) -> Dict[str, Any]:
                         ensure_ascii=False).encode("utf-8"))
         return {"sent": True, "reason": None}
     except Exception as exc:  # noqa: BLE001 — транспорт не вправе уронить прогон
-        return {"sent": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+        # Сообщение исключения может нести URL целиком (например,
+        # http.client.InvalidURL) — а в URL зашит токен бота. token здесь
+        # всегда непустой (проверено выше), поэтому маскируем его ДО
+        # усечения: обрезка по длине не гарантирует, что токен попадёт в
+        # отброшенный хвост.
+        reason = f"{type(exc).__name__}: {exc}".replace(token, "***")
+        return {"sent": False, "reason": reason[:200]}
 
 
 def _top_rejects(rejects: Dict[str, int]) -> str:
@@ -80,6 +86,18 @@ def e1_summary(report: Dict[str, Any], dry_run: bool) -> str:
         lines.append("Кабинеты с ошибкой: " +
                      ", ".join(a.get("account", "?") for a in report["failed_accounts"]))
     return "\n".join(lines)
+
+
+def abort_summary(verdict: str, reason: str, dry_run: bool) -> str:
+    """Сводка раннего прерывания такта Э1 — до отчёта по кабинетам.
+
+    Пять точек выхода (RUN_LOCKED, RUN_LEASE_LOST, CONFIG_UNAVAILABLE в
+    боевой записи, AUTONOMY_OFF, DATA_GATE_RED) возвращаются раньше NOTIFY
+    в конце _run_all — без этой сводки они молчат в Telegram, а тишина
+    неотличима от того, что крон не отработал вовсе.
+    """
+    mode = "репетиция" if dry_run else "БОЕВАЯ ЗАПИСЬ"
+    return f"Агент Э1 · {mode} · прервана: {verdict}\n{(reason or '—')[:500]}"
 
 
 def watchdog_summary(out: Dict[str, Any]) -> str:

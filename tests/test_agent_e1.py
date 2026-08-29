@@ -2392,11 +2392,20 @@ def test_data_gate_red_blocks_apply_run_before_any_journal_io(monkeypatch, capsy
     monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", _boom)
     monkeypatch.setattr(agent_e1.writer_db, "purge_dry_run_actions", _boom)
 
+    notify_calls = []
+    monkeypatch.setattr(agent_e1.notify, "send",
+                        lambda text: (notify_calls.append(text),
+                                     {"sent": False, "reason": "not_configured"})[1])
+
     rc = agent_e1._run_all([{"login": "acc"}], sandbox=False, dry_run=False,
                            today="2026-08-24")
 
     assert rc == 1
     assert "DATA_GATE_RED" in capsys.readouterr().out
+    # Молчание красного гейта в живом такте неотличимо от того, что крон не
+    # отработал вовсе — уведомление обязано уйти с тем же вердиктом.
+    assert len(notify_calls) == 1
+    assert "DATA_GATE_RED" in notify_calls[0]
 
 
 # ------------------- белый список аргументов прогона

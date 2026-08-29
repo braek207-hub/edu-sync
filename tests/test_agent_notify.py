@@ -25,6 +25,22 @@ def test_transport_error_never_raises(monkeypatch):
     assert out["sent"] is False and "OSError" in out["reason"]
 
 
+def test_transport_error_masks_token_in_reason(monkeypatch):
+    # http.client.InvalidURL и подобные исключения могут нести URL целиком —
+    # а в URL зашит токен бота. Токен не должен утечь в NOTIFY-строку лога.
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "secret123")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "1")
+
+    def _boom(*a, **k):
+        raise ValueError("bad url /botsecret123/sendMessage")
+
+    monkeypatch.setattr(notify, "_post", _boom)
+    out = notify.send("x")
+    assert out["sent"] is False
+    assert "secret123" not in out["reason"]
+    assert "***" in out["reason"]
+
+
 def test_send_success_reports_sent(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "1")

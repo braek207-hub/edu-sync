@@ -829,6 +829,41 @@ def test_transient_read_error_does_not_bury_the_action(monkeypatch):
     assert "кабинет не ответил" in out["reason"]
 
 
+def test_unreachable_journal_blip_propagates_not_relabeled_permanent(monkeypatch):
+    # Пометка неисполнимого отката на ветке "unreachable" строится ВНЕ
+    # внешнего try: если mark_rollback_failed сама споткнётся (журнальный
+    # блип), исключение обязано дойти как есть — а не быть перехваченным
+    # внешним except и перелейбленным в permanent=True («запрос на возврат
+    # не строится»), которого здесь никто не строил.
+    action = _stuck_add()  # 'stale' bidmodifier.add: payload без Id
+    client = _FakeClient()
+    monkeypatch.setattr(watchdog, "read_actual_modifiers",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 502")))
+
+    class _BlipDb(_FakeDb):
+        """Журнал спотыкается на ПЕРВОЙ пометке (unreachable, permanent=False).
+
+        Если сбой перехвачен внешним except (старое поведение), код делает
+        ВТОРУЮ попытку пометки — уже permanent=True — и она в этом дубле
+        успешна: старый код тогда молча ВОЗВРАЩАЕТ мислейбленный результат
+        вместо того, чтобы дать первому исключению дойти до вызывающего.
+        """
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def mark_rollback_failed(self, action_id, reason, permanent=False):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("journal write blip")
+            return super().mark_rollback_failed(action_id, reason, permanent=permanent)
+
+    db = _BlipDb()
+    with pytest.raises(RuntimeError, match="journal write blip"):
+        watchdog.rollback_one(client, action, db, set())
+    assert db.calls == 1, "исключение обязано дойти до вызывающего с первой попытки"
+
+
 def test_recovery_does_not_match_a_different_segment():
     cabinet = [{"Id": 555, "CampaignId": 111, "Type": "DESKTOP_ADJUSTMENT",
                 "DesktopAdjustment": {"BidModifier": 130}}]

@@ -300,9 +300,19 @@ def test_autonomy_off_stops_before_touching_anything(monkeypatch, capsys):
         raise AssertionError("прогон обязан остановиться ДО гейта данных")
 
     monkeypatch.setattr(agent_e1, "data_gate", _must_not_be_called)
+
+    notify_calls = []
+    monkeypatch.setattr(agent_e1.notify, "send",
+                        lambda text: (notify_calls.append(text),
+                                     {"sent": False, "reason": "not_configured"})[1])
+
     assert agent_e1._run_all([{"login": "acc"}], sandbox=False, dry_run=False,
                              today="2026-08-26") == 0
     assert "AUTONOMY_OFF" in capsys.readouterr().out
+    # Молчание раннего выхода в живом такте неотличимо от того, что крон не
+    # отработал вовсе, — уведомление обязано уйти даже когда автономия off.
+    assert len(notify_calls) == 1
+    assert "AUTONOMY_OFF" in notify_calls[0]
 
 
 def test_suggest_only_downgrades_a_live_run_to_a_rehearsal(monkeypatch, capsys):
@@ -400,10 +410,18 @@ def test_config_unavailable_blocks_live_write(monkeypatch, capsys):
     monkeypatch.setattr(agent_e1, "data_gate",
                         lambda today: {"status": "GREEN", "reason": "тест",
                                        "checks": [], "latest_fact_date": None})
+
+    notify_calls = []
+    monkeypatch.setattr(agent_e1.notify, "send",
+                        lambda text: (notify_calls.append(text),
+                                     {"sent": False, "reason": "not_configured"})[1])
+
     rc = agent_e1._run_all(clients=[], sandbox=False, dry_run=False, today="2026-08-30")
     out = capsys.readouterr().out
     assert rc == 1
     assert "CONFIG_UNAVAILABLE" in out
+    assert len(notify_calls) == 1
+    assert "CONFIG_UNAVAILABLE" in notify_calls[0]
 
 
 # --- отчёт прогона -------------------------------------------------------
