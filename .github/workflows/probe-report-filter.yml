@@ -1,0 +1,26 @@
+name: probe-report-filter
+# Read-only проверка формы условия Reports API, которым кабинетный агрегат
+# сегментных отчётов отсекает чужие кампании (scripts/probe_report_filter.py).
+# Отвергнутое Директом условие роняет не один отчёт, а весь такт расчёта —
+# поэтому форма проверяется здесь, до боевого прогона Э0.
+# Ничего не пишет: ни в базу, ни в кабинет.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Спросить Директ про Filter CampaignId NOT_IN
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+        run: python scripts/probe_report_filter.py
