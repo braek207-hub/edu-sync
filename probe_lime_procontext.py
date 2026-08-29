@@ -191,6 +191,42 @@ def main():
             f"визиты {fmt(r['sessions']):>10} заказы {fmt(r['purchases_count']):>8}"
         )
 
+    # ── 6. Готовая группировка PROCONTEXT против нашей ───────────────────────
+    # В lc_simple_view есть source_type — собственная группировка источника. Power BI
+    # почти наверняка режет по ней, а мы её игнорируем и классифицируем сами. Матрица
+    # показывает, где две таксономии расходятся.
+    with my.cursor() as c:
+        c.execute(
+            f"""SELECT source_type, {agg} FROM lc_simple_view
+                 WHERE date >= %s AND date <= %s GROUP BY source_type ORDER BY 2 DESC""",
+            (FROM, TO),
+        )
+        st = c.fetchall()
+    print("\n=== 6. source_type PROCONTEXT (готовая группировка источника) ===")
+    for r in st:
+        print(
+            f"  {str(r['source_type'])[:30]:<32} визиты {fmt(r['sessions']):>12} "
+            f"заказы {fmt(r['purchases_count']):>9} выручка {fmt(r['purchases_revenue']):>15}"
+        )
+
+    print("\n=== 7. Матрица source_type × наш channel (заказы) ===")
+    with my.cursor() as c:
+        c.execute(
+            f"""SELECT source_type, source, medium, {agg} FROM lc_simple_view
+                 WHERE date >= %s AND date <= %s GROUP BY source_type, source, medium""",
+            (FROM, TO),
+        )
+        cross = c.fetchall()
+    mat = defaultdict(lambda: defaultdict(float))
+    for r in cross:
+        ch, _ = classify(r["source"] or "", r["medium"] or "")
+        mat[str(r["source_type"])][ch] += float(r["purchases_count"] or 0)
+    for stype in sorted(mat, key=lambda k: -sum(mat[k].values())):
+        parts = ", ".join(
+            f"{ch} {fmt(v)}" for ch, v in sorted(mat[stype].items(), key=lambda kv: -kv[1]) if v
+        )
+        print(f"  {stype[:28]:<30} → {parts}")
+
     my.close()
     pg.close()
 
