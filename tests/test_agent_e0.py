@@ -222,6 +222,13 @@ def _patch_e0_run(monkeypatch, reports=None):
     # Запись находок генераторов. Пусто = порция принята; настоящая запись
     # проверяется отдельно (tests/test_agent_e0_ideas.py).
     monkeypatch.setattr(agent_e0.ideas_registry, "upsert", lambda rows: list(rows))
+    # Проход по живому реестру (порог окупаемости и парность «ожидание —
+    # смета» у строк, которые генератор перестал находить). Причина подмены та
+    # же, что у open_ideas: без неё чтение уходит в реальную базу и печатает
+    # ретраи коннекта в тот же stdout, который тест парсит как JSON. Пусто =
+    # снимать нечего; само правило прохода проверяется в
+    # tests/test_agent_ideas_registry.py.
+    monkeypatch.setattr(agent_e0.ideas_registry, "sweep_open", lambda *a, **k: [])
     monkeypatch.setattr(
         agent_e0.agent_db, "upsert_computed_settings",
         # Значения по умолчанию намеренно: на коде ДО правки вызов идёт без

@@ -224,12 +224,21 @@ def test_test_cost_is_the_money_the_campaign_will_live_on():
                                                   rel=1e-6)
 
 
-def test_expected_value_is_absent_when_a_payment_is_not_priced():
-    # Непосчитанная ценность и посчитанный ноль стоят в очереди реестра
-    # по-разному: ноль здесь был бы выдумкой.
+def test_direction_without_a_price_of_a_payment_is_not_proposed_at_all():
+    # Раньше идея заводилась с пустым ожиданием: ноль был бы выдумкой, и
+    # оставляли None. Но смета выноса настоящая — это деньги, которые новая
+    # кампания проживёт за горизонт, — и строка выходила сметой без выгоды,
+    # чего реестр теперь не принимает (ideas/limits.unpaired_reason): порция
+    # генератора падала бы целиком. Отсев с названной причиной: «кабинету
+    # нечем оценить оплату» и «вынос ничего не обещает» лечатся по-разному.
     ctx = _ctx()
     ctx.pop("value_per_payment_rub")
-    assert _idea(ctx=ctx)["expected_rub"] is None
+
+    found = consolidate.scan(_pair(), ctx)
+
+    assert found["ideas"] == []
+    assert [r["reason"] for r in found["skipped"]] == [
+        consolidate.GROUP_REASON_NO_VALUE_PER_PAYMENT]
 
 
 # -------------------------------------------------------- окупаемость

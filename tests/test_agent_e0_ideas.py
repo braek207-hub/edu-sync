@@ -601,6 +601,38 @@ def test_generators_findings_reach_the_registry(store):
     assert len(_rows_of(store, "proven")) == 1
 
 
+def test_the_tact_sweeps_stale_rows_of_the_live_registry(store):
+    # Пределы применялись только в момент записи и доставали лишь то, что
+    # генератор находит сегодня заново. Строка, которую он перестал находить,
+    # висела в очереди навсегда: замер 29.08.2026 (прод) — две идеи proven с
+    # ожиданием 32 ₽ при цене замера 933 ₽ и 129 ₽ при 829 ₽ пережили порог
+    # именно так. Проход стоит В ТАКТЕ, а не отдельной командой: очередь
+    # читается каждым прогоном, и чинить её надо там же, где читают.
+    stale = _idea(idea_id="stale-1", expected_rub=32.0, test_cost_rub=933.0)
+    store.table["stale-1"] = stale
+
+    summary = _collect()
+
+    assert summary["swept"]["closed"] == 1
+    assert store.table["stale-1"]["status"] == registry.STATUS_DROPPED
+    assert sum(summary["swept"]["by_reason"].values()) == 1
+
+
+def test_the_sweep_does_not_take_down_the_tact(store, monkeypatch):
+    # Расчётный такт считает деньги, и падать из-за экрана предложений ему
+    # нельзя: недоступный реестр становится строкой отчёта, как и остальные
+    # его чтения (closure.unavailable).
+    def _boom(*a, **k):
+        raise RuntimeError("реестр недоступен")
+
+    monkeypatch.setattr(agent_e0.ideas_registry, "sweep_open", _boom)
+
+    summary = _collect()
+
+    assert summary["swept"]["closed"] == 0
+    assert "реестр недоступен" in summary["swept"]["unavailable"]
+
+
 def test_refused_bundles_are_counted_by_reason(store):
     # Шаг 3: отбракованные связки попадают в отчёт числами по причинам.
     # «Поводов не нашлось» и «поводы были, но у всех не хватило рычага» ведут

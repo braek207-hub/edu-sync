@@ -241,17 +241,27 @@ def test_horizon_is_the_stake_one_without_relearning():
     assert _idea()["horizon_days"] == HORIZON_DAYS
 
 
-def test_test_cost_is_measured_not_invented():
-    # Смета — расход сегмента за горизонт по нынешнему темпу: 24 000 ₽ за 28
-    # дней это 857,14 ₽ в день.
-    assert _idea()["test_cost_rub"] == pytest.approx(24_000.0 / 28 * HORIZON_DAYS,
-                                                     rel=1e-6)
+def test_volume_at_risk_is_measured_but_is_not_the_price_of_the_check():
+    # Расход сегмента за горизонт по нынешнему темпу (24 000 ₽ за 28 дней это
+    # 857,14 ₽ в день) считается по-прежнему и виден человеку — но в detail, а
+    # не в колонке сметы. Выгоду расширения аудитории посчитать нечем (потолок
+    # сегмента неизвестен), а строка со сметой при пустом ожидании реестру
+    # запрещена: считаем обе величины или ни одной
+    # (ideas/limits.unpaired_reason). Смета к тому же означала бы списание
+    # риск-бюджета полосы, а предложение им не платит вовсе.
+    idea = _idea()
 
-
-def test_test_cost_is_empty_when_the_spend_is_unknown():
-    # Непосчитанная смета — не ноль: ноль вынес бы идею вперёд посчитанных.
-    idea = _idea(rows=[_segment(cost_rub=None)])
+    assert idea["expected_rub"] is None
     assert idea["test_cost_rub"] is None
+    assert idea["detail"]["segment_cost_at_risk_rub"] == pytest.approx(
+        24_000.0 / 28 * HORIZON_DAYS, rel=1e-6)
+
+
+def test_volume_at_risk_is_empty_when_the_spend_is_unknown():
+    # Непосчитанный объём — не ноль: ноль читался бы на экране как «сегмент
+    # ничего не тратит», хотя расход просто не приехал.
+    idea = _idea(rows=[_segment(cost_rub=None)])
+    assert idea["detail"]["segment_cost_at_risk_rub"] is None
 
 
 def test_success_rule_beats_the_campaign_price():

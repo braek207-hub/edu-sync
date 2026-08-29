@@ -139,6 +139,11 @@ REASON_NO_EXPECTATION = (
     "рычаг не смог заявить обещание (writer/expectation.of): без доли "
     "сегмента, дневного расхода и цены лида класс 1 не подтверждается, а "
     "замер такта не сможет закрыть наблюдение")
+REASON_NO_LEAD_VALUE = (
+    "ценность эффективного лида кампании не посчитана (portfolio.value_per_lead: "
+    "нет ступени лестницы, чека направления или лидов в окне) — обещанные "
+    "рычагом лиды не перевести в рубли, а риск-бюджет полосы корректировка "
+    "тратит настоящий: идея вышла бы расходом без выгоды")
 
 
 def _number(value: Any) -> Optional[float]:
@@ -353,7 +358,18 @@ def _one(bundle: Dict[str, Any], ctx: Dict[str, Any],
     daily_cost = _number(bundle.get("daily_cost_rub")) or 0.0
     test_cost = risk_mod.action_risk(action, {campaign_id: daily_cost},
                                      days_to_measure=horizon)
+
+    # Без цены лида идея не заводится вовсе. Раньше она уезжала в реестр с
+    # пустым ожиданием и посчитанной сметой — замер 29.08.2026: три живые
+    # строки на 2 058 ₽ заявленного риска и ни рубля обещанной выгоды. Это
+    # запрещено контрактом реестра (ideas/limits.unpaired_reason): смета
+    # корректировки настоящая, её списывает риск-бюджет полосы, и молчать о
+    # том, ради чего он тратится, нельзя. Отсев здесь, а не отказ реестра:
+    # реестр валит порцию целиком, и одна кампания без чека направления
+    # уносила бы с собой все находки генератора за такт.
     value_per_lead = _number(bundle.get("value_per_lead_rub"))
+    if value_per_lead is None:
+        return None, _skip(bundle, REASON_NO_LEAD_VALUE)
 
     return {
         "source": SOURCE,
@@ -361,11 +377,10 @@ def _one(bundle: Dict[str, Any], ctx: Dict[str, Any],
         "subject": _subject(bundle, _kind, segment_key),
         "tier": tier_mod.TIER_MEASURED,
         "lane": lane,
-        # Ценность идеи — обещание рычага в рублях выручки. Нет цены лида —
-        # None, а не ноль: непосчитанная ценность и посчитанный ноль стоят в
-        # очереди реестра по-разному (registry.rank).
-        "expected_rub": (round(leads_delta * value_per_lead, 2)
-                         if value_per_lead is not None else None),
+        # Ценность идеи — обещание рычага в рублях выручки. Цена лида здесь
+        # уже посчитана: связка без неё до этой строки не доезжает
+        # (REASON_NO_LEAD_VALUE выше).
+        "expected_rub": round(leads_delta * value_per_lead, 2),
         # Цена проверки — тот же расчёт, которым такт записи списывает
         # риск-бюджет полосы (writer/risk.action_risk), а не второе мнение о
         # том, сколько денег под ударом.
@@ -504,7 +519,12 @@ def _scaling_idea(row: Dict[str, Any], depth: int) -> Dict[str, Any]:
         # получена. Выдуманное число здесь вынесло бы предложение в начало
         # очереди обещанием, которого никто не считал.
         "expected_rub": None,
-        "test_cost_rub": row.get("test_cost_rub"),
+        # Смета родителя сюда не переносится по той же причине, по которой не
+        # переносится его ценность: она уже потрачена. Своей у предложения
+        # нет — риск-бюджет полосы за него не платит никто (полоса proposal,
+        # writer/lanes.RISK_PAYING_LANES), а пустое ожидание рядом с чужой
+        # сметой реестр не примет вовсе (ideas/limits.unpaired_reason).
+        "test_cost_rub": None,
         "horizon_days": row.get("horizon_days"),
         "success_rule": row.get("success_rule"),
         "detail": detail,

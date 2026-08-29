@@ -184,11 +184,14 @@ def _one(row: Dict[str, Any], ctx: Dict[str, Any], account: str,
 
     cost = _number(row.get("cost_rub"))
     window = _number(row.get("window_days"))
-    # Смета — расход сегмента за горизонт по нынешнему темпу. Непосчитанная
-    # остаётся пустой: ноль вынес бы идею вперёд посчитанных, потому что
-    # очередь реестра сравнивает ценность НА РУБЛЬ проверки.
-    test_cost = (round(cost / window * HORIZON_DAYS, 2)
-                 if cost and window and window > 0 else None)
+    # Расход сегмента за горизонт по нынешнему темпу. Это НЕ смета проверки:
+    # сметой в реестре зовётся списание риск-бюджета полосы, а предложение
+    # риск-бюджетом не платит (writer/lanes.RISK_PAYING_LANES). Число едет в
+    # detail — человеку знать объём под ударом надо, — а колонка сметы
+    # остаётся пустой, потому что пусто ожидание: считаем обе величины или ни
+    # одной (ideas/limits.unpaired_reason).
+    cost_at_risk = (round(cost / window * HORIZON_DAYS, 2)
+                    if cost and window and window > 0 else None)
 
     return {
         "source": SOURCE,
@@ -206,7 +209,7 @@ def _one(row: Dict[str, Any], ctx: Dict[str, Any], account: str,
         # не знаем. Правдоподобное число здесь вынесло бы идею вперёд
         # посчитанных (registry.rank), и незнание оказалось бы аргументом.
         "expected_rub": None,
-        "test_cost_rub": test_cost,
+        "test_cost_rub": None,
         # Аудитория обучение стратегии не сбрасывает (writer/lanes.py: та же
         # корректировка сегмента), значит недель переобучения к сроку не
         # прибавляется — горизонт ставки и есть срок.
@@ -229,6 +232,7 @@ def _one(row: Dict[str, Any], ctx: Dict[str, Any], account: str,
             "conversions": conversions,
             "share_of_clicks": (round(share, 6) if share is not None else None),
             "cost_rub": cost,
+            "segment_cost_at_risk_rub": cost_at_risk,
             "window_days": (int(window) if window else None),
             "base_cpl_rub": round(base_cpl, 2),
         },

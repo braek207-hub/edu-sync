@@ -316,3 +316,31 @@ def test_idea_action_is_addressed_to_its_campaign():
     assert _run()[0]["action"]["object_id"] == CAMPAIGN
 
 
+
+
+# ------------------------------------ ценность лида: без неё идеи не бывает
+
+
+def test_bundle_without_a_lead_value_is_skipped_with_a_named_reason():
+    # Смета корректировки настоящая: её списывает риск-бюджет полосы
+    # (writer/risk.action_risk). Без цены эффективного лида обещанные рычагом
+    # лиды не перевести в рубли, и идея выходила расходом без выгоды — замер
+    # 29.08.2026 (прод): три живые строки proven на 2 058 ₽ заявленного риска и
+    # ни рубля обещанной выгоды. Реестр такую строку теперь не принимает
+    # (ideas/limits.unpaired_reason) и валит ПОРЦИЮ целиком, поэтому отсев
+    # стоит здесь: одна кампания без чека направления иначе уносила бы с собой
+    # все находки генератора за такт.
+    report = proven.scan([_bundle(value_per_lead_rub=None)], _ctx())
+
+    assert report["ideas"] == []
+    assert [row["reason"] for row in report["skipped"]] == [
+        proven.REASON_NO_LEAD_VALUE]
+
+
+def test_every_idea_carries_both_numbers_or_neither():
+    # Инвариант очереди: строка, которая обещает потратить, обязана назвать,
+    # ради чего. Проверяется на самой идее, а не на реестре, — генератор
+    # обязан выходить в реестр уже правильным.
+    idea = _run()[0]
+    assert idea["expected_rub"] is not None
+    assert idea["test_cost_rub"] is not None

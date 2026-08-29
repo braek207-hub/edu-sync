@@ -275,3 +275,18 @@ def test_the_ban_is_visible_as_a_named_refusal():
 
     banned = [row for row in skipped if row["reason"] == abtests.REASON_LOST_BEFORE]
     assert [row["test_kind"] for row in banned] == ["budget_down"]
+
+
+def test_scaling_proposal_inherits_neither_the_value_nor_the_price(store):
+    # Ценность родителя уже получена, а его смета уже потрачена: переносить
+    # ни то, ни другое нельзя. Своей сметы у предложения нет вовсе —
+    # риск-бюджет полосы за него не платит никто (полоса proposal,
+    # writer/lanes.RISK_PAYING_LANES), — а чужая смета рядом с пустым
+    # ожиданием реестру запрещена (ideas/limits.unpaired_reason): порция
+    # масштабирования падала бы целиком, и выигранная ставка не давала бы
+    # продолжения вовсе.
+    idea = proven.scan_closed([_won_idea()], {"account": ACCOUNT})["ideas"][0]
+
+    assert idea["expected_rub"] is None
+    assert idea["test_cost_rub"] is None
+    registry.upsert([idea])

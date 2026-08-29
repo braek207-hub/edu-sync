@@ -19,9 +19,10 @@ class FakeIdeas:
     Двойник намеренно ТУПОЙ — он только хранит строки. Правило слияния
     (статус не откатывается, закрытая идея не воскресает) живёт в Python
     реестра, а не в тексте SQL, поэтому тесты проверяют его, а не свойства
-    этого класса. Единственное, что здесь повторяет запрос, — условие поиска
-    отклонений (subject_key + непустой rejected_by); оно же проверяется
-    отдельно по тексту SQL, чтобы копии не разъехались.
+    этого класса. Запросы здесь повторены ровно двумя условиями — поиск
+    отклонений (subject_key + непустой rejected_by) и выборка открытых строк
+    (статус из OPEN_STATUSES, при нужде — кабинет); оба проверяются отдельно
+    по тексту SQL, чтобы копии не разъехались.
     """
 
     def __init__(self):
@@ -77,6 +78,22 @@ class FakeIdeas:
             out.append(dict(row))
         return out
 
+    def read_open(self, account=None):
+        """Условие SELECT_OPEN_SQL: открытые статусы, при нужде — один кабинет.
+
+        Нужен проходу по живому реестру (registry.sweep_open): он читает
+        именно открытые строки, и без двойника его правило проверялось бы
+        только живой базой — то есть не проверялось бы вовсе.
+        """
+        out = []
+        for row in self.table.values():
+            if str(row.get("status")) not in registry.OPEN_STATUSES:
+                continue
+            if account is not None and str(row.get("account")) != str(account):
+                continue
+            out.append(dict(row))
+        return out
+
     def write_rows(self, rows):
         self.writes += 1
         for row in rows:
@@ -92,5 +109,6 @@ def store(monkeypatch):
     monkeypatch.setattr(registry, "_read_by_order", fake.read_by_order)
     monkeypatch.setattr(registry, "_read_by_experiment", fake.read_by_experiment)
     monkeypatch.setattr(registry, "_read_settled", fake.read_settled)
+    monkeypatch.setattr(registry, "_read_open", fake.read_open)
     monkeypatch.setattr(registry, "_write_rows", fake.write_rows)
     return fake

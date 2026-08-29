@@ -104,9 +104,27 @@ def test_registry_accepts_the_proposal(store):
     assert len(saved) == 1
     assert saved[0]["action"] is None
     assert saved[0]["source"] == master.SOURCE
-    # Идея не снимается как «не окупает проверку»: смету агент не считает —
-    # проверку проводит человек в интерфейсе кабинета.
+    # Идея не снимается как «не окупает проверку» и не отвергается как
+    # «смета без ожидания»: смету агент не считает — проверку проводит человек
+    # в интерфейсе кабинета, и риск-бюджет полосы за неё не платит никто.
+    # Пустая смета у предложения и непосчитанное ожидание — разные вещи, и
+    # контракт реестра (ideas/limits.unpaired_reason) запрещает только второе.
     assert saved[0]["status"] == registry.STATUS_NEW
+
+
+def test_a_proposal_survives_the_sweep_of_the_live_registry(store):
+    """Проход по реестру не должен выкашивать Мастер кампаний.
+
+    Проход закрывает строки, не проходящие пределы (порог окупаемости и
+    парность величин). Предложение с посчитанным ожиданием и пустой сметой
+    оба правила проходит — иначе экран предложений опустел бы ровно на том
+    генераторе, ради которого он и заведён.
+    """
+    registry.upsert(master.candidates([_card()], _ctx()))
+
+    assert registry.sweep_open() == []
+    assert all(row["status"] == registry.STATUS_NEW
+               for row in store.table.values())
 
 
 def test_the_same_campaign_lands_in_the_same_row_tomorrow(store):

@@ -368,12 +368,30 @@ def test_same_test_keeps_its_identity_between_runs():
     assert first["horizon_days"] != second["horizon_days"]
 
 
-def test_test_cost_covers_the_whole_horizon():
+def test_volume_at_risk_is_told_but_is_not_the_price_of_the_check():
     # Под ударом теста — весь расход кампании за срок замера, а не дельта
-    # рычага: проигравший тест портит кампанию целиком на всё это время.
+    # рычага: проигравший тест портит кампанию целиком на всё это время. Но
+    # СМЕТОЙ реестра это число не является: смета — списание риск-бюджета
+    # полосы, а предложение риск-бюджетом не платит вовсе. Стояло оно в
+    # колонке сметы — и экран предложений показывал 108 946 589 ₽ заявленной
+    # цены проверки при нулевой заявленной выгоде (замер 29.08.2026, 113 живых
+    # идей abtest). Теперь объём под ударом виден человеку в detail, а колонка
+    # сметы пуста рядом с пустым ожиданием — обе величины или ни одной.
     idea = _idea()
     daily = 560_000.0 / 28.0
-    assert idea["test_cost_rub"] == pytest.approx(daily * idea["horizon_days"])
+
+    assert idea["expected_rub"] is None
+    assert idea["test_cost_rub"] is None
+    assert idea["detail"]["campaign_cost_at_risk_rub"] == pytest.approx(
+        daily * idea["horizon_days"])
+
+
+def test_test_without_an_expectation_is_accepted_by_the_registry():
+    # Прямая проверка того, ради чего смета убрана: контракт реестра
+    # (ideas/limits.unpaired_reason) отвергает строку со сметой при
+    # непосчитанном ожидании, и порция генератора падала бы целиком — 113
+    # находок за такт вместо экрана предложений.
+    assert registry._prepare(_idea())["test_cost_rub"] is None
 
 
 def test_success_rule_is_machine_checkable():

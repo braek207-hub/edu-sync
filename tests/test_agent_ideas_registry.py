@@ -582,10 +582,36 @@ def test_free_check_is_not_judged_by_the_threshold(store):
 
 def test_unpriced_idea_is_not_dropped_by_the_threshold(store):
     # Непосчитанное — не ноль. Идея без ожидания не «бесценна», она
-    # непроверяема этим правилом: её судьбу решает очередь (rank отправляет
-    # такие в хвост), а не порог. Прочти незнание нулём — и генератор,
-    # забывший посчитать ожидание, снимался бы весь скопом.
-    registry.upsert([_idea(expected_rub=None, test_cost_rub=500.0)])
+    # непроверяема ПОРОГОМ: делить нечего, и сказать про неё «не окупает»
+    # значило бы придумать за генератор число. Порог её и не трогает —
+    # отвергает контракт (см. следующий тест), и разница видна по способу
+    # отказа: снятие с причиной против отказа в приёме.
+    assert registry.limits.unprofitable_reason(None, 500.0) is None
+
+
+def test_price_of_a_check_without_an_expectation_is_refused_on_arrival(store):
+    # Считаем обе величины или ни одной. Замер 29.08.2026 (прод): у генератора
+    # abtest 113 живых идей на 108 946 589 ₽ заявленной цены проверки — и ни у
+    # одной посчитанного ожидания. Экран предложений при этом — сто тринадцать
+    # строк расхода без единой цифры выгоды, а очередь их даже не ранжирует:
+    # rank делит ожидание на цену.
+    #
+    # Отказ в приёме, а не снятие с причиной: чинить такую строку нечем —
+    # снять её значило бы спрятать дефект генератора в данные, а принять —
+    # показать человеку расход без выгоды.
+    with pytest.raises(registry.InvalidIdea):
+        registry.upsert([_idea(expected_rub=None, test_cost_rub=500.0)])
+    assert registry.load(_id(_idea())) is None
+
+
+def test_expectation_without_a_price_of_a_check_is_accepted(store):
+    # Обратный случай законен, и правило несимметрично намеренно. Смета — это
+    # списание риск-бюджета полосы, а предложение человеку (класс 3, полоса
+    # proposal) риск-бюджетом не платит: генератор master считает переплату
+    # кампании против цены лида кабинета и оставляет смету ПУСТОЙ, потому что
+    # проверку делает человек руками в интерфейсе. Отвергни реестр такую
+    # строку — и Мастер кампаний исчез бы с экрана предложений целиком.
+    registry.upsert([_idea(expected_rub=1_000.0, test_cost_rub=None)])
     assert registry.load(_id(_idea()))["status"] == registry.STATUS_NEW
 
 
@@ -902,3 +928,70 @@ def test_the_order_lookup_does_not_filter_by_status():
     sql = " ".join(registry.SELECT_BY_ORDER_SQL.split())
     assert "status" not in sql
     assert "action" in sql and "order_id" in sql
+
+
+# ------------------------------------- проход по живому реестру (sweep_open)
+
+
+def test_sweep_closes_an_idea_the_generator_stopped_finding(store):
+    # Пределы применялись ТОЛЬКО в момент записи, то есть доставали лишь то,
+    # что генератор находит сегодня заново. Замер 29.08.2026 (прод): в живой
+    # очереди висели две идеи proven с ожиданием 32 ₽ при цене замера 933 ₽ и
+    # 129 ₽ при 829 ₽ — обе заведены до появления порога и обе его пережили,
+    # потому что генератор перестал их находить, а другого прохода по реестру
+    # не было.
+    store.table[_id(_idea())] = {
+        **registry._prepare(_idea(expected_rub=100_000.0)),
+        "expected_rub": 32.0, "test_cost_rub": 933.0,
+        "status": registry.STATUS_NEW,
+    }
+
+    closed = registry.sweep_open()
+
+    assert [row["idea_id"] for row in closed] == [_id(_idea())]
+    row = registry.load(_id(_idea()))
+    assert row["status"] == registry.STATUS_DROPPED
+    assert "не окупает" in row["dropped_reason"]
+
+
+def test_sweep_closes_a_price_of_a_check_without_an_expectation(store):
+    # Строка, принятая до появления контракта парности, живёт в реестре с
+    # заявленным расходом и пустой выгодой: приёмом её теперь не отвергнуть —
+    # она уже принята, — а очередь показывает её человеку каждый день.
+    store.table[_id(_idea())] = {
+        **registry._prepare(_idea()),
+        "expected_rub": None, "test_cost_rub": 108_946.0,
+        "status": registry.STATUS_NEW,
+    }
+
+    registry.sweep_open()
+
+    row = registry.load(_id(_idea()))
+    assert row["status"] == registry.STATUS_DROPPED
+    assert "смета без ожидания" in row["dropped_reason"]
+
+
+def test_sweep_does_not_touch_what_a_human_or_the_writer_took(store):
+    # queued взят человеком в работу, running — живая ставка. Снять их машинно
+    # значило бы отменить чужое решение либо осиротить эксперимент, чей
+    # вердикт уже некуда будет вернуть. Машина трогает только то, чего не
+    # касался ни человек, ни такт записи.
+    for status in (registry.STATUS_QUEUED, registry.STATUS_RUNNING):
+        campaign = f"c-{status}"
+        store.table[_id(_idea(campaign))] = {
+            **registry._prepare(_idea(campaign)),
+            "expected_rub": 32.0, "test_cost_rub": 933.0, "status": status,
+        }
+
+    assert registry.sweep_open() == []
+    assert {row["status"] for row in store.table.values()} == {
+        registry.STATUS_QUEUED, registry.STATUS_RUNNING}
+
+
+def test_sweep_leaves_a_paying_idea_in_the_queue(store):
+    # Приёмка задачи: очередь после прохода НЕПУСТА. Проход, снимающий заодно
+    # окупающиеся идеи, чинил бы экран, выключая агента.
+    registry.upsert([_idea()])
+
+    assert registry.sweep_open() == []
+    assert registry.load(_id(_idea()))["status"] == registry.STATUS_NEW

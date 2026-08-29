@@ -383,6 +383,21 @@ def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
             f"(источник, объект) — назавтра генератор посчитает другой и "
             "заведёт вторую строку на ту же находку")
 
+    expected = _check_price(idea, "expected_rub", non_negative=False)
+    test_cost = _check_price(idea, "test_cost_rub", non_negative=True)
+    unpaired = limits.unpaired_reason(expected, test_cost)
+    if unpaired:
+        # Контракт генератора, а не приговор идее: посчитаны обе величины или
+        # ни одной. Отказ здесь, а не снятие при записи, потому что чинить
+        # такую строку нечем — снять её значило бы прятать дефект кода в
+        # данные, а принять — показывать человеку расход без выгоды. Порция
+        # источника падает целиком (upsert), прогон при этом живёт: отказ
+        # реестра едет строкой отчёта (agent_e0.collect_ideas).
+        raise InvalidIdea(
+            f"{unpaired}; смета — это списание риск-бюджета полосы, и несёт её "
+            "только применяемая идея. Предложение человеку (класс 3) оставляет "
+            "смету пустой — см. ideas/master.py")
+
     return {
         "idea_id": computed_id,
         "source": source,
@@ -391,8 +406,8 @@ def _prepare(idea: Dict[str, Any]) -> Dict[str, Any]:
         "subject_key": subject_key(subject, account),
         "tier": int(tier),
         "lane": lane,
-        "expected_rub": _check_price(idea, "expected_rub", non_negative=False),
-        "test_cost_rub": _check_price(idea, "test_cost_rub", non_negative=True),
+        "expected_rub": expected,
+        "test_cost_rub": test_cost,
         "horizon_days": int(horizon),
         "success_rule": _check_success_rule(idea.get("success_rule")),
         "detail": _check_detail(idea.get("detail")),
@@ -696,6 +711,49 @@ def open_ideas(account: Optional[str] = None) -> List[Dict[str, Any]]:
     тактом.
     """
     return rank(_read_open(account))
+
+
+# Статусы, которые проход по реестру вправе закрыть. Не все открытые: queued
+# взят человеком в работу, running — живая ставка, и снять их машинно значило
+# бы отменить чужое решение либо осиротить эксперимент, чей вердикт уже некому
+# будет вернуть. Правило то же, что у _silence и reject: машина трогает только
+# то, чего не касался ни человек, ни такт записи.
+SWEEPABLE_STATUSES = (STATUS_NEW, STATUS_PROPOSED)
+
+
+def sweep_open(account: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Закрывает открытые строки, которые не проходят пределы ideas/limits.
+
+    Зачем отдельный проход. Пределы применялись ТОЛЬКО в момент записи
+    (_drop_unprofitable), а значит доставали лишь те строки, которые генератор
+    находит сегодня заново. Строка, которую он перестал находить, оставалась в
+    очереди навсегда с числами того дня, когда её завели: замер 29.08.2026
+    показал в живой очереди две идеи proven с ожиданием 32 ₽ при цене замера
+    933 ₽ и 129 ₽ при 829 ₽ — обе заведены до появления порога и обе пережили
+    его, потому что порог их больше не видел. Плюс правило меняется (порог,
+    парность величин), и вчерашние строки судятся вчерашней меркой ровно до
+    первого такого прохода.
+
+    Закрывает, а не прячет: строка ложится dropped с названной причиной, и по
+    данным видно, что идея снята машиной, а не что генератор замолчал.
+
+    Отказ человека сильнее: у отклонённой строки статус уже закрыт, и до
+    прохода она не доезжает (читаются только открытые).
+    """
+    closed: List[Dict[str, Any]] = []
+    for row in _read_open(account):
+        if str(row.get("status")) not in SWEEPABLE_STATUSES:
+            continue
+        reason = limits.closing_reason(row.get("expected_rub"),
+                                       row.get("test_cost_rub"))
+        if reason is None:
+            continue
+        out = dict(row)
+        out["status"] = STATUS_DROPPED
+        out["dropped_reason"] = reason
+        closed.append(out)
+    _write_rows(closed)
+    return closed
 
 
 def find_by_experiment(experiment_id: str) -> Optional[Dict[str, Any]]:

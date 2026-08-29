@@ -110,6 +110,10 @@ GROUP_REASON_THIN_MARGIN = (
 GROUP_REASON_NO_REVENUE = (
     "ожидаемые оплаты выноса не во что перевести: у доноров не посчитан "
     "средний чек, и окупаемость кампании осталась бы дробью без числителя")
+GROUP_REASON_NO_VALUE_PER_PAYMENT = (
+    "у кабинета не посчитан чек оплаты: ожидаемые оплаты выноса не перевести "
+    "в рубли, а деньги новой кампании под ударом настоящие — идея вышла бы "
+    "сметой без выгоды (ideas/limits.unpaired_reason)")
 
 
 def _number(value: Any) -> Optional[float]:
@@ -337,8 +341,18 @@ def _group(direction: str, donors: List[Dict[str, Any]], ctx: Dict[str, Any],
     donor_cpa = cost / conversions
 
     daily_cost = cost / float(window)
-    value_per_payment = _number(ctx.get("value_per_payment_rub"))
     expected_payments = daily_payments * horizon
+
+    # Чек оплаты — единственное, чем ожидаемые оплаты переводятся в рубли.
+    # Нет его — идея не заводится: смета выноса настоящая (деньги новой
+    # кампании за горизонт), и строка со сметой при пустом ожидании реестру
+    # запрещена (ideas/limits.unpaired_reason). Отсев с названной причиной, а
+    # не пустое ожидание рядом с ценой: «кабинету нечем оценить оплату» и
+    # «вынос ничего не обещает» лечатся по-разному.
+    value_per_payment = _number(ctx.get("value_per_payment_rub"))
+    if value_per_payment is None:
+        return None, {"direction": direction,
+                      "reason": GROUP_REASON_NO_VALUE_PER_PAYMENT}
 
     idea = {
         "source": SOURCE,
@@ -350,8 +364,7 @@ def _group(direction: str, donors: List[Dict[str, Any]], ctx: Dict[str, Any],
         # билдер), без наряда — предложение человеку.
         "tier": tier_mod.TIER_PROPOSAL,
         "lane": lanes_mod.LANE_PROPOSAL,
-        "expected_rub": (round(expected_payments * value_per_payment, 2)
-                         if value_per_payment is not None else None),
+        "expected_rub": round(expected_payments * value_per_payment, 2),
         # Цена теста — деньги, которые новая кампания проживёт за горизонт по
         # нынешнему темпу доноров. Это не «новые» деньги: тот же трафик просто
         # переезжает, — но под ударом они, и очередь реестра сравнивает идеи
