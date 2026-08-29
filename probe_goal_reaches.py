@@ -102,5 +102,21 @@ def main():
         print(f"  {dims:<110} {float((it.get('metrics') or [0])[0] or 0):>8,.0f}")
 
 
+    print("\n=== 5. По стране визита (кто именно достигает цель) ===")
+    resp = get({"metrics": m, "dimensions": "ym:s:regionCountryName",
+                "limit": 30, "sort": f"-{m}"})
+    for it in resp.get("data", [])[:15]:
+        name = ((it.get("dimensions") or [{}])[0] or {}).get("name") or "—"
+        print(f"  {str(name)[:40]:<42} {float((it.get('metrics') or [0])[0] or 0):>8,.0f}")
+
+    print("\n=== 6. Та же разбивка для «Регистрация или авторизация» 340818283 ===")
+    m2 = "ym:s:goal340818283reaches"
+    resp = get({"metrics": m2, "dimensions": "ym:s:regionCountryName",
+                "limit": 30, "sort": f"-{m2}"})
+    for it in resp.get("data", [])[:10]:
+        name = ((it.get("dimensions") or [{}])[0] or {}).get("name") or "—"
+        print(f"  {str(name)[:40]:<42} {float((it.get('metrics') or [0])[0] or 0):>8,.0f}")
+
+
 if __name__ == "__main__":
     main()
