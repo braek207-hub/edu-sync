@@ -183,6 +183,31 @@ def _window(days: int) -> tuple:
     return (today - timedelta(days=days)).isoformat(), today.isoformat()
 
 
+def _direct_clients_raw() -> List[Dict[str, Any]]:
+    """Кабинеты из окружения — как они заданы, до границы ответственности.
+
+    Отдельно от _direct_clients, потому что отчёт прогона обязан называть
+    ФАКТ: какие кабинеты отбор действительно выбросил. По уже отфильтрованному
+    списку этого не восстановить, а печатать вместо факта константу значит
+    сообщать о работе, которой не было.
+    """
+    raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
+    out: List[Dict[str, Any]] = []
+    if raw:
+        for item in json.loads(raw):
+            if isinstance(item, dict):
+                login = agent_db.normalize_login(item.get("login"))
+                goals = item.get("goal_ids") or item.get("goals") or []
+            else:
+                login, goals = agent_db.normalize_login(item), []
+            if login:
+                out.append({"login": login, "goal_ids": [str(g) for g in goals]})
+        if out:
+            return out
+    login = agent_db.normalize_login(os.environ.get("DIRECT_CLIENT_LOGIN"))
+    return [{"login": login, "goal_ids": []}] if login else []
+
+
 def _direct_clients() -> List[Dict[str, Any]]:
     """Кабинеты с целями. DIRECT_CLIENTS_JSON — список словарей
     {login, goal_ids, sheet_name}, формат задан sync/direct.py::_direct_clients.
@@ -199,22 +224,7 @@ def _direct_clients() -> List[Dict[str, Any]]:
     заповедник и справочник «кампания → кабинет» — всё ниже по течению растёт
     из этого списка и про исключение ничего не знает.
     """
-    raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
-    out: List[Dict[str, Any]] = []
-    if raw:
-        for item in json.loads(raw):
-            if isinstance(item, dict):
-                login = agent_db.normalize_login(item.get("login"))
-                goals = item.get("goal_ids") or item.get("goals") or []
-            else:
-                login, goals = agent_db.normalize_login(item), []
-            if login:
-                out.append({"login": login, "goal_ids": [str(g) for g in goals]})
-        if out:
-            return agent_scope.filter_clients(out)
-    login = agent_db.normalize_login(os.environ.get("DIRECT_CLIENT_LOGIN"))
-    single = [{"login": login, "goal_ids": []}] if login else []
-    return agent_scope.filter_clients(single)
+    return agent_scope.filter_clients(_direct_clients_raw())
 
 
 def resolve_goal_ids(client: Dict[str, Any]) -> List[str]:
@@ -1123,6 +1133,9 @@ def main() -> int:
     slice_from = (date.today() - timedelta(days=SLICE_WINDOW_DAYS)).isoformat()
     queries_from = (date.today() - timedelta(days=QUERY_WINDOW_DAYS)).isoformat()
     clients = [] if skip_direct else _direct_clients()
+    # Не константа EXCLUDED_ACCOUNTS, а те логины, которые отбор реально
+    # выбросил из состава этого прогона: отчёт называет факт.
+    excluded_accounts = agent_scope.excluded_client_logins(_direct_clients_raw())
 
     # 6-7. Отчёты Директа. ПАРАЛЛЕЛЬНО: каждый отчёт формируется до 10 минут, а их
     # десятки — последовательный обход делал прогон многочасовым (run 31781846178
@@ -1168,14 +1181,13 @@ def main() -> int:
     def _run_job(job: Dict[str, Any]) -> Dict[str, Any]:
         rows, goal = fetch_segment_report(
             job["login"], job["kind"], job["date_from"], date_to,
-            by_campaign=True, goals=job["goals"], with_date=job["with_date"],
+            goals=job["goals"], with_date=job["with_date"],
+            excluded_campaign_ids=excluded_campaign_ids,
         )
         if job["purpose"] == "computed":
-            # Отсечение и сложение — здесь, пока CampaignId ещё в строках.
-            # Дальше по течению кабинетные числа неотличимы от того, что
-            # отдал бы сам Директ, и разделить их было бы уже нечем.
-            rows = aggregate_account_rows(
-                agent_scope.drop_campaign_ids(rows, excluded_campaign_ids))
+            # Чужие строки отчёт уже не вернул (fetch_segment_report), здесь
+            # остаётся только сложить своё в кабинетные числа.
+            rows = aggregate_account_rows(rows)
         return {**job, "rows": rows, "goal": goal}
 
     # Вычисленные настройки копятся ПО КАБИНЕТАМ: числа посчитаны по аудитории
@@ -1210,9 +1222,8 @@ def main() -> int:
                     if rows:
                         computed_by_account.setdefault(login, []).extend(rows)
                 else:
-                    own_rows = agent_scope.drop_campaign_ids(
-                        job["rows"], excluded_campaign_ids)
-                    weekly = collapse_tail(build_sliced_facts(own_rows, job["kind"]))
+                    weekly = collapse_tail(
+                        build_sliced_facts(job["rows"], job["kind"]))
                     sliced_rows += weekly
                     # Э2.2: покампанийные корректировки — только device, это
                     # единственный срез с рабочим рычагом записи. Region мёртв
@@ -1323,7 +1334,8 @@ def main() -> int:
             object_rows += build_object_rows(
                 fetch_objects(login, level, campaign_ids), level, seen_on=today_iso)
         rows_for_login, query_goal = fetch_search_queries(
-            login, queries_from, date_to, goals=goals)
+            login, queries_from, date_to, goals=goals,
+            excluded_campaign_ids=excluded_campaign_ids)
         queries_by_login[login] = rows_for_login
         # Второй источник справочника «кампания → кабинет», и он сильнее
         # первого там, где первый молчит. campaigns.get не отдаёт кампании
@@ -1498,8 +1510,10 @@ def main() -> int:
             if login in set(blind_accounts):
                 continue
             try:
-                rows, _ = fetch_placements(login, slice_from, date_to,
-                                           goals=goals_by_login.get(login, []))
+                rows, _ = fetch_placements(
+                    login, slice_from, date_to,
+                    goals=goals_by_login.get(login, []),
+                    excluded_campaign_ids=excluded_campaign_ids)
             except Exception as exc:                     # noqa: BLE001
                 # Отчёт прогона — единственный JSON в выводе, и печатать в
                 # него посторонние строки нельзя: сбой одного кабинета едет
@@ -1914,7 +1928,7 @@ def main() -> int:
         # нулями: без неё «кабинет ничего не предложил» и «кабинета нет в
         # работе» выглядят в отчёте одинаково, а разбор начинается именно с
         # этого различия. Действием исключение не является и в журнал не идёт.
-        "excluded": {"accounts": sorted(agent_scope.EXCLUDED_ACCOUNTS),
+        "excluded": {"accounts": excluded_accounts,
                      "campaigns": len(excluded_campaign_ids)},
         "crm_through": latest_lead,
         "crm_lag_days": crm_lag,

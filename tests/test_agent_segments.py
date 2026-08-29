@@ -391,8 +391,10 @@ def test_region_slice_is_keyed_by_numeric_id_with_name_alongside(monkeypatch):
         "cab", "region", "2026-08-06", "2026-08-20")
 
     # Оба поля в одном запросе: отдельный проход за именами удвоил бы отчёты.
-    assert captured["fields"][:2] == ["TargetingLocationId",
-                                      "TargetingLocationName"]
+    # Первые два поля — CampaignId и Date: без CampaignId отсечь чужие
+    # кампании нечем, и его просит каждый отчёт.
+    assert captured["fields"][2:4] == ["TargetingLocationId",
+                                       "TargetingLocationName"]
     by_key = {r["slice_key"]: r for r in rows}
     assert by_key["213"]["slice_label"] == "Москва"
     assert by_key["213"]["clicks"] == 1000

@@ -477,6 +477,25 @@ UNUSABLE_ACTUAL_REASON = (
 )
 
 
+def _clients_raw() -> List[Dict[str, Any]]:
+    """Кабинеты из окружения, до границы ответственности.
+
+    Нужен отчёту прогона: строка «не смотрели» обязана называть логины,
+    которые отбор действительно выбросил, а не константу списка исключений
+    (agent_e0._direct_clients_raw — то же самое у расчёта).
+    """
+    raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
+    out: List[Dict[str, Any]] = []
+    if raw:
+        for item in json.loads(raw):
+            if not isinstance(item, dict):
+                continue
+            login = agent_db.normalize_login(item.get("login"))
+            if login:
+                out.append({"login": login})
+    return out
+
+
 def _clients() -> List[Dict[str, Any]]:
     """Кабинеты прогона. Форма — та же, что у расчёта (agent_e0._direct_clients).
 
@@ -491,16 +510,7 @@ def _clients() -> List[Dict[str, Any]]:
     здесь же: список кабинетов — единственный вход прогона, и всё, что ниже,
     работает уже с урезанным составом.
     """
-    raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
-    out: List[Dict[str, Any]] = []
-    if raw:
-        for item in json.loads(raw):
-            if not isinstance(item, dict):
-                continue
-            login = agent_db.normalize_login(item.get("login"))
-            if login:
-                out.append({"login": login})
-    return agent_scope.filter_clients(out)
+    return agent_scope.filter_clients(_clients_raw())
 
 
 def fetch_campaign_ids(client: WriteClient) -> List[int]:
@@ -2969,7 +2979,8 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
                 # Кампаний здесь нет намеренно — их считает отчёт Э0, где имя
                 # кампании видно и запрос к источнику всё равно сделан; ради
                 # одной отчётной строки движок записи лишнего запроса не шлёт.
-                "excluded": {"accounts": sorted(agent_scope.EXCLUDED_ACCOUNTS)},
+                "excluded": {
+                    "accounts": agent_scope.excluded_client_logins(_clients_raw())},
                 "window": [cutoff, today], "failed_accounts": failed_accounts}
     saved = blackbox.save_run(
         run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),

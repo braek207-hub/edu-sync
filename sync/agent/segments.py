@@ -246,12 +246,29 @@ def chosen_goal(records: List[Dict[str, str]], goal_column: Optional[str]) -> Di
     }
 
 
+def _own_records(tsv: str, excluded_campaign_ids: Iterable[Any]) -> List[Dict[str, str]]:
+    """Разбор ответа отчёта без строк кампаний вне зоны ответственности.
+
+    Отсечение стоит ЗДЕСЬ, а не у вызывающего, потому что по этим же строкам
+    выбирается колонка цели (primary_goal_column) и считается паспорт отчёта.
+    Отсечь после выбора значило бы, что цель — а через неё вся
+    конверсионность кабинета и все корректировки ставок — назначена чужой
+    кампанией: у неё может быть массовой совсем другая цель.
+
+    Ключ CampaignId, а не campaign_id: строки здесь ещё сырые, как их отдал
+    Директ. Отчёт без этой колонки не отсекается ничем — пустое значение ни
+    с чем не совпадает, — и это верно: без CampaignId различать нечем.
+    """
+    return agent_scope.drop_campaign_ids(
+        _parse_tsv(tsv), excluded_campaign_ids, id_key="CampaignId")
+
+
 def fetch_segment_report(
     login: str, segment_kind: str, date_from: str, date_to: str,
-    by_campaign: bool = False, goals: List[str] = (),
-    with_date: bool = True,
+    goals: List[str] = (), with_date: bool = True,
+    excluded_campaign_ids: Iterable[Any] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Срез за окно. by_campaign=True добавляет разрез по кампаниям.
+    """Срез за окно, всегда с разрезом по кампаниям.
 
     Условия в запросе не бывает никогда — ни в каком виде. «Всё кроме этих
     кампаний» Reports API выразить не умеет: замер 30.08.2026 (run
@@ -259,8 +276,9 @@ def fetch_segment_report(
     операторы EQUALS, IN», а перечисление своих через IN выбросило бы из
     ответа кампании Мастера — campaigns.get их не отдаёт вовсе
     (sync/agent/master.py), и агент потерял бы их расход, отсекая семь чужих
-    РК. Поэтому чужие режутся по строкам, где CampaignId есть, а кабинетные
-    числа складываются в Python (aggregate_account_rows).
+    РК. Поэтому CampaignId просится ВСЕГДА: без него отсечь чужие строки
+    нечем, а кабинетные числа складываются в Python
+    (aggregate_account_rows).
 
     with_date=False убирает из разреза дату: кабинетному агрегату она не
     нужна (числа всё равно суммируются по всему окну), а лишний разрез
@@ -275,8 +293,7 @@ def fetch_segment_report(
         fields.insert(1, label_field)
     if goals:
         fields.append("Conversions")
-    if by_campaign:
-        fields = (["CampaignId", "Date"] if with_date else ["CampaignId"]) + fields
+    fields = (["CampaignId", "Date"] if with_date else ["CampaignId"]) + fields
 
     criteria: Dict[str, Any] = {"DateFrom": date_from, "DateTo": date_to}
 
@@ -284,7 +301,7 @@ def fetch_segment_report(
         "params": _with_goals({
             "SelectionCriteria": criteria,
             "FieldNames": fields,
-            "ReportName": f"agent-{segment_kind}-{'bycamp-' if by_campaign else ''}{date_from}-{date_to}",
+            "ReportName": f"agent-{segment_kind}-bycamp-{date_from}-{date_to}",
             "ReportType": "CUSTOM_REPORT",
             "DateRangeType": "CUSTOM_DATE",
             "Format": "TSV",
@@ -293,7 +310,7 @@ def fetch_segment_report(
         }, list(goals))
     }
 
-    records = _parse_tsv(_run_report(login, payload))
+    records = _own_records(_run_report(login, payload), excluded_campaign_ids)
     # Одна цель на весь срез: см. primary_goal_column. Выбор построчно сравнивал
     # бы сегменты по разным целям.
     goal_column = primary_goal_column(records)
@@ -310,10 +327,9 @@ def fetch_segment_report(
             "conversions": _cell_int(rec.get(goal_column)) if goal_column else 0,
             "cost": float(rec.get("Cost") or 0.0),
         }
-        if by_campaign:
-            row["campaign_id"] = rec.get("CampaignId", "")
-            if with_date:
-                row["date"] = rec.get("Date", "")
+        row["campaign_id"] = rec.get("CampaignId", "")
+        if with_date:
+            row["date"] = rec.get("Date", "")
         rows.append(row)
     return rows, chosen_goal(records, goal_column)
 
@@ -636,7 +652,8 @@ def fetch_objects(login: str, object_level: str, campaign_ids: List[int]) -> Lis
 
 
 def fetch_search_queries(
-    login: str, date_from: str, date_to: str, goals: List[str] = ()
+    login: str, date_from: str, date_to: str, goals: List[str] = (),
+    excluded_campaign_ids: Iterable[Any] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Поисковые запросы за окно, агрегат без дат. Только строки с кликами:
     показы без кликов дают миллионы строк и ничего не решают.
@@ -662,7 +679,10 @@ def fetch_search_queries(
             "IncludeDiscount": "NO",
         }, list(goals))
     }
-    records = _parse_tsv(_run_report(login, payload))
+    # Чужие строки — до выбора цели: расход и конверсии ФРАЗЫ складываются по
+    # всем её кампаниям (objects.py), а минус-слово пишется в свои. Строка
+    # чужой РК решала бы порог, по которому режут собственную семантику.
+    records = _own_records(_run_report(login, payload), excluded_campaign_ids)
     # Та же история с именами колонок, что и у сегментных срезов: "Conversions"
     # в ответе нет, есть Conversions_<цель>_<атрибуция>. Здесь цена ошибки
     # другая, но не меньше: по этим числам отбираются кандидаты в минус-слова,
@@ -685,7 +705,8 @@ def fetch_search_queries(
 
 
 def fetch_placements(
-    login: str, date_from: str, date_to: str, goals: List[str] = ()
+    login: str, date_from: str, date_to: str, goals: List[str] = (),
+    excluded_campaign_ids: Iterable[Any] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Площадки сети за окно, агрегат без дат.
 
@@ -723,7 +744,9 @@ def fetch_placements(
             "IncludeDiscount": "NO",
         }, list(goals))
     }
-    records = _parse_tsv(_run_report(login, payload))
+    # Та же причина, что у запросов: площадка запрещается в своих кампаниях,
+    # значит и считаться должна по ним.
+    records = _own_records(_run_report(login, payload), excluded_campaign_ids)
     goal_column = primary_goal_column(records)
     rows = [
         {

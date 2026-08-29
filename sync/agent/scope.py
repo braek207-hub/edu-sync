@@ -63,6 +63,19 @@ def filter_clients(clients: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [c for c in clients if not is_excluded_account(c.get("login"))]
 
 
+def excluded_client_logins(clients: Iterable[Any]) -> List[str]:
+    """Логины, которые отбор действительно выбросил из состава прогона.
+
+    Отчёт прогона обязан называть факт, а не константу: EXCLUDED_ACCOUNTS —
+    свойство кода, а состав прогона — свойство секрета. Кабинет, которого в
+    DIRECT_CLIENTS_JSON нет вовсе, напечатанный как отброшенный, сообщал бы
+    о работе, которой не было.
+    """
+    logins = [c.get("login") if isinstance(c, dict) else c for c in clients]
+    return sorted({normalize_login(login) for login in logins
+                   if is_excluded_account(login)})
+
+
 def filter_campaign_rows(rows: Iterable[Dict[str, Any]],
                          name_key: str = "campaign_name") -> List[Dict[str, Any]]:
     """Строки с именем кампании без исключённых.

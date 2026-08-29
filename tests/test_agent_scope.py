@@ -305,7 +305,7 @@ def test_review_ignores_rejects_of_the_excluded_account():
         "account1-506453-ln8s"]
 
 
-# ------------------------- подключение: кабинетный агрегат сегментных отчётов
+# ------------------------- подключение: отчёты Директа со строками кампаний
 
 
 def _capture_segment_payload(monkeypatch, tsv="Device\n"):
@@ -351,110 +351,176 @@ def test_account_aggregate_is_summed_from_campaign_rows():
     ]
 
 
-def test_account_report_asks_for_campaign_id_without_date(monkeypatch):
-    """Кабинетному агрегату нужен CampaignId и не нужна Date.
+def test_every_segment_report_asks_for_campaign_id(monkeypatch):
+    """CampaignId просят ОБА такта — иначе отсечь чужие строки нечем.
 
-    CampaignId — чтобы было чем отсечь чужие строки. Date — не нужна: числа
-    всё равно складываются по всему окну, а лишний разрез умножает объём
-    ответа на число дней окна (30 у расчётного такта).
+    Разрез по кампаниям перестал быть признаком среза фактов: агрегат кабинета
+    у Директа не запрашивается вовсе (в его ответе CampaignId нет, и чужой
+    расход осел бы в знаменателе конверсионности сегмента). Date остаётся
+    отличием: срезу фактов она нужна — там недели, — а расчётному такту нет,
+    и лишний разрез умножил бы объём ответа на число дней окна.
     """
     from sync.agent import segments
 
     captured = _capture_segment_payload(monkeypatch)
     segments.fetch_segment_report("acc-1", "device", "2026-08-01", "2026-08-28",
-                                  by_campaign=True, with_date=False)
-
-    fields = captured["payload"]["params"]["FieldNames"]
-    assert fields[0] == "CampaignId"
-    assert "Date" not in fields
+                                  with_date=False)
+    assert captured["payload"]["params"]["FieldNames"][0] == "CampaignId"
+    assert "Date" not in captured["payload"]["params"]["FieldNames"]
     # Условия в запросе нет ни в каком виде: Мастер кампаний обязан остаться.
     assert "Filter" not in captured["payload"]["params"]["SelectionCriteria"]
 
-
-def test_sliced_report_still_asks_for_date(monkeypatch):
-    """Покампанийный срез фактов без Date собрать нельзя — там недели."""
-    from sync.agent import segments
-
     captured = _capture_segment_payload(monkeypatch)
-    segments.fetch_segment_report("acc-1", "device", "2026-08-01", "2026-08-28",
-                                  by_campaign=True)
-
+    segments.fetch_segment_report("acc-1", "device", "2026-08-01", "2026-08-28")
     assert captured["payload"]["params"]["FieldNames"][:2] == ["CampaignId", "Date"]
 
 
-def test_calculation_never_asks_direct_for_an_account_aggregate(monkeypatch, capsys):
-    """Ни один запрос такта расчёта не идёт агрегатом кабинета.
+def test_segment_report_drops_foreign_rows_before_choosing_the_goal(monkeypatch):
+    """Чужие строки уходят ДО выбора цели, а не после.
 
-    Пока запрос был агрегатом (by_campaign=False), в ответе не было
-    CampaignId — и отсечь в нём чужие деньги было нечем вообще: они оседали в
-    знаменателе конверсионности сегмента, то есть в кабинетных корректировках
-    ставок.
+    Колонка цели выбирается самой массовой по отчёту (primary_goal_column), и
+    паспорт отчёта считается по ней же. Отсечение после выбора означало бы,
+    что вся конверсионность кабинета — и, через неё, все корректировки
+    ставок — посчитаны по цели, которую назначила чужая кампания.
+    """
+    from sync.agent import segments
+
+    tsv = (
+        "CampaignId\tDevice\tClicks\tCost\tImpressions"
+        "\tConversions_11_LSCCD\tConversions_22_LSCCD\n"
+        "111\tMOBILE\t100\t1000.0\t900\t30\t5\n"
+        "710118280\tMOBILE\t900\t9000.0\t8000\t1\t400\n"
+    )
+    monkeypatch.setattr(segments, "_run_report", lambda login, payload: tsv)
+
+    rows, goal = segments.fetch_segment_report(
+        "acc-1", "device", "2026-08-01", "2026-08-28",
+        goals=["11", "22"], excluded_campaign_ids={"710118280"})
+
+    assert [r["campaign_id"] for r in rows] == ["111"]
+    # Цель 22 массовее только за счёт чужой кампании: её 400 конверсий
+    # перевесили бы 30 своих.
+    assert goal["goal_column"] == "Conversions_11_LSCCD"
+    assert goal["conversions"] == 30
+    assert rows[0]["conversions"] == 30
+
+
+def test_search_queries_drop_foreign_rows(monkeypatch):
+    """Фраза агрегируется по кампаниям кабинета — чужие в сумму не идут.
+
+    Кандидат в минус-слова отбирается по расходу и конверсиям ФРАЗЫ, сложенным
+    по всем её кампаниям (objects.py). Строка чужой РК добавляла бы расход в
+    порог, а минус-слово писалось бы в свои кампании: чужие деньги решали, что
+    отминусовать у себя.
+    """
+    from sync.agent import segments
+
+    tsv = ("CampaignId\tQuery\tCriteria\tCost\tClicks\tConversions_11_LSCCD\n"
+           "111\tколледж москва\tколледж\t500.0\t10\t2\n"
+           "710118280\tколледж москва\tколледж\t90000.0\t900\t0\n")
+    monkeypatch.setattr(segments, "_run_report", lambda login, payload: tsv)
+
+    rows, goal = segments.fetch_search_queries(
+        "acc-1", "2026-08-01", "2026-08-28", goals=["11"],
+        excluded_campaign_ids={"710118280"})
+
+    assert [r["campaign_id"] for r in rows] == ["111"]
+    assert sum(r["cost"] for r in rows) == 500.0
+    assert goal["conversions"] == 2
+
+
+def test_placements_drop_foreign_rows(monkeypatch):
+    """Площадка запрещается в своих кампаниях — считаться должна по ним же."""
+    from sync.agent import segments
+
+    tsv = ("CampaignId\tPlacement\tAdNetworkType\tCost\tClicks\tImpressions"
+           "\tConversions_11_LSCCD\n"
+           "111\tsite.ru\tAD_NETWORK\t500.0\t10\t100\t2\n"
+           "710118280\tsite.ru\tAD_NETWORK\t90000.0\t900\t9000\t0\n")
+    monkeypatch.setattr(segments, "_run_report", lambda login, payload: tsv)
+
+    rows, goal = segments.fetch_placements(
+        "acc-1", "2026-08-01", "2026-08-28", goals=["11"],
+        excluded_campaign_ids={"710118280"})
+
+    assert [r["campaign_id"] for r in rows] == ["111"]
+    assert goal["conversions"] == 2
+
+
+def test_calculation_hands_the_excluded_set_to_every_report_reader(monkeypatch, capsys):
+    """Все три отчёта кабинета получают множество исключённых.
+
+    Отсечение живёт внутри читателей (там же выбирается цель), но множество
+    приходит снаружи — из витрины источника, где имя кампании ещё видно.
+    Забытый аргумент у любого из трёх молча возвращает чужие строки: у
+    запросов — в кандидаты в минус-слова, у площадок — в запреты, у среза —
+    в факты и корректировки.
     """
     import sync.agent_e0 as agent_e0
     import tests.test_agent_e0 as e0_tests
 
     e0_tests._patch_e0_run(monkeypatch)
-    seen = []
-
-    def _report(login, kind, date_from, date_to, by_campaign=False, goals=(),
-                with_date=True):
-        seen.append({"login": login, "kind": kind, "by_campaign": by_campaign,
-                     "with_date": with_date})
-        return [], {"goal_column": None, "conversions": 0, "columns_offered": 0}
-
-    monkeypatch.setattr(agent_e0, "fetch_segment_report", _report)
-
-    assert agent_e0.main() == 0
-    capsys.readouterr()
-
-    assert seen, "отчёты вообще не запрашивались — тест ничего не проверил"
-    assert [j for j in seen if not j["by_campaign"]] == []
-
-
-def test_account_modifiers_are_computed_without_foreign_campaigns(monkeypatch, capsys):
-    """Кабинетные корректировки считаются по своим кампаниям и только по ним.
-
-    Чужая кампания здесь не просто добавляет расход: она добавляет клики в
-    знаменатель конверсионности сегмента. Проверяется по support_n — это и
-    есть клики, на которых посчитана корректировка.
-    """
-    import sync.agent_e0 as agent_e0
-    import tests.test_agent_e0 as e0_tests
-
-    calls = e0_tests._patch_e0_run(monkeypatch)
     monkeypatch.setattr(agent_e0.agent_db, "load_excluded_campaign_ids",
                         lambda *a, **k: {"710118280"})
+    seen = {}
+    goal = {"goal_column": None, "conversions": 0, "columns_offered": 0}
 
-    def _row(segment_key, campaign_id, clicks, conversions):
-        return {"segment_kind": "device", "segment_key": segment_key,
-                "slice_key": segment_key, "slice_label": "", "clicks": clicks,
-                "impressions": clicks * 10, "conversions": conversions,
-                "cost": float(clicks), "campaign_id": campaign_id}
+    def _segments(login, kind, date_from, date_to, goals=(), with_date=True,
+                  excluded_campaign_ids=()):
+        seen["segments"] = set(excluded_campaign_ids)
+        return [], goal
 
-    def _report(login, kind, date_from, date_to, by_campaign=False, goals=(),
-                with_date=True):
-        rows = ([] if (with_date or kind != "device") else [
-            _row("MOBILE", "111", 20000, 1200),
-            _row("DESKTOP", "111", 20000, 200),
-            # Чужая кампания: в её сегментах кликов больше, чем во всём
-            # кабинете, — доехав до расчёта, она перевернула бы обе
-            # корректировки.
-            _row("MOBILE", "710118280", 90000, 100),
-            _row("DESKTOP", "710118280", 90000, 9000),
-        ])
-        return rows, {"goal_column": "Conversions_1_LSCCD", "conversions": 1,
-                      "columns_offered": 1}
+    def _queries(login, date_from, date_to, goals=(), excluded_campaign_ids=()):
+        seen["queries"] = set(excluded_campaign_ids)
+        # Колонка цели нужна настоящая: кабинет без неё считается слепым и
+        # выпадает из шага площадок целиком — тогда третий читатель просто не
+        # был бы спрошен, а тест этого не заметил бы.
+        return [], {"goal_column": "Conversions_1_LSCCD", "conversions": 1,
+                    "columns_offered": 1}
 
-    monkeypatch.setattr(agent_e0, "fetch_segment_report", _report)
+    def _placements(login, date_from, date_to, goals=(), excluded_campaign_ids=()):
+        seen["placements"] = set(excluded_campaign_ids)
+        return [], goal
+
+    monkeypatch.setattr(agent_e0, "fetch_segment_report", _segments)
+    monkeypatch.setattr(agent_e0, "fetch_search_queries", _queries)
+    monkeypatch.setattr(agent_e0, "fetch_placements", _placements)
+    # Площадки спрашиваются только при живом пороге CPA — без него шаг
+    # пропускается целиком, и проверять было бы нечего.
+    monkeypatch.setattr(agent_e0.agent_db, "load_baseline_cpa",
+                        lambda *a, **k: {"vuz": 1000.0})
 
     assert agent_e0.main() == 0
     capsys.readouterr()
 
-    support = {r["setting_key"]: r["support_n"]
-               for call in calls for r in call["rows"]
-               if call["object_id"] == "acc-1"
-               and r["setting_kind"] == "bid_modifier:device"}
-    assert support == {"MOBILE": 20000, "DESKTOP": 20000}
+    assert seen == {"segments": {"710118280"},
+                    "queries": {"710118280"},
+                    "placements": {"710118280"}}
+
+
+def test_run_report_names_the_accounts_it_actually_dropped(monkeypatch):
+    """Строка «не смотрели» обязана называть факт, а не константу.
+
+    Список исключений — свойство кода, а состав прогона — свойство секрета.
+    Печатая константу, отчёт сообщал бы о работе, которой не было: кабинет,
+    которого в DIRECT_CLIENTS_JSON нет вовсе, выглядел бы отброшенным.
+    """
+    import sync.agent_e0 as agent_e0
+    import sync.agent_e1 as agent_e1
+
+    monkeypatch.setenv("DIRECT_CLIENTS_JSON", json.dumps([
+        {"login": "account1-506453-ln8s"},
+        {"login": " account4-506456-gsrr "},
+    ]))
+    assert scope.excluded_client_logins(agent_e0._direct_clients_raw()) == [
+        "account4-506456-gsrr"]
+    assert scope.excluded_client_logins(agent_e1._clients_raw()) == [
+        "account4-506456-gsrr"]
+
+    monkeypatch.setenv("DIRECT_CLIENTS_JSON", json.dumps([
+        {"login": "account1-506453-ln8s"}]))
+    assert scope.excluded_client_logins(agent_e0._direct_clients_raw()) == []
+    assert scope.excluded_client_logins(agent_e1._clients_raw()) == []
 
 
 # ------------------------- подключение: остальные агрегаты витрины фактов
