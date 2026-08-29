@@ -1141,6 +1141,11 @@ def main() -> int:
         rows, goal = fetch_segment_report(
             job["login"], job["kind"], job["date_from"], date_to,
             by_campaign=job["by_campaign"], goals=job["goals"],
+            # Кабинетный агрегат отдаёт по строке на сегмент, без CampaignId:
+            # отсечь чужие РК можно только условием самого запроса. У
+            # покампанийного среза Id есть, и он режется по строкам ниже —
+            # fetch_segment_report условие ему намеренно не ставит.
+            excluded_campaign_ids=excluded_campaign_ids,
         )
         return {**job, "rows": rows, "goal": goal}
 

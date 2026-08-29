@@ -17,7 +17,7 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
@@ -249,9 +249,23 @@ def chosen_goal(records: List[Dict[str, str]], goal_column: Optional[str]) -> Di
 def fetch_segment_report(
     login: str, segment_kind: str, date_from: str, date_to: str,
     by_campaign: bool = False, goals: List[str] = (),
+    excluded_campaign_ids: Iterable[Any] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Срез за окно. by_campaign=True добавляет разрез по кампаниям и датам —
     для edu_agent_facts_sliced; без него агрегат по аккаунту для корректировок.
+
+    excluded_campaign_ids — кампании вне зоны ответственности агента
+    (sync/agent/scope.py). Отсекает их САМ ДИРЕКТ, условием запроса, и только
+    у КАБИНЕТНОГО агрегата: в его ответе по строке на сегмент, CampaignId там
+    нет вовсе, и расход чужих РК иначе оседает в знаменателе конверсионности
+    сегмента — то есть в кабинетных корректировках ставок. Покампанийный срез
+    (by_campaign=True) режется по строкам выше по течению: два фильтра на
+    одном отчёте были бы двумя правдами, и расхождение между ними нечем было
+    бы объяснить.
+
+    Пустой список условия НЕ добавляет: кабинет без чужих кампаний обязан
+    спрашивать ровно то же тело, что и раньше, — от тела считается имя отчёта
+    (_stamp_report_name), и лишний ключ означал бы пересборку всех отчётов.
 
     Возвращает (строки, паспорт выбранной цели) — см. chosen_goal."""
     field = SEGMENT_FIELDS[segment_kind]
@@ -264,9 +278,18 @@ def fetch_segment_report(
     if by_campaign:
         fields = ["CampaignId", "Date"] + fields
 
+    criteria: Dict[str, Any] = {"DateFrom": date_from, "DateTo": date_to}
+    excluded = sorted({str(cid) for cid in excluded_campaign_ids or ()})
+    if excluded and not by_campaign:
+        # Форма условия — та же, что у живого фильтра отчёта запросов
+        # (Field/Operator/Values ниже в этом модуле): у CampaignId Reports API
+        # принимает EQUALS/NOT_EQUALS/IN/NOT_IN.
+        criteria["Filter"] = [{"Field": "CampaignId", "Operator": "NOT_IN",
+                               "Values": excluded}]
+
     payload = {
         "params": _with_goals({
-            "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
+            "SelectionCriteria": criteria,
             "FieldNames": fields,
             "ReportName": f"agent-{segment_kind}-{'bycamp-' if by_campaign else ''}{date_from}-{date_to}",
             "ReportType": "CUSTOM_REPORT",

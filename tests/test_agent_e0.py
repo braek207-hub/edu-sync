@@ -260,7 +260,8 @@ def _patch_e0_run(monkeypatch, reports=None):
         agent_e0, "fetch_segment_report",
         # Числа отдаёт только срез по устройствам: пол и возраст оставлены
         # пустыми, чтобы разбивка отчёта читалась однозначно.
-        lambda login, kind, date_from, date_to, by_campaign=False, goals=():
+        lambda login, kind, date_from, date_to, by_campaign=False, goals=(),
+               excluded_campaign_ids=():
             ([] if (by_campaign or kind != "device")
              else list(by_login.get(login, [])),
              {"goal_column": "Conversions_111_LSCCD", "conversions": 1,
@@ -494,7 +495,8 @@ def test_main_sends_account_goals_into_the_report_request(monkeypatch, capsys):
     monkeypatch.setattr(agent_e0, "fetch_account_goal_ids", lambda login: [555, 666])
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
-        lambda login, kind, date_from, date_to, by_campaign=False, goals=():
+        lambda login, kind, date_from, date_to, by_campaign=False, goals=(),
+               excluded_campaign_ids=():
             (seen_goals.append(list(goals)) or [], {"goal_column": "Conversions_111_LSCCD", "conversions": 7, "columns_offered": 1}))
 
     assert agent_e0.main() == 0
@@ -1033,7 +1035,8 @@ def test_main_writes_campaign_level_device_modifiers(monkeypatch, capsys):
     ]
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
-        lambda login, kind, date_from, date_to, by_campaign=False, goals=():
+        lambda login, kind, date_from, date_to, by_campaign=False, goals=(),
+               excluded_campaign_ids=():
             ((list(campaign_rows) if (by_campaign and kind == "device"
                                       and login == "acc-1") else [])
              if by_campaign else
@@ -1522,7 +1525,8 @@ def test_main_keeps_foreign_campaigns_out_of_sliced_facts(monkeypatch, capsys):
                         lambda rows: written.extend(rows) or len(rows))
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
-        lambda login, kind, date_from, date_to, by_campaign=False, goals=():
+        lambda login, kind, date_from, date_to, by_campaign=False, goals=(),
+               excluded_campaign_ids=():
             ([{"segment_kind": kind, "segment_key": "MOBILE", "slice_key": "MOBILE",
                "slice_label": "", "clicks": 10, "impressions": 100,
                "conversions": 1, "cost": 100.0,

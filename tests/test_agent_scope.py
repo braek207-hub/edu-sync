@@ -302,3 +302,94 @@ def test_review_ignores_rejects_of_the_excluded_account():
 
     assert [r["account"] for r in agent_review.own_rejects(rejects)] == [
         "account1-506453-ln8s"]
+
+
+# ------------------------- подключение: кабинетный агрегат сегментных отчётов
+
+
+def _capture_segment_payload(monkeypatch, tsv="Device\n"):
+    """Перехват тела запроса к Reports API вместо самого запроса."""
+    from sync.agent import segments
+
+    captured = {}
+    monkeypatch.setattr(segments, "_run_report",
+                        lambda login, payload: captured.update(payload=payload) or tsv)
+    return captured
+
+
+def test_account_aggregate_report_asks_direct_to_skip_foreign_campaigns(monkeypatch):
+    """Кабинетный агрегат нельзя отфильтровать по строкам — их нет.
+
+    by_campaign=False возвращает по строке на СЕГМЕНТ, без CampaignId: расход
+    чужих РК сидит внутри и уезжает в знаменатель конверсионности сегмента,
+    то есть в кабинетные корректировки ставок. Единственное место, где эти
+    кампании ещё различимы, — сам запрос.
+    """
+    from sync.agent import segments
+
+    captured = _capture_segment_payload(monkeypatch)
+
+    segments.fetch_segment_report(
+        "account10-506462-fqs4", "device", "2026-08-01", "2026-08-07",
+        excluded_campaign_ids=["712704859", "710118280"])
+
+    criteria = captured["payload"]["params"]["SelectionCriteria"]
+    assert criteria["Filter"] == [{"Field": "CampaignId", "Operator": "NOT_IN",
+                                  "Values": ["710118280", "712704859"]}]
+
+
+def test_report_without_exclusions_is_the_same_request_as_before(monkeypatch):
+    """Кабинет без чужих кампаний обязан спрашивать ровно то же, что и раньше.
+
+    Пустой Filter — не безобидное «условие ни на что»: это другое тело
+    запроса, другой хеш имени отчёта (_stamp_report_name) и лишний повод
+    Директу его отвергнуть. Нет исключений — нет и ключа.
+    """
+    from sync.agent import segments
+
+    captured = _capture_segment_payload(monkeypatch)
+
+    segments.fetch_segment_report("acc", "device", "2026-08-01", "2026-08-07")
+
+    assert "Filter" not in captured["payload"]["params"]["SelectionCriteria"]
+
+
+def test_by_campaign_report_is_filtered_by_rows_not_by_request(monkeypatch):
+    """Покампанийный срез режется по строкам — там CampaignId есть.
+
+    Два фильтра на одном отчёте были бы двумя правдами: расходись они, понять
+    по числам, какая сработала, стало бы нечем.
+    """
+    from sync.agent import segments
+
+    captured = _capture_segment_payload(monkeypatch)
+
+    segments.fetch_segment_report(
+        "acc", "device", "2026-08-01", "2026-08-07", by_campaign=True,
+        excluded_campaign_ids=["712704859"])
+
+    assert "Filter" not in captured["payload"]["params"]["SelectionCriteria"]
+
+
+def test_calculation_passes_the_excluded_ids_into_account_reports(monkeypatch):
+    """Множество Id доезжает из расчёта до запроса, а не остаётся в переменной."""
+    import sync.agent_e0 as agent_e0
+    import tests.test_agent_e0 as e0_tests
+
+    e0_tests._patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0.agent_db, "load_excluded_campaign_ids",
+                        lambda *a, **k: {"710118280"})
+    seen = []
+    monkeypatch.setattr(
+        agent_e0, "fetch_segment_report",
+        lambda login, kind, date_from, date_to, by_campaign=False, goals=(),
+        excluded_campaign_ids=(): seen.append(
+            {"by_campaign": by_campaign, "excluded": sorted(excluded_campaign_ids)})
+        or ([], {"goal_column": None, "conversions": 0, "columns_offered": 0}),
+    )
+
+    assert agent_e0.main() == 0
+
+    account_jobs = [j for j in seen if not j["by_campaign"]]
+    assert account_jobs, "кабинетные срезы не запрашивались — тест ничего не проверил"
+    assert all(j["excluded"] == ["710118280"] for j in account_jobs)
