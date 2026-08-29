@@ -676,6 +676,17 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
     monkeypatch.setattr(agent_e1.writer_db, "risk_limit", lambda *_: 50_000.0)
     monkeypatch.setattr(agent_e1.writer_db, "spent_risk", lambda *_: 0.0)
     monkeypatch.setattr(agent_e1.writer_db, "charged_risk_by_object", lambda *_: {})
+    # Дневная доля недельного риска — всегда понедельничная (остаток / 7).
+    #
+    # Иначе она зависит от ДНЯ ЗАПУСКА тестов: paced_allowance делит остаток на
+    # число ОСТАВШИХСЯ дней недели, и в субботу прогону достаётся 25 000 ₽
+    # вместо 7 143 ₽ — вдвое больше действий проходит бюджет. Двое суток в
+    # неделю набор падал (поймано 29.08.2026), причём на утверждениях о полосах
+    # и отказах, к пейсингу отношения не имеющих. Сам пейсинг проверяется на
+    # фиксированных датах в tests/test_agent_risk_pacing.py, поэтому здесь его
+    # закрепление ничего не прячет.
+    monkeypatch.setattr(agent_e1, "paced_allowance",
+                        lambda remaining, *a, **k: float(remaining) / risk.DAYS_IN_WEEK)
     # Прогон не читает зависшие строки, а ПОМЕЧАЕТ их: mark_stale_planned
     # возвращает только впервые обнаруженные (writer/db.py::MARK_STALE_SQL).
     monkeypatch.setattr(agent_e1.writer_db, "mark_stale_planned", lambda *a, **k: list(stale))
@@ -2973,6 +2984,12 @@ def test_lane_shows_what_the_run_budget_cut_after_the_lane_let_it_through(
         campaigns_by_login={"acc-1": list(range(101, 121))},
         daily_cost={str(c): 2000.0 for c in range(101, 121)},
     )
+    # Доля недельного риска на прогон названа прямо: полторы цены действия.
+    # Корректировка кампании с расходом 2 000 ₽/день стоит 8 400 ₽ (2 000 × 7
+    # дней × долю сдвига 0,6), значит пройдёт ровно одна из пяти. Раньше число
+    # бралось из потолка 50 000 ₽, поделённого на ОСТАВШИЕСЯ дни недели, — и
+    # утверждение о полосе держалось на дне запуска тестов.
+    monkeypatch.setattr(agent_e1, "paced_allowance", lambda *a, **k: 12_600.0)
 
     assert agent_e1.main() == 0
 
@@ -3001,6 +3018,9 @@ def test_action_cut_by_the_week_budget_becomes_a_reject_not_a_queue(
         campaigns_by_login={"acc-1": list(range(101, 121))},
         daily_cost={str(c): 2000.0 for c in range(101, 121)},
     )
+    # Та же названная прямо доля, что и в соседнем тесте: полторы цены
+    # действия, то есть проходит одно из пяти.
+    monkeypatch.setattr(agent_e1, "paced_allowance", lambda *a, **k: 12_600.0)
     monkeypatch.setattr(agent_e1.blackbox, "save_run",
                         lambda *a, **k: saved.update(k) or {
                             "run_id": "test", "saved": True, "rejects": 0,

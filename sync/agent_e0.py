@@ -95,7 +95,7 @@ from sync.agent.objects import (
     CANDIDATE_WINDOW_DAYS,
     minus_word_candidates,
     placement_candidates,
-    core_words,
+    core_words_by_campaign,
     phrases_cutting_only_waste,
     expansion_candidates,
     word_minus_candidates,
@@ -1132,8 +1132,12 @@ def main() -> int:
     # топу: слово живёт как раз в хвосте, который топ отсекает.
     # Слова НАШЕЙ семантики (из ключевых фраз кабинета) минусации не подлежат:
     # запрет отменил бы собственную закупку. Дорогая своя семантика лечится
-    # целевым CPA (Э3.5).
-    protected_words = core_words(seeing_queries)
+    # целевым CPA (Э3.5). Защита кампанийная: запрет пишется в кампанию
+    # (writer/negatives: object_level="campaign"), и слово, купленное в
+    # соседней кампании, здесь нашей закупкой не является. Общий на кабинет
+    # список снимал 2156 слов-кандидатов из 2163 (замер 29.08.2026) — то есть
+    # рычаг минус-слов не работал вовсе.
+    protected_words = core_words_by_campaign(seeing_queries)
     word_candidates = (word_minus_candidates(seeing_queries, cpa_limit=cpa_limit,
                                              base_conversion=base_conversion,
                                              protected_words=protected_words)
@@ -1635,7 +1639,12 @@ def main() -> int:
                 "cost_saved": round(sum(float(q.get("cost") or 0.0)
                                         for q in minus_dropped), 2),
                 "sample": [{"query": q.get("query"), "reason": q.get("reason"),
-                            "family": q.get("family")}
+                            "family": q.get("family"),
+                            # Где именно фраза оказалась нашей закупкой. Без
+                            # этого «own_keyword» неотличим от прежней
+                            # общекабинетной защиты, которую и меняли.
+                            **({"own_campaigns": q["own_campaigns"]}
+                               if q.get("own_campaigns") else {})}
                            for q in minus_dropped[:10]],
             },
             "blind_accounts": blind_accounts,

@@ -273,6 +273,47 @@ def test_word_from_our_own_keywords_is_protected():
     assert not [r for r in out if r["query"] == "институты"]
 
 
+def test_word_protection_covers_only_the_campaign_that_bought_it():
+    # Запрет пишется В КАМПАНИЮ, значит и «своим» слово бывает по кампаниям.
+    # Общая на кабинет защита снимала 2156 слов-кандидатов из 2163 (замер по
+    # выгрузке 29.08.2026) — рычаг минус-слов не работал вовсе.
+    from sync.agent.objects import word_minus_candidates
+    queries = [
+        {"campaign_id": "1", "query": f"институты москвы {i}", "cost": 40_000.0,
+         "clicks": 300, "conversions": 0, "matched_key": "институты москвы"}
+        for i in range(4)
+    ] + [
+        {"campaign_id": "2", "query": f"институты москвы {i}", "cost": 30_000.0,
+         "clicks": 200, "conversions": 0, "matched_key": "вузы москвы"}
+        for i in range(4)
+    ]
+    out = word_minus_candidates(queries, cpa_limit=1500.0, base_conversion=0.03)
+    row = [r for r in out if r["query"] == "институты"]
+    assert row, "в кампании 2 слово не куплено — кандидат обязан выжить"
+    # Приговор и цена риска считаются только по кампании, куда поедет запрет:
+    # трафик защищённой кампании отсечение не тронет.
+    assert row[0]["campaigns"] == ["2"]
+    assert row[0]["cost_by_campaign"] == {"2": 120_000.0}
+
+
+def test_word_conversions_of_a_protected_campaign_do_not_judge_it():
+    # Обратная сторона того же правила: конверсии кампании, где слово куплено,
+    # к кандидату отношения не имеют — их поток запрет не гасит. Считать их
+    # значило бы оправдывать слово трафиком, которого действие не касается.
+    from sync.agent.objects import word_minus_candidates
+    queries = [
+        {"campaign_id": "1", "query": "институты москвы", "cost": 20_000.0,
+         "clicks": 100, "conversions": 30, "matched_key": "институты москвы"},
+    ] + [
+        {"campaign_id": "2", "query": f"институты москвы {i}", "cost": 30_000.0,
+         "clicks": 200, "conversions": 0, "matched_key": "вузы москвы"}
+        for i in range(4)
+    ]
+    out = word_minus_candidates(queries, cpa_limit=1500.0, base_conversion=0.03)
+    row = [r for r in out if r["query"] == "институты"]
+    assert row and row[0]["campaigns"] == ["2"]
+
+
 def test_junk_word_without_conversions_is_still_a_candidate():
     # Обратная половина: слово, которого нет в нашей семантике и которое не
     # дало ни одной конверсии, по-прежнему кандидат.

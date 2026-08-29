@@ -93,6 +93,74 @@ def test_own_keyword_is_never_minused():
     assert dropped[0]["reason"] == "own_keyword"
 
 
+def test_own_keyword_protects_only_the_campaign_that_bought_it():
+    # Запрет пишется В КАМПАНИЮ (writer/negatives: object_level="campaign").
+    # Фраза, купленная в кампании 1, в кампании 2 нашей закупкой не является,
+    # и общая на кабинет защита снимала кандидата целиком: на выгрузке
+    # 29.08.2026 так умерли все 32 кандидата из 32.
+    queries = [
+        _q("мти институт", 9000.0, 40, 0, campaign="1", matched_key="мти институт"),
+        _q("мти институт", 7000.0, 30, 0, campaign="2", matched_key="институт"),
+    ]
+    candidates = [{"query": "мти институт", "cost": 16000.0, "clicks": 70,
+                   "conversions": 0, "cpa": 0.0,
+                   "reason": "zero_conversions", "campaigns": ["1", "2"],
+                   "cost_by_campaign": {"1": 9000.0, "2": 7000.0}}]
+
+    kept, dropped = objects.phrases_cutting_only_waste(
+        candidates, queries, cpa_limit=1700.0)
+
+    assert dropped == []
+    # Семейство сузилось до кампании, куда запрет реально поедет: цена риска и
+    # обещанная экономия считаются по нему же.
+    assert kept[0]["campaigns"] == ["2"]
+    assert kept[0]["cost"] == 7000.0
+    assert kept[0]["cost_by_campaign"] == {"2": 7000.0}
+
+
+def test_own_keyword_names_the_campaigns_where_the_phrase_is_ours():
+    # Кандидат снимается целиком, только если своими оказались ВСЕ кампании
+    # семейства, — и отчёт обязан назвать какие: иначе «own_keyword» неотличим
+    # от прежней общекабинетной защиты.
+    queries = [
+        _q("мти институт", 9000.0, 40, 0, campaign="1", matched_key="мти институт"),
+        _q("мти институт", 7000.0, 30, 0, campaign="2", matched_key="институт мти"),
+    ]
+    candidates = [{"query": "мти институт", "cost": 16000.0, "clicks": 70,
+                   "conversions": 0, "cpa": 0.0,
+                   "reason": "zero_conversions", "campaigns": ["1", "2"],
+                   "cost_by_campaign": {"1": 9000.0, "2": 7000.0}}]
+
+    kept, dropped = objects.phrases_cutting_only_waste(
+        candidates, queries, cpa_limit=1700.0)
+
+    assert kept == []
+    assert dropped[0]["reason"] == "own_keyword"
+    assert dropped[0]["own_campaigns"] == ["1", "2"]
+
+
+def test_family_pays_off_is_judged_on_the_campaigns_the_ban_reaches():
+    # Окупаемость семейства считается по кампаниям, куда запрет поедет.
+    # Конверсии кампании, защищённой собственным ключом, кандидата не спасают:
+    # их поток отсечение не тронет.
+    queries = [
+        _q("диплом купить", 9000.0, 40, 0, campaign="1", matched_key="диплом купить"),
+        _q("диплом купить", 6000.0, 30, 0, campaign="2", matched_key="диплом"),
+        _q("диплом купить срочно", 1000.0, 10, 6, campaign="1", matched_key="диплом купить"),
+    ]
+    candidates = [{"query": "диплом купить", "cost": 15000.0, "clicks": 70,
+                   "conversions": 0, "cpa": 0.0,
+                   "reason": "zero_conversions", "campaigns": ["1", "2"],
+                   "cost_by_campaign": {"1": 9000.0, "2": 6000.0}}]
+
+    kept, dropped = objects.phrases_cutting_only_waste(
+        candidates, queries, cpa_limit=1700.0)
+
+    assert dropped == []
+    assert kept[0]["campaigns"] == ["2"]
+    assert kept[0]["conversions"] == 0
+
+
 def test_kept_candidate_carries_the_cost_of_everything_it_cuts():
     # Цена риска и обещанная экономия считаются по реально отсекаемому
     # потоку: иначе экспозиция занижена ровно на хвост.

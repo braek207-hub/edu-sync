@@ -323,20 +323,37 @@ def expansion_candidates(
     return out
 
 
-def core_words(queries: List[Dict[str, Any]]) -> set:
-    """Слова НАШЕЙ семантики — те, что стоят в ключевых фразах кабинета.
+def core_words_by_campaign(queries: List[Dict[str, Any]]) -> Dict[str, set]:
+    """Слова НАШЕЙ семантики ПО КАМПАНИЯМ: {campaign_id: {слово}}.
 
     matched_key отчёта поисковых запросов — это фраза, которую мы сами
     купили. Её слова минусовать нельзя ни при какой цене: запрет отменил бы
     собственную закупку, а дорогая своя семантика лечится ставкой и целью
     CPA (Э3.5), а не запретом.
+
+    Почему по кампаниям, а не одним множеством на кабинет. Минус-фраза
+    записывается В КАМПАНИЮ (writer/negatives: object_level="campaign"), и
+    «своя» она ровно там, где куплена. Общий на кабинет список — та же ошибка
+    несовпадения единицы суждения с единицей действия, что уже исправлена для
+    семейств: замер на выгрузке 29.08.2026 показал, что глобальная защита
+    снимала 2156 слов-кандидатов из 2163, а по кампаниям остаются 115 слов на
+    81 660 ₽ клика без единой конверсии — они не куплены там, где горят.
+
+    Ключей без показов в окне здесь не видно: единственный источник «что мы
+    купили» — сам отчёт запросов. Спящий ключ в кампании отчёт не покажет, и
+    защита его не увидит. Цена такой ошибки ограничена: рычаг минусации имеет
+    обратную половину (writer/negatives.REMOVE_KIND) и вычитает ровно своё.
+    Закрывает пробел витрина ключей уровня групп (задача B4).
     """
-    out = set()
+    out: Dict[str, set] = {}
     for q in queries:
+        campaign_id = str(q.get("campaign_id") or "")
+        if not campaign_id:
+            continue
         key = str(q.get("matched_key") or "").lower()
         for word in _WORD_RE.findall(key):
             if len(word) >= MIN_WORD_CHARS:
-                out.add(word)
+                out.setdefault(campaign_id, set()).add(word)
     return out
 
 
@@ -351,17 +368,29 @@ def _phrase_words(text: Any) -> frozenset:
     return frozenset(_WORD_RE.findall(str(text or "").lower()))
 
 
-def bought_phrases(queries: List[Dict[str, Any]]) -> set:
-    """Ключевые фразы кабинета как наборы слов.
+def bought_phrases_by_campaign(queries: List[Dict[str, Any]]) -> Dict[str, set]:
+    """Ключевые фразы кабинета как наборы слов, ПО КАМПАНИЯМ.
 
     Набор, а не строка: минус-фраза не различает порядок, и «мти институт»
     запретит показ по купленной «институт мти» ровно так же.
+
+    По кампаниям — по тому же доводу, что и core_words_by_campaign: запрет
+    ставится в кампанию, и «своей» фраза может быть в одной кампании и чужой
+    в соседней. На выгрузке 29.08.2026 таких строк 611 на 245 855 ₽.
     """
-    return {words for words in
-            (_phrase_words(q.get("matched_key")) for q in queries) if words}
+    out: Dict[str, set] = {}
+    for q in queries:
+        campaign_id = str(q.get("campaign_id") or "")
+        if not campaign_id:
+            continue
+        words = _phrase_words(q.get("matched_key"))
+        if words:
+            out.setdefault(campaign_id, set()).add(words)
+    return out
 
 
-def cut_family(queries: List[Dict[str, Any]], phrase: Any) -> Dict[str, Any]:
+def cut_family(queries: List[Dict[str, Any]], phrase: Any,
+               only_campaigns: Optional[set] = None) -> Dict[str, Any]:
     """Весь поток, который погасит минус-фраза: агрегат по семейству.
 
     Семейство — запросы, содержащие ВСЕ слова фразы (справка Директа: без
@@ -371,6 +400,11 @@ def cut_family(queries: List[Dict[str, Any]], phrase: Any) -> Dict[str, Any]:
     угадывать. Значит настоящее семейство не меньше посчитанного, и ошибка
     правила — только в сторону «оставить кандидата», не в сторону «отрезать
     лишнее».
+
+    only_campaigns сужает семейство до кампаний, куда запрет реально поедет.
+    Кампанию, где фраза куплена нами самими, минус не получит — и считать её
+    поток в цене риска и в проверке окупаемости значит судить кандидата по
+    трафику, которого действие не касается.
     """
     words = _phrase_words(phrase)
     out: Dict[str, Any] = {"cost": 0.0, "clicks": 0, "conversions": 0,
@@ -380,6 +414,9 @@ def cut_family(queries: List[Dict[str, Any]], phrase: Any) -> Dict[str, Any]:
         return out
     for q in queries:
         if not words <= _phrase_words(q.get("query")):
+            continue
+        if only_campaigns is not None and str(
+                q.get("campaign_id") or "") not in only_campaigns:
             continue
         cost = float(q.get("cost") or 0.0)
         out["cost"] += cost
@@ -397,7 +434,7 @@ def cut_family(queries: List[Dict[str, Any]], phrase: Any) -> Dict[str, Any]:
 def phrases_cutting_only_waste(
     candidates: List[Dict[str, Any]], queries: List[Dict[str, Any]],
     cpa_limit: float, multiplier: float = CPA_OVERSHOOT,
-    bought: Optional[set] = None,
+    bought: Optional[Dict[str, set]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Отсев кандидатов, которые заберут с собой окупающийся трафик.
 
@@ -411,9 +448,13 @@ def phrases_cutting_only_waste(
 
     Два основания снять кандидата:
 
-      * own_keyword — фраза куплена кабинетом (matched_key). Свою закупку
-        отменяет человек, а не автопилот; дорогая своя семантика лечится
-        ставкой и целевым CPA (Э3.5).
+      * own_keyword — фраза куплена В ТОЙ ЖЕ КАМПАНИИ (matched_key). Свою
+        закупку отменяет человек, а не автопилот; дорогая своя семантика
+        лечится ставкой и целевым CPA (Э3.5). Кампанийно, а не по кабинету:
+        запрет пишется в кампанию, и купленная в соседней фраза здесь чужая.
+        Кандидат снимается целиком, только если своими оказались ВСЕ кампании
+        семейства; иначе выживает с оставшимися, и его семейство считается по
+        ним же.
       * family_pays_off — семейство приносит конверсии по цене в пределах
         допустимой (та же планка cpa_limit × multiplier, что судит фразу).
         Резать поток, который окупается, нельзя даже если отдельная строка
@@ -428,19 +469,29 @@ def phrases_cutting_only_waste(
     обещанную экономию считает то же, что отсекается. Прежние числа занижали
     экспозицию ровно на хвост.
     """
-    own = bought if bought is not None else bought_phrases(queries)
+    own = bought if bought is not None else bought_phrases_by_campaign(queries)
     kept: List[Dict[str, Any]] = []
     dropped: List[Dict[str, Any]] = []
     for candidate in candidates:
         phrase = candidate.get("query")
         words = _phrase_words(phrase)
-        if words and words in own:
-            dropped.append({**candidate, "reason": "own_keyword"})
-            continue
         family = cut_family(queries, phrase)
         if not family["queries"]:
             dropped.append({**candidate, "reason": "family_unknown"})
             continue
+        own_campaigns = {c for c in family["campaigns"]
+                         if words and words in own.get(c, ())}
+        if own_campaigns:
+            allowed = set(family["campaigns"]) - own_campaigns
+            if not allowed:
+                dropped.append({**candidate, "reason": "own_keyword",
+                                "own_campaigns": sorted(own_campaigns)})
+                continue
+            family = cut_family(queries, phrase, only_campaigns=allowed)
+            if not family["queries"]:
+                dropped.append({**candidate, "reason": "own_keyword",
+                                "own_campaigns": sorted(own_campaigns)})
+                continue
         conversions = family["conversions"]
         if conversions > 0 and family["cost"] / conversions <= cpa_limit * multiplier:
             dropped.append({
@@ -470,7 +521,7 @@ def word_minus_candidates(
     multiplier: float = CPA_OVERSHOOT,
     base_conversion: Optional[float] = None,
     min_phrases: int = MIN_PHRASES_PER_WORD,
-    protected_words: Optional[set] = None,
+    protected_words: Optional[Dict[str, set]] = None,
 ) -> List[Dict[str, Any]]:
     """Кандидаты в минус-СЛОВА: слово судится по всем фразам, где встретилось.
 
@@ -489,11 +540,25 @@ def word_minus_candidates(
     отрезать ядро трафика образовательного проекта. Дорогая, но живая
     семантика лечится ставкой и целевым CPA (Э3.5), а не запретом.
 
-    protected_words — слова нашей собственной семантики (core_words по
-    matched_key). Не минусуются никогда, по тому же доводу.
+    protected_words — слова нашей собственной семантики ПО КАМПАНИЯМ
+    ({campaign_id: {слово}}, core_words_by_campaign). В кампании, где слово
+    куплено, оно не минусуется никогда, по тому же доводу. Кампанийно, а не по
+    кабинету: запрет пишется в кампанию (writer/negatives), и в соседней то же
+    слово к нашей закупке отношения не имеет.
+
+    Из-за этого слово агрегируется ТОЛЬКО по кампаниям, куда запрет поедет:
+    трафик защищённых кампаний в приговор не входит вовсе. Считать его значило
+    бы судить слово по потоку, которого действие не коснётся, — и приписывать
+    отсечению чужую экономию и чужие конверсии.
     """
     if cpa_limit <= 0:
         return []
+
+    # Умолчание — защита ВКЛЮЧЕНА: своя семантика выводится из самих запросов
+    # (matched_key). Вызывающий, забывший передать список, не должен получать
+    # рычаг, готовый запретить собственные ключевые слова.
+    protected = (protected_words if protected_words is not None
+                 else core_words_by_campaign(queries))
 
     by_word: Dict[str, Dict[str, Any]] = {}
     for q in queries:
@@ -502,8 +567,14 @@ def word_minus_candidates(
         clicks = int(q.get("clicks") or 0)
         conversions = int(q.get("conversions") or 0)
         campaign_id = str(q.get("campaign_id") or "")
+        # Строка без кампании адресата не имеет: plan_negatives пропускает
+        # пустой campaign_id, значит такой трафик не отсекается ничем и в
+        # приговоре слову ему делать нечего.
+        if not campaign_id:
+            continue
+        own_here = protected.get(campaign_id) or set()
         for word in set(_WORD_RE.findall(phrase)):
-            if len(word) < MIN_WORD_CHARS:
+            if len(word) < MIN_WORD_CHARS or word in own_here:
                 continue
             slot = by_word.setdefault(word, {
                 "query": word, "cost": 0.0, "clicks": 0, "conversions": 0,
@@ -513,22 +584,16 @@ def word_minus_candidates(
             slot["clicks"] += clicks
             slot["conversions"] += conversions
             slot["phrases"] += 1
-            if campaign_id:
-                slot["campaigns"].add(campaign_id)
-                slot["cost_by_campaign"][campaign_id] = (
-                    slot["cost_by_campaign"].get(campaign_id, 0.0) + cost)
+            slot["campaigns"].add(campaign_id)
+            slot["cost_by_campaign"][campaign_id] = (
+                slot["cost_by_campaign"].get(campaign_id, 0.0) + cost)
 
-    # Умолчание — защита ВКЛЮЧЕНА: своя семантика выводится из самих запросов
-    # (matched_key). Вызывающий, забывший передать список, не должен получать
-    # рычаг, готовый запретить собственные ключевые слова.
-    protected = ({str(w).lower() for w in protected_words}
-                 if protected_words is not None else core_words(queries))
     ready = [{**slot, "campaigns": sorted(slot["campaigns"])}
              for slot in by_word.values()
              if slot["phrases"] >= min_phrases
-             # Своя семантика и слова с конверсиями до судьи не доходят:
-             # см. докстринг — минус-слово гасит и конверсионные фразы.
-             and slot["query"] not in protected
+             # Слова с конверсиями до судьи не доходят: см. докстринг —
+             # минус-слово гасит и конверсионные фразы. Своя семантика отсеяна
+             # выше, покампанийно, ещё на сборе агрегата.
              and slot["conversions"] == 0]
     split_by_word = {slot["query"]: slot["cost_by_campaign"] for slot in ready}
     judged = minus_word_candidates(ready, cpa_limit=cpa_limit,
