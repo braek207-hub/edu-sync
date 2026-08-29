@@ -113,3 +113,70 @@ def test_excluded_campaign_ids_collects_ids_of_dropped_rows():
 def test_like_patterns_match_the_substring_rule():
     """SQL-сторона исключения выведена из тех же констант, а не набрана руками."""
     assert scope.like_patterns() == ["%rsv%"]
+
+
+# --------------------------------------------- подключение: витрина источника
+
+
+def test_load_direct_rows_drops_foreign_campaigns(monkeypatch):
+    """Единственный вход агента в direct_stats фильтрует сам.
+
+    Читателей у него двое — расчёт (agent_e0) и гейт пишущих прогонов
+    (sync/agent/gate.py), и фильтр обязан быть общим: гейт сверяет сумму
+    источника с суммой витрины фактов, а витрину пишет расчёт. Отфильтруй
+    одну сторону — сверка разойдётся на расход чужих кампаний и запретит
+    запись навсегда.
+    """
+    from sync.agent import db as agent_db
+
+    rows = [{"date": "2026-08-01", "campaign_id": "1",
+             "campaign_name": "vuz / Поиск / РФ", "cost": 100.0},
+            {"date": "2026-08-01", "campaign_id": "710118280",
+             "campaign_name": "vse / ВПО-МСК-rsv", "cost": 900.0}]
+    monkeypatch.setattr(agent_db, "_fetch_dicts", lambda sql, params=(): rows)
+
+    kept = agent_db.load_direct_rows("2026-08-01", "2026-08-07")
+
+    assert [r["campaign_id"] for r in kept] == ["1"]
+
+
+def test_mart_cost_total_excludes_the_same_campaigns(monkeypatch):
+    """Вторая сторона сверки сумм — витрина фактов.
+
+    В edu_agent_facts строки чужих кампаний уже лежат: их писали прогоны до
+    введения исключения, и удалять их эта задача не имеет права. Значит
+    вычитать их обязан запрос, иначе источник (уже без rsv) не сойдётся с
+    витриной (ещё с rsv) и гейт покраснеет на ровном месте.
+    """
+    from sync.agent import db as agent_db
+
+    seen = {}
+    monkeypatch.setattr(agent_db, "_fetch_dicts",
+                        lambda sql, params=(): seen.update(sql=sql, params=params)
+                        or [{"total": 0.0}])
+
+    agent_db.mart_cost_total("2026-08-01", "2026-08-07")
+
+    assert "campaign_name" in seen["sql"]
+    assert "%rsv%" in seen["params"][-1]
+
+
+def test_load_excluded_campaign_ids_asks_the_source_by_name(monkeypatch):
+    """Отчёты Директа по сегментам отдают CampaignId без имени.
+
+    Множество исключённых Id снимается одним запросом к тому же источнику,
+    где имя есть, — а не выводится из уже отфильтрованных строк, в которых
+    чужих кампаний по построению не осталось.
+    """
+    from sync.agent import db as agent_db
+
+    seen = {}
+    monkeypatch.setattr(
+        agent_db, "_fetch_dicts",
+        lambda sql, params=(): seen.update(sql=sql, params=params)
+        or [{"campaign_id": "710118280"}, {"campaign_id": 712704859}])
+
+    ids = agent_db.load_excluded_campaign_ids("2026-08-01", "2026-08-07")
+
+    assert ids == {"710118280", "712704859"}
+    assert "campaign_name" in seen["sql"]
