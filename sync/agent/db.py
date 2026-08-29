@@ -920,6 +920,11 @@ def load_daily_account_totals(date_from: str, date_to: str) -> List[Dict[str, An
     Контроль для сезонной поправки красных линий (agent_e1_watchdog):
     подорожал ли лид у кабинета в целом между базой действия и окном
     наблюдения. По строке на день, а не на кампанию, — запрос дешёвый.
+
+    Кампании вне зоны ответственности агента вычитаются: этим контролем
+    двигается ПОРОГ ОТКАТА боевых изменений, и чужая РК, подорожавшая или
+    выключенная, сдвигала бы его по кампаниям, к которым агент отношения не
+    имеет. Строки при этом остаются на месте — см. mart_cost_total.
     """
     return _fetch_dicts(
         """
@@ -928,10 +933,11 @@ def load_daily_account_totals(date_from: str, date_to: str) -> List[Dict[str, An
                SUM(eff_leads) AS eff_leads
         FROM edu_agent_facts
         WHERE fact_date BETWEEN %s AND %s
+          AND NOT (lower(coalesce(campaign_name, '')) LIKE ANY(%s))
         GROUP BY fact_date
         ORDER BY fact_date
         """,
-        (date_from, date_to),
+        (date_from, date_to, _scope().like_patterns()),
     )
 
 
@@ -1185,15 +1191,21 @@ def load_mart_day_breadth(date_from: str, date_to: str) -> Dict[str, Any]:
     Один проход по витрине: GROUPING SETS даёт и строки по дням, и итоговую
     строку (fact_date = NULL) с числом РАЗНЫХ кампаний за всё окно. Считать
     итог максимумом по дням нельзя — кампании в разные дни разные.
+
+    Чужие кампании из счёта вычитаются: это ЗНАМЕНАТЕЛЬ гейта данных, и
+    типичный день витрины должен мериться по тем кампаниям, за которые агент
+    отвечает. Иначе выключенная чужая РК сужает день, день признаётся
+    неполным, и гейт запрещает запись из-за чужого решения.
     """
     rows = _fetch_dicts(
         """
         SELECT fact_date, COUNT(DISTINCT campaign_id) AS campaigns
         FROM edu_agent_facts
         WHERE fact_date BETWEEN %s AND %s
+          AND NOT (lower(coalesce(campaign_name, '')) LIKE ANY(%s))
         GROUP BY GROUPING SETS ((fact_date), ())
         """,
-        (date_from, date_to),
+        (date_from, date_to, _scope().like_patterns()),
     )
     days: Dict[Any, int] = {}
     total = 0
@@ -1228,15 +1240,21 @@ def load_cost_by_campaign(date_from: str, date_to: str) -> Dict[str, float]:
     дневной темп, и умножение на 28 даёт расход, которого не было. Для цены
     ошибки это верно (важен темп), для доли денег — нет: доля, посчитанная по
     выдуманным суммам, врёт и в числителе, и в знаменателе.
+
+    Чужие кампании вычитаются по той же причине: это знаменатель «слепой
+    доли» — сколько денег прошло мимо настроек, которые агент читает. Деньги
+    кабинета, который агент не ведёт, слепой зоной не являются, и раздувать
+    ими долю значит объявлять дефектом синка чужое решение.
     """
     rows = _fetch_dicts(
         """
         SELECT campaign_id, SUM(cost) AS cost
         FROM edu_agent_facts
         WHERE fact_date BETWEEN %s AND %s
+          AND NOT (lower(coalesce(campaign_name, '')) LIKE ANY(%s))
         GROUP BY campaign_id
         """,
-        (date_from, date_to),
+        (date_from, date_to, _scope().like_patterns()),
     )
     return {str(r["campaign_id"]): float(r["cost"] or 0.0) for r in rows}
 

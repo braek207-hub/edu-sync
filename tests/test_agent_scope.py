@@ -393,3 +393,53 @@ def test_calculation_passes_the_excluded_ids_into_account_reports(monkeypatch):
     account_jobs = [j for j in seen if not j["by_campaign"]]
     assert account_jobs, "кабинетные срезы не запрашивались — тест ничего не проверил"
     assert all(j["excluded"] == ["710118280"] for j in account_jobs)
+
+
+# ------------------------- подключение: остальные агрегаты витрины фактов
+
+
+def _capture_facts_sql(monkeypatch, rows):
+    from sync.agent import db as agent_db
+
+    seen = {}
+    monkeypatch.setattr(agent_db, "_fetch_dicts",
+                        lambda sql, params=(): seen.update(sql=sql, params=params)
+                        or rows)
+    return seen
+
+
+def test_daily_account_totals_exclude_foreign_campaigns(monkeypatch):
+    """Сезонная поправка красных линий сторожа — контроль по ВСЕЙ витрине.
+
+    Чужие кампании в этом контроле двигают порог отката боевых изменений.
+    """
+    from sync.agent import db as agent_db
+
+    seen = _capture_facts_sql(monkeypatch, [])
+    agent_db.load_daily_account_totals("2026-08-01", "2026-08-07")
+
+    assert "campaign_name" in seen["sql"]
+    assert "%rsv%" in seen["params"][-1]
+
+
+def test_mart_day_breadth_excludes_foreign_campaigns(monkeypatch):
+    """Ширина дня — знаменатель гейта данных: сколько кампаний считать нормой."""
+    from sync.agent import db as agent_db
+
+    seen = _capture_facts_sql(monkeypatch, [])
+    agent_db.load_mart_day_breadth("2026-08-01", "2026-08-07")
+
+    assert "campaign_name" in seen["sql"]
+    assert "%rsv%" in seen["params"][-1]
+
+
+def test_cost_by_campaign_excludes_foreign_campaigns(monkeypatch):
+    """Знаменатель «слепой доли»: сколько денег вообще прошло мимо агента."""
+    from sync.agent import db as agent_db
+
+    seen = _capture_facts_sql(monkeypatch, [])
+    agent_db.load_cost_by_campaign("2026-08-01", "2026-08-07")
+
+    assert "campaign_name" in seen["sql"]
+    assert "%rsv%" in seen["params"][-1]
+
