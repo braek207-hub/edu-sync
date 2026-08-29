@@ -54,7 +54,8 @@ def test_e1_summary_in_rehearsal_counts_dry_run_not_applied():
                "result": {"applied": 0, "failed": 0, "unknown_outcome": 0, "dry_run": 42},
                "rejects": {}, "lanes": {"taken": {}}}]}
     text = notify.e1_summary(report, dry_run=True)
-    assert "применено 42" in text
+    assert "применилось бы 42" in text
+    assert "применено" not in text
     assert "репетиция" in text
     assert "БОЕВАЯ" not in text
 

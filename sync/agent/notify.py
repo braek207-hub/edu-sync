@@ -31,7 +31,8 @@ def _post(url: str, data: bytes) -> None:
     req = urllib.request.Request(
         url, data=data,
         headers={"Content-Type": "application/json; charset=utf-8"})
-    urllib.request.urlopen(req, timeout=10).read()
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        resp.read()
 
 
 def send(text: str) -> Dict[str, Any]:
@@ -67,10 +68,12 @@ def e1_summary(report: Dict[str, Any], dry_run: bool) -> str:
     for acc in report.get("accounts") or []:
         res = acc.get("result") or {}
         taken = (acc.get("lanes") or {}).get("taken") or {}
-        applied = res.get("dry_run", 0) if dry_run else res.get("applied", 0)
+        # В репетиции слово «применено» врало бы: считается то, что применилось бы.
+        applied = (f"применилось бы {res.get('dry_run', 0)}" if dry_run
+                   else f"применено {res.get('applied', 0)}")
         lanes_text = ", ".join(f"{k} {v}" for k, v in taken.items()) or "—"
         lines.append(
-            f"{acc.get('account')}: план {acc.get('planned')}, применено {applied}, "
+            f"{acc.get('account')}: план {acc.get('planned')}, {applied}, "
             f"сбой {res.get('failed', 0)}, неясный исход {res.get('unknown_outcome', 0)}; "
             f"полосы {lanes_text}; отказы {_top_rejects(acc.get('rejects') or {})}")
     if report.get("failed_accounts"):
