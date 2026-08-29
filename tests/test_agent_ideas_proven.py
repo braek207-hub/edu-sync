@@ -26,13 +26,12 @@ import pytest
 
 from sync.agent import ladder
 from sync.agent.ideas import proven, registry
-from sync.agent.portfolio import GROWTH_LAMBDA_MARGIN
 from sync.agent.writer import lanes, plan, tier
 from sync.agent.writer.guardrails import check_action
 
 # λ кабинета из плана беты (задача 12): порог, с которым сравнивается
 # окупаемость связки. Число здесь — фикстура, а не порог: сам порог
-# (запас ×GROWTH_LAMBDA_MARGIN) берётся из portfolio.py.
+# (пол безубыточности) — сам λ, без запаса на рост: см. proven._one.
 LAMBDA = 0.71
 
 CAMPAIGN = "111"
@@ -128,14 +127,14 @@ def test_bundle_above_lambda_with_margin_becomes_tier_one():
     assert ideas and ideas[0]["tier"] == tier.TIER_MEASURED
 
 
-def test_barely_above_lambda_is_not_worth_scaling():
-    # Ровно на пороге растить нечего: предельный рубль там уже равен λ, и
-    # прибавка сдвинет связку за него. Запас — тот же, при котором солвер
-    # портфеля считает осмысленным доливать (portfolio.GROWTH_LAMBDA_MARGIN).
-    # base_romi ниже связки в обеих половинах — чтобы отказ (и его отсутствие)
-    # шёл именно от запаса по λ, а не от порога величины корректировки.
-    assert _run(romi=LAMBDA * 1.01, base_romi=LAMBDA * 0.7) == []
-    assert _run(romi=LAMBDA * GROWTH_LAMBDA_MARGIN, base_romi=LAMBDA * 0.7)
+def test_lambda_is_a_breakeven_floor_not_a_growth_margin():
+    # λ здесь — пол безубыточности, а не запас на рост: корректировка ставки
+    # денег кабинету не добавляет (rub_delta = 0), кривая насыщения не
+    # сдвигается, и требовать от переноса запаса ×1.2 значило бы платить им за
+    # то, чего перенос не делает. Насколько связка лучше — решает отношение к
+    # окупаемости своей кампании (base_romi ниже связки в обоих случаях).
+    assert _run(romi=LAMBDA * 1.01, base_romi=LAMBDA * 0.7)
+    assert _run(romi=LAMBDA * 0.99, base_romi=LAMBDA * 0.7) == []
 
 
 def test_lambda_absent_means_silence_not_a_default():
