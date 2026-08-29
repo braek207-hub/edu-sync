@@ -203,11 +203,6 @@ def diff_placements(
         actions.append(expectation.attach({
             "action_kind": PLACEMENT_KIND,
             **({"evidence": evidence} if evidence else {}),
-            # Измерена ли потеря объёма запретом. Тот же смысл и та же
-            # причина, что у минус-фразы (writer/negatives.py): баланс такта
-            # различает «объём посчитан» и «объём не считали», и берёт
-            # рублёвую плату только со второго.
-            "leads_measured": lost_window is not None,
             "object_level": "campaign",
             "object_id": str(campaign_id),
             "exposure": exposure.traffic_cut_exposure(

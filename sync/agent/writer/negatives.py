@@ -367,13 +367,6 @@ def diff_negatives(
         actions.append(expectation.attach({
             "action_kind": NEGATIVE_KIND,
             **({"evidence": evidence} if evidence else {}),
-            # Измерена ли потеря объёма этим отсечением. Ноль в
-            # expected_leads_delta двузначен — «вырезаем трафик без
-            # конверсий» и «конверсии вырезаемого не считали», — и баланс
-            # такта (balance.py) обязан их различать: у первого объём уже
-            # посчитан, и брать с него ВТОРУЮ плату рублёвым требованием
-            # адресата значит платить за одно действие дважды.
-            "leads_measured": lost_window is not None,
             "object_level": "campaign",
             "object_id": str(campaign_id),
             "exposure": exposure.traffic_cut_exposure(

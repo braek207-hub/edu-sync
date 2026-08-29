@@ -22,6 +22,20 @@ def _move(cid, cost, target, leads_delta):
             "expected_leads_delta": leads_delta}
 
 
+def _hygiene_action(cid, kind="negative.add", leads_delta=0.0):
+    """Боевое отсечение той формы, в которой его собирает writer/negatives.py.
+
+    Ожидание лежит в payload, а не верхним полем: гейт читает именно оттуда.
+    Выигрыш назван мал (200 ₽) намеренно — в старой сортировке гигиена
+    оказывалась самой дешёвой и снималась первой.
+    """
+    return {"action_kind": kind, "object_id": cid,
+            "idempotency_key": f"k-{cid}",
+            "expected_gain_rub": 200.0,
+            "payload": {"expected_leads_delta": leads_delta,
+                        "expected_rub_delta": -12_000.0}}
+
+
 # ----------------------------------------------------------------- баланс
 
 def test_freed_money_is_matched_by_additions():
@@ -46,52 +60,53 @@ def test_suspend_without_reassignment_leaves_money_unassigned():
     assert balance["shrinking"] is True
 
 
-def test_negative_and_placement_cuts_count_as_shrink():
-    # Потеря объёма НЕ измерена (leads_measured отсутствует): ноль в лидах
-    # означает «не мерили», и рубли остаются единственной защитой от сжатия.
+def test_cut_reallocates_money_instead_of_freeing_it():
+    """Уберите этот тест — и вернётся дефект D2 плана пропускной способности.
+
+    Минус-фраза недельный лимит кампании не трогает: те же деньги стратегия
+    раскладывает по оставшимся запросам в тот же день. Освобождением это не
+    является, адресата не требует, и такт от него сжимающим не становится.
+    Замер 29.08.2026 (edu_agent_rejects): пока вырезанный расход считался
+    освобождённым, гейт снял 23 запрета площадок и 15 минус-фраз, а применено
+    было ноль — за всё время работы агента.
+    """
     balance = tact_balance([], suspends=[],
                            cuts=[{"kind": "negative.add", "cost_saved": 12_000.0,
-                                  "expected_leads_delta": -1.0}])
-    assert balance["freed_rub"] == 12_000.0
-    assert balance["shrinking"] is True
-
-
-def test_measured_cut_reallocates_instead_of_freeing():
-    # Отсечение с ИЗМЕРЕННОЙ потерей объёма недельный лимит кампании не
-    # трогает: те же деньги стратегия перекладывает на оставшиеся запросы.
-    # Освобождением это не является, адресата не требует, и такт от него
-    # сжимающим не становится.
-    balance = tact_balance([], suspends=[],
-                           cuts=[{"kind": "negative.add", "cost_saved": 12_000.0,
-                                  "leads_measured": True,
                                   "expected_leads_delta": 0.0}])
     assert balance["freed_rub"] == 0.0
     assert balance["reallocated_rub"] == 12_000.0
     assert balance["shrinking"] is False
 
 
-def test_measured_cut_that_loses_volume_still_shrinks():
-    # Измерение показало, что вырезаемое давало конверсии, — это сжатие, и
-    # плата берётся объёмом. Рубли при этом по-прежнему не «освобождаются»:
-    # лимит кампании не изменился.
+def test_cut_with_measured_loss_is_reported_but_not_charged():
+    """Потеря конверсий отсечения — новость отчёта, а не плата такта.
+
+    Кандидат отбирается тем, что конверсии на нём стоят вдвое дороже
+    допустимого (objects.CPA_OVERSHOOT = 2.0) или их нет вовсе при расходе
+    выше трёх CPA. Деньги остаются в кампании и покупают конверсии на
+    оставшихся запросах — встречную покупку рычаг не считает, и записать
+    такту одну её половину значит соврать в известную сторону.
+
+    Заряжать лиды, не позволяя снять само отсечение, нельзя тем более: гейт
+    начал бы компенсировать чужую гигиену снятием доливок и выключений.
+    """
     balance = tact_balance([], suspends=[],
                            cuts=[{"kind": "negative.add", "cost_saved": 12_000.0,
-                                  "leads_measured": True,
                                   "expected_leads_delta": -3.0}])
     assert balance["freed_rub"] == 0.0
     assert balance["reallocated_rub"] == 12_000.0
-    assert balance["expected_leads_delta"] == -3.0
-    assert balance["shrinking"] is True
+    assert balance["reallocated_leads_delta"] == -3.0
+    assert balance["expected_leads_delta"] == 0.0
+    assert balance["shrinking"] is False
 
 
-def test_gate_keeps_measured_cuts_while_dropping_unmeasured_ones():
-    # Живой случай 27–28.08.2026: такт сжимался доливкой без адресата, и
+def test_gate_keeps_hygiene_while_dropping_the_suspend():
+    # Живой случай 25–28.08.2026: такт сжимался выключением без адресата, а
     # require_growth_address снимала самые дешёвые действия — то есть всю
-    # гигиену. Измеренное отсечение объёма не отнимает и сниматься не должно.
+    # гигиену. Гигиена класса 0 денег кабинету не освобождает и сниматься не
+    # должна; выключение освобождает — оно и снимается.
     actions = [
-        {"action_kind": "negative.add", "object_id": "111",
-         "leads_measured": True, "expected_leads_delta": 0.0,
-         "expected_gain_rub": 200.0},
+        _hygiene_action("111"),
         {"action_kind": "campaign.suspend", "object_id": "222",
          "expected_leads_delta": -4.0, "expected_gain_rub": 50_000.0},
     ]
@@ -125,43 +140,28 @@ def test_emergency_entry_does_not_make_tact_shrinking():
     assert balance["shrinking"] is False
 
 
-def test_balance_inputs_carry_measurement_flag_from_the_action():
-    # Признак ставит тот, кто знает: writer/negatives.py и
-    # writer/placements.py. Восстановить его здесь по нулю в лидах нельзя —
-    # ноль двузначен, — поэтому он обязан доехать с самим действием.
-    rows = balance_inputs(
-        [{"action_kind": "negative.add", "object_id": "111",
-          "leads_measured": True, "expected_leads_delta": 0.0},
-         {"action_kind": "placement.exclude", "object_id": "222",
-          "expected_leads_delta": 0.0}],
-        moves_by_campaign={},
-        cost_28d_by_campaign={},
-        cut_cost_by_kind={"negative.add": {"111": 9_000.0},
-                          "placement.exclude": {"222": 4_000.0}})
-    measured = {c["campaign_id"]: c["leads_measured"] for c in rows["cuts"]}
-    assert measured == {"111": True, "222": False}
-
-
 def test_freed_money_is_addressable_per_action():
     # Гейт снимает действия по одному и обязан знать, сколько денег возвращает
     # каждое снятие, иначе он не может остановиться на первом достаточном.
+    # Отсечения в этой карте нет: снять минус-фразу значит не вернуть кабинету
+    # ни рубля — её деньги из кампании и не уходили.
     balance = tact_balance(
         [], suspends=[{"campaign_id": "111", "cost_28d": 50_000.0,
                        "idempotency_key": "k-suspend"}],
         cuts=[{"kind": "negative.add", "cost_saved": 12_000.0,
                "idempotency_key": "k-neg"}])
-    assert balance["freed_by_key"] == {"k-suspend": 50_000.0, "k-neg": 12_000.0}
+    assert balance["freed_by_key"] == {"k-suspend": 50_000.0}
 
 
 # ------------------------------------------------------------------ гейт
 
 def test_growth_gate_drops_weakest_cut_until_tact_grows():
-    # Сжимающий такт: два сокращения и одна доливка. Снимается то сокращение,
+    # Сжимающий такт: два выключения и одна доливка. Снимается то сокращение,
     # чей выигрыш меньше, — пока баланс не перестанет быть отрицательным.
     actions = [
         {"action_kind": "campaign.suspend", "object_id": "111",
          "expected_leads_delta": -4.0, "expected_gain_rub": 1_000.0},
-        {"action_kind": "negative.add", "object_id": "333",
+        {"action_kind": "campaign.suspend", "object_id": "333",
          "expected_leads_delta": -3.0, "expected_gain_rub": 200.0},
         {"action_kind": "budget.set", "object_id": "222",
          "expected_leads_delta": +5.0, "expected_gain_rub": 5_000.0},
@@ -226,7 +226,7 @@ def test_growth_gate_stops_when_freed_money_is_covered():
     actions = [
         {"action_kind": "campaign.suspend", "object_id": "111",
          "idempotency_key": "k1"},
-        {"action_kind": "negative.add", "object_id": "333",
+        {"action_kind": "campaign.suspend", "object_id": "333",
          "idempotency_key": "k3"},
         {"action_kind": "budget.set", "object_id": "222",
          "payload": {"expected_leads_delta": 6.0}},
@@ -250,6 +250,61 @@ def test_emergency_cut_passes_gate_even_when_tact_shrinks():
                   "freed_rub": 50_000.0, "added_rub": 0.0})
     assert kept == actions
     assert blocked == []
+
+
+def test_hygiene_does_not_drag_down_the_assigned_share():
+    """Приёмка A2: в такте с гигиеной доля адресата не падает от вырезаний.
+
+    Живой такт 28.08.2026 (edu_agent_runs): freed_rub 153 528 ₽ при
+    assigned_share 0.0 — почти всё это был вырезанный гигиеной трафик,
+    который из кампаний не уходил. Такт объявлялся сжимающим, гейт снимал
+    самые дешёвые действия, и за всё время работы агента не применилось ни
+    одной минус-фразы и ни одного запрета площадки.
+    """
+    moves = [_move("111", 100_000.0, 60_000.0, -2.0),
+             _move("222", 100_000.0, 140_000.0, +4.0)]
+    cuts = [{"kind": "negative.add", "cost_saved": 150_000.0,
+             "expected_leads_delta": 0.0}]
+    balance = tact_balance(moves, suspends=[], cuts=cuts)
+    assert balance["assigned_share"] == 1.0
+    assert balance["reallocated_rub"] == 150_000.0
+    assert balance["shrinking"] is False
+
+
+def test_hygiene_is_never_blocked_without_address():
+    """Приёмка A2: blocked_without_address по гигиене — ноль.
+
+    Такт сжимается по своей причине (выключение кампании без адресата), и
+    гигиена класса 0 в нём есть. До 29.08.2026 гейт снимал её первой — она
+    дешевле всех; теперь она ему не показывается вовсе, а снимается то, что
+    действительно отняло деньги у кабинета.
+    """
+    actions = [_hygiene_action("111"),
+               _hygiene_action("333", kind="placement.exclude"),
+               {"action_kind": "campaign.suspend", "object_id": "222",
+                "idempotency_key": "k-suspend"}]
+    balance = {"shrinking": True, "expected_leads_delta": 0.0,
+               "freed_rub": 50_000.0, "added_rub": 0.0,
+               "freed_by_key": {"k-suspend": 50_000.0}}
+    allowed, blocked = require_growth_address(actions, balance)
+    assert [a["object_id"] for a in blocked] == ["222"]
+    assert sorted(a["object_id"] for a in allowed) == ["111", "333"]
+
+
+def test_cut_with_measured_loss_is_not_taken_off_by_the_gate_either():
+    # Отсечение с посчитанной потерей конверсий — по-прежнему перестановка:
+    # деньги остаются в кампании. Снятие такого действия кабинету ничего не
+    # возвращает, и гейт не имеет права его снимать даже в сжимающем такте —
+    # иначе гигиена платила бы за чужое сжатие.
+    actions = [_hygiene_action("111", leads_delta=-3.0),
+               {"action_kind": "campaign.suspend", "object_id": "222",
+                "idempotency_key": "k-suspend"}]
+    balance = {"shrinking": True, "expected_leads_delta": -4.0,
+               "freed_rub": 50_000.0, "added_rub": 0.0,
+               "freed_by_key": {"k-suspend": 50_000.0}}
+    allowed, blocked = require_growth_address(actions, balance)
+    assert [a["object_id"] for a in blocked] == ["222"]
+    assert [a["object_id"] for a in allowed] == ["111"]
 
 
 def test_emergency_kinds_are_real_action_kinds():
@@ -310,6 +365,8 @@ def test_balance_inputs_prices_suspend_by_campaign_cost():
 def test_balance_inputs_prices_cuts_by_kind():
     # Минус-фразы и площадки считают вырезанный расход каждый своим словарём:
     # у одной кампании бывают оба рычага, и общий словарь потерял бы один.
+    # Само число едет в reallocated_rub: вырезанный расход остаётся в
+    # кампании, и единственное место, где его видно, — это поле.
     actions = [{"action_kind": "negative.add", "object_id": "111",
                 "idempotency_key": "k-n"},
                {"action_kind": "placement.exclude", "object_id": "111",
@@ -317,7 +374,8 @@ def test_balance_inputs_prices_cuts_by_kind():
     cut_cost_by_kind = {"negative.add": {"111": 12_000.0},
                         "placement.exclude": {"111": 3_000.0}}
     balance = tact_balance(**balance_inputs(actions, {}, {}, cut_cost_by_kind))
-    assert balance["freed_rub"] == 15_000.0
+    assert balance["freed_rub"] == 0.0
+    assert balance["reallocated_rub"] == 15_000.0
 
 
 def test_balance_inputs_ignores_actions_without_money_meaning():
