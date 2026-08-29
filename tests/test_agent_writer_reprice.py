@@ -80,10 +80,25 @@ def test_row_without_a_share_is_not_repriced_and_is_named():
     assert untouched[0]["reason"], "строка исчезла из отчёта молча"
 
 
-def test_row_already_priced_by_the_delta_model_is_skipped():
+def test_row_priced_by_todays_model_is_skipped():
+    # Свежесть цены — совпадение ОСНОВАНИЯ с сегодняшним, а не непустая
+    # колонка: основание перечисляет множители модели словами и служит её
+    # отпечатком.
+    basis = reprice.basis_for(ACTION, SHARE, DAILY)
+    repriced, untouched = reprice.plan([{**ACTION, "risk_basis": basis}],
+                                       SHARES, DAILY)
+    assert repriced == []
+    assert untouched[0]["reason"] == reprice.REASON_ALREADY_DELTA
+
+
+def test_row_priced_by_the_previous_model_is_repriced():
+    # Прежнее правило «risk_basis заполнен — не трогаем» сработало ровно один
+    # раз, на переходе к дельта-модели. Поправка 29.08.2026 (ошибка раскладки)
+    # законсервировала бы по нему весь журнал в старых ценах — ровно то, ради
+    # чего модуль и написан.
     action = {**ACTION, "risk_basis": "сегмент 4.0% объекта × сдвиг 86%"}
     repriced, _ = reprice.plan([action], SHARES, DAILY)
-    assert repriced == []
+    assert [r["new"] for r in repriced] == [reprice.recompute(ACTION, SHARE, DAILY)]
 
 
 # --------------------------------------------------------------- края
@@ -91,9 +106,11 @@ def test_row_already_priced_by_the_delta_model_is_skipped():
 
 def test_new_price_is_the_delta_arithmetic_not_just_something_smaller():
     # «Меньше 5000» проходит и у случайно заниженного числа. Цена обязана быть
-    # ровно долей 4 % × сдвигом 86 % от расхода за 7 дней замера.
+    # ровно долей 4 % × сдвигом 86 % × ошибкой раскладки 43 % от расхода за
+    # 7 дней замера: переложенные деньги не сгорают, теряется разница
+    # эффективностей, которую заявляет сам коэффициент.
     new = reprice.recompute(ACTION, SHARE, DAILY)
-    assert new == round(5553.71 * 0.04 * 0.86 * 7, 2)
+    assert new == round(5553.71 * 0.04 * 0.86 * 0.43 * 7, 2)
 
 
 def test_unknown_daily_cost_leaves_the_row_alone():
@@ -111,7 +128,7 @@ def test_median_fallback_is_not_used_to_invent_a_price():
     # берёт для неё медиану. Переоценке этого достаточно — она консервативна
     # и это та же оценка, по которой строку оценил бы сегодняшний прогон.
     new = reprice.recompute(ACTION, SHARE, {"111": 1000.0, "222": 3000.0})
-    assert new == round(2000.0 * 0.04 * 0.86 * 7, 2)
+    assert new == round(2000.0 * 0.04 * 0.86 * 0.43 * 7, 2)
 
 
 def test_share_is_none_when_the_calc_of_that_day_has_no_such_segment():

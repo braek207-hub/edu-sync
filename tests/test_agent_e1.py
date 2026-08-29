@@ -866,14 +866,14 @@ def test_daily_risk_pocket_is_split_by_account_weight_not_by_traversal_order(
     assert _share(straight["big"]) >= _share(straight["small"]) > 0.0
     # Числа целиком: дневная доля прогона 50 000 / 7 = 7 142,86 ₽ режется
     # долями расхода 0,75 и 0,25 — 5 357,14 ₽ крупному и 1 785,71 ₽ мелкому.
-    # Действие крупного стоит 4 200 ₽, мелкого — 1 400 ₽, и каждому хватает
-    # ровно на одно. До починки крупный кабинет, обойдённый вторым, не получал
-    # ничего: мелкий забирал 5 250 ₽ тремя действиями, и на 4 200 ₽ не
-    # оставалось.
+    # Списывается 3 675 ₽ и 1 225 ₽ — те же 3:1, что у дневных расходов, и
+    # каждому кабинету хватает ровно на своё. До починки крупный кабинет,
+    # обойдённый вторым, не получал ничего: мелкий выбирал карман прогона
+    # первым, и крупному не оставалось.
     assert straight["big"]["account_risk_share_rub"] == 5_357.14
     assert straight["small"]["account_risk_share_rub"] == 1_785.71
-    assert straight["big"]["risk_charged_rub"] == 4_200.0
-    assert straight["small"]["risk_charged_rub"] == 1_400.0
+    assert straight["big"]["risk_charged_rub"] == 3_675.0
+    assert straight["small"]["risk_charged_rub"] == 1_225.0
     # Объём прогона при этом не растёт: сумма списаний по кабинетам не выше
     # дневной доли, посчитанной на прогон целиком.
     charged = sum(straight[login]["risk_charged_rub"] for login in ("big", "small"))
@@ -2969,13 +2969,14 @@ def test_lane_shortfall_reaches_the_run_report(monkeypatch, capsys):
     # живущий только в юнит-тесте чистой функции, человеку не показывается
     # никогда — а именно ради человека он и считается.
     #
-    # Двадцать кампаний по 2 000 ₽/день, по одной корректировке на каждую:
-    # цена действия 8 400 ₽, потолок полосы 50 000 ₽ — влезает пять.
+    # Двадцать кампаний по 6 666,67 ₽/день, по одной корректировке на каждую:
+    # цена действия 8 400 ₽ (расход × 7 дней × долю сдвига 0,6 × ошибку
+    # раскладки 0,3), потолок полосы 50 000 ₽ — влезает пять.
     _patch_run(
         monkeypatch,
         computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
         campaigns_by_login={"acc-1": list(range(101, 121))},
-        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+        daily_cost={str(c): 6666.67 for c in range(101, 121)},
     )
 
     assert agent_e1.main() == 0
@@ -3027,7 +3028,7 @@ def test_shortfall_travels_to_the_blackbox(monkeypatch, capsys):
         monkeypatch,
         computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
         campaigns_by_login={"acc-1": list(range(101, 121))},
-        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+        daily_cost={str(c): 6666.67 for c in range(101, 121)},
     )
     monkeypatch.setattr(agent_e1.blackbox, "save_run",
                         lambda *a, **k: saved.update(k) or {
@@ -3085,13 +3086,14 @@ def test_lane_shows_what_the_run_budget_cut_after_the_lane_let_it_through(
         monkeypatch,
         computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
         campaigns_by_login={"acc-1": list(range(101, 121))},
-        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+        daily_cost={str(c): 6666.67 for c in range(101, 121)},
     )
     # Доля недельного риска на прогон названа прямо: полторы цены действия.
-    # Корректировка кампании с расходом 2 000 ₽/день стоит 8 400 ₽ (2 000 × 7
-    # дней × долю сдвига 0,6), значит пройдёт ровно одна из пяти. Раньше число
-    # бралось из потолка 50 000 ₽, поделённого на ОСТАВШИЕСЯ дни недели, — и
-    # утверждение о полосе держалось на дне запуска тестов.
+    # Корректировка кампании с расходом 6 666,67 ₽/день стоит 8 400 ₽
+    # (расход × 7 дней × долю сдвига 0,6 × ошибку раскладки 0,3), значит
+    # пройдёт ровно одна из пяти. Раньше число бралось из потолка 50 000 ₽,
+    # поделённого на ОСТАВШИЕСЯ дни недели, — и утверждение о полосе
+    # держалось на дне запуска тестов.
     monkeypatch.setattr(agent_e1, "paced_allowance", lambda *a, **k: 12_600.0)
 
     assert agent_e1.main() == 0
@@ -3119,7 +3121,7 @@ def test_action_cut_by_the_week_budget_becomes_a_reject_not_a_queue(
         monkeypatch,
         computed_by_login={"acc-1": [_setting("bid_modifier:device", "DESKTOP", 30)]},
         campaigns_by_login={"acc-1": list(range(101, 121))},
-        daily_cost={str(c): 2000.0 for c in range(101, 121)},
+        daily_cost={str(c): 6666.67 for c in range(101, 121)},
     )
     # Та же названная прямо доля, что и в соседнем тесте: полторы цены
     # действия, то есть проходит одно из пяти.

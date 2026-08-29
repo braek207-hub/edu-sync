@@ -14,8 +14,11 @@ def test_segment_correction_costs_its_share_of_the_object_not_all_of_it():
     at_risk, _ = exposure.daily_rub(exp, object_daily_cost=5554.0)
 
     assert at_risk < 5554.0 * 0.05
-    # Проверяем и абсолют: 4 % сегмента × сдвиг 86 % от 5 554 ₽/день.
-    assert round(at_risk, 1) == round(5554.0 * 0.04 * 0.86, 1)
+    # Проверяем и абсолют: 4 % сегмента × сдвиг 86 % × ошибка раскладки 43 %
+    # от 5 554 ₽/день. Третий множитель — поправка 29.08.2026: корректировка
+    # не тратит денег, она их перекладывает, и на ошибке теряется разница
+    # эффективностей, которую заявляет сам коэффициент, а не вся сумма.
+    assert round(at_risk, 1) == round(5554.0 * 0.04 * 0.86 * 0.43, 1)
 
 
 def test_unknown_segment_share_means_the_whole_object():
@@ -30,14 +33,44 @@ def test_unknown_segment_share_means_the_whole_object():
     assert "неизвестн" in basis
 
 
-def test_half_correction_puts_the_whole_segment_at_risk():
-    # Сдвиг на 50 % и больше перестраивает сегмент целиком: доля упирается
-    # в единицу и дальше не растёт — цена не может превысить сам сегмент.
+def test_half_correction_moves_the_whole_segment():
+    # Сдвиг на 50 % и больше перекладывает сегмент целиком: множитель
+    # движения упирается в единицу и дальше не растёт. Под ударом при этом не
+    # весь сегмент, а та доля переложенного, на которую он может оказаться
+    # разложен неверно, — 70 % при коэффициенте −70 %.
     exp = exposure.bid_modifier_exposure(-70, segment_share=0.30)
 
     at_risk, _ = exposure.daily_rub(exp, object_daily_cost=1000.0)
 
+    assert at_risk == 300.0 * 0.7
+
+
+def test_a_full_correction_can_be_wrong_about_everything_it_moves():
+    # Оба множителя упираются в единицу только на |p| ≥ 100 %: удвоение
+    # ставки и правда способно ошибиться на весь переложенный объём. Верхняя
+    # граница прежней модели, таким образом, никуда не делась — она стала
+    # достижимой ровно там, где осмысленна.
+    exp = exposure.bid_modifier_exposure(100, segment_share=0.30)
+
+    at_risk, _ = exposure.daily_rub(exp, object_daily_cost=1000.0)
+
     assert at_risk == 300.0
+
+
+def test_the_price_of_a_move_mirrors_its_promise():
+    # Обещание корректировки (expectation._bid_modifier) — moved × сдвиг ÷ CPA
+    # лидов; та же величина в рублях расхода — moved × сдвиг. Цена ошибки
+    # обязана быть тем же числом: ошиблись ровно настолько, насколько
+    # надеялись выиграть. Разъедься они — риск-бюджет снова начал бы судить
+    # среднее худшим случаем.
+    daily, share, percent = 10_000.0, 0.20, 25
+    moved = daily * share * (percent / 100.0 * exposure.BID_ELASTICITY)
+    promise_rub = moved * (percent / 100.0)
+
+    exp = exposure.bid_modifier_exposure(percent, segment_share=share)
+    at_risk, _ = exposure.daily_rub(exp, object_daily_cost=daily)
+
+    assert round(at_risk, 6) == round(promise_rub, 6)
 
 
 def test_budget_move_costs_the_difference_not_the_whole_spend():
