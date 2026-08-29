@@ -414,3 +414,9 @@ def test_non_region_slices_have_no_label(monkeypatch):
         "cab", "device", "2026-08-06", "2026-08-20")
     assert "TargetingLocationName" not in captured["fields"]
     assert rows[0]["slice_label"] == ""
+
+
+def test_region_zero_is_not_a_region():
+    """«Не определено» приходит нулём — bidmodifiers.add его отверг бы."""
+    assert plan.direct_type_for("bid_modifier:region", "0")[0] is None
+    assert plan.direct_type_for("bid_modifier:region", "Москва")[0] is None

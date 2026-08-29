@@ -168,8 +168,13 @@ def direct_type_for(kind: str, key: str) -> Tuple[Optional[str], str, str]:
     if direct_type is None:
         return None, str(key), UNSUPPORTED_KIND_REASON.format(kind=kind or "—")
 
-    if direct_type == "REGIONAL_ADJUSTMENT" and not str(key).strip().isdigit():
-        return None, str(key), UNSUPPORTED_REGION_REASON
+    if direct_type == "REGIONAL_ADJUSTMENT":
+        # Ноль — не регион: так Reports API помечает строку без определённого
+        # места («не определено»). isdigit его пропускает, а bidmodifiers.add
+        # отверг бы элемент, и он переотправлялся бы каждый прогон.
+        canonical = str(key).strip()
+        if not canonical.isdigit() or int(canonical) <= 0:
+            return None, canonical, UNSUPPORTED_REGION_REASON
 
     if direct_type == "DEMOGRAPHICS_ADJUSTMENT":
         # Канонический регистр — верхний, как у устройств и как в самих
