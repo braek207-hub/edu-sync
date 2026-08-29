@@ -2288,6 +2288,32 @@ def test_schedule_reaches_the_cabinet(monkeypatch, capsys):
     assert targeting["ConsiderWorkingWeekends"] == "YES"
 
 
+def test_notifies_after_the_black_box_write(monkeypatch, capsys):
+    # Уведомление обязано уйти ПОСЛЕ save_run: сбой Telegram не вправе
+    # заблокировать запись в чёрный ящик, только дополнить её отчётом.
+    _patch_schedule_run(monkeypatch, [_setting("schedule:hour", "3", -40.0)])
+    order = []
+    monkeypatch.setattr(agent_e1.blackbox, "save_run",
+                        lambda *a, **k: order.append("blackbox") or
+                                        {"run_id": "test", "saved": False,
+                                         "rejects": 0, "error": "тест"})
+    calls = []
+
+    def _send(text):
+        order.append("notify")
+        calls.append(text)
+        return {"sent": False, "reason": "not_configured"}
+
+    monkeypatch.setattr(agent_e1.notify, "send", _send)
+
+    assert agent_e1.main() == 0
+    capsys.readouterr()
+
+    assert order == ["blackbox", "notify"], "уведомление ушло раньше записи в чёрный ящик"
+    assert len(calls) == 1
+    assert "Агент Э1" in calls[0]
+
+
 def test_schedule_is_reported_even_when_it_changes_nothing(monkeypatch, capsys):
     # «Профиля нет» и «профиль есть, но в кабинете уже стоит» обязаны
     # различаться: иначе оба выглядят как молчание прогона.
@@ -2783,13 +2809,17 @@ def test_run_verdict_names_the_run_by_its_worst_account():
 
 def test_run_verdict_reaches_the_black_box():
     # Проверка у получателя: вердикт обязан лежать в том самом словаре,
-    # который читает blackbox.save_run (report["verdict"]), а не только
-    # печататься рядом.
+    # который читает blackbox.save_run (report["verdict"]) и который уходит
+    # в notify.e1_summary, а не только печататься рядом. Вердикт и передача
+    # в save_run собраны через одну переменную run_report (задача 6:
+    # уведомление строится из тех же кусков, что и запись в чёрный ящик,
+    # без повторного мутирования уже сохранённого отчёта).
     import inspect
 
     source = inspect.getsource(agent_e1._run_all)
+    assert '"verdict": run_verdict(account_reports)' in source
     saved = source[source.index('stage="e1"'):]
-    assert '"verdict": run_verdict(account_reports)' in saved
+    assert "report=run_report" in saved
 
 
 # --- экономика кампании для ожидания: проводка в боевой прогон -------------

@@ -103,7 +103,7 @@ from sync.agent.writer.risk import (
     week_start,
     weekly_limit,
 )
-from sync.agent import blackbox, conflicts, experiments, learning_loop, rejects
+from sync.agent import blackbox, conflicts, experiments, learning_loop, notify, rejects
 from sync.agent.writer.rollback import red_line_for
 from sync.agent.writer.units import api_to_delta
 
@@ -2924,9 +2924,7 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "blind_spend": blind,
     }, ensure_ascii=False, indent=2))
 
-    saved = blackbox.save_run(
-        run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),
-        report={"verdict": run_verdict(account_reports),
+    run_report = {"verdict": run_verdict(account_reports),
                 # Ступени полос — в отчёт ПРОГОНА, а не кабинета: свободу
                 # зарабатывает полоса на всей своей истории, одна на все
                 # кабинеты. Без этой строки экран агента (задача 27) видит
@@ -2935,12 +2933,20 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
                 # потолком, от полосы, стоящей в тени.
                 "lane_steps": ctx["lane_steps"],
                 "accounts": account_reports, "blind_spend": blind,
-                "window": [cutoff, today], "failed_accounts": failed_accounts},
+                "window": [cutoff, today], "failed_accounts": failed_accounts}
+    saved = blackbox.save_run(
+        run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),
+        report=run_report,
         rejects=run_rejects)
     # Итог записи печатается всегда, включая ошибку: молчащий чёрный ящик
     # хуже отсутствующего — он создаёт уверенность, что история пишется.
     print(json.dumps({"verdict": "BLACKBOX", **saved,
                       "rejects_by_reason": rejects.by_reason(run_rejects)},
+                     ensure_ascii=False, indent=2))
+    # Уведомление — ПОСЛЕ save_run: сбой транспорта не должен блокировать
+    # запись в чёрный ящик, только дополнять её. send() по контракту не бросает.
+    print(json.dumps({"verdict": "NOTIFY",
+                      **notify.send(notify.e1_summary(run_report, dry_run))},
                      ensure_ascii=False, indent=2))
 
     if failed_accounts:

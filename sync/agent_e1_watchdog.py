@@ -54,6 +54,7 @@ from sync.agent import experiments
 from sync.agent import db as agent_db
 from sync.agent import gate as gate_module
 from sync.agent import holdout
+from sync.agent import notify
 from sync.agent import tact_effect
 from sync.agent.ideas import registry as ideas_registry
 from sync.agent.gate import mart_gate, with_source_checks
@@ -2118,6 +2119,9 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
     out["blackbox"] = blackbox.save_run(
         blackbox.new_run_id(), stage="watchdog",
         mode=blackbox.run_mode(sandbox, dry_run), report=out)
+    # Уведомление — ПОСЛЕ save_run: сбой транспорта не должен блокировать
+    # запись в чёрный ящик, только дополнять её. send() по контракту не бросает.
+    out["notify"] = notify.send(notify.watchdog_summary(out))
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 1 if fail_on_alarm and out["alarms"] else 0
 

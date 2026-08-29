@@ -2116,3 +2116,31 @@ def test_watchdog_verdict_turns_alarm_on_unrollbackable_rows(monkeypatch, capsys
     report = seen["report"]
     assert report["alarms"], "неоткатываемые строки обязаны поднимать тревогу"
     assert report["verdict"] == "ALARM"
+
+
+def test_watchdog_notifies_after_the_black_box_write(monkeypatch, capsys):
+    # Уведомление обязано уйти ПОСЛЕ save_run: чёрный ящик не должен зависеть
+    # от того, доступен ли Telegram. Порядок вызовов и текст сводки — оба
+    # проверяются в одном тесте, иначе можно проверить порядок и потерять
+    # то, что реально ушло бы человеку.
+    lock = _RecordingLock()
+    _patch_watchdog_main(monkeypatch, lock)
+    order = []
+    monkeypatch.setattr(watchdog.blackbox, "save_run",
+                        lambda *a, **k: order.append("blackbox") or
+                                        {"saved": False, "error": "тест"})
+    calls = []
+
+    def _send(text):
+        order.append("notify")
+        calls.append(text)
+        return {"sent": False, "reason": "not_configured"}
+
+    monkeypatch.setattr(watchdog.notify, "send", _send)
+
+    assert watchdog.main() == 0
+    capsys.readouterr()
+
+    assert order == ["blackbox", "notify"], "уведомление ушло раньше записи в чёрный ящик"
+    assert len(calls) == 1
+    assert "Сторож" in calls[0]
