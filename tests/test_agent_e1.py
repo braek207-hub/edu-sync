@@ -781,14 +781,15 @@ def test_cabinet_without_computed_settings_is_visible_in_report(monkeypatch, cap
     assert reports["acc-1"]["desired"] == 1
 
 
-# ------------------------------------- дефект 3: лимит полосы — на прогон
+# ------------------- дефект 3: лимит полосы и дня — по расходу кабинетов
 
 
-def test_lane_budget_is_shared_across_cabinets(monkeypatch, capsys):
-    # Тот же дефект, что был у лимита действий (cap_actions вызывался внутри
-    # цикла по кабинетам, и при четырёх кабинетах потолок был вчетверо выше
-    # заявленного), — теперь на полосах. Остаток полосы едет между кабинетами
-    # одним словарём, поэтому второй кабинет видит то, что потратил первый.
+def test_lane_pocket_belongs_to_the_cabinet_and_is_sized_by_its_spend(monkeypatch, capsys):
+    # Тетрадь остатков полосы — своя у каждого кабинета, и размер кармана
+    # считается от расхода ЭТОГО кабинета. Общая тетрадь отдавала карман
+    # первому по порядку обхода: замер 27.08.2026, полоса тонкой настройки —
+    # account10 взял 21 действие и вычерпал карман, крупнейший кабинет прогона
+    # account3 (9,3 млн ₽ за 28 дней) получил 2 из 177 заявленных.
     settings = [_setting("bid_modifier:device", "DESKTOP", 30)]
     _patch_run(
         monkeypatch,
@@ -801,11 +802,113 @@ def test_lane_budget_is_shared_across_cabinets(monkeypatch, capsys):
 
     reports = [r for r in _reports(capsys) if "account" in r]
     spent = [r["lanes"]["spent"] for r in reports]
-    assert spent[0] != {} or spent[1] != {}
-    # Второй кабинет продолжает счёт первого, а не начинает свой.
+    assert spent[0] != {} and spent[1] != {}
+    # Кабинеты-близнецы: у каждого своя тетрадь, и второй начинает счёт с нуля,
+    # а не продолжает первый. Разъедься эти два числа — карман снова общий.
     first = float((spent[0].get("tuning") or {}).get("risk_rub") or 0.0)
     second = float((spent[1].get("tuning") or {}).get("risk_rub") or 0.0)
-    assert second >= first, "полоса начала счёт заново на втором кабинете"
+    assert first > 0 and second == first, "тетрадь остатков полосы общая на прогон"
+    # Расход прогона делится поровну — доли кабинетов равны и в сумме дают 1.
+    shares = [r["lanes"]["account_share"] for r in reports]
+    assert shares == [0.5, 0.5]
+
+
+def test_daily_risk_pocket_is_split_by_account_weight_not_by_traversal_order(
+        monkeypatch, capsys):
+    """Уберите этот тест — и дневная доля недельного риска снова достанется
+    кабинету, которого обошли первым, а не тому, чьи деньги под управлением.
+
+    Карман полосы починен (тест выше), но этажом ниже стояла вторая рельса —
+    дневная доля прогона перед `fit_week_budget`, общая на все кабинеты и
+    вычерпываемая в порядке обхода. Живой такт 28.08.2026 на
+    ПОЧИНЕННЫХ полосах: дневная доля прогона 9 157 ₽, account10 (доля расхода
+    0,4075) обошли первым — он списал 9 113 ₽ и оставил прогону 44 ₽;
+    крупнейшему account3 (доля 0,4525) досталось этих 44 ₽, и из 13 отобранных
+    полосами действий уехали 2, а 11 ушли в deferred_by_risk. Доля прошедших:
+    2 из 214 у крупного против 4 из 190 у мелкого — ровно тот дефект «лимит
+    выбирает первое, а не важное», который полосы и чинили.
+
+    Проверка — перестановкой порядка обхода: исход кабинета обязан быть один и
+    тот же в обоих порядках, а у крупного кабинета доля прошедших не ниже, чем
+    у мелкого.
+    """
+    settings = [_setting("bid_modifier:device", "DESKTOP", 30),
+                _setting("bid_modifier:device", "MOBILE", -20),
+                _setting("bid_modifier:gender", "GENDER_MALE", 15)]
+
+    def _run(order):
+        _many_actions_per_campaign(monkeypatch)
+        _patch_run(
+            monkeypatch,
+            computed_by_login={login: settings for login in order},
+            campaigns_by_login={"big": [111], "small": [222]},
+            # Крупный кабинет тратит втрое больше мелкого: доли 0,75 и 0,25.
+            daily_cost={"111": 3_000.0, "222": 1_000.0},
+        )
+        assert agent_e1.main() == 0
+        return {r["account"]: r for r in _reports(capsys) if "account" in r}
+
+    straight = _run(["big", "small"])
+    reverse = _run(["small", "big"])
+
+    for login in ("big", "small"):
+        assert (straight[login]["risk_charged_rub"]
+                == reverse[login]["risk_charged_rub"]), (
+            f"исход кабинета {login} зависит от порядка обхода")
+        assert (straight[login]["prepared"]["count"]
+                == reverse[login]["prepared"]["count"])
+    # Крупный кабинет не голодает за спиной у мелкого: его доля прошедших не
+    # ниже. Сравниваются доли, а не штуки: у кабинетов разное число замыслов.
+    def _share(report):
+        planned = report["prepared"]["count"] + report["deferred_by_risk"]
+        return report["prepared"]["count"] / planned if planned else 0.0
+
+    assert _share(straight["big"]) >= _share(straight["small"]) > 0.0
+    # Числа целиком: дневная доля прогона 50 000 / 7 = 7 142,86 ₽ режется
+    # долями расхода 0,75 и 0,25 — 5 357,14 ₽ крупному и 1 785,71 ₽ мелкому.
+    # Действие крупного стоит 4 200 ₽, мелкого — 1 400 ₽, и каждому хватает
+    # ровно на одно. До починки крупный кабинет, обойдённый вторым, не получал
+    # ничего: мелкий забирал 5 250 ₽ тремя действиями, и на 4 200 ₽ не
+    # оставалось.
+    assert straight["big"]["account_risk_share_rub"] == 5_357.14
+    assert straight["small"]["account_risk_share_rub"] == 1_785.71
+    assert straight["big"]["risk_charged_rub"] == 4_200.0
+    assert straight["small"]["risk_charged_rub"] == 1_400.0
+    # Объём прогона при этом не растёт: сумма списаний по кабинетам не выше
+    # дневной доли, посчитанной на прогон целиком.
+    charged = sum(straight[login]["risk_charged_rub"] for login in ("big", "small"))
+    assert charged <= 50_000.0 / risk.DAYS_IN_WEEK
+
+
+def test_unknown_run_spend_splits_the_pocket_evenly_not_wholly(monkeypatch, capsys):
+    """Уберите этот тест — и при пробеле в витрине потолок прогона снова
+    вырастет во столько раз, сколько в прогоне кабинетов.
+
+    Расход прогона нулевой — доли от него не существует, а
+    `risk.weekly_limit` в этом случае отдаёт абсолютный дефолт вместо нуля
+    (ноль означал бы «агент не работает» при первом же лаге синка). Умножить
+    этот дефолт на долю «весь потолок каждому» — и два кабинета получат два
+    дефолта, четыре кабинета четыре: ровно тот дефект «потолок вчетверо выше
+    заявленного», который уже чинили у лимита действий.
+
+    Проверяется на долях, а не на списаниях: с нулевым расходом действие
+    ничего не стоит, и рубли сюда ничего не добавят.
+    """
+    settings = [_setting("bid_modifier:device", "DESKTOP", 30)]
+    _patch_run(
+        monkeypatch,
+        computed_by_login={"acc-1": settings, "acc-2": settings},
+        campaigns_by_login={"acc-1": [111], "acc-2": [222]},
+        # Кампании в справочнике есть, расхода по ним нет — лаг синка витрины.
+        daily_cost={"111": 0.0, "222": 0.0},
+    )
+
+    assert agent_e1.main() == 0
+
+    reports = {r["account"]: r for r in _reports(capsys) if "account" in r}
+    shares = [reports[login]["lanes"]["account_share"] for login in ("acc-1", "acc-2")]
+    assert shares == [0.5, 0.5]
+    assert sum(shares) == 1.0, "сумма карманов кабинетов больше кармана прогона"
 
 
 # --------------------------- дефект 4: риск кампании списывается один раз
