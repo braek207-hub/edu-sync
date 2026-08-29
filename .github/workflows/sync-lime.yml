@@ -38,7 +38,11 @@ jobs:
           LIME_DB_USER: ${{ secrets.LIME_DB_USER }}
           LIME_DB_PASSWORD: ${{ secrets.LIME_DB_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          LIME_SYNC_DAYS: "7"
+          # 30, не 7: PROCONTEXT досчитывает заказы задним числом, а день, выпавший из
+          # окна, у нас замерзает навсегда. Замер 29.08.2026 (окно 30.07–28.08): свежие
+          # дни сходятся с MySQL точно (21.08 — Δ 0 заказов, 20.08 — Δ 2), а каждый день
+          # вне окна недосчитывает 10–25 заказов, всего −391 заказ и −8 млн ₽ за месяц.
+          LIME_SYNC_DAYS: "30"
           LIME_SYNC_FROM: ${{ github.event.inputs.sync_from }}
           LIME_SYNC_TO: ${{ github.event.inputs.sync_to }}
           PYTHONIOENCODING: "utf-8"
