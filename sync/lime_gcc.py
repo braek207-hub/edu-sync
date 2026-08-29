@@ -193,6 +193,58 @@ def app_order_rows(app_agg: list[dict], fx_rate: float, date_s: str) -> list[tup
     return out
 
 
+GRAIN_LEN = 9  # date..campaign_name — зерно витрины дашборда (его GROUP BY)
+SUM_COLS = ("cost", "clicks", "impressions", "sessions", "users", "clients",
+            "purchases_count", "purchases_revenue", "customers",
+            "new_users", "new_customers", "new_customers_revenue",
+            "cart_reaches", "checkout_reaches")
+# Средние на визит: складывать их нельзя, только пересреднять по визитам.
+AVG_COLS = ("bounce_rate", "page_depth")
+
+
+def fold_by_grain(rows: list[tuple]) -> list[tuple]:
+    """Свернуть строки одного дня по зерну витрины (date..campaign_name).
+
+    Зачем. Заказы приложения (app_order_rows) и его трафик (app_traffic_tuples) приходят
+    разными строками: у первой заполнены заказы и выручка, у второй — визиты и юзеры.
+    Когда кампании нет (органика, Direct/SEO), обе ложатся на ОДНО зерно и до 29.08.2026
+    уезжали в базу двумя строками. Замер на проде: 14 таких пар из 384 360 строк —
+    единственное место во всей таблице, где зерно не уникально, и потому единственная
+    причина, по которой дашборд обязан делать GROUP BY (он стоит 92 % времени запроса).
+
+    Складываем здесь, а не в дашборде: строка «заказы без визитов» рядом со строкой
+    «визиты без заказов» — не два факта, а один, разрезанный источником.
+
+    Средние на визит (отказы, глубина) пересредняются по визитам: у строки заказов их нет
+    (None), у строки трафика есть — простое сложение дало бы сумму долей.
+    """
+    order = {name: i for i, name in enumerate(COLUMNS)}
+    i_sessions = order["sessions"]
+    folded: dict[tuple, list] = {}
+    for row in rows:
+        key = row[:GRAIN_LEN]
+        acc = folded.get(key)
+        if acc is None:
+            folded[key] = list(row)
+            continue
+        # Веса средних снимаем ДО сложения визитов: после него acc[sessions] — уже сумма,
+        # и пересреднение считало бы по неверному весу.
+        wa, wb = acc[i_sessions] or 0, row[i_sessions] or 0
+        for name in SUM_COLS:
+            i = order[name]
+            acc[i] = (acc[i] or 0) + (row[i] or 0)
+        for name in AVG_COLS:
+            i = order[name]
+            a, b = acc[i], row[i]
+            if b is None:
+                continue
+            if a is None:
+                acc[i] = b
+                continue
+            acc[i] = round((a * wa + b * wb) / (wa + wb), 4) if wa + wb else a
+    return [tuple(v) for v in folded.values()]
+
+
 # Приложение LIME International (AppMetrica); запущено ~2026-06-02 — раньше строк app нет.
 APP_ID = os.environ.get("GCC_APP_ID") or "6299245"
 APP_TRAFFIC_FLOOR = "2026-06-02"
@@ -375,6 +427,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
                           rub_spend_rows=google_geo, campaign_index=campaign_index)
         rows += app_order_rows(app_ord, fx_rate, day_s)
         rows += app_traffic_by_day.get(day_s, [])
+        rows = fold_by_grain(rows)
 
         if conn is None:
             i_country = COLUMNS.index("country")
