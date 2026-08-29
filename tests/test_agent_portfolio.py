@@ -2,6 +2,7 @@
 """Э3.2: единый порог предельной окупаемости и целевые бюджеты кампаний."""
 
 from sync.agent.portfolio import (
+    ACCOUNT_GROWTH_STEP,
     BETA_SUPERLINEAR_STEP,
     MAX_STEP_DOWN,
     MAX_STEP_UP,
@@ -840,6 +841,61 @@ def test_growth_beyond_step_caps_is_deferred_not_smeared():
     # объявил бы кабинет убыточным и раздул бы уверенность каждого сдвига.
     assert acc["lambda"] > 1.0
     assert acc["lambda_breakeven"] is True
+
+
+def test_account_that_only_shrinks_reports_no_growth_at_all():
+    """Сокращение кабинета не имеет права приезжать в поля роста.
+
+    Кампания с β ≥ 1 шагает на ×1.15 в ту или иную сторону НЕЗАВИСИМО от λ,
+    поэтому у кабинета из одних таких сумма целей не уравнивается с бюджетом
+    никаким порогом: порог садится на предельную окупаемость крупнейшей
+    кампании, и обе цели уходят вниз на ×1/1.15. Роста при этом нет вовсе —
+    запаса кабинету не передали, capped_by="room", — и невязка это чистое
+    сокращение, а не недоданная прибавка.
+
+    Числа взяты с прода 28.08.2026, кабинет account4: факт 698 112,80 ₽,
+    Σ целей 607 054,61 ₽, λ = 2,0896. Отчёт того прогона печатал
+    growth_rub = −91 058,19 ₽ и deferred_growth_rub = +91 058,19 ₽ — то есть
+    отрицательный «рост» и отложенную прибавку, которой никто не давал; экран
+    «Деньги» Panda-BI читает deferred прямо из этого поля. Заодно подмена
+    бюджета на Σ целей обнуляла sum_residual — единственную прямую проверку
+    «сумма на уровне кабинета» — ровно там, где сумма не сошлась.
+    """
+    saturation = {"a": _curve(cost=147_051.22, beta=1.05, marginal=2269.45),
+                  "b": _curve(cost=551_061.58, beta=1.1, marginal=1000.0)}
+    ladder = {"a": _ladder(revenue=1338.95 * 100), "b": _ladder(revenue=2089.6 * 100)}
+    section = portfolio_targets(saturation, ladder, {"a": "acc", "b": "acc"},
+                                monthly_cap_rub=5_000_000.0)
+    acc = section["accounts"]["acc"]
+    assert acc["growth_capped_by"] == "room"
+    assert acc["growth_rub"] == 0.0
+    assert acc["deferred_growth_rub"] == 0.0
+    # Бюджет кабинета — факт: сокращение придумал солвер, а не владелец.
+    assert acc["cost_28d"] == 698_112.80
+    assert acc["budget_28d"] == 698_112.80
+    # Σ целей ниже бюджета, и невязка говорит это вслух, а не растворяется в
+    # подменённом бюджете.
+    assert acc["target_sum_28d"] == 607_054.61
+    assert acc["sum_residual"] == -91_058.19
+
+
+def test_deferred_growth_never_exceeds_the_growth_that_was_granted():
+    """Отложить можно только то, что дали, — иначе счётчик копит призраки.
+
+    Прибавка ограничена шагом (+20 %), а разложить её мешают капы кампаний.
+    Отложенным вправе называться максимум сама прибавка: всё, что ниже факта
+    расхода, — уже сокращение, и складывать эти рубли с недоданным ростом
+    значит показывать владельцу «перенесено на следующий такт» вдвое больше,
+    чем механизм вообще собирался потратить.
+    """
+    saturation = {"1": _curve(beta=1.1)}
+    ladder = {"1": _ladder()}
+    section = portfolio_targets(saturation, ladder, {"1": "acc"},
+                                room_rub_by_login={"acc": 50_000.0},
+                                monthly_cap_rub=5_000_000.0)
+    acc = section["accounts"]["acc"]
+    assert acc["deferred_growth_rub"] <= acc["cost_28d"] * ACCOUNT_GROWTH_STEP
+    assert acc["growth_rub"] >= 0.0
 
 
 def test_growth_is_capped_by_the_monthly_plan_of_the_owner():

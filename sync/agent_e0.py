@@ -1891,7 +1891,13 @@ def main() -> int:
                     "deferred_growth_rub": acc["deferred_growth_rub"],
                     "capped_by": acc["growth_capped_by"],
                     "monthly_cap_rub": active_config["monthly_budget_cap_rub"],
-                    "lambda": acc["lambda"]}
+                    "lambda": acc["lambda"],
+                    # Причина отказа без своего числа — приговор без
+                    # основания. "lambda" читается по λ, а "romi" — только по
+                    # средней окупаемости кабинета против контракта, и раньше
+                    # её приходилось искать в соседней секции.
+                    "account_romi": acc["account_romi"],
+                    "target_romi": acc["target_romi"]}
             for login, acc in budget_threshold["accounts"].items()
         },
         # План освоения месяца: цель, выбранное и дневная доля по кабинетам.
