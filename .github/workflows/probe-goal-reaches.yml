@@ -1,0 +1,46 @@
+name: Probe Metrika goal reaches
+
+# Только чтение: спрашивает Stat API про одну цель разными способами, чтобы найти,
+# где синк целей теряет достижения. Ничего не пишет.
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe_goal:
+        description: "ID цели (по умолчанию 497698909 «Регистрация»)"
+        required: false
+        default: ""
+      probe_from:
+        description: "Начало окна (YYYY-MM-DD)"
+        required: false
+        default: ""
+      probe_to:
+        description: "Конец окна (YYYY-MM-DD)"
+        required: false
+        default: ""
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run probe
+        env:
+          LIME_METRIKA_TOKEN: ${{ secrets.LIME_METRIKA_TOKEN }}
+          LIME_METRIKA_COUNTER_ID: ${{ secrets.LIME_METRIKA_COUNTER_ID }}
+          PROBE_GOAL: ${{ github.event.inputs.probe_goal }}
+          PROBE_FROM: ${{ github.event.inputs.probe_from }}
+          PROBE_TO: ${{ github.event.inputs.probe_to }}
+          PYTHONIOENCODING: "utf-8"
+        run: python probe_goal_reaches.py
