@@ -23,4 +23,6 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
           DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+          # Скрипт лежит в scripts/, пакет sync — в корне: без этого ModuleNotFoundError
+          PYTHONPATH: ${{ github.workspace }}
         run: python scripts/probe_report_filter.py
