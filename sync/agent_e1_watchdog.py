@@ -809,7 +809,10 @@ def shadow_report(db_module: Any, facts_by_campaign: Dict[str, List[Dict[str, An
     превращалось бы в «сбылось» от накопленного дрейфа.
     """
     try:
-        rows = db_module.shadow_actions()
+        # Тот же отбор, что у открытых действий: вердикт тени пишется в
+        # журнал (mark_shadow_outcome ниже), и без границы сторож проставлял
+        # бы исход намерению чужой команды.
+        rows = own_actions(db_module.shadow_actions())
     except Exception as exc:  # noqa: BLE001
         return {"unavailable": f"{type(exc).__name__}: {exc}"[:200]}
 
@@ -2027,7 +2030,7 @@ def _shadow_rows() -> List[Dict[str, Any]]:
     запрос и напишет unavailable), а наблюдение идёт своим ходом.
     """
     try:
-        return list(writer_db.shadow_actions())
+        return own_actions(writer_db.shadow_actions())
     except Exception:  # noqa: BLE001
         return []
 

@@ -85,6 +85,24 @@ def excluded_campaign_ids(rows: Iterable[Dict[str, Any]],
     return {str(r.get(id_key)) for r in rows if is_excluded_campaign(r.get(name_key))}
 
 
+def drop_campaign_ids(rows: Iterable[Dict[str, Any]],
+                      excluded_ids: Iterable[Any],
+                      id_key: str = "campaign_id") -> List[Dict[str, Any]]:
+    """Отбор там, где имени нет вовсе, — по заранее снятому множеству Id.
+
+    Сегментные отчёты Директа и crm_lead_details знают только CampaignId:
+    предикат по имени до них не достаёт, и единственная различающая величина —
+    множество, снятое там, где имя ещё было (excluded_campaign_ids).
+
+    Пустое множество возвращает те же строки: «исключать нечего» обязано
+    означать «ничего не меняем», а не «отбор не сработал».
+    """
+    excluded = {str(cid) for cid in excluded_ids or ()}
+    if not excluded:
+        return list(rows)
+    return [r for r in rows if str(r.get(id_key)) not in excluded]
+
+
 def like_patterns() -> List[str]:
     """Те же подстроки в форме LIKE — для условий, которые считает СУБД.
 
@@ -92,4 +110,13 @@ def like_patterns() -> List[str]:
     запроса: список исключений один на систему, и вторая его копия в SQL
     разъехалась бы с первым же дополнением.
     """
+    for pattern in EXCLUDED_CAMPAIGN_PATTERNS:
+        # % и _ в LIKE — метасимволы: подстрока с ними значила бы в SQL не то,
+        # что в Python, и граница зоны ответственности разошлась бы между
+        # предикатом и запросом. Пока таких подстрок нет, проверка держит это
+        # свойство; появится — либо экранировать здесь и добавить ESCAPE во
+        # все четыре условия, либо переписать их на strpos.
+        assert "%" not in pattern and "_" not in pattern, (
+            f"подстрока {pattern!r} содержит метасимвол LIKE: "
+            f"условие в SQL перестанет совпадать с предикатом Python")
     return [f"%{pattern}%" for pattern in EXCLUDED_CAMPAIGN_PATTERNS]

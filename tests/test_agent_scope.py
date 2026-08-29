@@ -11,6 +11,7 @@ tests/test_agent_scope.py — что агент не видит вообще (sy
 подключённый.
 """
 
+import datetime as _dt
 import json
 
 import pytest
@@ -494,3 +495,113 @@ def test_cost_by_campaign_excludes_foreign_campaigns(monkeypatch):
     assert "campaign_name" in seen["sql"]
     assert "%rsv%" in seen["params"][-1]
 
+
+# ----------------------------------------- подключение: лиды, тень, транспорт
+
+
+def test_leads_of_foreign_campaigns_do_not_reach_facts(monkeypatch, capsys):
+    """Лид чужой кампании обязан отсекаться ДО сборки фактов.
+
+    В crm_lead_details имени кампании нет — только campaign_id, — поэтому
+    условие по имени сюда не достаёт, а последствия у пропущенного лида
+    тяжелее, чем у пропущенного расхода. Слот факта создаётся по паре «день ×
+    кампания» с campaign_name=None и cost=0 (facts.py), а запись фактов идёт
+    через ON CONFLICT: такой слот ПЕРЕЗАПИСЫВАЕТ историческую строку
+    edu_agent_facts пустым именем и нулевым расходом. Дальше эту строку не
+    ловит ни одно условие по имени (NULL не похож ни на один шаблон), и
+    отбор в заповедник по leads_30d может увести чужую кампанию под
+    эксперимент агента.
+    """
+    import sync.agent_e0 as agent_e0
+    import tests.test_agent_e0 as e0_tests
+
+    e0_tests._patch_e0_run(monkeypatch)
+    today = _dt.date.today().isoformat()
+    monkeypatch.setattr(agent_e0.agent_db, "load_excluded_campaign_ids",
+                        lambda *a, **k: {"710118280"})
+    monkeypatch.setattr(agent_e0.agent_db, "load_lead_rows", lambda *a, **k: [
+        {"lead_id": "L1", "campaign_id": "111", "created_date": today},
+        {"lead_id": "L2", "campaign_id": 710118280, "created_date": today},
+    ])
+    seen = {}
+
+    def _capture(direct_rows, lead_rows, score_rows):
+        seen["leads"] = list(lead_rows)
+        return [e0_tests._fact(today)]
+
+    monkeypatch.setattr(agent_e0, "assemble_facts", _capture)
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+
+    assert [r["lead_id"] for r in seen["leads"]] == ["L1"]
+
+
+def test_watchdog_does_not_judge_shadow_of_the_excluded_account():
+    """Вердикт тени пишется в журнал — по строке ЛЮБОГО кабинета.
+
+    Открытые действия сторож уже отбирает своими (own_actions), а ждущие
+    сверки намерения читались мимо границы: mark_shadow_outcome проставлял бы
+    «сбылось/не сбылось» намерению чужой команды, и в её журнале появлялись
+    бы вердикты, которых она не просила.
+    """
+    import sync.agent_e1_watchdog as watchdog
+
+    rows = [{"action_id": "a", "account": "account10-506462-fqs4",
+             "object_id": "111", "action_kind": "bid_modifier"},
+            {"action_id": "b", "account": "account4-506456-gsrr",
+             "object_id": "222", "action_kind": "bid_modifier"}]
+    marked = []
+
+    class _Db:
+        @staticmethod
+        def shadow_actions():
+            return list(rows)
+
+        @staticmethod
+        def mark_shadow_outcome(action_id, verdict, payload):
+            marked.append(action_id)
+            return True
+
+    report = watchdog.shadow_report(_Db(), {}, _dt.date.today(), None)
+
+    assert report["waiting"] == 1
+    assert "b" not in marked
+
+
+def test_watchdog_shadow_rows_are_own_only(monkeypatch):
+    """Тот же отбор на втором чтении тени — в отчёте прогона.
+
+    Два чтения одного журнала обязаны видеть одно и то же: иначе «ждут
+    сверки» в отчёте и «судим» в теле сторожа разойдутся, и объяснить разницу
+    будет нечем.
+    """
+    import sync.agent_e1_watchdog as watchdog
+
+    monkeypatch.setattr(watchdog.writer_db, "shadow_actions", lambda: [
+        {"action_id": "a", "account": "account1-506453-ln8s"},
+        {"action_id": "b", "account": "account4-506456-gsrr"},
+    ])
+
+    assert [r["action_id"] for r in watchdog._shadow_rows()] == ["a"]
+
+
+def test_write_client_refuses_the_excluded_account():
+    """Последний рубеж — у самого транспорта записи.
+
+    Выше по течению исключение держат отборы (own_actions, filter_clients), но
+    все они — списки, которые кто-то собирает. Транспорт же знает логин точно
+    и в момент, когда запись ещё не ушла: конструктор, отказывающий с
+    названной причиной, превращает будущую ошибку отбора из тихой правки
+    чужого кабинета в падение с текстом.
+    """
+    import pytest
+
+    from sync.agent.writer.client import WriteClient
+
+    with pytest.raises(ValueError) as exc:
+        WriteClient("account4-506456-gsrr", sandbox=False, dry_run=False)
+
+    assert "account4-506456-gsrr" in str(exc.value)
+    # Свой кабинет конструируется как раньше.
+    assert WriteClient("account1-506453-ln8s").login == "account1-506453-ln8s"

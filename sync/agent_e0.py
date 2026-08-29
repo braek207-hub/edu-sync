@@ -942,8 +942,27 @@ def main() -> int:
     # CampaignId и ничего больше, а отобрать по нему без этого множества
     # нечем — и чужие кампании уехали бы в edu_agent_facts_sliced и в
     # покампанийные корректировки Э2.2.
-    excluded_campaign_ids = agent_db.load_excluded_campaign_ids(date_from, date_to)
-    lead_rows = agent_db.load_lead_rows(date_from, date_to)
+    #
+    # Окно снятия — самое широкое из всех, кому множество понадобится:
+    # покампанийные срезы просят SLICE_WINDOW_DAYS независимо от --days, и на
+    # коротком прогоне чужая кампания, не тратившая эти дни, вернулась бы в
+    # срезы через собственное окно отчёта.
+    excluded_campaign_ids = agent_db.load_excluded_campaign_ids(
+        (date.today() - timedelta(days=max(days, SLICE_WINDOW_DAYS))).isoformat(),
+        date_to)
+    # Лиды отсекаются тем же множеством и ДО сборки фактов. В
+    # crm_lead_details имени кампании нет, а последствия у пропущенного лида
+    # тяжелее, чем у пропущенного расхода: слот факта создаётся по паре «день
+    # × кампания» с пустым именем и нулевым расходом (sync/agent/facts.py), а
+    # запись идёт через ON CONFLICT — такой слот ПЕРЕЗАПИСАЛ БЫ историческую
+    # строку edu_agent_facts, и вернуть её было бы неоткуда. Имя после этого
+    # NULL, то есть строку не ловит уже ни одно условие по имени.
+    #
+    # score_rows отдельно не отбираются намеренно: там нет campaign_id, а
+    # приписываются они лидам по lead_id — у отсечённого лида смотреть скор
+    # уже некому.
+    lead_rows = agent_scope.drop_campaign_ids(
+        agent_db.load_lead_rows(date_from, date_to), excluded_campaign_ids)
     lag_rows = agent_db.load_lag_rows(
         (date.fromisoformat(date_to) - timedelta(days=LAG_HISTORY_DAYS)).isoformat(),
         date_to)
@@ -1198,8 +1217,8 @@ def main() -> int:
                     if rows:
                         computed_by_account.setdefault(login, []).extend(rows)
                 else:
-                    own_rows = [r for r in job["rows"]
-                                if str(r.get("campaign_id")) not in excluded_campaign_ids]
+                    own_rows = agent_scope.drop_campaign_ids(
+                        job["rows"], excluded_campaign_ids)
                     weekly = collapse_tail(build_sliced_facts(own_rows, job["kind"]))
                     sliced_rows += weekly
                     # Э2.2: покампанийные корректировки — только device, это
