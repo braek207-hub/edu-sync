@@ -20,10 +20,9 @@
 не ложатся», и он НЕВЕРЕН: там 0,0% давал сломанный источник, а не объявление. Перемер
 29.08.2026 (probe_bjorn_card_views_ad_grain.py, день 20.08, источник переведён словарём):
 у 94,3% рекламных визитов есть ym:s:lastSignDirectClickBanner, и 94,7% рекламных просмотров
-находят свой ключ в bjorn_product_daily на грани источник × объявление × товар. То есть
-витрину можно углубить до кампании и объявления — мешает только первичный ключ таблицы.
-Ступень «смотрели карточку» при этом по-прежнему нельзя складывать по товарам: нужна своя
-строка-итог на каждую пару (источник, объявление), как сейчас на источник.
+находят свой ключ в bjorn_product_daily на грани источник × объявление × товар. Витрина
+углублена по этому замеру (миграция 20260829170000): в ключе появились campaign_id и ad_id,
+а строка-итог переехала с грани источника на грань (источник, кампания, объявление).
 
 Запросы лога снимаются в finally: неубранные копятся на квоте 10 ГБ.
 """
@@ -38,11 +37,19 @@ from typing import Any
 
 import requests
 
-from .common import SupabaseRest, add_date_range_args, env_required, resolve_date_range
+from .common import (
+    SupabaseRest,
+    add_date_range_args,
+    env_required,
+    normalize_campaign_id,
+    resolve_date_range,
+)
 
 BASE = "https://api-metrika.yandex.net/management/v1/counter/{counter}"
 TABLE = "bjorn_card_views_daily"
-ON_CONFLICT = "date,attribution,source,product_name"
+# Ключ витрины углублён до кампании и объявления (миграция 20260829170000): перемер 29.08
+# показал, что грань объявления сходится с товарной витриной на 94,7%.
+ON_CONFLICT = "date,attribution,source,campaign_id,ad_id,product_name"
 
 HIT_FIELDS = "ym:pv:visitID,ym:pv:dateTime,ym:pv:URL,ym:pv:title"
 
@@ -80,7 +87,13 @@ def norm_product(name: str) -> str:
 
 
 def visit_fields(prefix: str) -> str:
-    return f"ym:s:visitID,ym:s:{prefix}TrafficSource"
+    # Кампания и объявление берутся теми же полями, из которых их выводит товарная витрина
+    # (sync_products): UTMCampaign и баннер без «M-». Иначе строки двух витрин не встанут
+    # в один узел дерева на дашборде, даже если id совпадают по смыслу.
+    return (
+        f"ym:s:visitID,ym:s:{prefix}TrafficSource,"
+        f"ym:s:{prefix}UTMCampaign,ym:s:{prefix}DirectClickOrder,ym:s:{prefix}DirectClickBanner"
+    )
 
 
 def logs_create(counter: str, headers: dict[str, str], source: str, fields: str, d1: str, d2: str) -> int:
@@ -144,17 +157,31 @@ def fetch(counter: str, headers: dict[str, str], source: str, fields: str, d1: s
         logs_clean(counter, headers, request_id)
 
 
-def parse_visits(text: str) -> dict[str, str]:
-    """visitID → фраза источника, как её называет товарная витрина."""
-    out: dict[str, str] = {}
+def strip_banner(value: str) -> str:
+    """id объявления из логов. Пусто, ноль и нераскрытый UTM-шаблон «{...}» — не id."""
+    text = (value or "").strip()
+    if text in {"", "0", "None", "--", "null", "(not set)"}:
+        return ""
+    if text.startswith("{") and text.endswith("}"):
+        return ""
+    return text[2:] if text.startswith("M-") else text
+
+
+def parse_visits(text: str) -> dict[str, tuple[str, str, str]]:
+    """visitID → (фраза источника, id кампании, id объявления) в терминах товарной витрины."""
+    out: dict[str, tuple[str, str, str]] = {}
     for index, line in enumerate(text.splitlines()):
         if index == 0:
             continue
         parts = line.split("\t")
-        if len(parts) < 2:
+        if len(parts) < 5:
             continue
         code = parts[1].strip().lower()
-        out[parts[0]] = SOURCE_LABELS.get(code, "Не определено")
+        source = SOURCE_LABELS.get(code, "Не определено")
+        # UTMCampaign первым — им кампанию называет товарная витрина; DirectClickOrder
+        # подхватывает визиты, где метка не раскрылась.
+        campaign = normalize_campaign_id(parts[2]) or strip_banner(parts[3])
+        out[parts[0]] = (source, campaign, strip_banner(parts[4]))
     return out
 
 
@@ -184,26 +211,28 @@ def parse_card_views(hits: str) -> list[tuple[str, str, str]]:
 
 def build_rows(
     views: list[tuple[str, str, str]],
-    visits_by_attribution: dict[str, dict[str, str]],
+    visits_by_attribution: dict[str, dict[str, tuple[str, str, str]]],
     products: dict[str, str],
 ) -> list[dict[str, Any]]:
     """Свёртка просмотров в строки витрины. Товар берётся из справочника товарной витрины:
     имя должно совпасть с ней символ в символ, иначе ступень не приклеится к воронке.
 
-    Строка с пустым product_name — итог источника за день: сколько РАЗНЫХ людей открыли
-    хоть какую-то карточку. Без неё ступень воронки приходится складывать по товарам, а
-    один человек за визит открывает несколько карточек — сумма даёт 5 792 «человека» там,
-    где их 2 382 (замер 29.08.2026), и конверсия ступени вылезает за 100%. Итог считается по
-    ВСЕМ просмотрам /product/, включая товары без строки в товарной витрине."""
-    agg: dict[tuple[str, str, str, str], dict[str, Any]] = defaultdict(
+    Строка с пустым product_name — итог среза (источник, кампания, объявление) за день:
+    сколько РАЗНЫХ визитов открыли хоть какую-то карточку. Без неё ступень воронки
+    приходится складывать по товарам, а за визит открывают несколько карточек — сумма даёт
+    5 792 «визита» там, где их 2 382 (замер 29.08.2026), и конверсия вылезает за 100%.
+    Сумма итогов по объявлениям внутри источника равна прежнему итогу источника: у визита
+    ровно одно объявление последнего значимого перехода. Итог считается по ВСЕМ просмотрам
+    /product/, включая товары без строки в товарной витрине."""
+    agg: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = defaultdict(
         lambda: {"card_views": 0, "visit_ids": set()}
     )
     unknown: dict[str, int] = defaultdict(int)
 
     for attribution, visit_source in visits_by_attribution.items():
         for day, visit_id, product_key in views:
-            source = visit_source.get(visit_id, "Не определено")
-            total = agg[(day, attribution, source, "")]
+            source, campaign, ad = visit_source.get(visit_id, ("Не определено", "", ""))
+            total = agg[(day, attribution, source, campaign, ad, "")]
             total["card_views"] += 1
             total["visit_ids"].add(visit_id)
 
@@ -211,7 +240,7 @@ def build_rows(
             if product_name is None:
                 unknown[product_key] += 1
                 continue
-            bucket = agg[(day, attribution, source, product_name)]
+            bucket = agg[(day, attribution, source, campaign, ad, product_name)]
             bucket["card_views"] += 1
             bucket["visit_ids"].add(visit_id)
 
@@ -225,7 +254,9 @@ def build_rows(
             "date": key[0],
             "attribution": key[1],
             "source": key[2],
-            "product_name": key[3],
+            "campaign_id": key[3],
+            "ad_id": key[4],
+            "product_name": key[5],
             "card_views": value["card_views"],
             "card_viewers": len(value["visit_ids"]),
         }
