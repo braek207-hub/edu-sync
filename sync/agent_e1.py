@@ -2686,8 +2686,6 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
                           "reason": stored_config["unavailable"]},
                          ensure_ascii=False, indent=2))
         if not dry_run:
-            # Боевая запись без прочитанного слова человека — fail-closed на
-            # выключателе. Репетиция на дефолтах допустима: она ничего не пишет.
             return 1
     active_config = agent_config.resolve(stored_config["preset"],
                                          stored_config["overrides"])
