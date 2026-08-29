@@ -61,6 +61,7 @@ import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sync.agent import build_order
+from sync.agent import ladder as ladder_mod
 from sync.agent import power as power_mod
 from sync.agent.db import CRM_MATURITY_WINDOW_DAYS
 from sync.agent.experiments import HORIZON_DAYS as STAKE_HORIZON_DAYS
@@ -89,13 +90,9 @@ REASON_NOT_MINUSABLE = (
     "тест, а гарантированное удорожание: две наши кампании торгуются друг с "
     "другом на одном аукционе")
 REASON_NO_LAMBDA = "порог кабинета λ не посчитан — сравнивать окупаемость не с чем"
-REASON_NO_ROMI = "окупаемость связки не посчитана"
 REASON_THIN_MARGIN = (
     f"окупаемость выше λ, но без запаса ×{GROWTH_LAMBDA_MARGIN}: связка «ровно "
     "на пороге» не окупит отдельной кампании")
-REASON_NO_PAYMENTS = (
-    "у связки нет ожидаемых оплат (p_pay): порог значимости power.py считает "
-    "именно их, и подменить их конверсиями значило бы мерить другое")
 REASON_NO_COST = "у связки нет расхода: стартовый бюджет новой кампании не от чего отмерить"
 
 GROUP_REASON_THIN_POWER = (
@@ -104,6 +101,15 @@ GROUP_REASON_THIN_POWER = (
 GROUP_REASON_NO_CPA = (
     "у доноров не посчитана цена конверсии: критерий успеха не от чего "
     "отмерить — новая кампания обязана побить именно донорскую цену")
+GROUP_REASON_NO_PAYMENTS = (
+    "у выноса нет ожидаемых оплат (p_pay): порог значимости power.py считает "
+    "именно их, и подменить их конверсиями значило бы мерить другое")
+GROUP_REASON_THIN_MARGIN = (
+    f"окупаемость выноса выше λ, но без запаса ×{GROWTH_LAMBDA_MARGIN}: "
+    "кампания «ровно на пороге» не окупит переезда")
+GROUP_REASON_NO_REVENUE = (
+    "ожидаемые оплаты выноса не во что перевести: у доноров не посчитан "
+    "средний чек, и окупаемость кампании осталась бы дробью без числителя")
 
 
 def _number(value: Any) -> Optional[float]:
@@ -155,32 +161,59 @@ def _one(row: Dict[str, Any], ctx: Dict[str, Any],
     lam = _number(ctx.get("lambda"))
     if lam is None or lam <= 0:
         return None, _skip(row, REASON_NO_LAMBDA)
+    # Окупаемость связки ТРЁХЗНАЧНА, и это главное отличие от прежней версии.
+    # Посчитана и ниже порога — отказ здесь: связка, которая не окупается,
+    # не окупится и в новой кампании. НЕ посчитана — не отказ: лестница
+    # отказалась судить связку «кампания × фраза», а не признала её плохой.
+    #
+    # Замер 28.08 показал, во что превращался прежний отказ по непосчитанной
+    # окупаемости: 15 доноров из 17 отпадали на нём, до группировки не доживал
+    # ни один, и отчёт прогона не мог сказать, молчит генератор или сломан.
+    # Причина механическая: порог лестницы — 25 событий за окно, а связку
+    # «кампания × фраза» он проходит у 61 строки из 37 318 (0,16 %), потому
+    # что фраза столько кликов в одиночку не набирает. Экономика фразы при
+    # этом УЖЕ проверена выше по конвейеру: в доноры попадают только кандидаты
+    # расширения (objects.expansion_candidates) — с конверсиями и с ценой не
+    # выше медианного CPA кабинета. Второй, непроходимый экономический гейт
+    # рядом с проходимым был не строгостью, а выключателем.
+    #
+    # Поэтому вердикт об окупаемости переезжает на ГРУППУ (_group): кампания
+    # создаётся под направление целиком, события её доноров складываются, и
+    # порог применяется там, где статистика существует.
     romi = _number(row.get("romi"))
-    if romi is None:
-        return None, _skip(row, REASON_NO_ROMI)
-    if romi < lam * GROWTH_LAMBDA_MARGIN:
+    if romi is not None and romi < lam * GROWTH_LAMBDA_MARGIN:
         return None, _skip(row, REASON_THIN_MARGIN)
 
-    payments = _number(row.get("p_pay_sum"))
-    if payments is None or payments <= 0:
-        return None, _skip(row, REASON_NO_PAYMENTS)
     cost = _number(row.get("cost_rub"))
     if cost is None or cost <= 0:
         return None, _skip(row, REASON_NO_COST)
 
-    return {
+    donor = {
         "phrase": phrase,
         "donor_campaign_id": campaign_id,
         "direction": direction,
         "cost_rub": round(cost, 2),
         "conversions": _number(row.get("conversions")) or 0.0,
-        "p_pay_sum": round(payments, 4),
         "window_days": _number(row.get("window_days")),
+        "romi": romi,
+        # Чем лестница объяснила отказ судить связку. Нужна не здесь, а в
+        # отказе ГРУППЫ: если объёма не набралось и вместе, человек обязан
+        # прочитать причину лестницы, а не догадку генератора.
+        "romi_reason": _text(row.get("romi_reason")) or None,
+        # События и входы лестницы кампании-донора: из них группа считает свой
+        # объём, когда сама связка его не набрала (bundles.query_donors).
+        "counts": row.get("counts") or {},
+        "pools": row.get("pools") or (),
+        "avg_check": _number(row.get("avg_check")),
         # Настройки донора едут с ним: счётчик и цель новой кампании берутся
         # у них, а не из панели (launch.campaign_from_donors). Их отсутствие
         # не отбраковывает связку — оно оставляет идею предложением.
         "settings": row.get("settings"),
-    }, None
+    }
+    payments = _number(row.get("p_pay_sum"))
+    if payments is not None:
+        donor["p_pay_sum"] = round(payments, 4)
+    return donor, None
 
 
 def _cannibalization(donors: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -207,17 +240,87 @@ def _cannibalization(donors: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _economics(donors: List[Dict[str, Any]],
+               ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """Доноры направления → (ожидаемые оплаты, выручка, причина отказа).
+
+    Считается в два приёма, и это не оптимизация, а разная природа слагаемых.
+    Связка, которой лестница вердикт ДАЛА, приносит своё число как есть:
+    пересчитывать его здесь значило бы завести второго судью рядом с
+    лестницей. Связка, которой не дала, вносит не ноль и не догадку, а СВОИ
+    СОБЫТИЯ — они складываются с событиями таких же связок ЕЁ КАМПАНИИ, и
+    лестница спрашивается один раз про сумму.
+
+    Складывать по кампании, а не по направлению целиком, обязательно:
+    коэффициенты перехода и средний чек лестница берёт у кампании, и общий
+    прогон по направлению применил бы к событиям одной кампании воронку
+    другой. Направление же остаётся адресом кампании, а не единицей расчёта.
+
+    Ноль оплат в ответе законен и означает «объёма нет»; None означает
+    «посчитать нечем» — и это разные новости, поэтому третьим значением едет
+    причина, а не пустая сумма.
+    """
+    payments = 0.0
+    revenue = 0.0
+    unresolved: Dict[str, List[Dict[str, Any]]] = {}
+    for donor in donors:
+        own = _number(donor.get("p_pay_sum"))
+        if own is None:
+            unresolved.setdefault(donor["donor_campaign_id"], []).append(donor)
+            continue
+        payments += own
+        romi = _number(donor.get("romi"))
+        if romi is None:
+            return None, None, (donor.get("romi_reason")
+                                or GROUP_REASON_NO_REVENUE)
+        revenue += romi * donor["cost_rub"]
+
+    for campaign_id in sorted(unresolved):
+        rows = unresolved[campaign_id]
+        counts: Dict[str, float] = {}
+        for donor in rows:
+            for step, value in (donor.get("counts") or {}).items():
+                counts[step] = counts.get(step, 0.0) + (_number(value) or 0.0)
+        if not any(counts.values()):
+            # Ни оплат, ни событий: складывать нечего. Не «мало» — нечем.
+            return None, None, GROUP_REASON_NO_PAYMENTS
+        result = ladder_mod.ladder(counts, rows[0].get("pools") or (),
+                                   avg_check=rows[0].get("avg_check"))
+        got = _number(result.get("expected_payments"))
+        if got is None:
+            return None, None, (_text(result.get("reason"))
+                                or ladder_mod.NO_STEP_REASON)
+        payments += got
+        earned = _number(result.get("expected_revenue"))
+        if earned is None:
+            return None, None, (rows[0].get("romi_reason")
+                                or GROUP_REASON_NO_REVENUE)
+        revenue += earned
+    return payments, revenue, None
+
+
 def _group(direction: str, donors: List[Dict[str, Any]], ctx: Dict[str, Any],
            ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Доноры одного направления → (идея выноса, отбраковка группы)."""
     account = _text(ctx.get("account"))
     windows = [d["window_days"] for d in donors if d["window_days"]]
     window = max(windows) if windows else None
-    payments = sum(d["p_pay_sum"] for d in donors)
     cost = sum(d["cost_rub"] for d in donors)
     conversions = sum(d["conversions"] for d in donors)
 
-    if not window or window <= 0 or payments <= 0:
+    payments, revenue, refusal = _economics(donors)
+    if refusal is not None:
+        return None, {"direction": direction, "reason": refusal}
+
+    # Порог окупаемости — тот же, что был у связки, и применён к тому объекту,
+    # который на самом деле создаётся: к кампании направления целиком.
+    lam = _number(ctx.get("lambda"))
+    if lam is not None and lam > 0 and cost > 0 and revenue is not None:
+        if revenue / cost < lam * GROWTH_LAMBDA_MARGIN:
+            return None, {"direction": direction,
+                          "reason": GROUP_REASON_THIN_MARGIN}
+
+    if not window or window <= 0 or not payments or payments <= 0:
         return None, {"direction": direction, "reason": GROUP_REASON_THIN_POWER}
 
     # Сколько дней при нынешнем темпе доноров копится порог значимости. Темп
@@ -270,7 +373,11 @@ def _group(direction: str, donors: List[Dict[str, Any]], ctx: Dict[str, Any],
                  "donor_campaign_id": d["donor_campaign_id"],
                  "cost_rub": d["cost_rub"],
                  "conversions": d["conversions"],
-                 "p_pay_sum": d["p_pay_sum"]}
+                 # Ожидаемые оплаты фразы — ТОЛЬКО когда лестница их дала.
+                 # Ноль вместо «неизвестно» читался бы на экране как «фраза
+                 # не приносит оплат», хотя лестница отказалась судить её по
+                 # объёму, а не признала пустой.
+                 "p_pay_sum": d.get("p_pay_sum")}
                 for d in sorted(donors, key=lambda d: (-d["cost_rub"],
                                                        d["phrase"]))
             ],

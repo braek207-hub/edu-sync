@@ -87,6 +87,19 @@ REASON_UNKNOWN_CAMPAIGN = (
 REASON_NO_SEGMENT_KEY = "у строки среза пустой ключ сегмента"
 REASON_NO_PHRASE = "строка отчёта запросов без самого запроса"
 
+# Почему у связки не посчиталась окупаемость. Раньше обе причины сливались в
+# одну строку генератора («окупаемость связки не посчитана»), и разбор прогона
+# 28.08 упёрся ровно в это: 15 доноров выноса из 17 отпали с этой формулировкой,
+# а из отчёта нельзя было понять, чего не хватило — событий у самой связки или
+# среднего чека у её направления. Лечится это разным: первое — объёмом (или
+# группировкой связок), второе — оплатами в CRM.
+REASON_NO_AVG_CHECK = (
+    "у кампании связки не посчитан средний чек: ожидаемые оплаты не во что "
+    "перевести, и окупаемость осталась бы дробью без числителя")
+REASON_NO_COST_FOR_ROMI = (
+    "у связки нулевой расход за окно: делить выручку не на что, и окупаемость "
+    "была бы бесконечностью, а не числом")
+
 
 def _number(value: Any) -> Optional[float]:
     try:
@@ -221,19 +234,34 @@ def campaign_index(
     return index
 
 
-def _revenue(counts: Dict[str, Any], entry: Dict[str, Any]) -> Optional[float]:
-    """Ожидаемая выручка набора событий по лестнице кампании.
+def _expected(counts: Dict[str, Any], entry: Dict[str, Any],
+              ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """События связки → (ожидаемые оплаты, выручка, причина отказа).
 
     Пулы и средний чек берутся у кампании: связка живёт внутри неё, и своих
     коэффициентов перехода у неё быть не может — событий на них не набралось
     бы никогда.
+
+    Причина возвращается ТРЕТЬИМ значением, а не остаётся у вызывающего:
+    лестница знает, чего именно не хватило (ступени, коэффициента перехода),
+    а генератор — нет, и его собственная формулировка была бы догадкой о
+    чужом отказе. Проверено на прогоне 28.08: генератор писал «окупаемость не
+    посчитана» 363 раза у proven и 15 из 17 у consolidate, и обе цифры
+    молчали о том, лечится ли это объёмом или оплатами в CRM.
     """
-    avg_check = entry.get("avg_check")
-    if avg_check is None:
-        return None
     result = ladder_mod.ladder(counts, entry.get("pools") or (),
-                              avg_check=avg_check)
-    return _number(result.get("expected_revenue"))
+                               avg_check=entry.get("avg_check"))
+    payments = _number(result.get("expected_payments"))
+    if payments is None:
+        return None, None, _text(result.get("reason")) or ladder_mod.NO_STEP_REASON
+    if entry.get("avg_check") is None:
+        return payments, None, REASON_NO_AVG_CHECK
+    return payments, _number(result.get("expected_revenue")), None
+
+
+def _revenue(counts: Dict[str, Any], entry: Dict[str, Any]) -> Optional[float]:
+    """Только выручка — форма для мест, где причина отказа уже названа выше."""
+    return _expected(counts, entry)[1]
 
 
 # ------------------------------------------------ связки сегментов (proven)
@@ -301,9 +329,14 @@ def segment_bundles(
         if counts["leads"] > 0:
             bundle["cpa_rub"] = counts["cost"] / counts["leads"]
 
-        revenue = _revenue(bundle["counts"], entry)
+        _payments, revenue, why = _expected(bundle["counts"], entry)
         if revenue is not None and counts["cost"] > 0:
             bundle["romi"] = revenue / counts["cost"]
+        else:
+            # Причина едет со связкой, а не теряется здесь: генератор отбивает
+            # связку без окупаемости, и в отчёт обязана попасть та причина,
+            # которую назвала лестница, а не общая формулировка генератора.
+            bundle["romi_reason"] = why or REASON_NO_COST_FOR_ROMI
         base_revenue = _revenue(
             {"clicks": base["clicks"], "leads": base["leads"]}, entry)
         if base_revenue is not None and base["cost"] > 0:
@@ -384,14 +417,24 @@ def query_donors(
             # предложением человеку.
             "settings": entry.get("settings"),
         }
-        result = ladder_mod.ladder(counts, entry.get("pools") or (),
-                                   avg_check=entry.get("avg_check"))
-        payments = _number(result.get("expected_payments"))
+        # События связки и входы лестницы её кампании едут ВМЕСТЕ со строкой.
+        # Не «на всякий случай»: связка «кампания × фраза» почти никогда не
+        # набирает 25 событий сама (замер 28.08 — 61 строка из 37 318, 0,16 %),
+        # и единственное место, где события накапливаются до вердикта, — группа
+        # одного направления. Собирает её генератор (ideas/consolidate), и без
+        # этих полей ему пришлось бы либо ходить в такт за пулами второй
+        # дорогой, либо судить о выносе по числам, которых лестница не дала.
+        donor["counts"] = dict(counts)
+        donor["pools"] = entry.get("pools") or ()
+        donor["avg_check"] = entry.get("avg_check")
+
+        payments, revenue, why = _expected(counts, entry)
         if payments is not None:
             donor["p_pay_sum"] = payments
-        revenue = _number(result.get("expected_revenue"))
         if revenue is not None and cost > 0:
             donor["romi"] = revenue / cost
+        else:
+            donor["romi_reason"] = why or REASON_NO_COST_FOR_ROMI
         rows.append(donor)
     return {"rows": rows, "skipped": skipped}
 

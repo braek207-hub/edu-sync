@@ -336,6 +336,43 @@ def test_query_row_without_a_phrase_is_refused_with_a_reason():
     assert result["skipped"][0]["reason"] == bundles.REASON_NO_PHRASE
 
 
+def test_donor_carries_the_ladder_inputs_of_its_campaign():
+    # Связка «кампания × фраза» почти никогда не набирает 25 событий сама, и
+    # объём накапливается только в группе направления (ideas/consolidate).
+    # Не отдай ей события и входы лестницы — судить группе будет нечем.
+    donor = _donors([_query(clicks=3_000.0, conversions=60.0)])["rows"][0]
+
+    assert donor["counts"] == {"clicks": 3_000.0, "leads": 60.0}
+    assert donor["pools"] and donor["avg_check"] == 60_000.0
+
+
+def test_donor_without_a_ladder_verdict_names_the_ladder_reason():
+    # «Окупаемость не посчитана» — не причина, а её отсутствие: под этой
+    # строкой одинаково прячутся «ступень не набрала событий», «переход не
+    # оценить» и «нет среднего чека». Разбираться по ней приходилось в коде.
+    donor = _donors([_query(clicks=10.0, conversions=2.0)])["rows"][0]
+
+    assert "p_pay_sum" not in donor
+    assert donor["romi_reason"] == ladder_mod.NO_STEP_REASON
+
+
+def test_donor_without_spend_names_the_missing_denominator():
+    # Оплаты посчитаны, а делить выручку не на что: окупаемость была бы
+    # бесконечностью, а не числом.
+    donor = _donors([_query(cost=0.0)])["rows"][0]
+
+    assert donor["p_pay_sum"] > 0
+    assert donor["romi_reason"] == bundles.REASON_NO_COST_FOR_ROMI
+
+
+def test_donor_without_an_average_check_names_the_missing_numerator():
+    ladder = _ladder(avg_check={})
+    donor = _donors([_query()], index=_index(ladder=ladder))["rows"][0]
+
+    assert donor["p_pay_sum"] > 0
+    assert donor["romi_reason"] == bundles.REASON_NO_AVG_CHECK
+
+
 # ============================================== кампании тестов (abtest)
 
 

@@ -299,7 +299,12 @@ def _one(bundle: Dict[str, Any], ctx: Dict[str, Any],
         return None, _skip(bundle, REASON_NO_LAMBDA)
     romi = _number(bundle.get("romi"))
     if romi is None:
-        return None, _skip(bundle, REASON_NO_ROMI)
+        # Причину называет лестница (bundles._expected), а не генератор:
+        # «ступени не набралось» и «нет среднего чека направления» лечатся
+        # разным — объёмом и оплатами в CRM, — а прежняя общая формулировка
+        # уводила разбор прогона в археологию по коду (28.08: 363 связки).
+        return None, _skip(bundle, _text(bundle.get("romi_reason"))
+                           or REASON_NO_ROMI)
     if romi < lam * GROWTH_LAMBDA_MARGIN:
         return None, _skip(bundle, REASON_THIN_MARGIN)
 

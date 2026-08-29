@@ -24,7 +24,7 @@ import json as _json
 
 import sync.agent_e0 as agent_e0
 import sync.agent_e1 as agent_e1
-from sync.agent import rejects
+from sync.agent import demand as demand_mod, rejects
 from sync.agent.ideas import registry
 from sync.agent.writer import lanes, tier
 
@@ -778,3 +778,119 @@ def test_master_cards_of_another_account_do_not_leak(store):
 
     assert summary["by_source"]["master_campaign"]["ideas"] == 0
     assert _rows_of(store, "master_campaign") == []
+
+# ------------------------------- спрос без адресата (диагностика 28.08)
+
+
+def test_rising_demand_nobody_serves_is_named_in_the_report(store):
+    # Поводы спроса раздаются кабинету только по ЕГО живым направлениям, и
+    # отбор идёт ДО генератора. Это был единственный отсев во всём такте,
+    # который не оставлял в отчёте ничего. Замер 28.08: единственное растущее
+    # направление (dpo, σ=2.26) живо не было ни в одном из пяти кабинетов —
+    # генератор рынка честно отдал ноль, а прочитать это было неоткуда.
+    summary = _collect(demand={"dpo": {"regime": demand_mod.REGIME_RISE}})
+
+    reasons = summary["by_source"]["market"]["skipped_by_reason"]
+    assert reasons[agent_e0.DEMAND_RISING_UNADDRESSED] == 1
+
+
+def test_quiet_demand_nobody_serves_is_counted_apart_from_rising(store):
+    # Направление без кампаний и без подъёма — не новость, а фон. Слей их в
+    # один счётчик — и растущее направление утонуло бы в десятке спокойных.
+    summary = _collect(demand={"dpo": {"regime": demand_mod.REGIME_RISE},
+                               "mba": {"regime": demand_mod.REGIME_NORMAL}})
+
+    reasons = summary["by_source"]["market"]["skipped_by_reason"]
+    assert reasons[agent_e0.DEMAND_RISING_UNADDRESSED] == 1
+    assert reasons[agent_e0.DEMAND_UNADDRESSED] == 1
+
+
+def test_a_direction_with_live_campaigns_is_not_counted_as_unaddressed(store):
+    # Оно доехало до генератора, и его вердикт — уже его дело. Посчитай его и
+    # здесь — отчёт врал бы про охват вдвое.
+    summary = _collect(demand={"vuz": {"regime": demand_mod.REGIME_RISE}})
+
+    reasons = summary["by_source"].get("market", {}).get("skipped_by_reason", {})
+    assert agent_e0.DEMAND_RISING_UNADDRESSED not in reasons
+
+
+# ---------------------------------- наряд доезжает до очереди билдера (B3)
+
+
+def _text_campaign(goal=360_811_375, counter=98_627_983):
+    """Настройки донора, из которых новая кампания берёт счётчик и цель."""
+    return {"bidModifiers": {"total": 0, "items": []},
+            "TextCampaign": {"CounterIds": {"Items": [counter]},
+                             "BiddingStrategy": {"Search": {"AverageCpa": {
+                                 "GoalId": goal,
+                                 "AverageCpa": 1_600_000_000}}}}}
+
+
+def _with_launch(**over):
+    """Такт, в котором вынос собирается в наряд билдеру.
+
+    Два донора одного направления с прочитанными настройками — минимум, при
+    котором идея выноса перестаёт быть предложением и несёт наряд.
+    """
+    kwargs = {
+        "facts": _run_facts((("111", "vuz"), ("222", "vuz"))),
+        "ladder_section": _ladder_section(campaigns=("111", "222")),
+        "portfolio_section": _portfolio_section({"acc-1": {"111": "vuz",
+                                                           "222": "vuz"}}),
+        "sliced_rows": [],
+        "query_rows": [
+            {"query": "колледж заочно", "campaign_id": "111",
+             "clicks": 4_000.0, "conversions": 200.0, "cost": 90_000.0},
+            {"query": "поступить в колледж", "campaign_id": "222",
+             "clicks": 4_000.0, "conversions": 200.0, "cost": 90_000.0}],
+        "expansion": [{"query": "колледж заочно"},
+                      {"query": "поступить в колледж"}],
+        "settings_by_campaign": {"111": _text_campaign(),
+                                 "222": _text_campaign()},
+        "login_by_campaign": {"111": "acc-1", "222": "acc-1"},
+        "direction_by_campaign": {"111": "vuz", "222": "vuz"},
+    }
+    kwargs.update(over)
+    return _collect(**kwargs)
+
+
+def test_a_launch_order_reaches_the_builders_queue(store, monkeypatch):
+    # Наряд, оставшийся в колонке action, — предложение на экране, а не цикл:
+    # билдер читает очередь, а не реестр идей, и без постановки вынос не
+    # уезжает никуда.
+    sent = []
+    monkeypatch.setattr(agent_e0.build_queue, "enqueue", sent.append)
+
+    summary = _with_launch()
+
+    assert summary["by_source"]["consolidate"]["queued"] == 1
+    assert sent and sent[0]["kind"] and sent[0]["donor_negatives"]
+
+
+def test_an_order_the_builder_already_took_is_counted_not_rewritten(
+        store, monkeypatch):
+    # Тело взятого наряда заморожено: переписать его значило бы собирать
+    # движущуюся цель. Отказ обязан быть виден числом — иначе «наряд не
+    # обновился» и «наряда не было» выглядят одинаково.
+    def frozen(order):
+        raise agent_e0.build_queue.OrderFrozen("взят билдером")
+
+    monkeypatch.setattr(agent_e0.build_queue, "enqueue", frozen)
+    summary = _with_launch()
+
+    slot = summary["by_source"]["consolidate"]
+    assert slot["queued"] == 0
+    assert slot["skipped_by_reason"][agent_e0.ORDER_FROZEN_REASON] == 1
+
+
+def test_an_unavailable_queue_does_not_kill_the_run(store, monkeypatch):
+    # Расчётный такт считает деньги. Падать из-за недоступной очереди
+    # билдера ему нельзя — отказ становится строкой отчёта.
+    def broken(order):
+        raise RuntimeError("очередь недоступна")
+
+    monkeypatch.setattr(agent_e0.build_queue, "enqueue", broken)
+    summary = _with_launch()
+
+    assert summary["by_source"]["consolidate"]["upserted"] == 1
+    assert "consolidate:queue" in summary["failed"]

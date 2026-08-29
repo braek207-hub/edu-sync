@@ -406,6 +406,68 @@ AGENT_DDL: List[str] = [
       ON edu_agent_ideas (subject_key)
       WHERE rejected_by IS NOT NULL
     """,
+    # Очередь нарядов билдеру (sync/agent/build_queue.py,
+    # docs/BUILD-ORDER-QUEUE.md). Единственная таблица агента, которую читает
+    # ЧУЖОЙ репозиторий: тело кампании собирает «EDU кампании», и
+    # campaign.create из edu-sync невыразим в принципе.
+    #
+    #   order_id      — ключ. БЕЗ ДАТЫ (build_order.make_order_id): у реестра
+    #                   ровно одна открытая идея на (кабинет, вид,
+    #                   направление), и дата в ключе заводила бы новую
+    #                   кампанию каждым прогоном генератора, оставляя прежнюю
+    #                   тратить.
+    #   order_json    — ПРОВЕРЕННОЕ тело наряда. Билдер собирает ровно то, что
+    #                   прошло build_order.validate: разъедься эти два текста,
+    #                   проверка была бы о другом наряде.
+    #   status        — queued → taken → built | failed, плюс cancelled.
+    #                   Тело обновляется только в queued: собирать движущуюся
+    #                   цель нельзя.
+    #   campaign_id   — адрес созданного объекта. До ответа билдера его не
+    #                   существует: Id появляется только после campaigns.add,
+    #                   и без него агенту нечего ни наблюдать, ни откатывать.
+    #   started_on    — день ПЕРВОЙ ОТКРУТКИ, не создания. Кампания создаётся
+    #                   на паузе, между созданием и включением стоит человек,
+    #                   и окно наблюдения от дня создания съело бы горизонт
+    #                   днями простоя. NULL законен и означает «ещё не
+    #                   включена».
+    #   experiment_id — наблюдение в edu_agent_experiments. Заводится только
+    #                   вместе с датой старта: строка реестра без дня открутки
+    #                   обещала бы вердикт по пустому окну.
+    """
+    CREATE TABLE IF NOT EXISTS edu_agent_build_orders (
+      order_id      TEXT PRIMARY KEY,
+      idea_id       TEXT,
+      account       TEXT NOT NULL,
+      kind          TEXT NOT NULL,
+      level_slug    TEXT NOT NULL,
+      campaign_name TEXT NOT NULL,
+      direction     TEXT,
+      status        TEXT NOT NULL DEFAULT 'queued',
+      status_reason TEXT,
+      order_json    JSONB NOT NULL,
+      campaign_id   TEXT,
+      started_on    DATE,
+      experiment_id TEXT,
+      queued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    # Открытые наряды читает КАЖДЫЙ прогон билдера, а закрытые копятся без
+    # предела: частичный индекс держит выборку размером с очередь, а не с
+    # историей. Тот же довод, что у индекса открытых ставок.
+    """
+    CREATE INDEX IF NOT EXISTS edu_agent_build_orders_open_idx
+      ON edu_agent_build_orders (status)
+      WHERE status IN ('queued', 'taken')
+    """,
+    # Две кампании на один наряд — двойной расход и общий аукцион. Id
+    # приходит только с ответом билдера, поэтому индекс частичный: у
+    # неотвеченных нарядов колонка пуста, и уникальность их не касается.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS edu_agent_build_orders_campaign_idx
+      ON edu_agent_build_orders (campaign_id)
+      WHERE campaign_id IS NOT NULL
+    """,
 ]
 
 

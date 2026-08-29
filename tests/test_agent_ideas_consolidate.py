@@ -390,3 +390,104 @@ def test_success_rule_beats_the_donors_own_price():
     donor_cpa = (30_000.0 + 30_000.0) / (30.0 + 30.0)
     assert idea["success_rule"]["value"] == pytest.approx(donor_cpa)
     assert idea["success_rule"]["comparison"] == "vs_donors"
+
+
+# ------------------------------- окупаемость: связка молчит, группа судит
+
+
+# Пул направления: коэффициенты перехода, которыми лестница пересчитывает
+# клики в оплаты. Числители у всех пар выше MIN_RATE_EVENTS — иначе отказ
+# пришёл бы из-за слабого пула, а не из-за проверяемого условия.
+POOL = ("direction:spo", {"clicks": 100_000, "leads": 5_000, "eff": 2_000,
+                          "connected": 1_200, "deals": 400, "paid": 200})
+AVG_CHECK = 40_000.0
+
+
+def _mute(phrase="колледж заочно", campaign="111", clicks=4_000, **over):
+    """Связка, которой ЛЕСТНИЦА вердикт не дала: p_pay_sum и romi пусты.
+
+    Так выглядит подавляющее большинство связок в проде: порог лестницы —
+    25 событий за окно, а «кампания × фраза» столько кликов в одиночку не
+    набирает (замер 28.08: 61 строка из 37 318). Свои события при этом у
+    связки есть, и группа обязана считать по ним.
+    """
+    row = _q(phrase=phrase, campaign=campaign, **over)
+    row.update({"p_pay_sum": None, "romi": None,
+                "counts": {"clicks": clicks}, "pools": (POOL,),
+                "avg_check": AVG_CHECK})
+    return row
+
+
+def _mute_pair():
+    return [_mute(phrase="колледж заочно", campaign="111"),
+            _mute(phrase="поступить в колледж", campaign="222")]
+
+
+def test_query_the_ladder_refused_to_judge_is_not_dropped():
+    # Прежняя версия отвергала такую связку по «окупаемость не посчитана», и
+    # до группировки не доживал ни один донор из семнадцати. Отказ лестницы
+    # судить связку — не приговор связке: он про объём события, а не про её
+    # качество.
+    result = consolidate.scan(_mute_pair(), _ctx())
+    assert result["ideas"], result["skipped"]
+
+
+def test_group_economics_sums_events_of_the_donor_campaign():
+    # Клики двух связок ОДНОЙ кампании складываются и один раз проходят
+    # лестницу: коэффициенты перехода и средний чек — свойство кампании, и
+    # прогонять по ним чужие события нельзя.
+    payments, revenue, refusal = consolidate._economics(
+        [consolidate._one(row, _ctx())[0]
+         for row in (_mute(clicks=1_500), _mute(phrase="колледж после 9",
+                                                clicks=2_500))])
+    alone = consolidate._economics(
+        [consolidate._one(_mute(clicks=4_000), _ctx())[0]])
+
+    assert refusal is None
+    assert payments == pytest.approx(alone[0])
+    assert revenue == pytest.approx(alone[1])
+
+
+def test_group_without_events_at_all_is_refused_with_a_named_reason():
+    # Ноль событий — это «складывать нечего», а не «мало»: подставить сюда
+    # ноль оплат значило бы отправить вынос на проверку объёма с выдумкой.
+    rows = [_mute(phrase="колледж заочно", campaign="111", clicks=0),
+            _mute(phrase="поступить в колледж", campaign="222", clicks=0)]
+    result = consolidate.scan(rows, _ctx())
+
+    assert result["ideas"] == []
+    assert any(row["reason"] == consolidate.GROUP_REASON_NO_PAYMENTS
+               for row in result["skipped"])
+
+
+def test_group_margin_is_judged_on_the_campaign_that_gets_created():
+    # Порог ×GROWTH_LAMBDA_MARGIN никуда не делся — он применён к выносу
+    # целиком, а не к отдельной связке, у которой статистики на вердикт нет.
+    ctx = _ctx(**{"lambda": 100.0})
+    result = consolidate.scan(_mute_pair(), ctx)
+
+    assert result["ideas"] == []
+    assert any(row["reason"] == consolidate.GROUP_REASON_THIN_MARGIN
+               for row in result["skipped"])
+
+
+def test_group_without_an_average_check_names_the_missing_numerator():
+    # Средний чек кампании не посчитан → выручку не из чего собрать.
+    # Молчаливый отказ здесь неотличим от «связки плохие».
+    rows = [dict(row, avg_check=None) for row in _mute_pair()]
+    result = consolidate.scan(rows, _ctx())
+
+    assert result["ideas"] == []
+    assert result["skipped"], "отказ группы обязан быть назван"
+
+
+def test_computed_romi_below_the_margin_still_drops_the_query():
+    # Трёхзначность окупаемости не отменяет отказа: посчитанная и низкая
+    # окупаемость — приговор связке, она не станет лучше в новой кампании.
+    rows = [dict(row, romi=LAMBDA * 1.01, p_pay_sum=12.0)
+            for row in _mute_pair()]
+    result = consolidate.scan(rows, _ctx())
+
+    assert result["ideas"] == []
+    assert all(row["reason"] == consolidate.REASON_THIN_MARGIN
+               for row in result["skipped"])

@@ -26,7 +26,7 @@ from sync.agent.computed import compute_schedule, compute_segment_modifiers
 from sync.agent.confidence import thresholds_from_config
 from sync.agent.coverage import blind_spend
 from sync.agent.demand import REGION as DEMAND_REGION
-from sync.agent.demand import demand_regime, directions_without_series
+from sync.agent.demand import REGIME_RISE, demand_regime, directions_without_series
 from sync.agent.facts import assemble_facts
 from sync.agent.guard import (
     check_continuity,
@@ -75,7 +75,9 @@ from sync.agent.ideas import market as ideas_market
 from sync.agent.ideas import master as ideas_master
 from sync.agent.ideas import proven as ideas_proven
 from sync.agent.ideas import registry as ideas_registry
+from sync.agent import build_queue
 from sync.agent.writer import db as writer_db
+from sync.agent.writer import launch as launch_mod
 from sync.agent.writer import tier as tier_mod
 from sync.agent.writer.negatives import computed_rows as negative_computed_rows
 from sync.agent.writer.placements import computed_rows as placement_computed_rows
@@ -128,6 +130,27 @@ SLICE_WINDOW_DAYS = 90
 # Кандидаты в минус-слова считаются по свежим данным, глубокая история не нужна.
 QUERY_WINDOW_DAYS = CANDIDATE_WINDOW_DAYS
 PROFILE_FEATURES = ["groups_count", "phrases_per_group", "title2_fill_share"]
+
+# Отказы раздачи поводов спроса. Спрос Wordstat общий — он не знает про
+# кабинеты, — а повод адресуется кабинету только по ЕГО живым направлениям.
+# Отдельная формулировка для растущего направления не косметика: это
+# единственный случай, когда молчание генератора рынка означает не «рынок
+# спокоен», а «есть куда идти, и идти некому», и лечится он решением
+# человека, а не данными.
+DEMAND_RISING_UNADDRESSED = (
+    "спрос направления на подъёме, но живых кампаний у него нет ни в одном "
+    "кабинете: повод адресовать некому, и выбор «кому его завести» из данных "
+    "не выводится — это решение человека")
+DEMAND_UNADDRESSED = (
+    "направление не живо ни в одном кабинете: поводов спроса раздавать "
+    "некому")
+
+# Наряд уже взят билдером, и обновлять его тело нельзя. Не отказ генератора и
+# не ошибка прогона — состояние обмена, которое обязано быть видно: без него
+# генератор выглядел бы молчащим ровно тогда, когда его находка в работе.
+ORDER_FROZEN_REASON = (
+    "наряд уже взят билдером: тело заморожено до ответа — собирать движущуюся "
+    "цель нельзя")
 # Пороги свежести РАЗНЫЕ, потому что источники разной природы.
 #
 # Расход Директа приезжает своим синком и почти не отстаёт: трое суток без
@@ -514,7 +537,8 @@ def collect_ideas(
     def _run(source: str, ideas: List[Dict[str, Any]],
              skipped: List[Dict[str, Any]]) -> None:
         slot = by_source.setdefault(
-            source, {"ideas": 0, "upserted": 0, "skipped_by_reason": {}})
+            source, {"ideas": 0, "upserted": 0, "queued": 0,
+                     "skipped_by_reason": {}})
         slot["ideas"] += len(ideas)
         for row in skipped:
             reason = str(row.get("reason") or "")
@@ -526,6 +550,39 @@ def collect_ideas(
             slot["upserted"] += len(ideas_registry.upsert(ideas))
         except Exception as exc:  # noqa: BLE001
             failed[source] = f"{type(exc).__name__}: {exc}"[:300]
+            return
+        _enqueue_orders(source, ideas, slot)
+
+    def _enqueue_orders(source: str, ideas: List[Dict[str, Any]],
+                        slot: Dict[str, Any]) -> None:
+        """Идеи с нарядом → очередь билдеру (build_queue).
+
+        Ставится ПОСЛЕ реестра, а не вместо него: реестр — правда о том, чем
+        агент распорядился, очередь — способ доставки. Уедь наряд без записи
+        в реестре, и вердикт по собранной кампании некуда было бы вернуть:
+        feedback_out ищет идею по order_id.
+
+        Наряд, который билдер уже взял, обновлению не подлежит, и это НЕ
+        ошибка прогона: состав фраз плавает каждым тактом, а собирать
+        движущуюся цель нельзя. Такой случай едет счётчиком причины — иначе
+        генератор выглядел бы молчащим ровно тогда, когда его находка уже в
+        работе.
+        """
+        for idea in ideas:
+            action = idea.get("action") or {}
+            if action.get("action_kind") != launch_mod.LAUNCH_KIND:
+                continue
+            order = (action.get("payload") or {}).get("order")
+            if not order:
+                continue
+            try:
+                build_queue.enqueue(order)
+                slot["queued"] += 1
+            except build_queue.OrderFrozen:
+                slot["skipped_by_reason"][ORDER_FROZEN_REASON] = (
+                    slot["skipped_by_reason"].get(ORDER_FROZEN_REASON, 0) + 1)
+            except Exception as exc:  # noqa: BLE001
+                failed[f"{source}:queue"] = f"{type(exc).__name__}: {exc}"[:300]
 
     # Исходы своих же ставок за окно свежести: выигрыши питают масштабирование,
     # проигрыши становятся адресным запретом. Реестр недоступен — генераторы
@@ -588,6 +645,29 @@ def collect_ideas(
             [r for r in (master_rows or ()) if str(r.get("account")) == account],
             ctx)
         _run(ideas_master.SOURCE, found["ideas"], found["skipped"])
+
+    # Направление, которого нет живым НИ В ОДНОМ кабинете, до генератора рынка
+    # не доезжает: поводы спроса раздаются кабинету только по ЕГО
+    # направлениям, и отбор идёт ЗДЕСЬ, до scan(). Отсев по этому месту был
+    # единственным во всём такте, который не оставлял в отчёте ничего — ни
+    # строки, ни счётчика. Цена молчания измерена 28.08: из десяти
+    # направлений спроса на подъёме было ровно одно (dpo, σ=2.26), живых
+    # кампаний у него нет ни в одном из пяти кабинетов, и генератор рынка
+    # честно отдал ноль идей — а прочитать это было неоткуда: в отчёте стояли
+    # только «не на подъёме» (9) и «нет ряда» (7), и растущее направление не
+    # упоминалось вовсе.
+    addressed: set = set()
+    for own in live_by_account.values():
+        addressed |= own
+    for direction in sorted(set(demand or {}) - addressed):
+        regime = str(((demand or {}).get(direction) or {}).get("regime") or "")
+        reason = (DEMAND_RISING_UNADDRESSED if regime == REGIME_RISE
+                  else DEMAND_UNADDRESSED)
+        slot = by_source.setdefault(
+            ideas_market.SOURCE,
+            {"ideas": 0, "upserted": 0, "skipped_by_reason": {}})
+        slot["skipped_by_reason"][reason] = (
+            slot["skipped_by_reason"].get(reason, 0) + 1)
 
     return {
         "accounts": len(accounts),
