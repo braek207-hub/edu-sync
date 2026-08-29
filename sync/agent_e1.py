@@ -103,7 +103,7 @@ from sync.agent.writer.risk import (
     week_start,
     weekly_limit,
 )
-from sync.agent import blackbox, conflicts, experiments, learning_loop, rejects
+from sync.agent import blackbox, conflicts, experiments, learning_loop, notify, rejects
 from sync.agent.writer.rollback import red_line_for
 from sync.agent.writer.units import api_to_delta
 
@@ -423,11 +423,11 @@ EXHAUSTED_ATTEMPTS_REASON = (
 )
 
 # Предельный возраст расчёта Э0, дни. «Последний расчёт» не значит «свежий»:
-# без верхней границы движок раскатает месячные коэффициенты, посчитанные по
-# аудитории, которой больше нет. Неделя — потому что расчёт сжат к нулю по
-# объёму наблюдений, и недельного дрейфа он ещё не замечает, а месячный уже
-# описывает другой кабинет.
-MAX_COMPUTED_AGE_DAYS = 7
+# расчёт, посчитанный по вчерашней аудитории, описывает вчерашний кабинет.
+# 2 дня, потому что крон GitHub опаздывает на 6–12 ч, и дневной прогон Э0 может
+# выпасть целиком (как 27.08.2026): при прежнем лимите в неделю такой расчёт
+# применился бы молча. 2 дня оставляют одну ночь запаса на запоздалый прогон Э0.
+MAX_COMPUTED_AGE_DAYS = 2
 
 STALE_COMPUTED_REASON = (
     "расчёт Э0 старше {max_days} дн. (calc_date={calc_date}, возраст {age} дн.): "
@@ -2596,6 +2596,19 @@ def refusal(sandbox: bool, dry_run: bool) -> Optional[str]:
     return None
 
 
+def _notify_abort(verdict: str, reason: str, dry_run: bool) -> None:
+    """Уведомление о раннем прерывании такта — до отчёта по кабинетам.
+
+    Пять точек выхода в этом модуле (RUN_LOCKED, RUN_LEASE_LOST,
+    CONFIG_UNAVAILABLE в боевой записи, AUTONOMY_OFF, DATA_GATE_RED)
+    возвращаются раньше NOTIFY в конце _run_all, и без вызова здесь молчат
+    в Telegram — а тишина неотличима от того, что крон не отработал вовсе.
+    """
+    print(json.dumps({"verdict": "NOTIFY",
+                      **notify.send(notify.abort_summary(verdict, reason, dry_run))},
+                     ensure_ascii=False, indent=2))
+
+
 def main() -> int:
     sandbox = "--prod" not in sys.argv
     dry_run = "--apply" not in sys.argv
@@ -2647,6 +2660,7 @@ def main() -> int:
     except writer_db.RunLockBusy as exc:
         print(json.dumps({"verdict": "RUN_LOCKED", "reason": str(exc)},
                          ensure_ascii=False, indent=2))
+        _notify_abort("RUN_LOCKED", str(exc), dry_run)
         return 1
     except writer_db.RunLeaseLost as exc:
         # Аренда потеряна на ходу: с этого момента в кабинет мог начать писать
@@ -2654,6 +2668,7 @@ def main() -> int:
         # кабинета, а условие, при котором писать нельзя вообще.
         print(json.dumps({"verdict": "RUN_LEASE_LOST", "reason": str(exc)},
                          ensure_ascii=False, indent=2))
+        _notify_abort("RUN_LEASE_LOST", str(exc), dry_run)
         return 1
 
 
@@ -2673,23 +2688,31 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     try:
         stored_config = agent_db.load_agent_config()
     except Exception as exc:  # noqa: BLE001
-        # Панель недоступна — работаем как раньше: кодовые дефолты, то есть
-        # полный режим. Отказ базы не должен молча останавливать агента, но
-        # обязан быть виден: иначе «настройки не прочитались» и «настройки
-        # такие» выглядят в отчёте одинаково.
+        # Панель недоступна — боевая запись не должна продолжаться, потому что
+        # выключатель autonomy живёт в панели. Без прочитанного слова человека
+        # писать в кабинет запрещено. Репетиция продолжится на кодовых
+        # дефолтах: она ничего не пишет, поэтому рискованна разве что для
+        # диагностики. Отказ базы не должен молча останавливать репетицию, но
+        # обязан быть виден: иначе «настройки не прочитались» и «настройки такие»
+        # выглядят в отчёте одинаково.
         stored_config = {"preset": None, "overrides": {},
                          "unavailable": f"{type(exc).__name__}: {exc}"[:200]}
         print(json.dumps({"verdict": "CONFIG_UNAVAILABLE",
                           "reason": stored_config["unavailable"]},
                          ensure_ascii=False, indent=2))
+        if not dry_run:
+            _notify_abort("CONFIG_UNAVAILABLE", stored_config["unavailable"], dry_run)
+            return 1
     active_config = agent_config.resolve(stored_config["preset"],
                                          stored_config["overrides"])
     autonomy = str(active_config["autonomy"])
     if autonomy == "off":
+        reason = "в панели настроек autonomy=off — агент не работает"
         print(json.dumps({
             "verdict": "AUTONOMY_OFF",
-            "reason": "в панели настроек autonomy=off — агент не работает",
+            "reason": reason,
         }, ensure_ascii=False, indent=2))
+        _notify_abort("AUTONOMY_OFF", reason, dry_run)
         return 0
     if autonomy == "suggest_only" and not dry_run:
         print(json.dumps({
@@ -2711,6 +2734,7 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         if not dry_run:
             print(json.dumps({"verdict": "DATA_GATE_RED", "data_gate": gate},
                              ensure_ascii=False, indent=2))
+            _notify_abort("DATA_GATE_RED", gate.get("reason"), dry_run)
             return 1
         # Репетиция продолжается — но красный гейт обязан быть виден и в ней:
         # «ноль находок по плохим данным» и «данные в порядке» — разные
@@ -2919,9 +2943,7 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "blind_spend": blind,
     }, ensure_ascii=False, indent=2))
 
-    saved = blackbox.save_run(
-        run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),
-        report={"verdict": run_verdict(account_reports),
+    run_report = {"verdict": run_verdict(account_reports),
                 # Ступени полос — в отчёт ПРОГОНА, а не кабинета: свободу
                 # зарабатывает полоса на всей своей истории, одна на все
                 # кабинеты. Без этой строки экран агента (задача 27) видит
@@ -2930,12 +2952,20 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
                 # потолком, от полосы, стоящей в тени.
                 "lane_steps": ctx["lane_steps"],
                 "accounts": account_reports, "blind_spend": blind,
-                "window": [cutoff, today], "failed_accounts": failed_accounts},
+                "window": [cutoff, today], "failed_accounts": failed_accounts}
+    saved = blackbox.save_run(
+        run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),
+        report=run_report,
         rejects=run_rejects)
     # Итог записи печатается всегда, включая ошибку: молчащий чёрный ящик
     # хуже отсутствующего — он создаёт уверенность, что история пишется.
     print(json.dumps({"verdict": "BLACKBOX", **saved,
                       "rejects_by_reason": rejects.by_reason(run_rejects)},
+                     ensure_ascii=False, indent=2))
+    # Уведомление — ПОСЛЕ save_run: сбой транспорта не должен блокировать
+    # запись в чёрный ящик, только дополнять её. send() по контракту не бросает.
+    print(json.dumps({"verdict": "NOTIFY",
+                      **notify.send(notify.e1_summary(run_report, dry_run))},
                      ensure_ascii=False, indent=2))
 
     if failed_accounts:

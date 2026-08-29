@@ -1621,7 +1621,8 @@ def main() -> int:
     # рычагом не управляются и в расчёт не входят.
     tcpa_section = tcpa_targets(build_tcpa_inputs(
         facts, saturation["campaigns"], campaign_settings,
-        ladder_section["window_from"], ladder_section["window_to"]))
+        ladder_section["window_from"], ladder_section["window_to"]),
+        target_romi=active_config["target_romi"])
     tcpa_count = 0
     for campaign_id, rows in tcpa_computed_rows(tcpa_section).items():
         agent_db.upsert_computed_settings(

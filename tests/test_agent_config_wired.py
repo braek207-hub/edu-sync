@@ -300,9 +300,19 @@ def test_autonomy_off_stops_before_touching_anything(monkeypatch, capsys):
         raise AssertionError("прогон обязан остановиться ДО гейта данных")
 
     monkeypatch.setattr(agent_e1, "data_gate", _must_not_be_called)
+
+    notify_calls = []
+    monkeypatch.setattr(agent_e1.notify, "send",
+                        lambda text: (notify_calls.append(text),
+                                     {"sent": False, "reason": "not_configured"})[1])
+
     assert agent_e1._run_all([{"login": "acc"}], sandbox=False, dry_run=False,
                              today="2026-08-26") == 0
     assert "AUTONOMY_OFF" in capsys.readouterr().out
+    # Молчание раннего выхода в живом такте неотличимо от того, что крон не
+    # отработал вовсе, — уведомление обязано уйти даже когда автономия off.
+    assert len(notify_calls) == 1
+    assert "AUTONOMY_OFF" in notify_calls[0]
 
 
 def test_suggest_only_downgrades_a_live_run_to_a_rehearsal(monkeypatch, capsys):
@@ -344,10 +354,12 @@ def test_panel_cannot_raise_a_rehearsal_to_a_live_write(monkeypatch, capsys):
 
 
 def test_config_unavailable_is_visible_not_silent(monkeypatch, capsys):
-    """Отказ базы не останавливает агента, но обязан быть виден.
+    """Репетиция при недоступности панели продолжается на кодовых дефолтах,
+    отказ базы виден в выводе; боевая запись запрещена (см. тест
+    test_config_unavailable_blocks_live_write).
 
-    Иначе «настройки не прочитались» и «настройки такие» выглядят в отчёте
-    одинаково, и молчащая панель читается как применённая.
+    Иначе молчащая панель читается как применённая, а пользователь не видит
+    различия между ошибкой конфига и успешной загрузкой.
     """
     from sync import agent_e1
 
@@ -358,11 +370,58 @@ def test_config_unavailable_is_visible_not_silent(monkeypatch, capsys):
     monkeypatch.setattr(agent_e1, "data_gate",
                         lambda today: {"status": "RED", "reason": "тест",
                                        "checks": [], "latest_fact_date": None})
-    assert agent_e1._run_all([{"login": "acc"}], sandbox=False, dry_run=False,
-                             today="2026-08-26") == 1
+
+    class _ReachedDataGate(Exception):
+        """Метка: репетиция прошла дальше конфиг-шага и достигла data_gate."""
+
+    def _reached():
+        raise _ReachedDataGate()
+
+    monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", _reached)
+
+    # Репетиция: CONFIG_UNAVAILABLE печатается, run продолжается к data_gate
+    try:
+        agent_e1._run_all([{"login": "acc"}], sandbox=False, dry_run=True,
+                          today="2026-08-26")
+        assert False, "репетиция должна была достичь load_holdout_ids"
+    except _ReachedDataGate:
+        pass  # Ожидаемо: репетиция достигла data_gate и продолжила дальше
+
     out = capsys.readouterr().out
     assert "CONFIG_UNAVAILABLE" in out
     assert "пулер лёг" in out
+    # Репетиция прошла дальше конфиг-шага и достигла data_gate (красный)
+    assert "DATA_GATE_RED" not in out  # репетиция не печатает DATA_GATE_RED
+    assert '"verdict": "DATA_GATE"' in out  # репетиция печатает DATA_GATE (без RED)
+
+
+def test_config_unavailable_blocks_live_write(monkeypatch, capsys):
+    """Выключатель autonomy живёт в панели. Панель не прочиталась —
+    значит слово человека неизвестно, и писать в кабинет нельзя.
+
+    Боевой прогон должен остановиться сразу после CONFIG_UNAVAILABLE,
+    без попытки писать в кабинет. Репетиция продолжится на дефолтах.
+    """
+    from sync import agent_e1
+
+    monkeypatch.setattr(agent_e1.agent_db, "load_agent_config",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    # Гейт не должен вызваться, но подставляем на случай будущих изменений
+    monkeypatch.setattr(agent_e1, "data_gate",
+                        lambda today: {"status": "GREEN", "reason": "тест",
+                                       "checks": [], "latest_fact_date": None})
+
+    notify_calls = []
+    monkeypatch.setattr(agent_e1.notify, "send",
+                        lambda text: (notify_calls.append(text),
+                                     {"sent": False, "reason": "not_configured"})[1])
+
+    rc = agent_e1._run_all(clients=[], sandbox=False, dry_run=False, today="2026-08-30")
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "CONFIG_UNAVAILABLE" in out
+    assert len(notify_calls) == 1
+    assert "CONFIG_UNAVAILABLE" in notify_calls[0]
 
 
 # --- отчёт прогона -------------------------------------------------------

@@ -31,6 +31,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # DIRECT_CLIENTS_JSON намеренно НЕ передаётся: кабинет откатываемого
           # действия берётся из журнала, а не из списка клиентов. Изменение,
           # применённое кабинету, которого в списке больше нет, обязано

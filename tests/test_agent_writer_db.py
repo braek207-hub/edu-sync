@@ -549,8 +549,12 @@ def test_live_stale_planned_finds_only_rows_older_than_threshold():
     fresh = "test-fresh-" + suffix
     account = "test-" + suffix
     try:
-        writer_db.insert_action(_journal_row(stuck, account, object_id="111"))
-        writer_db.insert_action(_journal_row(fresh, account, object_id="222"))
+        # Зависшей считается только ОТПРАВЛЕННАЯ строка (sent_at): planned без
+        # sent_at уходит в aborted, как в apply.py перед mutate.
+        writer_db.mark_sent(writer_db.insert_action(
+            _journal_row(stuck, account, object_id="111")))
+        writer_db.mark_sent(writer_db.insert_action(
+            _journal_row(fresh, account, object_id="222")))
         _backdate(stuck, minutes=90)
 
         # Фильтр по кабинету: чужой кабинет зависшую строку не забирает.
@@ -578,9 +582,9 @@ def test_live_mark_stale_reports_finding_once_and_keeps_it_visible():
     key = "test-stale-" + suffix
     account = "test-" + suffix
     try:
-        writer_db.insert_action(_journal_row(key, account))
+        writer_db.mark_sent(writer_db.insert_action(_journal_row(key, account)))
         _backdate(key, minutes=90)
-        created_at = _read_row(key)["created_at"]
+        sent_at = _read_row(key)["sent_at"]
 
         first = writer_db.mark_stale_planned(60, account=account)
         second = writer_db.mark_stale_planned(60, account=account)
@@ -591,8 +595,8 @@ def test_live_mark_stale_reports_finding_once_and_keeps_it_visible():
         row = _read_row(key)
         assert row["status"] == "stale"
         # Момент отправки, а не момент обнаружения: изменение прошлой недели не
-        # должно съедать риск-бюджет текущей.
-        assert row["applied_at"] == created_at
+        # должно съедать риск-бюджет текущей (MARK_STALE_SQL: applied_at ← sent_at).
+        assert row["applied_at"] == sent_at
         assert row["response"]["stale"] is True
     finally:
         _cleanup(key)
@@ -607,7 +611,8 @@ def test_live_stale_row_is_watched_and_charged_to_risk():
     account = "test-" + suffix
     since = (datetime.utcnow() - timedelta(days=1)).isoformat()
     try:
-        writer_db.insert_action(_journal_row(key, account, risk_rub=444.0))
+        writer_db.mark_sent(writer_db.insert_action(
+            _journal_row(key, account, risk_rub=444.0)))
         _backdate(key, minutes=90)
         baseline = writer_db.spent_risk(since)
         writer_db.mark_stale_planned(60, account=account)
@@ -1081,7 +1086,7 @@ def test_live_lease_is_renewable_while_the_run_is_alive():
     # Продление сдвигает срок годности вперёд: прогон, идущий дольше часа, не
     # теряет аренду, и второй прогон не стартует.
     ensure_writer_tables()
-    with writer_db.run_lock("agent_e1", ttl_minutes=1) as lease:
+    with writer_db.run_lock("agent_writer", ttl_minutes=1) as lease:
         before = _lock_expires("agent_writer")
         lease.ttl_minutes = 60
         assert lease.renew() is True

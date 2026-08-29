@@ -292,14 +292,17 @@ def test_window_not_open_yet_is_reported_as_waiting():
 # --------------------------------------------------------------- откат
 
 def test_rollback_without_known_id_sends_nothing():
-    # bidmodifier.add: Id приходит только в ответе API. Ответа нет — откат
-    # вслепую невозможен, запрос отправлять нельзя.
+    # bidmodifier.add: Id приходит только в ответе API. Ответа нет, а
+    # кабинет ПРОЧИТАН и совпадения по паре «тип, ключ» не нашлось (не
+    # «кабинет недоступен» — это отдельный случай, см. тест ниже про
+    # временную ошибку чтения) — откат вслепую невозможен, запрос
+    # отправлять нельзя.
     action = _action(action_kind="bidmodifier.add",
                      payload={"CampaignId": 111, "BidModifier": 30,
                               "Type": "MOBILE_ADJUSTMENT", "key": "MOBILE"},
                      previous_state={}, response={})
     facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
-    report, client, db = _run(action, facts)
+    report, client, db = _run(action, facts, client=_FakeClient(modifiers=[]))
 
     assert client.calls == []
     assert report["rollback_failed"] == 1
@@ -809,6 +812,58 @@ def test_unreachable_cabinet_does_not_invent_an_id():
     assert report["rollback_failed"] == 1
 
 
+def test_transient_read_error_does_not_bury_the_action(monkeypatch):
+    # 5xx кабинета в момент отката — не «Id не существует». Строка обязана
+    # остаться в наблюдении и попробовать откат на следующем прогоне.
+    action = _stuck_add()  # 'stale' bidmodifier.add: payload без Id
+    client = _FakeClient()
+    monkeypatch.setattr(watchdog, "read_actual_modifiers",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 502")))
+    db = _FakeDb()
+    out = watchdog.rollback_one(client, action, db, set())
+
+    assert out["result"] == "rollback_failed"
+    assert out["permanent"] is False
+    assert db.failed == [{"action_id": action["action_id"],
+                          "reason": out["reason"], "permanent": False}]
+    assert "кабинет не ответил" in out["reason"]
+
+
+def test_unreachable_journal_blip_propagates_not_relabeled_permanent(monkeypatch):
+    # Пометка неисполнимого отката на ветке "unreachable" строится ВНЕ
+    # внешнего try: если mark_rollback_failed сама споткнётся (журнальный
+    # блип), исключение обязано дойти как есть — а не быть перехваченным
+    # внешним except и перелейбленным в permanent=True («запрос на возврат
+    # не строится»), которого здесь никто не строил.
+    action = _stuck_add()  # 'stale' bidmodifier.add: payload без Id
+    client = _FakeClient()
+    monkeypatch.setattr(watchdog, "read_actual_modifiers",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 502")))
+
+    class _BlipDb(_FakeDb):
+        """Журнал спотыкается на ПЕРВОЙ пометке (unreachable, permanent=False).
+
+        Если сбой перехвачен внешним except (старое поведение), код делает
+        ВТОРУЮ попытку пометки — уже permanent=True — и она в этом дубле
+        успешна: старый код тогда молча ВОЗВРАЩАЕТ мислейбленный результат
+        вместо того, чтобы дать первому исключению дойти до вызывающего.
+        """
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def mark_rollback_failed(self, action_id, reason, permanent=False):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("journal write blip")
+            return super().mark_rollback_failed(action_id, reason, permanent=permanent)
+
+    db = _BlipDb()
+    with pytest.raises(RuntimeError, match="journal write blip"):
+        watchdog.rollback_one(client, action, db, set())
+    assert db.calls == 1, "исключение обязано дойти до вызывающего с первой попытки"
+
+
 def test_recovery_does_not_match_a_different_segment():
     cabinet = [{"Id": 555, "CampaignId": 111, "Type": "DESKTOP_ADJUSTMENT",
                 "DesktopAdjustment": {"BidModifier": 130}}]
@@ -943,7 +998,9 @@ def test_live_spent_risk_still_counts_row_awaiting_manual_rollback():
         assert spent_risk(week) == with_action
 
         writer_db.mark_rolled_back(action_id)
-        assert spent_risk(week) == with_action - 777.0
+        # Откат не освобождает неделю: экспозиция уже случилась
+        # (RISK_CHARGED_STATUSES включает rolled_back).
+        assert spent_risk(week) == with_action
     finally:
         _cleanup(key)
 
@@ -2096,3 +2153,31 @@ def test_watchdog_verdict_turns_alarm_on_unrollbackable_rows(monkeypatch, capsys
     report = seen["report"]
     assert report["alarms"], "неоткатываемые строки обязаны поднимать тревогу"
     assert report["verdict"] == "ALARM"
+
+
+def test_watchdog_notifies_after_the_black_box_write(monkeypatch, capsys):
+    # Уведомление обязано уйти ПОСЛЕ save_run: чёрный ящик не должен зависеть
+    # от того, доступен ли Telegram. Порядок вызовов и текст сводки — оба
+    # проверяются в одном тесте, иначе можно проверить порядок и потерять
+    # то, что реально ушло бы человеку.
+    lock = _RecordingLock()
+    _patch_watchdog_main(monkeypatch, lock)
+    order = []
+    monkeypatch.setattr(watchdog.blackbox, "save_run",
+                        lambda *a, **k: order.append("blackbox") or
+                                        {"saved": False, "error": "тест"})
+    calls = []
+
+    def _send(text):
+        order.append("notify")
+        calls.append(text)
+        return {"sent": False, "reason": "not_configured"}
+
+    monkeypatch.setattr(watchdog.notify, "send", _send)
+
+    assert watchdog.main() == 0
+    capsys.readouterr()
+
+    assert order == ["blackbox", "notify"], "уведомление ушло раньше записи в чёрный ящик"
+    assert len(calls) == 1
+    assert "Сторож" in calls[0]

@@ -54,6 +54,7 @@ from sync.agent import experiments
 from sync.agent import db as agent_db
 from sync.agent import gate as gate_module
 from sync.agent import holdout
+from sync.agent import notify
 from sync.agent import tact_effect
 from sync.agent.ideas import registry as ideas_registry
 from sync.agent.gate import mart_gate, with_source_checks
@@ -123,6 +124,13 @@ PREVIEW_SAMPLE_LIMIT = 5
 NO_ID_REASON = (
     "неизвестен Id корректировки: откат вслепую невозможен "
     "(Id приходит только в ответе bidmodifier.add и не найден в кабинете)"
+)
+# В отличие от NO_ID_REASON — это НЕ приговор: кабинет мог просто не
+# ответить (5xx, таймаут) в момент чтения. Повтор на следующем прогоне
+# может увенчаться успехом, поэтому помечается временно (permanent=False).
+READ_FAILED_REASON = (
+    "кабинет не ответил при восстановлении Id корректировки — повтор на "
+    "следующем прогоне"
 )
 INCOMPLETE_REASON = "тело запроса на возврат неполное: нет Id или коэффициента"
 HOLDOUT_REASON = (
@@ -1119,7 +1127,7 @@ def _segment_of(action: Dict[str, Any]) -> Tuple[str, str]:
     return str(direct_type), str(setting_key)
 
 
-def resolve_added_modifier_id(client, action: Dict[str, Any]) -> Optional[Any]:
+def resolve_added_modifier_id(client, action: Dict[str, Any]) -> Tuple[str, Optional[Any]]:
     """Id добавленной корректировки, восстановленный ЧТЕНИЕМ кабинета.
 
     Строка bidmodifier.add без сохранённого ответа API (обрыв процесса между
@@ -1135,25 +1143,29 @@ def resolve_added_modifier_id(client, action: Dict[str, Any]) -> Optional[Any]:
     корректировка («мужчины 25–34») и запись без годного коэффициента в
     кандидаты не берутся, а двойное совпадение по одному сегменту означает,
     что кабинет не такой, каким мы его считаем, — угадывать там нельзя.
+
+    Возвращает ("ok", Id | None) при успешном чтении кабинета (Id — None,
+    если однозначного совпадения нет) или ("unreachable", описание причины)
+    — кабинет не ответил, и это НЕ то же самое, что «Id не существует»:
+    вызывающий код обязан различать эти два случая (permanent True/False).
     """
     want_type, want_key = _segment_of(action)
     if not want_type or not want_key:
-        return None
+        return ("ok", None)
     try:
         actual = read_actual_modifiers(client, str(action.get("object_id")))
-    except Exception:
-        # Кабинет недоступен — это не «Id не существует». Молчаливый None
-        # оставит строку неоткатываемой на этот прогон, но не пометит её
-        # неоткатываемой навсегда: пометку ставит вызывающий код по своей
-        # причине, и следующий прогон попробует прочитать снова.
-        return None
+    except Exception as exc:  # noqa: BLE001
+        # Кабинет недоступен — это не «Id не существует». Вызывающий код
+        # решает по этому состоянию отдельно: строка остаётся под
+        # наблюдением, а не хоронится навсегда.
+        return ("unreachable", f"{type(exc).__name__}: {exc}"[:200])
     matched = [item.get("Id") for item in actual
                if str(item.get("Type")) == want_type
                and str(item.get("key")) == want_key
                and not item.get("composite")
                and not item.get("unusable")
                and item.get("Id") is not None]
-    return matched[0] if len(matched) == 1 else None
+    return ("ok", matched[0] if len(matched) == 1 else None)
 
 
 def _fail(db_module, action: Dict[str, Any], reason: str, permanent: bool,
@@ -1229,13 +1241,24 @@ def rollback_one(client, action: Dict[str, Any], db_module,
         return {"result": "blocked_holdout", "action_id": action.get("action_id"),
                 "object_id": action.get("object_id"), "reason": HOLDOUT_REASON}
 
+    unreachable_reason = None
     try:
         request = rollback_payload(action)
         if request is None:
             # Id созданного объекта неизвестен — но он восстановим чтением
             # кабинета по паре «тип, ключ». Пробуем, прежде чем хоронить.
-            recovered = resolve_added_modifier_id(client, action)
-            if recovered is not None:
+            state, recovered = resolve_added_modifier_id(client, action)
+            if state == "unreachable":
+                # Кабинет не ответил — это не «Id не существует». Пометка
+                # временная: строка остаётся под наблюдением и получит ещё
+                # одну попытку на следующем прогоне. Сам _fail() строится
+                # НИЖЕ, вне этого try: если пометка (журнальная запись)
+                # споткнётся, внешний except обязан не перехватить её —
+                # иначе временный сбой журнала перелейблился бы в постоянный
+                # («запрос на возврат не строится»), хотя запрос тут ни при
+                # чём вовсе.
+                unreachable_reason = f"{READ_FAILED_REASON} ({recovered})"
+            elif recovered is not None:
                 request = rollback_payload({
                     **action,
                     "payload": {**(action.get("payload") or {}), "Id": recovered},
@@ -1245,6 +1268,9 @@ def rollback_one(client, action: Dict[str, Any], db_module,
         # прошлое состояние испорчено, и повтор его не починит.
         return _fail(db_module, action, f"запрос на возврат не строится: {exc}"[:300],
                      True, journal_ok)
+
+    if unreachable_reason is not None:
+        return _fail(db_module, action, unreachable_reason, False, journal_ok)
 
     if request is None:
         return _fail(db_module, action, NO_ID_REASON, True, journal_ok)
@@ -2100,6 +2126,9 @@ def _run_all(sandbox: bool, dry_run: bool, today: date, lease: Any = None,
     out["blackbox"] = blackbox.save_run(
         blackbox.new_run_id(), stage="watchdog",
         mode=blackbox.run_mode(sandbox, dry_run), report=out)
+    # Уведомление — ПОСЛЕ save_run: сбой транспорта не должен блокировать
+    # запись в чёрный ящик, только дополнять её. send() по контракту не бросает.
+    out["notify"] = notify.send(notify.watchdog_summary(out))
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 1 if fail_on_alarm and out["alarms"] else 0
 

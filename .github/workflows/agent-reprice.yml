@@ -1,0 +1,33 @@
+name: agent-reprice
+# Переоценка журнала действий в цены дельта-модели (scripts/reprice_actions.py).
+# DATABASE_URL живёт только в секретах Actions, поэтому единственный способ
+# запустить скрипт против прода — отсюда. Без apply=true печатает план и
+# ничего не пишет; apply=true — запись в edu_agent_actions за последние 28 дней.
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Записать новые цены (false — только план)"
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  reprice:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: План переоценки (и запись при apply=true)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ "${{ inputs.apply }}" = "true" ]; then
+            python scripts/reprice_actions.py --apply
+          else
+            python scripts/reprice_actions.py
+          fi

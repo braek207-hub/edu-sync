@@ -2288,6 +2288,32 @@ def test_schedule_reaches_the_cabinet(monkeypatch, capsys):
     assert targeting["ConsiderWorkingWeekends"] == "YES"
 
 
+def test_notifies_after_the_black_box_write(monkeypatch, capsys):
+    # Уведомление обязано уйти ПОСЛЕ save_run: сбой Telegram не вправе
+    # заблокировать запись в чёрный ящик, только дополнить её отчётом.
+    _patch_schedule_run(monkeypatch, [_setting("schedule:hour", "3", -40.0)])
+    order = []
+    monkeypatch.setattr(agent_e1.blackbox, "save_run",
+                        lambda *a, **k: order.append("blackbox") or
+                                        {"run_id": "test", "saved": False,
+                                         "rejects": 0, "error": "тест"})
+    calls = []
+
+    def _send(text):
+        order.append("notify")
+        calls.append(text)
+        return {"sent": False, "reason": "not_configured"}
+
+    monkeypatch.setattr(agent_e1.notify, "send", _send)
+
+    assert agent_e1.main() == 0
+    capsys.readouterr()
+
+    assert order == ["blackbox", "notify"], "уведомление ушло раньше записи в чёрный ящик"
+    assert len(calls) == 1
+    assert "Агент Э1" in calls[0]
+
+
 def test_schedule_is_reported_even_when_it_changes_nothing(monkeypatch, capsys):
     # «Профиля нет» и «профиль есть, но в кабинете уже стоит» обязаны
     # различаться: иначе оба выглядят как молчание прогона.
@@ -2354,6 +2380,8 @@ def test_data_gate_red_blocks_apply_run_before_any_journal_io(monkeypatch, capsy
     # первого обращения к журналу и загрузок планирования. Репетиция гейтом
     # не блокируется (смотреть на плохие данные можно, писать по ним — нет),
     # это отдельный путь.
+    monkeypatch.setattr(agent_e1.agent_db, "load_agent_config",
+                        lambda: {"preset": None, "overrides": {}})
     monkeypatch.setattr(agent_e1, "data_gate",
                         lambda today: {"status": "RED", "reason": "тест",
                                        "checks": []})
@@ -2364,11 +2392,20 @@ def test_data_gate_red_blocks_apply_run_before_any_journal_io(monkeypatch, capsy
     monkeypatch.setattr(agent_e1.agent_db, "load_holdout_ids", _boom)
     monkeypatch.setattr(agent_e1.writer_db, "purge_dry_run_actions", _boom)
 
+    notify_calls = []
+    monkeypatch.setattr(agent_e1.notify, "send",
+                        lambda text: (notify_calls.append(text),
+                                     {"sent": False, "reason": "not_configured"})[1])
+
     rc = agent_e1._run_all([{"login": "acc"}], sandbox=False, dry_run=False,
                            today="2026-08-24")
 
     assert rc == 1
     assert "DATA_GATE_RED" in capsys.readouterr().out
+    # Молчание красного гейта в живом такте неотличимо от того, что крон не
+    # отработал вовсе — уведомление обязано уйти с тем же вердиктом.
+    assert len(notify_calls) == 1
+    assert "DATA_GATE_RED" in notify_calls[0]
 
 
 # ------------------- белый список аргументов прогона
@@ -2781,13 +2818,17 @@ def test_run_verdict_names_the_run_by_its_worst_account():
 
 def test_run_verdict_reaches_the_black_box():
     # Проверка у получателя: вердикт обязан лежать в том самом словаре,
-    # который читает blackbox.save_run (report["verdict"]), а не только
-    # печататься рядом.
+    # который читает blackbox.save_run (report["verdict"]) и который уходит
+    # в notify.e1_summary, а не только печататься рядом. Вердикт и передача
+    # в save_run собраны через одну переменную run_report (задача 6:
+    # уведомление строится из тех же кусков, что и запись в чёрный ящик,
+    # без повторного мутирования уже сохранённого отчёта).
     import inspect
 
     source = inspect.getsource(agent_e1._run_all)
+    assert '"verdict": run_verdict(account_reports)' in source
     saved = source[source.index('stage="e1"'):]
-    assert '"verdict": run_verdict(account_reports)' in saved
+    assert "report=run_report" in saved
 
 
 # --- экономика кампании для ожидания: проводка в боевой прогон -------------
@@ -3164,3 +3205,9 @@ def test_proposals_do_not_inflate_the_lane_shortfall():
     assert gap["refused"] == 1, "предложение сосчитано как зажатое лимитом"
     assert gap["not_applicable"] == 1
     assert gap["passed_share"] == 0.5
+
+
+def test_computed_age_limit_is_two_days():
+    # Замер 27–28.08: крон опаздывает на 6–12 ч, Э0 пропускается целиком.
+    # Расчёт трёхдневной давности — уже не сегодняшний кабинет.
+    assert agent_e1.MAX_COMPUTED_AGE_DAYS == 2
