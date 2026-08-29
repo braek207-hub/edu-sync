@@ -3164,3 +3164,9 @@ def test_proposals_do_not_inflate_the_lane_shortfall():
     assert gap["refused"] == 1, "предложение сосчитано как зажатое лимитом"
     assert gap["not_applicable"] == 1
     assert gap["passed_share"] == 0.5
+
+
+def test_computed_age_limit_is_two_days():
+    # Замер 27–28.08: крон опаздывает на 6–12 ч, Э0 пропускается целиком.
+    # Расчёт трёхдневной давности — уже не сегодняшний кабинет.
+    assert agent_e1.MAX_COMPUTED_AGE_DAYS == 2
