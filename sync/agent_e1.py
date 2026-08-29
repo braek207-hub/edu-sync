@@ -2963,6 +2963,13 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
                 # потолком, от полосы, стоящей в тени.
                 "lane_steps": ctx["lane_steps"],
                 "accounts": account_reports, "blind_spend": blind,
+                # Кабинеты, которых прогон не видел вовсе (sync/agent/scope.py).
+                # Печатается всегда: без этой строки «кабинет ничего не
+                # применил» и «кабинета нет в работе» выглядят одинаково.
+                # Кампаний здесь нет намеренно — их считает отчёт Э0, где имя
+                # кампании видно и запрос к источнику всё равно сделан; ради
+                # одной отчётной строки движок записи лишнего запроса не шлёт.
+                "excluded": {"accounts": sorted(agent_scope.EXCLUDED_ACCOUNTS)},
                 "window": [cutoff, today], "failed_accounts": failed_accounts}
     saved = blackbox.save_run(
         run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),
