@@ -60,9 +60,23 @@ DEFAULT_CONTEXT = (
     "колледж, дистанционное обучение, приём абитуриентов"
 )
 
-# Где лежат проекции паспортов: <направление>.json. Проекция, а не паспорт
-# целиком — тот весит 27 КБ и в промпт не помещается (scripts/import_passport.py).
+# Где лежат проекции паспортов: <продукт>.json, где продукт — уровень билдера
+# (лендинг), а не направление кампаний. Проекция, а не паспорт целиком — тот
+# весит 27 КБ и в промпт не помещается (scripts/import_passport.py).
+#
+# Ключ продукта, а не направления, потому что паспорт делается ПОД ЛЕНДИНГ, и
+# один и тот же detect_direction накрывает разные продукты: в 'dist' попадают
+# и ВПО-дистант, и СПО-дистант, у которых «после 9 класса» — анти-маркер
+# одного и целевой маркер другого. Обратное тоже верно: продукт живёт в
+# нескольких кампаниях (у «Онлайн-школы» их восемь — РСЯ, ретаргетинг,
+# конкуренты, вечерние), и направление у них одно.
 PASSPORTS_DIR = Path(__file__).resolve().parent / "passports"
+
+# Карта адресации: кампания → продукт (точная, из журнала билдера) и
+# направление → продукт (приближение для кампаний, которых билдер не собирал).
+# Направление попадает в карту только там, где оно описывается ОДНИМ
+# продуктом; смешанные (dist) не попадают вовсе — приблизиться к ним нечем.
+PASSPORT_INDEX = "index.json"
 
 # Сколько символов паспорта едет в промпт. Предел не косметический: паспорт
 # без границы вытеснил бы список фраз за окно модели, и батч вернулся бы
@@ -240,44 +254,100 @@ def classify(
     return out
 
 
-def load_passport(direction: str) -> Optional[Dict[str, Any]]:
-    """Проекция паспорта направления с диска. None — паспорта нет.
-
-    Отсутствие — рабочее состояние, а не авария: направлений десять
-    (sync/classify.py::detect_direction), а паспорт есть там, где кампанию
-    собирал билдер. Нет паспорта — слой работает на общем описании, ровно как
-    до задачи 20.
-    """
-    key = str(direction or "").strip().lower()
-    if not key or "/" in key or "\\" in key or key.startswith("."):
+def _read_json(name: str) -> Optional[Dict[str, Any]]:
+    if not name or "/" in name or "\\" in name or name.startswith("."):
         return None
-    path = Path(PASSPORTS_DIR) / f"{key}.json"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads((Path(PASSPORTS_DIR) / name).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+
+
+def load_passport(product: str) -> Optional[Dict[str, Any]]:
+    """Проекция паспорта продукта с диска. None — паспорта нет.
+
+    Отсутствие — рабочее состояние, а не авария: паспорт есть там, где
+    кампанию собирал билдер. Нет паспорта — слой работает на общем описании,
+    ровно как до задачи 20.
+    """
+    key = str(product or "").strip().lower()
+    return _read_json(f"{key}.json") if key else None
+
+
+def load_index() -> Dict[str, Dict[str, str]]:
+    """Карта адресации паспортов. Нет файла — пустые карты, слой без паспортов.
+
+    Читается с диска каждый раз, а не кэшируется в модуле: прогон один, вызов
+    один, а кэш пережил бы правку карты в тестах и дал бы зелёное там, где
+    боевой прогон читает старое.
+    """
+    raw = _read_json(PASSPORT_INDEX) or {}
+    return {
+        "by_campaign": {str(k): str(v) for k, v in
+                        (raw.get("by_campaign") or {}).items()},
+        "by_direction": {str(k): str(v) for k, v in
+                         (raw.get("by_direction") or {}).items()},
+    }
+
+
+def passport_key(campaigns: Iterable[Any], direction: str,
+                 index: Optional[Dict[str, Dict[str, str]]] = None) -> str:
+    """Каким продуктом судить фразу. Пусто — судить нечем, поедет без паспорта.
+
+    Два уровня разрешения, и порядок между ними не произволен.
+
+    Сначала КАМПАНИЯ: журнал билдера знает, из какого лендинга собрана каждая
+    кампания, и точнее этого ответа не существует. Кампании фразы обязаны
+    сойтись на ОДНОМ продукте — иначе это та же подмена, ради которой правило
+    и написано: паспорт соседнего продукта судит фразу как свою.
+
+    Потом НАПРАВЛЕНИЕ — приближение для кампаний, которых билдер не собирал
+    (их в кабинете большинство). В карте направлений стоят только те, что
+    описываются одним продуктом; смешанные там отсутствуют, и фраза из них
+    честно едет без паспорта.
+
+    Кампания, которой в карте нет, ответ не портит: направление отвечает за
+    неё. А вот РАЗНЫЕ продукты у разных кампаний — портит, и это правильно.
+    """
+    index = index if index is not None else load_index()
+    by_campaign = index.get("by_campaign") or {}
+    products = {by_campaign[str(c)] for c in (campaigns or ())
+                if str(c) in by_campaign}
+    if len(products) == 1:
+        return products.pop()
+    if products:
+        return ""
+    return (index.get("by_direction") or {}).get(
+        str(direction or "").strip().lower(), "")
 
 
 def group_by_direction(
     candidates: Iterable[Dict[str, Any]], direction_by_campaign: Dict[str, str],
 ) -> Dict[str, List[str]]:
-    """Фразы кандидатов → {направление: [фразы]}. Спорные — под ключом "".
+    """Фразы кандидатов → {продукт: [фразы]}. Спорные — под ключом "".
 
-    Фраза, откручивавшаяся в кампаниях РАЗНЫХ направлений, паспорта не
-    получает. Паспорта соседних направлений противоречат друг другу ровно
-    там, где это опаснее всего: «после 9 класса» у высшего — анти-маркер, у
-    СПО — целевой маркер. Взять любой из двух значило бы судить фразу
-    паспортом чужого продукта, и вето «core» пришло бы не по делу.
+    Фраза, откручивавшаяся в кампаниях РАЗНЫХ продуктов, паспорта не
+    получает. Паспорта соседних продуктов противоречат друг другу ровно там,
+    где это опаснее всего: «после 9 класса» у высшего — анти-маркер, у СПО —
+    целевой маркер. Взять любой из двух значило бы судить фразу паспортом
+    чужого продукта, и вето «core» пришло бы не по делу.
+
+    Продукт разрешается passport_key: сначала по кампании (журнал билдера),
+    потом по направлению. Имя функции осталось прежним — его знает Э0 — но
+    ключ группы теперь продукт, и это ровно та поправка, ради которой карта
+    заведена: в 'dist' живут два разных продукта.
     """
+    index = load_index()
     groups: Dict[str, List[str]] = {}
     for candidate in candidates:
         query = str(candidate.get("query") or "").strip().lower()
         if not query:
             continue
-        seen = {str(direction_by_campaign.get(str(c)) or "")
-                for c in (candidate.get("campaigns") or ())}
+        campaigns = list(candidate.get("campaigns") or ())
+        seen = {str(direction_by_campaign.get(str(c)) or "") for c in campaigns}
         seen.discard("")
-        key = seen.pop() if len(seen) == 1 else ""
+        direction = seen.pop() if len(seen) == 1 else ""
+        key = passport_key(campaigns, direction, index)
         listed = groups.setdefault(key, [])
         if query not in listed:
             listed.append(query)

@@ -309,15 +309,75 @@ def test_classify_carries_the_passport_into_every_batch():
     assert all("аспирантура" in p for p in seen)
 
 
-def test_an_unknown_direction_has_no_passport():
-    assert semantic.load_passport("направления-нет") is None
+def test_an_unknown_product_has_no_passport():
+    assert semantic.load_passport("продукта-нет") is None
 
 
-def test_the_passport_of_a_direction_is_read_from_disk(tmp_path, monkeypatch):
-    (tmp_path / "vpo.json").write_text(json.dumps(PASSPORT, ensure_ascii=False),
-                                       encoding="utf-8")
+def test_the_passport_of_a_product_is_read_from_disk(tmp_path, monkeypatch):
+    (tmp_path / "kolledzh.json").write_text(
+        json.dumps(PASSPORT, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(semantic, "PASSPORTS_DIR", tmp_path)
-    assert semantic.load_passport("vpo")["what"] == PASSPORT["what"]
+    assert semantic.load_passport("kolledzh")["what"] == PASSPORT["what"]
+
+
+# --------------------------------------------- адресация паспорта продуктом
+
+
+def _index(tmp_path, monkeypatch, by_campaign=None, by_direction=None):
+    (tmp_path / semantic.PASSPORT_INDEX).write_text(
+        json.dumps({"by_campaign": by_campaign or {},
+                    "by_direction": by_direction or {}}, ensure_ascii=False),
+        encoding="utf-8")
+    monkeypatch.setattr(semantic, "PASSPORTS_DIR", tmp_path)
+
+
+def test_the_campaign_map_beats_the_direction_map(tmp_path, monkeypatch):
+    # Журнал билдера знает, из какого лендинга собрана кампания, и точнее
+    # ответа не существует. Направление — приближение, и уступает точному.
+    _index(tmp_path, monkeypatch,
+           by_campaign={"713822188": "distant_vpo"},
+           by_direction={"dist": "distant_spo"})
+    assert semantic.passport_key(["713822188"], "dist") == "distant_vpo"
+
+
+def test_a_campaign_outside_the_map_falls_back_to_its_direction(tmp_path,
+                                                                monkeypatch):
+    # Кампаний, которых билдер не собирал, в кабинете большинство: пустая
+    # карта кампаний не должна отнимать у них приближение по направлению.
+    _index(tmp_path, monkeypatch, by_direction={"spo": "kolledzh"})
+    assert semantic.passport_key(["999"], "spo") == "kolledzh"
+
+
+def test_a_phrase_across_two_products_gets_no_passport(tmp_path, monkeypatch):
+    # Та же подмена, ради которой правило и написано, но на уровне продукта:
+    # паспорт соседнего лендинга судил бы фразу как свою.
+    _index(tmp_path, monkeypatch,
+           by_campaign={"1": "distant_vpo", "2": "distant_spo"},
+           by_direction={"dist": "distant_vpo"})
+    assert semantic.passport_key(["1", "2"], "dist") == ""
+
+
+def test_a_mixed_direction_is_absent_from_the_map(tmp_path, monkeypatch):
+    # 'dist' накрывает два разных продукта, и приближения у него быть не
+    # может: «после 9 класса» — анти-маркер ВПО-дистанта и целевой маркер
+    # СПО-дистанта. Отсутствие в карте — решение, а не пробел.
+    _index(tmp_path, monkeypatch, by_direction={"spo": "kolledzh"})
+    assert semantic.passport_key(["999"], "dist") == ""
+
+
+def test_the_shipped_index_addresses_every_shipped_passport():
+    """Карта и файлы паспортов обязаны сходиться на чекауте.
+
+    Продукт, названный в карте, но без файла, — это тихое «без паспорта»:
+    прогон зелёный, разметка слепая. Обратное (файл без адреса) — паспорт,
+    до которого не доедет ни одна фраза.
+    """
+    index = semantic.load_index()
+    named = set(index["by_campaign"].values()) | set(index["by_direction"].values())
+    assert named, "карта пуста — ни один паспорт недостижим"
+    for product in sorted(named):
+        assert semantic.load_passport(product) is not None, (
+            f"продукт {product} в карте, а файла нет")
 
 
 # --------------------------------------------- какой паспорт какой фразе
@@ -327,12 +387,15 @@ def _candidate(query, campaigns):
     return {"query": query, "campaigns": set(campaigns)}
 
 
-def test_phrases_are_grouped_by_the_direction_of_their_campaigns():
+def test_phrases_are_grouped_by_the_product_of_their_campaigns(tmp_path,
+                                                               monkeypatch):
+    _index(tmp_path, monkeypatch,
+           by_direction={"vpo": "aspirantura", "spo": "kolledzh"})
     groups = semantic.group_by_direction(
         [_candidate("высшее заочно", ["1"]), _candidate("колледж заочно", ["2"])],
         {"1": "vpo", "2": "spo"})
-    assert groups["vpo"] == ["высшее заочно"]
-    assert groups["spo"] == ["колледж заочно"]
+    assert groups["aspirantura"] == ["высшее заочно"]
+    assert groups["kolledzh"] == ["колледж заочно"]
 
 
 def test_a_phrase_spanning_directions_gets_no_passport():
@@ -346,6 +409,20 @@ def test_a_phrase_spanning_directions_gets_no_passport():
     assert groups[""] == ["учиться дистанционно"]
 
 
+def test_two_products_inside_one_direction_are_kept_apart(tmp_path, monkeypatch):
+    # Дефект, ради которого карта заведена: обе кампании — 'dist', но
+    # продукты разные, и прежняя группировка судила бы обе фразы одним
+    # паспортом. Кампанийная адресация разводит их по своим.
+    _index(tmp_path, monkeypatch,
+           by_campaign={"1": "distant_vpo", "2": "distant_spo"})
+    groups = semantic.group_by_direction(
+        [_candidate("вуз дистанционно", ["1"]),
+         _candidate("колледж дистанционно", ["2"])],
+        {"1": "dist", "2": "dist"})
+    assert groups["distant_vpo"] == ["вуз дистанционно"]
+    assert groups["distant_spo"] == ["колледж дистанционно"]
+
+
 def test_a_phrase_of_an_unknown_campaign_gets_no_passport():
     groups = semantic.group_by_direction([_candidate("что-то", ["999"])], {})
     assert groups[""] == ["что-то"]
@@ -354,7 +431,10 @@ def test_a_phrase_of_an_unknown_campaign_gets_no_passport():
 # ------------------------------------ разметка кандидатов паспортами разом
 
 
-def test_candidates_are_classified_with_the_passport_of_their_direction():
+def test_candidates_are_classified_with_the_passport_of_their_direction(
+        tmp_path, monkeypatch):
+    _index(tmp_path, monkeypatch,
+           by_direction={"vpo": "vpo", "spo": "spo"})
     seen = {}
 
     def _spy(prompt):
@@ -375,9 +455,10 @@ def test_candidates_are_classified_with_the_passport_of_their_direction():
     assert set(verdicts) == {"высшее заочно", "колледж заочно"}
 
 
-def test_the_report_names_which_directions_had_a_passport():
-    # Паспорт есть не у всех направлений, и это влияет на разметку. Молчание
+def test_the_report_names_which_directions_had_a_passport(tmp_path, monkeypatch):
+    # Паспорт есть не у всех продуктов, и это влияет на разметку. Молчание
     # тут неотличимо от «паспорта не понадобились».
+    _index(tmp_path, monkeypatch, by_direction={"vpo": "vpo"})
     _, stats = semantic.classify_by_direction(
         [_candidate("высшее заочно", ["1"])], ask=lambda p: "{}",
         direction_by_campaign={"1": "vpo"}, load=lambda d: PASSPORT)
@@ -402,7 +483,8 @@ def test_the_shipped_passport_is_in_the_checkout():
     всё зелено — файл лежит на диске. Тест падает именно там, где дефект и
     проявляется: на чекауте, где есть только версионированное.
     """
-    passport = semantic.load_passport("school")
+    passport = semantic.load_passport("online_school")
     assert passport is not None, (
-        "sync/agent/passports/school.json не в чекауте — проверь .gitignore")
+        "sync/agent/passports/online_school.json не в чекауте — .gitignore")
     assert semantic.passport_block(passport)
+    assert semantic.load_index()["by_direction"].get("school") == "online_school"

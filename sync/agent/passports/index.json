@@ -1,0 +1,23 @@
+{
+ "_note": "адресация паспортов: кампания → продукт (точная, из журнала билдера) и направление → продукт (приближение). Правится scripts/import_passport.py, читается sync/agent/semantic.py",
+ "by_campaign": {
+  "713528059": "online_school",
+  "713552279": "online_school",
+  "713553880": "online_school",
+  "713560585": "online_school",
+  "713668859": "aspirantura",
+  "713687358": "kolledzh",
+  "713806183": "online_school",
+  "713806208": "online_school",
+  "713806986": "online_school",
+  "713807647": "online_school",
+  "713822188": "distant_vpo",
+  "713823285": "distant_vpo",
+  "713823643": "distant_spo",
+  "713824087": "distant_spo"
+ },
+ "by_direction": {
+  "school": "online_school",
+  "spo": "kolledzh"
+ }
+}
