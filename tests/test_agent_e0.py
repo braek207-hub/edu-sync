@@ -126,6 +126,9 @@ _DB_EMPTY_LOADERS = (
     # Состав заповедника: прогон читает его, чтобы вывести мёртвых. Пусто =
     # заповедника ещё нет, выводить некого — штатное состояние первого прогона.
     "load_holdout_ids",
+    # Id кампаний вне зоны ответственности агента (sync/agent/scope.py). Пусто =
+    # чужих кампаний в окне нет; сам фильтр проверяется в tests/test_agent_scope.py.
+    "load_excluded_campaign_ids",
 )
 
 # Отчёты Директа по кабинетам: у каждого свои сегменты и своя конверсионность —
@@ -256,9 +259,11 @@ def _patch_e0_run(monkeypatch, reports=None):
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
         # Числа отдаёт только срез по устройствам: пол и возраст оставлены
-        # пустыми, чтобы разбивка отчёта читалась однозначно.
-        lambda login, kind, date_from, date_to, by_campaign=False, goals=():
-            ([] if (by_campaign or kind != "device")
+        # пустыми, чтобы разбивка отчёта читалась однозначно. Расчётный такт
+        # узнаётся по with_date=False: разрез по кампаниям просят оба такта.
+        lambda login, kind, date_from, date_to, goals=(), with_date=True,
+               excluded_campaign_ids=():
+            ([] if (with_date or kind != "device")
              else list(by_login.get(login, [])),
              {"goal_column": "Conversions_111_LSCCD", "conversions": 1,
               "columns_offered": 1}),
@@ -491,7 +496,8 @@ def test_main_sends_account_goals_into_the_report_request(monkeypatch, capsys):
     monkeypatch.setattr(agent_e0, "fetch_account_goal_ids", lambda login: [555, 666])
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
-        lambda login, kind, date_from, date_to, by_campaign=False, goals=():
+        lambda login, kind, date_from, date_to, goals=(), with_date=True,
+               excluded_campaign_ids=():
             (seen_goals.append(list(goals)) or [], {"goal_column": "Conversions_111_LSCCD", "conversions": 7, "columns_offered": 1}))
 
     assert agent_e0.main() == 0
@@ -1030,10 +1036,11 @@ def test_main_writes_campaign_level_device_modifiers(monkeypatch, capsys):
     ]
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
-        lambda login, kind, date_from, date_to, by_campaign=False, goals=():
-            ((list(campaign_rows) if (by_campaign and kind == "device"
-                                      and login == "acc-1") else [])
-             if by_campaign else
+        lambda login, kind, date_from, date_to, goals=(), with_date=True,
+               excluded_campaign_ids=():
+            ((list(campaign_rows) if (kind == "device" and login == "acc-1")
+              else [])
+             if with_date else
              (list(_REPORTS_BY_LOGIN.get(login, [])) if kind == "device" else []),
              {"goal_column": "Conversions_111_LSCCD", "conversions": 1,
               "columns_offered": 1}),
@@ -1501,3 +1508,26 @@ def test_ladder_section_reports_window_coverage():
     section = agent_e0.funnel_ladder_section(facts, leads, today=today)
     assert section["campaigns_in_window"] == 1
     assert section["campaigns_known"] == 2
+
+
+def test_main_reports_what_it_did_not_look_at(monkeypatch, capsys):
+    """«Кабинет ничего не предложил» и «кабинета нет в работе» — разные вещи.
+
+    Без этой строки они выглядят в отчёте одинаково, и разбор прогона
+    начинается с догадки. Действием исключение не является: в журнал и в
+    чёрный ящик оно как действие не идёт.
+    """
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0.agent_db, "load_excluded_campaign_ids",
+                        lambda *a, **k: {"710118280", "712704859"})
+    monkeypatch.setenv("DIRECT_CLIENTS_JSON", _json.dumps(
+        [{"login": "acc-1", "goal_ids": ["1"]},
+         {"login": "account4-506456-gsrr", "goal_ids": ["2"]}]))
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    # Логины — те, что отбор ДЕЙСТВИТЕЛЬНО выбросил из состава прогона, а не
+    # константа списка исключений: кабинета может не быть в секрете вовсе.
+    assert report["excluded"]["accounts"] == ["account4-506456-gsrr"]
+    assert report["excluded"]["campaigns"] == 2

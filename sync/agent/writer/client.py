@@ -229,6 +229,17 @@ def _units_parts(header: str) -> Optional[tuple]:
 class WriteClient:
     def __init__(self, account_login: str, sandbox: bool = True, dry_run: bool = True,
                  token: Optional[str] = None):
+        # Последний рубеж границы зоны ответственности. Выше по течению её
+        # держат отборы списков (own_actions, filter_clients), но список
+        # всегда кто-то собирает, а здесь логин известен точно и запись ещё не
+        # ушла. Импорт внутри: sync.agent.scope тянет normalize_login из
+        # sync.agent.db, а тот — драйвер БД, которому в транспорте делать
+        # нечего.
+        from sync.agent.scope import is_excluded_account
+        if is_excluded_account(account_login):
+            raise ValueError(
+                f"кабинет {account_login} вне зоны ответственности агента: "
+                f"его ведёт другая команда, запись туда не предусмотрена")
         self.login = account_login
         self.sandbox = sandbox
         self.dry_run = dry_run

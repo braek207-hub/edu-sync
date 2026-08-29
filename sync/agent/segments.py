@@ -17,9 +17,11 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
+
+from sync.agent import scope as agent_scope
 
 REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports"
 CAMPAIGNS_URL = "https://api.direct.yandex.com/json/v5/campaigns"
@@ -244,12 +246,44 @@ def chosen_goal(records: List[Dict[str, str]], goal_column: Optional[str]) -> Di
     }
 
 
+def _own_records(tsv: str, excluded_campaign_ids: Iterable[Any]) -> List[Dict[str, str]]:
+    """Разбор ответа отчёта без строк кампаний вне зоны ответственности.
+
+    Отсечение стоит ЗДЕСЬ, а не у вызывающего, потому что по этим же строкам
+    выбирается колонка цели (primary_goal_column) и считается паспорт отчёта.
+    Отсечь после выбора значило бы, что цель — а через неё вся
+    конверсионность кабинета и все корректировки ставок — назначена чужой
+    кампанией: у неё может быть массовой совсем другая цель.
+
+    Ключ CampaignId, а не campaign_id: строки здесь ещё сырые, как их отдал
+    Директ. Отчёт без этой колонки не отсекается ничем — пустое значение ни
+    с чем не совпадает, — и это верно: без CampaignId различать нечем.
+    """
+    return agent_scope.drop_campaign_ids(
+        _parse_tsv(tsv), excluded_campaign_ids, id_key="CampaignId")
+
+
 def fetch_segment_report(
     login: str, segment_kind: str, date_from: str, date_to: str,
-    by_campaign: bool = False, goals: List[str] = (),
+    goals: List[str] = (), with_date: bool = True,
+    excluded_campaign_ids: Iterable[Any] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Срез за окно. by_campaign=True добавляет разрез по кампаниям и датам —
-    для edu_agent_facts_sliced; без него агрегат по аккаунту для корректировок.
+    """Срез за окно, всегда с разрезом по кампаниям.
+
+    Условия в запросе не бывает никогда — ни в каком виде. «Всё кроме этих
+    кампаний» Reports API выразить не умеет: замер 30.08.2026 (run
+    33274646184) получил ошибку 4001 «для поля CampaignId допустимы только
+    операторы EQUALS, IN», а перечисление своих через IN выбросило бы из
+    ответа кампании Мастера — campaigns.get их не отдаёт вовсе
+    (sync/agent/master.py), и агент потерял бы их расход, отсекая семь чужих
+    РК. Поэтому CampaignId просится ВСЕГДА: без него отсечь чужие строки
+    нечем, а кабинетные числа складываются в Python
+    (aggregate_account_rows).
+
+    with_date=False убирает из разреза дату: кабинетному агрегату она не
+    нужна (числа всё равно суммируются по всему окну), а лишний разрез
+    умножает объём ответа на число дней окна. Покампанийным фактам
+    (edu_agent_facts_sliced) дата нужна — там недели.
 
     Возвращает (строки, паспорт выбранной цели) — см. chosen_goal."""
     field = SEGMENT_FIELDS[segment_kind]
@@ -259,14 +293,15 @@ def fetch_segment_report(
         fields.insert(1, label_field)
     if goals:
         fields.append("Conversions")
-    if by_campaign:
-        fields = ["CampaignId", "Date"] + fields
+    fields = (["CampaignId", "Date"] if with_date else ["CampaignId"]) + fields
+
+    criteria: Dict[str, Any] = {"DateFrom": date_from, "DateTo": date_to}
 
     payload = {
         "params": _with_goals({
-            "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
+            "SelectionCriteria": criteria,
             "FieldNames": fields,
-            "ReportName": f"agent-{segment_kind}-{'bycamp-' if by_campaign else ''}{date_from}-{date_to}",
+            "ReportName": f"agent-{segment_kind}-bycamp-{date_from}-{date_to}",
             "ReportType": "CUSTOM_REPORT",
             "DateRangeType": "CUSTOM_DATE",
             "Format": "TSV",
@@ -275,7 +310,7 @@ def fetch_segment_report(
         }, list(goals))
     }
 
-    records = _parse_tsv(_run_report(login, payload))
+    records = _own_records(_run_report(login, payload), excluded_campaign_ids)
     # Одна цель на весь срез: см. primary_goal_column. Выбор построчно сравнивал
     # бы сегменты по разным целям.
     goal_column = primary_goal_column(records)
@@ -292,11 +327,54 @@ def fetch_segment_report(
             "conversions": _cell_int(rec.get(goal_column)) if goal_column else 0,
             "cost": float(rec.get("Cost") or 0.0),
         }
-        if by_campaign:
-            row["campaign_id"] = rec.get("CampaignId", "")
+        row["campaign_id"] = rec.get("CampaignId", "")
+        if with_date:
             row["date"] = rec.get("Date", "")
         rows.append(row)
     return rows, chosen_goal(records, goal_column)
+
+
+# Поля, которые складываются при сборке кабинетного агрегата. Остальные —
+# описание сегмента, у строк одного segment_key они совпадают.
+_SUMMED_FIELDS = ("clicks", "impressions", "conversions")
+
+
+def aggregate_account_rows(
+    rows: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Покампанийные строки среза -> кабинетный агрегат. Чистая функция.
+
+    Заменяет отдельный запрос агрегата у Директа, и не ради экономии: в
+    ответе агрегата нет CampaignId, и отсечь в нём чужие РК нечем — их клики
+    оседали бы в знаменателе конверсионности сегмента, то есть в кабинетных
+    корректировках ставок. Отсечение делается ВЫШЕ по течению
+    (scope.drop_campaign_ids), пока Id ещё есть; сюда приходят только свои.
+
+    Порядок результата детерминированный (по segment_key): настройки пишутся
+    в базу пачкой, и стабильный порядок делает diff двух прогонов читаемым.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = str(row.get("segment_key", ""))
+        slot = out.get(key)
+        if slot is None:
+            slot = out[key] = {
+                "segment_kind": row.get("segment_kind"),
+                "segment_key": key,
+                "slice_key": row.get("slice_key", key),
+                "slice_label": row.get("slice_label", ""),
+                "clicks": 0, "impressions": 0, "conversions": 0, "cost": 0.0,
+            }
+        # Метка сегмента приходит не от каждой кампании (у части строк она
+        # пустая), а нужна ровно одна — первая непустая.
+        if not slot["slice_label"] and row.get("slice_label"):
+            slot["slice_label"] = row["slice_label"]
+        for field in _SUMMED_FIELDS:
+            slot[field] += int(row.get(field) or 0)
+        slot["cost"] += float(row.get("cost") or 0.0)
+    for slot in out.values():
+        slot["cost"] = round(slot["cost"], 2)
+    return [out[key] for key in sorted(out)]
 
 
 # Сколько раз повторяется ЧТЕНИЕ при обрыве транспорта. Чтение идемпотентно:
@@ -347,7 +425,13 @@ def _api_post(url: str, login: str, payload: Dict[str, Any], what: str,
 
 
 def fetch_campaign_ids(login: str) -> List[int]:
-    """Id всех кампаний кабинета — по ним отбираются объекты нижних уровней."""
+    """Кампании кабинета в зоне ответственности агента.
+
+    Имя запрашивается ради самой границы (sync/agent/scope.py): кампании вне
+    её различаются только по нему, а этот список раздаёт Id снимку структуры,
+    справочнику «кампания -> кабинет» и через него — адресации идей. Без
+    "Name" в FieldNames фильтру нечего сравнивать.
+    """
     out: List[int] = []
     offset = 0
     while True:
@@ -358,14 +442,18 @@ def fetch_campaign_ids(login: str) -> List[int]:
                 "method": "get",
                 "params": {
                     "SelectionCriteria": {},
-                    "FieldNames": ["Id"],
+                    "FieldNames": ["Id", "Name"],
                     "Page": {"Limit": PAGE_LIMIT, "Offset": offset},
                 },
             },
             "campaigns.get",
         )
         items = result.get("Campaigns") or []
-        out += [int(c["Id"]) for c in items]
+        out += [int(c["Id"]) for c in
+                agent_scope.filter_campaign_rows(items, name_key="Name")]
+        # Постранично считается ВЕСЬ ответ, а не оставшееся после границы:
+        # отфильтрованная страница короче лимита, и обход оборвался бы на
+        # первой же странице с чужой кампанией.
         if len(items) < PAGE_LIMIT:
             break
         offset += PAGE_LIMIT
@@ -564,7 +652,8 @@ def fetch_objects(login: str, object_level: str, campaign_ids: List[int]) -> Lis
 
 
 def fetch_search_queries(
-    login: str, date_from: str, date_to: str, goals: List[str] = ()
+    login: str, date_from: str, date_to: str, goals: List[str] = (),
+    excluded_campaign_ids: Iterable[Any] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Поисковые запросы за окно, агрегат без дат. Только строки с кликами:
     показы без кликов дают миллионы строк и ничего не решают.
@@ -590,7 +679,10 @@ def fetch_search_queries(
             "IncludeDiscount": "NO",
         }, list(goals))
     }
-    records = _parse_tsv(_run_report(login, payload))
+    # Чужие строки — до выбора цели: расход и конверсии ФРАЗЫ складываются по
+    # всем её кампаниям (objects.py), а минус-слово пишется в свои. Строка
+    # чужой РК решала бы порог, по которому режут собственную семантику.
+    records = _own_records(_run_report(login, payload), excluded_campaign_ids)
     # Та же история с именами колонок, что и у сегментных срезов: "Conversions"
     # в ответе нет, есть Conversions_<цель>_<атрибуция>. Здесь цена ошибки
     # другая, но не меньше: по этим числам отбираются кандидаты в минус-слова,
@@ -613,7 +705,8 @@ def fetch_search_queries(
 
 
 def fetch_placements(
-    login: str, date_from: str, date_to: str, goals: List[str] = ()
+    login: str, date_from: str, date_to: str, goals: List[str] = (),
+    excluded_campaign_ids: Iterable[Any] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Площадки сети за окно, агрегат без дат.
 
@@ -651,7 +744,9 @@ def fetch_placements(
             "IncludeDiscount": "NO",
         }, list(goals))
     }
-    records = _parse_tsv(_run_report(login, payload))
+    # Та же причина, что у запросов: площадка запрещается в своих кампаниях,
+    # значит и считаться должна по ним.
+    records = _own_records(_run_report(login, payload), excluded_campaign_ids)
     goal_column = primary_goal_column(records)
     rows = [
         {

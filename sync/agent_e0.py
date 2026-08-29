@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from sync.agent import blackbox
 from sync.agent import db as agent_db
+from sync.agent import scope as agent_scope
 from sync.agent.computed import compute_schedule, compute_segment_modifiers
 from sync.agent.confidence import thresholds_from_config
 from sync.agent.coverage import blind_spend
@@ -113,6 +114,7 @@ from sync.agent.segment_quality import (
 )
 from sync.agent.segments import (
     fetch_account_goal_ids,
+    aggregate_account_rows,
     fetch_campaign_ids,
     fetch_objects,
     fetch_placements,
@@ -181,16 +183,13 @@ def _window(days: int) -> tuple:
     return (today - timedelta(days=days)).isoformat(), today.isoformat()
 
 
-def _direct_clients() -> List[Dict[str, Any]]:
-    """Кабинеты с целями. DIRECT_CLIENTS_JSON — список словарей
-    {login, goal_ids, sheet_name}, формат задан sync/direct.py::_direct_clients.
+def _direct_clients_raw() -> List[Dict[str, Any]]:
+    """Кабинеты из окружения — как они заданы, до границы ответственности.
 
-    Цели нужны не для красоты: без Goals в запросе Reports API не отдаёт колонку
-    Conversions и отвергает FieldNames с ошибкой 8000.
-
-    Логин нормализуется общей функцией agent_db.normalize_login — той же, что
-    у движка записи и у самой таблицы: он становится ключом object_id, и
-    расхождение нормализаций разводит запись и чтение по разным ключам.
+    Отдельно от _direct_clients, потому что отчёт прогона обязан называть
+    ФАКТ: какие кабинеты отбор действительно выбросил. По уже отфильтрованному
+    списку этого не восстановить, а печатать вместо факта константу значит
+    сообщать о работе, которой не было.
     """
     raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
     out: List[Dict[str, Any]] = []
@@ -207,6 +206,25 @@ def _direct_clients() -> List[Dict[str, Any]]:
             return out
     login = agent_db.normalize_login(os.environ.get("DIRECT_CLIENT_LOGIN"))
     return [{"login": login, "goal_ids": []}] if login else []
+
+
+def _direct_clients() -> List[Dict[str, Any]]:
+    """Кабинеты с целями. DIRECT_CLIENTS_JSON — список словарей
+    {login, goal_ids, sheet_name}, формат задан sync/direct.py::_direct_clients.
+
+    Цели нужны не для красоты: без Goals в запросе Reports API не отдаёт колонку
+    Conversions и отвергает FieldNames с ошибкой 8000.
+
+    Логин нормализуется общей функцией agent_db.normalize_login — той же, что
+    у движка записи и у самой таблицы: он становится ключом object_id, и
+    расхождение нормализаций разводит запись и чтение по разным ключам.
+
+    Кабинеты вне зоны ответственности агента (sync/agent/scope.py) отсекаются
+    ЗДЕСЬ, на единственном входе: отчёты Директа, цели, объекты, срезы,
+    заповедник и справочник «кампания → кабинет» — всё ниже по течению растёт
+    из этого списка и про исключение ничего не знает.
+    """
+    return agent_scope.filter_clients(_direct_clients_raw())
 
 
 def resolve_goal_ids(client: Dict[str, Any]) -> List[str]:
@@ -929,7 +947,33 @@ def main() -> int:
     confidence_thresholds = thresholds_from_config(active_config)
 
     direct_rows = agent_db.load_direct_rows(date_from, date_to)
-    lead_rows = agent_db.load_lead_rows(date_from, date_to)
+    # Кампании вне зоны ответственности агента из direct_rows уже вычтены
+    # (agent_db.load_direct_rows). Их Id снимаются отдельным запросом, потому
+    # что нужны там, где имени нет вовсе: сегментные отчёты Директа отдают
+    # CampaignId и ничего больше, а отобрать по нему без этого множества
+    # нечем — и чужие кампании уехали бы в edu_agent_facts_sliced и в
+    # покампанийные корректировки Э2.2.
+    #
+    # Окно снятия — самое широкое из всех, кому множество понадобится:
+    # покампанийные срезы просят SLICE_WINDOW_DAYS независимо от --days, и на
+    # коротком прогоне чужая кампания, не тратившая эти дни, вернулась бы в
+    # срезы через собственное окно отчёта.
+    excluded_campaign_ids = agent_db.load_excluded_campaign_ids(
+        (date.today() - timedelta(days=max(days, SLICE_WINDOW_DAYS))).isoformat(),
+        date_to)
+    # Лиды отсекаются тем же множеством и ДО сборки фактов. В
+    # crm_lead_details имени кампании нет, а последствия у пропущенного лида
+    # тяжелее, чем у пропущенного расхода: слот факта создаётся по паре «день
+    # × кампания» с пустым именем и нулевым расходом (sync/agent/facts.py), а
+    # запись идёт через ON CONFLICT — такой слот ПЕРЕЗАПИСАЛ БЫ историческую
+    # строку edu_agent_facts, и вернуть её было бы неоткуда. Имя после этого
+    # NULL, то есть строку не ловит уже ни одно условие по имени.
+    #
+    # score_rows отдельно не отбираются намеренно: там нет campaign_id, а
+    # приписываются они лидам по lead_id — у отсечённого лида смотреть скор
+    # уже некому.
+    lead_rows = agent_scope.drop_campaign_ids(
+        agent_db.load_lead_rows(date_from, date_to), excluded_campaign_ids)
     lag_rows = agent_db.load_lag_rows(
         (date.fromisoformat(date_to) - timedelta(days=LAG_HISTORY_DAYS)).isoformat(),
         date_to)
@@ -1089,6 +1133,9 @@ def main() -> int:
     slice_from = (date.today() - timedelta(days=SLICE_WINDOW_DAYS)).isoformat()
     queries_from = (date.today() - timedelta(days=QUERY_WINDOW_DAYS)).isoformat()
     clients = [] if skip_direct else _direct_clients()
+    # Не константа EXCLUDED_ACCOUNTS, а те логины, которые отбор реально
+    # выбросил из состава этого прогона: отчёт называет факт.
+    excluded_accounts = agent_scope.excluded_client_logins(_direct_clients_raw())
 
     # 6-7. Отчёты Директа. ПАРАЛЛЕЛЬНО: каждый отчёт формируется до 10 минут, а их
     # десятки — последовательный обход делал прогон многочасовым (run 31781846178
@@ -1116,18 +1163,31 @@ def main() -> int:
         # Срезы запрашиваются независимо от объёма оплат: конверсионность сегмента
         # считается по Conversions самого отчёта Директа. Прежний гейт по оплатам
         # аккаунта остался от расчёта, который сегменты не различал.
+        #
+        # ОБА такта просят покампанийный разрез, включая кабинетный. Агрегат
+        # кабинета у Директа больше не запрашивается: в его ответе нет
+        # CampaignId, и отсечь в нём чужие РК нечем — их клики оседали бы в
+        # знаменателе конверсионности сегмента, то есть в корректировках
+        # ставок. Условием запроса это не решается (см. fetch_segment_report),
+        # поэтому кабинетные числа складываются из строк (шаг ниже), а даты
+        # расчётному такту не нужны — with_date=False.
         for kind in ("device", "gender", "age"):
             jobs.append({"purpose": "computed", "login": login, "goals": goals,
-                         "kind": kind, "date_from": cutoff, "by_campaign": False})
+                         "kind": kind, "date_from": cutoff, "with_date": False})
         for kind in ("region", "network", "device"):
             jobs.append({"purpose": "sliced", "login": login, "goals": goals,
-                         "kind": kind, "date_from": slice_from, "by_campaign": True})
+                         "kind": kind, "date_from": slice_from, "with_date": True})
 
     def _run_job(job: Dict[str, Any]) -> Dict[str, Any]:
         rows, goal = fetch_segment_report(
             job["login"], job["kind"], job["date_from"], date_to,
-            by_campaign=job["by_campaign"], goals=job["goals"],
+            goals=job["goals"], with_date=job["with_date"],
+            excluded_campaign_ids=excluded_campaign_ids,
         )
+        if job["purpose"] == "computed":
+            # Чужие строки отчёт уже не вернул (fetch_segment_report), здесь
+            # остаётся только сложить своё в кабинетные числа.
+            rows = aggregate_account_rows(rows)
         return {**job, "rows": rows, "goal": goal}
 
     # Вычисленные настройки копятся ПО КАБИНЕТАМ: числа посчитаны по аудитории
@@ -1162,7 +1222,8 @@ def main() -> int:
                     if rows:
                         computed_by_account.setdefault(login, []).extend(rows)
                 else:
-                    weekly = collapse_tail(build_sliced_facts(job["rows"], job["kind"]))
+                    weekly = collapse_tail(
+                        build_sliced_facts(job["rows"], job["kind"]))
                     sliced_rows += weekly
                     # Э2.2: покампанийные корректировки — только device, это
                     # единственный срез с рабочим рычагом записи. Region мёртв
@@ -1273,7 +1334,8 @@ def main() -> int:
             object_rows += build_object_rows(
                 fetch_objects(login, level, campaign_ids), level, seen_on=today_iso)
         rows_for_login, query_goal = fetch_search_queries(
-            login, queries_from, date_to, goals=goals)
+            login, queries_from, date_to, goals=goals,
+            excluded_campaign_ids=excluded_campaign_ids)
         queries_by_login[login] = rows_for_login
         # Второй источник справочника «кампания → кабинет», и он сильнее
         # первого там, где первый молчит. campaigns.get не отдаёт кампании
@@ -1448,8 +1510,10 @@ def main() -> int:
             if login in set(blind_accounts):
                 continue
             try:
-                rows, _ = fetch_placements(login, slice_from, date_to,
-                                           goals=goals_by_login.get(login, []))
+                rows, _ = fetch_placements(
+                    login, slice_from, date_to,
+                    goals=goals_by_login.get(login, []),
+                    excluded_campaign_ids=excluded_campaign_ids)
             except Exception as exc:                     # noqa: BLE001
                 # Отчёт прогона — единственный JSON в выводе, и печатать в
                 # него посторонние строки нельзя: сбой одного кабинета едет
@@ -1860,6 +1924,12 @@ def main() -> int:
 
     report = {
         "verdict": "GREEN",
+        # Что прогон не видел вовсе. Строка печатается всегда, в том числе
+        # нулями: без неё «кабинет ничего не предложил» и «кабинета нет в
+        # работе» выглядят в отчёте одинаково, а разбор начинается именно с
+        # этого различия. Действием исключение не является и в журнал не идёт.
+        "excluded": {"accounts": excluded_accounts,
+                     "campaigns": len(excluded_campaign_ids)},
         "crm_through": latest_lead,
         "crm_lag_days": crm_lag,
         "facts_rows": len(facts),

@@ -498,8 +498,29 @@ def _fetch_dicts(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
             return [dict(r) for r in cur.fetchall()]
 
 
+def _scope():
+    """sync.agent.scope — импортом по месту, а не в шапке модуля.
+
+    Направление зависимости обратное: scope берёт отсюда normalize_login,
+    потому что логин кабинета — ключ object_id ЭТИХ таблиц, и нормализация
+    обязана быть одна. Импорт в шапке замкнул бы кольцо на загрузке.
+    """
+    from sync.agent import scope
+
+    return scope
+
+
 def load_direct_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
-    return _fetch_dicts(
+    """Строки источника за окно — БЕЗ кампаний вне зоны ответственности агента.
+
+    Фильтр стоит здесь, а не у вызывающих, потому что вызывающих двое и они
+    обязаны видеть одно и то же: расчёт (agent_e0) собирает из этих строк
+    витрину фактов, а гейт пишущих прогонов (sync/agent/gate.py) сверяет
+    сумму этих же строк с суммой той витрины. Отфильтруй одну сторону —
+    сверка разойдётся ровно на расход чужих кампаний и запретит боевую
+    запись навсегда, причём выглядеть это будет как испорченная витрина.
+    """
+    rows = _fetch_dicts(
         """
         SELECT date, campaign_id, campaign_name, project, direction,
                cost, clicks, impressions, conversions,
@@ -509,6 +530,27 @@ def load_direct_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
         """,
         (date_from, date_to),
     )
+    return _scope().filter_campaign_rows(rows)
+
+
+def load_excluded_campaign_ids(date_from: str, date_to: str) -> set:
+    """Id исключённых кампаний за окно — по имени в источнике.
+
+    Нужен там, где имени уже нет: сегментные отчёты Директа отдают
+    CampaignId и ничего больше, и отличить в них чужую кампанию можно только
+    по заранее снятому множеству. Из load_direct_rows его не вывести — там
+    этих строк по построению не осталось.
+    """
+    rows = _fetch_dicts(
+        """
+        SELECT DISTINCT campaign_id
+        FROM direct_stats
+        WHERE date BETWEEN %s AND %s
+          AND lower(coalesce(campaign_name, '')) LIKE ANY(%s)
+        """,
+        (date_from, date_to, _scope().like_patterns()),
+    )
+    return {str(r["campaign_id"]) for r in rows}
 
 
 def load_lead_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
@@ -878,6 +920,11 @@ def load_daily_account_totals(date_from: str, date_to: str) -> List[Dict[str, An
     Контроль для сезонной поправки красных линий (agent_e1_watchdog):
     подорожал ли лид у кабинета в целом между базой действия и окном
     наблюдения. По строке на день, а не на кампанию, — запрос дешёвый.
+
+    Кампании вне зоны ответственности агента вычитаются: этим контролем
+    двигается ПОРОГ ОТКАТА боевых изменений, и чужая РК, подорожавшая или
+    выключенная, сдвигала бы его по кампаниям, к которым агент отношения не
+    имеет. Строки при этом остаются на месте — см. mart_cost_total.
     """
     return _fetch_dicts(
         """
@@ -886,10 +933,11 @@ def load_daily_account_totals(date_from: str, date_to: str) -> List[Dict[str, An
                SUM(eff_leads) AS eff_leads
         FROM edu_agent_facts
         WHERE fact_date BETWEEN %s AND %s
+          AND NOT (lower(coalesce(campaign_name, '')) LIKE ANY(%s))
         GROUP BY fact_date
         ORDER BY fact_date
         """,
-        (date_from, date_to),
+        (date_from, date_to, _scope().like_patterns()),
     )
 
 
@@ -945,11 +993,19 @@ def mart_cost_total(date_from: str, date_to: str) -> float:
     значит, что витрина собрана не из тех строк, которые сейчас отдаёт источник:
     часть кампаний потерялась при сборке, или прогон писал по другому окну.
     Свежесть и непрерывность такого не видят — даты у битой витрины в порядке.
+
+    Кампании вне зоны ответственности агента вычитаются ЗАПРОСОМ, а не
+    удалением строк: их факты писали прогоны до введения исключения, и
+    чистить боевую таблицу задним числом эта граница права не имеет. Условие
+    обязано совпадать с фильтром источника (load_direct_rows) — иначе сверка
+    сравнивает витрину с чужими кампаниями и источник без них, расходится на
+    их расход и краснеет каждый прогон.
     """
     rows = _fetch_dicts(
         "SELECT COALESCE(SUM(cost), 0) AS total FROM edu_agent_facts "
-        "WHERE fact_date BETWEEN %s AND %s",
-        (date_from, date_to),
+        "WHERE fact_date BETWEEN %s AND %s "
+        "  AND NOT (lower(coalesce(campaign_name, '')) LIKE ANY(%s))",
+        (date_from, date_to, _scope().like_patterns()),
     )
     return float(rows[0]["total"] or 0.0) if rows else 0.0
 
@@ -1135,15 +1191,21 @@ def load_mart_day_breadth(date_from: str, date_to: str) -> Dict[str, Any]:
     Один проход по витрине: GROUPING SETS даёт и строки по дням, и итоговую
     строку (fact_date = NULL) с числом РАЗНЫХ кампаний за всё окно. Считать
     итог максимумом по дням нельзя — кампании в разные дни разные.
+
+    Чужие кампании из счёта вычитаются: это ЗНАМЕНАТЕЛЬ гейта данных, и
+    типичный день витрины должен мериться по тем кампаниям, за которые агент
+    отвечает. Иначе выключенная чужая РК сужает день, день признаётся
+    неполным, и гейт запрещает запись из-за чужого решения.
     """
     rows = _fetch_dicts(
         """
         SELECT fact_date, COUNT(DISTINCT campaign_id) AS campaigns
         FROM edu_agent_facts
         WHERE fact_date BETWEEN %s AND %s
+          AND NOT (lower(coalesce(campaign_name, '')) LIKE ANY(%s))
         GROUP BY GROUPING SETS ((fact_date), ())
         """,
-        (date_from, date_to),
+        (date_from, date_to, _scope().like_patterns()),
     )
     days: Dict[Any, int] = {}
     total = 0
@@ -1178,15 +1240,21 @@ def load_cost_by_campaign(date_from: str, date_to: str) -> Dict[str, float]:
     дневной темп, и умножение на 28 даёт расход, которого не было. Для цены
     ошибки это верно (важен темп), для доли денег — нет: доля, посчитанная по
     выдуманным суммам, врёт и в числителе, и в знаменателе.
+
+    Чужие кампании вычитаются по той же причине: это знаменатель «слепой
+    доли» — сколько денег прошло мимо настроек, которые агент читает. Деньги
+    кабинета, который агент не ведёт, слепой зоной не являются, и раздувать
+    ими долю значит объявлять дефектом синка чужое решение.
     """
     rows = _fetch_dicts(
         """
         SELECT campaign_id, SUM(cost) AS cost
         FROM edu_agent_facts
         WHERE fact_date BETWEEN %s AND %s
+          AND NOT (lower(coalesce(campaign_name, '')) LIKE ANY(%s))
         GROUP BY campaign_id
         """,
-        (date_from, date_to),
+        (date_from, date_to, _scope().like_patterns()),
     )
     return {str(r["campaign_id"]): float(r["cost"] or 0.0) for r in rows}
 

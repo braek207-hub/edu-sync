@@ -27,6 +27,7 @@ import sys
 from typing import Any, Dict, List
 
 from sync.agent import blackbox, drift
+from sync.agent import scope as agent_scope
 from sync.agent.writer.client import WriteClient
 from sync.agent.writer.db import LIVE_STATUSES
 from sync.db import get_connection
@@ -59,6 +60,18 @@ def applied_actions(days: int = DEFAULT_DAYS) -> List[Dict[str, Any]]:
             cur.execute(APPLIED_ACTIONS_SQL,
                         {"statuses": list(LIVE_STATUSES), "days": int(days)})
             return [dict(row) for row in cur.fetchall()]
+
+
+def own_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Строки журнала своих кабинетов (sync/agent/scope.py).
+
+    Журнал — общая таблица, и кабинет в ней всего лишь колонка: прогон,
+    который перестали запускать по кабинету, продолжает видеть его прошлые
+    строки и продолжает их судить. Исключение поэтому стоит и здесь, а не
+    только на входе кабинетов, — иначе граница держалась бы на том, что
+    кто-то не забыл убрать логин из секрета.
+    """
+    return [a for a in actions if not agent_scope.is_excluded_account(a.get("account"))]
 
 
 def fetch_state(client, campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -155,7 +168,7 @@ def main() -> int:
         if arg.startswith("--days="):
             days = max(1, int(arg.split("=", 1)[1]))
 
-    actions = applied_actions(days)
+    actions = own_actions(applied_actions(days))
     by_account: Dict[str, List[Dict[str, Any]]] = {}
     for action in actions:
         by_account.setdefault(str(action.get("account") or ""), []).append(action)

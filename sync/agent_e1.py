@@ -55,6 +55,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent import config as agent_config
 from sync.agent import db as agent_db
+from sync.agent import scope as agent_scope
 from sync.agent.confidence import thresholds_from_config
 from sync.agent.balance import (
     MIN_ASSIGNED_SHARE,
@@ -476,15 +477,12 @@ UNUSABLE_ACTUAL_REASON = (
 )
 
 
-def _clients() -> List[Dict[str, Any]]:
-    """Кабинеты прогона. Форма — та же, что у расчёта (agent_e0._direct_clients).
+def _clients_raw() -> List[Dict[str, Any]]:
+    """Кабинеты из окружения, до границы ответственности.
 
-    Логин нормализуется ТОЙ ЖЕ функцией, что на записи настроек: он едет и в
-    заголовок Client-Login запроса, и в load_latest_computed_settings как
-    ключ object_id. Прежде условие проверяло обрезанное значение, а в список
-    клало сырое — пробел по краям логина в переменной окружения разводил
-    запись и чтение по разным ключам, и прогон молча рапортовал, что
-    применять нечего.
+    Нужен отчёту прогона: строка «не смотрели» обязана называть логины,
+    которые отбор действительно выбросил, а не константу списка исключений
+    (agent_e0._direct_clients_raw — то же самое у расчёта).
     """
     raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
     out: List[Dict[str, Any]] = []
@@ -498,21 +496,44 @@ def _clients() -> List[Dict[str, Any]]:
     return out
 
 
+def _clients() -> List[Dict[str, Any]]:
+    """Кабинеты прогона. Форма — та же, что у расчёта (agent_e0._direct_clients).
+
+    Логин нормализуется ТОЙ ЖЕ функцией, что на записи настроек: он едет и в
+    заголовок Client-Login запроса, и в load_latest_computed_settings как
+    ключ object_id. Прежде условие проверяло обрезанное значение, а в список
+    клало сырое — пробел по краям логина в переменной окружения разводил
+    запись и чтение по разным ключам, и прогон молча рапортовал, что
+    применять нечего.
+
+    Кабинеты вне зоны ответственности агента (sync/agent/scope.py) отсекаются
+    здесь же: список кабинетов — единственный вход прогона, и всё, что ниже,
+    работает уже с урезанным составом.
+    """
+    return agent_scope.filter_clients(_clients_raw())
+
+
 def fetch_campaign_ids(client: WriteClient) -> List[int]:
     """Id всех кампаний ОДНОГО кабинета (форма — sync/agent/segments.py::fetch_campaign_ids).
 
     Постранично: Page.Limit/Offset, остановка когда страница короче лимита.
+
+    Имя запрашивается не ради отчёта: кампании вне зоны ответственности агента
+    различаются только по нему, а ниже по течению (own_campaign_ids, чтение
+    корректировок, план, отправка) едут одни Id. Без "Name" в FieldNames
+    фильтру нечего было бы сравнивать, и он молча пропускал бы всё.
     """
     out: List[int] = []
     offset = 0
     while True:
         result = client.get("campaigns", {
             "SelectionCriteria": {},
-            "FieldNames": ["Id"],
+            "FieldNames": ["Id", "Name"],
             "Page": {"Limit": CAMPAIGN_PAGE_LIMIT, "Offset": offset},
         })
         items = result.get("Campaigns") or []
-        out += [int(c["Id"]) for c in items]
+        out += [int(c["Id"])
+                for c in agent_scope.filter_campaign_rows(items, name_key="Name")]
         if len(items) < CAMPAIGN_PAGE_LIMIT:
             break
         offset += CAMPAIGN_PAGE_LIMIT
@@ -2952,6 +2973,14 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
                 # потолком, от полосы, стоящей в тени.
                 "lane_steps": ctx["lane_steps"],
                 "accounts": account_reports, "blind_spend": blind,
+                # Кабинеты, которых прогон не видел вовсе (sync/agent/scope.py).
+                # Печатается всегда: без этой строки «кабинет ничего не
+                # применил» и «кабинета нет в работе» выглядят одинаково.
+                # Кампаний здесь нет намеренно — их считает отчёт Э0, где имя
+                # кампании видно и запрос к источнику всё равно сделан; ради
+                # одной отчётной строки движок записи лишнего запроса не шлёт.
+                "excluded": {
+                    "accounts": agent_scope.excluded_client_logins(_clients_raw())},
                 "window": [cutoff, today], "failed_accounts": failed_accounts}
     saved = blackbox.save_run(
         run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),

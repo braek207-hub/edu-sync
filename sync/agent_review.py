@@ -20,6 +20,7 @@ import sys
 from typing import Any, Dict, List
 
 from sync.agent import blackbox, review
+from sync.agent import scope as agent_scope
 from sync.db import get_connection
 
 DEFAULT_DAYS = 7
@@ -57,6 +58,16 @@ def _fetch(sql: str, days: int) -> List[Dict[str, Any]]:
 PRINT_LIMIT = 40
 
 
+def own_rejects(rejects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Журнал отказов своих кабинетов (sync/agent/scope.py).
+
+    Разбор ищет стены, в которые агент упирается день за днём. Отказ по
+    кабинету, который агент вести не должен, такой стеной не является: он
+    поднял бы находку про кабинет, где чинить нечего.
+    """
+    return [r for r in rejects if not agent_scope.is_excluded_account(r.get("account"))]
+
+
 def main() -> int:
     days = DEFAULT_DAYS
     for arg in sys.argv[1:]:
@@ -64,7 +75,7 @@ def main() -> int:
             days = max(1, int(arg.split("=", 1)[1]))
 
     runs = _fetch(RUNS_SQL, days)
-    rejects = _fetch(REJECTS_SQL, days)
+    rejects = own_rejects(_fetch(REJECTS_SQL, days))
     result = review.review(runs, rejects, EXPECTED_STAGES)
 
     high = result["by_severity"]["high"]
