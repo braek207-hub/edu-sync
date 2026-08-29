@@ -18,7 +18,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent import blackbox
 from sync.agent import db as agent_db
@@ -114,7 +114,7 @@ from sync.agent.segment_quality import (
 )
 from sync.agent.segments import (
     fetch_account_goal_ids,
-    fetch_campaign_ids,
+    fetch_campaign_ids_by_scope,
     fetch_objects,
     fetch_placements,
     fetch_search_queries,
@@ -1120,9 +1120,23 @@ def main() -> int:
     # на прогоне 32580972099 в кандидаты попали «колледжи москвы», «мти»,
     # «мед колледж» — 31 запрос на 271 975 ₽.
     goals_by_login: Dict[str, List[str]] = {}
+    # Состав кабинета читается ЗДЕСЬ, до отчётов, хотя нужен ещё и шагу 8:
+    # кабинетный агрегат сегментов сужается перечислением своих кампаний
+    # (Reports API не знает оператора NOT_IN — ошибка 4001, run 33274646184),
+    # а значит список обязан быть готов раньше запроса. Один вызов на кабинет
+    # на прогон: шаг 8 берёт его отсюда же, второй раз campaigns.get не
+    # спрашивается.
+    campaigns_by_login: Dict[str, Tuple[List[int], List[int]]] = {}
     for client in clients:
         login, goals = client["login"], resolve_goal_ids(client)
         goals_by_login[login] = goals
+        own_ids, foreign_ids = fetch_campaign_ids_by_scope(login)
+        campaigns_by_login[login] = (own_ids, foreign_ids)
+        # Сужается только кабинет, которому есть что исключать. Условие «IN
+        # свои кампании» выбрасывает из агрегата и то, чего campaigns.get не
+        # отдаёт вовсе (кампании Мастера) — платить эту цену там, где чужих РК
+        # нет, не за что, и тело запроса такого кабинета остаётся прежним.
+        own_for_report = own_ids if foreign_ids else []
         lead_goal_ids.update(int(g) for g in goals if str(g).isdigit())
         # Расписания здесь нет: HourOfDay отвергается Reports API (probe 31781715471),
         # почасовой профиль приходит из Метрики (шаг 9).
@@ -1132,20 +1146,23 @@ def main() -> int:
         # аккаунта остался от расчёта, который сегменты не различал.
         for kind in ("device", "gender", "age"):
             jobs.append({"purpose": "computed", "login": login, "goals": goals,
-                         "kind": kind, "date_from": cutoff, "by_campaign": False})
+                         "kind": kind, "date_from": cutoff, "by_campaign": False,
+                         "own_campaign_ids": own_for_report})
         for kind in ("region", "network", "device"):
             jobs.append({"purpose": "sliced", "login": login, "goals": goals,
-                         "kind": kind, "date_from": slice_from, "by_campaign": True})
+                         "kind": kind, "date_from": slice_from, "by_campaign": True,
+                         "own_campaign_ids": []})
 
     def _run_job(job: Dict[str, Any]) -> Dict[str, Any]:
         rows, goal = fetch_segment_report(
             job["login"], job["kind"], job["date_from"], date_to,
             by_campaign=job["by_campaign"], goals=job["goals"],
             # Кабинетный агрегат отдаёт по строке на сегмент, без CampaignId:
-            # отсечь чужие РК можно только условием самого запроса. У
+            # отсечь чужие РК можно только условием самого запроса, и только
+            # перечислением СВОИХ (NOT_IN у CampaignId не существует). У
             # покампанийного среза Id есть, и он режется по строкам ниже —
-            # fetch_segment_report условие ему намеренно не ставит.
-            excluded_campaign_ids=excluded_campaign_ids,
+            # ему список намеренно передаётся пустым.
+            own_campaign_ids=job["own_campaign_ids"],
         )
         return {**job, "rows": rows, "goal": goal}
 
@@ -1281,7 +1298,8 @@ def main() -> int:
     for client in clients:
         login = client["login"]
         goals = goals_by_login.get(login, [])
-        account_campaigns = fetch_campaign_ids(login)
+        # Список уже прочитан на шаге 6-7 — тот же кабинет, тот же прогон.
+        account_campaigns = campaigns_by_login.get(login, ([], []))[0]
         # Архивные кампании здесь нужны: справочник «кампания → кабинет»
         # тем точнее, чем шире, а Метрика показывает и то, что уже выключено.
         for cid in account_campaigns:

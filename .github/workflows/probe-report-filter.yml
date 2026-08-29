@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Спросить Директ про Filter CampaignId NOT_IN
+      - name: Спросить Директ про Filter CampaignId IN
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}

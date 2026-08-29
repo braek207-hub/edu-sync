@@ -317,13 +317,47 @@ def _capture_segment_payload(monkeypatch, tsv="Device\n"):
     return captured
 
 
-def test_account_aggregate_report_asks_direct_to_skip_foreign_campaigns(monkeypatch):
+def test_campaign_list_splits_own_from_foreign(monkeypatch):
+    """Один проход campaigns.get отдаёт обе стороны: свои Id и чужие.
+
+    Чужие нужны не для отчёта: по ним кабинет узнаётся как «есть что
+    исключать», и только такому кабинету достаётся сужающее условие запроса.
+    """
+    from sync.agent import segments
+
+    def _fake_post(url, login, payload, what, attempts=None):
+        if payload["params"]["Page"]["Offset"]:
+            return {"Campaigns": []}
+        return {"Campaigns": [
+            {"Id": 1, "Name": "vuz / Поиск / РФ"},
+            {"Id": 710687014, "Name": "vse /ВПО/ rsv"},
+            {"Id": 2, "Name": "vse / СПО / РСЯ"},
+        ]}
+
+    monkeypatch.setattr(segments, "_api_post", _fake_post)
+
+    own, foreign = segments.fetch_campaign_ids_by_scope("account10-506462-fqs4")
+
+    assert own == [1, 2]
+    assert foreign == [710687014]
+    # Прежний вход остался вторым именем той же выборки: у него один читатель
+    # снаружи и десяток двойников в тестах, и ломать его незачем.
+    assert segments.fetch_campaign_ids("account10-506462-fqs4") == [1, 2]
+
+
+def test_account_aggregate_report_asks_direct_for_own_campaigns_only(monkeypatch):
     """Кабинетный агрегат нельзя отфильтровать по строкам — их нет.
 
     by_campaign=False возвращает по строке на СЕГМЕНТ, без CampaignId: расход
     чужих РК сидит внутри и уезжает в знаменатель конверсионности сегмента,
     то есть в кабинетные корректировки ставок. Единственное место, где эти
     кампании ещё различимы, — сам запрос.
+
+    Условие перечисляет СВОИ кампании, а не исключённые: замер 30.08.2026
+    (probe-report-filter, run 33274646184) получил от Директа ошибку 4001 —
+    «для поля CampaignId допустимы только операторы EQUALS, IN» для
+    CUSTOM_REPORT. Оператора NOT_IN не существует, и «всё кроме этих семи»
+    в этом API выражается только перечислением всего остального.
     """
     from sync.agent import segments
 
@@ -331,19 +365,19 @@ def test_account_aggregate_report_asks_direct_to_skip_foreign_campaigns(monkeypa
 
     segments.fetch_segment_report(
         "account10-506462-fqs4", "device", "2026-08-01", "2026-08-07",
-        excluded_campaign_ids=["712704859", "710118280"])
+        own_campaign_ids=[22, 11])
 
     criteria = captured["payload"]["params"]["SelectionCriteria"]
-    assert criteria["Filter"] == [{"Field": "CampaignId", "Operator": "NOT_IN",
-                                  "Values": ["710118280", "712704859"]}]
+    assert criteria["Filter"] == [{"Field": "CampaignId", "Operator": "IN",
+                                  "Values": ["11", "22"]}]
 
 
-def test_report_without_exclusions_is_the_same_request_as_before(monkeypatch):
+def test_report_without_own_list_is_the_same_request_as_before(monkeypatch):
     """Кабинет без чужих кампаний обязан спрашивать ровно то же, что и раньше.
 
-    Пустой Filter — не безобидное «условие ни на что»: это другое тело
-    запроса, другой хеш имени отчёта (_stamp_report_name) и лишний повод
-    Директу его отвергнуть. Нет исключений — нет и ключа.
+    Пустой список — не «условие ни на что»: это другое тело запроса, другой
+    хеш имени отчёта (_stamp_report_name) и лишний повод Директу его
+    отвергнуть. Нечего сужать — нет и ключа.
     """
     from sync.agent import segments
 
@@ -358,7 +392,9 @@ def test_by_campaign_report_is_filtered_by_rows_not_by_request(monkeypatch):
     """Покампанийный срез режется по строкам — там CampaignId есть.
 
     Два фильтра на одном отчёте были бы двумя правдами: расходись они, понять
-    по числам, какая сработала, стало бы нечем.
+    по числам, какая сработала, стало бы нечем. Здесь это ещё и вопрос
+    полноты: перечисление своих кампаний в запросе выбросило бы из среза
+    кампании Мастера, которых campaigns.get не отдаёт вовсе.
     """
     from sync.agent import segments
 
@@ -366,25 +402,36 @@ def test_by_campaign_report_is_filtered_by_rows_not_by_request(monkeypatch):
 
     segments.fetch_segment_report(
         "acc", "device", "2026-08-01", "2026-08-07", by_campaign=True,
-        excluded_campaign_ids=["712704859"])
+        own_campaign_ids=["11", "22"])
 
     assert "Filter" not in captured["payload"]["params"]["SelectionCriteria"]
 
 
-def test_calculation_passes_the_excluded_ids_into_account_reports(monkeypatch):
-    """Множество Id доезжает из расчёта до запроса, а не остаётся в переменной."""
+def test_calculation_narrows_only_accounts_that_own_foreign_campaigns(monkeypatch):
+    """Сужается запрос ТОЛЬКО у кабинета, которому есть что исключать.
+
+    Условие «IN свои кампании» — не бесплатное: оно заодно выбрасывает из
+    агрегата всё, чего не отдаёт campaigns.get, то есть кампании Мастера.
+    Платить эту цену там, где чужих РК нет, значило бы сузить агрегат ни за
+    чем — тело запроса такого кабинета обязано остаться прежним.
+    """
     import sync.agent_e0 as agent_e0
     import tests.test_agent_e0 as e0_tests
 
     e0_tests._patch_e0_run(monkeypatch)
-    monkeypatch.setattr(agent_e0.agent_db, "load_excluded_campaign_ids",
-                        lambda *a, **k: {"710118280"})
+    by_login = {"acc-1": ([11, 12], [710118280]), "acc-2": ([21], [])}
+    monkeypatch.setattr(agent_e0, "fetch_campaign_ids_by_scope",
+                        lambda login: by_login[login])
     seen = []
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
         lambda login, kind, date_from, date_to, by_campaign=False, goals=(),
-        excluded_campaign_ids=(): seen.append(
-            {"by_campaign": by_campaign, "excluded": sorted(excluded_campaign_ids)})
+        own_campaign_ids=(): seen.append(
+            {"login": login, "by_campaign": by_campaign,
+             # Приведение к строкам и сортировка — работа
+             # fetch_segment_report (проверена тестом формы выше); здесь
+             # важно только, ЧЕЙ список доехал.
+             "own": sorted(str(c) for c in own_campaign_ids)})
         or ([], {"goal_column": None, "conversions": 0, "columns_offered": 0}),
     )
 
@@ -392,7 +439,11 @@ def test_calculation_passes_the_excluded_ids_into_account_reports(monkeypatch):
 
     account_jobs = [j for j in seen if not j["by_campaign"]]
     assert account_jobs, "кабинетные срезы не запрашивались — тест ничего не проверил"
-    assert all(j["excluded"] == ["710118280"] for j in account_jobs)
+    narrowed = {j["login"]: j["own"] for j in account_jobs}
+    assert narrowed["acc-1"] == ["11", "12"]
+    assert narrowed["acc-2"] == []
+    # Покампанийный срез не сужается ни у кого: он режется по строкам.
+    assert all(j["own"] == [] for j in seen if j["by_campaign"])
 
 
 # ------------------------- подключение: остальные агрегаты витрины фактов

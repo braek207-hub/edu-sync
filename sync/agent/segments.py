@@ -249,23 +249,36 @@ def chosen_goal(records: List[Dict[str, str]], goal_column: Optional[str]) -> Di
 def fetch_segment_report(
     login: str, segment_kind: str, date_from: str, date_to: str,
     by_campaign: bool = False, goals: List[str] = (),
-    excluded_campaign_ids: Iterable[Any] = (),
+    own_campaign_ids: Iterable[Any] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Срез за окно. by_campaign=True добавляет разрез по кампаниям и датам —
     для edu_agent_facts_sliced; без него агрегат по аккаунту для корректировок.
 
-    excluded_campaign_ids — кампании вне зоны ответственности агента
-    (sync/agent/scope.py). Отсекает их САМ ДИРЕКТ, условием запроса, и только
-    у КАБИНЕТНОГО агрегата: в его ответе по строке на сегмент, CampaignId там
-    нет вовсе, и расход чужих РК иначе оседает в знаменателе конверсионности
-    сегмента — то есть в кабинетных корректировках ставок. Покампанийный срез
-    (by_campaign=True) режется по строкам выше по течению: два фильтра на
-    одном отчёте были бы двумя правдами, и расхождение между ними нечем было
-    бы объяснить.
+    own_campaign_ids — кампании кабинета, которые агент ведёт. Непустой
+    список сужает КАБИНЕТНЫЙ агрегат до них условием запроса: в его ответе по
+    строке на сегмент, CampaignId там нет вовсе, и расход чужих РК иначе
+    оседает в знаменателе конверсионности сегмента — то есть в кабинетных
+    корректировках ставок.
 
-    Пустой список условия НЕ добавляет: кабинет без чужих кампаний обязан
-    спрашивать ровно то же тело, что и раньше, — от тела считается имя отчёта
-    (_stamp_report_name), и лишний ключ означал бы пересборку всех отчётов.
+    Почему перечисляются СВОИ кампании, а не исключённые. Замер 30.08.2026
+    (probe-report-filter, run 33274646184) получил от Директа ошибку 4001:
+    «для поля CampaignId, указанного в Filter.Field, допустимы только
+    операторы EQUALS, IN» для типа отчёта CUSTOM_REPORT. Оператора NOT_IN не
+    существует, и «всё кроме этих семи» в этом API выражается единственным
+    способом — перечислением всего остального.
+
+    Цена такого выражения: агрегат сужается и до кампаний, которых
+    campaigns.get не отдаёт вовсе (Мастер кампаний, см. sync/agent/master.py).
+    Поэтому вызывающий сужает ТОЛЬКО кабинеты, где чужие РК действительно
+    есть, — платить эту цену там, где исключать нечего, не за что.
+
+    Покампанийный срез (by_campaign=True) условия не получает никогда: он
+    режется по строкам выше по течению, где CampaignId есть, и сужение
+    запроса выбросило бы из него Мастер кампаний без всякой нужды.
+
+    Пустой список условия НЕ добавляет: тело запроса обязано остаться
+    прежним — от него считается имя отчёта (_stamp_report_name), и лишний
+    ключ означал бы пересборку всех отчётов.
 
     Возвращает (строки, паспорт выбранной цели) — см. chosen_goal."""
     field = SEGMENT_FIELDS[segment_kind]
@@ -279,13 +292,13 @@ def fetch_segment_report(
         fields = ["CampaignId", "Date"] + fields
 
     criteria: Dict[str, Any] = {"DateFrom": date_from, "DateTo": date_to}
-    excluded = sorted({str(cid) for cid in excluded_campaign_ids or ()})
-    if excluded and not by_campaign:
-        # Форма условия — та же, что у живого фильтра отчёта запросов
-        # (Field/Operator/Values ниже в этом модуле): у CampaignId Reports API
-        # принимает EQUALS/NOT_EQUALS/IN/NOT_IN.
-        criteria["Filter"] = [{"Field": "CampaignId", "Operator": "NOT_IN",
-                               "Values": excluded}]
+    # Значения сортируются и приводятся к строкам: тело запроса обязано быть
+    # детерминированным, иначе имя отчёта (хеш тела) скачет от порядка
+    # множества в памяти и каждый прогон заказывает отчёт заново.
+    own = sorted({str(cid) for cid in own_campaign_ids or ()})
+    if own and not by_campaign:
+        criteria["Filter"] = [{"Field": "CampaignId", "Operator": "IN",
+                               "Values": own}]
 
     payload = {
         "params": _with_goals({
@@ -371,15 +384,22 @@ def _api_post(url: str, login: str, payload: Dict[str, Any], what: str,
     raise last_error  # недостижимо: последняя попытка либо вернула, либо подняла
 
 
-def fetch_campaign_ids(login: str) -> List[int]:
-    """Id всех кампаний кабинета — по ним отбираются объекты нижних уровней.
+def fetch_campaign_ids_by_scope(login: str) -> Tuple[List[int], List[int]]:
+    """Кампании кабинета, разложенные границей: (свои, чужие).
 
-    Имя запрашивается ради границы зоны ответственности (sync/agent/scope.py):
-    кампании вне её различаются только по имени, а этот список раздаёт Id
-    снимку структуры, справочнику «кампания → кабинет» и через него —
-    адресации идей. Без "Name" в FieldNames фильтру нечего сравнивать.
+    Имя запрашивается ради самой границы (sync/agent/scope.py): кампании вне
+    её различаются только по нему, а этот список раздаёт Id снимку структуры,
+    справочнику «кампания → кабинет» и через него — адресации идей. Без
+    "Name" в FieldNames фильтру нечего сравнивать.
+
+    Чужие возвращаются вторым списком, а не выбрасываются молча: по ним
+    кабинет узнаётся как «есть что исключать», и только такому кабинету
+    достаётся сужающее условие кабинетного агрегата (fetch_segment_report).
+    Один проход campaigns.get отдаёт обе стороны — второй запрос ради счёта
+    чужих был бы тем же ответом, спрошенным дважды.
     """
     out: List[int] = []
+    foreign: List[int] = []
     offset = 0
     while True:
         result = _api_post(
@@ -396,12 +416,19 @@ def fetch_campaign_ids(login: str) -> List[int]:
             "campaigns.get",
         )
         items = result.get("Campaigns") or []
-        out += [int(c["Id"])
-                for c in agent_scope.filter_campaign_rows(items, name_key="Name")]
+        for campaign in items:
+            side = (foreign if agent_scope.is_excluded_campaign(campaign.get("Name"))
+                    else out)
+            side.append(int(campaign["Id"]))
         if len(items) < PAGE_LIMIT:
             break
         offset += PAGE_LIMIT
-    return out
+    return out, foreign
+
+
+def fetch_campaign_ids(login: str) -> List[int]:
+    """Только свои кампании кабинета — второе имя той же выборки."""
+    return fetch_campaign_ids_by_scope(login)[0]
 
 
 # Состояния, которыми кампанию из кабинета уже не спрятать. Список полный
