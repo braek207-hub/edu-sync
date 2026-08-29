@@ -664,8 +664,17 @@ def collect_ideas(
     addressed: set = set()
     for own in live_by_account.values():
         addressed |= own
+    # Растущий спрос без адреса — единственный вопрос такта, ответ на который
+    # человек обязан дать сам. Счётчика причины для него мало: «одно
+    # направление осталось без адреса» не называет ни направления, ни силы
+    # подъёма, и решение по такой строке не принимается. Поэтому направления
+    # едут списком с числами; идею с выдуманным кабинетом такт не заводит —
+    # выбор кабинета из данных не выводится, и подставить сюда «самый крупный»
+    # значило бы выдать соглашение прогона за вывод.
+    rising_unaddressed: List[Dict[str, Any]] = []
     for direction in sorted(set(demand or {}) - addressed):
-        regime = str(((demand or {}).get(direction) or {}).get("regime") or "")
+        row = (demand or {}).get(direction) or {}
+        regime = str(row.get("regime") or "")
         reason = (DEMAND_RISING_UNADDRESSED if regime == REGIME_RISE
                   else DEMAND_UNADDRESSED)
         slot = by_source.setdefault(
@@ -673,6 +682,15 @@ def collect_ideas(
             {"ideas": 0, "upserted": 0, "skipped_by_reason": {}})
         slot["skipped_by_reason"][reason] = (
             slot["skipped_by_reason"].get(reason, 0) + 1)
+        if regime == REGIME_RISE:
+            rising_unaddressed.append({
+                "direction": direction,
+                "regime": regime,
+                "sigma": row.get("sigma"),
+                "frequency": row.get("frequency"),
+                "baseline_median": row.get("baseline_median"),
+                "last_week": row.get("last_week"),
+            })
 
     # Проход по живому реестру ПОСЛЕ генераторов: пределы (порог окупаемости и
     # парность «ожидание — смета») применялись только в момент записи, то есть
@@ -699,6 +717,9 @@ def collect_ideas(
                 segments["skipped"] + donors["skipped"], "reason"),
         },
         "by_source": by_source,
+        # Вопрос человеку, а не находка агента: спрос растёт, кампаний нет ни
+        # в одном кабинете. Пусто — законное состояние.
+        "rising_unaddressed": rising_unaddressed,
         # Замыкание: сколько исходов своих ставок такт увидел и чем они
         # кончились. Ноль выигрышей и ноль уроков — законное состояние
         # кабинета без закрытых ставок, но недоступный реестр выглядит так же,

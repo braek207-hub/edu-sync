@@ -837,6 +837,24 @@ def test_quiet_demand_nobody_serves_is_counted_apart_from_rising(store):
     assert reasons[agent_e0.DEMAND_UNADDRESSED] == 1
 
 
+def test_rising_demand_without_address_carries_its_numbers(store):
+    # Счётчика причины мало: «одно направление без адреса» не называет ни
+    # направления, ни силы подъёма, а решение принимается по ним. Идею с
+    # кабинетом такт не заводит — выбор кабинета из данных не выводится.
+    summary = _collect(demand={
+        "dpo": {"regime": demand_mod.REGIME_RISE, "sigma": 2.26,
+                "frequency": 41000, "baseline_median": 30000,
+                "last_week": "2026-08-17"},
+        "mba": {"regime": demand_mod.REGIME_NORMAL, "sigma": 0.1},
+    })
+
+    rising = summary["rising_unaddressed"]
+    assert [r["direction"] for r in rising] == ["dpo"]
+    assert rising[0]["sigma"] == 2.26
+    assert rising[0]["frequency"] == 41000
+    assert rising[0]["baseline_median"] == 30000
+
+
 def test_a_direction_with_live_campaigns_is_not_counted_as_unaddressed(store):
     # Оно доехало до генератора, и его вердикт — уже его дело. Посчитай его и
     # здесь — отчёт врал бы про охват вдвое.
