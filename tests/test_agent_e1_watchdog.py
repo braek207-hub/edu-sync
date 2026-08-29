@@ -292,14 +292,17 @@ def test_window_not_open_yet_is_reported_as_waiting():
 # --------------------------------------------------------------- откат
 
 def test_rollback_without_known_id_sends_nothing():
-    # bidmodifier.add: Id приходит только в ответе API. Ответа нет — откат
-    # вслепую невозможен, запрос отправлять нельзя.
+    # bidmodifier.add: Id приходит только в ответе API. Ответа нет, а
+    # кабинет ПРОЧИТАН и совпадения по паре «тип, ключ» не нашлось (не
+    # «кабинет недоступен» — это отдельный случай, см. тест ниже про
+    # временную ошибку чтения) — откат вслепую невозможен, запрос
+    # отправлять нельзя.
     action = _action(action_kind="bidmodifier.add",
                      payload={"CampaignId": 111, "BidModifier": 30,
                               "Type": "MOBILE_ADJUSTMENT", "key": "MOBILE"},
                      previous_state={}, response={})
     facts = {"111": _facts("111", date(2026, 8, 2), 8, cost=5000.0, leads=4)}
-    report, client, db = _run(action, facts)
+    report, client, db = _run(action, facts, client=_FakeClient(modifiers=[]))
 
     assert client.calls == []
     assert report["rollback_failed"] == 1
@@ -807,6 +810,23 @@ def test_unreachable_cabinet_does_not_invent_an_id():
     assert len(client.reads) == 1
     assert client.calls == []
     assert report["rollback_failed"] == 1
+
+
+def test_transient_read_error_does_not_bury_the_action(monkeypatch):
+    # 5xx кабинета в момент отката — не «Id не существует». Строка обязана
+    # остаться в наблюдении и попробовать откат на следующем прогоне.
+    action = _stuck_add()  # 'stale' bidmodifier.add: payload без Id
+    client = _FakeClient()
+    monkeypatch.setattr(watchdog, "read_actual_modifiers",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 502")))
+    db = _FakeDb()
+    out = watchdog.rollback_one(client, action, db, set())
+
+    assert out["result"] == "rollback_failed"
+    assert out["permanent"] is False
+    assert db.failed == [{"action_id": action["action_id"],
+                          "reason": out["reason"], "permanent": False}]
+    assert "кабинет не ответил" in out["reason"]
 
 
 def test_recovery_does_not_match_a_different_segment():

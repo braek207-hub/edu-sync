@@ -124,6 +124,13 @@ NO_ID_REASON = (
     "неизвестен Id корректировки: откат вслепую невозможен "
     "(Id приходит только в ответе bidmodifier.add и не найден в кабинете)"
 )
+# В отличие от NO_ID_REASON — это НЕ приговор: кабинет мог просто не
+# ответить (5xx, таймаут) в момент чтения. Повтор на следующем прогоне
+# может увенчаться успехом, поэтому помечается временно (permanent=False).
+READ_FAILED_REASON = (
+    "кабинет не ответил при восстановлении Id корректировки — повтор на "
+    "следующем прогоне"
+)
 INCOMPLETE_REASON = "тело запроса на возврат неполное: нет Id или коэффициента"
 HOLDOUT_REASON = (
     "кампания в заповеднике: сторож её не трогает — заповедник и есть база "
@@ -1119,7 +1126,7 @@ def _segment_of(action: Dict[str, Any]) -> Tuple[str, str]:
     return str(direct_type), str(setting_key)
 
 
-def resolve_added_modifier_id(client, action: Dict[str, Any]) -> Optional[Any]:
+def resolve_added_modifier_id(client, action: Dict[str, Any]) -> Tuple[str, Optional[Any]]:
     """Id добавленной корректировки, восстановленный ЧТЕНИЕМ кабинета.
 
     Строка bidmodifier.add без сохранённого ответа API (обрыв процесса между
@@ -1135,25 +1142,29 @@ def resolve_added_modifier_id(client, action: Dict[str, Any]) -> Optional[Any]:
     корректировка («мужчины 25–34») и запись без годного коэффициента в
     кандидаты не берутся, а двойное совпадение по одному сегменту означает,
     что кабинет не такой, каким мы его считаем, — угадывать там нельзя.
+
+    Возвращает ("ok", Id | None) при успешном чтении кабинета (Id — None,
+    если однозначного совпадения нет) или ("unreachable", описание причины)
+    — кабинет не ответил, и это НЕ то же самое, что «Id не существует»:
+    вызывающий код обязан различать эти два случая (permanent True/False).
     """
     want_type, want_key = _segment_of(action)
     if not want_type or not want_key:
-        return None
+        return ("ok", None)
     try:
         actual = read_actual_modifiers(client, str(action.get("object_id")))
-    except Exception:
-        # Кабинет недоступен — это не «Id не существует». Молчаливый None
-        # оставит строку неоткатываемой на этот прогон, но не пометит её
-        # неоткатываемой навсегда: пометку ставит вызывающий код по своей
-        # причине, и следующий прогон попробует прочитать снова.
-        return None
+    except Exception as exc:  # noqa: BLE001
+        # Кабинет недоступен — это не «Id не существует». Вызывающий код
+        # решает по этому состоянию отдельно: строка остаётся под
+        # наблюдением, а не хоронится навсегда.
+        return ("unreachable", f"{type(exc).__name__}: {exc}"[:200])
     matched = [item.get("Id") for item in actual
                if str(item.get("Type")) == want_type
                and str(item.get("key")) == want_key
                and not item.get("composite")
                and not item.get("unusable")
                and item.get("Id") is not None]
-    return matched[0] if len(matched) == 1 else None
+    return ("ok", matched[0] if len(matched) == 1 else None)
 
 
 def _fail(db_module, action: Dict[str, Any], reason: str, permanent: bool,
@@ -1234,7 +1245,14 @@ def rollback_one(client, action: Dict[str, Any], db_module,
         if request is None:
             # Id созданного объекта неизвестен — но он восстановим чтением
             # кабинета по паре «тип, ключ». Пробуем, прежде чем хоронить.
-            recovered = resolve_added_modifier_id(client, action)
+            state, recovered = resolve_added_modifier_id(client, action)
+            if state == "unreachable":
+                # Кабинет не ответил — это не «Id не существует». Пометка
+                # временная: строка остаётся под наблюдением и получит
+                # ещё одну попытку на следующем прогоне.
+                return _fail(db_module, action,
+                            f"{READ_FAILED_REASON} ({recovered})", False,
+                            journal_ok)
             if recovered is not None:
                 request = rollback_payload({
                     **action,
