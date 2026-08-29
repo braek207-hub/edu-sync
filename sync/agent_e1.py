@@ -2673,15 +2673,22 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     try:
         stored_config = agent_db.load_agent_config()
     except Exception as exc:  # noqa: BLE001
-        # Панель недоступна — работаем как раньше: кодовые дефолты, то есть
-        # полный режим. Отказ базы не должен молча останавливать агента, но
-        # обязан быть виден: иначе «настройки не прочитались» и «настройки
-        # такие» выглядят в отчёте одинаково.
+        # Панель недоступна — боевая запись не должна продолжаться, потому что
+        # выключатель autonomy живёт в панели. Без прочитанного слова человека
+        # писать в кабинет запрещено. Репетиция продолжится на кодовых
+        # дефолтах: она ничего не пишет, поэтому рискованна только диагностики.
+        # Отказ базы не должен молча останавливать репетицию, но обязан быть
+        # виден: иначе «настройки не прочитались» и «настройки такие» выглядят
+        # в отчёте одинаково.
         stored_config = {"preset": None, "overrides": {},
                          "unavailable": f"{type(exc).__name__}: {exc}"[:200]}
         print(json.dumps({"verdict": "CONFIG_UNAVAILABLE",
                           "reason": stored_config["unavailable"]},
                          ensure_ascii=False, indent=2))
+        if not dry_run:
+            # Боевая запись без прочитанного слова человека — fail-closed на
+            # выключателе. Репетиция на дефолтах допустима: она ничего не пишет.
+            return 1
     active_config = agent_config.resolve(stored_config["preset"],
                                          stored_config["overrides"])
     autonomy = str(active_config["autonomy"])

@@ -365,6 +365,27 @@ def test_config_unavailable_is_visible_not_silent(monkeypatch, capsys):
     assert "пулер лёг" in out
 
 
+def test_config_unavailable_blocks_live_write(monkeypatch, capsys):
+    """Выключатель autonomy живёт в панели. Панель не прочиталась —
+    значит слово человека неизвестно, и писать в кабинет нельзя.
+
+    Боевой прогон должен остановиться сразу после CONFIG_UNAVAILABLE,
+    без попытки писать в кабинет. Репетиция продолжится на дефолтах.
+    """
+    from sync import agent_e1
+
+    monkeypatch.setattr(agent_e1.agent_db, "load_agent_config",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    # Гейт не должен вызваться, но подставляем на случай будущих изменений
+    monkeypatch.setattr(agent_e1, "data_gate",
+                        lambda today: {"status": "GREEN", "reason": "тест",
+                                       "checks": [], "latest_fact_date": None})
+    rc = agent_e1._run_all(clients=[], sandbox=False, dry_run=False, today="2026-08-30")
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "CONFIG_UNAVAILABLE" in out
+
+
 # --- отчёт прогона -------------------------------------------------------
 
 def test_run_report_counts_exploration_separately():

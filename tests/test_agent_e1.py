@@ -2354,6 +2354,8 @@ def test_data_gate_red_blocks_apply_run_before_any_journal_io(monkeypatch, capsy
     # первого обращения к журналу и загрузок планирования. Репетиция гейтом
     # не блокируется (смотреть на плохие данные можно, писать по ним — нет),
     # это отдельный путь.
+    monkeypatch.setattr(agent_e1.agent_db, "load_agent_config",
+                        lambda: {"preset": None, "overrides": {}})
     monkeypatch.setattr(agent_e1, "data_gate",
                         lambda today: {"status": "RED", "reason": "тест",
                                        "checks": []})
