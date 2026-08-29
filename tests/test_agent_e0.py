@@ -112,7 +112,7 @@ _DB_NOOPS = (
 )
 
 _DB_EMPTY_LOADERS = (
-    "load_direct_rows", "load_lead_rows", "load_score_rows",
+    "load_direct_rows", "load_lead_rows", "load_lag_rows", "load_score_rows",
     "load_campaign_features", "load_device_bridge", "table_sizes",
     # Спрос Wordstat: без подмены прогон ушёл бы в реальную базу и напечатал
     # ретраи коннекта в тот же stdout, который тест парсит как JSON.
@@ -1443,3 +1443,41 @@ def test_empty_mart_is_not_a_breakage():
     daily = [("2026-08-24", 1_000_000.0)]
     check = check_sum_reconciliation(agent_e0._cost_up_to(daily, None), 0.0)
     assert check["status"] == "OK"
+
+
+def test_ladder_maturity_reads_deep_lag_sample_not_run_window():
+    """Лаг считается по глубокой выборке, а не по границе окна прогона.
+
+    Окно прогона (180 дней) совпадает с порогом зрелости когорты, поэтому в
+    lead_rows зрелым оказывается ровно пограничный день — самые длинные лаги.
+    До 29.08.2026 p90 выходил 178 вместо 37, и окно лестницы уезжало за
+    пределы загруженных фактов.
+    """
+    today = date(2026, 8, 22)
+    # Что видит прогон: единственный зрелый день — граница 180 дней назад,
+    # и лаг там огромный.
+    run_window = [_ladder_lead("2026-02-23", "spo", paid_on="2026-08-20")]
+    # Глубокая выборка: год истории, реальный лаг короткий.
+    deep = [_ladder_lead("2025-10-01", "spo", paid_on="2025-10-06")] * 9
+    deep += [_ladder_lead("2025-10-01", "spo", paid_on="2025-10-31")]  # лаг 30
+
+    without = agent_e0.funnel_ladder_section([], run_window, today=today)
+    assert without["maturity_days"] == 178
+
+    with_deep = agent_e0.funnel_ladder_section([], run_window, today=today,
+                                               lag_rows=deep)
+    assert with_deep["maturity_days"] == 30
+    assert with_deep["window_to"] == "2026-07-23"
+
+
+def test_ladder_section_reports_window_coverage():
+    """Покрытие окна — наружу: по нему видно, что лестница считалась на обрывке."""
+    today = date(2026, 8, 22)
+    leads = [_ladder_lead("2026-05-01", "spo", paid_on="2026-05-31")]  # лаг 30
+    facts = [
+        _ladder_fact("2026-07-01", "old", "spo", eff_leads=30),
+        _ladder_fact("2026-08-20", "fresh", "spo", clicks=500),
+    ]
+    section = agent_e0.funnel_ladder_section(facts, leads, today=today)
+    assert section["campaigns_in_window"] == 1
+    assert section["campaigns_known"] == 2

@@ -517,6 +517,31 @@ def load_lead_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
     )
 
 
+def load_lag_rows(date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    """Только даты создания и оплаты — под оценку лага оплаты.
+
+    Отдельная выборка, а не срез lead_rows, потому что зрелой считается
+    когорта старше LAG_COHORT_MIN_AGE_DAYS = 180 дней, а прогон грузит лиды
+    ровно за 180. Пересечение этих двух окон — один пограничный день, и в него
+    попадают ровно те лиды, у которых лаг максимален (созданы 180 дней назад,
+    оплачены недавно). Замер 29.08.2026: p90 по такой выборке = 178 дней при
+    настоящем p90 = 37, окно лестницы уезжало на 2025-12-04…2026-03-04 —
+    почти целиком за пределы загруженных фактов, и лестница считалась по трём
+    дням: 14 оплат вместо 178 за месяц.
+
+    Три колонки вместо сорока двух: год истории лидов целиком в память не
+    поднять, а лаг больше ничего и не требует.
+    """
+    return _fetch_dicts(
+        """
+        SELECT created_date, payment_date, is_paid
+        FROM crm_lead_details
+        WHERE created_date BETWEEN %s AND %s AND is_paid
+        """,
+        (date_from, date_to),
+    )
+
+
 def load_device_bridge(date_from: str, date_to: str) -> List[Dict[str, Any]]:
     """Мост «лид → устройство»: crm_lead_details.client_id × визиты Метрики.
 

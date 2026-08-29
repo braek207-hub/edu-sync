@@ -281,6 +281,11 @@ LADDER_MATURITY_PERCENTILE = 0.90
 # 2026-08-23). Порог — вдвое больше замеренного p90 = 33 дня: когорта старше
 # 180 дней успела показать свой хвост целиком.
 LAG_COHORT_MIN_AGE_DAYS = 180
+# Глубина отдельной выборки под замер лага. Окно прогона (DEFAULT_DAYS = 180)
+# и порог зрелости совпадают, поэтому по lead_rows зрелым оказывается ровно
+# один пограничный день — самые длинные лаги по построению. Год даёт больше
+# полугода зрелых когорт (db.load_lag_rows).
+LAG_HISTORY_DAYS = 365
 # Мост «лид → устройство» для качества сегментов (Э2.2b): окно длинное, потому
 # что глубокие ступени (сделки, оплаты) редкие — за квартал планшеты не набирают
 # даже соединений. 540 дней = окно probe 32622086445, на котором мера доказана.
@@ -729,6 +734,7 @@ def funnel_ladder_section(
     facts: List[Dict[str, Any]],
     lead_rows: List[Dict[str, Any]],
     today: date = None,
+    lag_rows: List[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Лестница воронки по кампаниям (Э2.1) — на ЗРЕЛОМ окне.
 
@@ -737,10 +743,18 @@ def funnel_ladder_section(
     выбирала бы мелкую ступень не потому, что данных нет, а потому что они не
     созрели. Средний чек — по направлению из зрелых оплат: покампанийный чек на
     единичных оплатах — шум.
+
+    lag_rows — глубокая выборка дат оплаты (db.load_lag_rows). Зрелой считается
+    когорта старше 180 дней, а lead_rows прогона покрывают ровно 180: считать
+    лаг по ним значит взять один пограничный день, где по построению лежат
+    самые длинные лаги. Так и было до 29.08.2026 — p90 выходил 178 вместо 37,
+    окно уезжало за пределы загруженных фактов, и вся лестница считалась по
+    трём дням. None — старое поведение (тесты, вызов без глубокой выборки).
     """
     today = today or date.today()
-    maturity_days = _lag_percentile(lead_rows, LADDER_MATURITY_PERCENTILE,
-                                    today=today)
+    maturity_days = _lag_percentile(
+        lag_rows if lag_rows is not None else lead_rows,
+        LADDER_MATURITY_PERCENTILE, today=today)
     window_to = (today - timedelta(days=maturity_days)).isoformat()
     window_from = (today - timedelta(days=maturity_days + LADDER_WINDOW_DAYS)).isoformat()
 
@@ -813,6 +827,12 @@ def funnel_ladder_section(
     report["maturity_days"] = maturity_days
     report["window_from"] = window_from
     report["window_to"] = window_to
+    # Сторож окна. Зрелое окно живёт в прошлом и может уехать за границу
+    # загруженных фактов целиком — тогда лестница считается на пустоте и молча
+    # раздаёт всем ступень «клики». Наружу идут обе величины, чтобы падение
+    # покрытия было видно в отчёте, а не выводилось из следствий.
+    report["campaigns_in_window"] = len(by_campaign)
+    report["campaigns_known"] = len(direction_of)
     # Пулы и чеки — наружу, а не только внутрь отчёта. По ним генераторы идей
     # переводят события связки (сегмента, запроса) в оплаты и выручку: своих
     # коэффициентов перехода у связки быть не может — событий на них не
@@ -885,6 +905,9 @@ def main() -> int:
 
     direct_rows = agent_db.load_direct_rows(date_from, date_to)
     lead_rows = agent_db.load_lead_rows(date_from, date_to)
+    lag_rows = agent_db.load_lag_rows(
+        (date.fromisoformat(date_to) - timedelta(days=LAG_HISTORY_DAYS)).isoformat(),
+        date_to)
     score_rows = agent_db.load_score_rows(date_from, date_to)
 
     # 1. Гейт качества данных.
@@ -1524,7 +1547,22 @@ def main() -> int:
 
     # 11. Отчёт мощности, лестница воронки и фактический объём таблиц.
     report = power_report(list(aggregates.values()))
-    ladder_section = funnel_ladder_section(facts, lead_rows)
+    ladder_section = funnel_ladder_section(facts, lead_rows, lag_rows=lag_rows)
+    ladder_known = int(ladder_section.get("campaigns_known") or 0)
+    ladder_in_window = int(ladder_section.get("campaigns_in_window") or 0)
+    if ladder_known and ladder_in_window * 2 < ladder_known:
+        agent_db.insert_guard_checks([{
+            "check_name": "ladder:window_coverage", "status": "WARN",
+            "detail": {
+                "maturity_days": ladder_section.get("maturity_days"),
+                "window_from": ladder_section.get("window_from"),
+                "window_to": ladder_section.get("window_to"),
+                "campaigns_in_window": ladder_in_window,
+                "campaigns_known": ladder_known,
+                "about": "зрелое окно покрывает меньше половины известных "
+                         "кампаний — лестница считается на обрывке данных",
+            },
+        }])
 
     # Э3.2: единый порог предельной окупаемости и целевые бюджеты — после
     # лестницы (оттуда ценность лида) и после справочника «кампания →
