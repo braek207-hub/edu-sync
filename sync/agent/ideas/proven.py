@@ -418,6 +418,14 @@ def _one(bundle: Dict[str, Any], ctx: Dict[str, Any],
             "comparison": "did_vs_holdout",
         },
         "action": action,
+        # Имя ключа — в доказательства, не в адрес. Ключ региона числовой
+        # (RegionalAdjustment требует RegionId), и «213» в экране идей
+        # человеку ничего не говорит; но имя живёт в справочнике Директа и
+        # меняется без нашего участия — войди оно в subject, переименование
+        # области заводило бы идею заново под новым идентификатором.
+        "detail": ({"segment_label": _text((bundle.get("segment") or {}).get("label"))}
+                   if isinstance(bundle.get("segment"), dict)
+                   and (bundle.get("segment") or {}).get("label") else None),
     }, None
 
 

@@ -111,6 +111,14 @@ AGENT_DDL: List[str] = [
       PRIMARY KEY (week_start, campaign_id, slice_kind, slice_key)
     )
     """,
+    # Читаемое имя ключа. Ключ региона — числовой RegionId (его требует
+    # RegionalAdjustment), и без имени строка «213» не читается ни в идее, ни
+    # в разборе прогона. Не в ключ: имя региона в справочнике Директа может
+    # смениться, и тогда одна и та же область разъехалась бы на две строки.
+    """
+    ALTER TABLE edu_agent_facts_sliced
+      ADD COLUMN IF NOT EXISTS slice_label TEXT
+    """,
     # Структура кабинета: группы, фразы, объявления. Новая версия пишется ТОЛЬКО
     # при изменении содержимого (content_hash), а не ежедневно.
     """
@@ -1263,13 +1271,16 @@ def upsert_sliced_facts(rows: List[Dict[str, Any]]) -> int:
     return _batch(
         """
         INSERT INTO edu_agent_facts_sliced (
-            week_start, campaign_id, slice_kind, slice_key,
+            week_start, campaign_id, slice_kind, slice_key, slice_label,
             cost, clicks, impressions, conversions
         ) VALUES (
             %(week_start)s, %(campaign_id)s, %(slice_kind)s, %(slice_key)s,
+            %(slice_label)s,
             %(cost)s, %(clicks)s, %(impressions)s, %(conversions)s
         )
         ON CONFLICT (week_start, campaign_id, slice_kind, slice_key) DO UPDATE SET
+            slice_label = COALESCE(NULLIF(EXCLUDED.slice_label, ''),
+                                   edu_agent_facts_sliced.slice_label),
             cost = EXCLUDED.cost,
             clicks = EXCLUDED.clicks,
             impressions = EXCLUDED.impressions,

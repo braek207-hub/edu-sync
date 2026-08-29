@@ -1,6 +1,7 @@
 import pytest
 import sync.agent.segments as segments
 from sync.agent.segments import _stamp_report_name
+from sync.agent.writer import plan
 
 
 def _payload(fields, goals=None):
@@ -366,3 +367,50 @@ def test_fetch_placements_keeps_only_network_traffic(monkeypatch):
         "111\tsome.site.ru\tAD_NETWORK\t9000\t120\t5000\n"))
     rows, _ = segments.fetch_placements("acc", "2026-07-01", "2026-08-11")
     assert [r["placement"] for r in rows] == ["some.site.ru"]
+
+
+def test_region_slice_is_keyed_by_numeric_id_with_name_alongside(monkeypatch):
+    """Ключ региона — RegionId, имя едет рядом.
+
+    RegionalAdjustment в API записи требует число, а срез отдавал «Москва» —
+    региональные корректировки не применялись вовсе (167 отказов на прогоне
+    29.08.2026). TargetingLocationId проверен probe-ом run 33248004571.
+    """
+    captured = {}
+
+    def _fake(login, payload):
+        captured["fields"] = payload["params"]["FieldNames"]
+        return (
+            "TargetingLocationId\tTargetingLocationName\tClicks\tCost\tImpressions\n"
+            "213\tМосква\t1000\t50000.00\t20000\n"
+            "1\tМосковская область\t400\t18000.00\t9000\n"
+        )
+
+    monkeypatch.setattr(segments, "_run_report", _fake)
+    rows, _goal = segments.fetch_segment_report(
+        "cab", "region", "2026-08-06", "2026-08-20")
+
+    # Оба поля в одном запросе: отдельный проход за именами удвоил бы отчёты.
+    assert captured["fields"][:2] == ["TargetingLocationId",
+                                      "TargetingLocationName"]
+    by_key = {r["slice_key"]: r for r in rows}
+    assert by_key["213"]["slice_label"] == "Москва"
+    assert by_key["213"]["clicks"] == 1000
+    # Ключ проходит писателя: до правки plan отбивал его как нечисловой.
+    assert plan.direct_type_for("bid_modifier:region", "213")[0] == \
+        "REGIONAL_ADJUSTMENT"
+
+
+def test_non_region_slices_have_no_label(monkeypatch):
+    """У остальных срезов ключ сам себе имя — второе поле не запрашивается."""
+    captured = {}
+
+    def _fake(login, payload):
+        captured["fields"] = payload["params"]["FieldNames"]
+        return "Device\tClicks\tCost\tImpressions\nMOBILE\t10\t100.0\t50\n"
+
+    monkeypatch.setattr(segments, "_run_report", _fake)
+    rows, _goal = segments.fetch_segment_report(
+        "cab", "device", "2026-08-06", "2026-08-20")
+    assert "TargetingLocationName" not in captured["fields"]
+    assert rows[0]["slice_label"] == ""

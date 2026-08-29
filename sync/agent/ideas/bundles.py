@@ -281,6 +281,10 @@ def segment_bundles(
     """
     totals: Dict[Tuple[str, str, str], Dict[str, float]] = {}
     by_campaign: Dict[Tuple[str, str], Dict[str, float]] = {}
+    # Читаемое имя ключа (регион): ключ числовой, и «213» в идее человеку
+    # ничего не говорит. В адрес связки имя не входит — им управляет
+    # справочник Директа, а переименование не должно менять idea_id.
+    labels: Dict[str, str] = {}
     skipped: List[Dict[str, Any]] = []
     for row in sliced_rows or ():
         if not isinstance(row, dict):
@@ -299,6 +303,8 @@ def segment_bundles(
             skipped.append({"campaign_id": campaign_id, "segment": kind,
                             "reason": REASON_NO_SEGMENT_KEY})
             continue
+        if row.get("slice_label"):
+            labels[key] = str(row["slice_label"])
         slot = totals.setdefault((campaign_id, kind, key),
                                  {"clicks": 0.0, "leads": 0.0, "cost": 0.0})
         base = by_campaign.setdefault((campaign_id, kind),
@@ -318,7 +324,8 @@ def segment_bundles(
         bundle: Dict[str, Any] = {
             "account": entry["account"],
             "campaign_id": campaign_id,
-            "segment": {"kind": setting_kind, "key": key},
+            "segment": {"kind": setting_kind, "key": key,
+                        **({"label": labels[key]} if key in labels else {})},
             "counts": {"clicks": counts["clicks"], "leads": counts["leads"]},
             "daily_cost_rub": (counts["cost"] / window_days
                                if window_days > 0 else None),

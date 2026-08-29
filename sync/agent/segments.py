@@ -43,20 +43,25 @@ OBJECT_WORKERS = 4
 # а HourOfDay отвергается ошибкой 8000 — почасовой детализации расхода
 # CUSTOM_REPORT не отдаёт вообще. Расписание считается на Э1 из Метрики.
 #
-# Регион отдаётся НАЗВАНИЕМ (TargetingLocationName), а RegionalAdjustment в
-# API записи требует числовой RegionId. Кандидат TargetingLocationId probe-ом
-# не проверялся (probe_report_fields.py его теперь спрашивает), поэтому поле
-# здесь не меняем вслепую: отказ по 8000 обрушил бы весь региональный срез,
-# который сейчас работает и нужен витрине. До ответа probe региональные
-# корректировки не ПРИМЕНЯЮТСЯ — с явной причиной в отчёте прогона
-# (sync/agent/writer/plan.py::UNSUPPORTED_REGION_REASON), а не падают на
-# int("Москва") с вечным переприменением.
+# Регион берётся ЧИСЛОМ. RegionalAdjustment в API записи требует RegionId, а
+# TargetingLocationName отдаёт «Москва» — на таком ключе региональные
+# корректировки не применялись вовсе (167 отказов за прогон 29.08.2026).
+# TargetingLocationId проверен probe-ом (run 33248004571: OK), поэтому ключ —
+# он, а название едет рядом отдельным полем: слепым ключ делать нельзя, «213»
+# в идее человеку ничего не говорит.
 SEGMENT_FIELDS = {
     "device": "Device",
     "gender": "Gender",
     "age": "Age",
-    "region": "TargetingLocationName",
+    "region": "TargetingLocationId",
     "network": "AdNetworkType",
+}
+
+# Читаемое имя сегмента. Есть только у региона: у остальных срезов ключ сам
+# себе имя (MOBILE, GENDER_MALE). Пара запрашивается одним запросом — Id и
+# Name одного региона идут в одной строке отчёта и лишних строк не порождают.
+SEGMENT_LABEL_FIELDS = {
+    "region": "TargetingLocationName",
 }
 
 # Тексты объявлений живут НЕ в FieldNames, а в отдельном TextAdFieldNames — ads.get
@@ -248,7 +253,10 @@ def fetch_segment_report(
 
     Возвращает (строки, паспорт выбранной цели) — см. chosen_goal."""
     field = SEGMENT_FIELDS[segment_kind]
+    label_field = SEGMENT_LABEL_FIELDS.get(segment_kind)
     fields = [field, "Clicks", "Cost", "Impressions"]
+    if label_field:
+        fields.insert(1, label_field)
     if goals:
         fields.append("Conversions")
     if by_campaign:
@@ -278,6 +286,7 @@ def fetch_segment_report(
             "segment_kind": segment_kind,
             "segment_key": rec.get(field, ""),
             "slice_key": rec.get(field, ""),
+            "slice_label": rec.get(label_field, "") if label_field else "",
             "clicks": _cell_int(rec.get("Clicks")),
             "impressions": _cell_int(rec.get("Impressions")),
             "conversions": _cell_int(rec.get(goal_column)) if goal_column else 0,

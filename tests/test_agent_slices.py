@@ -72,3 +72,30 @@ def test_collapse_tail_does_not_mix_campaigns_or_weeks():
 def test_empty_input():
     assert build_sliced_facts([], "device") == []
     assert collapse_tail([], min_clicks=30) == []
+
+
+def test_sliced_facts_carry_the_readable_label():
+    """Имя ключа доезжает до недельной строки: ключ региона числовой."""
+    rows = build_sliced_facts([
+        {"date": "2026-08-10", "campaign_id": "1", "slice_key": "213",
+         "slice_label": "Москва", "clicks": 40, "cost": 100.0,
+         "impressions": 500, "conversions": 3},
+        {"date": "2026-08-11", "campaign_id": "1", "slice_key": "213",
+         "slice_label": "Москва", "clicks": 10, "cost": 20.0,
+         "impressions": 100, "conversions": 1},
+    ], "region")
+    assert len(rows) == 1
+    assert rows[0]["slice_key"] == "213"
+    assert rows[0]["slice_label"] == "Москва"
+    assert rows[0]["clicks"] == 50
+
+
+def test_collapsed_tail_is_named_too():
+    """Свёрнутый хвост тоже читается: 'other' без имени — строка ни о чём."""
+    rows = collapse_tail([
+        {"week_start": "2026-08-10", "campaign_id": "1", "slice_kind": "region",
+         "slice_key": "17", "slice_label": "Тверь", "clicks": 2, "cost": 5.0,
+         "impressions": 10, "conversions": 0},
+    ])
+    assert rows[0]["slice_key"] == "other"
+    assert rows[0]["slice_label"] == "прочие"

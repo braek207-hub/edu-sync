@@ -35,8 +35,14 @@ def build_sliced_facts(report_rows: List[Dict[str, Any]], slice_kind: str) -> Li
             "campaign_id": str(r["campaign_id"]),
             "slice_kind": slice_kind,
             "slice_key": str(r["slice_key"]),
+            # Читаемое имя ключа (регион). Пустое у срезов, где ключ сам себе
+            # имя. Последнее непустое побеждает: переименование региона в
+            # справочнике Директа не должно делить строку надвое — ключ тот же.
+            "slice_label": "",
             "cost": 0.0, "clicks": 0, "impressions": 0, "conversions": 0,
         })
+        if r.get("slice_label"):
+            slot["slice_label"] = str(r["slice_label"])
         slot["cost"] += float(r.get("cost") or 0.0)
         slot["clicks"] += int(r.get("clicks") or 0)
         slot["impressions"] += int(r.get("impressions") or 0)
@@ -58,6 +64,7 @@ def collapse_tail(rows: List[Dict[str, Any]], min_clicks: int = MIN_CLICKS_KEEP)
             "campaign_id": r["campaign_id"],
             "slice_kind": r["slice_kind"],
             "slice_key": "other",
+            "slice_label": "прочие",
             "cost": 0.0, "clicks": 0, "impressions": 0, "conversions": 0,
         })
         slot["cost"] += float(r.get("cost") or 0.0)
