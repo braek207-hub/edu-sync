@@ -1275,6 +1275,23 @@ def main() -> int:
         rows_for_login, query_goal = fetch_search_queries(
             login, queries_from, date_to, goals=goals)
         queries_by_login[login] = rows_for_login
+        # Второй источник справочника «кампания → кабинет», и он сильнее
+        # первого там, где первый молчит. campaigns.get не отдаёт кампании
+        # «Мастер кампаний» вовсе (sync/agent/master.py), а Reports API про
+        # них знает всё: отчёт запросов возвращает их строки тысячами. Раз
+        # отчёт КАБИНЕТА вернул кампанию, она этого кабинета — это факт, а не
+        # вывод. Замер 29.08.2026: пять кампаний Мастера на 1 678 168 ₽
+        # расхода отказывались адресоваться («проект встречается сразу в
+        # нескольких кабинетах»), и вся зона уходила из идей молча.
+        #
+        # setdefault, а не присваивание: ответ campaigns.get полнее (он видит
+        # и архивные, у которых расхода в окне нет), и перетирать его строкой
+        # отчёта незачем. Противоречия между источниками быть не может —
+        # кампания живёт ровно в одном кабинете.
+        for row in rows_for_login:
+            campaign_id = str(row.get("campaign_id") or "").strip()
+            if campaign_id:
+                login_by_campaign_id.setdefault(campaign_id, login)
         query_goals.append({"account": login, **query_goal})
     agent_db.upsert_objects(object_rows)
     query_rows = top_queries_by_cost(
