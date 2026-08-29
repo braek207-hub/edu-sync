@@ -95,7 +95,7 @@ from sync.agent.objects import (
     CANDIDATE_WINDOW_DAYS,
     minus_word_candidates,
     placement_candidates,
-    core_words_by_campaign,
+    own_semantics,
     phrases_cutting_only_waste,
     expansion_candidates,
     word_minus_candidates,
@@ -1121,10 +1121,21 @@ def main() -> int:
     # «университет синергия красноярск», который расширение в этом же отчёте
     # предлагало докупить. Семейство считается по ВСЕМ запросам кабинета, а не
     # по топу scored_queries: окупающийся хвост живёт как раз вне топа.
+    # Что мы купили — из снимка структуры кабинета, а не из колонки
+    # matched_key отчёта запросов. В matched_key Директ возвращает и подбор
+    # автотаргетинга: из 32 266 строк, где он совпадает с самим запросом
+    # (7,70 млн ₽), ключами кабинета оказались 625 — 1,9 % (замер 29.08.2026).
+    # Защита принимала остальные 31 641 за нашу закупку и не давала минусовать
+    # ровно тот мусор, ради которого рычаг существует. Снимок знает и спящие
+    # ключи, которых в отчёте нет вовсе: минус поверх такого ключа убил бы его
+    # будущие показы молча.
+    own_words, own_phrases = own_semantics(
+        seeing_queries, agent_db.load_keywords_by_campaign())
     minus_dropped: List[Dict[str, Any]] = []
     if minus_candidates:
         minus_candidates, minus_dropped = phrases_cutting_only_waste(
-            minus_candidates, seeing_queries, cpa_limit=cpa_limit)
+            minus_candidates, seeing_queries, cpa_limit=cpa_limit,
+            bought=own_phrases)
     # Минус-СЛОВА поверх минус-фраз: отдельная фраза почти никогда не набирает
     # объём для приговора (при базовой конверсии в проценты сотня кликов без
     # конверсий — редкость), а слово, общее для полусотни фраз, набирает и
@@ -1136,11 +1147,11 @@ def main() -> int:
     # (writer/negatives: object_level="campaign"), и слово, купленное в
     # соседней кампании, здесь нашей закупкой не является. Общий на кабинет
     # список снимал 2156 слов-кандидатов из 2163 (замер 29.08.2026) — то есть
-    # рычаг минус-слов не работал вовсе.
-    protected_words = core_words_by_campaign(seeing_queries)
+    # рычаг минус-слов не работал вовсе. Источник ключей — тот же снимок
+    # структуры, что и у фраз (own_semantics выше).
     word_candidates = (word_minus_candidates(seeing_queries, cpa_limit=cpa_limit,
                                              base_conversion=base_conversion,
-                                             protected_words=protected_words)
+                                             protected_words=own_words)
                        if cpa_limit > 0 else [])
 
     # Расширение семантики — зеркало минусации: запросы, которые уже

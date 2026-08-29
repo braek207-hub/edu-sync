@@ -273,6 +273,68 @@ def test_word_from_our_own_keywords_is_protected():
     assert not [r for r in out if r["query"] == "институты"]
 
 
+def test_own_semantics_come_from_the_structure_snapshot_not_the_report():
+    # Колонка matched_key отчёта запросов НЕ равна «что мы купили»: Директ
+    # возвращает в ней и подбор автотаргетинга. Замер 29.08.2026: из 32 266
+    # строк, где matched_key совпадает с самим запросом (7,70 млн ₽), ключами
+    # кабинета оказались 625 — 1,9 %. Защита принимала остальные за нашу
+    # закупку и не давала минусовать ровно тот мусор, ради которого рычаг есть.
+    from sync.agent.objects import own_semantics
+    queries = [
+        {"campaign_id": "1", "query": "диплом купить срочно",
+         "matched_key": "диплом купить срочно"},
+    ]
+    words, phrases = own_semantics(queries, {"1": ["институты москвы"]})
+    assert words["1"] == {"институты", "москвы"}
+    assert frozenset({"диплом", "купить", "срочно"}) not in phrases["1"]
+
+
+def test_sleeping_keyword_is_protected_though_the_report_never_saw_it():
+    # Ключ без показов в окне отчёт не покажет вовсе, а минус поверх него убил
+    # бы его будущие показы молча. Снимок структуры знает такие ключи — ради
+    # этого он и стал источником.
+    from sync.agent.objects import own_semantics
+    words, phrases = own_semantics([], {"1": ["заочное обучение москва"]})
+    assert "заочное" in words["1"]
+    assert frozenset({"заочное", "обучение", "москва"}) in phrases["1"]
+
+
+def test_campaign_missing_from_the_snapshot_falls_back_to_matched_key():
+    # Пробел синка — не разрешение минусовать свои ключи. Кампании, которой в
+    # снимке нет вовсе (3 кампании, 0,59 млн ₽ в замере 29.08.2026), защита
+    # достаётся из прежнего источника.
+    from sync.agent.objects import own_semantics
+    queries = [
+        {"campaign_id": "9", "query": "мти институт отзывы",
+         "matched_key": "мти институт"},
+    ]
+    words, phrases = own_semantics(queries, {"1": ["институты москвы"]})
+    assert words["9"] == {"мти", "институт"}
+    assert frozenset({"мти", "институт"}) in phrases["9"]
+
+
+def test_campaign_with_structure_but_no_keywords_is_protected_by_nothing():
+    # Мастер кампаний и автотаргетинг: структура снята, ключей в кампании нет
+    # (6 кампаний, 1,03 млн ₽ в замере 29.08.2026). Это факт, а не пробел
+    # данных, — защищать нечего, и откат на matched_key был бы ошибкой.
+    from sync.agent.objects import own_semantics
+    queries = [
+        {"campaign_id": "1", "query": "диплом купить", "matched_key": "диплом купить"},
+    ]
+    words, phrases = own_semantics(queries, {"1": []})
+    assert words["1"] == set()
+    assert phrases["1"] == set()
+
+
+def test_direct_operators_do_not_leak_into_the_protection():
+    # Ключ кабинета несёт операторы («+в», «!москва», кавычки), а минус-фраза
+    # их не различает. Слово с приклеенным оператором защитило бы не то.
+    from sync.agent.objects import own_semantics
+    words, phrases = own_semantics([], {"1": ['"!институты +в москве"']})
+    assert words["1"] == {"институты", "москве"}
+    assert frozenset({"институты", "в", "москве"}) in phrases["1"]
+
+
 def test_word_protection_covers_only_the_campaign_that_bought_it():
     # Запрет пишется В КАМПАНИЮ, значит и «своим» слово бывает по кампаниям.
     # Общая на кабинет защита снимала 2156 слов-кандидатов из 2163 (замер по

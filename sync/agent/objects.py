@@ -357,6 +357,61 @@ def core_words_by_campaign(queries: List[Dict[str, Any]]) -> Dict[str, set]:
     return out
 
 
+def own_semantics(
+    queries: List[Dict[str, Any]],
+    keywords_by_campaign: Optional[Dict[str, List[str]]] = None,
+) -> Tuple[Dict[str, set], Dict[str, set]]:
+    """Что мы купили — по кампаниям: (слова ядра, фразы ядра).
+
+    Источник правды — снимок структуры кабинета (agent_db.load_keywords_by_
+    campaign), а НЕ колонка matched_key отчёта запросов. Замер последнего окна:
+    из 32 266 строк с matched_key == query ключами кабинета оказались 625
+    (1,9 %) — остальное подбор автотаргетинга, который защита принимала за
+    нашу закупку и не давала минусовать. Плюс отчёт не знает спящих ключей: у
+    них нет показов в окне, а минус поверх такого ключа убил бы его будущие
+    показы молча.
+
+    Кампания, которой в снимке нет вовсе (синк её не видел), откатывается на
+    прежний источник — matched_key этой кампании. Пустая защита на пробеле
+    данных означала бы, что первый же сбой синка разрешает минусовать
+    собственные ключи; отсутствие снимка — не разрешение.
+
+    Кампания, снятая со СТРУКТУРОЙ, но без ключей (Мастер кампаний,
+    автотаргетинг — 6 кампаний, 1,03 млн ₽ в последнем окне), получает пустую
+    защиту законно: ключей там правда нет, и защищать нечего.
+
+    Операторы Директа («+в», «!москва», «[москва]», кавычки) отпадают сами:
+    и слова, и фразы разбираются одним _WORD_RE, а минус-фраза операторов
+    исходного ключа всё равно не различает.
+    """
+    known = keywords_by_campaign or {}
+    words: Dict[str, set] = {}
+    phrases: Dict[str, set] = {}
+    for campaign_id, keywords in known.items():
+        campaign = str(campaign_id)
+        words.setdefault(campaign, set())
+        phrases.setdefault(campaign, set())
+        for keyword in keywords:
+            text = str(keyword or "").lower()
+            words[campaign].update(w for w in _WORD_RE.findall(text)
+                                   if len(w) >= MIN_WORD_CHARS)
+            phrase = _phrase_words(text)
+            if phrase:
+                phrases[campaign].add(phrase)
+
+    for q in queries:
+        campaign = str(q.get("campaign_id") or "")
+        if not campaign or campaign in known:
+            continue
+        key = str(q.get("matched_key") or "").lower()
+        words.setdefault(campaign, set()).update(
+            w for w in _WORD_RE.findall(key) if len(w) >= MIN_WORD_CHARS)
+        phrase = _phrase_words(key)
+        if phrase:
+            phrases.setdefault(campaign, set()).add(phrase)
+    return words, phrases
+
+
 def _phrase_words(text: Any) -> frozenset:
     """Слова фразы — ВСЕ, включая короткие.
 
