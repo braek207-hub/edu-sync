@@ -251,8 +251,7 @@ def _patch_e0_run(monkeypatch, reports=None):
     monkeypatch.setattr(agent_e0, "mine_quasi_experiments", lambda *a, **k: [])
     monkeypatch.setattr(agent_e0, "build_profile", lambda *a, **k: {})
     monkeypatch.setattr(agent_e0, "power_report", lambda *a, **k: {})
-    monkeypatch.setattr(agent_e0, "fetch_campaign_ids_by_scope",
-                        lambda *a, **k: ([], []))
+    monkeypatch.setattr(agent_e0, "fetch_campaign_ids", lambda *a, **k: [])
     monkeypatch.setattr(agent_e0, "fetch_objects", lambda *a, **k: [])
     monkeypatch.setattr(agent_e0, "fetch_search_queries",
                         lambda *a, **k: ([], {"goal_column": "Conversions_111_LSCCD", "conversions": 7, "columns_offered": 1}))
@@ -260,10 +259,12 @@ def _patch_e0_run(monkeypatch, reports=None):
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
         # Числа отдаёт только срез по устройствам: пол и возраст оставлены
-        # пустыми, чтобы разбивка отчёта читалась однозначно.
+        # пустыми, чтобы разбивка отчёта читалась однозначно. Расчётный такт
+        # узнаётся по with_date=False: разрез по кампаниям теперь просят оба,
+        # и by_campaign их больше не различает.
         lambda login, kind, date_from, date_to, by_campaign=False, goals=(),
-               own_campaign_ids=():
-            ([] if (by_campaign or kind != "device")
+               with_date=True:
+            ([] if (with_date or kind != "device")
              else list(by_login.get(login, [])),
              {"goal_column": "Conversions_111_LSCCD", "conversions": 1,
               "columns_offered": 1}),
@@ -497,7 +498,7 @@ def test_main_sends_account_goals_into_the_report_request(monkeypatch, capsys):
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
         lambda login, kind, date_from, date_to, by_campaign=False, goals=(),
-               own_campaign_ids=():
+               with_date=True:
             (seen_goals.append(list(goals)) or [], {"goal_column": "Conversions_111_LSCCD", "conversions": 7, "columns_offered": 1}))
 
     assert agent_e0.main() == 0
@@ -628,9 +629,8 @@ def test_each_counter_profile_goes_to_its_own_account_only(monkeypatch, capsys):
     monkeypatch.setenv("YM_TOKEN", "test-token")
     monkeypatch.setattr(agent_e0, "EDU_COUNTERS", [111, 222])
     # Счётчик 111 видит кампанию acc-1, счётчик 222 — кампанию acc-2.
-    monkeypatch.setattr(agent_e0, "fetch_campaign_ids_by_scope",
-                        lambda login: ([111], []) if login == "acc-1"
-                        else ([222], []))
+    monkeypatch.setattr(agent_e0, "fetch_campaign_ids",
+                        lambda login: [111] if login == "acc-1" else [222])
     monkeypatch.setattr(agent_e0, "assemble_facts", lambda *a, **k: [
         dict(_fact(_today()), campaign_id="111", campaign_name="к1"),
         dict(_fact(_today()), campaign_id="222", campaign_name="к2"),
@@ -679,8 +679,7 @@ def test_counter_without_an_account_is_reported_not_broadcast(monkeypatch, capsy
     calls = _patch_e0_run(monkeypatch)
     monkeypatch.setenv("YM_TOKEN", "test-token")
     monkeypatch.setattr(agent_e0, "EDU_COUNTERS", [111])
-    monkeypatch.setattr(agent_e0, "fetch_campaign_ids_by_scope",
-                        lambda login: ([], []))
+    monkeypatch.setattr(agent_e0, "fetch_campaign_ids", lambda login: [])
     monkeypatch.setattr(agent_e0, "fetch_campaign_behavior",
                         lambda *a, **k: [{"campaign_name": "ничья", "visits": 10,
                                           "bounces": 1, "pageviews": 20,
@@ -1039,10 +1038,10 @@ def test_main_writes_campaign_level_device_modifiers(monkeypatch, capsys):
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
         lambda login, kind, date_from, date_to, by_campaign=False, goals=(),
-               own_campaign_ids=():
-            ((list(campaign_rows) if (by_campaign and kind == "device"
-                                      and login == "acc-1") else [])
-             if by_campaign else
+               with_date=True:
+            ((list(campaign_rows) if (kind == "device" and login == "acc-1")
+              else [])
+             if with_date else
              (list(_REPORTS_BY_LOGIN.get(login, [])) if kind == "device" else []),
              {"goal_column": "Conversions_111_LSCCD", "conversions": 1,
               "columns_offered": 1}),
@@ -1529,12 +1528,12 @@ def test_main_keeps_foreign_campaigns_out_of_sliced_facts(monkeypatch, capsys):
     monkeypatch.setattr(
         agent_e0, "fetch_segment_report",
         lambda login, kind, date_from, date_to, by_campaign=False, goals=(),
-               own_campaign_ids=():
+               with_date=True:
             ([{"segment_kind": kind, "segment_key": "MOBILE", "slice_key": "MOBILE",
                "slice_label": "", "clicks": 10, "impressions": 100,
                "conversions": 1, "cost": 100.0,
                "campaign_id": cid, "date": _today()}
-              for cid in ("111", "710118280")] if by_campaign else [],
+              for cid in ("111", "710118280")] if with_date else [],
              {"goal_column": "Conversions_111_LSCCD", "conversions": 1,
               "columns_offered": 1}),
     )

@@ -249,36 +249,23 @@ def chosen_goal(records: List[Dict[str, str]], goal_column: Optional[str]) -> Di
 def fetch_segment_report(
     login: str, segment_kind: str, date_from: str, date_to: str,
     by_campaign: bool = False, goals: List[str] = (),
-    own_campaign_ids: Iterable[Any] = (),
+    with_date: bool = True,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Срез за окно. by_campaign=True добавляет разрез по кампаниям и датам —
-    для edu_agent_facts_sliced; без него агрегат по аккаунту для корректировок.
+    """Срез за окно. by_campaign=True добавляет разрез по кампаниям.
 
-    own_campaign_ids — кампании кабинета, которые агент ведёт. Непустой
-    список сужает КАБИНЕТНЫЙ агрегат до них условием запроса: в его ответе по
-    строке на сегмент, CampaignId там нет вовсе, и расход чужих РК иначе
-    оседает в знаменателе конверсионности сегмента — то есть в кабинетных
-    корректировках ставок.
+    Условия в запросе не бывает никогда — ни в каком виде. «Всё кроме этих
+    кампаний» Reports API выразить не умеет: замер 30.08.2026 (run
+    33274646184) получил ошибку 4001 «для поля CampaignId допустимы только
+    операторы EQUALS, IN», а перечисление своих через IN выбросило бы из
+    ответа кампании Мастера — campaigns.get их не отдаёт вовсе
+    (sync/agent/master.py), и агент потерял бы их расход, отсекая семь чужих
+    РК. Поэтому чужие режутся по строкам, где CampaignId есть, а кабинетные
+    числа складываются в Python (aggregate_account_rows).
 
-    Почему перечисляются СВОИ кампании, а не исключённые. Замер 30.08.2026
-    (probe-report-filter, run 33274646184) получил от Директа ошибку 4001:
-    «для поля CampaignId, указанного в Filter.Field, допустимы только
-    операторы EQUALS, IN» для типа отчёта CUSTOM_REPORT. Оператора NOT_IN не
-    существует, и «всё кроме этих семи» в этом API выражается единственным
-    способом — перечислением всего остального.
-
-    Цена такого выражения: агрегат сужается и до кампаний, которых
-    campaigns.get не отдаёт вовсе (Мастер кампаний, см. sync/agent/master.py).
-    Поэтому вызывающий сужает ТОЛЬКО кабинеты, где чужие РК действительно
-    есть, — платить эту цену там, где исключать нечего, не за что.
-
-    Покампанийный срез (by_campaign=True) условия не получает никогда: он
-    режется по строкам выше по течению, где CampaignId есть, и сужение
-    запроса выбросило бы из него Мастер кампаний без всякой нужды.
-
-    Пустой список условия НЕ добавляет: тело запроса обязано остаться
-    прежним — от него считается имя отчёта (_stamp_report_name), и лишний
-    ключ означал бы пересборку всех отчётов.
+    with_date=False убирает из разреза дату: кабинетному агрегату она не
+    нужна (числа всё равно суммируются по всему окну), а лишний разрез
+    умножает объём ответа на число дней окна. Покампанийным фактам
+    (edu_agent_facts_sliced) дата нужна — там недели.
 
     Возвращает (строки, паспорт выбранной цели) — см. chosen_goal."""
     field = SEGMENT_FIELDS[segment_kind]
@@ -289,16 +276,9 @@ def fetch_segment_report(
     if goals:
         fields.append("Conversions")
     if by_campaign:
-        fields = ["CampaignId", "Date"] + fields
+        fields = (["CampaignId", "Date"] if with_date else ["CampaignId"]) + fields
 
     criteria: Dict[str, Any] = {"DateFrom": date_from, "DateTo": date_to}
-    # Значения сортируются и приводятся к строкам: тело запроса обязано быть
-    # детерминированным, иначе имя отчёта (хеш тела) скачет от порядка
-    # множества в памяти и каждый прогон заказывает отчёт заново.
-    own = sorted({str(cid) for cid in own_campaign_ids or ()})
-    if own and not by_campaign:
-        criteria["Filter"] = [{"Field": "CampaignId", "Operator": "IN",
-                               "Values": own}]
 
     payload = {
         "params": _with_goals({
@@ -332,9 +312,53 @@ def fetch_segment_report(
         }
         if by_campaign:
             row["campaign_id"] = rec.get("CampaignId", "")
-            row["date"] = rec.get("Date", "")
+            if with_date:
+                row["date"] = rec.get("Date", "")
         rows.append(row)
     return rows, chosen_goal(records, goal_column)
+
+
+# Поля, которые складываются при сборке кабинетного агрегата. Остальные —
+# описание сегмента, у строк одного segment_key они совпадают.
+_SUMMED_FIELDS = ("clicks", "impressions", "conversions")
+
+
+def aggregate_account_rows(
+    rows: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Покампанийные строки среза -> кабинетный агрегат. Чистая функция.
+
+    Заменяет отдельный запрос агрегата у Директа, и не ради экономии: в
+    ответе агрегата нет CampaignId, и отсечь в нём чужие РК нечем — их клики
+    оседали бы в знаменателе конверсионности сегмента, то есть в кабинетных
+    корректировках ставок. Отсечение делается ВЫШЕ по течению
+    (scope.drop_campaign_ids), пока Id ещё есть; сюда приходят только свои.
+
+    Порядок результата детерминированный (по segment_key): настройки пишутся
+    в базу пачкой, и стабильный порядок делает diff двух прогонов читаемым.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = str(row.get("segment_key", ""))
+        slot = out.get(key)
+        if slot is None:
+            slot = out[key] = {
+                "segment_kind": row.get("segment_kind"),
+                "segment_key": key,
+                "slice_key": row.get("slice_key", key),
+                "slice_label": row.get("slice_label", ""),
+                "clicks": 0, "impressions": 0, "conversions": 0, "cost": 0.0,
+            }
+        # Метка сегмента приходит не от каждой кампании (у части строк она
+        # пустая), а нужна ровно одна — первая непустая.
+        if not slot["slice_label"] and row.get("slice_label"):
+            slot["slice_label"] = row["slice_label"]
+        for field in _SUMMED_FIELDS:
+            slot[field] += int(row.get(field) or 0)
+        slot["cost"] += float(row.get("cost") or 0.0)
+    for slot in out.values():
+        slot["cost"] = round(slot["cost"], 2)
+    return [out[key] for key in sorted(out)]
 
 
 # Сколько раз повторяется ЧТЕНИЕ при обрыве транспорта. Чтение идемпотентно:
@@ -384,22 +408,15 @@ def _api_post(url: str, login: str, payload: Dict[str, Any], what: str,
     raise last_error  # недостижимо: последняя попытка либо вернула, либо подняла
 
 
-def fetch_campaign_ids_by_scope(login: str) -> Tuple[List[int], List[int]]:
-    """Кампании кабинета, разложенные границей: (свои, чужие).
+def fetch_campaign_ids(login: str) -> List[int]:
+    """Кампании кабинета в зоне ответственности агента.
 
     Имя запрашивается ради самой границы (sync/agent/scope.py): кампании вне
     её различаются только по нему, а этот список раздаёт Id снимку структуры,
-    справочнику «кампания → кабинет» и через него — адресации идей. Без
+    справочнику «кампания -> кабинет» и через него — адресации идей. Без
     "Name" в FieldNames фильтру нечего сравнивать.
-
-    Чужие возвращаются вторым списком, а не выбрасываются молча: по ним
-    кабинет узнаётся как «есть что исключать», и только такому кабинету
-    достаётся сужающее условие кабинетного агрегата (fetch_segment_report).
-    Один проход campaigns.get отдаёт обе стороны — второй запрос ради счёта
-    чужих был бы тем же ответом, спрошенным дважды.
     """
     out: List[int] = []
-    foreign: List[int] = []
     offset = 0
     while True:
         result = _api_post(
@@ -416,19 +433,15 @@ def fetch_campaign_ids_by_scope(login: str) -> Tuple[List[int], List[int]]:
             "campaigns.get",
         )
         items = result.get("Campaigns") or []
-        for campaign in items:
-            side = (foreign if agent_scope.is_excluded_campaign(campaign.get("Name"))
-                    else out)
-            side.append(int(campaign["Id"]))
+        out += [int(c["Id"]) for c in
+                agent_scope.filter_campaign_rows(items, name_key="Name")]
+        # Постранично считается ВЕСЬ ответ, а не оставшееся после границы:
+        # отфильтрованная страница короче лимита, и обход оборвался бы на
+        # первой же странице с чужой кампанией.
         if len(items) < PAGE_LIMIT:
             break
         offset += PAGE_LIMIT
-    return out, foreign
-
-
-def fetch_campaign_ids(login: str) -> List[int]:
-    """Только свои кампании кабинета — второе имя той же выборки."""
-    return fetch_campaign_ids_by_scope(login)[0]
+    return out
 
 
 # Состояния, которыми кампанию из кабинета уже не спрятать. Список полный
