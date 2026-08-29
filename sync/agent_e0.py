@@ -750,14 +750,30 @@ def funnel_ladder_section(
     by_campaign: Dict[str, Dict[str, float]] = {}
     by_direction: Dict[str, Dict[str, float]] = {}
     account = _zero()
-    direction_of: Dict[str, str] = {}
+    # Направление кампании — по ВСЕМ фактам, а не только по зрелому окну.
+    # Ступень и коэффициенты перехода считать вне окна нельзя (там оплаты не
+    # доехали), а вот средний чек берётся у НАПРАВЛЕНИЯ, и кампании,
+    # запущенной после окна, он известен ровно так же, как старой: направление
+    # у неё есть сегодня.
+    #
+    # Цена ошибки измерена на прогоне 29.08.2026: сдвиг окна равен 178 дням
+    # (p90 лага оплаты), окно 2025-12-04…2026-03-04, в нём 26 кампаний из 89
+    # живых — то есть 18,0 млн ₽ расхода за 28 дней остались без чека, и
+    # генератор связок отказал 1221 раз «не посчитан средний чек». Сдвиг
+    # растёт вместе с лагом оплаты, поэтому дефект самовосстанавливающийся:
+    # свежая кампания не попадёт в окно НИКОГДА.
+    #
+    # Последний факт побеждает: направление кампании меняет человек в
+    # классификаторе, и сегодняшнее вернее полугодовалого.
+    direction_of: Dict[str, str] = {
+        str(f["campaign_id"]): (f.get("direction") or "БЕЗ_НАПРАВЛЕНИЯ")
+        for f in sorted(facts, key=lambda f: str(f["fact_date"])[:10])}
     for f in facts:
         fact_date = str(f["fact_date"])[:10]
         if not (window_from <= fact_date <= window_to):
             continue
         campaign_id = str(f["campaign_id"])
-        direction = f.get("direction") or "БЕЗ_НАПРАВЛЕНИЯ"
-        direction_of[campaign_id] = direction
+        direction = direction_of[campaign_id]
         camp = by_campaign.setdefault(campaign_id, _zero())
         direct = by_direction.setdefault(direction, _zero())
         for step, field in _LADDER_FIELDS.items():
@@ -785,10 +801,13 @@ def funnel_ladder_section(
         )
         for campaign_id in by_campaign
     }
+    # Чек — каждой известной такту кампании, а не только жившим в окне: ключ
+    # чека это направление, и ограничивать раздачу окном значило бы отдавать
+    # экономику только кампаниям старше полугода (см. direction_of выше).
     checks = {
-        campaign_id: avg_check[direction_of[campaign_id]]
-        for campaign_id in by_campaign
-        if direction_of[campaign_id] in avg_check
+        campaign_id: avg_check[direction]
+        for campaign_id, direction in direction_of.items()
+        if direction in avg_check
     }
     report = ladder_report(by_campaign, pools, avg_check_by_object=checks)
     report["maturity_days"] = maturity_days

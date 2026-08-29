@@ -982,6 +982,34 @@ def test_ladder_section_avg_check_comes_from_direction():
     assert section["by_object"]["c1"]["expected_revenue"] == 25 * 150000
 
 
+def test_ladder_section_gives_a_check_to_a_campaign_younger_than_the_window():
+    """Кампания моложе сдвинутого окна получает чек своего направления.
+
+    Окно решений сдвинуто назад на p90 лага оплаты, и у образования этот лаг
+    измеряется месяцами: прогон 29.08.2026 дал сдвиг 178 дней, окно
+    2025-12-04…2026-03-04 и 26 кампаний из 89 живых. Ступень и коэффициенты
+    вне окна считать нельзя — там оплаты не доехали. Чек считать можно: он
+    принадлежит НАПРАВЛЕНИЮ, а направление у свежей кампании есть сегодня.
+    Без этого генератор связок отказывал 1221 раз «не посчитан средний чек»
+    на 18,0 млн ₽ расхода, и отказ был вечным: сдвиг растёт вместе с лагом,
+    свежая кампания в окно не попадёт никогда.
+    """
+    today = date(2026, 8, 22)
+    # Лаг 30 дней → окно 2026-04-24…2026-07-23.
+    leads = [_ladder_lead("2026-05-01", "spo", paid_on="2026-05-31",
+                          revenue=150000)]
+    facts = [
+        _ladder_fact("2026-07-01", "old", "spo", payments_fact=25, deals=50,
+                     connected_leads=100, eff_leads=200),
+        # Запущена ПОСЛЕ окна: своей ступени у неё нет и быть не может.
+        _ladder_fact("2026-08-21", "fresh", "spo", clicks=500),
+    ]
+    section = agent_e0.funnel_ladder_section(facts, leads, today=today)
+    assert "fresh" not in section["by_object"]
+    assert section["avg_check"]["fresh"] == 150000
+    assert section["avg_check"]["old"] == 150000
+
+
 def test_ladder_section_distribution_names_campaigns_without_step():
     today = date(2026, 8, 22)
     facts = [_ladder_fact("2026-07-01", "thin", "spo", clicks=10)]
