@@ -998,7 +998,9 @@ def test_live_spent_risk_still_counts_row_awaiting_manual_rollback():
         assert spent_risk(week) == with_action
 
         writer_db.mark_rolled_back(action_id)
-        assert spent_risk(week) == with_action - 777.0
+        # Откат не освобождает неделю: экспозиция уже случилась
+        # (RISK_CHARGED_STATUSES включает rolled_back).
+        assert spent_risk(week) == with_action
     finally:
         _cleanup(key)
 
