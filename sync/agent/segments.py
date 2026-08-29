@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from sync.agent import scope as agent_scope
+
 REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports"
 CAMPAIGNS_URL = "https://api.direct.yandex.com/json/v5/campaigns"
 ADGROUPS_URL = "https://api.direct.yandex.com/json/v5/adgroups"
@@ -347,7 +349,13 @@ def _api_post(url: str, login: str, payload: Dict[str, Any], what: str,
 
 
 def fetch_campaign_ids(login: str) -> List[int]:
-    """Id всех кампаний кабинета — по ним отбираются объекты нижних уровней."""
+    """Id всех кампаний кабинета — по ним отбираются объекты нижних уровней.
+
+    Имя запрашивается ради границы зоны ответственности (sync/agent/scope.py):
+    кампании вне её различаются только по имени, а этот список раздаёт Id
+    снимку структуры, справочнику «кампания → кабинет» и через него —
+    адресации идей. Без "Name" в FieldNames фильтру нечего сравнивать.
+    """
     out: List[int] = []
     offset = 0
     while True:
@@ -358,14 +366,15 @@ def fetch_campaign_ids(login: str) -> List[int]:
                 "method": "get",
                 "params": {
                     "SelectionCriteria": {},
-                    "FieldNames": ["Id"],
+                    "FieldNames": ["Id", "Name"],
                     "Page": {"Limit": PAGE_LIMIT, "Offset": offset},
                 },
             },
             "campaigns.get",
         )
         items = result.get("Campaigns") or []
-        out += [int(c["Id"]) for c in items]
+        out += [int(c["Id"])
+                for c in agent_scope.filter_campaign_rows(items, name_key="Name")]
         if len(items) < PAGE_LIMIT:
             break
         offset += PAGE_LIMIT

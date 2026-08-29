@@ -55,6 +55,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent import config as agent_config
 from sync.agent import db as agent_db
+from sync.agent import scope as agent_scope
 from sync.agent.confidence import thresholds_from_config
 from sync.agent.balance import (
     MIN_ASSIGNED_SHARE,
@@ -485,6 +486,10 @@ def _clients() -> List[Dict[str, Any]]:
     клало сырое — пробел по краям логина в переменной окружения разводил
     запись и чтение по разным ключам, и прогон молча рапортовал, что
     применять нечего.
+
+    Кабинеты вне зоны ответственности агента (sync/agent/scope.py) отсекаются
+    здесь же: список кабинетов — единственный вход прогона, и всё, что ниже,
+    работает уже с урезанным составом.
     """
     raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
     out: List[Dict[str, Any]] = []
@@ -495,24 +500,30 @@ def _clients() -> List[Dict[str, Any]]:
             login = agent_db.normalize_login(item.get("login"))
             if login:
                 out.append({"login": login})
-    return out
+    return agent_scope.filter_clients(out)
 
 
 def fetch_campaign_ids(client: WriteClient) -> List[int]:
     """Id всех кампаний ОДНОГО кабинета (форма — sync/agent/segments.py::fetch_campaign_ids).
 
     Постранично: Page.Limit/Offset, остановка когда страница короче лимита.
+
+    Имя запрашивается не ради отчёта: кампании вне зоны ответственности агента
+    различаются только по нему, а ниже по течению (own_campaign_ids, чтение
+    корректировок, план, отправка) едут одни Id. Без "Name" в FieldNames
+    фильтру нечего было бы сравнивать, и он молча пропускал бы всё.
     """
     out: List[int] = []
     offset = 0
     while True:
         result = client.get("campaigns", {
             "SelectionCriteria": {},
-            "FieldNames": ["Id"],
+            "FieldNames": ["Id", "Name"],
             "Page": {"Limit": CAMPAIGN_PAGE_LIMIT, "Offset": offset},
         })
         items = result.get("Campaigns") or []
-        out += [int(c["Id"]) for c in items]
+        out += [int(c["Id"])
+                for c in agent_scope.filter_campaign_rows(items, name_key="Name")]
         if len(items) < CAMPAIGN_PAGE_LIMIT:
             break
         offset += CAMPAIGN_PAGE_LIMIT

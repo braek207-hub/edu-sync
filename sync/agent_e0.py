@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from sync.agent import blackbox
 from sync.agent import db as agent_db
+from sync.agent import scope as agent_scope
 from sync.agent.computed import compute_schedule, compute_segment_modifiers
 from sync.agent.confidence import thresholds_from_config
 from sync.agent.coverage import blind_spend
@@ -191,6 +192,11 @@ def _direct_clients() -> List[Dict[str, Any]]:
     Логин нормализуется общей функцией agent_db.normalize_login — той же, что
     у движка записи и у самой таблицы: он становится ключом object_id, и
     расхождение нормализаций разводит запись и чтение по разным ключам.
+
+    Кабинеты вне зоны ответственности агента (sync/agent/scope.py) отсекаются
+    ЗДЕСЬ, на единственном входе: отчёты Директа, цели, объекты, срезы,
+    заповедник и справочник «кампания → кабинет» — всё ниже по течению растёт
+    из этого списка и про исключение ничего не знает.
     """
     raw = (os.environ.get("DIRECT_CLIENTS_JSON") or "").strip()
     out: List[Dict[str, Any]] = []
@@ -204,9 +210,10 @@ def _direct_clients() -> List[Dict[str, Any]]:
             if login:
                 out.append({"login": login, "goal_ids": [str(g) for g in goals]})
         if out:
-            return out
+            return agent_scope.filter_clients(out)
     login = agent_db.normalize_login(os.environ.get("DIRECT_CLIENT_LOGIN"))
-    return [{"login": login, "goal_ids": []}] if login else []
+    single = [{"login": login, "goal_ids": []}] if login else []
+    return agent_scope.filter_clients(single)
 
 
 def resolve_goal_ids(client: Dict[str, Any]) -> List[str]:
@@ -929,6 +936,13 @@ def main() -> int:
     confidence_thresholds = thresholds_from_config(active_config)
 
     direct_rows = agent_db.load_direct_rows(date_from, date_to)
+    # Кампании вне зоны ответственности агента из direct_rows уже вычтены
+    # (agent_db.load_direct_rows). Их Id снимаются отдельным запросом, потому
+    # что нужны там, где имени нет вовсе: сегментные отчёты Директа отдают
+    # CampaignId и ничего больше, а отобрать по нему без этого множества
+    # нечем — и чужие кампании уехали бы в edu_agent_facts_sliced и в
+    # покампанийные корректировки Э2.2.
+    excluded_campaign_ids = agent_db.load_excluded_campaign_ids(date_from, date_to)
     lead_rows = agent_db.load_lead_rows(date_from, date_to)
     lag_rows = agent_db.load_lag_rows(
         (date.fromisoformat(date_to) - timedelta(days=LAG_HISTORY_DAYS)).isoformat(),
@@ -1162,7 +1176,9 @@ def main() -> int:
                     if rows:
                         computed_by_account.setdefault(login, []).extend(rows)
                 else:
-                    weekly = collapse_tail(build_sliced_facts(job["rows"], job["kind"]))
+                    own_rows = [r for r in job["rows"]
+                                if str(r.get("campaign_id")) not in excluded_campaign_ids]
+                    weekly = collapse_tail(build_sliced_facts(own_rows, job["kind"]))
                     sliced_rows += weekly
                     # Э2.2: покампанийные корректировки — только device, это
                     # единственный срез с рабочим рычагом записи. Region мёртв
@@ -1860,6 +1876,12 @@ def main() -> int:
 
     report = {
         "verdict": "GREEN",
+        # Что прогон не видел вовсе. Строка печатается всегда, в том числе
+        # нулями: без неё «кабинет ничего не предложил» и «кабинета нет в
+        # работе» выглядят в отчёте одинаково, а разбор начинается именно с
+        # этого различия. Действием исключение не является и в журнал не идёт.
+        "excluded": {"accounts": sorted(agent_scope.EXCLUDED_ACCOUNTS),
+                     "campaigns": len(excluded_campaign_ids)},
         "crm_through": latest_lead,
         "crm_lag_days": crm_lag,
         "facts_rows": len(facts),

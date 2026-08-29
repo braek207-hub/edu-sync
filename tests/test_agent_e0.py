@@ -126,6 +126,9 @@ _DB_EMPTY_LOADERS = (
     # Состав заповедника: прогон читает его, чтобы вывести мёртвых. Пусто =
     # заповедника ещё нет, выводить некого — штатное состояние первого прогона.
     "load_holdout_ids",
+    # Id кампаний вне зоны ответственности агента (sync/agent/scope.py). Пусто =
+    # чужих кампаний в окне нет; сам фильтр проверяется в tests/test_agent_scope.py.
+    "load_excluded_campaign_ids",
 )
 
 # Отчёты Директа по кабинетам: у каждого свои сегменты и своя конверсионность —
@@ -1501,3 +1504,54 @@ def test_ladder_section_reports_window_coverage():
     section = agent_e0.funnel_ladder_section(facts, leads, today=today)
     assert section["campaigns_in_window"] == 1
     assert section["campaigns_known"] == 2
+
+
+def test_main_keeps_foreign_campaigns_out_of_sliced_facts(monkeypatch, capsys):
+    """Сегментные отчёты Директа отдают CampaignId без имени.
+
+    Значит отобрать в них чужую кампанию можно только по заранее снятому
+    множеству Id. Без него срезы чужих РК уезжали бы в
+    edu_agent_facts_sliced и в покампанийные корректировки Э2.2 — то есть
+    агент считал бы по чужим деньгам, ни разу не назвав их.
+    """
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0.agent_db, "load_excluded_campaign_ids",
+                        lambda *a, **k: {"710118280"})
+    written = []
+    monkeypatch.setattr(agent_e0.agent_db, "upsert_sliced_facts",
+                        lambda rows: written.extend(rows) or len(rows))
+    monkeypatch.setattr(
+        agent_e0, "fetch_segment_report",
+        lambda login, kind, date_from, date_to, by_campaign=False, goals=():
+            ([{"segment_kind": kind, "segment_key": "MOBILE", "slice_key": "MOBILE",
+               "slice_label": "", "clicks": 10, "impressions": 100,
+               "conversions": 1, "cost": 100.0,
+               "campaign_id": cid, "date": _today()}
+              for cid in ("111", "710118280")] if by_campaign else [],
+             {"goal_column": "Conversions_111_LSCCD", "conversions": 1,
+              "columns_offered": 1}),
+    )
+
+    assert agent_e0.main() == 0
+    capsys.readouterr()
+
+    assert written, "срезы вообще не считались — тест ничего не проверил"
+    assert {str(r["campaign_id"]) for r in written} == {"111"}
+
+
+def test_main_reports_what_it_did_not_look_at(monkeypatch, capsys):
+    """«Кабинет ничего не предложил» и «кабинета нет в работе» — разные вещи.
+
+    Без этой строки они выглядят в отчёте одинаково, и разбор прогона
+    начинается с догадки. Действием исключение не является: в журнал и в
+    чёрный ящик оно как действие не идёт.
+    """
+    _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0.agent_db, "load_excluded_campaign_ids",
+                        lambda *a, **k: {"710118280", "712704859"})
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    assert report["excluded"]["accounts"] == ["account4-506456-gsrr"]
+    assert report["excluded"]["campaigns"] == 2

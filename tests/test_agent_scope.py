@@ -180,3 +180,94 @@ def test_load_excluded_campaign_ids_asks_the_source_by_name(monkeypatch):
 
     assert ids == {"710118280", "712704859"}
     assert "campaign_name" in seen["sql"]
+
+
+# --------------------------------------------- подключение: кабинеты прогонов
+
+
+def test_calculation_and_writer_both_drop_the_excluded_account(monkeypatch):
+    """Расчёт и движок записи читают один секрет и обязаны сойтись по составу."""
+    import sync.agent_e0 as agent_e0
+    import sync.agent_e1 as agent_e1
+
+    monkeypatch.setenv("DIRECT_CLIENTS_JSON", json.dumps([
+        {"login": "account10-506462-fqs4", "goal_ids": ["1"]},
+        {"login": " account4-506456-gsrr ", "goal_ids": ["2"]},
+        {"login": "account1-506453-ln8s", "goal_ids": []},
+    ]))
+
+    calc = [c["login"] for c in agent_e0._direct_clients()]
+    writer = [c["login"] for c in agent_e1._clients()]
+
+    assert calc == writer == ["account10-506462-fqs4", "account1-506453-ln8s"]
+
+
+def test_single_client_env_of_the_excluded_account_gives_nothing(monkeypatch):
+    """Запасной вход расчёта — DIRECT_CLIENT_LOGIN — исключение тоже уважает."""
+    import sync.agent_e0 as agent_e0
+
+    monkeypatch.delenv("DIRECT_CLIENTS_JSON", raising=False)
+    monkeypatch.setenv("DIRECT_CLIENT_LOGIN", "account4-506456-gsrr")
+
+    assert agent_e0._direct_clients() == []
+
+
+# --------------------------------------------- подключение: кампании кабинета
+
+
+class _FakeCampaignsClient:
+    """campaigns.get одного кабинета: страницы и запомненные запросы."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.requests = []
+
+    def get(self, service, params):
+        assert service == "campaigns"
+        self.requests.append(params)
+        idx = params["Page"]["Offset"] // params["Page"]["Limit"]
+        return {"Campaigns": self.pages[idx] if idx < len(self.pages) else []}
+
+
+def test_writer_campaign_list_asks_for_names_and_drops_foreign(monkeypatch):
+    """У движка записи это ЕДИНСТВЕННЫЙ вход списка кампаний.
+
+    Всё, что ниже (own_campaign_ids, чтение корректировок, план, отправка),
+    работает с его результатом. Без имени в FieldNames отличить чужую
+    кампанию нечем — фильтр молча пропускал бы всё.
+    """
+    import sync.agent_e1 as agent_e1
+
+    client = _FakeCampaignsClient(pages=[[
+        {"Id": 1, "Name": "vuz / Поиск / РФ"},
+        {"Id": 710118280, "Name": "vse / ВПО-МСК-rsv"},
+        {"Id": 2, "Name": "vse / СПО / РСЯ"},
+    ]])
+
+    ids = agent_e1.fetch_campaign_ids(client)
+
+    assert ids == [1, 2]
+    assert "Name" in client.requests[0]["FieldNames"]
+
+
+def test_calculation_campaign_list_asks_for_names_and_drops_foreign(monkeypatch):
+    """Тот же вход у расчёта: по нему снимаются объекты и справочник кабинетов."""
+    from sync.agent import segments
+
+    captured = {}
+
+    def _fake_post(url, login, payload, what, attempts=None):
+        captured["payload"] = payload
+        if payload["params"]["Page"]["Offset"]:
+            return {"Campaigns": []}
+        return {"Campaigns": [
+            {"Id": 1, "Name": "vuz / Поиск / РФ"},
+            {"Id": 710687014, "Name": "vse /ВПО/ rsv"},
+        ]}
+
+    monkeypatch.setattr(segments, "_api_post", _fake_post)
+
+    ids = segments.fetch_campaign_ids("account10-506462-fqs4")
+
+    assert ids == [1]
+    assert "Name" in captured["payload"]["params"]["FieldNames"]
