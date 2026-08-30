@@ -1531,3 +1531,19 @@ def test_main_reports_what_it_did_not_look_at(monkeypatch, capsys):
     # константа списка исключений: кабинета может не быть в секрете вовсе.
     assert report["excluded"]["accounts"] == ["account4-506456-gsrr"]
     assert report["excluded"]["campaigns"] == 2
+
+
+def test_progress_writes_to_stderr_not_to_stdout(capsys):
+    """Ход работы идёт в stderr: stdout занят отчётом прогона.
+
+    В stdout Э0 печатает ровно один JSON, и его читают снаружи. Строка хода
+    работы, попавшая туда, ломает разбор у каждого читателя сразу — а
+    замечено это будет только на прогоне.
+    """
+    agent_e0._progress("шаг", rows=7)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "шаг rows=7" in captured.err
+    # Время с начала прогона — иначе по строке не сказать, где ушли минуты.
+    assert captured.err.startswith("[e0 ")

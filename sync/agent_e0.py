@@ -16,6 +16,7 @@ ENV:     DATABASE_URL, DIRECT_TOKEN, DIRECT_CLIENTS_JSON
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -911,6 +912,30 @@ def computed_rows_for_job(job: Dict[str, Any]) -> tuple:
     return job["login"], rows, reason
 
 
+# Момент старта прогона: от него отсчитывается время в строках хода работы.
+_STARTED_AT = time.monotonic()
+
+
+def _progress(stage: str, **fields: Any) -> None:
+    """Одна строка хода работы в stderr — где прогон сейчас и сколько уже идёт.
+
+    Э0 печатает в stdout ровно один JSON и только в самом конце: пока он
+    считает, снаружи не видно НИЧЕГО. Прогон 33276642664 (--days 180) был
+    отменён по таймауту с пустым логом, и назвать шаг, на котором ушло
+    время, оказалось нечем — при штатных 36-39 минутах это разница между
+    «медленный отчёт Директа» и «расчёт зациклился».
+
+    stderr, а не stdout: stdout — это отчёт прогона, и посторонняя строка в
+    нём ломает разбор JSON у всех, кто его читает.
+    """
+    elapsed = int(time.monotonic() - _STARTED_AT)
+    tail = " ".join(f"{key}={value}" for key, value in fields.items())
+    stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[e0 {stamp} +{elapsed // 60}м{elapsed % 60:02d}с] {stage}"
+          f"{' ' + tail if tail else ''}",
+          file=sys.stderr, flush=True)
+
+
 def main() -> int:
     days = DEFAULT_DAYS
     if "--days" in sys.argv:
@@ -920,6 +945,7 @@ def main() -> int:
     today_iso = date.today().isoformat()
 
     agent_db.ensure_agent_tables()
+    _progress("старт", days=days, window=f"{date_from}..{date_to}")
 
     # Настройки агента: пресет и переопределения из БД поверх кодовых
     # дефолтов. Битая настройка роняет прогон намеренно — молча
@@ -947,6 +973,7 @@ def main() -> int:
     confidence_thresholds = thresholds_from_config(active_config)
 
     direct_rows = agent_db.load_direct_rows(date_from, date_to)
+    _progress("витрина источника", rows=len(direct_rows))
     # Кампании вне зоны ответственности агента из direct_rows уже вычтены
     # (agent_db.load_direct_rows). Их Id снимаются отдельным запросом, потому
     # что нужны там, где имени нет вовсе: сегментные отчёты Директа отдают
@@ -961,6 +988,7 @@ def main() -> int:
     excluded_campaign_ids = agent_db.load_excluded_campaign_ids(
         (date.today() - timedelta(days=max(days, SLICE_WINDOW_DAYS))).isoformat(),
         date_to)
+    _progress("чужие кампании", campaigns=len(excluded_campaign_ids))
     # Лиды отсекаются тем же множеством и ДО сборки фактов. В
     # crm_lead_details имени кампании нет, а последствия у пропущенного лида
     # тяжелее, чем у пропущенного расхода: слот факта создаётся по паре «день
@@ -978,6 +1006,7 @@ def main() -> int:
         (date.fromisoformat(date_to) - timedelta(days=LAG_HISTORY_DAYS)).isoformat(),
         date_to)
     score_rows = agent_db.load_score_rows(date_from, date_to)
+    _progress("лиды CRM", leads=len(lead_rows), scores=len(score_rows))
 
     # 1. Гейт качества данных.
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -1043,6 +1072,7 @@ def main() -> int:
     # 2. Факты.
     facts = assemble_facts(direct_rows, lead_rows, score_rows)
     agent_db.upsert_facts(facts)
+    _progress("факты записаны", rows=len(facts))
 
     # Направление кампании — для иерархии пулинга (Э2.2) и лестницы (Э2.1).
     direction_by_campaign: Dict[str, str] = {}
@@ -1081,6 +1111,7 @@ def main() -> int:
         agent_db.exclude_holdout(dead, excluded_on=today_iso)
     holdout = select_holdout(list(aggregates.values()))
     agent_db.upsert_holdout(holdout, included_on=today_iso)
+    _progress("заповедник", included=len(holdout), retired=len(dead))
 
     # 5. Квазиэксперименты → блокнот; тут же — их чтение (Э2.4): сигнал
     # насыщения по кампаниям и направлениям, вход кривых Э3.1.
@@ -1088,6 +1119,7 @@ def main() -> int:
     # (квазиэксперименты и пары недель), а проход дорогой.
     placebo_floor = placebo_sigma(facts) or 0.0
     quasi = mine_quasi_experiments(facts, error_floor=placebo_floor)
+    _progress("квазиэксперименты", found=len(quasi))
     agent_db.upsert_experiments(quasi)
     history = budget_response(
         quasi, {str(f["campaign_id"]): f.get("direction") for f in facts})
@@ -1129,6 +1161,8 @@ def main() -> int:
             rows, calc_date=today_iso, object_id=campaign_id,
             object_level="campaign")
         saturation_count += len(rows)
+
+    _progress("кривые насыщения", rows=saturation_count)
 
     slice_from = (date.today() - timedelta(days=SLICE_WINDOW_DAYS)).isoformat()
     queries_from = (date.today() - timedelta(days=QUERY_WINDOW_DAYS)).isoformat()
@@ -1184,6 +1218,8 @@ def main() -> int:
             goals=job["goals"], with_date=job["with_date"],
             excluded_campaign_ids=excluded_campaign_ids,
         )
+        _progress("отчёт Директа", login=job["login"], kind=job["kind"],
+                  purpose=job["purpose"], rows=len(rows))
         if job["purpose"] == "computed":
             # Чужие строки отчёт уже не вернул (fetch_segment_report), здесь
             # остаётся только сложить своё в кабинетные числа.
@@ -1208,6 +1244,7 @@ def main() -> int:
     # идентификаторы. Единственная защита от «корректировки посчитаны по
     # прокрутке страницы» — видеть выбор в отчёте прогона и сверять глазами.
     segment_goals: List[Dict[str, Any]] = []
+    _progress("отчёты Директа: старт", accounts=len(clients), jobs=len(jobs))
     if jobs:
         with ThreadPoolExecutor(max_workers=REPORT_WORKERS) as pool:
             for done in as_completed([pool.submit(_run_job, j) for j in jobs]):
@@ -1270,6 +1307,8 @@ def main() -> int:
         agent_db.upsert_computed_settings(rows, calc_date=today_iso, object_id=login)
         computed_count += len(rows)
     agent_db.upsert_sliced_facts(sliced_rows)
+    _progress("корректировки и срезы записаны",
+              computed=computed_count, sliced=len(sliced_rows))
 
     # Э2.2: покампанийные строки — под object_level='campaign'. Движок записи их
     # пока НЕ читает (применяется кабинетный уровень): сначала видимость и сверка
@@ -1322,6 +1361,8 @@ def main() -> int:
         login = client["login"]
         goals = goals_by_login.get(login, [])
         account_campaigns = fetch_campaign_ids(login)
+        _progress("состав кабинета", login=login,
+                  campaigns=len(account_campaigns))
         # Архивные кампании здесь нужны: справочник «кампания → кабинет»
         # тем точнее, чем шире, а Метрика показывает и то, что уже выключено.
         for cid in account_campaigns:
@@ -1333,10 +1374,13 @@ def main() -> int:
         for level in ("adgroup", "keyword", "ad"):
             object_rows += build_object_rows(
                 fetch_objects(login, level, campaign_ids), level, seen_on=today_iso)
+        _progress("структура кабинета", login=login,
+                  campaigns=len(campaign_ids), rows=len(object_rows))
         rows_for_login, query_goal = fetch_search_queries(
             login, queries_from, date_to, goals=goals,
             excluded_campaign_ids=excluded_campaign_ids)
         queries_by_login[login] = rows_for_login
+        _progress("отчёт запросов", login=login, rows=len(rows_for_login))
         # Второй источник справочника «кампания → кабинет», и он сильнее
         # первого там, где первый молчит. campaigns.get не отдаёт кампании
         # «Мастер кампаний» вовсе (sync/agent/master.py), а Reports API про
@@ -1359,6 +1403,8 @@ def main() -> int:
     query_rows = top_queries_by_cost(
         [q for rows in queries_by_login.values() for q in rows])
     agent_db.upsert_search_queries(query_rows)
+    _progress("структура и запросы записаны",
+              objects=len(object_rows), queries=len(query_rows))
 
     # Запросы, сжигающие втрое больше целевого CPA без единой конверсии.
     # Расчёт существовал, но НЕ ВЫЗЫВАЛСЯ ни разу: кандидаты в минус-слова не
@@ -1521,6 +1567,7 @@ def main() -> int:
                 placement_errors.append({"account": login,
                                          "error": f"{type(exc).__name__}: {exc}"[:200]})
                 continue
+            _progress("отчёт площадок", login=login, rows=len(rows))
             placements_seen += len(rows)
             placement_candidate_rows += rows
         base_clicks_p = sum(int(r.get("clicks") or 0) for r in placement_candidate_rows)
@@ -1539,6 +1586,7 @@ def main() -> int:
     # 9. Снимок настроек.
     snapshot_rows = build_snapshot_rows(campaign_settings, seen_on=today_iso)
     agent_db.upsert_settings_snapshot(snapshot_rows)
+    _progress("снимок настроек", rows=len(snapshot_rows))
 
     # 10. Профиль успеха и дистанции (после снимка структуры — признаки берутся оттуда).
     feature_rows = agent_db.load_campaign_features(date_from, date_to)
@@ -1655,6 +1703,7 @@ def main() -> int:
             "detail": {"unresolved_campaigns": unresolved, "resolved": len(resolved_behavior)},
         }])
     agent_db.upsert_behavior(resolved_behavior, window_from=slice_from, window_to=date_to)
+    _progress("обогащение Метрикой", rows=len(resolved_behavior))
 
     # 11. Отчёт мощности, лестница воронки и фактический объём таблиц.
     report = power_report(list(aggregates.values()))
@@ -1718,6 +1767,7 @@ def main() -> int:
     # чисел, а ради ЗАПАСА: сколько рублей кабинет освоит сегодня поднятием
     # лимитов, видно только после того, как солвер назвал цели (growth.py).
     # Итоговой станет вторая раскладка, ниже.
+    _progress("портфель: предварительный порог")
     preliminary_threshold = _solve_portfolio()
     # Слепая доля расхода: сколько денег прошло мимо настроек, которые агент
     # читает (Мастер кампаний и прочее вне API). Считается ДВАЖДЫ, и это не
@@ -1852,6 +1902,7 @@ def main() -> int:
         for login in sorted(pace_logins)
     }
 
+    _progress("портфель: итоговый порог")
     budget_threshold = _solve_portfolio(
         target_romi=active_config["target_romi"],
         room_rub_by_login=room_by_login,
@@ -2215,6 +2266,7 @@ def main() -> int:
         report["manifest"] = {"written": False,
                               "error": f"{type(exc).__name__}: {exc}"[:200]}
 
+    _progress("чёрный ящик")
     report["blackbox"] = blackbox.save_run(
         blackbox.new_run_id(), stage="e0",
         mode=blackbox.MODE_COMPUTE, report=report)
