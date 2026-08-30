@@ -966,6 +966,21 @@ def main() -> int:
         active_config_rows = [{"key": "__source__", "value": "кодовые дефолты",
                                "source": "unavailable",
                                "about": stored_config["unavailable"]}] + active_config_rows
+    # Причина, по которой ДЕНЕЖНЫЕ строки этого прогона писать нельзя. None —
+    # панель прочиталась, всё едет как обычно.
+    #
+    # Продолжать расчёт на кодовых дефолтах законно: лестница, кривые и спрос
+    # от панели не зависят и нужны дашборду. А вот целевой CPA и целевые
+    # бюджеты зависят — они берут target_romi и месячный потолок. Дефолт кода
+    # target_romi = 1.0 против 2.0 на панели: в edu_agent_computed_settings
+    # уехала бы цель ВДВОЕ мягче, и Э1, который панель читает нормально,
+    # применил бы именно её. Не записать свежую строку дешевле, чем записать
+    # неверную: Э1 держит старую до MAX_COMPUTED_AGE_DAYS, а дальше честно
+    # говорит STALE. Переменная одна на оба места намеренно — два литерала
+    # причины однажды разошлись бы.
+    config_baked_reason = stored_config.get("unavailable")
+    computed_skip_note = (f"панель недоступна: {config_baked_reason}"
+                          if config_baked_reason else None)
     # Пороги уверенности по классам действий — из того же активного конфига.
     # Считаются один раз на прогон: они не зависят ни от кабинета, ни от
     # объекта, и пересчёт их в каждом вызове означал бы, что где-то они могут
@@ -1736,12 +1751,16 @@ def main() -> int:
         facts, saturation["campaigns"], campaign_settings,
         ladder_section["window_from"], ladder_section["window_to"]),
         target_romi=active_config["target_romi"])
+    # Расчёт секции идёт всегда — в витрину строки едут только с живой
+    # панелью (config_baked_reason). Отчёт обязан показать, что агент насчитал
+    # бы: иначе «панель молчит» неотличимо от «считать было нечего».
     tcpa_count = 0
-    for campaign_id, rows in tcpa_computed_rows(tcpa_section).items():
-        agent_db.upsert_computed_settings(
-            rows, calc_date=today_iso, object_id=campaign_id,
-            object_level="campaign")
-        tcpa_count += len(rows)
+    if not config_baked_reason:
+        for campaign_id, rows in tcpa_computed_rows(tcpa_section).items():
+            agent_db.upsert_computed_settings(
+                rows, calc_date=today_iso, object_id=campaign_id,
+                object_level="campaign")
+            tcpa_count += len(rows)
 
     def _solve_portfolio(**growth_args):
         return portfolio_targets(
@@ -1917,12 +1936,16 @@ def main() -> int:
         # сырой модели, как до петли. Предварительная раскладка идёт без неё
         # намеренно: она считает запас по целям, а цели поправка не трогает.
         forecast_bias=learning.get("forecast_bias"))
+    # Та же зависимость от панели, что у целевого CPA выше, и тот же пропуск:
+    # раскладка считана на target_romi и месячном потолке, и на кодовых
+    # дефолтах её строки — это чужие деньги в витрине полосы allocation.
     budget_target_count = 0
-    for campaign_id, rows in portfolio_computed_rows(budget_threshold).items():
-        agent_db.upsert_computed_settings(
-            rows, calc_date=today_iso, object_id=campaign_id,
-            object_level="campaign")
-        budget_target_count += len(rows)
+    if not config_baked_reason:
+        for campaign_id, rows in portfolio_computed_rows(budget_threshold).items():
+            agent_db.upsert_computed_settings(
+                rows, calc_date=today_iso, object_id=campaign_id,
+                object_level="campaign")
+            budget_target_count += len(rows)
 
     # Вторая половина оптимизации: что УСИЛИТЬ. Собирается из уже посчитанного
     # — недобор трафика, упор в кап шага, режим спроса, запросы без своей
@@ -2163,6 +2186,9 @@ def main() -> int:
             "accounts": pace_by_login,
         },
         "budget_target_rows": budget_target_count,
+        # Та же причина тем же текстом, что у tcpa.skipped: одна переменная на
+        # оба места, чтобы «почему бюджеты не записаны» читалось одинаково.
+        "budget_target_skipped": computed_skip_note,
         "computed_settings": computed_count,
         "computed_settings_by_account": {k: len(v) for k, v in computed_by_account.items()},
         "computed_settings_skipped": computed_skipped,
@@ -2197,6 +2223,9 @@ def main() -> int:
             "moves_confident": tcpa_section["moves_confident"],
             "no_target": tcpa_section["no_target"],
             "computed_rows": tcpa_count,
+            # Почему строк ноль при непустой секции. Печатается всегда, в том
+            # числе None: отсутствие ключа неотличимо от «поле не добавили».
+            "skipped": computed_skip_note,
         },
         # Задача 13: чем закончились СОБСТВЕННЫЕ действия агента. Доля
         # попаданий печатается ещё и раздельно для растящих и сокращающих:

@@ -1547,3 +1547,76 @@ def test_progress_writes_to_stderr_not_to_stdout(capsys):
     assert "шаг rows=7" in captured.err
     # Время с начала прогона — иначе по строке не сказать, где ушли минуты.
     assert captured.err.startswith("[e0 ")
+
+
+# --------------------------------------------------------------- fail-open Э0
+#
+# Панель настроек агента (edu_agent_config) читается один раз за прогон, и её
+# недоступность расчёт намеренно не роняет: остальные секции от панели не
+# зависят и нужны дашборду. Но ДВЕ секции зависят — целевой CPA и целевые
+# бюджеты берут из панели target_romi и месячный потолок. На кодовых дефолтах
+# target_romi = 1.0 против 2.0 на панели, то есть в edu_agent_computed_settings
+# уезжала цель вдвое мягче — и Э1, который панель читает нормально, применил бы
+# именно её. Свежую строку с неверным числом не записать лучше, чем записать:
+# Э1 переживает два дня старых строк (MAX_COMPUTED_AGE_DAYS), а дальше честно
+# говорит STALE.
+
+
+def _rows_of_kind(kind, campaign_id="111"):
+    """Подмена вычислителя строк: фиктивная порция под запись."""
+    return lambda *a, **k: {campaign_id: [{"setting_kind": kind,
+                                           "setting_key": "target",
+                                           "value": 123.0}]}
+
+
+def _kinds_written(calls):
+    return {r["setting_kind"] for call in calls for r in call["rows"]}
+
+
+def test_money_settings_are_baked_when_the_panel_reads(monkeypatch, capsys):
+    """Панель прочиталась — строки целевого CPA и бюджета едут в витрину."""
+    calls = _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0, "tcpa_computed_rows", _rows_of_kind("tcpa_target"))
+    monkeypatch.setattr(agent_e0, "portfolio_computed_rows",
+                        _rows_of_kind("budget_target"))
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    assert {"tcpa_target", "budget_target"} <= _kinds_written(calls)
+    assert report["tcpa"]["computed_rows"] == 1
+    assert report["budget_target_rows"] == 1
+    # Пропуска не было — и это утверждение, а не умолчание: ключ печатается
+    # всегда, иначе «не пропускали» неотличимо от «поле забыли добавить».
+    assert report["tcpa"]["skipped"] is None
+    assert report["budget_target_skipped"] is None
+
+
+def test_unreadable_panel_keeps_money_settings_out_of_the_mart(monkeypatch, capsys):
+    """Панель не прочиталась — денежные строки не пишутся, причина в отчёте."""
+    calls = _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0, "tcpa_computed_rows", _rows_of_kind("tcpa_target"))
+    monkeypatch.setattr(agent_e0, "portfolio_computed_rows",
+                        _rows_of_kind("budget_target"))
+
+    def boom(*a, **k):
+        raise RuntimeError("нет соединения")
+
+    monkeypatch.setattr(agent_e0.agent_db, "load_agent_config", boom)
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    written = _kinds_written(calls)
+    assert "tcpa_target" not in written
+    assert "budget_target" not in written
+    # Секции всё равно посчитаны: отчёт обязан показывать, что агент насчитал
+    # бы, — иначе «панель молчит» неотличимо от «считать было нечего».
+    assert report["tcpa"]["campaigns"] == 0
+    assert report["tcpa"]["computed_rows"] == 0
+    assert report["budget_target_rows"] == 0
+    # Одна причина на оба места, а не два разных литерала.
+    assert "нет соединения" in report["tcpa"]["skipped"]
+    assert report["budget_target_skipped"] == report["tcpa"]["skipped"]
+    # Остальные строки прогона панели не касаются и записываются как обычно.
+    assert "bid_modifier:device" in written
