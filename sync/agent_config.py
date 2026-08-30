@@ -45,6 +45,7 @@ SQL-консоли. Этот модуль — недостающие ручки.
 ENV: DATABASE_URL, AGENT_CONFIG_ACTOR (кто правит; по умолчанию "cli")
 """
 
+import json
 import os
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -182,6 +183,10 @@ def to_text(value: Any) -> str:
         return ""
     if isinstance(value, bool):                     # на будущее: bool — не число
         return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        # Чтение (db._parse_config_value) разбирает JSON; str(dict) дал бы
+        # Python-repr с одинарными кавычками, и записанное не читалось бы.
+        return json.dumps(value, ensure_ascii=False)
     return str(value)
 
 
@@ -204,12 +209,46 @@ def validate_pairs(pairs: Sequence[str]) -> List[Tuple[str, Any]]:
         _refuse_locked(key)
         # Пусто — это «не задано»: единственный способ вернуть nullable-параметр
         # в пустое состояние. Для остальных ключей _validate это отвергнет.
-        value: Any = None if raw == "" else raw
+        value: Any = None if raw == "" else _from_text(key, raw)
         try:
             out.append((key, agent_config._validate(key, value)))
         except ValueError as exc:
             raise Refusal(str(exc)) from None
     return out
+
+
+def _from_text(key: str, raw: str) -> Any:
+    """Текст из args воркфлоу → значение для _validate.
+
+    Составные ключи (список полос, словарь «полоса: ступень») приезжают одной
+    строкой, а валидаторы ждут list/dict: без разбора здесь оба ключа из панели
+    задать нельзя вовсе (run 33296975452 — «нужен список полос» на верной
+    настройке). Принимаются две формы: короткая (`a,b` и `a:1,b:2`) и JSON.
+    """
+    kind = (agent_config.SPEC.get(key) or {}).get("kind")
+    if kind is None:
+        return raw
+    if raw[:1] in "[{":
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise Refusal(f"{key}={raw!r}: битый JSON") from None
+    if kind == agent_config.KIND_LANE_LIST:
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    if kind == agent_config.KIND_LANE_STEPS:
+        out: Dict[str, str] = {}
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            lane, sep, step = part.partition(":")
+            if not sep or not lane.strip() or not step.strip():
+                raise Refusal(
+                    f"{key}={raw!r}: нужна форма полоса:ступень через запятую, "
+                    f"например tuning:3,hygiene:1")
+            out[lane.strip()] = step.strip()
+        return out
+    return raw
 
 
 def validate_preset(name: Optional[str]) -> str:

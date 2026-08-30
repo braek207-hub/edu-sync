@@ -17,7 +17,8 @@ on:
           - unset
       args:
         description: >-
-          set: пары KEY=VALUE через пробел (monthly_budget_cap_rub= очищает).
+          set: пары KEY=VALUE через пробел (monthly_budget_cap_rub= очищает;
+          shadow_lanes=suspend,allocation; lane_steps=tuning:3,hygiene:1).
           preset: имя (conservative/balanced/aggressive).
           unset: ключи через пробел. show: не нужно.
         required: false

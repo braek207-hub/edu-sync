@@ -315,3 +315,32 @@ def test_to_text_and_validation_agree_on_types():
     assert validate_pairs(["budget_cooldown_days=21"]) == [("budget_cooldown_days", 21)]
     with pytest.raises(Refusal, match="KEY=VALUE"):
         validate_pairs(["explore_share"])
+
+
+def test_lane_keys_accept_text_forms_from_the_workflow():
+    # Воркфлоу agent-config передаёт args одной строкой: shadow_lanes и lane_steps
+    # приезжают текстом, а валидаторы ждут list/dict. Без разбора текста оба ключа
+    # из панели задать нельзя (run 33296975452: «нужен список полос»).
+    assert validate_pairs(["shadow_lanes=suspend, allocation"]) == [
+        ("shadow_lanes", ["allocation", "suspend"])]
+    assert validate_pairs(['shadow_lanes=["suspend"]']) == [("shadow_lanes", ["suspend"])]
+    assert validate_pairs(["lane_steps=tuning:3,hygiene:1"]) == [
+        ("lane_steps", {"tuning": 3, "hygiene": 1})]
+    assert validate_pairs(['lane_steps={"tuning": 3}']) == [("lane_steps", {"tuning": 3})]
+    assert validate_pairs(["shadow_lanes="]) == [("shadow_lanes", None)]
+    with pytest.raises(Refusal, match="tuning:3"):
+        validate_pairs(["lane_steps=tuning=3"])
+    with pytest.raises(Refusal, match="tuning:3"):
+        validate_pairs(["lane_steps=tuning:"])
+    with pytest.raises(Refusal, match="JSON"):
+        validate_pairs(["shadow_lanes=[suspend"])
+
+
+def test_composite_values_round_trip_through_the_text_column():
+    # to_text писал str(dict) — Python-repr с одинарными кавычками, который
+    # чтение (_parse_config_value, JSON) не разбирает: записанное не читалось.
+    steps = {"tuning": 3, "hygiene": 1}
+    assert agent_db._parse_config_value(to_text(steps)) == steps
+    lanes = ["allocation", "suspend"]
+    assert agent_db._parse_config_value(to_text(lanes)) == lanes
+
