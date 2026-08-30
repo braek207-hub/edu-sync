@@ -29,7 +29,10 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 45 не хватало: штатный прогон 36–39 мин, и 29.08 ручной прогон 33276642664
+    # отменился по таймауту, не оставив ни строки вывода. 90 — запас на очередь
+    # Reports API, а не норма: норму смотреть по маркерам этапов в логе.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,6 +41,8 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Run E0
         env:
+          # Без этого stdout Python копится до выхода, и отменённый прогон нем.
+          PYTHONUNBUFFERED: "1"
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
           DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
