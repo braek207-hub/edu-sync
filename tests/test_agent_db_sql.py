@@ -367,3 +367,18 @@ def test_exclude_holdout_does_not_move_an_earlier_exit_date(monkeypatch):
     agent_db.exclude_holdout(["c-1"], excluded_on="2026-08-29")
 
     assert "excluded_at IS NULL" in captured["sql"]
+
+
+def test_stage_reports_sql_is_ordered_oldest_first():
+    """Порядок — часть контракта, а не украшение.
+
+    Читатели чёрного ящика схлопывают дубли дня по правилу «побеждает
+    последний прогон». Без ORDER BY по времени старта победителем оказывался
+    бы случайный прогон — и месячная выгода агента считалась бы по замеру,
+    выбранному планировщиком запроса.
+    """
+    sql = " ".join(agent_db.STAGE_REPORTS_SQL.split())
+    assert sql.startswith("SELECT report FROM edu_agent_runs")
+    assert "WHERE stage = %s" in sql
+    assert "started_at >= now() - make_interval(days => %s)" in sql
+    assert sql.endswith("ORDER BY started_at")

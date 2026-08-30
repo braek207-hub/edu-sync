@@ -697,10 +697,18 @@ def mark_money_checked(action_id: str, verdict: str) -> bool:
 #
 # Окно — по applied_at: калибровка описывает поведение модели, а не историю
 # кабинета, и полугодовой хвост в ней уже про другого агента.
+#
+# expected_rub_delta — рублёвая половина того же обещания. Нужна не петле
+# обучения, а счёту выгоды (sync/agent/value.py): у полосы гигиены ценность
+# измеряется ВЫРЕЗАННЫМ расходом, а не приростом лидов, и фактического расхода
+# до/после в журнале нет вовсе — закрытие наблюдения пишет только
+# observation_verdict и observed_leads_delta. Обещание рычага здесь
+# единственный след денег, и печатается оно с пометкой 'planned'.
 CLOSED_ACTIONS_SQL = """
     SELECT action_kind, object_id, applied_at::date AS applied_on,
            observation_verdict AS closing_verdict, money_verdict,
            (payload->>'expected_leads_delta')::float AS expected_leads_delta,
+           (payload->>'expected_rub_delta')::float  AS expected_rub_delta,
            observed_leads_delta
       FROM edu_agent_actions
      WHERE applied_at IS NOT NULL

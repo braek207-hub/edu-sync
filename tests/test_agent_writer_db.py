@@ -1421,3 +1421,19 @@ def test_exhausted_segments_forget_old_failures():
     assert "EXHAUSTED_RETENTION_DAYS" in dir(writer_db)
     assert "created_at >= now() - make_interval(days => %s)" in \
         writer_db.EXHAUSTED_SEGMENTS_SQL
+
+
+def test_closed_actions_sql_carries_both_halves_of_the_promise():
+    """Ожидание в лидах и в рублях — из payload, одной выборкой.
+
+    Рублёвая половина нужна счёту выгоды: у полосы гигиены ценность меряется
+    вырезанным расходом, а фактического расхода до/после в журнале нет —
+    закрытие наблюдения пишет только вердикт и дельту лидов. Без этой колонки
+    вырезанные рубли считать было бы нечем, и гигиена печаталась бы нулём.
+    """
+    sql = " ".join(writer_db.CLOSED_ACTIONS_SQL.split())
+    assert "(payload->>'expected_leads_delta')::float AS expected_leads_delta" in sql
+    assert "(payload->>'expected_rub_delta')::float AS expected_rub_delta" in sql
+    # Окно по applied_at и только вынесенные вердикты — контракт выборки.
+    assert "observation_verdict IS NOT NULL" in sql
+    assert "applied_at >= now() - make_interval(days =>" in sql

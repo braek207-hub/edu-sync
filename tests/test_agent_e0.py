@@ -129,6 +129,9 @@ _DB_EMPTY_LOADERS = (
     # Id кампаний вне зоны ответственности агента (sync/agent/scope.py). Пусто =
     # чужих кампаний в окне нет; сам фильтр проверяется в tests/test_agent_scope.py.
     "load_excluded_campaign_ids",
+    # Отчёты сторожа из чёрного ящика — вход секции выгоды. Пусто = замеров
+    # такта за окно ещё нет; причина подмены та же, что у остальных читателей.
+    "load_stage_reports",
 )
 
 # Отчёты Директа по кабинетам: у каждого свои сегменты и своя конверсионность —
@@ -1547,3 +1550,145 @@ def test_progress_writes_to_stderr_not_to_stdout(capsys):
     assert "шаг rows=7" in captured.err
     # Время с начала прогона — иначе по строке не сказать, где ушли минуты.
     assert captured.err.startswith("[e0 ")
+
+
+# --------------------------------------------------------------- fail-open Э0
+#
+# Панель настроек агента (edu_agent_config) читается один раз за прогон, и её
+# недоступность расчёт намеренно не роняет: остальные секции от панели не
+# зависят и нужны дашборду. Но ДВЕ секции зависят — целевой CPA и целевые
+# бюджеты берут из панели target_romi и месячный потолок. На кодовых дефолтах
+# target_romi = 1.0 против 2.0 на панели, то есть в edu_agent_computed_settings
+# уезжала цель вдвое мягче — и Э1, который панель читает нормально, применил бы
+# именно её. Свежую строку с неверным числом не записать лучше, чем записать:
+# Э1 переживает два дня старых строк (MAX_COMPUTED_AGE_DAYS), а дальше честно
+# говорит STALE.
+
+
+def _rows_of_kind(kind, campaign_id="111"):
+    """Подмена вычислителя строк: фиктивная порция под запись."""
+    return lambda *a, **k: {campaign_id: [{"setting_kind": kind,
+                                           "setting_key": "target",
+                                           "value": 123.0}]}
+
+
+def _kinds_written(calls):
+    return {r["setting_kind"] for call in calls for r in call["rows"]}
+
+
+def test_money_settings_are_baked_when_the_panel_reads(monkeypatch, capsys):
+    """Панель прочиталась — строки целевого CPA и бюджета едут в витрину."""
+    calls = _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0, "tcpa_computed_rows", _rows_of_kind("tcpa_target"))
+    monkeypatch.setattr(agent_e0, "portfolio_computed_rows",
+                        _rows_of_kind("budget_target"))
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    assert {"tcpa_target", "budget_target"} <= _kinds_written(calls)
+    assert report["tcpa"]["computed_rows"] == 1
+    assert report["budget_target_rows"] == 1
+    # Пропуска не было — и это утверждение, а не умолчание: ключ печатается
+    # всегда, иначе «не пропускали» неотличимо от «поле забыли добавить».
+    assert report["tcpa"]["skipped"] is None
+    assert report["budget_target_skipped"] is None
+
+
+def test_unreadable_panel_keeps_money_settings_out_of_the_mart(monkeypatch, capsys):
+    """Панель не прочиталась — денежные строки не пишутся, причина в отчёте."""
+    calls = _patch_e0_run(monkeypatch)
+    monkeypatch.setattr(agent_e0, "tcpa_computed_rows", _rows_of_kind("tcpa_target"))
+    monkeypatch.setattr(agent_e0, "portfolio_computed_rows",
+                        _rows_of_kind("budget_target"))
+
+    def boom(*a, **k):
+        raise RuntimeError("нет соединения")
+
+    monkeypatch.setattr(agent_e0.agent_db, "load_agent_config", boom)
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    written = _kinds_written(calls)
+    assert "tcpa_target" not in written
+    assert "budget_target" not in written
+    # Секции всё равно посчитаны: отчёт обязан показывать, что агент насчитал
+    # бы, — иначе «панель молчит» неотличимо от «считать было нечего».
+    assert report["tcpa"]["campaigns"] == 0
+    assert report["tcpa"]["computed_rows"] == 0
+    assert report["budget_target_rows"] == 0
+    # Одна причина на оба места, а не два разных литерала.
+    assert "нет соединения" in report["tcpa"]["skipped"]
+    assert report["budget_target_skipped"] == report["tcpa"]["skipped"]
+    # Остальные строки прогона панели не касаются и записываются как обычно.
+    assert "bid_modifier:device" in written
+
+
+# ------------------------------------------------------- выгода агента в рублях
+#
+# Секция agent_value отвечает на единственный вопрос владельца: сколько агент
+# принёс за месяц. Оба слагаемых уже посчитаны в долях (эффект такта против
+# заповедника и исход действия против базового темпа) — здесь они переводятся
+# в рубли и складываются по окну. Контракт ключей читает экран Panda-BI.
+
+
+def _watchdog_run(day, account="acc-1", did=-0.1, cost=1_000_000.0):
+    """Отчёт прогона сторожа: замер такта лежит ВНУТРИ кабинета."""
+    return {"today": day, "accounts": [{
+        "account": account,
+        "tact_effect": {"tact_date": day, "verdict": "improved", "did": did,
+                        "ci": (-0.2, -0.02), "treated": {"cost": cost}},
+    }]}
+
+
+def test_main_reports_agent_value_in_rubles(monkeypatch, capsys):
+    """Секция собирается из чёрного ящика и журнала, окно у обоих одно."""
+    _patch_e0_run(monkeypatch)
+    stage_calls = []
+    journal_calls = []
+
+    def stage_reports(stage, days):
+        stage_calls.append((stage, days))
+        return [_watchdog_run("2026-08-10")]
+
+    def closed_actions(days=None):
+        journal_calls.append(days)
+        return []
+
+    monkeypatch.setattr(agent_e0.agent_db, "load_stage_reports", stage_reports)
+    monkeypatch.setattr(agent_e0.writer_db, "closed_actions", closed_actions)
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    section = report["agent_value"]
+    assert section["window_days"] == agent_e0.VALUE_WINDOW_DAYS
+    assert section["saved_rub"] == 100_000.0
+    assert (section["n_tacts"], section["n_tacts_measured"]) == (1, 1)
+    assert section["did_interval_rub"] == [20_000.0, 200_000.0]
+    assert section["unmeasured_share"] == 0.0
+    # Такты и журнал читаются на ОДНОМ окне: месяц, а не умолчание в 180 дней.
+    # Петля обучения читает журнал своим окном — её вызов здесь ни при чём,
+    # поэтому проверяется наличие вызова с окном выгоды, а не единственность.
+    assert stage_calls == [("watchdog", agent_e0.VALUE_WINDOW_DAYS)]
+    assert agent_e0.VALUE_WINDOW_DAYS in journal_calls
+
+
+def test_agent_value_failure_does_not_kill_the_run(monkeypatch, capsys):
+    """Чёрный ящик недоступен — причина в секции, расчёт идёт дальше."""
+    _patch_e0_run(monkeypatch)
+
+    def boom(*a, **k):
+        raise RuntimeError("чёрный ящик молчит")
+
+    monkeypatch.setattr(agent_e0.agent_db, "load_stage_reports", boom)
+
+    assert agent_e0.main() == 0
+    report = _json.loads(capsys.readouterr().out)
+
+    assert "чёрный ящик молчит" in report["agent_value"]["unavailable"]
+    assert report["agent_value"]["window_days"] == agent_e0.VALUE_WINDOW_DAYS
+    # Нулей рядом с причиной нет: «не прочитали» не притворяется «выгоды ноль».
+    assert "saved_rub" not in report["agent_value"]
+    assert report["verdict"] == "GREEN"

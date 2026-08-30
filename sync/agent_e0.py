@@ -69,7 +69,8 @@ from sync.agent import master as master_mod
 from sync.agent.learning_loop import forecast_bias, track_record
 from sync.agent.mining import mine_quasi_experiments, placebo_sigma
 from sync.agent.portfolio import computed_rows as portfolio_computed_rows
-from sync.agent.portfolio import portfolio_targets
+from sync.agent.portfolio import portfolio_targets, value_per_lead
+from sync.agent import value as agent_value
 from sync.agent.ideas import abtests as ideas_abtests
 from sync.agent.ideas import bundles as ideas_bundles
 from sync.agent.ideas import consolidate as ideas_consolidate
@@ -177,6 +178,15 @@ REPORT_WORKERS = 4
 # плюс запас на пропущенные недели выгрузки — с трёхкратным запасом база
 # набирается даже на рваном ряде.
 DEMAND_HISTORY_WEEKS = 26
+# Окно счёта выгоды агента. Месяц — горизонт, на котором Павел судит о бете:
+# короче него измеренных тактов набирается единицы, а длиннее — в сумму
+# начинает попадать другой агент (карта полос и ступени меняются быстрее).
+#
+# Интервал такта за месяц ВКЛЮЧАЕТ НОЛЬ, и это ожидаемо, а не дефект: агент
+# двигает 1–3 % расхода в неделю, и точность DiD на таком плече заведомо шире
+# эффекта. Поэтому интервал печатается рядом с суммой, а не вместо неё, — и
+# рядом же печатается доля неизмеренного.
+VALUE_WINDOW_DAYS = 30
 
 
 def _window(days: int) -> tuple:
@@ -966,6 +976,21 @@ def main() -> int:
         active_config_rows = [{"key": "__source__", "value": "кодовые дефолты",
                                "source": "unavailable",
                                "about": stored_config["unavailable"]}] + active_config_rows
+    # Причина, по которой ДЕНЕЖНЫЕ строки этого прогона писать нельзя. None —
+    # панель прочиталась, всё едет как обычно.
+    #
+    # Продолжать расчёт на кодовых дефолтах законно: лестница, кривые и спрос
+    # от панели не зависят и нужны дашборду. А вот целевой CPA и целевые
+    # бюджеты зависят — они берут target_romi и месячный потолок. Дефолт кода
+    # target_romi = 1.0 против 2.0 на панели: в edu_agent_computed_settings
+    # уехала бы цель ВДВОЕ мягче, и Э1, который панель читает нормально,
+    # применил бы именно её. Не записать свежую строку дешевле, чем записать
+    # неверную: Э1 держит старую до MAX_COMPUTED_AGE_DAYS, а дальше честно
+    # говорит STALE. Переменная одна на оба места намеренно — два литерала
+    # причины однажды разошлись бы.
+    config_baked_reason = stored_config.get("unavailable")
+    computed_skip_note = (f"панель недоступна: {config_baked_reason}"
+                          if config_baked_reason else None)
     # Пороги уверенности по классам действий — из того же активного конфига.
     # Считаются один раз на прогон: они не зависят ни от кабинета, ни от
     # объекта, и пересчёт их в каждом вызове означал бы, что где-то они могут
@@ -1736,12 +1761,16 @@ def main() -> int:
         facts, saturation["campaigns"], campaign_settings,
         ladder_section["window_from"], ladder_section["window_to"]),
         target_romi=active_config["target_romi"])
+    # Расчёт секции идёт всегда — в витрину строки едут только с живой
+    # панелью (config_baked_reason). Отчёт обязан показать, что агент насчитал
+    # бы: иначе «панель молчит» неотличимо от «считать было нечего».
     tcpa_count = 0
-    for campaign_id, rows in tcpa_computed_rows(tcpa_section).items():
-        agent_db.upsert_computed_settings(
-            rows, calc_date=today_iso, object_id=campaign_id,
-            object_level="campaign")
-        tcpa_count += len(rows)
+    if not config_baked_reason:
+        for campaign_id, rows in tcpa_computed_rows(tcpa_section).items():
+            agent_db.upsert_computed_settings(
+                rows, calc_date=today_iso, object_id=campaign_id,
+                object_level="campaign")
+            tcpa_count += len(rows)
 
     def _solve_portfolio(**growth_args):
         return portfolio_targets(
@@ -1826,6 +1855,42 @@ def main() -> int:
                     "forecast_bias": forecast_bias(closed)}
     except Exception as exc:  # noqa: BLE001
         learning = {"unavailable": f"{type(exc).__name__}: {exc}"[:200]}
+
+    # ВЫГОДА АГЕНТА В РУБЛЯХ за месяц. Оба замера у агента уже есть, и оба в
+    # долях: эффект такта против заповедника (сторож, чёрный ящик) и исход
+    # действия против базового темпа (журнал). Не хватало ровно перевода в
+    # деньги и суммы по периоду — то есть единственного числа, которым
+    # владелец судит о бете.
+    #
+    # Цена лида берётся ТОЙ ЖЕ функцией и из ТОЙ ЖЕ лестницы, по которой
+    # считал портфель (portfolio.value_per_lead на ladder_section.by_object).
+    # Вторая карта цены лида означала бы, что отчёт о выгоде и раскладка
+    # бюджетов однажды разойдутся, и разойдутся молча.
+    #
+    # Окно журнала — то же VALUE_WINDOW_DAYS, а не умолчание closed_actions
+    # (180 дней): такты и действия обязаны считаться на одном периоде, иначе
+    # «за месяц» складывается из месяца и полугода.
+    #
+    # Секция целиком под try/except, как learning выше: чёрный ящик и журнал —
+    # отчётный слой поверх расчёта, и их недоступность обязана стать видимой
+    # строкой, а не упавшим прогоном.
+    try:
+        value_tacts = agent_value.tacts_from_reports(
+            agent_db.load_stage_reports("watchdog", VALUE_WINDOW_DAYS))
+        value_actions = writer_db.closed_actions(VALUE_WINDOW_DAYS)
+        agent_value_section = {
+            "window_days": VALUE_WINDOW_DAYS,
+            **agent_value.period_value(
+                value_tacts, value_actions,
+                {campaign_id: price["value"]
+                 for campaign_id, row in (ladder_section["by_object"] or {}).items()
+                 if (price := value_per_lead(row)) is not None}),
+        }
+        _progress("выгода агента", tacts=len(value_tacts),
+                  actions=len(value_actions))
+    except Exception as exc:  # noqa: BLE001
+        agent_value_section = {"window_days": VALUE_WINDOW_DAYS,
+                               "unavailable": f"{type(exc).__name__}: {exc}"[:200]}
 
     # Э7.8: спрос рынка как календарь направлений. Окно — 26 недель: базовое
     # окно режима 8 недель плюс запас на дыры выгрузки Wordstat.
@@ -1917,12 +1982,16 @@ def main() -> int:
         # сырой модели, как до петли. Предварительная раскладка идёт без неё
         # намеренно: она считает запас по целям, а цели поправка не трогает.
         forecast_bias=learning.get("forecast_bias"))
+    # Та же зависимость от панели, что у целевого CPA выше, и тот же пропуск:
+    # раскладка считана на target_romi и месячном потолке, и на кодовых
+    # дефолтах её строки — это чужие деньги в витрине полосы allocation.
     budget_target_count = 0
-    for campaign_id, rows in portfolio_computed_rows(budget_threshold).items():
-        agent_db.upsert_computed_settings(
-            rows, calc_date=today_iso, object_id=campaign_id,
-            object_level="campaign")
-        budget_target_count += len(rows)
+    if not config_baked_reason:
+        for campaign_id, rows in portfolio_computed_rows(budget_threshold).items():
+            agent_db.upsert_computed_settings(
+                rows, calc_date=today_iso, object_id=campaign_id,
+                object_level="campaign")
+            budget_target_count += len(rows)
 
     # Вторая половина оптимизации: что УСИЛИТЬ. Собирается из уже посчитанного
     # — недобор трафика, упор в кап шага, режим спроса, запросы без своей
@@ -2163,6 +2232,9 @@ def main() -> int:
             "accounts": pace_by_login,
         },
         "budget_target_rows": budget_target_count,
+        # Та же причина тем же текстом, что у tcpa.skipped: одна переменная на
+        # оба места, чтобы «почему бюджеты не записаны» читалось одинаково.
+        "budget_target_skipped": computed_skip_note,
         "computed_settings": computed_count,
         "computed_settings_by_account": {k: len(v) for k, v in computed_by_account.items()},
         "computed_settings_skipped": computed_skipped,
@@ -2197,12 +2269,22 @@ def main() -> int:
             "moves_confident": tcpa_section["moves_confident"],
             "no_target": tcpa_section["no_target"],
             "computed_rows": tcpa_count,
+            # Почему строк ноль при непустой секции. Печатается всегда, в том
+            # числе None: отсутствие ключа неотличимо от «поле не добавили».
+            "skipped": computed_skip_note,
         },
         # Задача 13: чем закончились СОБСТВЕННЫЕ действия агента. Доля
         # попаданий печатается ещё и раздельно для растящих и сокращающих:
         # мера исхода судит по цене, а срезав объём, кампания почти всегда
         # дешевеет — общий hit_rate систематически хвалил бы резаков.
         "learning_loop": learning,
+        # Выгода агента в рублях за месяц: сколько сэкономили такты (против
+        # заповедника) и сколько принесли собственные действия (против
+        # базового темпа). Суммы стоят РЯДОМ, а не складываются: такт меряет
+        # цену лида, действие — прирост лидов, и одно число из них было бы
+        # двойным счётом. Доля неизмеренного печатается тут же — без неё сумма
+        # выглядит полным ответом, будучи ответом по измеренной части.
+        "agent_value": agent_value_section,
         # Э7.8: режим спроса по направлениям. Сезонный подъём или спад меняет
         # ожидания от кампаний направления, а не объявляется их провалом.
         "demand_regime": {
