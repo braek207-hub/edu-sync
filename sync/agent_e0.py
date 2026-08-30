@@ -69,7 +69,8 @@ from sync.agent import master as master_mod
 from sync.agent.learning_loop import forecast_bias, track_record
 from sync.agent.mining import mine_quasi_experiments, placebo_sigma
 from sync.agent.portfolio import computed_rows as portfolio_computed_rows
-from sync.agent.portfolio import portfolio_targets
+from sync.agent.portfolio import portfolio_targets, value_per_lead
+from sync.agent import value as agent_value
 from sync.agent.ideas import abtests as ideas_abtests
 from sync.agent.ideas import bundles as ideas_bundles
 from sync.agent.ideas import consolidate as ideas_consolidate
@@ -177,6 +178,15 @@ REPORT_WORKERS = 4
 # плюс запас на пропущенные недели выгрузки — с трёхкратным запасом база
 # набирается даже на рваном ряде.
 DEMAND_HISTORY_WEEKS = 26
+# Окно счёта выгоды агента. Месяц — горизонт, на котором Павел судит о бете:
+# короче него измеренных тактов набирается единицы, а длиннее — в сумму
+# начинает попадать другой агент (карта полос и ступени меняются быстрее).
+#
+# Интервал такта за месяц ВКЛЮЧАЕТ НОЛЬ, и это ожидаемо, а не дефект: агент
+# двигает 1–3 % расхода в неделю, и точность DiD на таком плече заведомо шире
+# эффекта. Поэтому интервал печатается рядом с суммой, а не вместо неё, — и
+# рядом же печатается доля неизмеренного.
+VALUE_WINDOW_DAYS = 30
 
 
 def _window(days: int) -> tuple:
@@ -1846,6 +1856,42 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         learning = {"unavailable": f"{type(exc).__name__}: {exc}"[:200]}
 
+    # ВЫГОДА АГЕНТА В РУБЛЯХ за месяц. Оба замера у агента уже есть, и оба в
+    # долях: эффект такта против заповедника (сторож, чёрный ящик) и исход
+    # действия против базового темпа (журнал). Не хватало ровно перевода в
+    # деньги и суммы по периоду — то есть единственного числа, которым
+    # владелец судит о бете.
+    #
+    # Цена лида берётся ТОЙ ЖЕ функцией и из ТОЙ ЖЕ лестницы, по которой
+    # считал портфель (portfolio.value_per_lead на ladder_section.by_object).
+    # Вторая карта цены лида означала бы, что отчёт о выгоде и раскладка
+    # бюджетов однажды разойдутся, и разойдутся молча.
+    #
+    # Окно журнала — то же VALUE_WINDOW_DAYS, а не умолчание closed_actions
+    # (180 дней): такты и действия обязаны считаться на одном периоде, иначе
+    # «за месяц» складывается из месяца и полугода.
+    #
+    # Секция целиком под try/except, как learning выше: чёрный ящик и журнал —
+    # отчётный слой поверх расчёта, и их недоступность обязана стать видимой
+    # строкой, а не упавшим прогоном.
+    try:
+        value_tacts = agent_value.tacts_from_reports(
+            agent_db.load_stage_reports("watchdog", VALUE_WINDOW_DAYS))
+        value_actions = writer_db.closed_actions(VALUE_WINDOW_DAYS)
+        agent_value_section = {
+            "window_days": VALUE_WINDOW_DAYS,
+            **agent_value.period_value(
+                value_tacts, value_actions,
+                {campaign_id: price["value"]
+                 for campaign_id, row in (ladder_section["by_object"] or {}).items()
+                 if (price := value_per_lead(row)) is not None}),
+        }
+        _progress("выгода агента", tacts=len(value_tacts),
+                  actions=len(value_actions))
+    except Exception as exc:  # noqa: BLE001
+        agent_value_section = {"window_days": VALUE_WINDOW_DAYS,
+                               "unavailable": f"{type(exc).__name__}: {exc}"[:200]}
+
     # Э7.8: спрос рынка как календарь направлений. Окно — 26 недель: базовое
     # окно режима 8 недель плюс запас на дыры выгрузки Wordstat.
     demand = demand_regime(
@@ -2232,6 +2278,13 @@ def main() -> int:
         # мера исхода судит по цене, а срезав объём, кампания почти всегда
         # дешевеет — общий hit_rate систематически хвалил бы резаков.
         "learning_loop": learning,
+        # Выгода агента в рублях за месяц: сколько сэкономили такты (против
+        # заповедника) и сколько принесли собственные действия (против
+        # базового темпа). Суммы стоят РЯДОМ, а не складываются: такт меряет
+        # цену лида, действие — прирост лидов, и одно число из них было бы
+        # двойным счётом. Доля неизмеренного печатается тут же — без неё сумма
+        # выглядит полным ответом, будучи ответом по измеренной части.
+        "agent_value": agent_value_section,
         # Э7.8: режим спроса по направлениям. Сезонный подъём или спад меняет
         # ожидания от кампаний направления, а не объявляется их провалом.
         "demand_regime": {

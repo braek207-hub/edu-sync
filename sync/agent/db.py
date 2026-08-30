@@ -1113,6 +1113,43 @@ def load_agent_config() -> Dict[str, Any]:
     return {"preset": preset, "overrides": overrides}
 
 
+# Отчёты прогонов одной стадии из чёрного ящика. Порядок — по возрастанию
+# времени старта: читатели схлопывают дубли дня «побеждает последний», и без
+# гарантии порядка победителем оказывался бы случайный прогон.
+STAGE_REPORTS_SQL = """
+    SELECT report
+      FROM edu_agent_runs
+     WHERE stage = %s
+       AND started_at >= now() - make_interval(days => %s)
+     ORDER BY started_at
+"""
+
+
+def load_stage_reports(stage: str, days: int) -> List[Dict[str, Any]]:
+    """Отчёты прогонов стадии за окно — распарсенными словарями.
+
+    Колонка jsonb, и драйвер обычно отдаёт её уже словарём; строка приходит
+    оттуда, где jsonb приехал текстом. Разбор здесь, а не у вызывающего:
+    читателей у чёрного ящика становится больше одного, и json.loads в каждом
+    из них однажды разошёлся бы обработкой битой строки.
+
+    Битый или неожиданной формы отчёт пропускается: чёрный ящик — история, а
+    не источник истины прогона, и одна испорченная строка не имеет права
+    ронять расчёт, который её читает.
+    """
+    out: List[Dict[str, Any]] = []
+    for row in _fetch_dicts(STAGE_REPORTS_SQL, (str(stage), int(days))):
+        report = row.get("report")
+        if isinstance(report, str):
+            try:
+                report = json.loads(report)
+            except ValueError:
+                continue
+        if isinstance(report, dict):
+            out.append(report)
+    return out
+
+
 def crm_maturity_date() -> Optional[date]:
     """Последний день, за который лиды в CRM РЕАЛЬНО есть. Граница зрелости.
 
