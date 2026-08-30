@@ -34,6 +34,7 @@ sync/agent/value.py — сколько агент принёс и сэконом
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from sync.agent.tact_effect import NO_ACTIONS_REASON
 from sync.agent.writer.lanes import LANE_HYGIENE, LANE_OF_KIND
 
 # Вердикты замера такта, при которых об эффекте можно что-то утверждать: весь
@@ -183,6 +184,13 @@ def tacts_from_reports(reports: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]
         for account in (report or {}).get("accounts") or []:
             effect = account.get("tact_effect") or {}
             if not effect:
+                continue
+            # Сторож ходит каждый день, а такт с применёнными действиями —
+            # не каждый: день без действий он возвращает как «unknown» с этой
+            # причиной. Это не неизмеренный такт, а его отсутствие; считать
+            # такие дни в n_tacts значило бы за месяц показать «измерен 1 из
+            # 30» там, где тактов было три.
+            if effect.get("reason") == NO_ACTIONS_REASON:
                 continue
             login = str(account.get("account") or "")
             latest[(login, str(effect.get("tact_date")))] = {

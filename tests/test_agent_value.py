@@ -59,8 +59,10 @@ def test_interval_of_an_inconclusive_tact_includes_zero():
 
 
 def test_interval_is_ordered_low_first():
+    # Умножение на отрицательный расход-множитель переворачивает границы:
+    # ci даётся возрастающим, а в рублях верх и низ меняются местами.
     out = value.tact_value({"verdict": "improved", "did": -0.10,
-                            "ci": (-0.18, -0.02), "cost_treated_after": 1e6})
+                            "ci": (-0.02, -0.18), "cost_treated_after": 1e6})
     low, high = out["interval_rub"]
     assert low <= high and (low, high) == (20_000.0, 180_000.0)
 
@@ -198,6 +200,18 @@ def test_different_accounts_of_one_day_are_different_tacts():
                       {"account": "acc-2", "tact_effect": _effect("2026-08-10")}]},
     ])
     assert len(tacts) == 2
+
+
+def test_a_day_without_applied_actions_is_not_a_tact():
+    """День без действий сторож помечает NO_ACTIONS_REASON — такта не было."""
+    from sync.agent.tact_effect import NO_ACTIONS_REASON
+    effect = {**_effect("2026-08-11"), "verdict": "unknown", "did": None,
+              "ci": None, "reason": NO_ACTIONS_REASON}
+    tacts = value.tacts_from_reports([
+        _watchdog_report("2026-08-10"),
+        {"accounts": [{"account": "acc-1", "tact_effect": effect}]},
+    ])
+    assert [t["tact_date"] for t in tacts] == ["2026-08-10"]
 
 
 def test_a_report_without_a_measure_yields_no_tact():
