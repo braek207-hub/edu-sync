@@ -2047,6 +2047,22 @@ def test_campaign_scope_without_limits_changes_nothing():
     assert scope.select(["111", "222"]) == ["111", "222"]
 
 
+def test_campaign_scope_limit_slot_skips_holdout():
+    # Первый боевой прогон 31.08.2026: --max-campaigns=1 выдал единственный
+    # слот кампании заповедника, check_holdout отклонил все её действия,
+    # applied=0 — и детерминизм выбора повторял бы этот ноль каждый прогон.
+    picked = agent_e1.CampaignScope(max_campaigns=1).select(
+        ["111", "222", "333"], skip={"111"})
+    assert picked == ["222"]
+
+
+def test_campaign_scope_only_filter_ignores_skip():
+    # only — явное решение оператора; заповедник его не перебивает.
+    picked = agent_e1.CampaignScope(only=["111"]).select(
+        ["111", "222"], skip={"111"})
+    assert picked == ["111"]
+
+
 # =========================================================================
 # Дефект И3: отклонённое и неудавшееся переотправляются вечно
 #

@@ -234,18 +234,29 @@ class CampaignScope:
     def enabled(self) -> bool:
         return self.only is not None or self.max_campaigns is not None
 
-    def select(self, campaign_ids: List[str]) -> List[str]:
+    def select(self, campaign_ids: List[str],
+               skip: Any = frozenset()) -> List[str]:
         """Кампании кабинета → та их часть, которую прогону позволено трогать.
 
         Порядок входного списка сохраняется (own_campaign_ids отдаёт его
         отсортированным), поэтому выбор при --max-campaigns детерминирован:
         повторный прогон с тем же ограничением возьмёт те же кампании, а не
         случайные.
+
+        skip — кампании, которым слот лимита не достаётся (заповедник):
+        рельса check_holdout всё равно отклонит каждое их действие, и слот,
+        выданный такой кампании, гарантирует пустой прогон. Первый боевой
+        запуск 31.08.2026 так и закончился: --max-campaigns=1 выдал
+        единственный слот кампании заповедника, applied=0, и детерминизм
+        выбора означал тот же ноль на каждом повторе. На фильтр only skip
+        не действует: явно названная кампания — решение оператора.
         """
         selected = list(campaign_ids)
         if self.only is not None:
             selected = [c for c in selected if str(c) in self.only]
         if self.remaining is not None:
+            excluded = {str(c) for c in skip} - (self.only or set())
+            selected = [c for c in selected if str(c) not in excluded]
             selected = selected[:max(self.remaining, 0)]
             self.remaining -= len(selected)
         return selected
@@ -541,7 +552,8 @@ def fetch_campaign_ids(client: WriteClient) -> List[int]:
 
 
 def own_campaign_ids(client: WriteClient, daily_cost_by_campaign: Dict[str, float],
-                     scope: Optional[CampaignScope] = None) -> List[str]:
+                     scope: Optional[CampaignScope] = None,
+                     holdout_ids: Any = None) -> List[str]:
     """Кампании ЭТОГО кабинета, пересечённые со справочником расходов.
 
     daily_cost_by_campaign построен по ВСЕМ кабинетам сразу — без пересечения
@@ -553,7 +565,7 @@ def own_campaign_ids(client: WriteClient, daily_cost_by_campaign: Dict[str, floa
     """
     own = {str(i) for i in fetch_campaign_ids(client)}
     ids = sorted(own & set(daily_cost_by_campaign.keys()))
-    return scope.select(ids) if scope is not None else ids
+    return scope.select(ids, skip=holdout_ids or frozenset()) if scope is not None else ids
 
 
 def _delta_or_none(raw: Any) -> Any:
@@ -1693,7 +1705,8 @@ def run_account(
     # кампаний кабинета их существование в принципе не проверить — ранний
     # выход «у кабинета нет корректировок» молча прятал бы личные значения.
     scope = ctx["campaign_scope"]
-    campaign_ids = own_campaign_ids(client, daily_cost, scope)
+    campaign_ids = own_campaign_ids(client, daily_cost, scope,
+                                    holdout_ids=holdout_ids)
 
     # Э2.2: личные значения кампаний. Приоритет — «кампания, если есть, иначе
     # кабинет», по каждому виду настройки целиком: у кампании с личным набором
