@@ -1,0 +1,63 @@
+name: Backfill Bjorn products/card views
+
+# Разовый догон истории товарной воронки (stat API Метрики хранит историю целиком).
+# Синк пишет строго окно --from..--to и перед записью удаляет ровно его, поэтому
+# помесячная нарезка безопасна и повторяема.
+on:
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "Начало (YYYY-MM-DD)"
+        required: true
+      date_to:
+        description: "Конец (YYYY-MM-DD)"
+        required: true
+      module:
+        description: "products | card_views"
+        required: false
+        default: "products"
+
+concurrency:
+  group: bjorn-marketing-sync
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      SUPABASE_URL: ${{ secrets.BJORN_SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.BJORN_SUPABASE_SERVICE_KEY }}
+      METRICA_TOKEN: ${{ secrets.BJORN_METRICA_TOKEN }}
+      METRICA_COUNTER_ID: ${{ secrets.BJORN_METRICA_COUNTER_ID }}
+      METRICA_ATTRIBUTIONS: "automatic,first,lastsign"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Backfill by month
+        run: |
+          python - <<'PY' > months.txt
+          from datetime import date, timedelta
+          import os
+          a = date.fromisoformat(os.environ["DF"]); b = date.fromisoformat(os.environ["DT"])
+          cur = a
+          while cur <= b:
+              nxt = (cur.replace(day=1) + timedelta(days=32)).replace(day=1)
+              end = min(b, nxt - timedelta(days=1))
+              print(cur.isoformat(), end.isoformat())
+              cur = end + timedelta(days=1)
+          PY
+          cat months.txt
+          while read -r f t; do
+            echo "=== $f .. $t ==="
+            python -m sync.bjorn.sync_${MODULE} --from "$f" --to "$t"
+          done < months.txt
+        env:
+          DF: ${{ github.event.inputs.date_from }}
+          DT: ${{ github.event.inputs.date_to }}
+          MODULE: ${{ github.event.inputs.module }}
