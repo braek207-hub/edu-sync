@@ -51,20 +51,27 @@ RATE_PAIRS: Tuple[Tuple[str, str], ...] = (
 MIN_STEP_EVENTS = 25.0
 MIN_RATE_EVENTS = 25.0
 
-NO_STEP_REASON = (
-    f"ни одна ступень воронки не набрала {int(MIN_STEP_EVENTS)} событий за окно — "
-    "объекту нечем меряться, решения только на пуле похожих"
-)
+def no_step_reason(min_events: float = MIN_STEP_EVENTS) -> str:
+    """Причина отказа с ФАКТИЧЕСКИМ порогом: consolidate судит группы по
+    панельной ручке, и причина «не набрала 25» при пороге 10 врала бы."""
+    return (
+        f"ни одна ступень воронки не набрала {int(min_events)} событий за окно — "
+        "объекту нечем меряться, решения только на пуле похожих"
+    )
+
+
+NO_STEP_REASON = no_step_reason()
 
 
 def _count(counts: Dict[str, Any], step: str) -> float:
     return float(counts.get(step) or 0.0)
 
 
-def choose_step(counts: Dict[str, Any]) -> Optional[str]:
+def choose_step(counts: Dict[str, Any],
+                min_events: float = MIN_STEP_EVENTS) -> Optional[str]:
     """Самая глубокая ступень с достаточным числом событий."""
     for step in STEP_ORDER:
-        if _count(counts, step) >= MIN_STEP_EVENTS:
+        if _count(counts, step) >= min_events:
             return step
     return None
 
@@ -187,12 +194,13 @@ def ladder(
     counts: Dict[str, Any],
     pools: Sequence[Tuple[str, Dict[str, Any]]],
     avg_check: Optional[float] = None,
+    min_events: float = MIN_STEP_EVENTS,
 ) -> Dict[str, Any]:
     """Ступень объекта + пересчёт её значения в ожидаемые оплаты и выручку."""
-    step = choose_step(counts)
+    step = choose_step(counts, min_events)
     events_by_step = {s: _count(counts, s) for s in STEP_ORDER}
     if step is None:
-        return {"step": None, "reason": NO_STEP_REASON,
+        return {"step": None, "reason": no_step_reason(min_events),
                 "events_by_step": events_by_step}
 
     events = _count(counts, step)

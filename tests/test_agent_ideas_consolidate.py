@@ -520,3 +520,44 @@ def test_growth_margin_is_charged_once_on_the_group_not_on_the_donor():
     reasons = {row["reason"] for row in result["skipped"]}
     assert consolidate.REASON_THIN_MARGIN not in reasons, (
         "запас роста взят дважды: связка отсеяна порогом кампании")
+
+
+# ------------------------------- панельные ручки порогов выноса (01.09.2026)
+
+
+def test_min_expected_payments_is_a_setting_not_a_constant():
+    # Владелец вправе принять для выноса вердикт грубее общего судьи: фразы
+    # уже доказаны деньгами доноров, кампания создаётся на паузе. Пара
+    # «дефолт отвергает — ручка пропускает» показывает, что отказ приходил
+    # именно от порога объёма, а не от чего-то ещё.
+    rows = [_q(p_pay=2.0), _q(phrase="поступить в колледж", campaign="222",
+                              p_pay=2.0)]
+
+    assert consolidate.candidates(rows, _ctx()) == []
+    assert consolidate.candidates(
+        rows, _ctx(config={consolidate.MIN_EXPECTED_PAYMENTS_KEY: 10}))
+
+
+def test_lowered_payment_threshold_travels_into_the_refusal_text():
+    # Причина отказа обязана называть ФАКТИЧЕСКИЙ порог: «не набрать 25» при
+    # пороге 10 отправила бы человека проверять не то число.
+    thin = [_q(p_pay=0.05), _q(phrase="поступить в колледж", campaign="222",
+                               p_pay=0.05)]
+    result = consolidate.scan(
+        thin, _ctx(config={consolidate.MIN_EXPECTED_PAYMENTS_KEY: 10}))
+
+    assert result["ideas"] == []
+    assert any("не набрать 10" in row["reason"] for row in result["skipped"])
+
+
+def test_ladder_step_threshold_for_groups_is_a_setting():
+    # Группа с 15 кликами: общий порог лестницы (25) отказывает, панельная
+    # ручка выноса (10) даёт ступень и оценку. Ручка локальна для
+    # consolidate — общий MIN_STEP_EVENTS остальных механизмов не трогается.
+    donors = [consolidate._one(_mute(clicks=15), _ctx())[0]]
+
+    _, _, refused = consolidate._economics(donors)
+    payments, _, ok = consolidate._economics(donors, min_step_events=10)
+
+    assert refused is not None and "25 событий" in refused
+    assert ok is None and payments is not None and payments > 0

@@ -37,10 +37,15 @@ sync/agent/ideas/consolidate.py — генератор идей: вынос до
 
 **Пороги.** Ни один не заведён заново:
 
-  * ОБЪЁМ — power.MIN_EXPECTED_PAYMENTS = 25: столько ожидаемых оплат нужно
-    накопить, чтобы решение на объекте вообще имело силу (MDE ≈ 30 % при базе
-    1.4 %). Кампания, которой не хватит событий на вердикт, — не эксперимент,
-    а трата.
+  * ОБЪЁМ — по умолчанию power.MIN_EXPECTED_PAYMENTS = 25: столько ожидаемых
+    оплат нужно накопить, чтобы решение на объекте вообще имело силу
+    (MDE ≈ 30 % при базе 1.4 %). Кампания, которой не хватит событий на
+    вердикт, — не эксперимент, а трата. С 01.09.2026 порог (и порог ступени
+    лестницы для групп) — панельные ручки consolidate_min_expected_payments /
+    consolidate_min_step_events: вынос собирает фразы, уже доказанные
+    деньгами доноров, кампания создаётся на паузе и включается человеком,
+    поэтому владелец вправе принять здесь оценку грубее, не ослабляя общего
+    судью остальных механизмов.
   * СРОК НАКОПЛЕНИЯ — сколько дней при нынешнем темпе доноров нужно, чтобы
     этот объём набрался, но не меньше experiments.HORIZON_DAYS: горизонт
     замера ставки объявлен там и там же читается сторожем.
@@ -102,9 +107,30 @@ REASON_THIN_MARGIN = (
     "донора, не окупится и в новой кампании")
 REASON_NO_COST = "у связки нет расхода: стартовый бюджет новой кампании не от чего отмерить"
 
-GROUP_REASON_THIN_POWER = (
-    f"направлению не набрать {power_mod.MIN_EXPECTED_PAYMENTS:g} ожидаемых "
-    "оплат за допустимый срок: это не эксперимент, а трата")
+# Панельные ручки выноса (config.SPEC, дефолты = общие пороги кода). Вынос
+# собирает фразы, уже доказанные деньгами доноров, и кампания создаётся на
+# паузе — владелец вправе принять здесь оценку грубее общего судьи, не трогая
+# пороги остальных механизмов.
+MIN_STEP_EVENTS_KEY = "consolidate_min_step_events"
+MIN_EXPECTED_PAYMENTS_KEY = "consolidate_min_expected_payments"
+
+
+def _min_step_events(ctx: Dict[str, Any]) -> float:
+    value = _number(((ctx or {}).get("config") or {}).get(MIN_STEP_EVENTS_KEY))
+    return value if value and value > 0 else ladder_mod.MIN_STEP_EVENTS
+
+
+def _min_expected_payments(ctx: Dict[str, Any]) -> float:
+    value = _number(((ctx or {}).get("config") or {}).get(MIN_EXPECTED_PAYMENTS_KEY))
+    return value if value and value > 0 else power_mod.MIN_EXPECTED_PAYMENTS
+
+
+def thin_power_reason(min_expected: float) -> str:
+    return (f"направлению не набрать {min_expected:g} ожидаемых "
+            "оплат за допустимый срок: это не эксперимент, а трата")
+
+
+GROUP_REASON_THIN_POWER = thin_power_reason(power_mod.MIN_EXPECTED_PAYMENTS)
 GROUP_REASON_NO_CPA = (
     "у доноров не посчитана цена конверсии: критерий успеха не от чего "
     "отмерить — новая кампания обязана побить именно донорскую цену")
@@ -251,7 +277,8 @@ def _cannibalization(donors: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _economics(donors: List[Dict[str, Any]],
+def _economics(donors: List[Dict[str, Any]], *,
+               min_step_events: float = ladder_mod.MIN_STEP_EVENTS,
                ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     """Доноры направления → (ожидаемые оплаты, выручка, причина отказа).
 
@@ -296,11 +323,12 @@ def _economics(donors: List[Dict[str, Any]],
             # Ни оплат, ни событий: складывать нечего. Не «мало» — нечем.
             return None, None, GROUP_REASON_NO_PAYMENTS
         result = ladder_mod.ladder(counts, rows[0].get("pools") or (),
-                                   avg_check=rows[0].get("avg_check"))
+                                   avg_check=rows[0].get("avg_check"),
+                                   min_events=min_step_events)
         got = _number(result.get("expected_payments"))
         if got is None:
             return None, None, (_text(result.get("reason"))
-                                or ladder_mod.NO_STEP_REASON)
+                                or ladder_mod.no_step_reason(min_step_events))
         payments += got
         earned = _number(result.get("expected_revenue"))
         if earned is None:
@@ -319,7 +347,8 @@ def _group(direction: str, donors: List[Dict[str, Any]], ctx: Dict[str, Any],
     cost = sum(d["cost_rub"] for d in donors)
     conversions = sum(d["conversions"] for d in donors)
 
-    payments, revenue, refusal = _economics(donors)
+    payments, revenue, refusal = _economics(
+        donors, min_step_events=_min_step_events(ctx))
     if refusal is not None:
         return None, {"direction": direction, "reason": refusal}
 
@@ -331,17 +360,20 @@ def _group(direction: str, donors: List[Dict[str, Any]], ctx: Dict[str, Any],
             return None, {"direction": direction,
                           "reason": GROUP_REASON_THIN_MARGIN}
 
+    min_expected = _min_expected_payments(ctx)
     if not window or window <= 0 or not payments or payments <= 0:
-        return None, {"direction": direction, "reason": GROUP_REASON_THIN_POWER}
+        return None, {"direction": direction,
+                      "reason": thin_power_reason(min_expected)}
 
     # Сколько дней при нынешнем темпе доноров копится порог значимости. Темп
     # берётся у доноров, а не выдумывается для новой кампании: она собирается
     # ИЗ ИХ ЖЕ трафика, и другого основания для прогноза объёма нет.
     daily_payments = payments / float(window)
-    days_to_power = int(math.ceil(power_mod.MIN_EXPECTED_PAYMENTS / daily_payments))
+    days_to_power = int(math.ceil(min_expected / daily_payments))
     horizon = max(days_to_power, STAKE_HORIZON_DAYS) + CRM_MATURITY_WINDOW_DAYS
     if horizon > limits.max_horizon(ctx):
-        return None, {"direction": direction, "reason": GROUP_REASON_THIN_POWER}
+        return None, {"direction": direction,
+                      "reason": thin_power_reason(min_expected)}
 
     if conversions <= 0:
         return None, {"direction": direction, "reason": GROUP_REASON_NO_CPA}
