@@ -185,6 +185,23 @@ def _metrica_get(params: dict[str, Any], token: str) -> dict[str, Any]:
     raise RuntimeError("Metrica API: max retries")
 
 
+def _fetch_with_split(fetch, token: str, date_from: str, date_to: str) -> list[dict[str, Any]]:
+    """31.08.26 Метрика начала отвечать 400 «Запрос слишком сложный» на окно 60 дней —
+    объём счётчика вырос. Окно не уменьшаем (атрибуция дозревает задним числом),
+    вместо этого при этой ошибке рекурсивно делим период пополам."""
+    try:
+        return fetch(token, date_from, date_to)
+    except RuntimeError as e:
+        span = (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days
+        if "Запрос слишком сложный" not in str(e) or span < 2:
+            raise
+        mid = date.fromisoformat(date_from) + timedelta(days=span // 2)
+        print(f"  400 too-complex, split: {date_from}—{mid} + {mid + timedelta(days=1)}—{date_to}")
+        return _fetch_with_split(fetch, token, date_from, mid.isoformat()) + _fetch_with_split(
+            fetch, token, (mid + timedelta(days=1)).isoformat(), date_to
+        )
+
+
 def fetch_metrica_sources(token: str, date_from: str, date_to: str) -> list[dict[str, Any]]:
     dimensions = ",".join(
         [
@@ -458,7 +475,7 @@ def main() -> int:
 
     try:
         print(f"Metrica sources: {date_from} — {date_to}")
-        rows = fetch_metrica_sources(token, date_from, date_to)
+        rows = _fetch_with_split(fetch_metrica_sources, token, date_from, date_to)
         print(f"  rows: {len(rows)}")
         if rows:
             deleted = delete_sources_from(date_from)
@@ -470,7 +487,16 @@ def main() -> int:
 
     try:
         print(f"Metrica purchases: {date_from} — {date_to}")
-        rows = fetch_metrica_purchases(token, date_from, date_to)
+        rows = _fetch_with_split(fetch_metrica_purchases, token, date_from, date_to)
+        # после разбиения заказ может попасть в оба под-окна — оставляем позднюю дату,
+        # иначе execute_batch упадёт на двойном ON CONFLICT по order_id
+        by_order = {}
+        for r in rows:
+            prev = by_order.get(r["order_id"])
+            if prev and prev["purchase_date"] > r["purchase_date"]:
+                continue
+            by_order[r["order_id"]] = r
+        rows = list(by_order.values())
         print(f"  rows: {len(rows)}")
         if rows:
             deleted = delete_purchases_from(date_from)
