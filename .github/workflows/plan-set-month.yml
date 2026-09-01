@@ -1,0 +1,60 @@
+# Перезапись плана одного месяца в листе plan_monthly + upsert в базу.
+# Лист — источник истины (ночной sync делает TRUNCATE monthly_plans),
+# поэтому план меняется здесь, а не SQL-ом в базе.
+name: plan-set-month
+
+on:
+  workflow_dispatch:
+    inputs:
+      month:
+        description: "Месяц YYYY-MM"
+        required: true
+      rows_json:
+        description: "JSON-список строк месяца (project, direction, budget, leads, connections, deals, payments, revenue, notes)"
+        required: true
+
+jobs:
+  set-plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Create Google SA key file
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -n "$GCP_SA_KEY" ]; then
+            printf '%s' "$GCP_SA_KEY" > sa.json
+          elif [ -n "$GOOGLE_SERVICE_ACCOUNT" ]; then
+            printf '%s' "$GOOGLE_SERVICE_ACCOUNT" > sa.json
+          else
+            echo "No Google credentials secret"
+            exit 1
+          fi
+
+      - name: Write plan month
+        env:
+          PYTHONUNBUFFERED: "1"
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
+          SHEET_ID_EDU: ${{ secrets.SHEET_ID_EDU }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ROWS_JSON: ${{ github.event.inputs.rows_json }}
+        run: |
+          printf '%s' "$ROWS_JSON" > /tmp/rows.json
+          python scripts/plan_set_month.py --month "${{ github.event.inputs.month }}" --rows /tmp/rows.json
+
+      # Серверный кэш Panda-BI (unstable_cache 24ч) — иначе новый план
+      # виден в дашборде только через сутки.
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
