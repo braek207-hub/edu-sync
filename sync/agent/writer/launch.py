@@ -323,6 +323,25 @@ def _rollback_key(what: str, campaign_id: str) -> str:
 # ------------------------------------------- настройки кампании от доноров
 
 
+def donor_goal_ids(settings: Optional[Dict[str, Any]]) -> List[int]:
+    """Цели оптимизации донора: сперва витрина, затем сырой формат кабинета.
+
+    Публична, потому что этой же парой источников пользуется генератор выноса
+    (consolidate): доноры с разными целями не сводятся в одну кампанию, и
+    разводить их нужно ДО экономики группы — тем же чтением настроек, каким
+    наряд потом соберёт кампанию, иначе развод и сборка разойдутся.
+    """
+    settings = settings if isinstance(settings, dict) else {}
+    return (_vitrina_goal_ids(settings)
+            or segments.goal_ids_from_campaign(settings))
+
+
+def donor_counter_ids(settings: Optional[Dict[str, Any]]) -> List[int]:
+    """Счётчики Метрики донора: сперва витрина, затем сырой формат кабинета."""
+    settings = settings if isinstance(settings, dict) else {}
+    return _vitrina_counter_ids(settings) or _counter_ids(settings)
+
+
 def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
                          donor_cpa: float, window_days: float,
                          ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -336,7 +355,10 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
     Доноры разошлись в цели — запуск отменяется, а не усредняется: это два
     разных смысла конверсии в одном кабинете, и выбирать между ними по
     большинству нельзя. Тот же ответ, что у неизвестной доли сегмента в
-    exposure: неизвестное — не среднее.
+    exposure: неизвестное — не среднее. Штатно расхождение разводит сам
+    генератор ещё до экономики группы (consolidate._split_measurement, тем же
+    чтением настроек — donor_goal_ids/donor_counter_ids); здесь — последний
+    рубеж на случай, если доноры пришли другим путём.
 
     Недельный лимит — то, что доноры по этим фразам УЖЕ тратят. Трафик
     переезжает, а не появляется, и лимит выше их расхода означал бы, что
@@ -363,9 +385,8 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
     cost = 0.0
     for donor in donors:
         settings = donor.get("settings") or {}
-        own_goals = (_vitrina_goal_ids(settings)
-                     or segments.goal_ids_from_campaign(settings))
-        own_counters = _vitrina_counter_ids(settings) or _counter_ids(settings)
+        own_goals = donor_goal_ids(settings)
+        own_counters = donor_counter_ids(settings)
         # Проверка по КАЖДОМУ донору, а не по объединению: донор без цели —
         # это донор, чья настройка не прочитана, и согласие остальных о нём
         # ничего не говорит. Объединение спрятало бы расхождение ровно там,

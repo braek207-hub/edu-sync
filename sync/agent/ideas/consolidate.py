@@ -35,6 +35,16 @@ sync/agent/ideas/consolidate.py — генератор идей: вынос до
 у ВПО и СПО разные посадочные, разная аудитория и разная экономика, и
 кампания, склеенная из двух, не даёт вердикта ни по одному.
 
+**Система измерения не смешивается тоже.** Кампания меряет успех целью и
+счётчиком доноров (launch.campaign_from_donors), и доноры с разными целями в
+одну не сводятся: два смысла конверсии не усредняются. До 01.09.2026 такое
+расхождение хоронило находку целиком — идея деградировала в предложение при
+живой экономике. Теперь доноры разводятся по системам измерения ДО гейтов
+группы (_split_measurement): кампания собирается под систему с наибольшим
+объёмом конверсий (метрика вердикта), прочие откладываются с названной
+причиной — их фразы не входят ни в кампанию, ни в кросс-минусовку, ничей
+смысл конверсии не подменяется чужим.
+
 **Пороги.** Ни один не заведён заново:
 
   * ОБЪЁМ — по умолчанию power.MIN_EXPECTED_PAYMENTS = 25: столько ожидаемых
@@ -254,6 +264,79 @@ def _one(row: Dict[str, Any], ctx: Dict[str, Any],
     if payments is not None:
         donor["p_pay_sum"] = round(payments, 4)
     return donor, None
+
+
+def _measurement(donor: Dict[str, Any],
+                 ) -> Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]]:
+    """Система измерения донора: (цели, счётчики) из его настроек.
+
+    None — настройки не прочитаны. Такие доноры образуют СВОЮ группу, а не
+    примешиваются к прочитанным: попади они в выбранную группу, наряд бы не
+    собрался («не прочитана цель»), и коалиция с читаемым большинством
+    утопила бы его в предложение.
+    """
+    settings = donor.get("settings")
+    goals = tuple(launch.donor_goal_ids(settings))
+    counters = tuple(launch.donor_counter_ids(settings))
+    if not goals and not counters:
+        return None
+    return goals, counters
+
+
+def _measurement_label(sig: Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]],
+                       ) -> str:
+    if sig is None:
+        return "непрочитанные настройки"
+    goals, counters = sig
+    goal_text = ",".join(str(g) for g in goals) or "без цели"
+    counter_text = ",".join(str(c) for c in counters) or "без счётчика"
+    return f"цель {goal_text} (счётчик {counter_text})"
+
+
+def measurement_sidelined_reason(kept: str, dropped: str,
+                                 kept_conversions: float,
+                                 dropped_conversions: float) -> str:
+    return (f"доноры с другой системой измерения отложены: кампания "
+            f"направления собирается под {kept} ({kept_conversions:g} "
+            f"конверсий), а {dropped} ({dropped_conversions:g}) ждёт своего "
+            "выноса — у одной кампании не может быть двух смыслов конверсии")
+
+
+def _split_measurement(direction: str, donors: List[Dict[str, Any]],
+                       ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Доноры направления → (группа одной системы измерения, отложенные).
+
+    Развод идёт ДО гейтов группы: экономика, порог λ и срок вердикта обязаны
+    считаться по той кампании, которая реально соберётся, а не по коалиции,
+    которую наряд потом отверг бы. Выбирается система с наибольшим объёмом
+    конверсий — той же метрикой, которой _group меряет срок вердикта; при
+    равенстве — с большим расходом, дальше детерминированный порядок сигнатур
+    (состав идей не должен плавать от порядка строк на входе).
+    """
+    groups: Dict[Any, List[Dict[str, Any]]] = {}
+    for donor in donors:
+        groups.setdefault(_measurement(donor), []).append(donor)
+    if len(groups) <= 1:
+        return donors, []
+
+    def volume(sig: Any) -> Tuple[float, float]:
+        rows = groups[sig]
+        return (sum(d["conversions"] for d in rows),
+                sum(d["cost_rub"] for d in rows))
+
+    ordered = sorted(groups, key=lambda sig: (sig is None, sig or ()))
+    best = max(ordered, key=volume)
+    chosen = groups.pop(best)
+    kept_conversions = sum(d["conversions"] for d in chosen)
+    sidelined = [
+        {"direction": direction,
+         "reason": measurement_sidelined_reason(
+             _measurement_label(best), _measurement_label(sig),
+             kept_conversions,
+             sum(d["conversions"] for d in groups[sig]))}
+        for sig in ordered if sig in groups
+    ]
+    return chosen, sidelined
 
 
 def _cannibalization(donors: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -526,7 +609,10 @@ def scan(rows: Sequence[Dict[str, Any]],
 
     ideas: List[Dict[str, Any]] = []
     for direction in sorted(by_direction):
-        idea, refusal = _group(direction, by_direction[direction], ctx)
+        donors, sidelined = _split_measurement(direction,
+                                               by_direction[direction])
+        skipped.extend(sidelined)
+        idea, refusal = _group(direction, donors, ctx)
         if idea is not None:
             ideas.append(idea)
         else:

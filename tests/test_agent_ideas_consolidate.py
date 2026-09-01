@@ -350,15 +350,42 @@ def test_consolidation_with_donor_settings_carries_an_order():
     assert {n["campaign_id"] for n in order["donor_negatives"]} == {"111", "222"}
 
 
-def test_donors_disagreeing_on_the_goal_keep_the_idea_a_proposal():
+def test_donors_disagreeing_on_the_goal_split_instead_of_burying_the_find():
     # Два смысла конверсии в одной кампании невозможны, и усреднять их
-    # нельзя. Находка при этом не теряется: человек видит её и причину.
-    idea = _idea([_q(phrase="колледж заочно", campaign="111",
-                     settings=_settings()),
-                  _q(phrase="поступить в колледж", campaign="222",
-                     settings=_settings(goal=111_222_333))])
-    assert idea["tier"] == tier.TIER_PROPOSAL
-    assert "цел" in idea["detail"]["launch_refusal"]
+    # нельзя. Но прежний ответ — отказ всей группе — хоронил находку с живой
+    # экономикой. Теперь кампания собирается под систему измерения с большим
+    # объёмом конверсий, а доноры другой цели откладываются с причиной: их
+    # фразы не входят ни в кампанию, ни в кросс-минусовку.
+    result = consolidate.scan(
+        [_q(phrase="колледж заочно", campaign="111",
+            settings=_settings(), conversions=40.0),
+         _q(phrase="поступить в колледж", campaign="222",
+            settings=_settings(goal=111_222_333), conversions=5.0)],
+        _ctx())
+    idea = result["ideas"][0]
+    assert idea["tier"] == tier.TIER_BET
+    order = idea["action"]["payload"]["order"]
+    assert order["campaign"]["goal_id"] == 360_811_375
+    assert {n["campaign_id"] for n in order["donor_negatives"]} == {"111"}
+    phrases = {q["phrase"] for q in idea["detail"]["queries"]}
+    assert "поступить в колледж" not in phrases
+    assert any("отложены" in s["reason"] and "111222333" in s["reason"]
+               for s in result["skipped"])
+
+
+def test_unread_settings_do_not_drag_the_readable_donors_into_a_proposal():
+    # Донор с непрочитанными настройками — своя группа, а не сосед по
+    # коалиции: примешайся он к читаемым, наряд не собрался бы («не прочитана
+    # цель») и утопил бы вынос в предложение при живом большинстве.
+    result = consolidate.scan(
+        [_q(phrase="колледж заочно", campaign="111",
+            settings=_settings(), conversions=40.0),
+         _q(phrase="поступить в колледж", campaign="222", conversions=5.0)],
+        _ctx())
+    idea = result["ideas"][0]
+    assert idea["tier"] == tier.TIER_BET
+    assert any("непрочитанные настройки" in s["reason"]
+               for s in result["skipped"])
 
 
 def test_the_order_of_an_idea_is_the_same_from_run_to_run():
