@@ -199,21 +199,8 @@ def _check_campaign(order: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(
             "кампания без счётчика и цели: стратегия AVERAGE_CPA невозможна, "
             "и кампания встала бы в кабинете на ручных ставках")
-    # Гео — поле наряда, а не умолчание билдера: подставь получатель свой
-    # дефолт (МСК), и вынос всероссийского донора молча стал бы московской
-    # кампанией — видно только в кабинете. Форма — как RegionIds Директа:
-    # положительные показывают, отрицательные исключают.
-    try:
-        regions = [int(r) for r in (campaign.get("region_ids") or ())]
-    except (TypeError, ValueError):
-        raise ValueError("гео кампании (region_ids) не приводится к числам")
-    if not any(r > 0 for r in regions):
-        raise ValueError(
-            "кампания без региона показа (region_ids): билдеру пришлось бы "
-            "выдумывать гео, а гео доноров — измеренный факт")
     return {"weekly_budget": int(budget), "target_cpa": int(cpa),
-            "counter_id": int(counter), "goal_id": int(goal),
-            "region_ids": sorted(set(regions))}
+            "counter_id": int(counter), "goal_id": int(goal)}
 
 
 def validate(order: Dict[str, Any]) -> Dict[str, Any]:

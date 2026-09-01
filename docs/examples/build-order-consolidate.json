@@ -45,8 +45,7 @@
     "weekly_budget": 60000,
     "target_cpa": 1600,
     "counter_id": 98627983,
-    "goal_id": 360811375,
-    "region_ids": [1, 10716]
+    "goal_id": 360811375
   },
   "window_days": 30,
   "horizon_days": 30,

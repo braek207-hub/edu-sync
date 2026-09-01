@@ -48,8 +48,7 @@ def _order(**over):
             {"campaign_id": "222", "phrases": ["заочный колледж после 9"]},
         ],
         "campaign": {"weekly_budget": 60_000, "target_cpa": 1_600,
-                     "counter_id": 98_627_983, "goal_id": 360_811_375,
-                     "region_ids": [1, 10_716]},
+                     "counter_id": 98_627_983, "goal_id": 360_811_375},
         # Окно наблюдения фраз: без него расход в наряде — число без срока, и
         # ни недельный лимит новой кампании, ни цена риска её кросс-минусовки
         # не считаются (задача 18).
@@ -203,23 +202,6 @@ def test_campaign_without_a_goal_is_invalid():
             "counter_id": 98_627_983}))
 
 
-def test_campaign_without_geo_is_invalid():
-    # Гео — поле наряда, а не умолчание билдера: его дефолт (МСК) молча
-    # превратил бы вынос всероссийского донора в московскую кампанию.
-    campaign = {**_order()["campaign"]}
-    campaign.pop("region_ids")
-    with pytest.raises(ValueError, match="region_ids"):
-        build_order.validate(_order(campaign=campaign))
-
-
-def test_geo_made_only_of_exclusions_is_invalid():
-    # Отрицательные регионы — исключения; кампания из одних исключений не
-    # показывается нигде, и Директ отверг бы её уже после заливки.
-    campaign = {**_order()["campaign"], "region_ids": [-1]}
-    with pytest.raises(ValueError, match="region_ids"):
-        build_order.validate(_order(campaign=campaign))
-
-
 def test_a_valid_order_survives_validation_unchanged_in_meaning():
     # Обратная сторона всех запретов: годный наряд обязан пройти. Иначе
     # валидатор чинится тем, что не пропускает ничего.
@@ -286,8 +268,7 @@ def test_an_order_built_from_an_idea_keeps_its_link():
                           "comparison": "did_vs_holdout"},
          "detail": {"queries": _order()["queries"], "window_days": 30}},
         campaign={"weekly_budget": 60_000, "target_cpa": 1_600,
-                  "counter_id": 98_627_983, "goal_id": 360_811_375,
-                  "region_ids": [1]})
+                  "counter_id": 98_627_983, "goal_id": 360_811_375})
 
     assert order["idea_id"] == "i-1"
     assert build_order.validate(order)

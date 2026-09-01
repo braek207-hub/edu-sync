@@ -342,11 +342,8 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
     переезжает, а не появляется, и лимит выше их расхода означал бы, что
     вместе с выносом мы молча увеличили ставку на направление.
 
-    Гео — тоже от доноров, и по той же причине, что цель: фразы переезжают
-    вместе со своими показами, и кампания в другом регионе покупала бы другой
-    трафик под видом того же теста. Доноры разошлись в гео — отказ, а не
-    объединение: сумма регионов показывала бы каждому донору шире, чем он
-    проверен деньгами.
+    Гео наряд не задаёт — решение Павла 01.09.2026: билдер ставит свой
+    дефолт (МСК), а другое гео человек выставляет в кабинете сам.
 
     Настройки доноров приходят витриной edu_campaign_settings (см.
     edu_direct_settings.py: strategy/targeting/meta). Сырой формат
@@ -363,7 +360,6 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
 
     goals: set = set()
     counters: set = set()
-    region_sets: set = set()
     cost = 0.0
     for donor in donors:
         settings = donor.get("settings") or {}
@@ -382,14 +378,8 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
         if not own_counters:
             return None, (f"у донора {donor.get('donor_campaign_id')} не прочитан "
                           "счётчик Метрики: без него кампания не отдаёт конверсий")
-        own_regions = _region_ids(settings)
-        if not any(rid > 0 for rid in own_regions):
-            return None, (f"у донора {donor.get('donor_campaign_id')} не прочитано "
-                          "гео показов: кампания без региона доноров покупала "
-                          "бы другой трафик под видом того же теста")
         goals.update(int(goal) for goal in own_goals)
         counters.update(int(counter) for counter in own_counters)
-        region_sets.add(frozenset(own_regions))
         cost += _number(donor.get("cost_rub")) or 0.0
 
     if len(goals) > 1:
@@ -398,11 +388,6 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
     if len(counters) > 1:
         return None, (f"доноры считают разными счётчиками ({sorted(counters)}): "
                       "сводить их в одну кампанию нечем")
-    if len(region_sets) > 1:
-        shown = [sorted(regions) for regions in sorted(region_sets, key=sorted)]
-        return None, (f"доноры показываются в разном гео ({shown}): "
-                      "у новой кампании не может быть двух географий теста")
-
     cpa = _number(donor_cpa)
     if not cpa or cpa <= 0:
         return None, "цена конверсии доноров неизвестна: целевую назначить не от чего"
@@ -412,11 +397,6 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
         "target_cpa": int(round(cpa)),
         "counter_id": counters.pop(),
         "goal_id": goals.pop(),
-        # Форма — как RegionIds Директа: положительные показывают,
-        # отрицательные исключают. Билдер обязан получить гео полем наряда:
-        # его собственное умолчание (МСК) молча сузило бы всероссийского
-        # донора до Москвы — видно только в кабинете.
-        "region_ids": sorted(region_sets.pop()),
     }, None
 
 
@@ -462,25 +442,6 @@ def _vitrina_counter_ids(settings: Dict[str, Any]) -> List[int]:
         return []
     out: List[int] = []
     for value in meta.get("counterIds") or ():
-        try:
-            out.append(int(value))
-        except (TypeError, ValueError):
-            continue
-    return sorted(set(out))
-
-
-def _region_ids(settings: Dict[str, Any]) -> List[int]:
-    """Гео показов кампании из витрины (targeting.regions).
-
-    Витрина складывает туда RegionIds групп, а исключения хранит
-    отрицательными — ровно семантика RegionIds Директа, которую наряд везёт
-    билдеру без перевода.
-    """
-    targeting = settings.get("targeting")
-    if not isinstance(targeting, dict):
-        return []
-    out: List[int] = []
-    for value in targeting.get("regions") or ():
         try:
             out.append(int(value))
         except (TypeError, ValueError):
