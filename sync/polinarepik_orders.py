@@ -25,7 +25,10 @@ INGEST_URL = os.environ.get(
     "POLINAREPIK_INGEST_URL", "https://panda-bi.vercel.app/api/ingest/polinarepik"
 ).strip()
 BATCH_SIZE = int(os.environ.get("POLINAREPIK_ORDERS_BATCH", "200"))
-MAX_RETRIES = 4
+# 30.08–01.09.26 их сайт стал стопорить TLS-хендшейк для зарубежных IP (раннеры GH):
+# «Read timed out (15)» на этапе connect. Из РФ отвечает за 3 с. Длинные ретраи с большим
+# connect-таймаутом пробивают флапающую фильтрацию; полный блок не лечат.
+MAX_RETRIES = 8
 
 
 def _require(name: str) -> str:
@@ -44,7 +47,7 @@ def fetch_orders(api_key: str) -> list[dict[str, Any]]:
             resp = requests.get(
                 SOURCE_URL,
                 headers={"X-API-Key": api_key, "Accept": "application/json"},
-                timeout=(15, 60),
+                timeout=(60, 90),
             )
         except requests.exceptions.RequestException as e:
             last_err = e
