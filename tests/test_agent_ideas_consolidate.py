@@ -150,15 +150,18 @@ def test_each_direction_gets_its_own_address():
 
 
 def test_below_power_threshold_no_consolidation():
-    # Шаг 3 плана беты. Порог — power.MIN_EXPECTED_PAYMENTS, не своё число.
-    thin = [_q(phrase="колледж заочно", campaign="111", p_pay=0.05),
-            _q(phrase="поступить в колледж", campaign="222", p_pay=0.05)]
+    # Шаг 3 плана беты. Объём на срок меряется КОНВЕРСИЯМИ — метрикой
+    # вердикта (success_rule: cpa_rub): порог оплат отсекал вынос всегда,
+    # потому что вердикт оплатами не меряется. Порог — power.
+    # MIN_EXPECTED_PAYMENTS по умолчанию, не своё число.
+    thin = [_q(phrase="колледж заочно", campaign="111", conversions=0.4),
+            _q(phrase="поступить в колледж", campaign="222", conversions=0.4)]
     assert consolidate.candidates(thin, _ctx()) == []
 
 
 def test_thin_direction_is_refused_with_a_named_reason():
-    thin = [_q(p_pay=0.05), _q(phrase="поступить в колледж", campaign="222",
-                               p_pay=0.05)]
+    thin = [_q(conversions=0.4), _q(phrase="поступить в колледж",
+                                    campaign="222", conversions=0.4)]
     result = consolidate.scan(thin, _ctx())
 
     assert result["ideas"] == []
@@ -170,17 +173,17 @@ def test_power_threshold_is_the_one_from_power_module():
     # чужой порог собственным запасом.
     window = 28
     per_query = power.MIN_EXPECTED_PAYMENTS / 2.0
-    rows = [_q(campaign="111", p_pay=per_query, window_days=window),
+    rows = [_q(campaign="111", conversions=per_query, window_days=window),
             _q(phrase="поступить в колледж", campaign="222",
-               p_pay=per_query, window_days=window)]
+               conversions=per_query, window_days=window)]
     assert consolidate.candidates(rows, _ctx())
 
 
 def test_slow_accumulation_is_not_worth_a_quarter():
     # Эксперимент, которому на вердикт нужен больше чем предел, соревнуется
     # уже не с донорами, а с сезоном.
-    slow = [_q(p_pay=0.6), _q(phrase="поступить в колледж", campaign="222",
-                              p_pay=0.6)]
+    slow = [_q(conversions=2.0), _q(phrase="поступить в колледж",
+                                    campaign="222", conversions=2.0)]
     assert consolidate.candidates(slow, _ctx()) == []
 
 
@@ -192,8 +195,8 @@ def test_horizon_limit_is_a_setting_not_a_constant():
     # Связки подобраны так, что вердикт набирается за ~200 дней: при пределе
     # по умолчанию идея отвергается, при поднятом — проходит. Отвергается
     # ИМЕННО из-за предела, а не по другой причине, — это и показывает пара.
-    slow = [_q(p_pay=1.75), _q(phrase="поступить в колледж", campaign="222",
-                               p_pay=1.75)]
+    slow = [_q(conversions=1.75), _q(phrase="поступить в колледж",
+                                     campaign="222", conversions=1.75)]
 
     assert consolidate.candidates(slow, _ctx()) == []
     assert consolidate.candidates(
@@ -525,26 +528,26 @@ def test_growth_margin_is_charged_once_on_the_group_not_on_the_donor():
 # ------------------------------- панельные ручки порогов выноса (01.09.2026)
 
 
-def test_min_expected_payments_is_a_setting_not_a_constant():
+def test_min_verdict_conversions_is_a_setting_not_a_constant():
     # Владелец вправе принять для выноса вердикт грубее общего судьи: фразы
     # уже доказаны деньгами доноров, кампания создаётся на паузе. Пара
     # «дефолт отвергает — ручка пропускает» показывает, что отказ приходил
     # именно от порога объёма, а не от чего-то ещё.
-    rows = [_q(p_pay=2.0), _q(phrase="поступить в колледж", campaign="222",
-                              p_pay=2.0)]
+    rows = [_q(conversions=2.5), _q(phrase="поступить в колледж",
+                                    campaign="222", conversions=2.5)]
 
     assert consolidate.candidates(rows, _ctx()) == []
     assert consolidate.candidates(
-        rows, _ctx(config={consolidate.MIN_EXPECTED_PAYMENTS_KEY: 10}))
+        rows, _ctx(config={consolidate.MIN_VERDICT_CONVERSIONS_KEY: 10}))
 
 
-def test_lowered_payment_threshold_travels_into_the_refusal_text():
+def test_lowered_verdict_threshold_travels_into_the_refusal_text():
     # Причина отказа обязана называть ФАКТИЧЕСКИЙ порог: «не набрать 25» при
     # пороге 10 отправила бы человека проверять не то число.
-    thin = [_q(p_pay=0.05), _q(phrase="поступить в колледж", campaign="222",
-                               p_pay=0.05)]
+    thin = [_q(conversions=0.05), _q(phrase="поступить в колледж",
+                                     campaign="222", conversions=0.05)]
     result = consolidate.scan(
-        thin, _ctx(config={consolidate.MIN_EXPECTED_PAYMENTS_KEY: 10}))
+        thin, _ctx(config={consolidate.MIN_VERDICT_CONVERSIONS_KEY: 10}))
 
     assert result["ideas"] == []
     assert any("не набрать 10" in row["reason"] for row in result["skipped"])

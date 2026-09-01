@@ -40,12 +40,14 @@ sync/agent/ideas/consolidate.py — генератор идей: вынос до
   * ОБЪЁМ — по умолчанию power.MIN_EXPECTED_PAYMENTS = 25: столько ожидаемых
     оплат нужно накопить, чтобы решение на объекте вообще имело силу
     (MDE ≈ 30 % при базе 1.4 %). Кампания, которой не хватит событий на
-    вердикт, — не эксперимент, а трата. С 01.09.2026 порог (и порог ступени
-    лестницы для групп) — панельные ручки consolidate_min_expected_payments /
-    consolidate_min_step_events: вынос собирает фразы, уже доказанные
-    деньгами доноров, кампания создаётся на паузе и включается человеком,
-    поэтому владелец вправе принять здесь оценку грубее, не ослабляя общего
-    судью остальных механизмов.
+    вердикт, — не эксперимент, а трата. С 01.09.2026 объём на СРОК меряется
+    конверсиями, а не ожидаемыми оплатами — по метрике самого вердикта
+    (success_rule: cpa_rub против доноров); подробно — в _group. Порог срока
+    (consolidate_min_verdict_conversions) и порог ступени лестницы для групп
+    (consolidate_min_step_events) — панельные ручки: вынос собирает фразы,
+    уже доказанные деньгами доноров, кампания создаётся на паузе и
+    включается человеком, поэтому владелец вправе принять здесь оценку
+    грубее, не ослабляя общего судью остальных механизмов.
   * СРОК НАКОПЛЕНИЯ — сколько дней при нынешнем темпе доноров нужно, чтобы
     этот объём набрался, но не меньше experiments.HORIZON_DAYS: горизонт
     замера ставки объявлен там и там же читается сторожем.
@@ -112,7 +114,7 @@ REASON_NO_COST = "у связки нет расхода: стартовый бю
 # паузе — владелец вправе принять здесь оценку грубее общего судьи, не трогая
 # пороги остальных механизмов.
 MIN_STEP_EVENTS_KEY = "consolidate_min_step_events"
-MIN_EXPECTED_PAYMENTS_KEY = "consolidate_min_expected_payments"
+MIN_VERDICT_CONVERSIONS_KEY = "consolidate_min_verdict_conversions"
 
 
 def _min_step_events(ctx: Dict[str, Any]) -> float:
@@ -120,14 +122,15 @@ def _min_step_events(ctx: Dict[str, Any]) -> float:
     return value if value and value > 0 else ladder_mod.MIN_STEP_EVENTS
 
 
-def _min_expected_payments(ctx: Dict[str, Any]) -> float:
-    value = _number(((ctx or {}).get("config") or {}).get(MIN_EXPECTED_PAYMENTS_KEY))
+def _min_verdict_conversions(ctx: Dict[str, Any]) -> float:
+    value = _number(((ctx or {}).get("config") or {})
+                    .get(MIN_VERDICT_CONVERSIONS_KEY))
     return value if value and value > 0 else power_mod.MIN_EXPECTED_PAYMENTS
 
 
-def thin_power_reason(min_expected: float) -> str:
-    return (f"направлению не набрать {min_expected:g} ожидаемых "
-            "оплат за допустимый срок: это не эксперимент, а трата")
+def thin_power_reason(min_verdict: float) -> str:
+    return (f"направлению не набрать {min_verdict:g} конверсий на вердикт "
+            "за допустимый срок: это не эксперимент, а трата")
 
 
 GROUP_REASON_THIN_POWER = thin_power_reason(power_mod.MIN_EXPECTED_PAYMENTS)
@@ -360,25 +363,36 @@ def _group(direction: str, donors: List[Dict[str, Any]], ctx: Dict[str, Any],
             return None, {"direction": direction,
                           "reason": GROUP_REASON_THIN_MARGIN}
 
-    min_expected = _min_expected_payments(ctx)
+    min_verdict = _min_verdict_conversions(ctx)
     if not window or window <= 0 or not payments or payments <= 0:
         return None, {"direction": direction,
-                      "reason": thin_power_reason(min_expected)}
-
-    # Сколько дней при нынешнем темпе доноров копится порог значимости. Темп
-    # берётся у доноров, а не выдумывается для новой кампании: она собирается
-    # ИЗ ИХ ЖЕ трафика, и другого основания для прогноза объёма нет.
-    daily_payments = payments / float(window)
-    days_to_power = int(math.ceil(min_expected / daily_payments))
-    horizon = max(days_to_power, STAKE_HORIZON_DAYS) + CRM_MATURITY_WINDOW_DAYS
-    if horizon > limits.max_horizon(ctx):
-        return None, {"direction": direction,
-                      "reason": thin_power_reason(min_expected)}
+                      "reason": thin_power_reason(min_verdict)}
 
     if conversions <= 0:
         return None, {"direction": direction, "reason": GROUP_REASON_NO_CPA}
     donor_cpa = cost / conversions
 
+    # Сколько дней при нынешнем темпе доноров копится объём НА ВЕРДИКТ. Темп
+    # берётся у доноров, а не выдумывается для новой кампании: она собирается
+    # ИЗ ИХ ЖЕ трафика, и другого основания для прогноза объёма нет.
+    #
+    # Объём считается в КОНВЕРСИЯХ, а не в ожидаемых оплатах — по метрике
+    # самого вердикта: success_rule ниже — «cpa_rub ≤ цена доноров», то есть
+    # цена КОНВЕРСИИ, и сторож проверит её по конверсиям кампании. До
+    # 01.09.2026 срок требовал 25 ожидаемых ОПЛАТ — события в ~70 раз более
+    # редкого, чем лид (база p(pay|lead) ≈ 1.4 %), которым вердикт не
+    # меряется вовсе: гейт отсекал вынос практически всегда, при живых
+    # донорах со 126 конверсиями за окно. Оплаты остаются там, где ими
+    # действительно меряют: в смете выгоды (expected_rub ниже) и в пороге
+    # окупаемости λ выше.
+    daily_verdict = conversions / float(window)
+    days_to_power = int(math.ceil(min_verdict / daily_verdict))
+    horizon = max(days_to_power, STAKE_HORIZON_DAYS) + CRM_MATURITY_WINDOW_DAYS
+    if horizon > limits.max_horizon(ctx):
+        return None, {"direction": direction,
+                      "reason": thin_power_reason(min_verdict)}
+
+    daily_payments = payments / float(window)
     daily_cost = cost / float(window)
     expected_payments = daily_payments * horizon
 

@@ -251,6 +251,18 @@ def test_unset_returns_the_parameter_to_the_preset_value(store):
         agent_config.PRESETS["aggressive"]["explore_share"]
 
 
+def test_an_orphaned_key_can_be_unset(store):
+    # Ключ, ушедший из SPEC (переименование ручки), роняет все прогоны на
+    # «неизвестном параметре» — --unset обязан уметь снять сироту, иначе её
+    # нельзя вылечить вовсе. Кейс реален: consolidate_min_expected_payments →
+    # consolidate_min_verdict_conversions (01.09.2026).
+    store.table["retired_knob"] = {"key": "retired_knob", "value": "10",
+                                   "preset": None, "updated_by": "old"}
+
+    assert main(["--unset", "retired_knob"], store=store) == 0
+    assert "retired_knob" not in store.table
+
+
 def test_unset_preset_returns_to_code_defaults(store):
     main(["--preset", "aggressive"], store=store)
     assert main(["--unset", PRESET_KEY], store=store) == 0

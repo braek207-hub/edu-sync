@@ -260,7 +260,14 @@ def validate_preset(name: Optional[str]) -> str:
 
 
 def validate_keys(keys: Sequence[str]) -> List[str]:
-    """Ключи для --unset. Снять можно только то, что вообще бывает задано."""
+    """Ключи для --unset.
+
+    Неизвестный ключ здесь НЕ отказ, в отличие от --set: строка, чей ключ
+    ушёл из SPEC (переименование ручки), роняет ВСЕ прогоны на «неизвестном
+    параметре», и --unset — единственный законный способ её снять. Отказывать
+    по SPEC значило бы, что сироту нельзя вылечить вовсе. Пороги защиты
+    (--locked) снять по-прежнему нельзя.
+    """
     out: List[str] = []
     for key in keys:
         key = key.strip()
@@ -268,8 +275,6 @@ def validate_keys(keys: Sequence[str]) -> List[str]:
             out.append(key)
             continue
         _refuse_locked(key)
-        if key not in agent_config.SPEC:
-            raise Refusal(f"неизвестный параметр: {key}")
         out.append(key)
     return out
 
