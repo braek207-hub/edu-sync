@@ -341,6 +341,17 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
     Недельный лимит — то, что доноры по этим фразам УЖЕ тратят. Трафик
     переезжает, а не появляется, и лимит выше их расхода означал бы, что
     вместе с выносом мы молча увеличили ставку на направление.
+
+    Гео — тоже от доноров, и по той же причине, что цель: фразы переезжают
+    вместе со своими показами, и кампания в другом регионе покупала бы другой
+    трафик под видом того же теста. Доноры разошлись в гео — отказ, а не
+    объединение: сумма регионов показывала бы каждому донору шире, чем он
+    проверен деньгами.
+
+    Настройки доноров приходят витриной edu_campaign_settings (см.
+    edu_direct_settings.py: strategy/targeting/meta). Сырой формат
+    campaigns.get (TextCampaign.BiddingStrategy) остаётся читаемым запасным
+    путём: наряд может собираться и из свежего чтения кабинета.
     """
     if not donors:
         return None, "запуск без доноров: настройки кампании взять не из чего"
@@ -352,11 +363,13 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
 
     goals: set = set()
     counters: set = set()
+    region_sets: set = set()
     cost = 0.0
     for donor in donors:
         settings = donor.get("settings") or {}
-        own_goals = segments.goal_ids_from_campaign(settings)
-        own_counters = _counter_ids(settings)
+        own_goals = (_vitrina_goal_ids(settings)
+                     or segments.goal_ids_from_campaign(settings))
+        own_counters = _vitrina_counter_ids(settings) or _counter_ids(settings)
         # Проверка по КАЖДОМУ донору, а не по объединению: донор без цели —
         # это донор, чья настройка не прочитана, и согласие остальных о нём
         # ничего не говорит. Объединение спрятало бы расхождение ровно там,
@@ -369,8 +382,14 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
         if not own_counters:
             return None, (f"у донора {donor.get('donor_campaign_id')} не прочитан "
                           "счётчик Метрики: без него кампания не отдаёт конверсий")
+        own_regions = _region_ids(settings)
+        if not any(rid > 0 for rid in own_regions):
+            return None, (f"у донора {donor.get('donor_campaign_id')} не прочитано "
+                          "гео показов: кампания без региона доноров покупала "
+                          "бы другой трафик под видом того же теста")
         goals.update(int(goal) for goal in own_goals)
         counters.update(int(counter) for counter in own_counters)
+        region_sets.add(frozenset(own_regions))
         cost += _number(donor.get("cost_rub")) or 0.0
 
     if len(goals) > 1:
@@ -379,6 +398,10 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
     if len(counters) > 1:
         return None, (f"доноры считают разными счётчиками ({sorted(counters)}): "
                       "сводить их в одну кампанию нечем")
+    if len(region_sets) > 1:
+        shown = [sorted(regions) for regions in sorted(region_sets, key=sorted)]
+        return None, (f"доноры показываются в разном гео ({shown}): "
+                      "у новой кампании не может быть двух географий теста")
 
     cpa = _number(donor_cpa)
     if not cpa or cpa <= 0:
@@ -389,7 +412,80 @@ def campaign_from_donors(donors: Sequence[Dict[str, Any]], *,
         "target_cpa": int(round(cpa)),
         "counter_id": counters.pop(),
         "goal_id": goals.pop(),
+        # Форма — как RegionIds Директа: положительные показывают,
+        # отрицательные исключают. Билдер обязан получить гео полем наряда:
+        # его собственное умолчание (МСК) молча сузило бы всероссийского
+        # донора до Москвы — видно только в кабинете.
+        "region_ids": sorted(region_sets.pop()),
     }, None
+
+
+def _vitrina_goal_ids(settings: Dict[str, Any]) -> List[int]:
+    """Цели оптимизации из витрины edu_campaign_settings.
+
+    Витрина (edu_direct_settings.py) хранит их в strategy.{search,network,
+    package}.goalIds и strategy.priorityGoals — тот же состав источников, что
+    у сырого формата в segments.goal_ids_from_campaign, только после
+    нормализации. Пустой ответ — «это не витрина», и вызывающий пробует
+    сырой формат.
+    """
+    strategy = settings.get("strategy")
+    if not isinstance(strategy, dict):
+        return []
+    out: List[int] = []
+    for key in ("search", "network", "package"):
+        block = strategy.get(key)
+        if not isinstance(block, dict):
+            continue
+        for goal in block.get("goalIds") or ():
+            try:
+                out.append(int(goal))
+            except (TypeError, ValueError):
+                continue
+    for goal in strategy.get("priorityGoals") or ():
+        try:
+            out.append(int(goal))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(out))
+
+
+def _vitrina_counter_ids(settings: Dict[str, Any]) -> List[int]:
+    """Счётчики Метрики из витрины (meta.counterIds).
+
+    Поле появилось вместе с нарядами: до них витрина счётчик не хранила, и
+    campaign_from_donors в проде отказывал КАЖДОМУ выносу с «не прочитан
+    счётчик» — формат теста (сырой campaigns.get) разошёлся с форматом боя.
+    """
+    meta = settings.get("meta")
+    if not isinstance(meta, dict):
+        return []
+    out: List[int] = []
+    for value in meta.get("counterIds") or ():
+        try:
+            out.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(out))
+
+
+def _region_ids(settings: Dict[str, Any]) -> List[int]:
+    """Гео показов кампании из витрины (targeting.regions).
+
+    Витрина складывает туда RegionIds групп, а исключения хранит
+    отрицательными — ровно семантика RegionIds Директа, которую наряд везёт
+    билдеру без перевода.
+    """
+    targeting = settings.get("targeting")
+    if not isinstance(targeting, dict):
+        return []
+    out: List[int] = []
+    for value in targeting.get("regions") or ():
+        try:
+            out.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(out))
 
 
 def _counter_ids(settings: Dict[str, Any]) -> List[int]:

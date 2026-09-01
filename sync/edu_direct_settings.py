@@ -587,9 +587,11 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 package_ids.add(int(p["StrategyId"]))
                 break
 
+        own_counters: List[int] = []
         for block in (tc, uc, mc):
             for counter in _counter_ids_from_block(block):
                 counter_ids.add(counter)
+                own_counters.append(counter)
 
         settings_opts: List[str] = []
         for block in (tc, uc, mc):
@@ -636,6 +638,11 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 "campaignType": c.get("Type"),
                 "state": c.get("State"),
                 "status": c.get("Status"),
+                # Счётчики кампании нужны наряду на сборку: новая кампания
+                # обязана мерить успех тем же счётчиком, что доноры
+                # (agent/writer/launch.campaign_from_donors), а панель как
+                # источник там отвергнута по построению.
+                "counterIds": sorted(set(own_counters)),
             },
             "strategy": {
                 "search": search_ch or None,

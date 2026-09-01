@@ -869,12 +869,16 @@ def test_a_direction_with_live_campaigns_is_not_counted_as_unaddressed(store):
 
 
 def _text_campaign(goal=360_811_375, counter=98_627_983):
-    """Настройки донора, из которых новая кампания берёт счётчик и цель."""
+    """Настройки донора, из которых новая кампания берёт счётчик, цель и гео.
+
+    Формат — витрина edu_campaign_settings, как в бою (agent_e0 →
+    db.load_campaign_settings_raw), а не сырой campaigns.get.
+    """
     return {"bidModifiers": {"total": 0, "items": []},
-            "TextCampaign": {"CounterIds": {"Items": [counter]},
-                             "BiddingStrategy": {"Search": {"AverageCpa": {
-                                 "GoalId": goal,
-                                 "AverageCpa": 1_600_000_000}}}}}
+            "meta": {"counterIds": [counter]},
+            "strategy": {"search": {"goalIds": [goal],
+                                    "biddingStrategyType": "AVERAGE_CPA"}},
+            "targeting": {"regions": [1, 10_716]}}
 
 
 def _with_launch(**over):

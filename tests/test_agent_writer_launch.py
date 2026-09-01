@@ -53,7 +53,8 @@ def _order(**over):
             {"campaign_id": "222", "phrases": ["заочный колледж после 9"]},
         ],
         "campaign": {"weekly_budget": 60_000, "target_cpa": 1_600,
-                     "counter_id": 98_627_983, "goal_id": 360_811_375},
+                     "counter_id": 98_627_983, "goal_id": 360_811_375,
+                     "region_ids": [1, 10_716]},
         "window_days": 30,
         "horizon_days": 30,
         "success_rule": {"metric": "cpa_rub", "op": "<=", "threshold": 1_600.0,
@@ -381,18 +382,26 @@ def test_the_manual_lane_is_named_by_the_same_string_as_the_lane():
 # -------------------------------------------- настройки кампании от доноров
 
 
+def _donor_settings():
+    # Формат — витрина edu_campaign_settings (edu_direct_settings.py), а не
+    # сырой campaigns.get: именно её подаёт бой (agent_e0 →
+    # db.load_campaign_settings_raw → bundles → consolidate). Прежняя
+    # фикстура в сыром формате держала тесты зелёными, пока в проде КАЖДЫЙ
+    # вынос отказывал с «не прочитан счётчик».
+    return {
+        "meta": {"counterIds": [98_627_983]},
+        "strategy": {"search": {"goalIds": [360_811_375],
+                                "biddingStrategyType": "AVERAGE_CPA"}},
+        "targeting": {"regions": [1, 10_716]},
+    }
+
+
 def _donors():
     return [
         {"donor_campaign_id": "111", "cost_rub": 18_400.0, "conversions": 12,
-         "settings": {"TextCampaign": {
-             "CounterIds": {"Items": [98_627_983]},
-             "BiddingStrategy": {"Search": {"AverageCpa": {
-                 "GoalId": 360_811_375, "AverageCpa": 1_600_000_000}}}}}},
+         "settings": _donor_settings()},
         {"donor_campaign_id": "222", "cost_rub": 9_100.0, "conversions": 6,
-         "settings": {"TextCampaign": {
-             "CounterIds": {"Items": [98_627_983]},
-             "BiddingStrategy": {"Search": {"AverageCpa": {
-                 "GoalId": 360_811_375, "AverageCpa": 1_600_000_000}}}}}},
+         "settings": _donor_settings()},
     ]
 
 
@@ -408,16 +417,63 @@ def test_campaign_settings_come_from_the_donors():
     assert campaign["target_cpa"] == 1_600
 
 
+def test_the_raw_campaigns_get_format_is_still_readable():
+    # Запасной путь: наряд может собираться и из свежего чтения кабинета, где
+    # настройки в сыром формате campaigns.get. Гео там даёт только витрина,
+    # поэтому сырые настройки дополняются её блоком targeting.
+    raw = {"TextCampaign": {
+        "CounterIds": {"Items": [98_627_983]},
+        "BiddingStrategy": {"Search": {"AverageCpa": {
+            "GoalId": 360_811_375, "AverageCpa": 1_600_000_000}}}},
+        "targeting": {"regions": [225]}}
+    donors = _donors()
+    for donor in donors:
+        donor["settings"] = raw
+    campaign, reason = launch.campaign_from_donors(
+        donors, donor_cpa=1_600.0, window_days=30)
+    assert reason is None
+    assert campaign["goal_id"] == 360_811_375
+
+
 def test_the_weekly_budget_is_what_the_donors_already_spend():
     campaign, _ = launch.campaign_from_donors(
         _donors(), donor_cpa=1_600.0, window_days=30)
     assert campaign["weekly_budget"] == round((18_400.0 + 9_100.0) / 30 * 7)
 
 
+def test_the_geo_of_the_new_campaign_is_the_geo_of_the_donors():
+    # Фразы переезжают вместе со своими показами: кампания в другом регионе
+    # покупала бы другой трафик под видом того же теста. Отрицательные
+    # регионы (исключения витрины) едут как есть — семантика RegionIds.
+    campaign, reason = launch.campaign_from_donors(
+        _donors(), donor_cpa=1_600.0, window_days=30)
+    assert reason is None
+    assert campaign["region_ids"] == [1, 10_716]
+
+
+def test_donors_disagreeing_on_geo_refuse_the_launch():
+    # Сумма регионов показывала бы каждому донору шире, чем он проверен
+    # деньгами, поэтому расхождение — отказ, а не объединение.
+    donors = _donors()
+    donors[1]["settings"]["targeting"]["regions"] = [225]
+    campaign, reason = launch.campaign_from_donors(
+        donors, donor_cpa=1_600.0, window_days=30)
+    assert campaign is None
+    assert "гео" in reason
+
+
+def test_a_donor_without_geo_refuses_the_launch():
+    donors = _donors()
+    donors[0]["settings"]["targeting"]["regions"] = []
+    campaign, reason = launch.campaign_from_donors(
+        donors, donor_cpa=1_600.0, window_days=30)
+    assert campaign is None
+    assert "гео" in reason
+
+
 def test_donors_disagreeing_on_the_goal_refuse_the_launch():
     donors = _donors()
-    donors[1]["settings"]["TextCampaign"]["BiddingStrategy"]["Search"][
-        "AverageCpa"]["GoalId"] = 111_222_333
+    donors[1]["settings"]["strategy"]["search"]["goalIds"] = [111_222_333]
     campaign, reason = launch.campaign_from_donors(
         donors, donor_cpa=1_600.0, window_days=30)
     assert campaign is None

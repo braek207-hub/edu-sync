@@ -319,11 +319,16 @@ def test_consolidation_without_donor_settings_stays_a_proposal():
     assert idea["detail"]["launch_refusal"]
 
 
-def _settings(goal=360_811_375, counter=98_627_983):
-    return {"TextCampaign": {
-        "CounterIds": {"Items": [counter]},
-        "BiddingStrategy": {"Search": {"AverageCpa": {
-            "GoalId": goal, "AverageCpa": 1_600_000_000}}}}}
+def _settings(goal=360_811_375, counter=98_627_983, regions=(1, 10_716)):
+    # Формат — витрина edu_campaign_settings: именно её подаёт бой
+    # (db.load_campaign_settings_raw → bundles → сюда). Сырой campaigns.get
+    # в фикстуре держал тесты зелёными, пока прод отказывал каждому выносу.
+    return {
+        "meta": {"counterIds": [counter]},
+        "strategy": {"search": {"goalIds": [goal],
+                                "biddingStrategyType": "AVERAGE_CPA"}},
+        "targeting": {"regions": list(regions)},
+    }
 
 
 def test_consolidation_with_donor_settings_carries_an_order():
