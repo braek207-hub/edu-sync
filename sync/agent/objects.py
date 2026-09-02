@@ -228,9 +228,27 @@ def placement_candidates(
 BLOCKLIST_REASON = "blocklist"
 
 
+def _site_matches(site: str, patterns: List[str]) -> bool:
+    """Матч имени площадки по паттернам владельца.
+
+    Паттерн с «^» — префикс, без — подстрока. Префикс нужен классу мобильных
+    приложений: bundle id начинается с «com.», но подстрока «com.» зацепила
+    бы и обычные .com-домены соседними символами — класс и его случайные
+    тёзки различаются только позицией матча.
+    """
+    for pattern in patterns:
+        if pattern.startswith("^"):
+            if site.startswith(pattern[1:]):
+                return True
+        elif pattern in site:
+            return True
+    return False
+
+
 def blocklist_placement_candidates(
     placements: List[Dict[str, Any]], patterns: List[str],
     top_n: int = 30,
+    allow: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Площадки из чёрного списка владельца в топ-N по расходу окна.
 
@@ -238,7 +256,12 @@ def blocklist_placement_candidates(
     а не статистика: DSP-обменники и VPN-приложения дают спам-лиды, которые
     конверсиями Директа выглядят живыми, и статистический критерий
     (placement_candidates) их защищает. Паттерн — подстрока имени площадки в
-    нижнем регистре.
+    нижнем регистре, «^» в начале — префикс (см. _site_matches).
+
+    allow — исключения владельца (placement_allowlist): известные приложения
+    (Авито, VK…), которые под классовый паттерн вроде «^com.» попадают, но
+    мусором не являются. Исключение снимает только чёрный список — статистика
+    (placement_candidates) продолжает судить такую площадку как любую другую.
 
     Ворота топ-N — защита лимита кабинета (1000 запрещённых площадок на
     кампанию): матчей у паттернов тысячи, почти все — копеечные, и без ворот
@@ -250,6 +273,8 @@ def blocklist_placement_candidates(
     normalized = [p for p in normalized if p]
     if not normalized:
         return []
+    allowed = [str(p or "").strip().lower() for p in (allow or ())]
+    allowed = [p for p in allowed if p]
 
     totals: Dict[str, Dict[str, Any]] = {}
     for row in placements:
@@ -277,7 +302,9 @@ def blocklist_placement_candidates(
     ranked = sorted(totals.values(), key=lambda r: -r["cost"])[:max(1, int(top_n))]
     out: List[Dict[str, Any]] = []
     for slot in ranked:
-        if not any(p in slot["placement"] for p in normalized):
+        if not _site_matches(slot["placement"], normalized):
+            continue
+        if allowed and _site_matches(slot["placement"], allowed):
             continue
         out.append({
             "placement": slot["placement"],

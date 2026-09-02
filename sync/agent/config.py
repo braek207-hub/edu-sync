@@ -129,6 +129,16 @@ SPEC: Dict[str, Dict[str, Any]] = {
                  "(решение владельца); действует только на топ по расходу — "
                  "см. placement_blocklist_top_n",
     },
+    "placement_allowlist": {
+        # Исключения владельца из чёрного списка: известные приложения
+        # (Авито, VK…), которые под классовый паттерн вроде «^com.» попадают,
+        # но мусором не являются. Исключение снимает ТОЛЬКО чёрный список:
+        # статистический критерий продолжает судить площадку как любую
+        # другую — сольёт деньги без конверсий, будет срезана по данным.
+        "default": None, "nullable": True, "kind": KIND_TEXT_LIST,
+        "about": "исключения из placement_blocklist (известные приложения); "
+                 "статистику не отменяют",
+    },
     "placement_blocklist_top_n": {
         "default": 30, "min": 1, "max": 200,
         "about": "чёрный список площадок смотрит только на топ-N по расходу "
@@ -312,7 +322,10 @@ def _text_list(key: str, value: Any) -> List[str]:
     out: List[str] = []
     for item in value:
         text = str(item or "").strip().lower()
-        if len(text) < 2:
+        # «^» в начале — префиксный матч (objects._site_matches); длина
+        # меряется по содержательной части, сам маркер символом не считается.
+        body = text[1:] if text.startswith("^") else text
+        if len(body) < 2:
             raise ValueError(f"{key}: паттерн {item!r} короче 2 символов")
         if " " in text:
             raise ValueError(f"{key}: паттерн {item!r} содержит пробел — "

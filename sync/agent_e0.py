@@ -1608,7 +1608,8 @@ def main() -> int:
         blocklist_list = blocklist_placement_candidates(
             placement_candidate_rows,
             patterns=active_config.get("placement_blocklist") or (),
-            top_n=int(active_config.get("placement_blocklist_top_n") or 30))
+            top_n=int(active_config.get("placement_blocklist_top_n") or 30),
+            allow=active_config.get("placement_allowlist") or ())
         seen_sites = {c["placement"] for c in placement_candidates_list}
         placement_candidates_list += [c for c in blocklist_list
                                       if c["placement"] not in seen_sites]

@@ -568,3 +568,34 @@ def test_blocklist_matching_is_case_insensitive_and_empty_list_is_silent():
     out = blocklist_placement_candidates(rows, ["dsp-"], top_n=10)
     assert [c["placement"] for c in out] == ["dsp-opera-exchange.yandex.ru"]
     assert blocklist_placement_candidates(rows, [], top_n=10) == []
+
+
+def test_blocklist_prefix_pattern_hits_bundles_not_com_domains():
+    # «^com.» — класс мобильных приложений (bundle id). Подстрока «com.»
+    # зацепила бы и обычные .com-домены соседними символами.
+    from sync.agent.objects import blocklist_placement_candidates
+    rows = [
+        {"campaign_id": "1", "placement": "com.slicemasterfruit.android",
+         "cost": 1500.0, "clicks": 100, "conversions": 5},
+        {"campaign_id": "1", "placement": "welcome.ru",
+         "cost": 1400.0, "clicks": 90, "conversions": 3},
+        {"campaign_id": "1", "placement": "example.com",
+         "cost": 1300.0, "clicks": 80, "conversions": 2},
+    ]
+    out = blocklist_placement_candidates(rows, ["^com."], top_n=30)
+    assert [c["placement"] for c in out] == ["com.slicemasterfruit.android"]
+
+
+def test_allowlist_saves_known_apps_from_the_class_pattern():
+    # «кроме известных приложений типа Авито, VK» — исключение снимает только
+    # чёрный список; статистика продолжает судить площадку как любую другую.
+    from sync.agent.objects import blocklist_placement_candidates
+    rows = [
+        {"campaign_id": "1", "placement": "com.vk.vkclient",
+         "cost": 24000.0, "clicks": 224, "conversions": 44},
+        {"campaign_id": "1", "placement": "com.pingsecure.client.app",
+         "cost": 3500.0, "clicks": 700, "conversions": 13},
+    ]
+    out = blocklist_placement_candidates(rows, ["^com."], top_n=30,
+                                         allow=["vk", "avito"])
+    assert [c["placement"] for c in out] == ["com.pingsecure.client.app"]
