@@ -101,6 +101,7 @@ from sync.agent.objects import (
     build_object_rows,
     CANDIDATE_WINDOW_DAYS,
     minus_word_candidates,
+    blocklist_placement_candidates,
     placement_candidates,
     own_semantics,
     phrases_cutting_only_waste,
@@ -1600,6 +1601,17 @@ def main() -> int:
         placement_candidates_list = placement_candidates(
             placement_candidate_rows, cpa_limit=cpa_limit,
             base_conversion=(base_conv_p / base_clicks_p) if base_clicks_p else 0.0)
+        # Чёрный список владельца поверх статистики: паттерны из панели,
+        # только топ-N по расходу (см. objects.blocklist_placement_candidates).
+        # Площадка, уже пойманная статистикой, второй раз не заводится — у
+        # статистического кандидата основание сильнее (даёт класс 0).
+        blocklist_list = blocklist_placement_candidates(
+            placement_candidate_rows,
+            patterns=active_config.get("placement_blocklist") or (),
+            top_n=int(active_config.get("placement_blocklist_top_n") or 30))
+        seen_sites = {c["placement"] for c in placement_candidates_list}
+        placement_candidates_list += [c for c in blocklist_list
+                                      if c["placement"] not in seen_sites]
         for campaign_id, rows in placement_computed_rows(placement_candidates_list).items():
             agent_db.upsert_computed_settings(
                 rows, calc_date=today_iso, object_id=campaign_id,

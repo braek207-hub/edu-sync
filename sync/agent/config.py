@@ -36,6 +36,7 @@ from sync.agent.writer.switch import MAX_SUSPENDS_PER_RUN
 # а вид — в двух (валидация и подпись), и разъехаться им нельзя.
 KIND_LANE_STEPS = "lane_steps"   # {полоса: ступень}
 KIND_LANE_LIST = "lane_list"     # [полоса, полоса]
+KIND_TEXT_LIST = "text_list"     # [подстрока, подстрока]
 
 # Что регулируется. Значение по умолчанию = константа кода, диапазон — границы,
 # внутри которых параметр остаётся осмысленным (а не «лишь бы не падало»).
@@ -113,6 +114,26 @@ SPEC: Dict[str, Dict[str, Any]] = {
         "default": None, "nullable": True, "kind": KIND_LANE_LIST,
         "about": "полосы на приёмке: пишут «сделал бы X, жду Y», ничего не "
                  "применяя",
+    },
+    "placement_blocklist": {
+        # Чёрный список площадок владельца: подстроки домена или bundle id
+        # («dsp-», «vpn», «.games»). Площадка, имя которой содержит любую из
+        # них, запрещается БЕЗ статистики — это решение человека о качестве
+        # трафика (Павел, 02.09.2026: DSP-обменники и VPN-приложения дают
+        # спам-лиды, которые конверсиями Директа выглядят живыми, и
+        # статистический критерий их защищает). Ворота — топ-N по расходу
+        # (placement_blocklist_top_n): без них хвост из тысяч копеечных
+        # матчей забил бы лимит кабинета (1000 слотов на кампанию) за неделю.
+        "default": None, "nullable": True, "kind": KIND_TEXT_LIST,
+        "about": "подстроки имён площадок, которые режутся без статистики "
+                 "(решение владельца); действует только на топ по расходу — "
+                 "см. placement_blocklist_top_n",
+    },
+    "placement_blocklist_top_n": {
+        "default": 30, "min": 1, "max": 200,
+        "about": "чёрный список площадок смотрит только на топ-N по расходу "
+                 "за окно: защита лимита кабинета (1000 слотов) от "
+                 "копеечного хвоста",
     },
     "idea_max_horizon_days": {
         # Ручка объявлена в ideas/limits.py («решать должен человек в
@@ -216,6 +237,8 @@ def _validate(key: str, value: Any) -> Any:
         return _lane_steps(key, value)
     if kind == KIND_LANE_LIST:
         return _lane_list(key, value)
+    if kind == KIND_TEXT_LIST:
+        return _text_list(key, value)
 
     choices = spec.get("choices")
     if choices is not None:
@@ -275,6 +298,28 @@ def _lane_list(key: str, value: Any) -> List[str]:
     if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple, set)):
         raise ValueError(f"{key}={value!r}: нужен список полос")
     return sorted({_known_lane(key, lane) for lane in value})
+
+
+def _text_list(key: str, value: Any) -> List[str]:
+    """Список подстрок-паттернов: нижний регистр, без пустых и без пробелов.
+
+    Паттерн короче двух символов — ошибка, а не умолчание: подстрока «a»
+    совпала бы почти с каждым доменом, и один неловкий элемент списка
+    превратил бы точечный запрет в ковровый.
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple, set)):
+        raise ValueError(f"{key}={value!r}: нужен список подстрок")
+    out: List[str] = []
+    for item in value:
+        text = str(item or "").strip().lower()
+        if len(text) < 2:
+            raise ValueError(f"{key}: паттерн {item!r} короче 2 символов")
+        if " " in text:
+            raise ValueError(f"{key}: паттерн {item!r} содержит пробел — "
+                             "домены и bundle id пробелов не содержат")
+        if text not in out:
+            out.append(text)
+    return sorted(out)
 
 
 def resolve(preset: Optional[str] = None,

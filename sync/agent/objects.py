@@ -225,6 +225,75 @@ def placement_candidates(
     return [{**row, "placement": row.pop("query")} for row in out]
 
 
+BLOCKLIST_REASON = "blocklist"
+
+
+def blocklist_placement_candidates(
+    placements: List[Dict[str, Any]], patterns: List[str],
+    top_n: int = 30,
+) -> List[Dict[str, Any]]:
+    """Площадки из чёрного списка владельца в топ-N по расходу окна.
+
+    Решение о качестве здесь принимает ЧЕЛОВЕК (панель placement_blocklist),
+    а не статистика: DSP-обменники и VPN-приложения дают спам-лиды, которые
+    конверсиями Директа выглядят живыми, и статистический критерий
+    (placement_candidates) их защищает. Паттерн — подстрока имени площадки в
+    нижнем регистре.
+
+    Ворота топ-N — защита лимита кабинета (1000 запрещённых площадок на
+    кампанию): матчей у паттернов тысячи, почти все — копеечные, и без ворот
+    список забился бы хвостом за неделю. Площадка из чёрного списка ждёт,
+    пока не станет заметна деньгами, — и тогда режется независимо от
+    конверсий, с причиной blocklist в витрине.
+    """
+    normalized = [str(p or "").strip().lower() for p in (patterns or ())]
+    normalized = [p for p in normalized if p]
+    if not normalized:
+        return []
+
+    totals: Dict[str, Dict[str, Any]] = {}
+    for row in placements:
+        site = str(row.get("placement") or "").strip().lower()
+        if not site:
+            continue
+        slot = totals.setdefault(site, {
+            "placement": site, "cost": 0.0, "clicks": 0, "conversions": 0,
+            "campaigns": set(), "cost_by_campaign": {},
+            "conversions_by_campaign": {},
+        })
+        cost = float(row.get("cost") or 0.0)
+        conversions = int(row.get("conversions") or 0)
+        campaign_id = str(row.get("campaign_id") or "")
+        slot["cost"] += cost
+        slot["clicks"] += int(row.get("clicks") or 0)
+        slot["conversions"] += conversions
+        slot["campaigns"].add(campaign_id)
+        if campaign_id:
+            slot["cost_by_campaign"][campaign_id] = (
+                slot["cost_by_campaign"].get(campaign_id, 0.0) + cost)
+            slot["conversions_by_campaign"][campaign_id] = (
+                slot["conversions_by_campaign"].get(campaign_id, 0) + conversions)
+
+    ranked = sorted(totals.values(), key=lambda r: -r["cost"])[:max(1, int(top_n))]
+    out: List[Dict[str, Any]] = []
+    for slot in ranked:
+        if not any(p in slot["placement"] for p in normalized):
+            continue
+        out.append({
+            "placement": slot["placement"],
+            "cost": round(slot["cost"], 2),
+            "clicks": slot["clicks"],
+            "conversions": slot["conversions"],
+            "reason": BLOCKLIST_REASON,
+            "campaigns": sorted(c for c in slot["campaigns"] if c),
+            "cost_by_campaign": {c: round(v, 2)
+                                 for c, v in sorted(slot["cost_by_campaign"].items())},
+            "conversions_by_campaign": dict(
+                sorted(slot["conversions_by_campaign"].items())),
+        })
+    return out
+
+
 # Минимальная длина слова-кандидата. Предлоги и союзы («в», «на», «и») в
 # минус-слова не годятся: они встречаются везде, и запрет выкосил бы вместе с
 # мусором всю работающую семантику.

@@ -518,3 +518,53 @@ def test_expansion_falls_back_to_the_report_when_the_snapshot_missed_a_campaign(
     ]
     bought = own_semantics(queries, {"1": ["колледж"]})[1]
     assert expansion_candidates(queries, cpa_limit=1700.0, bought=bought) == []
+
+
+# ------------------- чёрный список площадок владельца (Павел, 02.09.2026)
+
+
+def test_blocklist_bans_a_matching_site_in_the_top_regardless_of_conversions():
+    # DSP-обменники и VPN-приложения дают спам-лиды: конверсии Директа у них
+    # живые, и статистический критерий такую площадку защищает. Решение о
+    # качестве принимает человек паттерном — конверсии не спасают.
+    from sync.agent.objects import blocklist_placement_candidates
+    rows = [
+        {"campaign_id": "1", "placement": "com.pingsecure.client.app",
+         "cost": 3500.0, "clicks": 700, "conversions": 13},
+        {"campaign_id": "1", "placement": "dzen.ru",
+         "cost": 30000.0, "clicks": 1200, "conversions": 82},
+    ]
+    out = blocklist_placement_candidates(rows, patterns=["vpn", "pingsecure"],
+                                         top_n=30)
+    assert [c["placement"] for c in out] == ["com.pingsecure.client.app"]
+    assert out[0]["reason"] == "blocklist"
+    assert out[0]["conversions"] == 13
+
+
+def test_blocklist_waits_until_the_site_is_in_the_top_by_cost():
+    # Ворота топ-N — защита лимита кабинета (1000 слотов): копеечный матч
+    # ждёт, пока не станет заметен деньгами, а не занимает слот сразу.
+    from sync.agent.objects import blocklist_placement_candidates
+    rows = [{"campaign_id": "1", "placement": f"site{i}.ru",
+             "cost": 1000.0 + i, "clicks": 10, "conversions": 0}
+            for i in range(30)]
+    rows.append({"campaign_id": "1", "placement": "cheap-vpn.app",
+                 "cost": 5.0, "clicks": 2, "conversions": 0})
+    assert blocklist_placement_candidates(rows, ["vpn"], top_n=30) == []
+    # Тот же матч в топе — режется.
+    rows.append({"campaign_id": "2", "placement": "cheap-vpn.app",
+                 "cost": 50000.0, "clicks": 500, "conversions": 0})
+    out = blocklist_placement_candidates(rows, ["vpn"], top_n=30)
+    assert [c["placement"] for c in out] == ["cheap-vpn.app"]
+    # Расход и кампании агрегированы по всем строкам площадки.
+    assert out[0]["cost"] == 50005.0
+    assert out[0]["campaigns"] == ["1", "2"]
+
+
+def test_blocklist_matching_is_case_insensitive_and_empty_list_is_silent():
+    from sync.agent.objects import blocklist_placement_candidates
+    rows = [{"campaign_id": "1", "placement": "DSP-Opera-Exchange.yandex.ru",
+             "cost": 1000.0, "clicks": 100, "conversions": 0}]
+    out = blocklist_placement_candidates(rows, ["dsp-"], top_n=10)
+    assert [c["placement"] for c in out] == ["dsp-opera-exchange.yandex.ru"]
+    assert blocklist_placement_candidates(rows, [], top_n=10) == []

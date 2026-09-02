@@ -166,3 +166,27 @@ def test_composite_settings_survive_the_text_column():
     assert _parse_config_value("0.07") == 0.07
     assert _parse_config_value("full") == "full"
     assert _parse_config_value("{сломано") == "{сломано"
+
+
+# ------------------- чёрный список площадок: паттерны проверяются на входе
+
+
+def test_placement_blocklist_accepts_a_list_of_patterns():
+    config = resolve(None, {"placement_blocklist": ["VPN", "dsp-", "vpn"]})
+    assert config["placement_blocklist"] == ["dsp-", "vpn"]
+
+
+def test_placement_blocklist_rejects_a_pattern_that_would_ban_everything():
+    # Подстрока «a» совпала бы почти с каждым доменом: один неловкий элемент
+    # превратил бы точечный запрет в ковровый.
+    with pytest.raises(ValueError):
+        resolve(None, {"placement_blocklist": ["a"]})
+    with pytest.raises(ValueError):
+        resolve(None, {"placement_blocklist": ["две площадки"]})
+    with pytest.raises(ValueError):
+        resolve(None, {"placement_blocklist": "vpn"})
+
+
+def test_placement_blocklist_is_empty_by_default_and_clearable():
+    assert resolve(None, {})["placement_blocklist"] is None
+    assert resolve(None, {"placement_blocklist": None})["placement_blocklist"] is None

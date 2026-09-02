@@ -39,6 +39,15 @@ MAX_SITE_CHARS = 255
 # такт обязан оставаться различимым в наблюдении.
 MAX_SITES_PER_TICK = 10
 
+# Отдельный, больший кап для площадок с ИЗМЕРЕННЫМ нулём конверсий. Их запрет
+# — арифметика (класс 0: вырезаемый трафик не приносил ничего, наблюдение
+# такту не нужно и риск-бюджетом он не платит), а хвост сети — это сотни
+# дешёвых нулевых площадок, которые при общем капе 10 не вычищались бы
+# месяцами (решение Павла 02.09.2026: «площадки минусовать активно»).
+# Площадки с конверсиями и с неизмеренными конверсиями остаются под тесным
+# капом: там отсечение стоит лидов, и такт обязан быть различим.
+MAX_ZERO_SITES_PER_TICK = 25
+
 NOT_TEXT_REASON = "запрет площадок доступен не для этого типа кампании"
 
 _SPACES = re.compile(r"\s+")
@@ -67,11 +76,14 @@ def site_is_valid(site: str) -> Tuple[bool, str]:
 def plan_placements(
     candidates: List[Dict[str, Any]],
     max_per_tick: int = MAX_SITES_PER_TICK,
+    max_zero_per_tick: int = MAX_ZERO_SITES_PER_TICK,
 ) -> Dict[str, Any]:
     """Кандидаты расчёта → площадки к запрету по кампаниям.
 
     Отбор по расходу, как у фраз: за такт уходят самые дорогие, остальные
-    ждут следующего, и счётчик over_cap об этом говорит.
+    ждут следующего, и счётчик over_cap об этом говорит. Капа два: тесный —
+    для площадок, чьё отсечение стоит конверсий (измеренных или неизмеренных),
+    расширенный — для измеренного нуля, где терять нечего.
     """
     valid: List[Dict[str, Any]] = []
     invalid: List[Dict[str, Any]] = []
@@ -85,7 +97,17 @@ def plan_placements(
         valid.append({**candidate, "site": site})
 
     valid.sort(key=lambda c: -float(c.get("cost") or 0.0))
-    taken = valid[:max_per_tick]
+
+    def _measured_zero(candidate: Dict[str, Any]) -> bool:
+        # None — «не измеряли», и расширенного капа такой площадке не
+        # положено: неизвестные конверсии — не ноль (см. комментарий к
+        # PLACEMENT_CONVERSIONS_KIND).
+        conversions = candidate.get("conversions")
+        return conversions is not None and float(conversions) <= 0.0
+
+    zero = [c for c in valid if _measured_zero(c)]
+    risky = [c for c in valid if not _measured_zero(c)]
+    taken = risky[:max_per_tick] + zero[:max_zero_per_tick]
 
     desired: Dict[str, List[str]] = {}
     # Вырезаемый расход по кампаниям — вход цены риска, как у минус-фраз.

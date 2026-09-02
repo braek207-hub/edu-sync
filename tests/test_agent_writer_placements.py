@@ -8,6 +8,7 @@
 """
 
 from sync.agent.writer.placements import (
+    MAX_ZERO_SITES_PER_TICK,
     MAX_EXCLUDED_SITES,
     MAX_SITE_CHARS,
     MAX_SITES_PER_TICK,
@@ -35,12 +36,32 @@ def test_site_validation_rejects_junk():
     assert not site_is_valid("две площадки")[0]
 
 
-def test_plan_caps_sites_per_tick_by_cost():
+def test_measured_zero_sites_get_the_wide_cap():
+    # Запрет измеренного нуля — арифметика (класс 0, терять нечего), и хвост
+    # из сотен дешёвых нулевых площадок не должен ждать месяцами за тесным
+    # капом наблюдаемых действий (решение Павла 02.09.2026).
     plan = plan_placements([_candidate(f"site{i}.ru", cost=1000.0 * i)
-                            for i in range(1, MAX_SITES_PER_TICK + 4)])
-    assert len(plan["desired"]["1"]) == MAX_SITES_PER_TICK
-    assert f"site{MAX_SITES_PER_TICK + 3}.ru" in plan["desired"]["1"]
+                            for i in range(1, MAX_ZERO_SITES_PER_TICK + 4)])
+    assert len(plan["desired"]["1"]) == MAX_ZERO_SITES_PER_TICK
+    assert f"site{MAX_ZERO_SITES_PER_TICK + 3}.ru" in plan["desired"]["1"]
     assert plan["over_cap"] == 3
+
+
+def test_sites_costing_conversions_keep_the_tight_cap():
+    # Площадка с конверсиями (и с неизмеренными конверсиями) при отсечении
+    # стоит лидов — такт обязан оставаться различимым в наблюдении.
+    with_conversions = [
+        {**_candidate(f"conv{i}.ru", cost=1000.0 * i),
+         "conversions": 2, "reason": "cpa_above_limit"}
+        for i in range(1, MAX_SITES_PER_TICK + 3)]
+    unmeasured = [
+        {**_candidate(f"unknown{i}.ru", cost=500.0), "conversions": None}
+        for i in range(3)]
+    plan = plan_placements(with_conversions + unmeasured)
+    assert len(plan["desired"]["1"]) == MAX_SITES_PER_TICK
+    # Самые дорогие — первыми: неизмеренные дешёвые не вытесняют дорогих.
+    assert f"conv{MAX_SITES_PER_TICK + 2}.ru" in plan["desired"]["1"]
+    assert plan["over_cap"] == 5
 
 
 def test_merge_keeps_existing_and_respects_the_cabinet_limit():
