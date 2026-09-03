@@ -1144,6 +1144,7 @@ def _switch_report(
     refused: Optional[List[Dict[str, Any]]] = None,
     planned_count: int = 0, not_found: Optional[List[str]] = None,
     deferred_over_cap: int = 0,
+    max_per_run: int = switch.MAX_SUSPENDS_PER_RUN,
     limit: int = PREVIEW_SAMPLE_LIMIT,
 ) -> Dict[str, Any]:
     """Что прогон решил про выключения кампаний (Э3.4).
@@ -1167,8 +1168,10 @@ def _switch_report(
         "confidence_unknown": switch_plan["confidence_unknown"],
         "actions_planned": planned_count,
         # Потолок выключений: сверх него — не отказ, ждёт следующего расчёта.
+        # ДЕЙСТВУЮЩИЙ потолок, то есть панельный (max_suspends_per_run), а не
+        # кодовая константа: 03.09 отчёт печатал 1 при работающем капе 2.
         "deferred_over_cap": deferred_over_cap,
-        "max_per_run": switch.MAX_SUSPENDS_PER_RUN,
+        "max_per_run": int(max_per_run),
     }
     if refused is not None:
         by_reason: Dict[str, int] = {}
@@ -2486,7 +2489,9 @@ def run_account(
                                  cooled=budget_cooled),
         "switch": _switch_report(switch_plan, switch_desired, switch_refused,
                                  switch_planned_count, switch_not_found,
-                                 deferred_over_cap=len(switch_deferred)),
+                                 deferred_over_cap=len(switch_deferred),
+                                 max_per_run=int(
+                                     ctx["config"]["max_suspends_per_run"])),
         "tcpa": _tcpa_report(tcpa_plan, tcpa_desired, tcpa_refused,
                              tcpa_planned_count, tcpa_not_found,
                              cooled=tcpa_cooled),
