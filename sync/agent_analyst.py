@@ -9,10 +9,16 @@ READ-ONLY: вердикты уходят владельцу в Telegram и в ч
 кабинет и панель не идёт ничего (почему так — sync/agent/analyst.py).
 
 Запуск:
-    python -m sync.agent_analyst            # сутки
+    python -m sync.agent_analyst            # API-путь (ANTHROPIC_API_KEY)
+    python -m sync.agent_analyst --local    # через Claude Code CLI (подписка)
     python -m sync.agent_analyst --days=3
-ENV: DATABASE_URL, ANTHROPIC_API_KEY (нет ключа — SKIPPED, не падение),
+ENV: DATABASE_URL; для API-пути ANTHROPIC_API_KEY (нет — SKIPPED, не падение);
      TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID (нет — разбор только в ящик).
+
+--local — боевой путь: биллинг от подписки Claude, а не API (решение Павла
+03.09). Запускается планировщиком Windows (задача EDU-agent-analyst) на
+машине, где живёт claude CLI; env добирается из локальных .env сам, потому
+что планировщик переменных окружения не даёт.
 """
 
 import json
@@ -120,14 +126,64 @@ def ask_model(system: str, user: str) -> Dict[str, Any]:
                 "usage": None}
 
 
+# Кандидаты локальных .env: планировщик Windows окружения не даёт, поэтому
+# --local добирает переменные сам. override=False — реальное окружение важнее.
+LOCAL_ENV_FILES = (
+    r"d:\vscode\edu-sync\.env",
+    r"d:\vscode\EDU v2\.env.local",
+)
+
+# Столько ждём один вызов CLI. Opus с ~50к символов контекста думает
+# минуты; меньше 10 минут ставить нельзя — таймаут превратится в SKIPPED
+# и день останется без разбора.
+CLI_TIMEOUT_SEC = 900
+
+
+def _load_local_env() -> None:
+    from dotenv import load_dotenv
+
+    for path in LOCAL_ENV_FILES:
+        load_dotenv(path, override=False)
+
+
+def ask_cli(prompt: str) -> Dict[str, Any]:
+    """Тот же контракт, что у ask_model, но через claude -p: биллинг идёт
+    от подписки Claude Code, а не от API-баланса."""
+    import os
+    import shutil
+    import subprocess
+
+    binary = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    try:
+        proc = subprocess.run(
+            [binary, "--model", "opus", "-p"],
+            input=prompt, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=CLI_TIMEOUT_SEC)
+    except Exception as exc:  # noqa: BLE001 — надзор не роняет ничего
+        return {"raw": None, "error": f"{type(exc).__name__}: {exc}"[:300],
+                "usage": None}
+    if proc.returncode != 0:
+        return {"raw": None,
+                "error": f"claude_exit_{proc.returncode}: {proc.stderr}"[:300],
+                "usage": None}
+    return {"raw": proc.stdout, "error": None, "usage": {"via": "cli"}}
+
+
 def main() -> int:
     days = DEFAULT_DAYS
+    local = "--local" in sys.argv[1:]
     for arg in sys.argv[1:]:
         if arg.startswith("--days="):
             days = max(1, int(arg.split("=", 1)[1]))
+    if local:
+        _load_local_env()
 
     context = gather_context(days)
-    answer = ask_model(analyst.SYSTEM_PROMPT, analyst.build_user_prompt(context))
+    if local:
+        answer = ask_cli(analyst.merged_prompt(context))
+    else:
+        answer = ask_model(analyst.SYSTEM_PROMPT,
+                           analyst.build_user_prompt(context))
     result = analyst.parse_response(answer["raw"]) if answer["raw"] else None
 
     if result is None:

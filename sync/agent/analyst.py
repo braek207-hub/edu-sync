@@ -166,6 +166,11 @@ def parse_response(raw: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def merged_prompt(context: Dict[str, Any]) -> str:
+    """Оба промпта одним текстом — для запуска через CLI без системного канала."""
+    return SYSTEM_PROMPT + "\n\n" + build_user_prompt(context)
+
+
 def _row_list(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, list):
         return []

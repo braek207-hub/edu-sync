@@ -70,6 +70,14 @@ def test_prompt_carries_every_block_and_the_ask():
         assert marker in prompt
 
 
+def test_merged_prompt_carries_role_and_data():
+    # CLI-путь (claude -p) не имеет системного канала: роль и данные
+    # обязаны ехать одним текстом, роль — первой.
+    text = analyst.merged_prompt({"as_of": "2026-09-03", "runs": []})
+    assert text.startswith(analyst.SYSTEM_PROMPT[:40])
+    assert "Прогоны агента" in text
+
+
 def test_action_compaction_caps_the_list():
     actions = [{"action_id": f"a{i}", "action_kind": "bidmodifier.set",
                 "object_level": "campaign", "object_id": str(i),

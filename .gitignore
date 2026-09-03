@@ -17,3 +17,6 @@ secrets-local/
 !tests/fixtures/*.json
 !docs/examples/*.json
 !sync/agent/passports/*.json
+
+# Логи локальных запусков (воркер аналитика и пр.)
+output/

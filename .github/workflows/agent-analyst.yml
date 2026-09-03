@@ -1,9 +1,9 @@
 name: agent-analyst
+# Боевой путь — ЛОКАЛЬНЫЙ: планировщик Windows, задача EDU-agent-analyst,
+# 12:15 МСК, python -m sync.agent_analyst --local (биллинг от подписки
+# Claude Code, решение Павла 03.09). Этот workflow — резервный API-путь:
+# без крона, руками, и живёт только если в секретах появится ANTHROPIC_API_KEY.
 on:
-  schedule:
-    # 09:15 UTC = 12:15 МСК: Э0 (09:30 МСК) и Э1 (11:00 МСК) уже отработали,
-    # аналитик читает их следы — план, применение, отказы одного дня рядом.
-    - cron: "15 9 * * *"
   workflow_dispatch:
     inputs:
       days:
