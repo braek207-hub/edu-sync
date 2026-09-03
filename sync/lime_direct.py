@@ -1048,8 +1048,10 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
         settings_opts: List[str] = []
         for block in (tc, uc, mc):
             for opt in block.get("Settings") or []:
-                if isinstance(opt, dict) and opt.get("Option") == "YES":
-                    settings_opts.append(str(opt.get("Name", "")))
+                # CampaignSettingGet API v5: {"Option": <имя флага>, "Value": "YES"|"NO"}.
+                # До 03.09.2026 читались ключи Name/Option → campaignSettings был пуст у всех кампаний.
+                if isinstance(opt, dict) and opt.get("Value") == "YES":
+                    settings_opts.append(str(opt.get("Option", "")))
 
         priority_goals: List[int] = []
         for block in (tc, uc, mc):
