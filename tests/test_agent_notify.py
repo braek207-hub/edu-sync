@@ -54,14 +54,50 @@ def test_send_success_reports_sent(monkeypatch):
     assert b"\xd0\xbf\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82" in data  # "привет" utf-8
 
 
-def test_e1_summary_names_applied_and_rejected():
-    report = {"verdict": "GREEN", "accounts": [{"account": "acc", "planned": 240,
-               "result": {"applied": 3, "failed": 0, "unknown_outcome": 0, "dry_run": 0},
-               "rejects": {"lane_limit": 174, "budget": 6},
-               "lanes": {"taken": {"tuning": 20, "hygiene": 10}}}]}
+def test_e1_summary_sums_accounts_and_hides_reject_codes():
+    """Формат для человека (решение 03.09): суммы по кабинетам, коды причин
+    отказов в текст не попадают — их место в логе и чёрном ящике."""
+    report = {"verdict": "GREEN", "accounts": [
+        {"account": "acc-1", "planned": 240,
+         "result": {"applied": 3, "failed": 0, "unknown_outcome": 0, "dry_run": 0},
+         "rejects": {"lane_limit": 174, "budget": 6},
+         "lanes": {"taken": {"tuning": 20}}},
+        {"account": "acc-2", "planned": 10,
+         "result": {"applied": 2, "failed": 0, "unknown_outcome": 0, "dry_run": 0},
+         "rejects": {"budget": 20}, "lanes": {"taken": {}}}]}
     text = notify.e1_summary(report, dry_run=False)
-    assert "acc" in text and "применено 3" in text and "lane_limit 174" in text
-    assert "БОЕВАЯ" in text
+    assert "Сделал сам: 5" in text
+    assert "200 отложил" in text
+    assert "lane_limit" not in text and "budget" not in text
+    assert "всё ок" in text
+
+
+def test_e1_summary_announces_pending_approvals():
+    report = {"verdict": "GREEN", "pending_approvals": [{}, {}],
+              "accounts": [{"account": "acc", "planned": 5,
+               "result": {"applied": 1, "failed": 0, "unknown_outcome": 0, "dry_run": 0},
+               "rejects": {}, "lanes": {"taken": {}}}]}
+    text = notify.e1_summary(report, dry_run=False)
+    assert "Прошу апрув: 2" in text
+
+
+def test_e1_summary_without_pending_says_no_big_actions():
+    report = {"verdict": "GREEN", "accounts": [{"account": "acc", "planned": 5,
+               "result": {"applied": 1, "failed": 0, "unknown_outcome": 0, "dry_run": 0},
+               "rejects": {}, "lanes": {"taken": {}}}]}
+    text = notify.e1_summary(report, dry_run=False)
+    assert "Крупных действий не предлагаю" in text
+
+
+def test_e1_summary_surfaces_failures():
+    report = {"verdict": "PARTIAL", "failed_accounts": [{"account": "acc-3"}],
+              "accounts": [{"account": "acc", "planned": 5,
+               "result": {"applied": 1, "failed": 2, "unknown_outcome": 1, "dry_run": 0},
+               "rejects": {}, "lanes": {"taken": {}}}]}
+    text = notify.e1_summary(report, dry_run=False)
+    assert "ВНИМАНИЕ" in text and "сбоев 2" in text
+    assert "неясный исход 1" in text and "acc-3" in text
+    assert "есть проблемы" in text
 
 
 def test_e1_summary_in_rehearsal_counts_dry_run_not_applied():
@@ -70,10 +106,9 @@ def test_e1_summary_in_rehearsal_counts_dry_run_not_applied():
                "result": {"applied": 0, "failed": 0, "unknown_outcome": 0, "dry_run": 42},
                "rejects": {}, "lanes": {"taken": {}}}]}
     text = notify.e1_summary(report, dry_run=True)
-    assert "применилось бы 42" in text
-    assert "применено" not in text
+    assert "Применилось бы: 42" in text
+    assert "Сделал сам" not in text
     assert "репетиция" in text
-    assert "БОЕВАЯ" not in text
 
 
 def test_e1_summary_reports_zero_applied_silence_is_a_signal():
@@ -81,10 +116,10 @@ def test_e1_summary_reports_zero_applied_silence_is_a_signal():
                "result": {"applied": 0, "failed": 0, "unknown_outcome": 0, "dry_run": 0},
                "rejects": {}, "lanes": {"taken": {}}}]}
     text = notify.e1_summary(report, dry_run=False)
-    assert "применено 0" in text
+    assert "Сделал сам: 0" in text
 
 
-def test_watchdog_summary_names_account_alarm_and_rollbacks():
+def test_watchdog_summary_names_alarm_and_rollbacks():
     out = {"verdict": "ALARM",
            "alarms": ["Кабинет acc: пробита красная линия по CPA на 3 объектах"],
            "under_watch": 12,
@@ -94,16 +129,18 @@ def test_watchdog_summary_names_account_alarm_and_rollbacks():
                          "closed_verdicts": {"held": 4, "harmed": 1},
                          "needs_review": 2}]}
     text = notify.watchdog_summary(out)
-    assert "acc" in text
+    assert "ЕСТЬ ПРОБЛЕМЫ" in text
     assert "пробита красная линия по CPA на 3 объектах" in text
-    assert "откатов 2" in text
+    assert "Откатил 2" in text
+    assert "НЕ СМОГ откатить 1" in text
+    assert "Нужны руки: 1" in text
 
 
-def test_watchdog_summary_green_has_no_alarms_block():
+def test_watchdog_summary_green_is_one_calm_line():
     out = {"verdict": "GREEN", "alarms": [], "under_watch": 5,
            "needs_manual_rollback": 0,
            "accounts": [{"account": "acc", "rolled_back": 0, "breached": 0,
                          "rollback_failed": 0, "closed_verdicts": {}, "needs_review": 0}]}
     text = notify.watchdog_summary(out)
-    assert "ТРЕВОГИ" not in text
-    assert "откатов 0" in text
+    assert "ТРЕВОГА" not in text and "ПРОБЛЕМЫ" not in text
+    assert "вредных не нашёл" in text and "На замере 5" in text

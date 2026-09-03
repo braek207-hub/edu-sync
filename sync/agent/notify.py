@@ -24,7 +24,6 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 # Лимит Bot API на текст сообщения — 4096 символов; отчёт обрезается, а не
 # отбрасывается: усечённая сводка лучше отсутствующей.
 MAX_TEXT_LEN = 4000
-TOP_REJECTS_SHOWN = 4
 
 
 def _post(url: str, data: bytes) -> None:
@@ -56,35 +55,59 @@ def send(text: str) -> Dict[str, Any]:
         return {"sent": False, "reason": reason[:200]}
 
 
-def _top_rejects(rejects: Dict[str, int]) -> str:
-    ordered = sorted((rejects or {}).items(), key=lambda kv: -kv[1])[:TOP_REJECTS_SHOWN]
-    return ", ".join(f"{k} {v}" for k, v in ordered) or "—"
-
-
 def e1_summary(report: Dict[str, Any], dry_run: bool) -> str:
-    """Сводка такта записи Э1. Ключи — из report.accounts[i]:
+    """Сводка такта записи Э1 — для человека, не для отладки.
 
-    result: {applied, failed, dry_run, skipped, deferred, rejected,
-             units_low, conflicted, unknown_outcome} — БЕЗ "stale". В
-    репетиции ничего фактически не применяется, поэтому счётчик того, что
-    применилось бы, — result["dry_run"], а не result["applied"].
+    Решение Павла 03.09.2026: прежний формат (по кабинету на строку, коды
+    причин отказов, счётчики полос) был нечитаем — «дичь какая-то». Полный
+    расклад и так живёт в логе прогона и чёрном ящике; сводка отвечает на
+    три человеческих вопроса: что сделал сам, просит ли апрув, есть ли
+    проблемы. Кабинеты сворачиваются в сумму — поимённо они нужны только
+    когда с кабинетом беда.
+
+    Ключи — из report.accounts[i].result: {applied, failed, dry_run,
+    rejected, unknown_outcome, ...} — БЕЗ "stale". В репетиции ничего
+    фактически не применяется, поэтому счётчик того, что применилось бы, —
+    result["dry_run"], а не result["applied"].
     """
-    mode = "репетиция" if dry_run else "БОЕВАЯ ЗАПИСЬ"
-    lines = [f"Агент Э1 · {mode} · {report.get('verdict')}"]
-    for acc in report.get("accounts") or []:
-        res = acc.get("result") or {}
-        taken = (acc.get("lanes") or {}).get("taken") or {}
-        # В репетиции слово «применено» врало бы: считается то, что применилось бы.
-        applied = (f"применилось бы {res.get('dry_run', 0)}" if dry_run
-                   else f"применено {res.get('applied', 0)}")
-        lanes_text = ", ".join(f"{k} {v}" for k, v in taken.items()) or "—"
-        lines.append(
-            f"{acc.get('account')}: план {acc.get('planned')}, {applied}, "
-            f"сбой {res.get('failed', 0)}, неясный исход {res.get('unknown_outcome', 0)}; "
-            f"полосы {lanes_text}; отказы {_top_rejects(acc.get('rejects') or {})}")
-    if report.get("failed_accounts"):
-        lines.append("Кабинеты с ошибкой: " +
-                     ", ".join(a.get("account", "?") for a in report["failed_accounts"]))
+    accounts = report.get("accounts") or []
+
+    def _sum(key: str) -> int:
+        return sum(int((a.get("result") or {}).get(key) or 0) for a in accounts)
+
+    applied = _sum("dry_run") if dry_run else _sum("applied")
+    failed = _sum("failed")
+    unknown = _sum("unknown_outcome")
+    rejected = _sum("rejected")
+    held = sum(sum((a.get("rejects") or {}).values()) for a in accounts)
+    pending = len(report.get("pending_approvals") or [])
+    trouble = bool(failed or unknown or report.get("failed_accounts"))
+
+    if dry_run:
+        lines = ["Агент · репетиция (в кабинет ничего не писал)",
+                 f"Применилось бы: {applied} мелких правок."]
+    else:
+        status = "есть проблемы" if trouble else "всё ок"
+        lines = [f"Агент · {status}",
+                 f"Сделал сам: {applied} мелких правок "
+                 f"(ставки, площадки, минус-фразы) по {len(accounts)} каб."]
+    if held:
+        lines.append(f"Ещё {held} отложил из-за внутренних лимитов риска — "
+                     "норма, вернётся к ним в следующие дни.")
+    lines.append(f"Прошу апрув: {pending} — отвечай на следующее сообщение."
+                 if pending else "Крупных действий не предлагаю.")
+    if rejected and not dry_run:
+        lines.append(f"Кабинет отверг {rejected} — разберёт разбор недели.")
+    if trouble:
+        parts = []
+        if failed:
+            parts.append(f"сбоев {failed}")
+        if unknown:
+            parts.append(f"неясный исход {unknown}")
+        if report.get("failed_accounts"):
+            parts.append("кабинеты с ошибкой: " + ", ".join(
+                a.get("account", "?") for a in report["failed_accounts"]))
+        lines.append("ВНИМАНИЕ: " + ", ".join(parts))
     return "\n".join(lines)
 
 
@@ -96,26 +119,49 @@ def abort_summary(verdict: str, reason: str, dry_run: bool) -> str:
     в конце _run_all — без этой сводки они молчат в Telegram, а тишина
     неотличима от того, что крон не отработал вовсе.
     """
-    mode = "репетиция" if dry_run else "БОЕВАЯ ЗАПИСЬ"
-    return f"Агент Э1 · {mode} · прервана: {verdict}\n{(reason or '—')[:500]}"
+    mode = "репетиция" if dry_run else "боевой прогон"
+    return (f"Агент не отработал ({mode}): {verdict}\n{(reason or '—')[:500]}")
 
 
 def watchdog_summary(out: Dict[str, Any]) -> str:
-    """Сводка такта отката (сторож). Верхний уровень отчёта несёт только
-    alarms/under_watch/needs_manual_rollback; rolled_back/breached/
-    rollback_failed/closed_verdicts/needs_review живут ПО АККАУНТАМ в
-    out["accounts"][i] — breached там уже int (счётчик), не список.
+    """Сводка такта отката (сторож) — для человека, тем же решением
+    03.09.2026, что и e1_summary: кабинеты в сумму, коды — в слова.
+
+    Верхний уровень отчёта несёт только alarms/under_watch/
+    needs_manual_rollback; rolled_back/breached/rollback_failed/
+    closed_verdicts/needs_review живут ПО АККАУНТАМ в out["accounts"][i] —
+    breached там уже int (счётчик), не список.
     """
-    lines = [f"Сторож · {out.get('verdict')}"]
-    if out.get("alarms"):
-        lines.append("ТРЕВОГИ: " + "; ".join(out["alarms"]))
-    for acc in out.get("accounts") or []:
-        closed = sum((acc.get("closed_verdicts") or {}).values())
-        lines.append(
-            f"{acc.get('account')}: откатов {acc.get('rolled_back', 0)}, "
-            f"пробоев {acc.get('breached', 0)}, "
-            f"неоткаченных {acc.get('rollback_failed', 0)}, "
-            f"закрыто наблюдений {closed}, к разбору {acc.get('needs_review', 0)}")
-    lines.append(f"под наблюдением {out.get('under_watch', 0)}, "
-                 f"неоткатываемых вручную {out.get('needs_manual_rollback', 0)}")
+    accounts = out.get("accounts") or []
+
+    def _sum(key: str) -> int:
+        return sum(int(a.get(key) or 0) for a in accounts)
+
+    rolled = _sum("rolled_back")
+    breached = _sum("breached")
+    not_rolled = _sum("rollback_failed")
+    review = _sum("needs_review")
+    manual = int(out.get("needs_manual_rollback") or 0)
+    watch = int(out.get("under_watch") or 0)
+    trouble = bool(out.get("alarms") or rolled or breached or not_rolled
+                   or manual or review)
+
+    if not trouble:
+        return (f"Проверка своих правок: вредных не нашёл, откатывать нечего. "
+                f"На замере {watch}.")
+
+    lines = ["Проверка своих правок · ЕСТЬ ПРОБЛЕМЫ"]
+    for alarm in out.get("alarms") or []:
+        lines.append("ТРЕВОГА: " + str(alarm))
+    if rolled:
+        lines.append(f"Откатил {rolled} правок, которые навредили кампаниям.")
+    if breached:
+        lines.append(f"Пробита красная линия у {breached} — CPA хуже порога.")
+    if not_rolled:
+        lines.append(f"НЕ СМОГ откатить {not_rolled} — смотри лог сторожа.")
+    if manual:
+        lines.append(f"Нужны руки: {manual} не откатываются автоматически.")
+    if review:
+        lines.append(f"К разбору недели: {review}.")
+    lines.append(f"На замере {watch}.")
     return "\n".join(lines)

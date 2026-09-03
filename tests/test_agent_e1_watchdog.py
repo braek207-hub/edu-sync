@@ -2180,4 +2180,4 @@ def test_watchdog_notifies_after_the_black_box_write(monkeypatch, capsys):
 
     assert order == ["blackbox", "notify"], "уведомление ушло раньше записи в чёрный ящик"
     assert len(calls) == 1
-    assert "Сторож" in calls[0]
+    assert "Проверка своих правок" in calls[0]

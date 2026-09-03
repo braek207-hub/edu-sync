@@ -2332,7 +2332,7 @@ def test_notifies_after_the_black_box_write(monkeypatch, capsys):
 
     assert order == ["blackbox", "notify"], "уведомление ушло раньше записи в чёрный ящик"
     assert len(calls) == 1
-    assert "Агент Э1" in calls[0]
+    assert calls[0].startswith("Агент")
 
 
 def test_schedule_is_reported_even_when_it_changes_nothing(monkeypatch, capsys):
