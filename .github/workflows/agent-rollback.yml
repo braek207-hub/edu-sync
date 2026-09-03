@@ -1,0 +1,46 @@
+name: agent-rollback
+# Ручной откат списочных действий (negative.add / placement.exclude):
+# автооткат rollback_payload их не умеет, а точечный откат должен читать
+# ТЕКУЩИЙ список боевого кабинета — токен DIRECT_TOKEN есть только здесь.
+# Порядок: сначала прогон без apply (план: что именно снимем), глазами
+# проверить removed-списки, затем тот же запуск с apply.
+on:
+  workflow_dispatch:
+    inputs:
+      action_ids:
+        description: "action_id через запятую"
+        required: true
+        type: string
+      apply:
+        description: "РЕАЛЬНАЯ ЗАПИСЬ (без неё — план)"
+        required: false
+        type: boolean
+        default: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Rollback list actions
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+        run: |
+          # Всегда --prod: песочница этим логинам недоступа не даёт (Code 513,
+          # см. agent-e1.yml), а план обязан читать список именно боевого
+          # кабинета — иначе removed построен по несуществующему состоянию.
+          # Чтение без --apply в кабинет не пишет.
+          IDS="${{ github.event.inputs.action_ids }}"
+          case "$IDS" in
+            *[!0-9a-fA-F,]*) echo "action_ids: только hex и запятые, получено: $IDS"; exit 1;;
+          esac
+          ARGS="--ids=$IDS --prod"
+          if [ "${{ github.event.inputs.apply }}" = "true" ]; then ARGS="$ARGS --apply"; fi
+          echo "Аргументы:$ARGS"
+          python scripts/rollback_list_actions.py $ARGS
