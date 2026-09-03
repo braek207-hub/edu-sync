@@ -1,0 +1,38 @@
+name: agent-approver
+# Воркер апрув-контура (sync/agent_approver.py): читает ответы Павла в
+# Telegram («да <код>» / «нет <код>») и применяет одобренные действия из
+# очереди pending_approval. Разбор контура — sync/agent/approval.py.
+# Крон часто и только днём: запрос уходит после Э1 (11:00 МСК), ответ
+# должен применяться в течение минут, а ночью очереди не бывает — её
+# закрывает TTL 36 часов.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "разбор без записи в кабинет"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # каждые 20 минут с 08:00 до 23:40 МСК (UTC+3)
+    - cron: "*/20 5-20 * * *"
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Apply human decisions
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="--dry-run"; fi
+          python -m sync.agent_approver $ARGS

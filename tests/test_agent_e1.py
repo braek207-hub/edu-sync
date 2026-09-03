@@ -92,6 +92,11 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
                                        "checks": []})
     monkeypatch.setattr(agent_e1.writer_db, "recent_action_objects",
                         lambda *a, **k: set())
+    # Память вето апрув-контура: прогон читает её раз на запуск. Пусто =
+    # человек ничего не отклонял — поведение, на которое написаны остальные
+    # проверки. Без подмены прогон уходит в живую базу и печатает ретраи
+    # коннекта в тот же stdout, который тесты разбирают как JSON.
+    monkeypatch.setattr(agent_e1.approval_db, "vetoed_keys", lambda *a, **k: [])
     # Послужной список полос: прогон читает его первым делом, чтобы выдать
     # каждой полосе ступень (lane_steps_of). Пусто = ни одного закрытого
     # наблюдения, то есть все полосы на своём полу — поведение, на которое

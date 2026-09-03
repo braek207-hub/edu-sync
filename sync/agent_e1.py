@@ -53,6 +53,8 @@ import sys
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from sync.agent import approval
+from sync.agent import approval_db
 from sync.agent import config as agent_config
 from sync.agent import db as agent_db
 from sync.agent import scope as agent_scope
@@ -896,6 +898,41 @@ def _shadow_row(action: Dict[str, Any]) -> Dict[str, Any]:
     """
     return {**action, "risk_rub": 0.0, "learning_impact": learning_impact(action),
             "baseline_daily_rub": None, "risk_basis": None}
+
+
+def record_pending_approvals(actions: List[Dict[str, Any]],
+                             journal_ok: bool = True) -> Dict[str, Any]:
+    """Действия полос под апрувом — в журнал статусом pending_approval.
+
+    Разбор контура — sync/agent/approval.py. Действие прошло ВСЕ гейты и
+    рельсы риска, его цена посчитана и остаётся в строке: применит воркер
+    после «да» человека, и риск-бюджет прочтёт её по applied_at как любую
+    другую. Ключ идемпотентности тот же — завтрашний прогон перепишет ЭТУ ЖЕ
+    строку свежим расчётом, а не заведёт вторую (insert_action).
+
+    journal_ok — репетиция журнал не трогает (тот же контракт, что у
+    record_shadow_intents): очередь, заведённая репетицией, ждала бы
+    человека, которому ничего не отправляли.
+    """
+    rows: List[Dict[str, Any]] = []
+    written = 0
+    for action in actions:
+        action_id = writer_db.make_action_id(action["idempotency_key"])
+        rows.append({"action_id": action_id,
+                     "account": str(action.get("account") or ""),
+                     "object_id": str(action.get("object_id")),
+                     "action_kind": str(action.get("action_kind")),
+                     "lane": str(action.get("lane") or ""),
+                     "risk_rub": float(action.get("risk_rub") or 0.0),
+                     "payload": action.get("payload") or {}})
+        if not journal_ok:
+            continue
+        try:
+            writer_db.insert_action(action, status=approval.PENDING_STATUS)
+            written += 1
+        except Exception:  # noqa: BLE001 — одна строка не отменяет остальные
+            continue
+    return {"count": len(actions), "written": written, "rows": rows}
 
 
 def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
@@ -2348,6 +2385,23 @@ def run_account(
                                          charged_risk, caps, daily_cost)
     ctx["run_risk_remaining"] -= sum(float(a.get("risk_rub") or 0.0) for a in prepared)
 
+    # Апрув-контур (sync/agent/approval.py): действия полос под словом
+    # человека прошли ВСЕ гейты и рельсы риска — дальше их судьбу решает не
+    # код, а Павел в Telegram. Перехват стоит ровно здесь, ПОСЛЕ подгонки
+    # бюджета (цена посчитана и показывается человеку настоящей) и ДО ставок
+    # и отправки: ставка заводится только на то, что реально едет сейчас,
+    # а очередь применит воркер (sync/agent_approver.py). Риск удержанных
+    # действий из дневной доли не возвращается — «да» может прийти сегодня же,
+    # и день не вправе потратить эти деньги дважды.
+    prepared, held = approval.split_for_approval(
+        prepared, ctx.get("config"), vetoed_keys=ctx.get("approval_vetoed") or ())
+    held_vetoed = [a for a in held if a.get("_vetoed")]
+    approval_queue = [a for a in held if not a.get("_vetoed")]
+    pending = record_pending_approvals(
+        approval_queue, journal_ok=journal_writes_allowed(sandbox, dry_run))
+    if pending["written"]:
+        ctx.setdefault("pending_approvals", []).extend(pending["rows"])
+
     # Реестр гипотез: разведочная ставка заводится ДО отправки в кабинет и
     # ровно здесь — риск-бюджет уже назвал её цену (risk_rub), а действие ещё
     # не ушло. Заводить раньше значило бы держать в очереди замыслы, которые
@@ -2391,6 +2445,7 @@ def run_account(
         (rejects.LEARNING_COOLDOWN, in_learning_cooldown),
         (rejects.CLOSED_KEY, closed_keys),
         (rejects.NO_GROWTH_ADDRESS, without_address),
+        (rejects.HUMAN_VETO, held_vetoed),
     ], account=login, stage="e1", risks=risks)
     # Отказы САМОГО применения приезжают строками из apply_actions: там
     # решается, хватает ли кабинету баллов, и знает об этом только оно. Не
@@ -2468,6 +2523,11 @@ def run_account(
         # печатается тоже — «в тени никого» и «тень молчит» ведут к разным
         # следующим шагам.
         "shadow": shadow,
+        # Апрув-контур: сколько действий встало в очередь к человеку и
+        # сколько снято живым вето. Нули печатаются тем же доводом, что у
+        # shadow: «очередь пуста» и «контур молчит» ведут к разным шагам.
+        "approval": {"queued": pending["count"], "written": pending["written"],
+                     "vetoed": len(held_vetoed)},
         # Ф14: связки запуска. Все три числа нулями тоже печатаются: «нарядов
         # не было», «наряд был, доноров не прочитали» и «минусовка уехала без
         # запуска» ведут к разным следующим шагам, а один счётчик их сливает.
@@ -2900,6 +2960,19 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "lease": lease,
     }
 
+    # Память вето апрув-контура — один раз на прогон. План пересчитывается
+    # каждый такт с тем же ключом идемпотентности, и без этой памяти
+    # вчерашнее «нет» человека стиралось бы сегодняшней постановкой в
+    # очередь. Отказ чтения не роняет прогон: без памяти контур лишь
+    # переспросит то, что человек уже отклонял, — и это видно в отчёте.
+    try:
+        ctx["approval_vetoed"] = frozenset(approval_db.vetoed_keys())
+    except Exception as exc:  # noqa: BLE001
+        ctx["approval_vetoed"] = frozenset()
+        print(json.dumps({"verdict": "APPROVAL_MEMORY_UNAVAILABLE",
+                          "reason": f"{type(exc).__name__}: {exc}"[:200]},
+                         ensure_ascii=False, indent=2))
+
     # Уборка собственных строк репетиции: у них нет ни финального, ни живого
     # статуса, то есть ни один механизм журнала их не закрывает, — без срока
     # хранения они копятся вечно. За ними ничего не стоит: mutate в репетиции
@@ -2994,7 +3067,10 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
                 # одной отчётной строки движок записи лишнего запроса не шлёт.
                 "excluded": {
                     "accounts": agent_scope.excluded_client_logins(_clients_raw())},
-                "window": [cutoff, today], "failed_accounts": failed_accounts}
+                "window": [cutoff, today], "failed_accounts": failed_accounts,
+                # Очередь апрув-контура за прогон — в отчёт целиком: чёрный
+                # ящик обязан помнить, что агент спрашивал у человека.
+                "pending_approvals": ctx.get("pending_approvals") or []}
     saved = blackbox.save_run(
         run_id, stage="e1", mode=blackbox.run_mode(sandbox, dry_run),
         report=run_report,
@@ -3009,6 +3085,17 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     print(json.dumps({"verdict": "NOTIFY",
                       **notify.send(notify.e1_summary(run_report, dry_run))},
                      ensure_ascii=False, indent=2))
+    # Запрос апрува — ВТОРЫМ сообщением, а не строкой в сводке: сводка —
+    # новость, запрос — вопрос с кодами, на который человек отвечает
+    # реплаем в тот же чат. Уходит только когда очередь реально записана
+    # в журнал (не репетиция): просить «да» на то, чего воркер не найдёт,
+    # значит учить человека игнорировать запросы.
+    pending_rows = ctx.get("pending_approvals") or []
+    if pending_rows and journal_writes_allowed(sandbox, dry_run):
+        print(json.dumps({"verdict": "APPROVAL_REQUEST",
+                          "queued": len(pending_rows),
+                          **notify.send(approval.format_request(pending_rows))},
+                         ensure_ascii=False, indent=2))
 
     if failed_accounts:
         # Итоговая строка отдельно от кабинетных отчётов: иначе отказ первого
