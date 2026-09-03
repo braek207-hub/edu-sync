@@ -30,10 +30,12 @@ import json
 import os
 import sys
 import urllib.request
+from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
-from sync.agent import approval, approval_db, notify
+from sync.agent import approval, approval_db, build_queue, notify
 from sync.agent.writer import apply as writer_apply
+from sync.agent.writer import launch
 from sync.agent.writer import db as writer_db
 from sync.agent.writer.client import DirectWriteError, WriteClient, is_outcome_unknown
 
@@ -177,8 +179,45 @@ def run(dry_run: bool) -> Dict[str, Any]:
         outcome = apply_one(clients[login], row)
         approval_db.record_decision(key, str(row["action_id"]),
                                     approval_db.DECISION_APPROVED)
+        if (outcome.get("result") == "applied"
+                and str(row.get("action_kind")) == launch.RESUME_KIND):
+            outcome["order"] = _close_resumed_order(row)
         report["applied"].append({"code": code, **outcome})
     return report
+
+
+def _close_resumed_order(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Кампания включена по «да» → наряд закрывается датой первой открутки.
+
+    Без этого шага started_on не поставил бы никто: билдер отвечает про
+    сборку, а включает воркер. Дата заводит наблюдение vs_holdout
+    (build_queue.observation) — кампания попадает под замер с первого дня.
+    Отказ учёта не отменяет включения (кампания уже крутится) — он виден
+    полем в отчёте, и следующее «да» его не повторит: строка журнала уже
+    закрыта, а наряд можно закрыть руками (scripts/agent_build_queue.py).
+    """
+    payload = row.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = {}
+    order_id = str(payload.get("order_id") or "")
+    if not order_id:
+        return {"closed": False, "reason": "в payload нет order_id"}
+    try:
+        updated = build_queue.accept(
+            order_id, campaign_id=str(row.get("object_id") or ""),
+            started_on=date.today().isoformat(),
+            note="кампания включена по «да» человека в Telegram")
+    except Exception as exc:  # noqa: BLE001 — учёт не вправе отменить включение
+        return {"closed": False, "order_id": order_id,
+                "reason": f"{type(exc).__name__}: {exc}"[:200]}
+    if updated is None:
+        return {"closed": False, "order_id": order_id,
+                "reason": "наряд не найден"}
+    return {"closed": True, "order_id": order_id,
+            "experiment_id": updated.get("experiment_id")}
 
 
 def _summary(report: Dict[str, Any]) -> str:

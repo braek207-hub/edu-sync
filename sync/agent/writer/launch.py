@@ -46,6 +46,14 @@ from sync.agent.writer import exposure, expectation, negatives, switch
 
 LAUNCH_KIND = "campaign.create"
 
+# Включение собранной кампании — единственный вид действия, который никогда
+# не идёт общим планом: он рождается не расчётом, а фактом «билдер собрал»,
+# и едет ТОЛЬКО через апрув-контур (approval.py) — очередь pending_approval,
+# дверь которой открывает человек словом «да» в Telegram. В allow-лист записи
+# (guardrails.ALLOWED_ACTION_KINDS) вид не входит намеренно: попади он в
+# общий план любым генератором, рельсы обязаны его отклонить.
+RESUME_KIND = "campaign.resume"
+
 # Состояние, в котором кампания обязана появиться в кабинете.
 STATE_SUSPENDED = "SUSPENDED"
 
@@ -125,6 +133,67 @@ def build(order: Dict[str, Any]) -> Dict[str, Any]:
         "previous_state": {},
         "idempotency_key": _idempotency_key(checked["order_id"]),
     }
+
+
+def resume_action(order_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Строка собранного наряда → запрос на включение кампании. None — рано.
+
+    Решение Павла 03.09.2026 («давай переведём запуски»): между «билдер
+    собрал, кампания на паузе» и «кампания крутится» стоит человек, и до
+    этой функции его слово жило только в кабинете — собранная кампания
+    молча ждала, пока Павел сам её найдёт. Теперь агент спрашивает явно:
+    действие ложится в очередь апрува, человек отвечает «да <код>» в
+    Telegram, воркер включает.
+
+    None в трёх случаях, и все три — «включать нечего или уже»: наряд не
+    built, у него нет campaign_id (адреса объекта), или started_on уже
+    стоит (кампания включена — билдером ли, человеком ли в кабинете).
+
+    Риск действия — ноль: недельный лимит новой кампании равен измеренному
+    расходу доноров по этим же фразам (campaign_from_donors), деньги
+    переезжают, а не назначаются (build_queue.STAKE_SOURCE). Красная линия
+    пустая по той же причине, что у наряда: за кампанией следит наблюдение
+    vs_holdout (build_queue.observation), а не рельса красной линии.
+    """
+    if _text(order_row.get("status")) != "built":
+        return None
+    campaign_id = _text(order_row.get("campaign_id"))
+    if not campaign_id or order_row.get("started_on"):
+        return None
+    return {
+        "action_kind": RESUME_KIND,
+        "object_level": "campaign",
+        "object_id": campaign_id,
+        "account": _text(order_row.get("account")),
+        "lane": "launch",
+        "exposure": exposure.whole_object_exposure(
+            "включение собранной кампании: под трафик встаёт весь её лимит"),
+        "direct_type": "CAMPAIGN_STATE",
+        "key": "resume",
+        "payload": {
+            "CampaignId": int(campaign_id),
+            "CampaignName": _text(order_row.get("campaign_name")),
+            # Адрес наряда: по нему воркер после включения закрывает
+            # started_on (build_queue.accept) — иначе наблюдение за новой
+            # кампанией не заведётся никогда.
+            "order_id": _text(order_row.get("order_id")),
+        },
+        "previous_state": {"State": STATE_SUSPENDED},
+        "risk_rub": 0.0,
+        "red_line": {},
+        "idempotency_key": _resume_key(campaign_id),
+    }
+
+
+def _resume_key(campaign_id: str) -> str:
+    """Ключ включения — только campaign_id: решение о включении одно.
+
+    Отдельное пространство от ключа наряда (_idempotency_key) и от ключа
+    отката (_rollback_key): создание, включение и откат — три разных
+    решения с тремя строками журнала.
+    """
+    raw = f"launch-resume:{campaign_id}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 # ------------------------------------------------------------ связка такта

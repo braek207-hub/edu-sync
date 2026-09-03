@@ -144,3 +144,30 @@ def test_watchdog_summary_green_is_one_calm_line():
     text = notify.watchdog_summary(out)
     assert "ТРЕВОГА" not in text and "ПРОБЛЕМЫ" not in text
     assert "вредных не нашёл" in text and "На замере 5" in text
+
+
+def test_e1_summary_shows_the_launch_pipeline_and_proposals():
+    """Решение 03.09: невидимая половина работы агента — конвейер новых
+    кампаний и идеи-предложения — видна в каждой сводке."""
+    report = {"verdict": "GREEN",
+              "launch_queue": {"building": 2, "built_waiting": 1},
+              "proposal_open": 229,
+              "accounts": [{"account": "acc", "planned": 5,
+               "result": {"applied": 1, "failed": 0, "unknown_outcome": 0, "dry_run": 0},
+               "rejects": {}, "lanes": {"taken": {}}}]}
+    text = notify.e1_summary(report, dry_run=False)
+    assert "Новые кампании: 2 в сборке, 1 собрано" in text
+    assert "«да» на включение" in text
+    assert "Идей-предложений в копилке: 229" in text
+
+
+def test_e1_summary_is_silent_about_an_empty_launch_pipeline():
+    report = {"verdict": "GREEN",
+              "launch_queue": {"building": 0, "built_waiting": 0},
+              "proposal_open": 0,
+              "accounts": [{"account": "acc", "planned": 5,
+               "result": {"applied": 1, "failed": 0, "unknown_outcome": 0, "dry_run": 0},
+               "rejects": {}, "lanes": {"taken": {}}}]}
+    text = notify.e1_summary(report, dry_run=False)
+    assert "Новые кампании" not in text
+    assert "копилке" not in text

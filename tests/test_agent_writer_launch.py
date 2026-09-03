@@ -466,3 +466,59 @@ def test_the_criterion_of_the_consolidate_generator_is_a_valid_baseline():
     # окажись этой базы среди допустимых, наряд из его же идеи не собрался
     # бы — а тесты обеих сторон остались бы зелёными на выдуманном входе.
     assert "vs_donors" in build_order.COMPARISONS
+
+
+# ------------------------------------------------- включение через апрув
+
+
+def _built_row(**over):
+    row = {"status": "built", "campaign_id": "987654",
+           "started_on": None, "account": "acc-edu",
+           "campaign_name": "EDU_CONS_MSK", "order_id": "ord-1"}
+    row.update(over)
+    return row
+
+
+def test_resume_action_from_a_built_order():
+    action = launch.resume_action(_built_row())
+    assert action["action_kind"] == launch.RESUME_KIND
+    assert action["object_id"] == "987654"
+    assert action["account"] == "acc-edu"
+    assert action["payload"]["CampaignId"] == 987654
+    assert action["payload"]["order_id"] == "ord-1"
+    assert action["previous_state"] == {"State": launch.STATE_SUSPENDED}
+    # Риском не платит и красной линии не несёт: деньги — переезд донорских,
+    # наблюдение — vs_holdout наряда, не рельса.
+    assert action["risk_rub"] == 0.0
+    assert action["red_line"] == {}
+
+
+def test_resume_action_key_depends_only_on_campaign():
+    a = launch.resume_action(_built_row())
+    b = launch.resume_action(_built_row(campaign_name="другое имя",
+                                        order_id="ord-2"))
+    assert a["idempotency_key"] == b["idempotency_key"]
+    assert a["idempotency_key"] != launch._rollback_key("suspend", "987654")
+
+
+def test_resume_action_refuses_orders_that_are_not_ready():
+    # Не built, без адреса, уже включена — во всех трёх включать нечего.
+    assert launch.resume_action(_built_row(status="queued")) is None
+    assert launch.resume_action(_built_row(campaign_id="")) is None
+    assert launch.resume_action(_built_row(started_on="2026-09-03")) is None
+
+
+def test_resume_action_travels_to_the_api_as_campaigns_resume():
+    action = launch.resume_action(_built_row())
+    service, method, params = apply.to_api_call(action)
+    assert (service, method) == ("campaigns", "resume")
+    assert params == {"SelectionCriteria": {"Ids": [987654]}}
+    # Ответ resume разбираем по элементам — метод обязан быть известен
+    # разборщику, иначе исход уехал бы в stale.
+    assert apply._RESULT_COLLECTION.get("resume") == "ResumeResults"
+
+
+def test_resume_kind_is_not_writable_from_the_general_plan():
+    # Включение едет ТОЛЬКО через апрув-контур: общий план его отклоняет.
+    ok, reason = guardrails.check_action(launch.resume_action(_built_row()))
+    assert ok is False

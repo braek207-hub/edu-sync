@@ -323,7 +323,10 @@ def test_ideas_are_asked_for_this_cabinet_only(monkeypatch, capsys):
     assert agent_e1.main() == 0
     capsys.readouterr()
 
-    assert asked == ["acc-1"]
+    # Кабинетный цикл спрашивает СВОЙ кабинет; хвостовой вызов без фильтра —
+    # прогонная сводка (счёт идей-предложений для Telegram, 03.09.2026), она
+    # ничего не применяет и в кабинеты не едет.
+    assert asked == ["acc-1", None]
 
 
 # ------------------------------------------------ чтение открытых идей

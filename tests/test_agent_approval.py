@@ -163,3 +163,76 @@ class TestRoundTrip:
         decisions = approval.parse_decisions(["да 3fa2b1", "нет 8c41d0"])
         verdicts = approval.resolve_decisions(decisions, codes)
         assert verdicts == {"3fa2b1": True, "8c41d0": False}
+
+
+class TestResumeGist:
+    def test_resume_names_the_campaign_and_says_it_is_paused(self):
+        row = {"action_id": "abc123deadbeef", "object_id": "987654",
+               "account": "acc-edu", "action_kind": "campaign.resume",
+               "payload": {"CampaignId": 987654,
+                           "CampaignName": "EDU_CONS_MSK",
+                           "order_id": "ord-1"},
+               "risk_rub": 0.0}
+        text = approval.format_request([row])
+        assert "ВКЛЮЧИТЬ" in text
+        assert "EDU_CONS_MSK" in text
+        assert "на паузе" in text
+        # Риска нет — рублей в строке быть не должно.
+        assert "риск" not in text
+
+
+class TestCloseResumedOrder:
+    """Учёт включения: «да» на campaign.resume закрывает наряд датой."""
+
+    def _row(self, payload):
+        return {"action_id": "a" * 24, "object_id": "987654",
+                "action_kind": "campaign.resume", "payload": payload}
+
+    def test_applied_resume_accepts_the_order_with_todays_date(self, monkeypatch):
+        from sync import agent_approver
+
+        calls = {}
+
+        def _accept(order_id, campaign_id, started_on, note):
+            calls.update(order_id=order_id, campaign_id=campaign_id,
+                         started_on=started_on)
+            return {"order_id": order_id, "experiment_id": "exp-1"}
+
+        monkeypatch.setattr(agent_approver.build_queue, "accept", _accept)
+        out = agent_approver._close_resumed_order(
+            self._row({"order_id": "ord-1", "CampaignId": 987654}))
+        assert out["closed"] is True
+        assert out["experiment_id"] == "exp-1"
+        assert calls["order_id"] == "ord-1"
+        assert calls["campaign_id"] == "987654"
+        assert calls["started_on"]  # сегодняшняя дата, не пусто
+
+    def test_payload_arrives_as_json_text_from_the_journal(self, monkeypatch):
+        # Колонка payload — jsonb; часть драйверов отдаёт её строкой.
+        from sync import agent_approver
+
+        monkeypatch.setattr(
+            agent_approver.build_queue, "accept",
+            lambda order_id, **k: {"order_id": order_id})
+        out = agent_approver._close_resumed_order(
+            self._row('{"order_id": "ord-2", "CampaignId": 1}'))
+        assert out["closed"] is True
+
+    def test_accounting_failure_does_not_hide_the_resume(self, monkeypatch):
+        # Кампания уже включена — отказ учёта виден полем, не исключением.
+        from sync import agent_approver
+
+        def _boom(*a, **k):
+            raise RuntimeError("база недоступна")
+
+        monkeypatch.setattr(agent_approver.build_queue, "accept", _boom)
+        out = agent_approver._close_resumed_order(self._row({"order_id": "x"}))
+        assert out["closed"] is False
+        assert "RuntimeError" in out["reason"]
+
+    def test_missing_order_id_is_named_not_swallowed(self, monkeypatch):
+        from sync import agent_approver
+
+        out = agent_approver._close_resumed_order(self._row({}))
+        assert out["closed"] is False
+        assert "order_id" in out["reason"]

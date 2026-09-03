@@ -94,8 +94,25 @@ def e1_summary(report: Dict[str, Any], dry_run: bool) -> str:
     if held:
         lines.append(f"Ещё {held} отложил из-за внутренних лимитов риска — "
                      "норма, вернётся к ним в следующие дни.")
+    # Конвейер новых кампаний — раньше он жил молча: наряд билдеру, сборка,
+    # кампания на паузе. Решение Павла 03.09.2026: половина работы агента
+    # была невидима — теперь состояние конвейера в каждой сводке.
+    queue = report.get("launch_queue") or {}
+    building = int(queue.get("building") or 0)
+    waiting = int(queue.get("built_waiting") or 0)
+    if building or waiting:
+        parts = []
+        if building:
+            parts.append(f"{building} в сборке")
+        if waiting:
+            parts.append(f"{waiting} собрано, жду твоего «да» на включение")
+        lines.append("Новые кампании: " + ", ".join(parts) + ".")
     lines.append(f"Прошу апрув: {pending} — отвечай на следующее сообщение."
                  if pending else "Крупных действий не предлагаю.")
+    proposals = report.get("proposal_open")
+    if proposals:
+        lines.append(f"Идей-предложений в копилке: {proposals} — это находки "
+                     "без рычага у агента, разберём на недельном разборе.")
     if rejected and not dry_run:
         lines.append(f"Кабинет отверг {rejected} — разберёт разбор недели.")
     if trouble:

@@ -105,6 +105,10 @@ def _payload_gist(action: Dict[str, Any]) -> str:
     payload = action.get("payload") or {}
     if kind == "campaign.suspend":
         return "пауза кампании"
+    if kind == "campaign.resume":
+        name = str(payload.get("CampaignName") or "").strip()
+        tail = f" «{name}»" if name else ""
+        return f"ВКЛЮЧИТЬ новую кампанию{tail} — собрана, стоит на паузе"
     if kind in ("budget.set", "budget.set_daily", "tcpa.set"):
         strategy = payload.get("BiddingStrategy") or {}
         amounts = _strategy_amounts(strategy)

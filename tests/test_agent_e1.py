@@ -97,6 +97,10 @@ def _patch_infra(monkeypatch, cooled=None, final_keys=(), lease=None, exhausted=
     # проверки. Без подмены прогон уходит в живую базу и печатает ретраи
     # коннекта в тот же stdout, который тесты разбирают как JSON.
     monkeypatch.setattr(agent_e1.approval_db, "vetoed_keys", lambda *a, **k: [])
+    # Очередь нарядов билдеру: _run_all читает её после кабинетов (включение
+    # собранных кампаний через апрув + строка конвейера в сводке). Пусто =
+    # нарядов нет. Без подмены — живая база и ретраи в разбираемом stdout.
+    monkeypatch.setattr(agent_e1.build_queue, "by_status", lambda *a, **k: [])
     # Послужной список полос: прогон читает его первым делом, чтобы выдать
     # каждой полосе ступень (lane_steps_of). Пусто = ни одного закрытого
     # наблюдения, то есть все полосы на своём полу — поведение, на которое
@@ -3232,3 +3236,66 @@ def test_computed_age_limit_is_two_days():
     # Замер 27–28.08: крон опаздывает на 6–12 ч, Э0 пропускается целиком.
     # Расчёт трёхдневной давности — уже не сегодняшний кабинет.
     assert agent_e1.MAX_COMPUTED_AGE_DAYS == 2
+
+
+# ---------------------------------------- включение собранных кампаний
+
+
+class TestQueueResumeApprovals:
+    def _built(self, campaign_id="987654", **over):
+        row = {"status": "built", "campaign_id": campaign_id,
+               "started_on": None, "account": "acc-edu",
+               "campaign_name": "EDU_CONS_MSK", "order_id": "ord-1"}
+        row.update(over)
+        return row
+
+    def test_built_orders_join_the_approval_queue(self, monkeypatch):
+        written = []
+        monkeypatch.setattr(agent_e1.build_queue, "by_status",
+                            lambda statuses: [self._built()])
+        monkeypatch.setattr(agent_e1.writer_db, "final_status_keys",
+                            lambda keys: set())
+        monkeypatch.setattr(
+            agent_e1.writer_db, "insert_action",
+            lambda action, status: written.append((action, status)) or "id-1")
+        ctx = {"approval_vetoed": frozenset()}
+        out = agent_e1.queue_resume_approvals(ctx, journal_ok=True)
+        assert out["built_waiting"] == 1 and out["queued"] == 1
+        assert written[0][1] == agent_e1.approval.PENDING_STATUS
+        assert written[0][0]["action_kind"] == "campaign.resume"
+        rows = ctx["pending_approvals"]
+        assert len(rows) == 1 and rows[0]["object_id"] == "987654"
+
+    def test_veto_memory_and_closed_keys_are_respected(self, monkeypatch):
+        from sync.agent.writer import launch as launch_mod
+
+        a, b, c = (self._built("111"), self._built("222"), self._built("333"))
+        monkeypatch.setattr(agent_e1.build_queue, "by_status",
+                            lambda statuses: [a, b, c])
+        vetoed_key = launch_mod.resume_action(a)["idempotency_key"]
+        closed_key = launch_mod.resume_action(b)["idempotency_key"]
+        monkeypatch.setattr(agent_e1.writer_db, "final_status_keys",
+                            lambda keys: {closed_key})
+        written = []
+        monkeypatch.setattr(
+            agent_e1.writer_db, "insert_action",
+            lambda action, status: written.append(action) or "id")
+        ctx = {"approval_vetoed": frozenset({vetoed_key})}
+        out = agent_e1.queue_resume_approvals(ctx, journal_ok=True)
+        assert out == {"built_waiting": 3, "queued": 1,
+                       "vetoed": 1, "closed": 1}
+        assert [w["object_id"] for w in written] == ["333"]
+
+    def test_rehearsal_does_not_touch_the_journal(self, monkeypatch):
+        monkeypatch.setattr(agent_e1.build_queue, "by_status",
+                            lambda statuses: [self._built()])
+        monkeypatch.setattr(agent_e1.writer_db, "final_status_keys",
+                            lambda keys: set())
+        monkeypatch.setattr(
+            agent_e1.writer_db, "insert_action",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("журнал")))
+        ctx = {"approval_vetoed": frozenset()}
+        out = agent_e1.queue_resume_approvals(ctx, journal_ok=False)
+        # Репетиция: очередь посчитана, но в журнал и в TG-очередь не едет.
+        assert out["queued"] == 1
+        assert "pending_approvals" not in ctx

@@ -295,6 +295,15 @@ def to_api_call(action: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
             "SelectionCriteria": {"Ids": [int(payload["CampaignId"])]}
         }
 
+    if kind == "campaign.resume":
+        # Включение собранной билдером кампании. Вид не входит в allow-лист
+        # записи и общим планом не едет никогда — только через апрув-контур
+        # (writer/launch.resume_action): строку в pending_approval кладёт Э1,
+        # применяет воркер после «да» человека в Telegram.
+        return "campaigns", "resume", {
+            "SelectionCriteria": {"Ids": [int(payload["CampaignId"])]}
+        }
+
     if kind == "schedule.set":
         # Расписание применяется ЦЕЛИКОМ и через саму кампанию: у Директа нет
         # способа поменять один час. Тело собрано планом (writer/schedule.py),

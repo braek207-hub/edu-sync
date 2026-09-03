@@ -55,6 +55,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent import approval
 from sync.agent import approval_db
+from sync.agent import build_queue
 from sync.agent import config as agent_config
 from sync.agent import db as agent_db
 from sync.agent import scope as agent_scope
@@ -933,6 +934,53 @@ def record_pending_approvals(actions: List[Dict[str, Any]],
         except Exception:  # noqa: BLE001 — одна строка не отменяет остальные
             continue
     return {"count": len(actions), "written": written, "rows": rows}
+
+
+def queue_resume_approvals(ctx: Dict[str, Any],
+                           journal_ok: bool) -> Dict[str, Any]:
+    """Собранные наряды, ждущие включения, → очередь апрув-контура.
+
+    Решение Павла 03.09.2026 («давай переведём запуски»). Запуск кампании —
+    три решения: создать (наряд, ставит Э0), собрать (билдер, кампания на
+    паузе), включить. Первые два уже работают; третье до этой функции жило
+    молча — кампания стояла на паузе, пока человек сам не найдёт её в
+    кабинете. Теперь Э1 спрашивает явно: campaign.resume ложится в
+    pending_approval и уходит кодом в общий APPROVAL_REQUEST, применяет
+    воркер после «да».
+
+    Мимо полос и рельс риска намеренно: действие не рождается расчётом
+    этого дня — оно следствие уже одобренного наряда, чей риск оплачен
+    переездом донорских денег (build_queue.STAKE_SOURCE), а наблюдение
+    ведёт vs_holdout. Вето человека и уже закрытые ключи фильтруются той же
+    памятью, что у остального контура: «нет» не переспрашивается 14 дней,
+    включённая кампания не предлагается второй раз.
+    """
+    out = {"built_waiting": 0, "queued": 0, "vetoed": 0, "closed": 0}
+    rows = build_queue.by_status([build_queue.STATUS_BUILT])
+    actions = []
+    for row in rows:
+        action = launch.resume_action(row)
+        if action is not None:
+            actions.append(action)
+    out["built_waiting"] = len(actions)
+    if not actions:
+        return out
+
+    vetoed = ctx.get("approval_vetoed") or frozenset()
+    fresh = [a for a in actions if a["idempotency_key"] not in vetoed]
+    out["vetoed"] = len(actions) - len(fresh)
+
+    already = writer_db.final_status_keys(a["idempotency_key"] for a in fresh)
+    fresh = [a for a in fresh if a["idempotency_key"] not in already]
+    out["closed"] = out["built_waiting"] - out["vetoed"] - len(fresh)
+    if not fresh:
+        return out
+
+    pending = record_pending_approvals(fresh, journal_ok=journal_ok)
+    out["queued"] = pending["count"]
+    if pending["written"]:
+        ctx.setdefault("pending_approvals", []).extend(pending["rows"])
+    return out
 
 
 def lane_shortfalls(taken: List[Dict[str, Any]], refused: List[Dict[str, Any]],
@@ -3055,7 +3103,34 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
         "blind_spend": blind,
     }, ensure_ascii=False, indent=2))
 
+    # Запуски: собранные билдером кампании стоят на паузе и до этого шага
+    # ждали человека молча. Здесь их включение встаёт в очередь апрува — код
+    # уйдёт тем же APPROVAL_REQUEST ниже. Плюс состояние конвейера нарядов
+    # целиком (в сборке / собрано) — в отчёт и сводку: половина работы агента
+    # была невидима именно отсюда. Отказ очереди нарядов прогон не роняет.
+    try:
+        launch_queue = queue_resume_approvals(
+            ctx, journal_ok=journal_writes_allowed(sandbox, dry_run))
+        open_orders = build_queue.by_status(build_queue.OPEN_STATUSES)
+        launch_queue["building"] = len(open_orders)
+    except Exception as exc:  # noqa: BLE001
+        launch_queue = {"unavailable": f"{type(exc).__name__}: {exc}"[:200]}
+    print(json.dumps({"verdict": "LAUNCH_QUEUE", **launch_queue},
+                     ensure_ascii=False, indent=2))
+
+    # Идеи-предложения (класс 3, рычага нет по определению) копятся в
+    # реестре и до этой строки жили только в чёрном ящике. Счёт — в отчёт и
+    # сводку: «в тени» перестаёт быть невидимым. Отказ чтения не роняет.
+    try:
+        proposal_open = sum(
+            1 for idea in ideas_registry.open_ideas()
+            if ideas_registry.idea_tier(idea) == tier_mod.TIER_PROPOSAL)
+    except Exception:  # noqa: BLE001
+        proposal_open = None
+
     run_report = {"verdict": run_verdict(account_reports),
+                "launch_queue": launch_queue,
+                "proposal_open": proposal_open,
                 # Ступени полос — в отчёт ПРОГОНА, а не кабинета: свободу
                 # зарабатывает полоса на всей своей истории, одна на все
                 # кабинеты. Без этой строки экран агента (задача 27) видит
