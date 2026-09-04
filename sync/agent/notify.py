@@ -116,8 +116,16 @@ def e1_summary(report: Dict[str, Any], dry_run: bool) -> str:
         if waiting:
             parts.append(f"{waiting} собрано, жду твоего «да» на включение")
         lines.append("Новые кампании: " + ", ".join(parts) + ".")
-    lines.append(f"Прошу апрув: {pending} — отвечай на следующее сообщение."
-                 if pending else "Крупных действий не предлагаю.")
+    if pending:
+        # Цена вопроса рядом с числом: «прошу апрув: 3» не говорит, три это
+        # мелочь или треть недельного риск-бюджета. risk_rub кладёт в строки
+        # тот же record_pending_approvals, что и печатает запрос апрува.
+        risk = sum(float(row.get("risk_rub") or 0.0)
+                   for row in (report.get("pending_approvals") or []))
+        cost = f" на {_money(risk)} риска" if risk else ""
+        lines.append(f"Прошу апрув: {pending}{cost} — жми кнопки под запросом.")
+    else:
+        lines.append("Крупных действий не предлагаю.")
     proposals = report.get("proposal_open")
     if proposals:
         lines.append(f"Идей-предложений в копилке: {proposals} — это находки "
@@ -190,4 +198,127 @@ def watchdog_summary(out: Dict[str, Any]) -> str:
     if review:
         lines.append(f"К разбору недели: {review}.")
     lines.append(f"На замере {watch}.")
+    return "\n".join(lines)
+
+
+def _money(rub: float) -> str:
+    """Рубли для человека: тысячные разряды узкими пробелами, копейки прочь.
+
+    Копейка в сводке недели — шум: суммы идут десятками тысяч, а лишние два
+    знака мешают увидеть порядок величины с одного взгляда.
+    """
+    return f"{round(float(rub or 0.0)):,}".replace(",", "\u00a0") + "\u00a0₽"
+
+
+# Веса находок разбора, которые попадают в сводку человеку. low не попадает
+# намеренно: его место в логе прогона. Сводка, где перечислено всё, читается
+# как «ничего важного» ровно так же, как пустая.
+REVIEW_SEVERITIES = ("high", "medium")
+
+# Сколько находок называется поимённо. Остальные сворачиваются в счётчик:
+# двадцать строк подряд человек не читает, а список из трёх с хвостом
+# «и ещё 17» честно показывает и главное, и объём.
+REVIEW_FINDINGS_SHOWN = 3
+
+
+def review_summary(result: Dict[str, Any],
+                   value: Any = None,
+                   actions_now: Any = None,
+                   actions_prev: Any = None,
+                   days: int = 7) -> str:
+    """Сводка недельного разбора — то же, что печатает agent_review, словами.
+
+    Три вопроса недели: сколько агент сделал (и больше или меньше прошлой
+    недели), во что это встало и что принесло, обо что он бьётся.
+
+    Про деньги здесь действует правило sync/agent/value.py: НЕИЗМЕРЕННОЕ НЕ
+    РАВНО НУЛЮ. Поэтому рядом с суммой всегда едет доля неизмеренного, а при
+    нуле измеренных наблюдений сумма не печатается вовсе — «0 ₽» человек
+    прочтёт как «агент не принёс ничего», а замер такого не утверждал.
+
+    value/actions_* необязательны: отчёт Э0 за неделю может не найтись
+    (стадия молчала — это само по себе находка разбора), и сводка обязана
+    уйти всё равно.
+    """
+    findings = [f for f in (result.get("findings") or [])
+                if f.get("severity") in REVIEW_SEVERITIES]
+    lines = [f"Разбор недели ({days} дн.)"]
+
+    now = dict(actions_now or {})
+    prev = dict(actions_prev or {})
+    applied_now = int(now.get("applied") or 0)
+    if now:
+        applied_prev = int(prev.get("applied") or 0)
+        delta = applied_now - applied_prev
+        trend = ("столько же, сколько неделей раньше" if delta == 0
+                 else f"{'+' if delta > 0 else ''}{delta} к прошлой неделе")
+        line = f"Применено: {applied_now} действий ({trend})."
+        risk = float(now.get("risk_rub") or 0.0)
+        if risk:
+            line += f" Под риском {_money(risk)}."
+        lines.append(line)
+        waiting = int(now.get("pending_approval") or 0)
+        rejected = int(now.get("rejected") or 0)
+        rolled = int(now.get("rolled_back") or 0)
+        tail = []
+        if waiting:
+            tail.append(f"ждут твоего слова {waiting}")
+        if rejected:
+            tail.append(f"отклонено тобой {rejected}")
+        if rolled:
+            tail.append(f"откачено сторожем {rolled}")
+        if tail:
+            lines.append("Из очереди: " + ", ".join(tail) + ".")
+
+    if value:
+        measured = (int(value.get("n_tacts_measured") or 0)
+                    + int(value.get("n_actions_measured") or 0))
+        if measured:
+            share = float(value.get("unmeasured_share") or 0.0)
+            parts = []
+            saved = float(value.get("saved_rub") or 0.0)
+            if saved:
+                interval = value.get("did_interval_rub")
+                span = (f" (от {_money(interval[0])} до {_money(interval[1])})"
+                        if interval else "")
+                # Интервал, накрывающий ноль, — это «утверждать нечего», а не
+                # «сэкономил столько-то с погрешностью»: слово «сэкономил»
+                # рядом с таким интервалом присваивает агенту деньги, которых
+                # замер ему не отдал (то же правило, что и у вердикта
+                # inconclusive в tact_effect).
+                crosses_zero = bool(interval) and interval[0] <= 0 <= interval[1]
+                parts.append(f"экономия не отличима от нуля: оценка "
+                             f"{_money(saved)}{span}" if crosses_zero
+                             else f"сэкономил {_money(saved)}{span}")
+            earned = float(value.get("earned_rub") or 0.0)
+            if earned:
+                parts.append(f"принёс {_money(earned)}")
+            cut = float(value.get("cut_rub") or 0.0)
+            if cut:
+                parts.append(f"вырезал впустую {_money(abs(cut))}")
+            if parts:
+                lines.append("Деньги: " + ", ".join(parts) + ". "
+                             f"Измерено {measured} наблюдений, "
+                             f"не измерено {round(share * 100)} % — "
+                             "это не ноль, а неизвестность.")
+        else:
+            lines.append("Деньги: за неделю не измерено ни одного наблюдения "
+                         "— утверждать нечего.")
+
+    if not findings:
+        lines.append("Проблем разбор не нашёл.")
+        return "\n".join(lines)
+
+    high = sum(1 for f in findings if f.get("severity") == "high")
+    lines.append(f"Проблем: {len(findings)}"
+                 + (f", из них срочных {high}." if high else "."))
+    for finding in findings[:REVIEW_FINDINGS_SHOWN]:
+        mark = "СРОЧНО: " if finding.get("severity") == "high" else ""
+        subject = str(finding.get("subject") or "").strip()
+        detail = str(finding.get("detail") or "").strip()
+        text = f"{subject} — {detail}" if subject and detail else (subject or detail)
+        lines.append(f"· {mark}{text[:220]}")
+    if len(findings) > REVIEW_FINDINGS_SHOWN:
+        lines.append(f"…и ещё {len(findings) - REVIEW_FINDINGS_SHOWN} — "
+                     "полный список в логе разбора.")
     return "\n".join(lines)

@@ -11,6 +11,10 @@ on:
         description: "Период разбора в днях"
         required: false
         default: "7"
+      notify:
+        description: "Прислать сводку в Telegram (true/false)"
+        required: false
+        default: "false"
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -26,12 +30,16 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           # Ни DIRECT_TOKEN, ни клиентов: разбор не ходит в кабинет вовсе,
           # он читает уже собранный чёрный ящик.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           # --fail-on-high по расписанию: находки веса high (молчащая
           # стадия, изменение, которого нет в кабинете) обязаны приходить
           # письмом о красном ране. Находки полегче ждут в отчёте.
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            python -m sync.agent_review --fail-on-high
+            python -m sync.agent_review --fail-on-high --notify
           else
-            python -m sync.agent_review --days=${{ github.event.inputs.days || '7' }}
+            NOTIFY=""
+            if [ "${{ github.event.inputs.notify }}" = "true" ]; then NOTIFY="--notify"; fi
+            python -m sync.agent_review --days=${{ github.event.inputs.days || '7' }} $NOTIFY
           fi

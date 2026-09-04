@@ -171,3 +171,112 @@ def test_e1_summary_is_silent_about_an_empty_launch_pipeline():
     text = notify.e1_summary(report, dry_run=False)
     assert "Новые кампании" not in text
     assert "копилке" not in text
+
+
+# ── Сводка недельного разбора ────────────────────────────────────────────────
+#
+# Главная проверка здесь не форматирование, а правило sync/agent/value.py:
+# НЕИЗМЕРЕННОЕ НЕ РАВНО НУЛЮ. Сводка, печатающая «0 ₽» там, где замер сказал
+# «утверждать нечего», врёт владельцу ровно в ту сторону, в которую он и
+# боится ошибиться.
+
+GREEN = {"findings": [], "by_severity": {"high": 0, "medium": 0, "low": 0}}
+
+
+def test_review_green_says_so():
+    text = notify.review_summary(GREEN)
+    assert "Разбор недели" in text
+    assert "Проблем разбор не нашёл." in text
+
+
+def test_review_unmeasured_is_not_zero_rubles():
+    value = {"saved_rub": 0.0, "earned_rub": 0.0, "cut_rub": 0.0,
+             "n_tacts": 3, "n_tacts_measured": 0,
+             "n_actions": 40, "n_actions_measured": 0,
+             "unmeasured_share": 1.0, "did_interval_rub": None}
+    text = notify.review_summary(GREEN, value)
+    assert "не измерено ни одного наблюдения" in text
+    assert "0 ₽" not in text
+
+
+def test_review_money_carries_interval_and_unmeasured_share():
+    value = {"saved_rub": 42400.0, "did_interval_rub": [8000.0, 90000.0],
+             "earned_rub": 12000.0, "cut_rub": -3000.0,
+             "n_tacts": 2, "n_tacts_measured": 1,
+             "n_actions": 30, "n_actions_measured": 9,
+             "unmeasured_share": 0.6875}
+    text = notify.review_summary(GREEN, value)
+    assert "сэкономил" in text and "42" in text
+    # Интервал обязан быть виден: одна сумма без него читается как точное знание.
+    assert "от" in text and "до" in text
+    assert "69 %" in text and "не ноль" in text
+
+
+def test_review_trend_against_previous_week():
+    now = {"applied": 12, "risk_rub": 40000, "pending_approval": 2,
+           "rejected": 1, "rolled_back": 0}
+    prev = {"applied": 20, "risk_rub": 10000}
+    text = notify.review_summary(GREEN, None, now, prev)
+    assert "Применено: 12" in text
+    assert "-8 к прошлой неделе" in text
+    assert "ждут твоего слова 2" in text and "отклонено тобой 1" in text
+    # Ноль откатов не печатается: строка «откачено 0» шумит, а не сообщает.
+    assert "откачено" not in text
+
+
+def test_review_same_as_last_week_is_said_in_words():
+    text = notify.review_summary(GREEN, None, {"applied": 7}, {"applied": 7})
+    assert "столько же" in text
+
+
+def test_review_shows_top_findings_and_counts_the_rest():
+    findings = [{"code": f"C{i}", "severity": "high" if i == 0 else "medium",
+                 "subject": f"кампания {i}", "detail": "стена"} for i in range(6)]
+    text = notify.review_summary({"findings": findings}, None)
+    assert "Проблем: 6, из них срочных 1." in text
+    assert "СРОЧНО: кампания 0 — стена" in text
+    assert "и ещё 3" in text
+
+
+def test_review_drops_low_severity():
+    # Вес low живёт в логе прогона: сводка, где перечислено всё, читается как
+    # «ничего важного» ровно так же, как пустая.
+    findings = [{"code": "C", "severity": "low", "subject": "s", "detail": "d"}]
+    text = notify.review_summary({"findings": findings})
+    assert "Проблем разбор не нашёл." in text
+
+
+def test_e1_summary_names_the_price_of_approval():
+    report = {"accounts": [{"result": {"applied": 3}}],
+              "pending_approvals": [{"risk_rub": 7800.0}, {"risk_rub": 7600.0}]}
+    text = notify.e1_summary(report, dry_run=False)
+    assert "Прошу апрув: 2" in text
+    assert "15" in text and "₽ риска" in text
+
+
+def test_e1_summary_without_risk_stays_readable():
+    report = {"accounts": [{"result": {"applied": 1}}],
+              "pending_approvals": [{}]}
+    text = notify.e1_summary(report, dry_run=False)
+    assert "Прошу апрув: 1" in text and "риска" not in text
+
+
+def test_review_interval_crossing_zero_is_not_called_saving():
+    # Интервал по обе стороны нуля — «утверждать нечего». Слово «сэкономил»
+    # рядом с ним присвоило бы агенту деньги, которых замер ему не отдал.
+    value = {"saved_rub": 42400.0, "did_interval_rub": [-5000.0, 90000.0],
+             "earned_rub": 0.0, "cut_rub": 0.0,
+             "n_tacts": 2, "n_tacts_measured": 1,
+             "n_actions": 0, "n_actions_measured": 0, "unmeasured_share": 0.5}
+    text = notify.review_summary(GREEN, value)
+    assert "сэкономил" not in text
+    assert "не отличима от нуля" in text
+
+
+def test_review_interval_fully_positive_is_a_saving():
+    value = {"saved_rub": 42400.0, "did_interval_rub": [8000.0, 90000.0],
+             "earned_rub": 0.0, "cut_rub": 0.0,
+             "n_tacts": 2, "n_tacts_measured": 2,
+             "n_actions": 0, "n_actions_measured": 0, "unmeasured_share": 0.0}
+    text = notify.review_summary(GREEN, value)
+    assert "сэкономил" in text
