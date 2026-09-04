@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """GCC-отчёт: агрегация web по срезам (GCC+страны) и построение строки широкого формата."""
 from sync.lime_gcc_report import (
-    _CODES, _GCC, _apply_app_total, _date_label, _header, _row_values, _scope_cols,
-    _split_app_by_logs, aggregate_orders_linear, fetch_web,
+    _CODES, _GCC, _apply_app_total, _date_label, _ga4_row, _header, _row_values, _scope_cols,
+    _split_app_by_logs, aggregate_orders_linear, fetch_metrika_web, fetch_web,
 )
 
 
@@ -216,3 +216,28 @@ def test_aggregate_orders_lpc_whole_order_to_paid_or_org():
     assert out["2026-07-01"]["KSA"] == {"web_org": 0, "web_paid": 0, "app_org": 0, "app_paid": 1}
     # тотал заказов сходится: сумма всех полей GCC = 4
     assert sum(g.values()) == 4
+
+
+def test_fetch_metrika_web_sums_five_countries():
+    rows = [
+        # date, country, traffic_type, users
+        ("2026-08-14", "ОАЭ", "Платный", 1800),
+        ("2026-08-14", "ОАЭ", "Бесплатный", 900),
+        ("2026-08-14", "Саудовская Аравия", "Платный", 300),
+        ("2026-08-14", "Бахрейн", "Платный", 55),   # не из пяти → мимо GCC-тотала
+    ]
+    d = fetch_metrika_web(FakeConn(rows), ["2026-08-14"])["2026-08-14"]
+    assert d[_GCC] == {"org": 900, "paid": 2100}
+    assert d["UAE"] == {"org": 900, "paid": 1800}
+    assert d["KSA"] == {"org": 0, "paid": 300}
+    # GCC = сумма пяти стран (в пайплайне Метрики строк без страны нет)
+    assert d[_GCC]["paid"] == sum(d[c]["paid"] for c in _CODES)
+
+
+def test_metrika_tab_row_matches_ga4_tab_shape():
+    """Вкладка Метрики пишется формой GA4-вкладки — иначе формулы сверки не найдут колонки."""
+    rows = [("2026-08-14", "ОАЭ", "Платный", 10), ("2026-08-14", "ОАЭ", "Бесплатный", 5)]
+    day = fetch_metrika_web(FakeConn(rows), ["2026-08-14"])["2026-08-14"]
+    r = _ga4_row("2026-08-14", day)
+    assert r["Total"] == 15 and r["ORG Total"] == 5 and r["PAID Total"] == 10
+    assert r["Total UAE"] == 15

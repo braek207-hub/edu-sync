@@ -37,7 +37,7 @@ COUNTER_ID = int(os.environ.get("GCC_METRICA_COUNTER_ID") or "98232701")
 SYNC_DAYS = int(os.environ.get("LIME_GCC_COUNTERS_DAYS") or "7")
 
 COLUMNS = (
-    "date", "source", "country", "channel", "subchannel",
+    "date", "source", "country", "channel", "subchannel", "traffic_type",
     "campaign_id", "campaign_name", "visits", "users", "orders", "revenue",
 )
 DELETE_SQL = "DELETE FROM lime_gcc_counter_daily WHERE date >= %s AND date <= %s"
@@ -65,9 +65,9 @@ def metrika_rows(frm: str, to: str) -> list[tuple]:
     for r in raw:
         if not r.get("country"):
             continue
-        channel, subchannel, _ = map_metrika_channel(
+        channel, subchannel, traffic_type = map_metrika_channel(
             r.get("traffic_source"), r.get("source_engine"), r.get("utm_source"))
-        key = (r["date"], "metrika", r["country"], channel, subchannel,
+        key = (r["date"], "metrika", r["country"], channel, subchannel, traffic_type,
                _clean(r.get("campaign")), "")
         cur = agg.setdefault(key, [0.0, 0.0])
         cur[0] += float(r.get("visits") or 0)
@@ -93,9 +93,10 @@ def ga4_order_rows(frm: str, to: str) -> list[tuple]:
         revenue = float(r["metrics"][1] or 0)
         if orders <= 0 and revenue <= 0:
             continue
-        channel, subchannel, _ = map_ga4_channel(_clean(src), _clean(med))
+        channel, subchannel, traffic_type = map_ga4_channel(_clean(src), _clean(med))
         iso = f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 and d.isdigit() else d
-        key = (iso, "ga4", country, channel, subchannel, _clean(cid), _clean(cname))
+        key = (iso, "ga4", country, channel, subchannel, traffic_type,
+               _clean(cid), _clean(cname))
         cur = agg.setdefault(key, [0.0, 0.0])
         cur[0] += orders
         cur[1] += revenue
@@ -113,8 +114,8 @@ def run() -> None:
     rows = metrika_rows(frm, to) + ga4_order_rows(frm, to)
     n_m = sum(1 for r in rows if r[1] == "metrika")
     n_g = len(rows) - n_m
-    visits = sum(r[7] for r in rows)
-    orders = sum(r[9] for r in rows)
+    visits = sum(r[COLUMNS.index("visits")] for r in rows)
+    orders = sum(r[COLUMNS.index("orders")] for r in rows)
     print(f"lime_gcc_counters {frm}..{to}: metrika={n_m} строк ({visits:.0f} визитов), "
           f"ga4={n_g} строк ({orders:.0f} заказов)")
 

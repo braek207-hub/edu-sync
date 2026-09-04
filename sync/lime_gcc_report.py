@@ -6,14 +6,18 @@
     Web Org · Web Paid · App Org · App Paid · WEB Total · APP Total · Total(«Общий» у GCC).
 
 Источники:
-  • WEB (трафик = sessions Метрики, заказы = purchases Triple Whale) — уже в lime_stats
-    (region='gcc', data_source='web') с колонками country + traffic_type.
+  • WEB (трафик — GA4 417919368 c 2026-08-20, до того Яндекс.Метрика; заказы = purchases
+    Triple Whale) — уже в lime_stats (region='gcc', data_source='web') с country + traffic_type.
   • APP (app 6299245, трафик = sessions, заказы = e-commerce) — ФАЗА 2, пока нули.
+  • ЖИВАЯ Метрика 98232701 — витрина счётчиков lime_gcc_counter_daily (source='metrika'),
+    единственный независимый от GA4 источник в книге; на нём стоят оба листа сверки.
 
 «GCC»-срез = весь регион, включая country=NULL (визиты/заказы без страны), поэтому по
 странам он НЕ сходится с суммой пяти — так в данных.
 
-Две вкладки: «Fact Traffic GCC» (sessions) и «Fact Orders GCC» (purchases).
+Вкладки: «Fact Traffic GCC» (трафик витрины) · «Fact Orders GCC» (заказы linear) ·
+«Fact Orders LPC» · «Fact Traffic GA4» (web-часть витрины, тот же GA4) ·
+«Fact Traffic Metrika» (живая Метрика) · «Сверка web DAU» · «Сверка CR web».
 
 Режимы (LIME_GCC_MODE): build (создать вкладки + залить окно) | refresh (обновить
 последние N дней, дописать новые даты) | probe (read-only). Пишем по ИМЕНАМ колонок.
@@ -33,12 +37,18 @@ SHEET_ID = os.environ.get("LIME_GCC_SHEET_ID") or "1JSM7wcZlNnKX6uB4kk7UwkQzv7QE
 TRAFFIC_TAB = os.environ.get("LIME_GCC_TRAFFIC_TAB") or "Fact Traffic GCC"
 ORDERS_TAB = os.environ.get("LIME_GCC_ORDERS_TAB") or "Fact Orders GCC"
 GA4_TAB = os.environ.get("LIME_GCC_GA4_TAB") or "Fact Traffic GA4"
+# ЖИВАЯ Яндекс.Метрика 98232701 (lime_gcc_counter_daily, source='metrika') — независимый от
+# GA4 счётчик. Своя вкладка нужна с 2026-08-20: после перевода витрины на GA4 «Fact Traffic
+# GCC» перестал быть Метрикой, и сверка сравнивала GA4 сам с собой (шов на 13.08 = окно
+# refresh(7д) в день переключения).
+METRIKA_TAB = os.environ.get("LIME_GCC_METRIKA_TAB") or "Fact Traffic Metrika"
 COMPARE_TAB = os.environ.get("LIME_GCC_COMPARE_TAB") or "Сверка web DAU"
 # Заказы по НОВОЙ методике (весь заказ последней платной площадке, lastPlatformClick) —
 # отдельный лист рядом с linear-листом, структура колонок та же.
 ORDERS_LPC_TAB = os.environ.get("LIME_GCC_ORDERS_LPC_TAB") or "Fact Orders LPC"
 # Сверка конверсий было/стало на формулах (web): числители из двух листов заказов,
-# знаменатели из GA4-листа (было) и Метрика-листа (стало).
+# знаменатели из GA4-листа (было) и Метрика-листа (стало) — Метрика берётся из METRIKA_TAB,
+# а не из витринной вкладки: витрина с 2026-08-20 сама на GA4.
 CR_TAB = os.environ.get("LIME_GCC_CR_TAB") or "Сверка CR web"
 
 REFRESH_DAYS = int(os.environ.get("LIME_GCC_REFRESH_DAYS") or "7")
@@ -137,6 +147,38 @@ def fetch_web(conn, dates: list[str]) -> dict:
             if code:
                 traffic[d][code][field] += int(users)
     return traffic
+
+
+_METRIKA_SQL = """
+SELECT date::text AS d, country, traffic_type,
+       COALESCE(SUM(users), 0)::bigint AS users
+FROM lime_gcc_counter_daily
+WHERE source = 'metrika' AND date = ANY(%s::date[])
+GROUP BY date, country, traffic_type
+"""
+
+
+def fetch_metrika_web(conn, dates: list[str]) -> dict:
+    """ЖИВАЯ Метрика 98232701: date → {scope → {org, paid}} по web DAU (ym:s:users).
+
+    Источник — витрина счётчиков lime_gcc_counter_daily (sync/lime_gcc_counters.py), не
+    lime_stats: витрина GCC с 2026-08-20 наполняется GA4. Пайплайн Метрики добирает крест
+    Stat API остатком ВНУТРИ страны, поэтому сумма каналов страны = чистый тотал страны,
+    а GCC = сумма 5 стран (строк без страны там нет).
+    """
+    out = {d: {s: {"org": 0, "paid": 0} for s in (_GCC,) + _CODES} for d in dates}
+    with conn.cursor() as cur:
+        cur.execute(_METRIKA_SQL, (dates,))
+        for d, country, ttype, users in cur.fetchall():
+            if d not in out:
+                continue
+            field = "paid" if ttype == "Платный" else "org"
+            code = _COUNTRY_CODE.get((country or "").strip())
+            if not code:
+                continue
+            out[d][code][field] += int(users)
+            out[d][_GCC][field] += int(users)
+    return out
 
 
 def _linear_paid_frac(order: dict) -> float:
@@ -968,12 +1010,15 @@ def _ga4_row(iso: str, day: dict) -> dict:
 
 
 def ga4_compare_formulas(service) -> None:
-    """Лист сверки на ФОРМУЛАХ (без синка): GA4 «всего» (totalUsers) vs Метрика DAU по web.
+    """Лист сверки на ФОРМУЛАХ (без синка): GA4 (витрина) vs ЖИВАЯ Метрика 98232701, web DAU.
 
-    Тянет из готовых листов Fact Traffic GA4 (столбец «Total» = totalUsers) и Fact Traffic GCC
-    («WEB Total» = Метрика DAU) по дате и имени колонки (ARRAYFORMULA+VLOOKUP+MATCH). Авто-
-    обновляется, когда обновляются эти листы — ничего не считаем в питоне, отдельного синка нет.
-    Δ% = (GA4 всего − Метрика DAU)/Метрика DAU·100. По GCC и 5 странам.
+    Тянет из готовых листов Fact Traffic GA4 и Fact Traffic Metrika по дате и имени колонки
+    (ARRAYFORMULA+VLOOKUP+MATCH). Авто-обновляется, когда обновляются эти листы.
+    Δ% = (GA4 − Метрика)/Метрика·100. По GCC и 5 странам.
+
+    ⚠️ Метрика берётся из METRIKA_TAB, а НЕ из витринной «Fact Traffic GCC»: с 2026-08-20
+    витрина сама на GA4, и до 2026-09-04 лист сверял GA4 сам с собой (шов на 13.08 —
+    окно refresh(7д) в день переключения; ≤12.08 в витринной вкладке осталась Метрика).
     """
     from sync.gcc_ga4 import GA4_CODES
     from sync.sheets_write import add_tab, get_locale, list_tabs, write_formulas
@@ -982,9 +1027,9 @@ def ga4_compare_formulas(service) -> None:
     loc = get_locale(service, SHEET_ID)
     s = ";" if loc.split("_")[0] in ("ru", "de", "fr", "es", "it", "pt", "nl", "pl", "tr", "uk") else ","
 
-    ga4, gcc = GA4_TAB, TRAFFIC_TAB  # 'Fact Traffic GA4', 'Fact Traffic GCC'
-    # (метка, имя «всего»-колонки в GA4-листе, имя WEB-колонки в Метрика-листе)
-    scopes = [("GCC", "Total", "WEB Total")] + [(c, f"Total {c}", f"{c} WEB Total") for c in GA4_CODES]
+    ga4, gcc = GA4_TAB, METRIKA_TAB  # 'Fact Traffic GA4', 'Fact Traffic Metrika'
+    # (метка, имя «всего»-колонки; у обеих вкладок формат колонок одинаковый)
+    scopes = [("GCC", "Total", "Total")] + [(c, f"Total {c}", f"Total {c}") for c in GA4_CODES]
 
     # A2 — даты, разлитые из GA4-листа (драйвер); диапазон растёт сам.
     header = ["Дата"]
@@ -1040,7 +1085,9 @@ def cr_compare_formulas(service) -> None:
     """Лист «Сверка CR web» на ФОРМУЛАХ: конверсия было/стало по дням, платный/бесплатный, страны.
 
     CR было = заказы linear ('Fact Orders GCC') / трафик GA4 ('Fact Traffic GA4');
-    CR стало = заказы LPC ('Fact Orders LPC') / трафик Метрики ('Fact Traffic GCC').
+    CR стало = заказы LPC ('Fact Orders LPC') / трафик Метрики ('Fact Traffic Metrika').
+    Знаменатель «стало» — живая Метрика 98232701, а не витринная вкладка: та с 2026-08-20
+    наполняется GA4, из-за чего «стало» считалось по тому же трафику, что и «было».
     Только web: у app источник трафика в обеих методиках один (AppMetrica), сравнивать нечего.
     Автообновление: формулы тянут значения из четырёх листов по дате и имени колонки.
     """
@@ -1052,7 +1099,7 @@ def cr_compare_formulas(service) -> None:
     # У исторических листов шапка НЕ обязана быть в строке 1 (сверху примечания) — читаем
     # реальную строку заголовка и колонку «Дата» каждого листа, формулы строим по факту.
     meta: dict[str, dict] = {}
-    for tab in (TRAFFIC_TAB, ORDERS_TAB, ORDERS_LPC_TAB, GA4_TAB):
+    for tab in (METRIKA_TAB, ORDERS_TAB, ORDERS_LPC_TAB, GA4_TAB):
         grid = read_values(service, SHEET_ID, f"{tab}!A1:BZ12", render="FORMATTED_VALUE")
         hdr_i = _header_row(grid)
         if hdr_i is None:
@@ -1075,12 +1122,13 @@ def cr_compare_formulas(service) -> None:
         return (f"=ARRAYFORMULA(IF($A$2:$A=\"\"{s}\"\"{s}IFERROR(ROUND("
                 f"{vlook(num_tab, num_col)}/{vlook(den_tab, den_col)}*100{s}2){s}\"\")))")
 
-    # (метка, префикс колонок Метрика/заказы, ORG/PAID-колонки GA4-листа)
+    # (метка, префикс колонок листов заказов, ORG/PAID-колонки листов трафика —
+    #  у GA4-вкладки и вкладки Метрики формат колонок одинаковый)
     scopes = [("GCC", "", "ORG Total", "PAID Total")] + \
              [(c, f"{c} ", f"ORG {c}", f"PAID {c}") for c in _CODES]
 
-    t_m = meta[TRAFFIC_TAB]
-    drv = f"'{TRAFFIC_TAB}'!${_col_letter(t_m['date_j'])}${t_m['row1']}:${_col_letter(t_m['date_j'])}"
+    t_m = meta[GA4_TAB]
+    drv = f"'{GA4_TAB}'!${_col_letter(t_m['date_j'])}${t_m['row1']}:${_col_letter(t_m['date_j'])}"
     header = ["Дата"]
     row2 = [f"=ARRAYFORMULA(IF({drv}=\"\"{s}\"\"{s}{drv}))"]
     for label, p, ga_org, ga_paid in scopes:
@@ -1088,9 +1136,9 @@ def cr_compare_formulas(service) -> None:
                    f"{label} Org CR было", f"{label} Org CR стало"]
         row2 += [
             cr(ORDERS_TAB, f"{p}Web Paid", GA4_TAB, ga_paid),
-            cr(ORDERS_LPC_TAB, f"{p}Web Paid", TRAFFIC_TAB, f"{p}Web Paid"),
+            cr(ORDERS_LPC_TAB, f"{p}Web Paid", METRIKA_TAB, ga_paid),
             cr(ORDERS_TAB, f"{p}Web Org", GA4_TAB, ga_org),
-            cr(ORDERS_LPC_TAB, f"{p}Web Org", TRAFFIC_TAB, f"{p}Web Org"),
+            cr(ORDERS_LPC_TAB, f"{p}Web Org", METRIKA_TAB, ga_org),
         ]
 
     print(f"локаль книги {loc}, разделитель '{s}'")
@@ -1106,23 +1154,50 @@ def cr_compare_formulas(service) -> None:
 
 
 def ga4_run(service, dates: list[str], mode: str) -> None:
-    """Собрать GA4-трафик по hostName/каналам и записать лист GA4.
+    """Записать лист GA4 — ровно теми числами, что лежат в витрине (lime_stats, web).
 
-    Метрика по умолчанию `totalUsers` («Всего пользователей» в UI) — ровно то, чем Павел
-    заполняет ручной файл (сверено: мой totalUsers по 5 странам за 24.07 = 4365 ≈ «Всего»
-    4380 в отчёте «Привлечение трафика»). Меняется через GCC_GA4_METRIC.
+    До 2026-09-04 вкладка собиралась ОТДЕЛЬНЫМ запросом к GA4 (грандтотал `totalUsers` по
+    дате×hostName). Пока витрина была на Метрике, это был независимый взгляд; после её
+    перевода на GA4 (20.08) в книге оказалось ДВА разных GA4-числа: витрина/дашборд/
+    недельный автоотчёт считают `activeUsers` по строкам разбивки, вкладка — `totalUsers`
+    грандтоталом. Расхождение 2–4% (замер зонда W33: activeUsers сходится с ручным отчётом
+    на 0.25%, totalUsers промахивается на +4.5%) выглядело как расхождение источников.
+    Теперь GA4 в книге один — витрина; независимый источник для сверки = вкладка Метрики.
     """
-    from sync.gcc_ga4 import GA4_PROPERTY, fetch_ga4_traffic
-
-    metric = os.environ.get("GCC_GA4_METRIC") or "totalUsers"
-    data = fetch_ga4_traffic(GA4_PROPERTY, dates, metric)
-    for iso in dates:
+    conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
+    try:
+        mart = fetch_web(conn, dates)
+    finally:
+        conn.close()
+    data = {iso: {s: {"org": m["web_org"], "paid": m["web_paid"]}
+                  for s, m in day.items()} for iso, day in mart.items()}
+    for iso in dates[-3:]:
         g = data[iso]["GCC"]
         print(f"{iso}: GA4 ORG {g['org']} PAID {g['paid']} Total {g['org'] + g['paid']}")
     if mode == "ga4-build":
         _build_tab(service, GA4_TAB, dates, data, header=_ga4_header(), row_fn=_ga4_row)
     else:
         _refresh_tab(service, GA4_TAB, dates, data, row_fn=_ga4_row)
+
+
+def metrika_run(service, dates: list[str], mode: str) -> None:
+    """Залить вкладку живой Метрики (ORG/PAID/Total по GCC и 5 странам) из витрины счётчиков.
+
+    Форма колонок — как у GA4-вкладки (_ga4_header/_ga4_row), чтобы формулы сверки тянули
+    оба источника одинаково: имя колонки ищется внутри своей вкладки.
+    """
+    conn = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
+    try:
+        data = fetch_metrika_web(conn, dates)
+    finally:
+        conn.close()
+    for iso in dates[-3:]:
+        g = data[iso][_GCC]
+        print(f"{iso}: Метрика ORG {g['org']} PAID {g['paid']} Total {g['org'] + g['paid']}")
+    if mode == "metrika-build":
+        _build_tab(service, METRIKA_TAB, dates, data, header=_ga4_header(), row_fn=_ga4_row)
+    else:
+        _refresh_tab(service, METRIKA_TAB, dates, data, row_fn=_ga4_row)
 
 
 def ga4_cleanup(service) -> None:
@@ -1230,6 +1305,20 @@ def main() -> None:
         to = _msk_today() - timedelta(days=1)
         ga4_run(service, _dates(to - timedelta(days=REFRESH_DAYS - 1), to), "ga4-refresh")
         return
+    if mode == "ga4-rebuild":  # перезаписать ВСЮ историю GA4-листа (даты уже есть → refresh их обновит)
+        to_env = os.environ.get("LIME_GCC_TO")
+        to = date.fromisoformat(to_env) if to_env else _msk_today() - timedelta(days=1)
+        ga4_run(service, _dates(date.fromisoformat(BUILD_FROM), to), "ga4-refresh")
+        return
+    if mode == "metrika-build":  # создать вкладку живой Метрики + бэкфилл (LIME_GCC_FROM..вчера)
+        to_env = os.environ.get("LIME_GCC_TO")
+        to = date.fromisoformat(to_env) if to_env else _msk_today() - timedelta(days=1)
+        metrika_run(service, _dates(date.fromisoformat(BUILD_FROM), to), "metrika-build")
+        return
+    if mode == "metrika-refresh":  # обновить последние N дней вкладки Метрики
+        to = _msk_today() - timedelta(days=1)
+        metrika_run(service, _dates(to - timedelta(days=REFRESH_DAYS - 1), to), "metrika-refresh")
+        return
     if mode == "compare-formulas":  # создать лист сверки на формулах (GA4 всего vs Метрика DAU)
         ga4_compare_formulas(service)
         return
@@ -1259,11 +1348,17 @@ def main() -> None:
         to = _msk_today() - timedelta(days=1)
         dates = _dates(to - timedelta(days=REFRESH_DAYS - 1), to)
         _run(service, dates, "refresh")
-        # GA4-лист — best-effort в той же связке (независимый источник; сбой не рушит основной синк).
+        # GA4-лист — best-effort в той же связке (производная витрины; сбой не рушит основной синк).
         try:
             ga4_run(service, dates, "ga4-refresh")
         except Exception as e:  # noqa: BLE001
             print(f"GA4 refresh ПРОПУЩЕН: {type(e).__name__}: {e}")
+        # Вкладка живой Метрики — тоже best-effort: это независимый от GA4 счётчик, на нём
+        # держатся оба листа сверки. Пустая/отставшая вкладка не должна ронять основной синк.
+        try:
+            metrika_run(service, dates, "metrika-refresh")
+        except Exception as e:  # noqa: BLE001
+            print(f"Метрика refresh ПРОПУЩЕН: {type(e).__name__}: {e}")
     else:
         raise SystemExit(f"lime_gcc_report: неизвестный режим {mode!r}")
 

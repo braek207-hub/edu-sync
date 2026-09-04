@@ -23,7 +23,7 @@ on:
         description: "Бэкфилл: дата конца YYYY-MM-DD"
         required: false
       mode:
-        description: "sync | regeo (ре-ингест только web-трафика на гео, заказы из lime_stats)"
+        description: "sync | regeo (ре-ингест только web-трафика на гео, заказы из lime_stats) | counters-only (только витрина счётчиков: бэкфилл живой Метрики, витрину не трогаем)"
         required: false
         default: "sync"
       dry_run:
@@ -60,6 +60,9 @@ jobs:
           printf '%s' "$GSC_SA_KEY" > sa.json
 
       - name: Run GCC sync
+        # counters-only: длинный бэкфилл живой Метрики в витрину счётчиков не должен
+        # перезаписывать lime_stats и полдня тянуть TW/GA4 за весь период.
+        if: github.event.inputs.mode != 'counters-only'
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
@@ -79,7 +82,8 @@ jobs:
       # Сверочная витрина счётчиков (Метрика 98232701 визиты/пользователи + GA4-заказы) —
       # после основного синка; падение сверки не валит главные данные (continue-on-error).
       - name: Run GCC counters compare
-        continue-on-error: true
+        # В обычном прогоне сверка второстепенна; в counters-only она и есть задача — падать честно.
+        continue-on-error: ${{ github.event.inputs.mode != 'counters-only' }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           GOOGLE_APPLICATION_CREDENTIALS: sa.json

@@ -19,6 +19,12 @@ CREATE TABLE IF NOT EXISTS lime_gcc_counter_daily (
   revenue       numeric NOT NULL DEFAULT 0
 );
 
+-- Платность канала источника — тем же классификатором, что и витрина (map_metrika_channel /
+-- map_ga4_channel). Без неё лист сверки не мог разложить Метрику на ORG/PAID и брал платность
+-- по имени канала, теряя остаток креста Stat API.
+ALTER TABLE lime_gcc_counter_daily
+  ADD COLUMN IF NOT EXISTS traffic_type text NOT NULL DEFAULT '';
+
 CREATE INDEX IF NOT EXISTS lime_gcc_counter_daily_date_source
   ON lime_gcc_counter_daily (date, source);
 
