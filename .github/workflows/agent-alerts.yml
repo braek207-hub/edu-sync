@@ -1,0 +1,47 @@
+name: agent-alerts
+# Сторож внутридневных тревог: вставшие кампании и обвал открутки кабинета.
+# Источник — Reports API за ТЕКУЩИЙ день (витрины наливаются раз в сутки и про
+# сегодня не знают ничего; что отчёт за today живой — замер
+# probe_intraday_spend, run 33857247004).
+on:
+  schedule:
+    # 09,11,13,15,17 UTC = 12,14,16,18,20 МСК. Раз в два часа, а не каждый:
+    # прогон стоит восьми отчётов Директа (сегодня и вчера по четырём
+    # кабинетам), а вставшая кампания за лишний час теряет столько же, сколько
+    # ежечасный опрос сжёг бы баллов API. Раньше 12 МСК у части кампаний ещё
+    # законный ноль, позже 20 человек всё равно ничего не сделает до утра.
+    - cron: "0 9,11,13,15,17 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Посчитать и напечатать, не отправляя (true/false)"
+        required: false
+        default: "true"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run intraday watchdog
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
+          DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # По расписанию — боевой прогон; руками по умолчанию репетиция,
+          # чтобы проверка правил не будила человека.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            python -m sync.agent_alerts
+          elif [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
+            python -m sync.agent_alerts
+          else
+            python -m sync.agent_alerts --dry-run
+          fi
