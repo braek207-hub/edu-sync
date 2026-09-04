@@ -34,16 +34,25 @@ def _post(url: str, data: bytes) -> None:
         resp.read()
 
 
-def send(text: str) -> Dict[str, Any]:
-    """Шлёт text в чат. Никогда не бросает — результат всегда в поле."""
+def send(text: str, buttons: Any = None) -> Dict[str, Any]:
+    """Шлёт text в чат. Никогда не бросает — результат всегда в поле.
+
+    buttons — готовый inline_keyboard (список рядов кнопок) либо None. Кнопки
+    имеют смысл только когда ответы человека принимает вебхук Panda-BI: нажатие
+    приходит туда как callback_query. При работе через getUpdates они не мешают
+    (нажатие просто не будет прочитано), но и не помогают — поэтому решение
+    добавить их принимает вызывающий, а не транспорт.
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
         return {"sent": False, "reason": "not_configured"}
     try:
+        payload: Dict[str, Any] = {"chat_id": chat, "text": text[:MAX_TEXT_LEN]}
+        if buttons:
+            payload["reply_markup"] = {"inline_keyboard": buttons}
         _post(TELEGRAM_API.format(token=token),
-              json.dumps({"chat_id": chat, "text": text[:MAX_TEXT_LEN]},
-                        ensure_ascii=False).encode("utf-8"))
+              json.dumps(payload, ensure_ascii=False).encode("utf-8"))
         return {"sent": True, "reason": None}
     except Exception as exc:  # noqa: BLE001 — транспорт не вправе уронить прогон
         # Сообщение исключения может нести URL целиком (например,

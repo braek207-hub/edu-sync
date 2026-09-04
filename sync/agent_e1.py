@@ -3174,7 +3174,8 @@ def _run_all(clients: List[Dict[str, Any]], sandbox: bool, dry_run: bool,
     if pending_rows and journal_writes_allowed(sandbox, dry_run):
         print(json.dumps({"verdict": "APPROVAL_REQUEST",
                           "queued": len(pending_rows),
-                          **notify.send(approval.format_request(pending_rows))},
+                          **notify.send(approval.format_request(pending_rows),
+                                        approval.request_buttons(pending_rows))},
                          ensure_ascii=False, indent=2))
 
     if failed_accounts:

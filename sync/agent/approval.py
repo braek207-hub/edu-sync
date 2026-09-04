@@ -156,6 +156,28 @@ def format_request(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def request_buttons(rows: List[Dict[str, Any]]) -> List[List[Dict[str, str]]]:
+    """Кнопки к сводке: пара «применить / отклонить» на каждое действие.
+
+    Формат callback_data — «ok:<код>» / «no:<код>», ровно тот, что разбирает
+    вебхук Panda-BI (lib/telegram/router.ts). Bot API режет callback_data на 64
+    байтах, поэтому в ней только код: остальное вебхук достаёт из журнала.
+
+    Кнопки не отменяют текстовый ответ: разбор «да <код>» остаётся на месте, и
+    если вебхук выключен, человек отвечает словами, как раньше.
+    """
+    keyboard: List[List[Dict[str, str]]] = []
+    for row in rows:
+        code = short_code(str(row.get("action_id") or ""))
+        if not code:
+            continue
+        keyboard.append([
+            {"text": f"Применить {code}", "callback_data": f"ok:{code}"},
+            {"text": f"Отклонить {code}", "callback_data": f"no:{code}"},
+        ])
+    return keyboard
+
+
 def parse_decisions(texts: Iterable[str]) -> List[Tuple[str, bool]]:
     """Тексты человека → [(код | '*', одобрено)]. Порядок сохраняется:
     позднее слово перебивает раннее у того же кода (решает вызывающий,

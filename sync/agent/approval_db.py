@@ -15,7 +15,7 @@ NOT EXISTS при первом обращении:
     чата и вечно держал его в Telegram.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from sync.db import get_connection
 
@@ -85,6 +85,34 @@ def vetoed_keys(days: int = VETO_MEMORY_DAYS) -> List[str]:
                 """,
                 (DECISION_VETOED, int(days)))
             return [str(r[0]) for r in cur.fetchall()]
+
+
+def decisions_for(keys: Iterable[str]) -> Dict[str, str]:
+    """Решения человека по этим ключам идемпотентности: ключ → approved|vetoed.
+
+    Источник решений, когда ответы принимает вебхук Panda-BI, а не getUpdates:
+    бот пишет слово человека сюда тем же INSERT ... ON CONFLICT, а воркер его
+    отсюда читает. Одновременно webhook и getUpdates у Bot API невозможны, и
+    после переезда на вебхук воркер обязан смотреть в базу — иначе он ослепнет.
+
+    Строка со статусом pending_approval в журнале и approved здесь означает
+    «человек сказал да, применение ещё не состоялось»: применённое действие
+    из pending уходит статусом, а не удалением решения.
+    """
+    keys = [str(k) for k in keys if str(k)]
+    if not keys:
+        return {}
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT idempotency_key, decision FROM edu_agent_approvals
+                 WHERE idempotency_key = ANY(%s)
+                   AND decision IN (%s, %s)
+                """,
+                (keys, DECISION_APPROVED, DECISION_VETOED))
+            return {str(r[0]): str(r[1]) for r in cur.fetchall()}
 
 
 def get_offset() -> int:

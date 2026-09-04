@@ -137,31 +137,70 @@ def apply_one(client: WriteClient, row: Dict[str, Any]) -> Dict[str, Any]:
         return {**base, "result": "failed", "error": str(exc)[:200]}
 
 
+def decision_source() -> str:
+    """Откуда берутся решения человека: база (по умолчанию) или getUpdates.
+
+    Bot API НЕ отдаёт getUpdates, пока у бота стоит вебхук, — а вебхук теперь
+    держит Panda-BI (app/api/telegram/webhook): он принимает и разговор, и
+    нажатия кнопок, и пишет слово человека в edu_agent_approvals. Поэтому
+    источник по умолчанию — база.
+
+    APPROVER_SOURCE=getupdates возвращает прежнее поведение. Это путь отката:
+    снять вебхук (deleteWebhook) и выставить переменную — контур снова работает
+    сам по себе, без Panda-BI.
+    """
+    return (os.environ.get("APPROVER_SOURCE") or "db").strip().lower()
+
+
+def verdicts_from_db(pending: List[Dict[str, Any]],
+                     by_code: Dict[str, Dict[str, Any]]) -> Dict[str, bool]:
+    """Решения, записанные вебхуком: код действия → одобрено."""
+    stored = approval_db.decisions_for(
+        [str(r.get("idempotency_key") or "") for r in pending])
+    out: Dict[str, bool] = {}
+    for code, row in by_code.items():
+        decision = stored.get(str(row.get("idempotency_key") or ""))
+        if decision == approval_db.DECISION_APPROVED:
+            out[code] = True
+        elif decision == approval_db.DECISION_VETOED:
+            out[code] = False
+    return out
+
+
 def run(dry_run: bool) -> Dict[str, Any]:
     approval_db.ensure_schema()
 
     expired = approval_db.expire_pending(approval.PENDING_TTL_HOURS)
     pending = approval_db.load_pending()
+    source = decision_source()
+    by_code = {approval.short_code(str(r["action_id"])): r for r in pending}
 
-    offset = approval_db.get_offset()
-    updates = fetch_updates(offset)
-    texts, max_id = own_texts(updates)
-    decisions = approval.parse_decisions(texts)
+    texts: List[str] = []
+    decisions: List[Tuple[str, bool]] = []
+    verdicts: Dict[str, bool] = {}
 
-    # Курсор двигается ДО применения: решение, упавшее на применении,
-    # закрыто статусом в журнале, а не повтором тех же сообщений — повтор
-    # apply уже применённого создал бы в кабинете второй объект.
-    if max_id is not None:
-        approval_db.set_offset(max_id)
+    if source == "getupdates":
+        offset = approval_db.get_offset()
+        updates = fetch_updates(offset)
+        texts, max_id = own_texts(updates)
+        decisions = approval.parse_decisions(texts)
+
+        # Курсор двигается ДО применения: решение, упавшее на применении,
+        # закрыто статусом в журнале, а не повтором тех же сообщений — повтор
+        # apply уже применённого создал бы в кабинете второй объект.
+        if max_id is not None:
+            approval_db.set_offset(max_id)
+        if pending and decisions:
+            verdicts = approval.resolve_decisions(decisions, by_code)
+    elif pending:
+        verdicts = verdicts_from_db(pending, by_code)
 
     report: Dict[str, Any] = {"expired": expired, "pending": len(pending),
+                              "source": source,
                               "texts": len(texts), "decisions": len(decisions),
                               "applied": [], "vetoed": [], "dry_run": dry_run}
-    if not pending or not decisions:
+    if not verdicts:
         return report
-
-    by_code = {approval.short_code(str(r["action_id"])): r for r in pending}
-    verdicts = approval.resolve_decisions(decisions, by_code)
 
     clients: Dict[str, WriteClient] = {}
     for code, approved in verdicts.items():
