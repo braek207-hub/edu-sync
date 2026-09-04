@@ -1328,6 +1328,18 @@ def main() -> None:
     if mode == "cr-compare-formulas":  # лист «Сверка CR web» было/стало на формулах
         cr_compare_formulas(service)
         return
+    if mode == "compare-check":  # что реально посчитал лист сверки за окно LIME_GCC_FROM..TO
+        from sync.sheets_write import read_values
+        frm = os.environ.get("LIME_GCC_FROM") or ""
+        to = os.environ.get("LIME_GCC_TO") or "9999-99-99"
+        grid = read_values(service, SHEET_ID, f"{COMPARE_TAB}!A1:D4000", render="FORMATTED_VALUE")
+        hdr_i = _header_row(grid) or 0
+        print(" | ".join(grid[hdr_i][:4]))
+        for row in grid[hdr_i + 1:]:
+            m = _DATE_RE.search(row[0] if row else "")
+            if m and frm <= f"{m[3]}-{m[2]}-{m[1]}" <= to:
+                print("  " + " | ".join(str(c) for c in row[:4]))
+        return
     if mode == "cr-check":  # диагностика листа сверки CR: значения + формулы
         from sync.sheets_write import read_values
         vals = read_values(service, SHEET_ID, f"{CR_TAB}!A1:F10", render="FORMATTED_VALUE")

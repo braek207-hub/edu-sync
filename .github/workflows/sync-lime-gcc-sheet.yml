@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "refresh | build | orders-lpc-build | cr-compare-formulas | ga4-build | ga4-refresh | ga4-rebuild | metrika-build | metrika-refresh | compare-formulas | traffic-backfill | app-traffic-fill | page-data | ga4-probe | ga4-validate | ga4-cleanup"
+        description: "refresh | build | orders-lpc-build | cr-compare-formulas | ga4-build | ga4-refresh | ga4-rebuild | metrika-build | metrika-refresh | compare-formulas | traffic-backfill | app-traffic-fill | page-data | ga4-probe | ga4-validate | ga4-cleanup | compare-check"
         required: false
         default: "refresh"
       refresh_days:
