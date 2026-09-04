@@ -216,6 +216,26 @@ def audit():
     print(f"MLND_STAT distinct={len(mlagg)} visits={sum(v[0] for v in mlagg.values())}")
     for path, v in sorted(mlagg.items(), key=lambda x: -x[1][0])[:20]:
         print(f"MLND {path[:70]} | v={v[0]} u={v[1]}")
+    # Служебные хиты Shopify web-pixel sandbox: до 19.08 их в выдаче не было, после —
+    # появились. Считаем из уже полученной выдачи, отдельный запрос не нужен.
+    pix = {k: v for k, v in mlagg.items() if "web-pixel" in k}
+    print(f"MPIX_TOTAL paths={len(pix)} visits={sum(v[0] for v in pix.values())} "
+          f"users={sum(v[1] for v in pix.values())}")
+
+    # Куда сел лишний Direct: на ПК или на мобильные. Разрыв Метрика↔GA4 на десктопе
+    # появился ровно 19.08, до того устройства сходились.
+    print("\n### DIRECT×DEVICE Метрика (GCC5, всё окно):")
+    mdd = _m(["ym:s:deviceCategory", "ym:s:startURLDomain"], ["ym:s:users", "ym:s:visits"],
+             frm_s, to_s, filters="ym:s:lastsignTrafficSource=='direct'")
+    dagg = {}
+    for r in mdd:
+        if domain_country_gcc5(r["dimensions"][1]["name"]):
+            dev = r["dimensions"][0]["name"]
+            a = dagg.setdefault(dev, [0, 0])
+            a[0] += int(r["metrics"][0])
+            a[1] += int(r["metrics"][1])
+    for dev, a in sorted(dagg.items(), key=lambda x: -x[1][0]):
+        print(f"MDIRDEV {dev} | u={a[0]} v={a[1]}")
 
     # ── 8. КЛИКИ Google Ads/Meta (из TW ads_table) vs Метрика DAU
     print("\n### CLICKS TW ads_table по каналу:")
