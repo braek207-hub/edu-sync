@@ -1042,8 +1042,10 @@ def ga4_compare_formulas(service) -> None:
              f"MATCH(\"{metr_h}\"{s}'{gcc}'!$1:$1{s}0){s}FALSE))))"),
             (f"=ARRAYFORMULA(IF($A$2:$A=\"\"{s}\"\"{s}IFERROR(VLOOKUP($A$2:$A{s}'{ga4}'!$A:$Z{s}"
              f"MATCH(\"{ga4_h}\"{s}'{ga4}'!$1:$1{s}0){s}FALSE))))"),
-            (f"=ARRAYFORMULA(IF(${metr_L}$2:${metr_L}=\"\"{s}\"\"{s}IFERROR(ROUND("
-             f"({ga4_L}2:{ga4_L}-{metr_L}2:{metr_L})/{metr_L}2:{metr_L}*100{s}1){s}\"\")))"),
+            # ДОЛЯ, не «×100»: столбцы Δ% в книге имеют процентный формат ячейки и сами
+            # домножают на 100 при показе (иначе 21,1 рисуется как 2110,00%).
+            (f"=ARRAYFORMULA(IF(${metr_L}$2:${metr_L}=\"\"{s}\"\"{s}IFERROR("
+             f"({ga4_L}2:{ga4_L}-{metr_L}2:{metr_L})/{metr_L}2:{metr_L}{s}\"\")))"),
         ]
 
     print(f"локаль книги {loc}, разделитель '{s}'")
