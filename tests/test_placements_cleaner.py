@@ -165,3 +165,18 @@ def test_summary_counts_whole_day_not_just_cuts():
     assert plan["summary"]["site"]["clicks"] == 10
     assert plan["summary"]["app"]["clicks"] == 90
     assert plan["day_sites"] == 2
+
+
+def test_archived_campaign_refused():
+    """Клики за сегодня есть, но архивную кампанию Директ обновлять не даст."""
+    rows = [_row(1, "com.junk.app", 50)]
+    plan = plan_account(rows, [dict(_campaign(1), State="ARCHIVED")])
+    assert plan["actions"] == []
+    assert "вне игры" in plan["refused"][0]["reason"]
+
+
+def test_paused_campaign_is_still_cleaned():
+    """Остановленная сегодня кампания вернётся уже без этого мусора."""
+    rows = [_row(1, "com.junk.app", 50)]
+    plan = plan_account(rows, [dict(_campaign(1), State="SUSPENDED")])
+    assert [a["placement"] for a in plan["actions"][0]["added"]] == ["com.junk.app"]

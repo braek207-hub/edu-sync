@@ -4,8 +4,8 @@
 from typing import Any, Dict, List, Optional
 
 from sync.placements.classify import CUT_VERDICTS, classify, normalize
-from sync.placements.direct import (CLEANABLE_TYPES, MAX_EXCLUDED_SITES,
-                                    MAX_SITE_CHARS)
+from sync.placements.direct import (CLEANABLE_STATES, CLEANABLE_TYPES,
+                                    MAX_EXCLUDED_SITES, MAX_SITE_CHARS)
 
 # Сколько верхних по кликам площадок кампании смотрит один такт. Ворота
 # защищают лимит слотов: мусорный хвост исчисляется тысячами имён, и без
@@ -120,6 +120,14 @@ def plan_account(rows: List[Dict[str, Any]],
             refused.append({"campaign_id": cid, "name": campaign.get("Name"),
                             "reason": "тип %s: запрет площадок недоступен"
                                       % campaign.get("Type")})
+            continue
+        if campaign.get("State") not in CLEANABLE_STATES:
+            # Клики за сегодня у неё есть, но кампания уже вне игры: архив,
+            # завершение по дате, конверсия в другой формат. Запись либо
+            # отклоняется Директом, либо не даёт эффекта.
+            refused.append({"campaign_id": cid, "name": campaign.get("Name"),
+                            "reason": "состояние %s: кампания вне игры, "
+                                      "запрет не пишем" % campaign.get("State")})
             continue
 
         existing = [normalize(s) for s in
