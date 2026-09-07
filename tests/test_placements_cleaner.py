@@ -175,8 +175,10 @@ def test_archived_campaign_refused():
     assert "вне игры" in plan["refused"][0]["reason"]
 
 
-def test_paused_campaign_is_still_cleaned():
-    """Остановленная сегодня кампания вернётся уже без этого мусора."""
+def test_paused_campaign_is_left_alone():
+    """Чистим только запущенные: остановленная сегодня уже не открутится."""
     rows = [_row(1, "com.junk.app", 50)]
-    plan = plan_account(rows, [dict(_campaign(1), State="SUSPENDED")])
-    assert [a["placement"] for a in plan["actions"][0]["added"]] == ["com.junk.app"]
+    for state in ("OFF", "SUSPENDED"):
+        plan = plan_account(rows, [dict(_campaign(1), State=state)])
+        assert plan["actions"] == [], state
+        assert "вне игры" in plan["refused"][0]["reason"]
