@@ -1,0 +1,56 @@
+name: placement-cleaner
+# Чистильщик площадок РСЯ: запрещает мусорный инвентарь (мобильные приложения
+# вне allowlist, DSP-обменники, игры, помойные домены) во всех подключённых
+# кабинетах.
+#
+# Почему ежечасно, а не раз в два часа, как agent-alerts: окно отчёта — TODAY,
+# и весь смысл такта в том, чтобы новая мусорная площадка жила часы, а не
+# сутки. Прогон стоит одного отчёта на кабинет; суточный лимит баллов Директа
+# и так нарезан на 24 часовых окна, так что час ложится в него ровно.
+on:
+  schedule:
+    - cron: "5 * * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Боевая запись (true) или репетиция (false)"
+        required: false
+        default: "false"
+      accounts:
+        description: "Кабинеты через запятую; пусто — все доступные"
+        required: false
+        default: ""
+
+concurrency:
+  # Два такта одновременно писали бы список запретов один поверх другого:
+  # ExcludedSites заменяется целиком, и тот, кто финиширует вторым, откатит
+  # запреты первого.
+  group: placement-cleaner
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Clean placements
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RUSSEVER_DIRECT: ${{ secrets.RUSSEVER_DIRECT }}
+        run: |
+          # По расписанию — боевой прогон; руками по умолчанию репетиция,
+          # чтобы проверка правил не резала кабинет молча.
+          ACCOUNTS="${{ github.event.inputs.accounts }}"
+          ARGS=""
+          if [ -n "$ACCOUNTS" ]; then ARGS="--accounts $ACCOUNTS"; fi
+          if [ "${{ github.event_name }}" = "schedule" ] \
+             || [ "${{ github.event.inputs.apply }}" = "true" ]; then
+            python -m sync.placements_clean --apply $ARGS
+          else
+            python -m sync.placements_clean --dry-run $ARGS
+          fi
