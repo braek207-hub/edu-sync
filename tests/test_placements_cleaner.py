@@ -182,3 +182,15 @@ def test_paused_campaign_is_left_alone():
         plan = plan_account(rows, [dict(_campaign(1), State=state)])
         assert plan["actions"] == [], state
         assert "вне игры" in plan["refused"][0]["reason"]
+
+
+def test_dsp_subdomain_with_hyphen():
+    """Обменники подписываются составным поддоменом — по точкам он неделим.
+
+    Регрессия: из шести dsp-площадок в топе Russever 07.09.2026 словарь узнавал
+    одну, остальные шли как «обычный сайт».
+    """
+    for site in ("dsp-opera-exchange.yandex.ru", "dsp-ironsource.yandex.ru",
+                 "dsp-yeahmobi.yandex.ru"):
+        assert classify(site)[0] == "dsp", site
+    assert classify("com.d_one_games.escape_from_school")[0] == "game"

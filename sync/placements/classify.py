@@ -20,6 +20,7 @@
 """
 
 import os
+import re
 from typing import Dict, Set, Tuple
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -151,6 +152,21 @@ def _segments(name: str):
     return [s for s in name.split(".") if s]
 
 
+_WORD_SPLIT = re.compile(r"[.\-_]+")
+
+
+def _tokens(name: str) -> Set[str]:
+    """Слова имени: сегменты, разбитые ещё и по дефису с подчёркиванием.
+
+    Обменники подписываются составным поддоменом — dsp-opera-exchange.yandex.ru,
+    dsp-inneractive.yandex.ru, dsp-yeahmobi.yandex.ru. По одним точкам такой
+    поддомен — единый сегмент, и словарь его не узнаёт: на Russever 07.09.2026
+    из шести dsp-площадок в топе распознавалась одна (dsp.yandex.ru), остальные
+    шли как «обычный сайт» и оставались откручиваться.
+    """
+    return {t for t in _WORD_SPLIT.split(name) if t}
+
+
 def is_app(name: str) -> bool:
     """Bundle id мобильного приложения против доменного имени.
 
@@ -188,7 +204,7 @@ def classify(name: str,
     if not site:
         return "junk", "пустое имя площадки"
 
-    segs = set(_segments(site))
+    segs = _tokens(site)
 
     # DSP и game проверяются ДО приложений: dsp.yandex и game.yandex по
     # структуре имени выглядят как bundle id, но резать их надо с их
