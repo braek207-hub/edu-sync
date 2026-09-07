@@ -54,7 +54,8 @@ def plan_account(rows: List[Dict[str, Any]],
                  top_n: int = TOP_N,
                  fill_ceiling: int = FILL_CEILING,
                  allow_exact=None,
-                 allow_prefix=None) -> Dict[str, Any]:
+                 allow_prefix=None,
+                 overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Строки отчёта + кампании кабинета → план запретов по кампаниям.
 
     Возвращает действия (что писать), отказы (почему не пишем) и сводку
@@ -88,6 +89,11 @@ def plan_account(rows: List[Dict[str, Any]],
         d["cost"] += cost
 
     verdicts = {site: classify(site, **kwargs) for site in day}
+    # Поправки второго судьи (llm.py) ложатся поверх словаря. Только «резать»:
+    # согласие модели со словарём ничего не меняет и в план не едет.
+    for site, verdict in (overrides or {}).items():
+        if site in verdicts:
+            verdicts[site] = verdict
 
     summary: Dict[str, Dict[str, Any]] = {}
     for site, (verdict, _) in verdicts.items():
@@ -98,6 +104,10 @@ def plan_account(rows: List[Dict[str, Any]],
 
     actions: List[Dict[str, Any]] = []
     refused: List[Dict[str, Any]] = []
+    # Имена в окне ворот, которые словарь оставил обычными сайтами: их и
+    # показываем модели. Спрашивать про весь день незачем — за воротами
+    # площадка всё равно не будет запрещена этим тактом.
+    candidates: Dict[str, int] = {}
 
     for cid, sites in sorted(pair.items()):
         campaign = by_id.get(cid)
@@ -145,6 +155,8 @@ def plan_account(rows: List[Dict[str, Any]],
         for site, clicks, cost in fresh[:top_n]:
             verdict, why = verdicts[site]
             if verdict not in CUT_VERDICTS:
+                if verdict == "site":
+                    candidates[site] = max(candidates.get(site, 0), clicks)
                 continue
             ok, bad = site_is_valid(site)
             if not ok:
@@ -188,6 +200,8 @@ def plan_account(rows: List[Dict[str, Any]],
     return {
         "actions": actions,
         "refused": refused,
+        "candidates": [site for site, _ in
+                       sorted(candidates.items(), key=lambda kv: -kv[1])],
         "summary": summary,
         "day_sites": len(day),
         "day_clicks": sum(v["clicks"] for v in day.values()),

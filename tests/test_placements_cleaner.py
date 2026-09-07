@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Чистильщик площадок РСЯ: классификатор и ворота такта."""
 
+import json
+
 from sync.placements.classify import classify, is_app, normalize
 from sync.placements.direct import MAX_SITE_CHARS
 from sync.placements.plan import merge_sites, plan_account
@@ -194,3 +196,59 @@ def test_dsp_subdomain_with_hyphen():
                  "dsp-yeahmobi.yandex.ru"):
         assert classify(site)[0] == "dsp", site
     assert classify("com.d_one_games.escape_from_school")[0] == "game"
+
+
+# --- второй судья (модель) -----------------------------------------------
+
+from sync.placements import llm  # noqa: E402
+
+
+def _ask_junk(prompt):
+    """Модель, которая всё считает мусором: проверяем не её, а щиты вокруг."""
+    sites = [ln.strip() for ln in prompt.splitlines() if "." in ln
+             and not ln.startswith("-") and " " not in ln.strip()]
+    items = [{"site": s, "verdict": "junk", "why": "дорвей"} for s in sites]
+    return json.dumps({"items": items}, ensure_ascii=False)
+
+
+def test_llm_never_touches_protected():
+    """Крупные порталы не режем вовсе — мнение модели этого не отменяет."""
+    verdicts = llm.judge(["mail.ru", "news.mail.ru", "dzen.ru", "hlam-xxx.ru"],
+                         ask=_ask_junk)
+    assert "mail.ru" not in verdicts
+    assert "news.mail.ru" not in verdicts
+    assert llm.overrides_from({"mail.ru": ("junk", "х")}) == {}
+
+
+def test_llm_overrides_only_cut():
+    """«keep» ничего не меняет: словарь и так оставил площадку."""
+    out = llm.overrides_from({"a.ru": ("junk", "пиратка"),
+                              "b.ru": ("keep", "СМИ")})
+    assert list(out) == ["a.ru"]
+    assert out["a.ru"][0] == "llm"
+
+
+def test_llm_broken_answer_is_silence():
+    """Оборванный JSON — молчание, а не согласие: резать нечего."""
+    assert llm.judge(["x.ru"], ask=lambda p: "не json") == {}
+    assert llm.judge(["x.ru"], ask=lambda p: (_ for _ in ()).throw(IOError)) == {}
+
+
+def test_llm_without_key_is_off():
+    assert llm.judge(["x.ru"], ask=None) == {}
+
+
+def test_plan_offers_only_site_candidates():
+    """Модели показываем лишь то, что словарь оставил и что попало в ворота."""
+    rows = [_row(1, "portal.ru", 90), _row(1, "com.junk.app", 80),
+            _row(1, "tail.ru", 1)]
+    plan = plan_account(rows, [_campaign(1)], top_n=2)
+    assert plan["candidates"] == ["portal.ru"]
+
+
+def test_override_turns_site_into_cut():
+    rows = [_row(1, "doorway.ru", 90)]
+    plan = plan_account(rows, [_campaign(1)],
+                        overrides={"doorway.ru": ("llm", "модель: дорвей")})
+    added = plan["actions"][0]["added"][0]
+    assert added["placement"] == "doorway.ru" and added["verdict"] == "llm"
