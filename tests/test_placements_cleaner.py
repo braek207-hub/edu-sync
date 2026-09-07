@@ -130,11 +130,24 @@ def test_sites_are_never_cut():
     assert added == ["com.junk.app"]
 
 
-def test_non_text_campaign_refused():
+def test_unsupported_type_refused():
     rows = [_row(1, "com.junk.app", 50)]
-    plan = plan_account(rows, [_campaign(1, type_="CPM_BANNER_CAMPAIGN")])
+    plan = plan_account(rows, [_campaign(1, type_="SMART_CAMPAIGN")])
     assert plan["actions"] == []
     assert "запрет площадок недоступен" in plan["refused"][0]["reason"]
+
+
+def test_media_campaign_is_cleaned_with_its_own_limit():
+    """Медийная поддерживает ExcludedSites, но её лимит вдесятеро короче."""
+    rows = [_row(1, "com.junk.app", 50)]
+    plan = plan_account(rows, [_campaign(1, type_="CPM_BANNER_CAMPAIGN")])
+    assert plan["actions"][0]["added"][0]["placement"] == "com.junk.app"
+
+    full = ["site%d.ru" % i for i in range(90)]
+    plan = plan_account(rows, [_campaign(1, type_="CPM_BANNER_CAMPAIGN",
+                                         excluded=full)])
+    assert plan["actions"] == []
+    assert "из 100" in plan["refused"][0]["reason"]
 
 
 def test_fill_ceiling_leaves_room_for_human():

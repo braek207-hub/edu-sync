@@ -158,8 +158,8 @@ def main(argv=None) -> int:
                         help="кабинеты через запятую; пусто — все доступные")
     parser.add_argument("--top-n", type=int, default=planner.TOP_N,
                         help="сколько верхних по кликам смотреть в кампании")
-    parser.add_argument("--no-llm", action="store_true",
-                        help="судить только словарём, модель не спрашивать")
+    parser.add_argument("--llm", action="store_true",
+                        help="спрашивать модель по кандидатам (нужен ключ)")
     parser.add_argument("--no-db", action="store_true",
                         help="не писать журнал (нет DATABASE_URL)")
     args = parser.parse_args(argv)
@@ -182,10 +182,12 @@ def main(argv=None) -> int:
             _out("журнал недоступен (%s) — прогон идёт без него" % err)
             use_db = False
 
-    ask = None if args.no_llm else llm.asker()
+    # Второй судья по умолчанию выключен: провайдер платный, и без
+    # явного согласия такт за него не платит.
+    ask = llm.asker() if args.llm else None
     _out("режим: %s, кабинетов %d, ворота топ-%d по кликам, второй судья: %s"
          % ("БОЕВОЙ" if apply else "репетиция", len(ready), args.top_n,
-            ("модель %s" % llm_model(ask)) if ask else "выключен (нет ключа)"))
+            ("модель %s" % llm_model(ask)) if ask else "выключен (нужен --llm)"))
 
     failures = 0
     totals = {"sites": 0, "campaigns": 0, "ok": 0, "failed": 0}

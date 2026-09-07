@@ -23,9 +23,20 @@ POLL_SLEEP = 10
 MAX_EXCLUDED_SITES = 1000
 MAX_SITE_CHARS = 255
 
-# Запрет площадок живёт только у текстовых кампаний. У ЕПК, Мастера кампаний
-# и медийных этого рычага нет вовсе — их пропускаем, а не пытаемся писать.
-CLEANABLE_TYPES = frozenset({"TEXT_CAMPAIGN"})
+# У кого рычаг есть. Замер кабинета Russever 07.09.2026: поле ExcludedSites
+# Директ отдаёт и текстовым, и медийным кампаниям. Мастер кампаний не виден
+# API v5 вовсе — campaigns/get по прямому Id возвращает пустой список, а не
+# ошибку, так что «пропускаем» тут не выбор, а единственное возможное.
+CLEANABLE_TYPES = frozenset({"TEXT_CAMPAIGN", "CPM_BANNER_CAMPAIGN"})
+
+# Размер чёрного списка зависит от типа: у медийных объявлений он в десять раз
+# короче (лимиты клиента GENERAL_DOMAIN_BLACKLIST_SIZE=1000 против
+# VIDEO_DOMAIN_BLACKLIST_SIZE=100). Один потолок на всех переполнил бы медийную.
+SITES_LIMIT_BY_TYPE = {"CPM_BANNER_CAMPAIGN": 100}
+
+
+def sites_limit(campaign_type: str) -> int:
+    return SITES_LIMIT_BY_TYPE.get(campaign_type, MAX_EXCLUDED_SITES)
 
 # Пишем только в запущенные кампании. Остановленная сегодня открутиться уже
 # не может, и такт на неё тратить незачем: включат — попадёт в отчёт и будет

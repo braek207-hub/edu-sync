@@ -5,7 +5,8 @@ from typing import Any, Dict, List, Optional
 
 from sync.placements.classify import CUT_VERDICTS, classify, normalize
 from sync.placements.direct import (CLEANABLE_STATES, CLEANABLE_TYPES,
-                                    MAX_EXCLUDED_SITES, MAX_SITE_CHARS)
+                                    MAX_EXCLUDED_SITES, MAX_SITE_CHARS,
+                                    sites_limit)
 
 # Сколько верхних по кликам площадок кампании смотрит один такт. Ворота
 # защищают лимит слотов: мусорный хвост исчисляется тысячами имён, и без
@@ -13,9 +14,11 @@ from sync.placements.direct import (CLEANABLE_STATES, CLEANABLE_TYPES,
 # хвоста ждёт, пока не станет заметна кликами.
 TOP_N = 30
 
-# Потолок заполнения. Остаток держим под ручные запреты директолога: список
-# общий, и выбрать его целиком значит отнять у человека рычаг.
-FILL_CEILING = 900
+# Доля лимита, которую вправе занять робот. Остаток держим под ручные запреты
+# директолога: список общий, и выбрать его целиком значит отнять у человека
+# рычаг. Считается от лимита ТИПА кампании — у медийной он вдесятеро короче.
+FILL_SHARE = 0.9
+FILL_CEILING = int(MAX_EXCLUDED_SITES * FILL_SHARE)
 
 
 def site_is_valid(site: str):
@@ -123,8 +126,8 @@ def plan_account(rows: List[Dict[str, Any]],
                 "campaign_id": cid,
                 "clicks": sum(v["clicks"] for v in sites.values()),
                 "cost": round(sum(v["cost"] for v in sites.values()), 2),
-                "reason": "недоступна API v5 (тип не поддерживается) — "
-                          "чистить только руками в интерфейсе"})
+                "reason": "не видна API v5 (Мастер кампаний) — запрет "
+                          "площадок недоступен и в интерфейсе"})
             continue
         if campaign.get("Type") not in CLEANABLE_TYPES:
             refused.append({"campaign_id": cid, "name": campaign.get("Name"),
@@ -170,21 +173,25 @@ def plan_account(rows: List[Dict[str, Any]],
         if not added:
             continue
 
-        room = fill_ceiling - len(existing)
+        limit = sites_limit(campaign.get("Type"))
+        ceiling = (fill_ceiling if limit >= MAX_EXCLUDED_SITES
+                   else int(limit * FILL_SHARE))
+        room = ceiling - len(existing)
         if room <= 0:
             refused.append({
                 "campaign_id": cid, "name": campaign.get("Name"),
                 "reason": "список запретов заполнен (%d из %d), чистильщик "
-                          "исчерпан" % (len(existing), MAX_EXCLUDED_SITES)})
+                          "исчерпан" % (len(existing), limit)})
             continue
         if len(added) > room:
             refused.append({
                 "campaign_id": cid, "name": campaign.get("Name"),
                 "reason": "до потолка %d осталось %d слотов, отложено %d "
-                          "площадок" % (fill_ceiling, room, len(added) - room)})
+                          "площадок" % (ceiling, room, len(added) - room)})
             added = added[:room]
 
-        merged = merge_sites(existing, [a["placement"] for a in added])
+        merged = merge_sites(existing, [a["placement"] for a in added],
+                             max_sites=limit)
         actions.append({
             "campaign_id": cid,
             "campaign_name": campaign.get("Name"),
