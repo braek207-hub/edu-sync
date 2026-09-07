@@ -101,7 +101,12 @@ def run_login(account, login: str, apply: bool, top_n: int,
             sum(a["cut_clicks"] for a in actions),
             sum(a["cut_cost"] for a in actions)))
     for item in plan["refused"][:10]:
-        _out("    отказ: %s" % item.get("reason"))
+        # Деньги в отказе показываем всегда: недостижимая кампания молча
+        # съедает бюджет, и без цифры это выглядит рядовой технической
+        # строкой, а не решением, которое человеку надо принять.
+        money = ("  [%d кл, %.0f ₽]" % (item["clicks"], item["cost"])
+                 if item.get("clicks") else "")
+        _out("    отказ: %s%s" % (item.get("reason"), money))
 
     # Журнал важен, но чистка важнее: недоступная база не повод оставить
     # кабинет грязным. Отказ журнала виден в выводе и не глушится.
