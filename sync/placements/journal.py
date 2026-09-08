@@ -176,3 +176,23 @@ def save_llm_verdicts(verdicts, model: str) -> None:
                       decided_at = now()
                 """, rows)
         conn.commit()
+
+
+def robot_cuts(account: str):
+    """Что робот запрещал сам: кампания → множество площадок.
+
+    Нужно для обратного хода. Снимать всё подряд по имени нельзя: тот же
+    com.avito.android директолог мог запретить руками годом раньше, и стирать
+    его решение — не право робота. Репетиция снятия 08.09.2026 нашла такие
+    имена в 24 кампаниях Russever, и своих среди них была меньшая часть.
+    """
+    out = {}
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT campaign_id, placement "
+                        "FROM placement_cleaner_cuts "
+                        "WHERE account = %s AND applied", (account,))
+            for campaign_id, placement in cur.fetchall():
+                out.setdefault(str(campaign_id), set()).add(
+                    (placement or "").strip().lower())
+    return out

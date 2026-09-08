@@ -80,7 +80,12 @@ JUNK_TOKENS = frozenset({
 # подстрока здесь недопустима — в живых данных EDU есть vk.baraholka.russia,
 # и по подстроке «vk» барахолка прошла бы как ВКонтакте.
 ALLOW_EXACT = frozenset({
+    # Одно приложение живёт под двумя нотациями: у ВК Видео и Авито в
+    # AppGallery/Google Play префиксы com.*, а не ru.*, и списка ru.* мало —
+    # аудит запретов 08.09.2026 нашёл com.avito.android в пяти кампаниях.
     "com.vkontakte.android", "com.vk.vkclient", "com.vk.im", "com.vk.music",
+    "com.vk.vkvideo.prod", "com.vk.calls", "com.avito.android",
+    "com.rutube.app",
     "ru.ok.android", "ru.ok.messages", "ru.odnoklassniki.iphone",
     "ru.zen.android",
     "ru.mail.mailapp", "ru.mail.mail", "ru.mail.cloud",

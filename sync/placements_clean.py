@@ -161,6 +161,41 @@ def run_login(account, login: str, apply: bool, top_n: int,
             "ok": applied_ok, "failed": applied_bad}
 
 
+def unban(account, login: str, sites, apply: bool, mine=None) -> int:
+    """Снять указанные площадки из всех кампаний кабинета.
+
+    Обратный ход нужен ровно потому, что словарь ошибается: allowlist узнал
+    об имени позже, чем робот его запретил, и без снятия ошибка остаётся в
+    кабинете навсегда — merge_sites прежние запреты не трогает.
+
+    Снимается только своё: mine — журнал робота (кампания → площадки). Тот же
+    com.avito.android директолог мог запретить руками, и стирать его решение
+    заодно со своей ошибкой недопустимо.
+    """
+    token = account.token()
+    hits = 0
+    for campaign in direct.campaigns(token, login):
+        items = (campaign.get("ExcludedSites") or {}).get("Items") or []
+        own = (mine or {}).get(str(campaign["Id"]), set())
+        keep = [s for s in items
+                if not (s.strip().lower() in sites
+                        and s.strip().lower() in own)]
+        if len(keep) == len(items):
+            continue
+        gone = sorted(set(items) - set(keep))
+        _out("    %s «%s» −%d: %s"
+             % (campaign["Id"], (campaign.get("Name") or "")[:34],
+                len(gone), ", ".join(gone)))
+        hits += 1
+        if not apply:
+            continue
+        ok, note = direct.set_excluded_sites(token, login,
+                                             str(campaign["Id"]), keep)
+        if not ok:
+            _out("        ✗ %s" % note)
+    return hits
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Чистильщик площадок РСЯ")
     parser.add_argument("--apply", action="store_true",
@@ -171,6 +206,9 @@ def main(argv=None) -> int:
                         help="кабинеты через запятую; пусто — все доступные")
     parser.add_argument("--top-n", type=int, default=planner.TOP_N,
                         help="сколько верхних по кликам смотреть в кампании")
+    parser.add_argument("--unban", default="",
+                        help="снять эти площадки из всех кампаний "
+                             "(через запятую) и выйти")
     parser.add_argument("--llm", action="store_true",
                         help="спрашивать модель по кандидатам (нужен ключ)")
     parser.add_argument("--no-db", action="store_true",
@@ -198,6 +236,32 @@ def main(argv=None) -> int:
     # Второй судья по умолчанию выключен: провайдер платный, и без
     # явного согласия такт за него не платит.
     ask = llm.asker() if args.llm else None
+    if args.unban:
+        sites = {s.strip().lower() for s in args.unban.split(",") if s.strip()}
+        _out("снятие запретов (%s): %s"
+             % ("БОЕВОЕ" if apply else "репетиция", ", ".join(sorted(sites))))
+        touched = 0
+        for account, logins in ready:
+            mine = {}
+            if use_db:
+                try:
+                    mine = journal.robot_cuts(account.key)
+                except Exception as err:
+                    _out("  журнал недоступен: %s" % err)
+            if not mine:
+                # Без журнала свой запрет неотличим от человеческого.
+                _out("  [%s] журнала нет — снимать небезопасно, пропуск"
+                     % account.key)
+                continue
+            for login in logins:
+                _out("\n[%s / %s]" % (account.key, login))
+                try:
+                    touched += unban(account, login, sites, apply, mine)
+                except Exception as err:
+                    _out("  ОШИБКА: %s" % err)
+        _out("\nитого затронуто кампаний: %d" % touched)
+        return 0
+
     _out("режим: %s, кабинетов %d, ворота топ-%d по кликам, второй судья: %s"
          % ("БОЕВОЙ" if apply else "репетиция", len(ready), args.top_n,
             ("модель %s" % llm_model(ask)) if ask else "выключен (нужен --llm)"))
