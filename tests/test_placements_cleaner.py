@@ -150,6 +150,14 @@ def test_media_campaign_is_cleaned_with_its_own_limit():
     assert "из 100" in plan["refused"][0]["reason"]
 
 
+def test_unified_campaign_is_cleaned():
+    """ЕПК — формат, в который Директ переводит все новые кампании."""
+    plan = plan_account([_row(1, "com.junk.app", 50)],
+                        [_campaign(1, type_="UNIFIED_CAMPAIGN")])
+    assert plan["actions"][0]["added"][0]["placement"] == "com.junk.app"
+    assert plan["refused"] == []
+
+
 def test_fill_ceiling_leaves_room_for_human():
     existing = ["site%d.ru" % i for i in range(899)]
     rows = [_row(1, "com.a.app", 9), _row(1, "com.b.app", 8)]
