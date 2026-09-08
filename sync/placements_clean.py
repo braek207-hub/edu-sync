@@ -74,8 +74,16 @@ def run_login(account, login: str, apply: bool, top_n: int,
               use_db: bool, ask=None) -> dict:
     token = account.token()
     _out("\n[%s / %s] отчёт площадок за сегодня…" % (account.key, login))
-    rows = direct.placements_today(token, login)
+    # Кампании сначала: у агентского кабинета половина клиентов пустая или
+    # выключена, и заказывать по ним отчёт — минуты прогона впустую.
     campaigns = direct.campaigns(token, login)
+    live = [c for c in campaigns
+            if c.get("Type") in direct.CLEANABLE_TYPES
+            and c.get("State") in direct.CLEANABLE_STATES]
+    if not live:
+        _out("  нечего чистить: ни одной запущенной кампании с рычагом")
+        return {"sites": 0, "campaigns": 0, "ok": 0, "failed": 0}
+    rows = direct.placements_today(token, login)
     plan = planner.plan_account(rows, campaigns, top_n=top_n)
 
     if ask is not None:
