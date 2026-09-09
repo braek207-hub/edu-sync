@@ -126,8 +126,9 @@ def plan_account(rows: List[Dict[str, Any]],
                 "campaign_id": cid,
                 "clicks": sum(v["clicks"] for v in sites.values()),
                 "cost": round(sum(v["cost"] for v in sites.values()), 2),
-                "reason": "не видна API v5 (Мастер кампаний) — запрет "
-                          "площадок недоступен и в интерфейсе"})
+                "reason": "не видна API v5 (Мастер кампаний) — роботу не "
+                          "достать; руками: Отчёт по площадкам → галочки → "
+                          "«Запретить показы»"})
             continue
         if campaign.get("Type") not in CLEANABLE_TYPES:
             refused.append({"campaign_id": cid, "name": campaign.get("Name"),
