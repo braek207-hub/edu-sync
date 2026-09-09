@@ -3,13 +3,18 @@ name: placement-cleaner
 # вне allowlist, DSP-обменники, игры, помойные домены) во всех подключённых
 # кабинетах.
 #
-# Почему ежечасно, а не раз в два часа, как agent-alerts: окно отчёта — TODAY,
-# и весь смысл такта в том, чтобы новая мусорная площадка жила часы, а не
-# сутки. Прогон стоит одного отчёта на кабинет; суточный лимит баллов Директа
-# и так нарезан на 24 часовых окна, так что час ложится в него ровно.
+# Такт должен идти раз в 20–30 минут: окно отчёта — TODAY, и весь смысл в
+# том, чтобы новая мусорная площадка жила минуты, а не сутки.
+#
+# Расписанию Actions это доверить нельзя. Замер 07–09.09.2026: при cron
+# «5 * * * *» GitHub поднял 13 прогонов за трое суток вместо 72 — реальные
+# промежутки 2,6–5,5 часа, потому что запуски по расписанию в очереди
+# отбрасываются под нагрузкой, особенно в начале часа. Поэтому расписание
+# теперь только будильник раз в три часа, а частоту держит цикл внутри
+# самого прогона: один раннер делает PASSES тактов с шагом PASS_GAP.
 on:
   schedule:
-    - cron: "5 * * * *"
+    - cron: "23 */3 * * *"
   workflow_dispatch:
     inputs:
       apply:
@@ -31,7 +36,9 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Цикл занимает ~2,5 часа; потолок с запасом, но заведомо меньше трёх
+    # часов, чтобы прогон закончился до будильника следующего.
+    timeout-minutes: 170
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,15 +54,40 @@ jobs:
           # Второй судья: без ключа слой молча выключается,
           # чистка идёт одним словарём.
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # Семь тактов с шагом 25 минут ≈ 2,5 часа непрерывной чистки на
+          # один будильник расписания.
+          PASSES: "7"
+          PASS_GAP: "1500"
         run: |
           # По расписанию — боевой прогон; руками по умолчанию репетиция,
           # чтобы проверка правил не резала кабинет молча.
           ACCOUNTS="${{ github.event.inputs.accounts }}"
           ARGS=""
           if [ -n "$ACCOUNTS" ]; then ARGS="--accounts $ACCOUNTS"; fi
+          MODE="--dry-run"
+          PASSES_NOW=1
           if [ "${{ github.event_name }}" = "schedule" ] \
              || [ "${{ github.event.inputs.apply }}" = "true" ]; then
-            python -m sync.placements_clean --apply $ARGS
-          else
-            python -m sync.placements_clean --dry-run $ARGS
+            MODE="--apply"
+          fi
+          # Цикл — только у расписания: ручной запуск должен отвечать сразу,
+          # а не держать раннер два часа ради одной проверки.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            PASSES_NOW="$PASSES"
+          fi
+
+          failed=0
+          i=1
+          while [ "$i" -le "$PASSES_NOW" ]; do
+            echo "::group::такт $i из $PASSES_NOW"
+            # Падение одного такта (сеть Директа, отказ клиента) не должно
+            # обрывать цикл: следующий через 25 минут доберёт то же самое.
+            python -m sync.placements_clean $MODE $ARGS || failed=$((failed + 1))
+            echo "::endgroup::"
+            if [ "$i" -lt "$PASSES_NOW" ]; then sleep "$PASS_GAP"; fi
+            i=$((i + 1))
+          done
+          if [ "$failed" -gt 0 ]; then
+            echo "тактов с ошибкой: $failed из $PASSES_NOW"
+            exit 1
           fi
