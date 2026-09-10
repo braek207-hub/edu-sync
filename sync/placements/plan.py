@@ -58,7 +58,8 @@ def plan_account(rows: List[Dict[str, Any]],
                  fill_ceiling: int = FILL_CEILING,
                  allow_exact=None,
                  allow_prefix=None,
-                 overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                 overrides: Optional[Dict[str, Any]] = None,
+                 always_block=None) -> Dict[str, Any]:
     """Строки отчёта + кампании кабинета → план запретов по кампаниям.
 
     Возвращает действия (что писать), отказы (почему не пишем) и сводку
@@ -91,12 +92,19 @@ def plan_account(rows: List[Dict[str, Any]],
         d["clicks"] += clicks
         d["cost"] += cost
 
+    forced = [s for s in (normalize(x) for x in (always_block or [])) if s]
+
     verdicts = {site: classify(site, **kwargs) for site in day}
     # Поправки второго судьи (llm.py) ложатся поверх словаря. Только «резать»:
     # согласие модели со словарём ничего не меняет и в план не едет.
     for site, verdict in (overrides or {}).items():
         if site in verdicts:
             verdicts[site] = verdict
+    # Решение человека главнее обоих судей: в списке кабинета площадка
+    # запрещается, даже если словарь считает её крупным порталом.
+    for site in forced:
+        if site in verdicts:
+            verdicts[site] = ("forced", "обязательная минусация кабинета")
 
     summary: Dict[str, Dict[str, Any]] = {}
     for site, (verdict, _) in verdicts.items():
@@ -112,7 +120,17 @@ def plan_account(rows: List[Dict[str, Any]],
     # площадка всё равно не будет запрещена этим тактом.
     candidates: Dict[str, int] = {}
 
-    for cid, sites in sorted(pair.items()):
+    # Кампании из отчёта плюс — если у кабинета есть обязательный список —
+    # все пригодные кампании кабинета: обязательная минусация не ждёт, пока
+    # площадка наберёт клики, она должна стоять в списке заранее.
+    cids = set(pair)
+    if forced:
+        cids |= {str(c["Id"]) for c in campaigns
+                 if c.get("Type") in CLEANABLE_TYPES
+                 and c.get("State") in CLEANABLE_STATES}
+
+    for cid in sorted(cids):
+        sites = pair.get(cid, {})
         campaign = by_id.get(cid)
         if campaign is None:
             # Кампания есть в статистике, но campaigns/get её не отдаёт даже
@@ -156,7 +174,25 @@ def plan_account(rows: List[Dict[str, Any]],
         fresh.sort(key=lambda item: (-item[1], -item[2], item[0]))
 
         added: List[Dict[str, Any]] = []
+        # Обязательные — первыми и вне ворот: они не соревнуются за место в
+        # топе по кликам, потому что их запретил человек, а не правило.
+        for site in forced:
+            if site in known:
+                continue
+            ok, bad = site_is_valid(site)
+            if not ok:
+                refused.append({"campaign_id": cid, "placement": site,
+                                "reason": bad})
+                continue
+            stat = sites.get(site) or {"clicks": 0, "cost": 0.0}
+            added.append({"placement": site, "clicks": stat["clicks"],
+                          "cost": round(stat["cost"], 2), "verdict": "forced",
+                          "reason": "обязательная минусация кабинета"})
+            known.add(site)
+
         for site, clicks, cost in fresh[:top_n]:
+            if site in known:
+                continue  # уже взят обязательным списком выше
             verdict, why = verdicts[site]
             if verdict not in CUT_VERDICTS:
                 if verdict == "site":

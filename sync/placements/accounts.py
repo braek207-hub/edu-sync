@@ -9,7 +9,7 @@
 
 import json
 import os
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 
 class Account(NamedTuple):
@@ -19,6 +19,10 @@ class Account(NamedTuple):
     login: Optional[str] = None       # Client-Login; None — прямой кабинет
     logins_env: Optional[str] = None  # JSON со списком клиентов агентства
     agency: bool = False              # спросить список клиентов у Директа
+    # Площадки, которые в этом кабинете запрещаются всегда: не по вердикту
+    # словаря и не по кликам, а решением человека. Список кабинетный —
+    # почта и Дзен у одного клиента сливают бюджет, у другого приносят лиды.
+    always_block: Tuple[str, ...] = ()
 
     def token(self) -> str:
         return os.environ.get(self.token_env, "").strip()
@@ -28,7 +32,15 @@ class Account(NamedTuple):
 # обкатывался, и его данные — эталон для проверки правил.
 ACCOUNTS: List[Account] = [
     Account("russever", "Групп Орсо (Russever)", "RUSSEVER_DIRECT",
-            login="orso-groupmedia"),
+            login="orso-groupmedia",
+            # Решение Павла 10.09.2026, только для этого кабинета: почтовые
+            # интерфейсы и игры Яндекса откручивают бюджет без заявок.
+            # Словарь их не режет и резать не должен — mail.ru и yandex.ru
+            # это крупные площадки, вопрос ставок, а не мусора; здесь работает
+            # не вердикт, а прямое указание.
+            always_block=("mail.yandex.ru", "mail.ru", "win.mail.ru",
+                          "images.yandex.ru", "mail.rambler.ru",
+                          "m.games.yandex.ru")),
     # EDU — агентский кабинет: клиентов два десятка, и список живёт у самого
     # Директа. Секрет DIRECT_CLIENTS_JSON перечисляет только тех, у кого
     # проставлены цели, — чистить надо всех, включая новых, о которых секрет

@@ -144,7 +144,7 @@ CORE_TLDS = frozenset({
 
 # «llm» ставит второй судья (llm.py) поверх словаря: сайт правильной формы,
 # который модель опознала как дорвей, помойку или пиратку.
-CUT_VERDICTS = frozenset({"app", "dsp", "game", "junk", "llm"})
+CUT_VERDICTS = frozenset({"app", "dsp", "game", "junk", "llm", "forced"})
 
 
 def normalize(name: str) -> str:

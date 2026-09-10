@@ -150,6 +150,52 @@ def test_media_campaign_is_cleaned_with_its_own_limit():
     assert "из 100" in plan["refused"][0]["reason"]
 
 
+FORCED = ("mail.ru", "m.games.yandex.ru")
+
+
+def test_forced_sites_are_banned_without_any_clicks():
+    """Обязательная минусация не ждёт статистики: список стоит заранее."""
+    plan = plan_account([], [_campaign(1)], always_block=FORCED)
+    added = [a["placement"] for a in plan["actions"][0]["added"]]
+    assert added == ["mail.ru", "m.games.yandex.ru"]
+    assert plan["actions"][0]["added"][0]["verdict"] == "forced"
+
+
+def test_forced_beats_the_dictionary():
+    """mail.ru словарь считает крупным порталом — решение человека главнее."""
+    assert classify("mail.ru")[0] == "site"
+    plan = plan_account([_row(1, "mail.ru", 40)], [_campaign(1)],
+                        always_block=FORCED)
+    cut = {a["placement"]: a for a in plan["actions"][0]["added"]}
+    assert cut["mail.ru"]["verdict"] == "forced"
+    assert cut["mail.ru"]["clicks"] == 40
+    assert plan["summary"]["forced"]["sites"] == 1
+
+
+def test_forced_not_repeated_and_not_re_added():
+    """Уже запрещённую площадку второй раз не пишем."""
+    plan = plan_account([_row(1, "mail.ru", 40)],
+                        [_campaign(1, excluded=["mail.ru"])],
+                        always_block=FORCED)
+    added = [a["placement"] for a in plan["actions"][0]["added"]]
+    assert added == ["m.games.yandex.ru"]
+
+
+def test_forced_only_for_the_account_that_asked():
+    """Без списка кабинета почта остаётся нетронутой."""
+    plan = plan_account([_row(1, "mail.ru", 40)], [_campaign(1)])
+    assert plan["actions"] == []
+
+
+def test_forced_skips_campaigns_without_the_lever():
+    """Остановленная и чужого типа кампания обязательного списка не получает."""
+    stopped = dict(_campaign(1), State="SUSPENDED")
+    smart = _campaign(2, type_="SMART_CAMPAIGN")
+    plan = plan_account([], [stopped, smart], always_block=FORCED)
+    assert plan["actions"] == []
+    assert plan["refused"] == []
+
+
 def test_unified_campaign_is_cleaned():
     """ЕПК — формат, в который Директ переводит все новые кампании."""
     plan = plan_account([_row(1, "com.junk.app", 50)],

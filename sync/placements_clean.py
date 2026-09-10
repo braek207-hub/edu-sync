@@ -84,7 +84,9 @@ def run_login(account, login: str, apply: bool, top_n: int,
         _out("  нечего чистить: ни одной запущенной кампании с рычагом")
         return {"sites": 0, "campaigns": 0, "ok": 0, "failed": 0}
     rows = direct.placements_today(token, login)
-    plan = planner.plan_account(rows, campaigns, top_n=top_n)
+    forced = account.always_block
+    plan = planner.plan_account(rows, campaigns, top_n=top_n,
+                                always_block=forced)
 
     if ask is not None:
         overrides, note = ask_model(plan, ask, use_db)
@@ -92,8 +94,11 @@ def run_login(account, login: str, apply: bool, top_n: int,
             _out(note)
         if overrides:
             plan = planner.plan_account(rows, campaigns, top_n=top_n,
-                                        overrides=overrides)
+                                        overrides=overrides,
+                                        always_block=forced)
 
+    if forced:
+        _out("  обязательная минусация кабинета: %s" % ", ".join(forced))
     _out("  площадок за день: %d, кликов %d, расход %.0f ₽"
          % (plan["day_sites"], plan["day_clicks"], plan["day_cost"]))
     for verdict in sorted(plan["summary"],
