@@ -1,0 +1,62 @@
+name: russever-creo
+# Напоминание в Telegram, в каком городе РосСеверЭкспо пора менять креативы.
+#
+# Такт идёт раз в сутки утром по Москве. Расписание Actions ненадёжно (замер
+# 07–09.09.2026: 13 прогонов вместо 72), но здесь это не страшно: сообщение
+# не одноразовое событие, а сверка «фаза по календарю против того, что залито
+# в кабинет». Пока креативы не обновлены, напоминание приходит и на следующий
+# день. Второй будильник вечером — на случай, если утренний отбросили.
+on:
+  schedule:
+    - cron: "12 6 * * *"    # 09:12 МСК
+    - cron: "12 15 * * *"   # 18:12 МСК
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Дата ГГГГ-ММ-ДД (пусто — сегодня по МСК)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Только напечатать, не отправлять (true/false)"
+        required: false
+        default: "true"
+      force:
+        description: "Отправить даже когда менять нечего (true/false)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: russever-creo
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Creative phase reminder
+        env:
+          # Кабинет читается, чтобы отличить «пора менять» от «уже поменяли».
+          # Без токена такт не падает — сверка идёт только по календарю.
+          RUSSEVER_DIRECT: ${{ secrets.RUSSEVER_DIRECT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          # По расписанию — боевая отправка; руками по умолчанию репетиция,
+          # чтобы проверка формулировок не будила Павла лишним сообщением.
+          if [ "${{ github.event_name }}" != "schedule" ] \
+             && [ "${{ github.event.inputs.dry_run }}" != "false" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+          python -m sync.russever_creo_alert $ARGS
