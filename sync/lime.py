@@ -55,11 +55,7 @@ def classify(source: str, medium: str):
     if m in ("cpm",) and s not in ("", "(not set)"):
         return "SEM", s.capitalize()
 
-    # `vk-ads-(ex.-mytarget)` / medium (not set) — сессии приложения без UTM, которые
-    # AppMetrica подписала источником УСТАНОВКИ (publisher «VK Ads (ex. myTarget)»).
-    # Это платные установки, не органика — тот же случай, что `yandex.direct / (not set)`
-    # в SEM выше. До 11.09.2026 падало в SMM (organic): ~140 тыс. сессий/мес.
-    if any(x in s for x in ["vk_ads", "vkads", "vk-ads"]):
+    if any(x in s for x in ["vk_ads", "vkads"]):
         return "SMM paid", "VK.Ads"
     if "vkontakte" in s and m in ("cpc", "cpa"):
         return "SMM paid", "VK.Ads"
