@@ -109,9 +109,13 @@ def trackers_with_raw_macro():
         print(f"   {tid} | {name} | {pub} | {a['installs']} | {a['raw']} | {a['sample']}")
 
 
+def _truthy(v):
+    return (v or "").strip().lower() in ("1", "true", "yes")
+
+
 def _raw_macro_by_tracker(endpoint: str, fields: str, param_field: str, days: int):
     """Клики/диплинки трекеров (в т.ч. ремаркетинг — RT-атрибуция) с сырым макросом.
-    Окно короткое: кликов на порядок больше установок."""
+    Окно один день: 5 дней кликов убили раннер (SIGTERM 143 на 6-й минуте, память)."""
     token = os.environ.get("APPMETRICA_TOKEN")
     if not token:
         return
@@ -119,7 +123,7 @@ def _raw_macro_by_tracker(endpoint: str, fields: str, param_field: str, days: in
     since = (datetime.fromisoformat(TO) - timedelta(days=days - 1)).date().isoformat()
     print(f"\n── {endpoint}: сырой {{utm_source}} по трекерам, {since}..{TO} ──")
     rows = fetch_export(endpoint, app_id, token, since, TO, fields)
-    print(f"   строк: {len(rows)}")
+    print(f"   строк: {len(rows)}", flush=True)
     acc = defaultdict(lambda: {"n": 0, "raw": 0, "sample": ""})
     for r in rows:
         key = (r.get("tracking_id") or "", r.get("tracker_name") or "", r.get("publisher_name") or "")
@@ -137,15 +141,16 @@ def _raw_macro_by_tracker(endpoint: str, fields: str, param_field: str, days: in
 
 
 def main():
-    print(f"[probe] окно {FROM} .. {TO}")
-    direct_without_utm()
-    trackers_with_raw_macro()
+    print(f"[probe] окно {FROM} .. {TO}", flush=True)
+    if not _truthy(os.environ.get("PROBE_SKIP_PART1")):
+        direct_without_utm()
+        trackers_with_raw_macro()
     _raw_macro_by_tracker(
         "clicks", "tracker_name,tracking_id,publisher_name,click_url_parameters,click_datetime",
-        "click_url_parameters", 5)
+        "click_url_parameters", 1)
     _raw_macro_by_tracker(
         "deeplinks", "tracker_name,tracking_id,publisher_name,deeplink_url_parameters,deeplink_datetime",
-        "deeplink_url_parameters", 5)
+        "deeplink_url_parameters", 1)
 
 
 if __name__ == "__main__":
