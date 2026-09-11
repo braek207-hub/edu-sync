@@ -110,7 +110,54 @@ def classify(source: str, medium: str):
     return "Others", s or m or "Unknown"
 
 
-def aggregate(rows):
+def load_vk_group_map(pg_url: str) -> dict:
+    """Группа VK → (кампания ad_plan, её имя из кабинета).
+
+    В ссылках VK Ads макрос {{campaign_id}} несёт id ГРУППЫ (наследие myTarget), PROCONTEXT
+    кладёт его в сырой `campaign`, а campaign_id/campaign_name ставит по своему
+    справочнику. Тот справочник знает не все кабинеты: группы кабинетов 809330054/814617419/
+    814620282, созданные после 01.07.2026, остались без campaign_id (замер 11.09.2026:
+    20 тыс. сессий за две недели ушли в строку без кампании, все 14 групп есть в
+    lime_vk_entities). Свой справочник собирает sync/lime_vk_ads.py по всем 4 кабинетам.
+    """
+    conn = psycopg2.connect(pg_url, connect_timeout=30)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT e.entity_id, e.ad_plan_id, s.campaign_name
+                FROM lime_vk_entities e
+                LEFT JOIN LATERAL (
+                    SELECT campaign_name FROM lime_vk_ads_stats
+                    WHERE campaign_id = e.ad_plan_id AND campaign_name IS NOT NULL
+                    ORDER BY date DESC LIMIT 1
+                ) s ON TRUE
+                WHERE e.kind = 'ad_group' AND e.ad_plan_id IS NOT NULL
+                """
+            )
+            return {str(g): (str(p), n or "") for g, p, n in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+_BAD_ID = {None, "(not set)", "<NA>", ""}
+
+
+def resolve_vk_campaign(r, vk_groups):
+    """(campaign_id, campaign_name) строки: значение PROCONTEXT, если оно есть, иначе —
+    группа VK из сырого `campaign` через наш справочник. Только для источника VK.Ads:
+    числовой `campaign` у других источников — не id группы."""
+    cid, cname = r["campaign_id"], r["campaign_name"]
+    if cid not in _BAD_ID or not vk_groups:
+        return cid, cname
+    s = (r.get("source") or "").lower()
+    if not any(x in s for x in ["vk_ads", "vkads"]):
+        return cid, cname
+    hit = vk_groups.get(str(r.get("campaign") or "").strip())
+    return hit if hit else (cid, cname)
+
+
+def aggregate(rows, vk_groups=None):
     agg = defaultdict(lambda: {
         "cost": 0.0, "clicks": 0.0, "impressions": 0.0,
         "sessions": 0, "users": 0, "clients": 0,
@@ -122,9 +169,8 @@ def aggregate(rows):
     for r in rows:
         channel, subchannel = classify(r["source"] or "", r["medium"] or "")
         is_paid = channel in PAID_CHANNELS
-        cid = r["campaign_id"]
-        cname = r["campaign_name"]
-        bad = {None, "(not set)", "<NA>", ""}
+        cid, cname = resolve_vk_campaign(r, vk_groups)
+        bad = _BAD_ID
 
         key = (
             str(r["date"]),
@@ -202,7 +248,7 @@ def date_chunks(date_from: str, date_to: str):
         d += timedelta(days=1)
 
 
-def sync_chunk(conn_my, day_from: str, day_to: str):
+def sync_chunk(conn_my, day_from: str, day_to: str, vk_groups=None):
     with conn_my.cursor() as cur:
         cur.execute(
             "SELECT * FROM lc_simple_view WHERE date >= %s AND date <= %s",
@@ -213,7 +259,7 @@ def sync_chunk(conn_my, day_from: str, day_to: str):
     if not rows:
         return 0, 0
 
-    agg = aggregate(rows)
+    agg = aggregate(rows, vk_groups)
     data = agg_to_rows(agg)
 
     conn_pg = psycopg2.connect(_pg_url(), connect_timeout=30)
@@ -245,13 +291,21 @@ def sync_lime() -> None:
 
     print(f"[lime-sync] syncing {label}...")
 
+    # Справочник грузится ОДИН раз и обязан быть непустым: день переписывается целиком
+    # (DELETE+INSERT), и пустая карта при зелёном прогоне тихо вернула бы VK-кампании
+    # в строку без campaign_id — та же ловушка, что была у синка AppMetrica.
+    vk_groups = load_vk_group_map(_pg_url())
+    if not vk_groups:
+        raise RuntimeError("lime_vk_entities пуст: справочник групп VK недоступен, синк остановлен")
+    print(f"[lime-sync] справочник групп VK: {len(vk_groups)}")
+
     conn_my = pymysql.connect(**_mysql_cfg())
     try:
         total_raw = 0
         total_agg = 0
         for day in date_chunks(date_from, date_to):
             conn_my.ping(reconnect=True)
-            raw, agg_n = sync_chunk(conn_my, day, day)
+            raw, agg_n = sync_chunk(conn_my, day, day, vk_groups)
             total_raw += raw
             total_agg += agg_n
             print(f"[lime-sync] {day}: raw={raw} -> aggregated={agg_n}")
