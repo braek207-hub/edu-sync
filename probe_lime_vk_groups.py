@@ -113,34 +113,69 @@ def main():
         raw = cur.fetchall()
         show("сырой campaign у app-строк VK без campaign_id", raw, 80)
 
-    pg = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
-    gids = sorted({str(r["campaign"]) for r in raw if str(r["campaign"] or "").isdigit()})
-    if gids:
-        with pg.cursor() as cur:
-            cur.execute(
-                "SELECT entity_id, kind, ad_plan_id, cabinet, name FROM lime_vk_entities WHERE entity_id = ANY(%s)",
-                (gids,),
-            )
-            found = {r[0]: r[1:] for r in cur.fetchall()}
-        tot = sum(int(r["sessions"] or 0) for r in raw)
-        ok = sum(int(r["sessions"] or 0) for r in raw if str(r["campaign"]) in found)
-        print(f"\n── сырой campaign против lime_vk_entities: {len(gids)} id, найдено {len(found)}; "
-              f"сессий резолвится {ok} из {tot} ──")
-        for i in gids:
-            print(f"  {i}: {found.get(i, 'нет в справочнике')}")
+        # 5. Корзина без id: `vk-ads-(ex.-mytarget)` / medium (not set). Кто это — по неделям,
+        #    по attribution_type/device/OS, и есть ли у неё ХОТЬ ЧТО-ТО в других полях.
+        cur.execute(
+            """
+            SELECT DATE_FORMAT(date - INTERVAL WEEKDAY(date) DAY, '%%Y-%%m-%%d') wk,
+                   source, medium, attribution_type,
+                   SUM(campaign NOT IN ('', '(not set)')) with_campaign,
+                   COUNT(*) n, SUM(sessions) sessions, SUM(purchases_count) orders
+            FROM lc_simple_view
+            WHERE date >= '2026-05-01' AND data_source = 'app'
+              AND (LOWER(source) LIKE '%%vk%%' OR LOWER(source) LIKE '%%mytarget%%')
+              AND (campaign_id IS NULL OR campaign_id IN ('', '(not set)'))
+            GROUP BY 1,2,3,4
+            ORDER BY 1,7 DESC
+            """
+        )
+        show("VK app-строки без campaign_id по неделям", cur.fetchall(), 200)
 
-    # 4. Сверка: campaign_id из MySQL → это ad_plan или ad_group по нашему справочнику
-    ids = sorted({str(r["campaign_id"]) for r in vk if r["campaign_id"] not in (None, "", "(not set)")})
-    if ids:
-        with pg.cursor() as cur:
-            cur.execute(
-                "SELECT entity_id, kind FROM lime_vk_entities WHERE entity_id = ANY(%s)",
-                (ids,),
-            )
-            kinds = {}
-            for eid, kind in cur.fetchall():
-                kinds[kind] = kinds.get(kind, 0) + 1
-        print(f"\n── campaign_id MySQL против lime_vk_entities: {len(ids)} id, по видам {kinds} ──")
+        cur.execute(
+            """
+            SELECT source, medium, attribution_type, source_type, device, operating_system,
+                   ad_platform, ad_platform_account, region, regionCountry,
+                   COUNT(*) n, SUM(sessions) sessions, SUM(purchases_count) orders
+            FROM lc_simple_view
+            WHERE date >= %s AND date <= %s AND data_source = 'app'
+              AND LOWER(source) LIKE '%%mytarget%%'
+            GROUP BY 1,2,3,4,5,6,7,8,9,10
+            ORDER BY sessions DESC
+            """,
+            (FROM, TO),
+        )
+        show("все поля у строк vk-ads-(ex.-mytarget)", cur.fetchall(), 40)
+
+        # Все источники app-строк — чтобы понять, откуда у PROCONTEXT берётся имя паблишера
+        cur.execute(
+            """
+            SELECT source, medium, attribution_type,
+                   SUM(campaign_id NOT IN ('', '(not set)')) with_cid,
+                   COUNT(*) n, SUM(sessions) sessions, SUM(purchases_count) orders
+            FROM lc_simple_view
+            WHERE date >= %s AND date <= %s AND data_source = 'app'
+            GROUP BY 1,2,3
+            ORDER BY sessions DESC
+            LIMIT 40
+            """,
+            (FROM, TO),
+        )
+        show("все источники app-строк", cur.fetchall(), 40)
+
+    pg = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT date_trunc('week', date)::date wk, publisher, COUNT(DISTINCT campaign_id) camps,
+                   SUM(installs) installs
+            FROM lime_app_installs
+            WHERE date >= '2026-05-01' AND publisher ILIKE '%%vk%%'
+            GROUP BY 1,2 ORDER BY 1,2
+            """
+        )
+        print("\n── наши установки VK из AppMetrica по неделям ──")
+        for r in cur.fetchall():
+            print("  ", r)
     pg.close()
     my.close()
 
