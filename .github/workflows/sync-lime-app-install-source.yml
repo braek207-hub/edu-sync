@@ -1,0 +1,43 @@
+name: Sync LIME app install-source daily
+
+# Сессии/покупки приложения по дате × кампания установки (lime_app_install_source_daily).
+# После sync-lime-vk (справочник групп) и sync-lime-appmetrica (04:10 MSK, до 90 мин).
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 06:00 MSK
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "Бэкфилл: начало (YYYY-MM-DD). Пусто — последние APP_SOURCE_DAYS дней"
+        required: false
+        default: ""
+      date_to:
+        description: "Бэкфилл: конец (YYYY-MM-DD, пусто — вчера)"
+        required: false
+        default: ""
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # Бэкфилл с июля = ~25 чанков по 3 дня, каждый — два экспорта Logs API с поллингом.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Sync
+        run: python -m sync.lime_app_install_source
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          APPMETRICA_TOKEN: ${{ secrets.APPMETRICA_TOKEN }}
+          APP_SOURCE_FROM: ${{ github.event.inputs.date_from }}
+          APP_SOURCE_TO: ${{ github.event.inputs.date_to }}
+          APPMETRICA_POLL_MAX: "90"
+          PYTHONIOENCODING: "utf-8"
+      - name: Revalidate dashboard cache
+        if: success()
+        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
