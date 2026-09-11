@@ -42,8 +42,20 @@ def classify(source: str, medium: str):
     s = (source or "").lower().strip()
     m = (medium or "").lower().strip()
 
+    # `yandex.direct` / `(not set)` — сессии приложения без UTM, подписанные AppMetrica
+    # источником УСТАНОВКИ (attribution UA). Расхода и кампании у них нет, как и у
+    # `vk-ads-(ex.-mytarget)`; по решению Павла (11.09.2026) — не в платном.
+    if s == "yandex.direct" and m == "(not set)":
+        return "Direct", "Yandex.Direct (установки)"
     if any(x in s for x in ["ya.direct", "yandex.direct", "y a.direct"]):
         return "SEM", "Яндекс.Директ"
+    # medium `ad` + id рекламной системы — так PROCONTEXT подписывает клики без UTM
+    # (Метрика: TrafficSource=ad, AdvEngine=ya_direct). Кампании нет, но канал известен:
+    # замер 12.08–10.09.2026 — 120 тыс. сессий Директа лежали в Others.
+    if m == "ad" and s == "ya_direct":
+        return "SEM", "Яндекс.Директ"
+    if m == "ad" and s == "google_adwords":
+        return "SEM", "Google.Adwords"
     if "yandex" in s and "market" not in s and m == "cpc":
         return "SEM", "Яндекс.Директ"
     if "google" in s and "brand" not in s and m == "cpc":
@@ -103,8 +115,10 @@ def classify(source: str, medium: str):
     if "olv" in s or m in ("smart-tv", "olv", "video_network"):
         return "Others", "OLV"
 
-    if s in ("(direct)", "(not set)", "", "(no data)", "(undefined)") or \
-            m in ("(none)", "(not set)", ""):
+    # `direct`/`none` и `(not+set)` — те же прямые открытия приложения, только
+    # подписанные AppMetrica иначе (замер 12.08–10.09.2026: 108 тыс. сессий в Others).
+    if s in ("(direct)", "(not set)", "(not+set)", "", "(no data)", "(undefined)") or \
+            m in ("(none)", "(not set)", "(not+set)", "") or (s == "direct" and m == "none"):
         return "Direct", "Direct"
 
     return "Others", s or m or "Unknown"
