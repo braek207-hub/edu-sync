@@ -109,10 +109,43 @@ def trackers_with_raw_macro():
         print(f"   {tid} | {name} | {pub} | {a['installs']} | {a['raw']} | {a['sample']}")
 
 
+def _raw_macro_by_tracker(endpoint: str, fields: str, param_field: str, days: int):
+    """Клики/диплинки трекеров (в т.ч. ремаркетинг — RT-атрибуция) с сырым макросом.
+    Окно короткое: кликов на порядок больше установок."""
+    token = os.environ.get("APPMETRICA_TOKEN")
+    if not token:
+        return
+    app_id = os.environ.get("APPMETRICA_APP_ID") or "4415407"
+    since = (datetime.fromisoformat(TO) - timedelta(days=days - 1)).date().isoformat()
+    print(f"\n── {endpoint}: сырой {{utm_source}} по трекерам, {since}..{TO} ──")
+    rows = fetch_export(endpoint, app_id, token, since, TO, fields)
+    print(f"   строк: {len(rows)}")
+    acc = defaultdict(lambda: {"n": 0, "raw": 0, "sample": ""})
+    for r in rows:
+        key = (r.get("tracking_id") or "", r.get("tracker_name") or "", r.get("publisher_name") or "")
+        a = acc[key]
+        a["n"] += 1
+        params = r.get(param_field) or ""
+        if "{utm_source}" in params or "%7Butm_source%7D" in params:
+            a["raw"] += 1
+            if not a["sample"]:
+                a["sample"] = params[:200]
+    bad = sorted(((k, a) for k, a in acc.items() if a["raw"] > 0), key=lambda kv: -kv[1]["raw"])
+    print(f"   трекеров с сырым макросом: {len(bad)}")
+    for (tid, name, pub), a in bad:
+        print(f"   {tid} | {name} | {pub} | всего {a['n']} | с макросом {a['raw']} | {a['sample']}")
+
+
 def main():
     print(f"[probe] окно {FROM} .. {TO}")
     direct_without_utm()
     trackers_with_raw_macro()
+    _raw_macro_by_tracker(
+        "clicks", "tracker_name,tracking_id,publisher_name,click_url_parameters,click_datetime",
+        "click_url_parameters", 5)
+    _raw_macro_by_tracker(
+        "deeplinks", "tracker_name,tracking_id,publisher_name,deeplink_url_parameters,deeplink_datetime",
+        "deeplink_url_parameters", 5)
 
 
 if __name__ == "__main__":
