@@ -1,0 +1,40 @@
+name: Probe LIME source fixes (Direct без UTM, трекер {utm_source})
+
+# Только чтение: кампании Директа без UTM (Метрика) + трекеры AppMetrica с сырым макросом
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe_from:
+        description: "Начало окна (YYYY-MM-DD, пусто — последние 14 дней)"
+        required: false
+        default: ""
+      probe_to:
+        description: "Конец окна (YYYY-MM-DD)"
+        required: false
+        default: ""
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run probe
+        env:
+          LIME_METRIKA_TOKEN: ${{ secrets.LIME_METRIKA_TOKEN }}
+          APPMETRICA_TOKEN: ${{ secrets.APPMETRICA_TOKEN }}
+          PROBE_FROM: ${{ github.event.inputs.probe_from }}
+          PROBE_TO: ${{ github.event.inputs.probe_to }}
+          PYTHONIOENCODING: "utf-8"
+        run: python probe_lime_source_fixes.py
