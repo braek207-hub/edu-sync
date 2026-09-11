@@ -63,7 +63,11 @@ def fetch_installations(app_id: str, token: str, date_since: str, date_until: st
 
 
 def fetch_purchase_events(app_id: str, token: str, date_since: str, date_until: str,
-                          event_name: str, country: bool = False) -> list[dict]:
+                          event_name: str, country: bool = False,
+                          date_dimension: str = "receive") -> list[dict]:
+    """date_dimension='default' (время события) — для витрин по ДАТЕ покупки, которые
+    пишутся чанками DELETE+INSERT: с 'receive' в окно попадают события за более ранние
+    даты и конфликтуют с уже записанными днями (UniqueViolation 11.09.2026)."""
     params = {
         "application_id": app_id,
         "date_since": f"{date_since} 00:00:00",
@@ -72,7 +76,7 @@ def fetch_purchase_events(app_id: str, token: str, date_since: str, date_until: 
         # AppMetrica UI (янв-2026, M0). С 'default' покупки завышались на +0.5..0.8%
         # из-за сдвига границы месяца; с 'receive' VK совпадает точно (206), остальные
         # в пределах 0.3-0.4% (остаток — антифрод-фильтрация отчётов, в сыром логе её нет).
-        "date_dimension": "receive",
+        "date_dimension": date_dimension,
         "fields": EVENT_FIELDS + (_GEO if country else ""),
         "event_name": event_name,  # серверный фильтр по имени события
     }

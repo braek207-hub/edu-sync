@@ -155,8 +155,15 @@ def sync_lime_app_install_source() -> int:
         conn.commit()
         for c_since, c_until in day_chunks(since, until):
             sessions = fetch_sessions(app_id, token, c_since, c_until)
-            purchases = purchase_facts(fetch_purchase_events(app_id, token, c_since, c_until, event_name))
+            # Покупки по времени СОБЫТИЯ (не приёма): строки витрины — по дате покупки, чанк
+            # переписывает ровно свои даты. Поздние события подхватит ежедневное окно 10 дней.
+            purchases = purchase_facts(fetch_purchase_events(
+                app_id, token, c_since, c_until, event_name, date_dimension="default"))
             rows = build_source_daily(first, sessions, purchases)
+            outside = [r for r in rows if not (c_since <= r[0].isoformat() <= c_until)]
+            if outside:
+                raise RuntimeError(f"[lime-app-source] {c_since}..{c_until}: {len(outside)} строк "
+                                   f"вне окна чанка (первая {outside[0][:3]}) — Logs API вернул чужие даты")
             if not sessions:
                 raise RuntimeError(f"[lime-app-source] {c_since}..{c_until}: сессий 0 — "
                                    f"пустой ответ Logs API, день не переписываем")
