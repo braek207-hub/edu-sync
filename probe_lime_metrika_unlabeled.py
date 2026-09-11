@@ -50,25 +50,18 @@ def fetch(dimensions, filters, limit=60):
 def main():
     print(f"[probe] окно {FROM} .. {TO}")
 
-    print("\n── utm_source=ya_direct: источник по Метрике и кампания Директа (по клику) ──")
+    # `ya_direct`/`ad` у PROCONTEXT — не UTM (по utm_source=ya_direct визитов 0), а id
+    # рекламной системы и типа источника Метрики: AdvEngine=ya_direct, TrafficSource=ad.
+    print("\n── AdvEngine=ya_direct: есть ли utm_campaign и какая кампания по клику ──")
     fetch(
-        ("ym:s:lastsignTrafficSource", "ym:s:lastsignSourceEngine",
-         "ym:s:lastsignDirectClickOrder", "ym:s:lastsignDirectClickOrderName", "ym:s:lastsignUTMMedium"),
-        "ym:s:lastsignUTMSource=='ya_direct'",
+        ("ym:s:lastsignUTMSource", "ym:s:lastsignUTMCampaign",
+         "ym:s:lastsignDirectClickOrder", "ym:s:lastsignDirectClickOrderName"),
+        "ym:s:lastsignAdvEngine=='ya_direct'",
+        limit=80,
     )
 
-    print("\n── utm_source=ya_direct: utm_campaign / utm_content ──")
-    fetch(
-        ("ym:s:lastsignUTMCampaign", "ym:s:lastsignUTMContent"),
-        "ym:s:lastsignUTMSource=='ya_direct'",
-        limit=30,
-    )
-
-    print("\n── Директ по клику (yclid) БЕЗ utm_campaign: сколько всего и какие кампании ──")
-    fetch(
-        ("ym:s:lastsignUTMSource", "ym:s:lastsignDirectClickOrder", "ym:s:lastsignDirectClickOrderName"),
-        "ym:s:lastsignSourceEngine=='Яндекс: Директ' AND ym:s:lastsignUTMCampaign=='(not set)'",
-    )
+    print("\n── AdvEngine=ya_direct: только по наличию utm_source ──")
+    fetch(("ym:s:lastsignUTMSource",), "ym:s:lastsignAdvEngine=='ya_direct'", limit=20)
 
     print("\n── google/cpc: utm_campaign и что Метрика знает ──")
     fetch(
