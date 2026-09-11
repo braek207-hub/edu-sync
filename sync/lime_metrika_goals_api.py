@@ -29,6 +29,7 @@ DIMENSIONS = (
     "ym:s:date",
     "ym:s:lastsignTrafficSource",
     "ym:s:lastsignSourceEngine",
+    "ym:s:lastsignDirectClickOrder",
     "ym:s:lastsignDirectClickOrderName",
     "ym:s:lastsignUTMCampaign",
 )
@@ -110,6 +111,7 @@ def parse_goal_rows(resp: dict, goal_ids: list[str]) -> list[dict]:
             "date": dim(dims, "ym:s:date", "name"),
             "traffic_source": dim(dims, "ym:s:lastsignTrafficSource", "id"),
             "source_engine": dim(dims, "ym:s:lastsignSourceEngine", "name"),
+            "direct_order_id": dim(dims, "ym:s:lastsignDirectClickOrder", "id"),
             "direct_campaign_name": dim(dims, "ym:s:lastsignDirectClickOrderName", "name"),
             "utm_campaign": dim(dims, "ym:s:lastsignUTMCampaign", "name"),
         }

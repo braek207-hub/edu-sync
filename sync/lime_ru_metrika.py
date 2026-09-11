@@ -24,8 +24,9 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync.lime import load_vk_group_map
 from sync.lime_ru_metrika_api import fetch_ru_traffic
-from sync.metrika_channels import map_metrika_channel
+from sync.lime_ru_metrika_keys import campaign_key, ru_channel
 
 COUNTER_ID = os.environ.get("LIME_METRIKA_COUNTER_ID") or "23504302"
 DAYS_BACK = int(os.environ.get("LIME_RU_METRIKA_DAYS_BACK") or "30")
@@ -40,12 +41,12 @@ INSERT_SQL = f"INSERT INTO lime_metrika_campaign_ru ({', '.join(COLUMNS)}) VALUE
 DELETE_SQL = "DELETE FROM lime_metrika_campaign_ru WHERE date >= %s AND date <= %s"
 
 
-def build_rows(metrika_rows, date_s: str) -> list[tuple]:
+def build_rows(metrika_rows, date_s: str, vk_groups: dict | None = None) -> list[tuple]:
     """Свернуть строки Метрики за день в кортежи порядка COLUMNS.
 
-    Ключ свёртки — (channel, subchannel, campaign_id, campaign_name). campaign_id берём
-    из utm_campaign (для рекламы = id кампании Директа, совпадает с витриной). Нераспознанные
-    каналы схлопываются до уровня канала (пустой campaign_id).
+    Ключ свёртки — (channel, subchannel, campaign_id, campaign_name). Ключ кампании — в
+    терминах витрины PROCONTEXT (sync/lime_ru_metrika_keys.campaign_key): Директ по id
+    заказа из клика, VK по справочнику групп, бесплатные каналы — уровень канала.
 
     Args:
         metrika_rows: строки parse_metrika_kz за date_s.
@@ -57,14 +58,12 @@ def build_rows(metrika_rows, date_s: str) -> list[tuple]:
     agg: dict[tuple[str, str, str, str], dict] = {}
 
     for m in metrika_rows:
-        channel, subchannel, traffic_type = map_metrika_channel(
+        channel, subchannel, traffic_type = ru_channel(
             m.get("traffic_source"), m.get("source_engine")
         )
-        # campaign_id из utm_campaign: для рекламного трафика = id кампании Директа (как в
-        # витрине PROCONTEXT), по нему дашборд и джойнит. Прочие каналы дают пустой id и
-        # обогащаются по (channel, subchannel).
-        campaign_id = (m.get("utm_campaign") or "").strip()
-        campaign_name = (m.get("direct_campaign_name") or "").strip()
+        campaign_id, campaign_name = campaign_key(
+            channel, subchannel, traffic_type, m.get("utm_campaign"),
+            m.get("direct_order_id"), m.get("direct_campaign_name"), vk_groups)
         key = (channel, subchannel, campaign_id, campaign_name)
         acc = agg.get(key)
         if acc is None:
@@ -104,14 +103,24 @@ def build_rows(metrika_rows, date_s: str) -> list[tuple]:
     return out
 
 
+def _vk_groups() -> dict:
+    """Справочник группа VK → кампания. Пустой = отказ: иначе весь VK Метрики тихо
+    осядет на уровне канала и затрёт грань кампаний при следующем прогоне."""
+    groups = load_vk_group_map(os.environ["DATABASE_URL"].split("?")[0])
+    if not groups:
+        raise RuntimeError("lime_vk_entities пуст — VK Метрики не резолвится; см. sync-lime-vk.yml")
+    return groups
+
+
 def _sync_range(frm: date, to: date, conn) -> int:
     token = os.environ["LIME_METRIKA_TOKEN"]
     total = 0
+    vk_groups = _vk_groups()
     day = frm
     while day <= to:
         day_s = day.isoformat()
         metrika = fetch_ru_traffic(COUNTER_ID, token, day_s, day_s)
-        rows = build_rows(metrika, day_s)
+        rows = build_rows(metrika, day_s, vk_groups)
 
         if conn is None:
             i_v, i_o = COLUMNS.index("visits"), COLUMNS.index("orders")

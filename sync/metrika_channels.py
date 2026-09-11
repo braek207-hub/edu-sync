@@ -99,6 +99,10 @@ def map_metrika_channel(
             return "SMM paid", "TikTok Ads", "Платный"
         if "snapchat" in engine:
             return "SMM paid", "Snapchat Ads", "Платный"
+        # Канон витрины (classify: vk_ads/cpc → SMM paid / VK.Ads). До 2026-09-11 уходило
+        # в «SEM / VK Ads» и 14,7 тыс. визитов за месяц не встречали строку витрины RU.
+        if "vk" in engine or "mytarget" in engine:
+            return "SMM paid", "VK.Ads", "Платный"
         # Площадка не опознана (реклама без меток) — но это ТОЧНО платный трафик.
         return "SEM", (source_engine or "Ad"), "Платный"
 

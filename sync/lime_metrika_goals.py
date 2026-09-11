@@ -26,8 +26,9 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync.lime import load_vk_group_map
 from sync.lime_metrika_goals_api import fetch_goal_catalog, fetch_goal_reaches
-from sync.metrika_channels import map_metrika_channel
+from sync.lime_ru_metrika_keys import campaign_key, ru_channel
 
 COUNTER_ID = os.environ.get("LIME_METRIKA_COUNTER_ID") or "23504302"
 DAYS_BACK = int(os.environ.get("LIME_METRIKA_GOALS_DAYS_BACK") or "30")
@@ -81,7 +82,7 @@ _DDL = (
 )
 
 
-def build_rows(goal_rows, date_s: str) -> list[tuple]:
+def build_rows(goal_rows, date_s: str, vk_groups: dict | None = None) -> list[tuple]:
     """Свернуть достижения целей за день в кортежи порядка COLUMNS.
 
     Ключ свёртки — (channel, subchannel, campaign_id, goal_id): тот же разрез, по
@@ -101,10 +102,12 @@ def build_rows(goal_rows, date_s: str) -> list[tuple]:
         reaches = float(g.get("reaches") or 0)
         if reaches <= 0:
             continue
-        channel, subchannel, traffic_type = map_metrika_channel(
+        channel, subchannel, traffic_type = ru_channel(
             g.get("traffic_source"), g.get("source_engine")
         )
-        campaign_id = (g.get("utm_campaign") or "").strip()
+        campaign_id, _ = campaign_key(
+            channel, subchannel, traffic_type, g.get("utm_campaign"),
+            g.get("direct_order_id"), g.get("direct_campaign_name"), vk_groups)
         goal_id = str(g.get("goal_id") or "").strip()
         if not goal_id:
             continue
@@ -150,9 +153,19 @@ def _write_catalog(conn, catalog: list[dict]) -> None:
     conn.commit()
 
 
+def _vk_groups() -> dict:
+    """Справочник группа VK → кампания. Пустой = отказ: иначе весь VK Метрики тихо
+    осядет на уровне канала и затрёт грань кампаний при следующем прогоне."""
+    groups = load_vk_group_map(os.environ["DATABASE_URL"].split("?")[0])
+    if not groups:
+        raise RuntimeError("lime_vk_entities пуст — VK Метрики не резолвится; см. sync-lime-vk.yml")
+    return groups
+
+
 def _sync_range(frm: date, to: date, conn) -> int:
     token = os.environ["LIME_METRIKA_TOKEN"]
     catalog = fetch_goal_catalog(COUNTER_ID, token)
+    vk_groups = _vk_groups()
     goal_ids = [g["goal_id"] for g in catalog]
     print(f"lime_metrika_goals: целей в счётчике {COUNTER_ID} — {len(goal_ids)}")
     if not goal_ids:
@@ -171,7 +184,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
     day = frm
     while day <= to:
         day_s = day.isoformat()
-        rows = build_rows(by_day.get(day_s, []), day_s)
+        rows = build_rows(by_day.get(day_s, []), day_s, vk_groups)
 
         if conn is None:
             i_r = COLUMNS.index("reaches")
