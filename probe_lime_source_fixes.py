@@ -145,12 +145,14 @@ def main():
     if not _truthy(os.environ.get("PROBE_SKIP_PART1")):
         direct_without_utm()
         trackers_with_raw_macro()
+    if not _truthy(os.environ.get("PROBE_ONLY_DEEPLINKS")):
+        # 10.09.2026: 2,03 млн кликов за день, сырого макроса 0.
+        _raw_macro_by_tracker(
+            "clicks", "tracker_name,tracking_id,publisher_name,click_url_parameters,click_datetime",
+            "click_url_parameters", 1)
     _raw_macro_by_tracker(
-        "clicks", "tracker_name,tracking_id,publisher_name,click_url_parameters,click_datetime",
-        "click_url_parameters", 1)
-    _raw_macro_by_tracker(
-        "deeplinks", "tracker_name,tracking_id,publisher_name,deeplink_url_parameters,deeplink_datetime",
-        "deeplink_url_parameters", 1)
+        "deeplinks", "tracker_name,tracking_id,publisher_name,deeplink_url_parameters,event_datetime",
+        "deeplink_url_parameters", 3)
 
 
 if __name__ == "__main__":
