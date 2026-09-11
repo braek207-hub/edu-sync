@@ -94,25 +94,54 @@ def main():
             )
             show("доп. колонки у app-строк VK без campaign_id", cur.fetchall(), 40)
 
-        # 3. Есть ли в MySQL другие таблицы/вью с маппингом групп (имена)
-        cur.execute("SHOW FULL TABLES")
-        names = [list(r.values())[0] for r in cur.fetchall()]
-        print("\nтаблицы/вью в схеме:", ", ".join(names))
+        # 3. Сырой `campaign` у app-строк VK без campaign_id: это id группы VK?
+        cur.execute(
+            """
+            SELECT source, medium, ad_platform, campaign,
+                   COUNT(*) n, SUM(sessions) sessions, SUM(purchases_count) orders,
+                   SUM(purchases_revenue) revenue
+            FROM lc_simple_view
+            WHERE date >= %s AND date <= %s AND data_source = 'app'
+              AND (LOWER(source) LIKE '%%vk%%' OR LOWER(source) LIKE '%%mytarget%%')
+              AND (campaign_id IS NULL OR campaign_id IN ('', '(not set)'))
+            GROUP BY 1,2,3,4
+            ORDER BY sessions DESC
+            LIMIT 80
+            """,
+            (FROM, TO),
+        )
+        raw = cur.fetchall()
+        show("сырой campaign у app-строк VK без campaign_id", raw, 80)
+
+    pg = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
+    gids = sorted({str(r["campaign"]) for r in raw if str(r["campaign"] or "").isdigit()})
+    if gids:
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT entity_id, kind, ad_plan_id, cabinet, name FROM lime_vk_entities WHERE entity_id = ANY(%s)",
+                (gids,),
+            )
+            found = {r[0]: r[1:] for r in cur.fetchall()}
+        tot = sum(int(r["sessions"] or 0) for r in raw)
+        ok = sum(int(r["sessions"] or 0) for r in raw if str(r["campaign"]) in found)
+        print(f"\n── сырой campaign против lime_vk_entities: {len(gids)} id, найдено {len(found)}; "
+              f"сессий резолвится {ok} из {tot} ──")
+        for i in gids:
+            print(f"  {i}: {found.get(i, 'нет в справочнике')}")
 
     # 4. Сверка: campaign_id из MySQL → это ad_plan или ad_group по нашему справочнику
     ids = sorted({str(r["campaign_id"]) for r in vk if r["campaign_id"] not in (None, "", "(not set)")})
     if ids:
-        pg = psycopg2.connect(os.environ["DATABASE_URL"].split("?")[0], connect_timeout=30)
         with pg.cursor() as cur:
             cur.execute(
-                "SELECT entity_id, kind, ad_plan_id, cabinet FROM lime_vk_entities WHERE entity_id = ANY(%s)",
+                "SELECT entity_id, kind FROM lime_vk_entities WHERE entity_id = ANY(%s)",
                 (ids,),
             )
-            found = {r[0]: r[1:] for r in cur.fetchall()}
-        print(f"\n── campaign_id MySQL против lime_vk_entities: {len(ids)} id, найдено {len(found)} ──")
-        for i in ids:
-            print(f"  {i}: {found.get(i, 'нет в справочнике')}")
-        pg.close()
+            kinds = {}
+            for eid, kind in cur.fetchall():
+                kinds[kind] = kinds.get(kind, 0) + 1
+        print(f"\n── campaign_id MySQL против lime_vk_entities: {len(ids)} id, по видам {kinds} ──")
+    pg.close()
     my.close()
 
 
