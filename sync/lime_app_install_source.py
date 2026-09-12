@@ -64,9 +64,11 @@ def day_chunks(since: str, until: str, size: int = CHUNK_DAYS) -> list[tuple[str
     return out
 
 
-def _attr(first: dict[str, tuple], dev: str) -> tuple[str, str]:
+def _attr(first: dict[str, tuple], dev: str, day: date) -> tuple[str, str]:
+    """Кампания установки для события дня `day`. События ДО дня установки — остаток
+    «unknown»: у переатрибутированного клиента (VK-ретаргет) история до клика не кампании."""
     info = first.get(dev)
-    if info is None:
+    if info is None or day < info[0].date():
         return "unknown", ""
     return info[1] or "unknown", info[3] or ""
 
@@ -85,12 +87,12 @@ def build_source_daily(first: dict[str, tuple], sessions: list[dict],
         if not dev:
             continue
         d = parse_dt(s["session_start_datetime"]).date()
-        pub, cid = _attr(first, dev)
+        pub, cid = _attr(first, dev, d)
         a = acc[(d, pub, cid)]
         a["sessions"] += 1
         a["devices"].add(dev)
     for dev, dt, _txn, amount in purchases:
-        pub, cid = _attr(first, dev)
+        pub, cid = _attr(first, dev, dt.date())
         a = acc[(dt.date(), pub, cid)]
         a["orders"] += 1
         a["revenue"] += amount

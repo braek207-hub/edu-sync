@@ -47,3 +47,14 @@ def test_device_without_install_in_window_is_unknown_remainder():
 def test_day_chunks_cover_window_without_gaps():
     assert day_chunks("2026-09-01", "2026-09-07", 3) == [
         ("2026-09-01", "2026-09-03"), ("2026-09-04", "2026-09-06"), ("2026-09-07", "2026-09-07")]
+
+
+def test_event_before_install_day_is_unknown_remainder():
+    """Устройство переатрибутировано 01.08 — его сессии и покупки ДО этого дня кампании
+    не принадлежат (иначе старый покупатель «приносит» ретаргету свою историю)."""
+    sessions = [{"appmetrica_device_id": "d3", "session_start_datetime": "2026-07-20 10:00:00"},
+                {"appmetrica_device_id": "d3", "session_start_datetime": "2026-08-01 09:00:00"}]
+    purchases = [("d3", datetime(2026, 7, 20, 12, 0), "t0", 9000.0)]
+    rows = _by_key(build_source_daily(FIRST, sessions, purchases))
+    assert rows[("2026-07-20", "unknown", "")] == {"sessions": 1, "devices": 1, "orders": 1, "revenue": 9000.0}
+    assert rows[("2026-08-01", "Yandex.Direct", "117845740")]["sessions"] == 1

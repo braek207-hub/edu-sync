@@ -116,7 +116,7 @@ def test_build_cohorts_cumulative_unique_buyers():
         "d3": {"install_dt": datetime(2026, 1, 25), "publisher": "VK Ads"},
     }
     purchases = [
-        _buy("d1", (2026, 1)),  # life 0
+        _buy("d1", (2026, 1), day=15),  # life 0 (после дня установки)
         _buy("d1", (2026, 3)),  # повтор — не двоит
         _buy("d2", (2026, 2)),  # life 1
     ]
@@ -252,7 +252,7 @@ def test_build_cohorts_orders_and_revenue_are_cumulative():
     """Покупатель считается один раз, заказы и выручка — каждый раз."""
     fi = {"d1": {"install_dt": datetime(2026, 1, 5), "publisher": "VK Ads"}}
     purchases = [
-        _buy("d1", (2026, 1), 1000.0, "t1"),
+        _buy("d1", (2026, 1), 1000.0, "t1", day=9),
         _buy("d1", (2026, 2), 500.0, "t2"),
         _buy("d1", (2026, 2), 300.0, "t3"),
     ]
@@ -290,7 +290,7 @@ def test_daily_cohort_sums_lifetime_revenue_per_install_day():
         _inst("d2", "2026-01-06 11:00:00", "Yandex.Direct", camp="704121835"),
     ]
     purchases = [
-        _buy("d1", (2026, 1), 1000.0, "t1"),
+        _buy("d1", (2026, 1), 1000.0, "t1", day=6),
         _buy("d1", (2026, 5), 2000.0, "t2"),   # покупка сильно позже — всё равно этот день
         _buy("d2", (2026, 2), 3000.0, "t3"),
     ]
@@ -533,12 +533,13 @@ def test_purchase_cycles_bind_to_first_install_not_repeat():
 
 
 def test_purchase_cycles_drop_purchase_before_install():
-    """Покупка раньше собственной установки — рассинхрон времён, шаг не пройден."""
+    """Покупка раньше дня собственной установки — история до переатрибуции: ни шага, ни
+    покупателя у этой когорты."""
     installs = [_cyc_inst("d1", "2026-03-10 10:00:00")]
     purchases = [("d1", datetime(2026, 3, 1), "t1", 100.0)]
     cycle, cohort = m.build_purchase_cycles(installs, purchases, True, False)
     assert cycle == []
-    assert cohort[0][5] == 1        # покупателем устройство всё равно остаётся
+    assert cohort[0][5] == 0
 
 
 def test_purchase_cycles_ignore_device_installed_outside_window():
@@ -567,3 +568,34 @@ def test_purchase_facts_keeps_event_time():
     events = [{"appmetrica_device_id": "d1", "event_datetime": "2026-01-10 10:30:00",
                "event_json": '{"transaction_id": 1, "value": 100}'}]
     assert m.purchase_facts(events)[0][1] == datetime(2026, 1, 10, 10, 30)
+
+
+def test_daily_cohort_ignores_purchases_before_install_day():
+    """Переатрибуция старого покупателя (VK-ретаргет 05.09): его покупки ДО этого дня —
+    не заслуга кампании. Кейс 27807511: 52 установки → 96 «когортных» заказов за день."""
+    installs = [_inst("d1", "2026-09-05 10:00:00", "Yandex.Direct", reattr="1", camp="27807511")]
+    purchases = [
+        _buy("d1", (2026, 8), 700000.0, "old", day=20),   # до установки — не считать
+        _buy("d1", (2026, 9), 4000.0, "same-day", day=5),  # день установки — считать
+        _buy("d1", (2026, 9), 6000.0, "after", day=7),
+    ]
+    rows = m.build_installs_daily_with_cohort(installs, purchases, True, False)
+    (_d, _pub, _det, camp, n, orders, revenue) = rows[0]
+    assert (camp, n, orders, revenue) == ("27807511", 1, 2, 10000.0)
+
+
+def test_build_cohorts_ignores_same_month_purchase_before_install_day():
+    fi = {"d1": {"install_dt": datetime(2026, 9, 20), "publisher": "VK Ads"}}
+    purchases = [_buy("d1", (2026, 9), 5000.0, "before", day=5),
+                 _buy("d1", (2026, 9), 1000.0, "after", day=25)]
+    rows = {(cm, p, lm): (b, o, r) for (cm, p, lm, _sz, b, o, r) in m.build_cohorts(fi, purchases, max_life=1)}
+    assert rows[(date(2026, 9, 1), "VK Ads", 0)] == (1, 1, 1000.0)
+
+
+def test_purchase_cycles_ignore_purchases_before_install_day():
+    installs = [_inst("d1", "2026-09-05 10:00:00", "VK Ads", reattr="1")]
+    purchases = [_buy("d1", (2026, 8), 1000.0, "old", day=20),
+                 _buy("d1", (2026, 9), 1000.0, "first", day=8)]
+    cycle, cohort = m.build_purchase_cycles(installs, purchases, True, False)
+    assert cohort == [(date(2026, 9, 5), "VK Ads", "", "", 1, 1, 0, 0)]
+    assert cycle == [(date(2026, 9, 5), "VK Ads", "", "", m.CYCLE_STEPS[0], 3, 1)]

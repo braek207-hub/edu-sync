@@ -280,6 +280,10 @@ def build_installs_daily_with_cohort(installs: list[dict], purchases: list[tuple
     Числа НАКОПИТЕЛЬНЫЕ на момент синка: когорта продолжает покупать, поэтому выручка
     прошлых дней растёт от прогона к прогону. Это природа когортной метрики.
 
+    Покупки ДО дня установки не считаются: «первая установка в окне» у старого клиента —
+    это переатрибуция (VK-ретаргет), и без отсечки его история за 7 месяцев приписывалась
+    бы кампании (27807511, 05.09.2026: 52 установки → 96 заказов, 741 тыс. за день).
+
     Возвращает (date, publisher, detail, campaign_id, installs, cohort_orders, cohort_revenue).
     """
     entity_map = entity_map or {}
@@ -289,9 +293,9 @@ def build_installs_daily_with_cohort(installs: list[dict], purchases: list[tuple
 
     orders: dict[tuple, int] = defaultdict(int)
     revenue: dict[tuple, float] = defaultdict(float)
-    for dev, _purchase_dt, _txn, amount in purchases:
+    for dev, purchase_dt, _txn, amount in purchases:
         f = first.get(dev)
-        if not f:
+        if not f or purchase_dt.date() < f[0].date():
             continue
         key = (f[0].date(), f[1], f[2], f[3])
         orders[key] += 1
@@ -356,7 +360,7 @@ def build_cohorts(first_installs: dict[str, dict], purchases: list[tuple],
 
     for dev, purchase_dt, _txn, amount in purchases:
         ck = device_cohort.get(dev)
-        if not ck:
+        if not ck or purchase_dt.date() < first_installs[dev]["install_dt"].date():
             continue
         lm = month_diff(month_start(purchase_dt), ck[0])
         if lm < 0 or lm > max_life:
@@ -421,9 +425,10 @@ def build_purchase_cycles(installs: list[dict], purchases: list[tuple],
     first = first_install_attribution(installs, keep_reattribution, keep_reinstall, entity_map)
 
     # device → отсортированные даты покупок (дедуп по transaction_id уже сделан выше).
+    # Покупки до дня установки — история переатрибутированного клиента, не шаг когорты.
     by_device: dict[str, list] = defaultdict(list)
     for dev, purchase_dt, _txn, _amount in purchases:
-        if dev in first:
+        if dev in first and purchase_dt.date() >= first[dev][0].date():
             by_device[dev].append(purchase_dt)
 
     cycle: dict[tuple, int] = defaultdict(int)
