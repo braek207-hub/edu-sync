@@ -5,6 +5,10 @@ sync/edu_direct_settings.py — синк настроек кампаний Ди�
 Порт settings-части sync/lime_direct.py (LIME, один логин) под мульти-аккаунт EDU.
 Стат-репортная часть не портирована — статистику EDU тянет sync/direct.py.
 
+_upsert_campaign_settings/_sync_campaign_settings принимают table/extra_counter_ids —
+этим же кодом переиспользуется sync/meshnflesh_direct_settings.py (кабинет meshnflesh,
+таблица mnf_campaign_settings), не копируя парсинг настроек второй раз.
+
 Тянет на каждый логин из sync.direct._direct_clients() настройки кампаний (per campaign,
 edu_campaign_settings): стратегия, аудитория, таргетинг, корректировки, офферный
 таргетинг. Эмитит JSONB той же формы, что в LIME (её парсят те же фронт-селекторы).
@@ -1334,8 +1338,13 @@ def _build_campaign_settings(
     return settings
 
 
-_SETTINGS_UPSERT_SQL = """
-    INSERT INTO edu_campaign_settings (campaign_id, campaign_name, settings, synced_at)
+# Таблица — параметр, не константа: sync/meshnflesh_direct_settings.py переиспользует
+# весь этот модуль под кабинет meshnflesh, подставляя mnf_campaign_settings вместо
+# edu_campaign_settings. Значение приходит только из своего же кода (см. вызовы ниже),
+# внешний ввод сюда не попадает.
+def _settings_upsert_sql(table: str) -> str:
+    return f"""
+    INSERT INTO {table} (campaign_id, campaign_name, settings, synced_at)
     VALUES (%(campaign_id)s, %(campaign_name)s, %(settings)s::jsonb, NOW())
     ON CONFLICT (campaign_id) DO UPDATE SET
        campaign_name = EXCLUDED.campaign_name,
@@ -1344,14 +1353,17 @@ _SETTINGS_UPSERT_SQL = """
 """
 
 
-def _upsert_campaign_settings(rows: List[Dict[str, Any]]) -> int:
+def _upsert_campaign_settings(
+    rows: List[Dict[str, Any]], table: str = "edu_campaign_settings"
+) -> int:
     if not rows:
         return 0
+    sql = _settings_upsert_sql(table)
     with psycopg2.connect(_pg_url()) as conn:
         with conn.cursor() as cur:
             for row in rows:
                 cur.execute(
-                    _SETTINGS_UPSERT_SQL,
+                    sql,
                     {
                         "campaign_id": row["campaign_id"],
                         "campaign_name": row.get("campaign_name"),
@@ -1362,7 +1374,12 @@ def _upsert_campaign_settings(rows: List[Dict[str, Any]]) -> int:
     return len(rows)
 
 
-def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> int:
+def _sync_campaign_settings(
+    campaign_ids: List[str],
+    names: Dict[str, str],
+    table: str = "edu_campaign_settings",
+    extra_counter_ids: Optional[List[int]] = None,
+) -> int:
     if not campaign_ids:
         return 0
 
@@ -1370,9 +1387,11 @@ def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> i
     print(f"[edu_direct_settings] настройки кампаний ({len(campaign_ids)})...")
 
     base_map = _fetch_campaigns_for_settings(campaign_ids)
-    # Всегда включаем известные счётчики EDU (vuz/vse/provuz) — у части кампаний
-    # campaigns.get не отдаёт CounterIds → без этого их goalNames пуст, цель = «Цель #ID».
-    counter_ids = sorted(set(list(base_map.pop("_counter_ids", []) or [])) | set(EDU_METRIKA_COUNTERS))
+    # Всегда включаем известные счётчики (по умолчанию EDU: vuz/vse/provuz) — у части
+    # кампаний campaigns.get не отдаёт CounterIds → без этого их goalNames пуст,
+    # цель = «Цель #ID». Вызывающий может подставить свои счётчики (meshnflesh).
+    fixed_counters = EDU_METRIKA_COUNTERS if extra_counter_ids is None else extra_counter_ids
+    counter_ids = sorted(set(list(base_map.pop("_counter_ids", []) or [])) | set(fixed_counters))
 
     adgroups_map = _fetch_adgroups_by_campaign(campaign_ids)
     bidmodifiers_map = _fetch_bidmodifiers_by_campaign(campaign_ids)
@@ -1455,8 +1474,8 @@ def _sync_campaign_settings(campaign_ids: List[str], names: Dict[str, str]) -> i
             "settings": settings,
         })
 
-    n = _upsert_campaign_settings(rows)
-    print(f"[edu_direct_settings] upsert {n} строк в edu_campaign_settings")
+    n = _upsert_campaign_settings(rows, table=table)
+    print(f"[edu_direct_settings] upsert {n} строк в {table}")
     return n
 
 
