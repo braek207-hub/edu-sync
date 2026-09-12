@@ -1,0 +1,46 @@
+name: Probe LIME VK attribution (один день, одна кампания)
+
+# Только чтение: как PROCONTEXT атрибутирует app-сессии кампании VK — диплинк vs источник установки
+
+on:
+  workflow_dispatch:
+    inputs:
+      day:
+        description: "День (YYYY-MM-DD, по умолчанию 2026-09-05)"
+        required: false
+        default: ""
+      campaign:
+        description: "ad_plan VK (по умолчанию 27807511)"
+        required: false
+        default: ""
+      installs_from:
+        description: "Начало окна установок (по умолчанию 2026-03-01)"
+        required: false
+        default: ""
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run probe
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          APPMETRICA_TOKEN: ${{ secrets.APPMETRICA_TOKEN }}
+          APPMETRICA_POLL_MAX: "240"
+          PROBE_DAY: ${{ github.event.inputs.day }}
+          PROBE_CAMPAIGN: ${{ github.event.inputs.campaign }}
+          PROBE_INSTALLS_FROM: ${{ github.event.inputs.installs_from }}
+          PYTHONIOENCODING: "utf-8"
+        run: python probe_lime_vk_attribution.py
