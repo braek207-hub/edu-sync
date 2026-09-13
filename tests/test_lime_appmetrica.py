@@ -599,3 +599,26 @@ def test_purchase_cycles_ignore_purchases_before_install_day():
     cycle, cohort = m.build_purchase_cycles(installs, purchases, True, False)
     assert cohort == [(date(2026, 9, 5), "VK Ads", "", "", 1, 1, 0, 0)]
     assert cycle == [(date(2026, 9, 5), "VK Ads", "", "", m.CYCLE_STEPS[0], 3, 1)]
+
+
+def test_install_purchase_daily_keys_by_install_and_purchase_dates():
+    """Витрина (дата установки × дата покупки): дашборд суммирует покупки до конца
+    выбранного периода — «установки периода и их заказы в периоде», не пожизненная когорта."""
+    installs = [
+        _inst("d1", "2026-09-05 10:00:00", "Yandex.Direct", camp="704121835"),
+        _inst("d2", "2026-09-05 11:00:00", "Yandex.Direct", camp="704121835"),
+        _inst("d1", "2026-09-20 10:00:00", "Yandex.Direct", camp="704121835"),  # переустановка
+    ]
+    purchases = [
+        _buy("d1", (2026, 9), 1000.0, "t1", day=5),
+        _buy("d1", (2026, 9), 2000.0, "t2", day=7),
+        _buy("d2", (2026, 9), 3000.0, "t3", day=7),
+        _buy("d2", (2026, 10), 4000.0, "t4", day=1),
+        _buy("d2", (2026, 8), 9000.0, "old", day=30),   # до установки — не считать
+    ]
+    rows = m.build_install_purchase_daily(installs, purchases, False, False)
+    assert rows == [
+        (date(2026, 9, 5), date(2026, 9, 5), "Yandex.Direct", "", "704121835", 1, 1000.0),
+        (date(2026, 9, 5), date(2026, 9, 7), "Yandex.Direct", "", "704121835", 2, 5000.0),
+        (date(2026, 9, 5), date(2026, 10, 1), "Yandex.Direct", "", "704121835", 1, 4000.0),
+    ]

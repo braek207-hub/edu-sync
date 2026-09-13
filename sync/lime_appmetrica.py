@@ -306,6 +306,33 @@ def build_installs_daily_with_cohort(installs: list[dict], purchases: list[tuple
             for (d, p, det, c, n) in base]
 
 
+def build_install_purchase_daily(installs: list[dict], purchases: list[tuple],
+                                 keep_reattribution: bool, keep_reinstall: bool,
+                                 entity_map: dict | None = None) -> list[tuple]:
+    """Покупки по (дата установки × дата покупки) устройства — витрина lime_app_install_purchase_daily.
+
+    Зачем: Павел читает «Заказы установок» за период как «установки периода и их заказы
+    В ЭТОМ ЖЕ периоде» (выбрал день — заказы этого дня с установок этого дня; месяц —
+    установки месяца и их покупки до конца месяца). Дневная строка с пожизненной суммой
+    этого дать не может: дашборд суммирует отсюда покупки с purchase_date ≤ конца периода.
+
+    Привязка — к ПЕРВОЙ установке устройства (как у когорт), покупки до дня установки
+    отброшены. Возвращает (install_date, purchase_date, publisher, detail, campaign_id,
+    orders, revenue), отсортировано.
+    """
+    first = first_install_attribution(installs, keep_reattribution, keep_reinstall, entity_map or {})
+    orders: dict[tuple, int] = defaultdict(int)
+    revenue: dict[tuple, float] = defaultdict(float)
+    for dev, purchase_dt, _txn, amount in purchases:
+        f = first.get(dev)
+        if not f or purchase_dt.date() < f[0].date():
+            continue
+        key = (f[0].date(), purchase_dt.date(), f[1], f[2], f[3])
+        orders[key] += 1
+        revenue[key] += amount
+    return [(*k, orders[k], round(revenue[k], 2)) for k in sorted(orders)]
+
+
 def purchase_facts(events: list[dict]) -> list[tuple]:
     """Сырые события покупки → факты (device, время покупки, transaction_id, сумма).
 
@@ -519,6 +546,19 @@ _CYCLE_DDL = (
       PRIMARY KEY (cohort_date, publisher, detail, campaign_id))""",
     """CREATE INDEX IF NOT EXISTS idx_lime_app_cycle_cohort_date
       ON lime_app_cycle_cohort (cohort_date)""",
+    # Зеркало migrations/lime/030_app_install_purchase_daily.sql.
+    """CREATE TABLE IF NOT EXISTS lime_app_install_purchase_daily (
+      install_date  date NOT NULL,
+      purchase_date date NOT NULL,
+      publisher     text NOT NULL,
+      detail        text NOT NULL DEFAULT '',
+      campaign_id   text NOT NULL DEFAULT '',
+      orders        integer NOT NULL DEFAULT 0,
+      revenue       numeric(14,2) NOT NULL DEFAULT 0,
+      updated_at    timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (install_date, purchase_date, publisher, detail, campaign_id))""",
+    """CREATE INDEX IF NOT EXISTS idx_lime_app_install_purchase_daily_purchase
+      ON lime_app_install_purchase_daily (purchase_date)""",
     # ENABLE RLS берёт ACCESS EXCLUSIVE lock даже когда RLS уже включён → условно.
     """DO $$
     BEGIN
@@ -530,12 +570,17 @@ _CYCLE_DDL = (
                      WHERE n.nspname = 'public' AND c.relname = 'lime_app_cycle_cohort'
                        AND c.relrowsecurity)
       THEN EXECUTE 'ALTER TABLE lime_app_cycle_cohort ENABLE ROW LEVEL SECURITY'; END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = 'public' AND c.relname = 'lime_app_install_purchase_daily'
+                       AND c.relrowsecurity)
+      THEN EXECUTE 'ALTER TABLE lime_app_install_purchase_daily ENABLE ROW LEVEL SECURITY'; END IF;
     END $$""",
 )
 
 
 def _write(installs_rows: list[tuple], cohort_rows: list[tuple],
-           cycle_rows: list[tuple], cycle_cohort_rows: list[tuple]) -> None:
+           cycle_rows: list[tuple], cycle_cohort_rows: list[tuple],
+           install_purchase_rows: list[tuple]) -> None:
     conn = psycopg2.connect(_pg_url(), connect_timeout=30)
     try:
         with conn.cursor() as cur:
@@ -572,6 +617,14 @@ def _write(installs_rows: list[tuple], cohort_rows: list[tuple],
                 "(cohort_date, publisher, detail, campaign_id, devices, buyers1, buyers2, buyers3) "
                 "VALUES %s",
                 cycle_cohort_rows, page_size=2000,
+            )
+            cur.execute("DELETE FROM lime_app_install_purchase_daily")
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO lime_app_install_purchase_daily "
+                "(install_date, purchase_date, publisher, detail, campaign_id, orders, revenue) "
+                "VALUES %s",
+                install_purchase_rows, page_size=2000,
             )
         conn.commit()
     except Exception:
@@ -635,6 +688,8 @@ def sync_lime_appmetrica() -> None:
     cohort_rows = build_cohorts(first, purchases_raw, max_life)
     cycle_rows, cycle_cohort_rows = build_purchase_cycles(
         installs_raw, purchases_raw, keep_reattr, keep_reinstall, entity_map)
+    install_purchase_rows = build_install_purchase_daily(
+        installs_raw, purchases_raw, keep_reattr, keep_reinstall, entity_map)
 
     if not installs_rows:
         raise RuntimeError(
@@ -644,7 +699,8 @@ def sync_lime_appmetrica() -> None:
             f"({since}..{until})."
         )
 
-    _write(installs_rows, cohort_rows, cycle_rows, cycle_cohort_rows)
+    _write(installs_rows, cohort_rows, cycle_rows, cycle_cohort_rows, install_purchase_rows)
     print(f"[lime-appmetrica] записано: install-строк={len(installs_rows)}, "
           f"cohort-строк={len(cohort_rows)}, cycle-строк={len(cycle_rows)}, "
-          f"cycle-cohort-строк={len(cycle_cohort_rows)}")
+          f"cycle-cohort-строк={len(cycle_cohort_rows)}, "
+          f"install×purchase-строк={len(install_purchase_rows)}")
