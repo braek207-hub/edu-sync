@@ -45,6 +45,28 @@ def _export(endpoint: str, params: dict, token: str) -> list[dict]:
 # Гео для GCC-разреза (по стране). AppMetrica отдаёт ISO-код страны события/установки.
 _GEO = ",city,country_iso_code"
 
+
+def app_country() -> str:
+    """Страна, которой ограничены RU-витрины приложения (установки, сессии, покупки).
+
+    Витрина PROCONTEXT region='ru' держит только события RU-устройств: проба 30072646 за
+    31.08–06.09.2026 — наши 5 заказов против их 3, два лишних с устройства из DE; без них
+    выручка сошлась ровно (38 195). Решение Павла 13.09.2026 — фильтровать так же.
+    APP_COUNTRY="" выключает фильтр (нужно для GCC-разреза, который сам режет по стране).
+    """
+    return (os.environ.get("APP_COUNTRY") if "APP_COUNTRY" in os.environ else "RU").strip().upper()
+
+
+def only_country(rows: list[dict], iso: str | None = None) -> list[dict]:
+    """Оставить строки Logs API со страной iso (по стране самого события: установка
+    считается по стране установки, покупка — по стране покупки). Пустая iso — без фильтра;
+    строки без country_iso_code (запрос был без гео) отбрасываются, чтобы фильтр не был
+    молча пустым."""
+    iso = app_country() if iso is None else iso
+    if not iso:
+        return rows
+    return [r for r in rows if (r.get("country_iso_code") or "").upper() == iso]
+
 # Сессии (app-трафик = sessions, не installs). У сессии нет publisher (источник —
 # атрибут установки), поэтому paid/organic сессий берётся джойном device → install.
 SESSION_FIELDS = "appmetrica_device_id,session_start_datetime"

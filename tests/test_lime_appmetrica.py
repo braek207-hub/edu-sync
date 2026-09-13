@@ -438,7 +438,7 @@ def test_sync_refuses_to_wipe_when_vk_entity_map_unusable():
     installs = [
         {"appmetrica_device_id": "d1", "install_datetime": "2026-07-06 10:00:00",
          "publisher_name": VK_PUB, "click_url_parameters": "c=140704359",
-         "is_reinstallation": "0", "is_reattribution": "0"},
+         "is_reinstallation": "0", "is_reattribution": "0", "country_iso_code": "RU"},
     ]
     with patch.dict(os.environ, {"APPMETRICA_TOKEN": "test-token"}, clear=False), \
          patch("sync.lime_appmetrica.fetch_installations", return_value=installs), \
@@ -455,7 +455,8 @@ def test_sync_proceeds_when_no_vk_installs_have_macro_c():
     ни при чём, синк должен спокойно дойти до записи."""
     installs = [
         {"appmetrica_device_id": "d1", "install_datetime": "2026-07-06 10:00:00",
-         "publisher_name": "Organic", "is_reinstallation": "0", "is_reattribution": "0"},
+         "publisher_name": "Organic", "is_reinstallation": "0", "is_reattribution": "0",
+         "country_iso_code": "RU"},
     ]
     with patch.dict(os.environ, {"APPMETRICA_TOKEN": "test-token"}, clear=False), \
          patch("sync.lime_appmetrica.fetch_installations", return_value=installs), \

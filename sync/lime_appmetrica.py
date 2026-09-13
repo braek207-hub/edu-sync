@@ -13,7 +13,7 @@ from urllib.parse import parse_qs
 import psycopg2
 import psycopg2.extras
 
-from sync.appmetrica_logs import fetch_installations, fetch_purchase_events
+from sync.appmetrica_logs import app_country, fetch_installations, fetch_purchase_events, only_country
 
 
 def parse_dt(s: str) -> datetime:
@@ -651,14 +651,17 @@ def sync_lime_appmetrica() -> None:
     keep_reinstall = _truthy(os.environ.get("APP_KEEP_REINSTALL") or "0")
 
     since, until = sync_window(months, date.today())
-    print(f"[lime-appmetrica] окно {since}..{until}, app={app_id}, event={event_name}")
+    country = app_country()
+    print(f"[lime-appmetrica] окно {since}..{until}, app={app_id}, event={event_name}, "
+          f"страна={country or 'все'}")
 
-    installs_raw = fetch_installations(app_id, token, since, until)
+    installs_raw = only_country(fetch_installations(app_id, token, since, until, country=bool(country)))
     # События тянем ПОМЕСЯЧНО и сразу сворачиваем в факты: с event_json (там корзина)
     # всё окно одним куском — сотни мегабайт в памяти.
     purchases_raw: list[tuple] = []
     for chunk_since, chunk_until in month_chunks(since, until):
-        chunk = fetch_purchase_events(app_id, token, chunk_since, chunk_until, event_name)
+        chunk = only_country(fetch_purchase_events(app_id, token, chunk_since, chunk_until, event_name,
+                                                   country=bool(country)))
         purchases_raw.extend(purchase_facts(chunk))
         print(f"[lime-appmetrica] покупки {chunk_since}..{chunk_until}: "
               f"событий={len(chunk)}, фактов накоплено={len(purchases_raw)}", flush=True)

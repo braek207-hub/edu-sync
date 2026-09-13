@@ -27,7 +27,7 @@ from datetime import date, datetime, timedelta
 import psycopg2
 import psycopg2.extras
 
-from sync.appmetrica_logs import fetch_installations, fetch_purchase_events, fetch_sessions
+from sync.appmetrica_logs import app_country, fetch_installations, fetch_purchase_events, fetch_sessions, only_country
 from sync.lime_appmetrica import (
     _truthy, first_install_attribution, load_vk_entity_map, parse_dt, purchase_facts,
     sync_window, vk_entity_map_unusable, vk_resolve_stats,
@@ -134,10 +134,13 @@ def sync_lime_app_install_source() -> int:
     today = date.today()
     since, until = _window(today)
     inst_since, inst_until = sync_window(install_months, today)
-    print(f"[lime-app-source] окно {since}..{until}, установки {inst_since}..{inst_until}, app={app_id}")
+    country = app_country()
+    print(f"[lime-app-source] окно {since}..{until}, установки {inst_since}..{inst_until}, "
+          f"app={app_id}, страна={country or 'все'}")
 
     entity_map = load_vk_entity_map()
-    installs_raw = fetch_installations(app_id, token, inst_since, inst_until)
+    installs_raw = only_country(fetch_installations(app_id, token, inst_since, inst_until,
+                                                    country=bool(country)))
     vk_total, vk_with_c, vk_resolved = vk_resolve_stats(installs_raw, entity_map)
     print(f"[lime-app-source] установок {len(installs_raw)}; VK {vk_total}, с `c` {vk_with_c}, "
           f"резолвнулось {vk_resolved}")
@@ -156,11 +159,12 @@ def sync_lime_app_install_source() -> int:
                 cur.execute(ddl)
         conn.commit()
         for c_since, c_until in day_chunks(since, until):
-            sessions = fetch_sessions(app_id, token, c_since, c_until)
+            sessions = only_country(fetch_sessions(app_id, token, c_since, c_until, country=bool(country)))
             # Покупки по времени СОБЫТИЯ (не приёма): строки витрины — по дате покупки, чанк
             # переписывает ровно свои даты. Поздние события подхватит ежедневное окно 10 дней.
-            purchases = purchase_facts(fetch_purchase_events(
-                app_id, token, c_since, c_until, event_name, date_dimension="default"))
+            purchases = purchase_facts(only_country(fetch_purchase_events(
+                app_id, token, c_since, c_until, event_name, date_dimension="default",
+                country=bool(country))))
             rows = build_source_daily(first, sessions, purchases)
             outside = [r for r in rows if not (c_since <= r[0].isoformat() <= c_until)]
             if outside:
