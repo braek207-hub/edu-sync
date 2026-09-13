@@ -17,6 +17,18 @@ on:
         description: "Начало окна установок (по умолчанию 2026-03-01)"
         required: false
         default: ""
+      script:
+        description: "probe_lime_vk_attribution.py | probe_lime_vk_orders_geo.py"
+        required: false
+        default: "probe_lime_vk_attribution.py"
+      probe_from:
+        description: "orders_geo: начало окна"
+        required: false
+        default: ""
+      probe_to:
+        description: "orders_geo: конец окна"
+        required: false
+        default: ""
 
 jobs:
   probe:
@@ -42,5 +54,7 @@ jobs:
           PROBE_DAY: ${{ github.event.inputs.day }}
           PROBE_CAMPAIGN: ${{ github.event.inputs.campaign }}
           PROBE_INSTALLS_FROM: ${{ github.event.inputs.installs_from }}
+          PROBE_FROM: ${{ github.event.inputs.probe_from }}
+          PROBE_TO: ${{ github.event.inputs.probe_to }}
           PYTHONIOENCODING: "utf-8"
-        run: python probe_lime_vk_attribution.py
+        run: python ${{ github.event.inputs.script || 'probe_lime_vk_attribution.py' }}
