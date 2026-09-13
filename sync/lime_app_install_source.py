@@ -136,11 +136,10 @@ def sync_lime_app_install_source() -> int:
     inst_since, inst_until = sync_window(install_months, today)
     country = app_country()
     print(f"[lime-app-source] окно {since}..{until}, установки {inst_since}..{inst_until}, "
-          f"app={app_id}, страна={country or 'все'}")
+          f"app={app_id}, страна покупок={country or 'все'}")
 
     entity_map = load_vk_entity_map()
-    installs_raw = only_country(fetch_installations(app_id, token, inst_since, inst_until,
-                                                    country=bool(country)))
+    installs_raw = fetch_installations(app_id, token, inst_since, inst_until)
     vk_total, vk_with_c, vk_resolved = vk_resolve_stats(installs_raw, entity_map)
     print(f"[lime-app-source] установок {len(installs_raw)}; VK {vk_total}, с `c` {vk_with_c}, "
           f"резолвнулось {vk_resolved}")
@@ -159,7 +158,7 @@ def sync_lime_app_install_source() -> int:
                 cur.execute(ddl)
         conn.commit()
         for c_since, c_until in day_chunks(since, until):
-            sessions = only_country(fetch_sessions(app_id, token, c_since, c_until, country=bool(country)))
+            sessions = fetch_sessions(app_id, token, c_since, c_until)
             # Покупки по времени СОБЫТИЯ (не приёма): строки витрины — по дате покупки, чанк
             # переписывает ровно свои даты. Поздние события подхватит ежедневное окно 10 дней.
             purchases = purchase_facts(only_country(fetch_purchase_events(

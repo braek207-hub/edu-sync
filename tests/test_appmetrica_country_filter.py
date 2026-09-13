@@ -1,4 +1,4 @@
-"""RU-витрины приложения держат только события RU-устройств — как витрина PROCONTEXT region='ru'."""
+"""Покупки RU-витрин приложения — только RU-страны, как у PROCONTEXT region='ru' (установки и сессии — все)."""
 import pytest
 
 from sync.appmetrica_logs import app_country, only_country

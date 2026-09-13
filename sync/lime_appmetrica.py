@@ -653,9 +653,9 @@ def sync_lime_appmetrica() -> None:
     since, until = sync_window(months, date.today())
     country = app_country()
     print(f"[lime-appmetrica] окно {since}..{until}, app={app_id}, event={event_name}, "
-          f"страна={country or 'все'}")
+          f"страна покупок={country or 'все'}")
 
-    installs_raw = only_country(fetch_installations(app_id, token, since, until, country=bool(country)))
+    installs_raw = fetch_installations(app_id, token, since, until)
     # События тянем ПОМЕСЯЧНО и сразу сворачиваем в факты: с event_json (там корзина)
     # всё окно одним куском — сотни мегабайт в памяти.
     purchases_raw: list[tuple] = []
