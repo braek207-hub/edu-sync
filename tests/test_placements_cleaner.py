@@ -150,6 +150,71 @@ def test_media_campaign_is_cleaned_with_its_own_limit():
     assert "из 100" in plan["refused"][0]["reason"]
 
 
+def test_junk_words_anywhere_in_name():
+    """umkaplay.ru по точкам — один сегмент, токен «play» его не ловил."""
+    for site in ("umkaplay.ru", "mozgoplay.com", "gamezone.net",
+                 "freesoft.ru", "com.playrix.township"):
+        verdict, why = classify(site)
+        assert verdict in ("junk", "app"), site
+        assert "слово" in why, site
+
+
+def test_junk_words_do_not_override_allowlist():
+    """ru.more.play — Okko, известное приложение остаётся."""
+    assert classify("ru.more.play")[0] == "keep"
+
+
+# --- спам-площадки -------------------------------------------------------
+
+from sync.placements.spam import suspicious_sites
+
+
+def _week(cid, site, clicks, conv, goal=1):
+    return {"campaign_id": str(cid), "placement": site, "clicks": clicks,
+            "cost": clicks * 30.0, "impressions": clicks * 100,
+            "conversions": {goal: conv}}
+
+
+def test_spam_site_by_conversion_rate():
+    """Пример Павла: 12 достижений с 93 кликов при 3,4 % по кабинету."""
+    rows = [_week(1, "umkaplay.ru", 93, 12)]
+    rows += [_week(1, "site%d.ru" % i, 100, 2) for i in range(20)]
+    goals = {"1": 1}
+    hit = suspicious_sites(rows, goals)
+    assert list(hit) == ["umkaplay.ru"]
+    assert "12 достижений" in hit["umkaplay.ru"]
+
+
+def test_spam_needs_volume_and_ratio():
+    """Три заявки с двух кликов — шум; 8 % при 6 % по кабинету — норма."""
+    rows = [_week(1, "tiny.ru", 2, 3)]
+    rows += [_week(1, "site%d.ru" % i, 100, 6) for i in range(10)]
+    rows += [_week(1, "good.ru", 100, 8)]
+    assert suspicious_sites(rows, {"1": 1}) == {}
+
+
+def test_spam_skips_known_apps_and_portals():
+    """ВК даёт шесть заявок с 55 кликов — решать человеку, не правилу."""
+    rows = [_week(1, "com.vk.vkclient", 55, 6), _week(1, "dzen.ru", 40, 6)]
+    rows += [_week(1, "site%d.ru" % i, 100, 1) for i in range(10)]
+    assert suspicious_sites(rows, {"1": 1}) == {}
+
+
+def test_spam_counts_own_goal_and_sums_campaigns():
+    """Конверсии — по цели стратегии кампании; площадка считается целиком."""
+    rows = [_week(1, "x.ru", 30, 3, goal=1), _week(2, "x.ru", 30, 3, goal=2)]
+    rows[0]["conversions"][2] = 99  # чужая цель кампании 1 не считается
+    rows += [_week(1, "site%d.ru" % i, 100, 1) for i in range(10)]
+    hit = suspicious_sites(rows, {"1": 1, "2": 2})
+    assert "6 достижений с 60 кликов" in hit["x.ru"]
+
+
+def test_spam_is_pinned_into_every_campaign():
+    plan = plan_account([], [_campaign(1), _campaign(2)],
+                        spam={"umkaplay.ru": "спам"})
+    assert [a["added"][0]["verdict"] for a in plan["actions"]] == ["spam"] * 2
+
+
 FORCED = ("mail.ru", "m.games.yandex.ru")
 
 

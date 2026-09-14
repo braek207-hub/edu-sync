@@ -7,6 +7,7 @@
 """
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -108,6 +109,30 @@ def campaigns(token: str, login: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _report_lines(token: str, login: str, body: Dict[str, Any]) -> List[str]:
+    """Отчёт из очереди Reports API → непустые строки TSV (первая — шапка)."""
+    headers = dict(_headers(token, login))
+    headers.update({"processingMode": "auto", "returnMoneyInMicros": "false",
+                    "skipReportHeader": "true", "skipReportSummary": "true"})
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+    text = None
+    for attempt in range(1, MAX_POLL + 1):
+        req = urllib.request.Request(REPORTS, data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                if resp.status == 200:
+                    text = resp.read().decode("utf-8")
+                    break
+        except urllib.error.HTTPError as err:
+            raise DirectError("reports HTTP %s: %s"
+                              % (err.code, err.read().decode("utf-8")[:400]))
+        time.sleep(POLL_SLEEP)
+    if text is None:
+        raise DirectError("отчёт не сформировался за %d попыток" % MAX_POLL)
+    return [ln for ln in text.splitlines() if ln.strip()]
+
+
 def placements_today(token: str, login: str) -> List[Dict[str, Any]]:
     """Площадки сети за сегодня: кампания, имя площадки, клики, расход.
 
@@ -132,27 +157,7 @@ def placements_today(token: str, login: str) -> List[Dict[str, Any]]:
         "IncludeVAT": "YES",
         "IncludeDiscount": "NO",
     }}
-    headers = dict(_headers(token, login))
-    headers.update({"processingMode": "auto", "returnMoneyInMicros": "false",
-                    "skipReportHeader": "true", "skipReportSummary": "true"})
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-
-    text = None
-    for attempt in range(1, MAX_POLL + 1):
-        req = urllib.request.Request(REPORTS, data=data, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                if resp.status == 200:
-                    text = resp.read().decode("utf-8")
-                    break
-        except urllib.error.HTTPError as err:
-            raise DirectError("reports HTTP %s: %s"
-                              % (err.code, err.read().decode("utf-8")[:400]))
-        time.sleep(POLL_SLEEP)
-    if text is None:
-        raise DirectError("отчёт не сформировался за %d попыток" % MAX_POLL)
-
-    lines = [ln for ln in text.splitlines() if ln.strip()]
+    lines = _report_lines(token, login, body)
     if not lines:
         return []
     header = lines[0].split("\t")
@@ -169,6 +174,104 @@ def placements_today(token: str, login: str) -> List[Dict[str, Any]]:
             "clicks": int(float(rec.get("Clicks") or 0)),
             "cost": float(rec.get("Cost") or 0.0),
             "impressions": int(float(rec.get("Impressions") or 0)),
+        })
+    return rows
+
+
+def _strategy_goal(strategy: Dict[str, Any]) -> Any:
+    for arm in ("Network", "Search"):
+        for kind, block in ((strategy.get(arm) or {}).items()):
+            if isinstance(block, dict) and block.get("GoalId"):
+                return int(block["GoalId"])
+    return None
+
+
+def campaign_goals(token: str, login: str) -> Dict[str, int]:
+    """Кампания → цель её автостратегии.
+
+    Правило спам-площадок считает конверсии именно по этой цели: автостратегия
+    учится на ней, и площадка, которая «достигает» её слишком хорошо, — та
+    самая, что кормит стратегию пустыми заявками (см. память
+    edu-spam-leads-autostrategy-goal). Кампании без цели в стратегии — без
+    правила: считать по «всем целям» нечем, Reports API требует список.
+    """
+    out: Dict[str, int] = {}
+    offset = 0
+    while True:
+        res = call(token, login, "campaigns", {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {},
+                "FieldNames": ["Id"],
+                "TextCampaignFieldNames": ["BiddingStrategy"],
+                "Page": {"Limit": 1000, "Offset": offset},
+            },
+        })
+        chunk = res.get("Campaigns", [])
+        for c in chunk:
+            goal = _strategy_goal((c.get("TextCampaign") or {})
+                                  .get("BiddingStrategy") or {})
+            if goal:
+                out[str(c["Id"])] = goal
+        if len(chunk) < 1000:
+            break
+        offset += len(chunk)
+    return out
+
+
+def placements_with_goals(token: str, login: str, goals: List[int],
+                          date_range: str = "LAST_7_DAYS") -> List[Dict[str, Any]]:
+    """Площадки сети за период с достижениями целей: для спам-правила.
+
+    Окно шире суточного: спам-площадка даёт по 1–3 заявки в день, и за
+    сутки её не отличить от честной. Конверсии приходят по колонке на цель
+    (Conversions_<goal>_<модель>); строка несёт словарь goal → достижения.
+    """
+    goals = sorted({int(g) for g in goals})[:10]  # потолок Reports API
+    if not goals:
+        return []
+    body = {"params": {
+        "SelectionCriteria": {"Filter": [{"Field": "Clicks",
+                                          "Operator": "GREATER_THAN",
+                                          "Values": ["0"]}]},
+        "Goals": [str(g) for g in goals],
+        "AttributionModels": ["AUTO"],
+        "FieldNames": ["CampaignId", "Placement", "AdNetworkType", "Cost",
+                       "Clicks", "Impressions", "Conversions"],
+        "ReportName": "placement-spam-%s-%d" % (login, int(time.time())),
+        "ReportType": "CUSTOM_REPORT",
+        "DateRangeType": date_range,
+        "Format": "TSV",
+        "IncludeVAT": "YES",
+        "IncludeDiscount": "NO",
+    }}
+    lines = _report_lines(token, login, body)
+    if not lines:
+        return []
+    header = lines[0].split("\t")
+    conv_cols = [(i, int(m.group(1))) for i, h in enumerate(header)
+                 for m in [re.match(r"Conversions_(\d+)", h)] if m]
+    col = {h: i for i, h in enumerate(header)}
+    rows = []
+    for line in lines[1:]:
+        cells = line.split("\t")
+        if len(cells) < len(header):
+            continue
+        if cells[col["AdNetworkType"]].upper() != "AD_NETWORK":
+            continue
+        if not cells[col["Placement"]]:
+            continue
+        conv = {}
+        for i, goal in conv_cols:
+            raw = cells[i]
+            conv[goal] = int(float(raw)) if raw not in ("", "--") else 0
+        rows.append({
+            "campaign_id": str(cells[col["CampaignId"]]),
+            "placement": cells[col["Placement"]],
+            "clicks": int(float(cells[col["Clicks"]] or 0)),
+            "cost": float(cells[col["Cost"]] or 0.0),
+            "impressions": int(float(cells[col["Impressions"]] or 0)),
+            "conversions": conv,
         })
     return rows
 

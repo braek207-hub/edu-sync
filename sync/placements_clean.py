@@ -16,7 +16,7 @@ import sys
 import traceback
 
 from sync.placements import accounts as reg
-from sync.placements import direct, journal, llm
+from sync.placements import direct, journal, llm, spam
 from sync.placements import plan as planner
 
 
@@ -70,6 +70,21 @@ def ask_model(plan, ask, use_db: bool):
     return overrides, note
 
 
+def spam_sites(account, token: str, login: str) -> dict:
+    """Спам-площадки логина по недельной статистике. Пусто — если отчёт
+    не дался: правило дополняет чистку, а не блокирует её."""
+    try:
+        goals = direct.campaign_goals(token, login)
+        if not goals:
+            return {}
+        week = direct.placements_with_goals(token, login,
+                                            sorted(set(goals.values())))
+        return spam.suspicious_sites(week, goals)
+    except Exception as err:
+        _out("  спам-правило пропущено: %s" % err)
+        return {}
+
+
 def run_login(account, login: str, apply: bool, top_n: int,
               use_db: bool, ask=None) -> dict:
     token = account.token()
@@ -85,8 +100,9 @@ def run_login(account, login: str, apply: bool, top_n: int,
         return {"sites": 0, "campaigns": 0, "ok": 0, "failed": 0}
     rows = direct.placements_today(token, login)
     forced = account.always_block
+    suspicious = spam_sites(account, token, login) if account.spam_rule else {}
     plan = planner.plan_account(rows, campaigns, top_n=top_n,
-                                always_block=forced)
+                                always_block=forced, spam=suspicious)
 
     if ask is not None:
         overrides, note = ask_model(plan, ask, use_db)
@@ -95,10 +111,12 @@ def run_login(account, login: str, apply: bool, top_n: int,
         if overrides:
             plan = planner.plan_account(rows, campaigns, top_n=top_n,
                                         overrides=overrides,
-                                        always_block=forced)
+                                        always_block=forced, spam=suspicious)
 
     if forced:
         _out("  обязательная минусация кабинета: %s" % ", ".join(forced))
+    for site, why in suspicious.items():
+        _out("  %s — %s" % (site, why))
     _out("  площадок за день: %d, кликов %d, расход %.0f ₽"
          % (plan["day_sites"], plan["day_clicks"], plan["day_cost"]))
     for verdict in sorted(plan["summary"],

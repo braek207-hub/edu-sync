@@ -59,7 +59,8 @@ def plan_account(rows: List[Dict[str, Any]],
                  allow_exact=None,
                  allow_prefix=None,
                  overrides: Optional[Dict[str, Any]] = None,
-                 always_block=None) -> Dict[str, Any]:
+                 always_block=None,
+                 spam: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Строки отчёта + кампании кабинета → план запретов по кампаниям.
 
     Возвращает действия (что писать), отказы (почему не пишем) и сводку
@@ -92,7 +93,18 @@ def plan_account(rows: List[Dict[str, Any]],
         d["clicks"] += clicks
         d["cost"] += cost
 
-    forced = [s for s in (normalize(x) for x in (always_block or [])) if s]
+    # Пришпиленные площадки: их запрет не зависит ни от ворот, ни от
+    # сегодняшних кликов. Обязательный список кабинета — решение человека,
+    # спам-площадки — статистика за неделю (spam.py). Порядок важен: сначала
+    # человек, потом правило.
+    pinned: Dict[str, tuple] = {}
+    for site in (normalize(x) for x in (always_block or [])):
+        if site:
+            pinned[site] = ("forced", "обязательная минусация кабинета")
+    for site, why in (spam or {}).items():
+        site = normalize(site)
+        if site and site not in pinned:
+            pinned[site] = ("spam", why)
 
     verdicts = {site: classify(site, **kwargs) for site in day}
     # Поправки второго судьи (llm.py) ложатся поверх словаря. Только «резать»:
@@ -100,11 +112,11 @@ def plan_account(rows: List[Dict[str, Any]],
     for site, verdict in (overrides or {}).items():
         if site in verdicts:
             verdicts[site] = verdict
-    # Решение человека главнее обоих судей: в списке кабинета площадка
-    # запрещается, даже если словарь считает её крупным порталом.
-    for site in forced:
+    # Пришпиленное главнее обоих судей: площадка запрещается, даже если
+    # словарь считает её крупным порталом.
+    for site, verdict in pinned.items():
         if site in verdicts:
-            verdicts[site] = ("forced", "обязательная минусация кабинета")
+            verdicts[site] = verdict
 
     summary: Dict[str, Dict[str, Any]] = {}
     for site, (verdict, _) in verdicts.items():
@@ -120,11 +132,11 @@ def plan_account(rows: List[Dict[str, Any]],
     # площадка всё равно не будет запрещена этим тактом.
     candidates: Dict[str, int] = {}
 
-    # Кампании из отчёта плюс — если у кабинета есть обязательный список —
-    # все пригодные кампании кабинета: обязательная минусация не ждёт, пока
-    # площадка наберёт клики, она должна стоять в списке заранее.
+    # Кампании из отчёта плюс — если есть пришпиленные площадки — все
+    # пригодные кампании кабинета: такой запрет не ждёт, пока площадка
+    # наберёт клики, он должен стоять в списке заранее.
     cids = set(pair)
-    if forced:
+    if pinned:
         cids |= {str(c["Id"]) for c in campaigns
                  if c.get("Type") in CLEANABLE_TYPES
                  and c.get("State") in CLEANABLE_STATES}
@@ -174,9 +186,9 @@ def plan_account(rows: List[Dict[str, Any]],
         fresh.sort(key=lambda item: (-item[1], -item[2], item[0]))
 
         added: List[Dict[str, Any]] = []
-        # Обязательные — первыми и вне ворот: они не соревнуются за место в
-        # топе по кликам, потому что их запретил человек, а не правило.
-        for site in forced:
+        # Пришпиленные — первыми и вне ворот: они не соревнуются за место в
+        # топе по кликам, потому что решение о них уже принято.
+        for site, (verdict, why) in pinned.items():
             if site in known:
                 continue
             ok, bad = site_is_valid(site)
@@ -186,8 +198,8 @@ def plan_account(rows: List[Dict[str, Any]],
                 continue
             stat = sites.get(site) or {"clicks": 0, "cost": 0.0}
             added.append({"placement": site, "clicks": stat["clicks"],
-                          "cost": round(stat["cost"], 2), "verdict": "forced",
-                          "reason": "обязательная минусация кабинета"})
+                          "cost": round(stat["cost"], 2), "verdict": verdict,
+                          "reason": why})
             known.add(site)
 
         for site, clicks, cost in fresh[:top_n]:

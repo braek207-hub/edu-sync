@@ -144,7 +144,21 @@ CORE_TLDS = frozenset({
 
 # «llm» ставит второй судья (llm.py) поверх словаря: сайт правильной формы,
 # который модель опознала как дорвей, помойку или пиратку.
-CUT_VERDICTS = frozenset({"app", "dsp", "game", "junk", "llm", "forced"})
+CUT_VERDICTS = frozenset({"app", "dsp", "game", "junk", "llm", "forced",
+                          "spam"})
+
+# Подстроки, а не слова: umkaplay.ru и mozgoplay.com по точкам и дефисам
+# дают один сегмент, и словарный токен «play» их не ловит. Решение Павла
+# 14.09.2026 — резать всё, где эти слова содержатся; известные приложения
+# (allowlist) проверяются раньше и остаются.
+JUNK_WORDS = ("game", "play", "free")
+
+
+def _junk_word(site: str):
+    for word in JUNK_WORDS:
+        if word in site:
+            return word
+    return None
 
 
 def normalize(name: str) -> str:
@@ -234,6 +248,9 @@ def classify(name: str,
         hit = segs & JUNK_TOKENS
         if hit:
             return "app", "мусорное приложение: %s" % ", ".join(sorted(hit))
+        word = _junk_word(site)
+        if word:
+            return "app", "мусорное приложение: слово «%s»" % word
         return "app", "мобильное приложение"
 
     tld = _segments(site)[-1]
@@ -242,6 +259,9 @@ def classify(name: str,
     hit = segs & JUNK_TOKENS
     if hit:
         return "junk", "мусорный сайт: %s" % ", ".join(sorted(hit))
+    word = _junk_word(site)
+    if word:
+        return "junk", "мусорный сайт: слово «%s» в имени" % word
     return "site", "обычный сайт"
 
 

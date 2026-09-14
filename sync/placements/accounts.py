@@ -23,6 +23,11 @@ class Account(NamedTuple):
     # словаря и не по кликам, а решением человека. Список кабинетный —
     # почта и Дзен у одного клиента сливают бюджет, у другого приносят лиды.
     always_block: Tuple[str, ...] = ()
+    # Резать площадки, которые «достигают» цель автостратегии кратно чаще
+    # кабинета (spam.py). Нужно там, где стратегия учится на лид-форме и
+    # спам-заявки выглядят для Директа успехом; у e-com цель — оплата, и
+    # накрутить её площадка не может.
+    spam_rule: bool = False
 
     def token(self) -> str:
         return os.environ.get(self.token_env, "").strip()
@@ -46,7 +51,10 @@ ACCOUNTS: List[Account] = [
     # проставлены цели, — чистить надо всех, включая новых, о которых секрет
     # ещё не знает.
     Account("edu", "EDUNETWORK", "DIRECT_TOKEN",
-            logins_env="DIRECT_CLIENTS_JSON", agency=True),
+            logins_env="DIRECT_CLIENTS_JSON", agency=True,
+            # Решение Павла 14.09.2026: площадки с аномально частым
+            # «Спасибо» выключать — это спам-заявки, а не студенты.
+            spam_rule=True),
     Account("lime", "LIME", "LIME_DIRECT_TOKEN",
             login=os.environ.get("LIME_DIRECT_CLIENT_LOGIN") or None),
     Account("bjorn", "BJORN", "BJORN_DIRECT_TOKEN",
