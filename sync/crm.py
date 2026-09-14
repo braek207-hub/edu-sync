@@ -204,11 +204,14 @@ def _sync_leads_raw(
     dropped_no_campaign = 0
     max_date_iso = ""
     tail_dates = [str(_cell(r, li["date"]))[:19] for r in values[-3:]]
+    no_date_samples: List[str] = []
 
     for row in values[1:]:
         date_iso = to_iso_date(_cell(row, li["date"]))
         if not date_iso:
             dropped_no_date += 1
+            if len(no_date_samples) < 3 and any(str(c).strip() for c in row):
+                no_date_samples.append(" | ".join(str(c)[:24] for c in row[:12]))
             continue
         if date_iso > max_date_iso:
             max_date_iso = date_iso
@@ -389,6 +392,8 @@ def _sync_leads_raw(
         f"без даты {dropped_no_date}, без кампании/ленда {dropped_no_campaign}, "
         f"последние 3 ячейки даты: {tail_dates}"
     )
+    for sample in no_date_samples:
+        print(f"CRM Лиды: строка без даты, образец: {sample}")
 
     return agg, lead_dims_by_id, lead_details
 
