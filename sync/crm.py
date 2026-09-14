@@ -198,11 +198,20 @@ def _sync_leads_raw(
     lead_details: List[Dict[str, Any]] = []
     seen: set[str] = seen_lead_ids if seen_lead_ids is not None else set()
     dropped_dups = 0
+    # Диагностика чтения листа: без неё «лист вырос, а витрина нет» не отличить от
+    # «лист не вырос» — строки без даты/кампании пропускаются молча (14.09.2026).
+    dropped_no_date = 0
+    dropped_no_campaign = 0
+    max_date_iso = ""
+    tail_dates = [str(_cell(r, li["date"]))[:19] for r in values[-3:]]
 
     for row in values[1:]:
         date_iso = to_iso_date(_cell(row, li["date"]))
         if not date_iso:
+            dropped_no_date += 1
             continue
+        if date_iso > max_date_iso:
+            max_date_iso = date_iso
         cid = normalize_campaign_id(_cell(row, li["campaign"]))
         land = (
             str(_cell(row, li["land"])).strip().lower() if li["land"] != -1 else ""
@@ -210,6 +219,7 @@ def _sync_leads_raw(
         if not cid and land:
             cid = f"land:{land}"
         if not cid:
+            dropped_no_campaign += 1
             continue
 
         city = (
@@ -374,6 +384,11 @@ def _sync_leads_raw(
 
     if dropped_dups:
         print(f"CRM Лиды: пропущено {dropped_dups} строк с уже посчитанным lead_id (дубли выгрузки)")
+    print(
+        f"CRM Лиды: строк в листе {len(values) - 1}, макс. дата {max_date_iso or '—'}, "
+        f"без даты {dropped_no_date}, без кампании/ленда {dropped_no_campaign}, "
+        f"последние 3 ячейки даты: {tail_dates}"
+    )
 
     return agg, lead_dims_by_id, lead_details
 
