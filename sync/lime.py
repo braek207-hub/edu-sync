@@ -43,19 +43,22 @@ def classify(source: str, medium: str):
     m = (medium or "").lower().strip()
 
     # `yandex.direct` / `(not set)` — сессии приложения без UTM, подписанные AppMetrica
-    # источником УСТАНОВКИ (attribution UA). Расхода и кампании у них нет, как и у
-    # `vk-ads-(ex.-mytarget)`; по решению Павла (11.09.2026) — не в платном.
-    if s == "yandex.direct" and m == "(not set)":
-        return "Direct", "Yandex.Direct (установки)"
+    # источником УСТАНОВКИ (attribution UA). Расхода и кампании нет, но витрина
+    # PROCONTEXT (ручная книга агентства) держит их в SEM → App Display: W33 2026
+    # у агентства 516 заказов = 65 по display-кампаниям + 452 таких сессий. Решение
+    # 11.09.2026 «не в платном» отменено 15.09.2026: отчёт обязан сходиться с витриной.
     if any(x in s for x in ["ya.direct", "yandex.direct", "y a.direct"]):
         return "SEM", "Яндекс.Директ"
     # medium `ad` + id рекламной системы — так PROCONTEXT подписывает клики без UTM
-    # (Метрика: TrafficSource=ad, AdvEngine=ya_direct). Кампании нет, но канал известен:
-    # замер 12.08–10.09.2026 — 120 тыс. сессий Директа лежали в Others.
+    # (Метрика: TrafficSource=ad, AdvEngine=ya_direct). Кампании нет → в SEM строка
+    # без campaign_id падала бы в Display (фоллбэк дашборда), а витрина их в Display
+    # не кладёт (W33: 103 у агентства против 83 + 485 таких у нас). Поэтому вне SEM,
+    # но под своим именем — чтобы не растворялись в Others (замер 12.08–10.09.2026:
+    # 120 тыс. сессий, 2 081 заказ).
     if m == "ad" and s == "ya_direct":
-        return "SEM", "Яндекс.Директ"
+        return "Others", "Яндекс.Директ (без UTM)"
     if m == "ad" and s == "google_adwords":
-        return "SEM", "Google.Adwords"
+        return "Others", "Google.Adwords (без UTM)"
     if "yandex" in s and "market" not in s and m == "cpc":
         return "SEM", "Яндекс.Директ"
     if "google" in s and "brand" not in s and m == "cpc":

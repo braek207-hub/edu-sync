@@ -8,15 +8,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from sync.lime import classify
 
 
-def test_direct_click_without_utm_is_direct_channel():
-    # PROCONTEXT подписывает клики без UTM id рекламной системы Метрики + medium `ad`
-    assert classify("ya_direct", "ad") == ("SEM", "Яндекс.Директ")
-    assert classify("google_adwords", "ad") == ("SEM", "Google.Adwords")
+def test_direct_click_without_utm_is_outside_sem_but_named():
+    # PROCONTEXT подписывает клики без UTM id рекламной системы Метрики + medium `ad`.
+    # В SEM без campaign_id они падали бы в Display, а витрина их там не держит
+    # (сверка W33 2026 с ручной книгой агентства, 15.09.2026) — вне SEM, но не безымянные.
+    assert classify("ya_direct", "ad") == ("Others", "Яндекс.Директ (без UTM)")
+    assert classify("google_adwords", "ad") == ("Others", "Google.Adwords (без UTM)")
 
 
-def test_direct_install_attributed_app_sessions_are_not_paid():
-    # сессии приложения без UTM, источник = установка; расхода нет — как у VK, в органике
-    assert classify("yandex.direct", "(not set)") == ("Direct", "Yandex.Direct (установки)")
+def test_direct_install_attributed_app_sessions_stay_in_sem():
+    # сессии приложения без UTM, источник = установка: у витрины они в SEM → App Display
+    # (W33 2026: 516 = 65 + 452), отчёт обязан сходиться — в SEM без campaign_id
+    assert classify("yandex.direct", "(not set)") == ("SEM", "Яндекс.Директ")
     assert classify("ya.direct", "cpc") == ("SEM", "Яндекс.Директ")
     assert classify("yandex.direct", "cpc") == ("SEM", "Яндекс.Директ")
 
