@@ -66,3 +66,22 @@ def group_titles(group_id: int, tok: Optional[str] = None) -> List[str]:
             if title:
                 out.append(title)
     return out
+
+
+def campaign_titles(campaign_id: int, tok: Optional[str] = None) -> List[str]:
+    """То же по кампании новой структуры (NEW): объявления лежат в десятках
+    групп по 3, читать группу за группой не нужно."""
+    r = call("ads", "get", {
+        "SelectionCriteria": {"CampaignIds": [campaign_id], "States": ["ON", "OFF"]},
+        "FieldNames": ["Id", "Type"],
+        "ResponsiveAdFieldNames": ["Titles"],
+        "Page": {"Limit": 500}}, tok=tok)
+    out: List[str] = []
+    for ad in (r or {}).get("Ads", []):
+        if ad.get("Type") != "RESPONSIVE_AD":
+            continue
+        for t in (ad.get("ResponsiveAd", {}).get("Titles") or []):
+            title = t.get("Title") if isinstance(t, dict) else t
+            if title:
+                out.append(title)
+    return out

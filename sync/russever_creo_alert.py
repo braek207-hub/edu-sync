@@ -21,11 +21,11 @@ from typing import Any, Dict, List, Optional
 
 from sync.agent import notify
 from sync.russever import direct
-from sync.russever.cities import CITY, RSYA, SEARCH, is_over, phase
+from sync.russever.cities import CITY, NEW, RSYA, SEARCH, is_over, phase
 from sync.russever.copy import texts, titles
 
 MSK = dt.timezone(dt.timedelta(hours=3))
-ORDER = ["magadan", "salehard", "urengoy", "yakutsk", "kogalym", "chelyabinsk"]
+ORDER = ["magadan", "salehard", "urengoy", "yakutsk", "kogalym", "chelyabinsk", "mirny", "surgut", "lensk", "khm"]
 
 
 def today_msk() -> dt.date:
@@ -41,7 +41,12 @@ def city_state(slug: str, day: dt.date, tok: Optional[str]) -> Dict[str, Any]:
     want = titles(C, day)[1]
     live: List[str] = []
     read = False
-    if tok:
+    if tok and slug in NEW:
+        got = direct.campaign_titles(NEW[slug]["Видео"], tok=tok)
+        if got:
+            read = True
+            live.extend(got)
+    elif tok:
         for gid in RSYA[slug].values():
             got = direct.group_titles(gid, tok=tok)
             if got:
@@ -88,12 +93,16 @@ def build_message(day: dt.date, states: List[Dict[str, Any]]) -> Optional[str]:
         C = CITY[s["slug"]]
         ph, T = titles(C, day)
         _, TX, LINKS = texts(C, day)
-        camps = ", ".join(str(c) for c in RSYA[s["slug"]])
         причина = ("сегодня переход" if s["смена_сегодня"]
                    else "в кабинете стоит другая фаза")
         L.append(f"МЕНЯТЬ СЕЙЧАС — {s['город']}: нужна фаза «{ph}» ({причина})")
-        L.append(f"  РСЯ {camps} (группа автотаргета)"
-                 f" · Поиск {', '.join(str(c) for c in SEARCH[s['slug']])}")
+        if s["slug"] in NEW:
+            L.append("  кампании " + ", ".join(f"{k} {v}" for k, v in NEW[s["slug"]].items())
+                     + f" · python -m sync.russever.phase {s['slug']} --go")
+        else:
+            camps = ", ".join(str(c) for c in RSYA[s["slug"]])
+            L.append(f"  РСЯ {camps} (группа автотаргета)"
+                     f" · Поиск {', '.join(str(c) for c in SEARCH.get(s['slug'], []))}")
         L.append("  Заголовки:")
         L += [f"   {i}. {t}" for i, t in enumerate(T, 1)]
         L.append("  Тексты:")
