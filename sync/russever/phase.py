@@ -3,9 +3,8 @@
 
     python -m sync.russever.phase <slug> [--go] [--date YYYY-MM-DD]
 
-У каждого комбинаторного объявления один заголовок и один текст (модель ХМ);
-заголовки фазы раздаются по кругу — 7 заголовков × 3 текста на десятки объявлений,
-как при сборке. Быстрые ссылки — новый набор на фазу. Графические (IMAGE_AD)
+У каждого комбинаторного объявления 3 заголовка и 3 текста (сборка 19.09):
+окно из 3 заголовков со сдвигом по номеру объявления внутри группы, тексты — первые 3 фазы. Быстрые ссылки — новый набор на фазу. Графические (IMAGE_AD)
 без текста, их не трогаем. Без --go — только показать, что будет залито.
 """
 import datetime as dt
@@ -55,6 +54,10 @@ def main(argv: List[str]) -> int:
             return 1
         ads += r.get("Ads", [])
     ads.sort(key=lambda a: (a["AdGroupId"], a["Id"]))
+    pos: Dict[int, int] = {}   # номер объявления внутри группы — как t3(k) при сборке
+    for a in ads:
+        a["k"] = pos.get(a["AdGroupId"], 0)
+        pos[a["AdGroupId"]] = a["k"] + 1
     print(f"  объявлений к обновлению: {len(ads)}")
     if not go:
         return 0
@@ -70,9 +73,9 @@ def main(argv: List[str]) -> int:
     ok = 0
     errs: List[Any] = []
     for i in range(0, len(ads), 100):
-        batch = [{"Id": a["Id"], "ResponsiveAd": {"Titles": [T[(i + j) % len(T)]], "Texts": [TX[(i + j) % len(TX)]],
-                                                  "SitelinkSetId": sl_id}}
-                 for j, a in enumerate(ads[i:i + 100])]
+        batch = [{"Id": a["Id"], "ResponsiveAd": {"Titles": [T[(3 * a["k"] + n) % len(T)] for n in range(3)],
+                                                  "Texts": TX[:3], "SitelinkSetId": sl_id}}
+                 for a in ads[i:i + 100]]
         res = (direct.call("ads", "update", {"Ads": batch}) or {}).get("UpdateResults", [])
         ok += sum(1 for u in res if u.get("Id"))
         errs += [u.get("Errors") for u in res if not u.get("Id")]
