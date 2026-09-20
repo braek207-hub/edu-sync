@@ -30,6 +30,8 @@ def plural(n: int, one: str, few: str, many: str) -> str:
 
 # бренды — состав города по блоку брендов на лендинге rossever-expo.ru/<город> (16.09.2026),
 # первые два идут в заголовки. Бренд, которого нет в городе, в объявлении запрещён (Павел).
+# Krakatau — по таблице ТЗ «РосСеверЭкспо_города_марки_ТЗ_v3» (20.09): разрешён везде, кроме
+# Сургута, даже там, где лендинг его не показывает (Когалым, Челябинск, ХМ).
 CITY: Dict[str, dict] = {
     "magadan": dict(
         город="Магадан", род="Магадана", где="Магадане",
@@ -60,13 +62,13 @@ CITY: Dict[str, dict] = {
         пл="ТЦ Надежда", адрес="ул. Ленинградская, 29",
         старт=dt.date(2026, 9, 23), конец=dt.date(2026, 9, 27),
         кратко="23–27.09", стартД="23 сентября",
-        бренды="Bask, Bjorn Larsen, Laplanger, Finntrail, Red Fox, Arctic Explorer"),  # лендинг 19.09
+        бренды="Bask, Bjorn Larsen, Laplanger, Finntrail, Red Fox, Arctic Explorer, Krakatau"),  # лендинг 19.09
     "chelyabinsk": dict(
         город="Челябинск", род="Челябинска", где="Челябинске",
         пл="ТЦ Горки", адрес="ул. Артиллерийская, 136",
         старт=dt.date(2026, 9, 23), конец=dt.date(2026, 10, 14),
         кратко="23.09–14.10", стартД="23 сентября",
-        бренды="Bask, Bjorn Larsen, Laplanger, Finntrail, Red Fox, Arctic Explorer"),  # лендинг 19.09
+        бренды="Bask, Bjorn Larsen, Laplanger, Finntrail, Red Fox, Arctic Explorer, Krakatau"),  # лендинг 19.09
     "mirny": dict(  # данные с лендинга rossever-expo.ru/mirny (15.09.2026)
         город="Мирный", род="Мирного", где="Мирном",
         пл="ТЦ Моника", адрес="ул. 40 лет Октября, 43/1",
@@ -92,7 +94,7 @@ CITY: Dict[str, dict] = {
         пл="ТЦ NEBO", адрес="ул. Мира, 45",
         старт=dt.date(2026, 10, 7), конец=dt.date(2026, 10, 11),
         кратко="7–11.10", стартД="7 октября",
-        бренды="Bask, Bjorn Larsen, Laplanger, Finntrail, Red Fox, Arctic Explorer"),
+        бренды="Bask, Bjorn Larsen, Laplanger, Finntrail, Red Fox, Arctic Explorer, Krakatau"),
 }
 
 # Слаг лендинга, если отличается от ключа
