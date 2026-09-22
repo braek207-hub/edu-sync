@@ -2,7 +2,8 @@ import os
 import re
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, List
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
 import psycopg2
@@ -413,6 +414,53 @@ def upsert_direct_stats(rows: List[Dict[str, Any]]) -> int:
     return len(rows)
 
 
+class SourceShrunkError(ValueError):
+    """Источник отдал заметно меньше, чем уже лежит в базе за то же окно."""
+
+
+# Google-лист CRM живёт своей жизнью: 22.09.2026 «Лиды» пересобирался из Битрикса,
+# и в момент синка в нём было 1 199 лидов до 12.01 вместо 112 941 до 18.09. DELETE
+# date >= min снёс восемь месяцев crm_leads/crm_lead_details. Поэтому полная замена
+# окна разрешена, только если новых данных не заметно меньше уже лежащих.
+# Пороги: половина объёма (чистка мусорных статусов даёт проценты, не половину) и
+# откат максимальной даты больше недели (лаг CRM 2–4 дня, см. edu-crm-lag-no-maturation).
+SHRINK_MIN_SHARE = 0.5
+SHRINK_MAX_DATE_ROLLBACK = timedelta(days=7)
+
+
+def check_not_shrunk(
+    table: str,
+    *,
+    old_total: float,
+    old_max: Optional[date],
+    new_total: float,
+    new_max: date,
+) -> None:
+    if os.environ.get("CRM_REPLACE_FORCE") == "1":
+        return
+    if old_total and new_total < old_total * SHRINK_MIN_SHARE:
+        raise SourceShrunkError(
+            f"{table}: источник отдал {new_total:g} против {old_total:g} в базе за то же окно "
+            f"— похоже на опустевший лист; замена отменена (CRM_REPLACE_FORCE=1 — принудительно)"
+        )
+    if old_max and new_max < old_max - SHRINK_MAX_DATE_ROLLBACK:
+        raise SourceShrunkError(
+            f"{table}: источник кончается {new_max.isoformat()}, в базе уже {old_max.isoformat()} "
+            f"— похоже на недозаполненный лист; замена отменена (CRM_REPLACE_FORCE=1 — принудительно)"
+        )
+
+
+def _guard_window_replace(cur, table: str, date_col: str, measure: str, rows: List[Dict[str, Any]],
+                          new_total: float, min_date: str) -> None:
+    cur.execute(
+        f"SELECT COALESCE(SUM({measure}), 0), MAX({date_col}) FROM {table} WHERE {date_col} >= %s",
+        (min_date,),
+    )
+    old_total, old_max = cur.fetchone()
+    new_max = max(date.fromisoformat(str(r[date_col])[:10]) for r in rows)
+    check_not_shrunk(table, old_total=float(old_total), old_max=old_max, new_total=new_total, new_max=new_max)
+
+
 def replace_crm_leads(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
@@ -450,6 +498,8 @@ def replace_crm_leads(rows: List[Dict[str, Any]]) -> int:
     min_date = min(str(r["date"]) for r in rows)
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _guard_window_replace(cur, "crm_leads", "date", "leads", rows,
+                                  sum(int(r["leads"]) for r in rows), min_date)
             cur.execute("DELETE FROM crm_leads WHERE date >= %s", (min_date,))
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
         conn.commit()
@@ -541,6 +591,7 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
     min_date = min(str(r["created_date"]) for r in rows)
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _guard_window_replace(cur, "crm_lead_details", "created_date", "1", rows, len(rows), min_date)
             cur.execute("DELETE FROM crm_lead_details WHERE created_date >= %s", (min_date,))
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
         conn.commit()
@@ -595,6 +646,8 @@ def replace_crm_payments(rows: List[Dict[str, Any]]) -> int:
     min_date = min(str(r["date"]) for r in rows)
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _guard_window_replace(cur, "crm_payments", "date", "payments", rows,
+                                  sum(int(r["payments"]) for r in rows), min_date)
             cur.execute("DELETE FROM crm_payments WHERE date >= %s", (min_date,))
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
         conn.commit()
