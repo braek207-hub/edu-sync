@@ -5,11 +5,22 @@ from __future__ import annotations
 import json
 import os
 
+import httplib2
 from google.oauth2.service_account import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+
+def _sheets_http() -> httplib2.Http:
+    # httplib2 ≥0.32 считает ответ «декомпрессионной бомбой», если после 10 МиБ
+    # он раздулся больше чем в 100× относительно gzip-байтов. Лист CRM «Лиды»
+    # (130k+ строк, тысячи пустых) — как раз такой: 22.09.2026 коэффициент стал
+    # 133× и синк потерял crm_leads/crm_payments. Ratio выключаем; жёсткий
+    # потолок объёма (10 ГиБ) остаётся — от Google это единственный нужный предохранитель.
+    return httplib2.Http(decode_limit_ratio=0)
 
 
 def get_sheets_service():
@@ -20,7 +31,8 @@ def get_sheets_service():
     else:
         sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT"]
         creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=SCOPES)
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    http = AuthorizedHttp(creds, http=_sheets_http())
+    return build("sheets", "v4", http=http, cache_discovery=False)
 
 
 def read_sheet(
