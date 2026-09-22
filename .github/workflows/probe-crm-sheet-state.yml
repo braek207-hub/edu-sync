@@ -13,9 +13,13 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
+      - name: Ключ сервис-аккаунта
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: printf '%s' "$GCP_SA_KEY" > sa.json
       - name: Состояние листа
         env:
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
           GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
           CRM_LEADS_SHEETS: Лиды
         run: python probe_crm_sheet_state.py
