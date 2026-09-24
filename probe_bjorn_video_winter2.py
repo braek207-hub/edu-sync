@@ -141,11 +141,6 @@ def probe(login: str, token: str) -> None:
             break
 
     # Что вообще принимает bidmodifiers.add — вытаскиваем список типов из ошибки.
-    probe_add = call("bidmodifiers", {
-        "BidModifiers": [{"CampaignId": ids[0] if ids else 0}],
-    }, login, token, method="add")
-    print(f"\nдопустимые поля bidmodifiers.add (из ответа API): {err(probe_add)}")
-
     # ── 2. Состав групп активных кампаний ─────────────────────────────────────
     print("\n" + "#" * 70)
     print("# 2. СОСТАВ ГРУПП: ТГО рядом с фидовыми объявлениями")
