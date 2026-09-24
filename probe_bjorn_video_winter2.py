@@ -72,7 +72,7 @@ def probe(login: str, token: str) -> None:
     print("=" * 78)
 
     camps = call("campaigns", {
-        "SelectionCriteria": {"States": ["ON"]},
+        "SelectionCriteria": {"States": ["ON", "SUSPENDED"]},
         "FieldNames": ["Id", "Name", "Type", "State"],
         "Page": {"Limit": 200},
     }, login, token)
@@ -124,6 +124,20 @@ def probe(login: str, token: str) -> None:
             for m in rows:
                 if "Video" in json.dumps(m):
                     print(f"  {m}")
+            for t in ("VIDEO_ADJUSTMENT", "AD_GROUP_ADJUSTMENT"):
+                rr = call("bidmodifiers", {
+                    "SelectionCriteria": {"CampaignIds": ids,
+                                          "Levels": ["CAMPAIGN", "AD_GROUP"],
+                                          "Types": [t]},
+                    "FieldNames": ["Id", "CampaignId", "AdGroupId", "Type", "Level"],
+                    "AdGroupAdjustmentFieldNames": ["AdGroupAdjustment"],
+                    "Page": {"Limit": 200},
+                }, login, token)
+                ee = err(rr)
+                got = [] if ee else rr.get("result", {}).get("BidModifiers", [])
+                print(f"  тип {t}: {ee if ee else str(len(got)) + ' шт'}")
+                for m in got[:20]:
+                    print(f"     {m}")
             break
 
     # Что вообще принимает bidmodifiers.add — вытаскиваем список типов из ошибки.
