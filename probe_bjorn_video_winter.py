@@ -261,8 +261,7 @@ def probe_account(login: str, token: str) -> None:
         e = err(kw)
         kw_by_group: dict[int, int] = defaultdict(int)
         if e:
-            print(f"
-keywords.get ОШИБКА: {e}")
+            print(f"\nkeywords.get ОШИБКА: {e}")
         else:
             for k in kw.get("result", {}).get("Keywords", []):
                 kw_by_group[k["AdGroupId"]] += 1
@@ -281,8 +280,7 @@ keywords.get ОШИБКА: {e}")
             for a in at.get("result", {}).get("AudienceTargets", []):
                 at_by_group[a["AdGroupId"]] += 1
 
-        print("
---- Условия показа в ВКЛЮЧЁННЫХ группах ---")
+        print("\n--- Условия показа в ВКЛЮЧЁННЫХ группах ---")
         for g in groups_list:
             if g["CampaignId"] not in on_camp_ids:
                 continue
