@@ -88,7 +88,7 @@ def probe_account(login: str, token: str) -> None:
     # ── A. Кампании ───────────────────────────────────────────────────────────
     camps = call("campaigns", {
         "SelectionCriteria": {"States": ["ON", "OFF", "SUSPENDED"]},
-        "FieldNames": ["Id", "Name", "Type", "Status", "State", "StatusPayment", "DailyBudget"],
+        "FieldNames": ["Id", "Name", "Type", "Status", "State", "StatusPayment", "DailyBudget", "StartDate"],
         "TextCampaignFieldNames": ["BiddingStrategy"],
         "SmartCampaignFieldNames": ["BiddingStrategy"],
         "DynamicTextCampaignFieldNames": ["BiddingStrategy"],
@@ -121,7 +121,7 @@ def probe_account(login: str, token: str) -> None:
                 strat = f"search={search} net={net} {extra if extra else ''}"
                 break
         print(f"  {c['Id']} | {c.get('Type')} | {c.get('State')}/{c.get('Status')} | "
-              f"budget={c.get('DailyBudget')} | {c.get('Name')}")
+              f"start={c.get('StartDate')} | budget={c.get('DailyBudget')} | {c.get('Name')}")
         if strat:
             print(f"      стратегия: {strat}")
 
@@ -232,8 +232,8 @@ def probe_account(login: str, token: str) -> None:
 
     # ── E. Фиды ───────────────────────────────────────────────────────────────
     feeds = call("feeds", {
-        "FieldNames": ["Id", "Name", "BusinessType", "SourceType", "UpdateStatus",
-                       "FilenameSource", "UrlSource"],
+        "FieldNames": ["Id", "Name", "BusinessType", "SourceType", "Status",
+                       "NumberOfItems", "NumberOfListings", "CampaignIds", "UpdatedAt"],
         "Page": {"Limit": 100},
     }, login, token)
     e = err(feeds)
@@ -243,9 +243,53 @@ def probe_account(login: str, token: str) -> None:
         fl = feeds.get("result", {}).get("Feeds", [])
         print(f"\n--- Фиды ({len(fl)}) ---")
         for f in fl:
-            src = (f.get("UrlSource") or {}).get("Url") or (f.get("FilenameSource") or {}).get("Filename")
             print(f"  {f['Id']} | {f.get('BusinessType')} | {f.get('SourceType')} | "
-                  f"{f.get('UpdateStatus')} | {f.get('Name')} | {str(src)[:90]}")
+                  f"{f.get('Status')} | items={f.get('NumberOfItems')} "
+                  f"listings={f.get('NumberOfListings')} | camps={f.get('CampaignIds')} | "
+                  f"upd={f.get('UpdatedAt')} | {f.get('Name')}")
+
+
+    # ── G. Условия показа в группах (есть ли вообще, чем группа ловит трафик) ─
+    on_camp_ids = [c["Id"] for c in campaigns if c.get("State") == "ON"]
+    on_group_ids = [g["Id"] for g in groups_list if g["CampaignId"] in on_camp_ids]
+    if on_group_ids:
+        kw = call("keywords", {
+            "SelectionCriteria": {"AdGroupIds": on_group_ids[:1000]},
+            "FieldNames": ["Id", "AdGroupId", "CampaignId", "Keyword", "State", "Status"],
+            "Page": {"Limit": 5000},
+        }, login, token)
+        e = err(kw)
+        kw_by_group: dict[int, int] = defaultdict(int)
+        if e:
+            print(f"
+keywords.get ОШИБКА: {e}")
+        else:
+            for k in kw.get("result", {}).get("Keywords", []):
+                kw_by_group[k["AdGroupId"]] += 1
+
+        at = call("audiencetargets", {
+            "SelectionCriteria": {"AdGroupIds": on_group_ids[:1000]},
+            "FieldNames": ["Id", "AdGroupId", "CampaignId", "RetargetingListId", "InterestId",
+                           "State"],
+            "Page": {"Limit": 5000},
+        }, login, token)
+        e = err(at)
+        at_by_group: dict[int, int] = defaultdict(int)
+        if e:
+            print(f"audiencetargets.get ОШИБКА: {e}")
+        else:
+            for a in at.get("result", {}).get("AudienceTargets", []):
+                at_by_group[a["AdGroupId"]] += 1
+
+        print("
+--- Условия показа в ВКЛЮЧЁННЫХ группах ---")
+        for g in groups_list:
+            if g["CampaignId"] not in on_camp_ids:
+                continue
+            n_kw, n_at = kw_by_group.get(g["Id"], 0), at_by_group.get(g["Id"], 0)
+            flag = "  ← НЕТ УСЛОВИЙ" if (n_kw + n_at) == 0 else ""
+            print(f"  {g['CampaignId']} | {g['Id']} | фраз={n_kw} аудиторий={n_at} | "
+                  f"{g.get('Name')}{flag}")
 
     # ── F. Фильтры смарт-групп (где режется ассортимент) ─────────────────────
     smart_group_ids = [g["Id"] for g in groups_list
