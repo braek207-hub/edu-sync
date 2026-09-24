@@ -90,7 +90,7 @@ def probe(login: str, token: str) -> None:
     print("#" * 70)
 
     base = call("bidmodifiers", {
-        "SelectionCriteria": {"CampaignIds": ids},
+        "SelectionCriteria": {"CampaignIds": ids, "Levels": ["CAMPAIGN", "AD_GROUP"]},
         "FieldNames": ["Id", "CampaignId", "AdGroupId", "Type", "Level"],
         "Page": {"Limit": 1000},
     }, login, token)
@@ -112,7 +112,7 @@ def probe(login: str, token: str) -> None:
     for block in ("VideoBidModifierFieldNames", "VideoAdjustmentFieldNames",
                   "VideoBidAdjustmentFieldNames"):
         r = call("bidmodifiers", {
-            "SelectionCriteria": {"CampaignIds": ids},
+            "SelectionCriteria": {"CampaignIds": ids, "Levels": ["CAMPAIGN", "AD_GROUP"]},
             "FieldNames": ["Id", "CampaignId", "Type", "Level"],
             block: ["BidModifier"],
             "Page": {"Limit": 100},
@@ -128,7 +128,7 @@ def probe(login: str, token: str) -> None:
 
     # Что вообще принимает bidmodifiers.add — вытаскиваем список типов из ошибки.
     probe_add = call("bidmodifiers", {
-        "BidModifiers": [{"CampaignId": ids[0] if ids else 0, "__probe__": 1}],
+        "BidModifiers": [{"CampaignId": ids[0] if ids else 0}],
     }, login, token, method="add")
     print(f"\nдопустимые поля bidmodifiers.add (из ответа API): {err(probe_add)}")
 
