@@ -48,28 +48,28 @@ def err(body: dict) -> str | None:
     return f"{e.get('error_string')} | {e.get('error_detail')}"[:300]
 
 
-def logins(token: str) -> list[str]:
+def clients() -> list[tuple[str, str]]:
+    """Пары (login, token). Токен может лежать внутри DIRECT_CLIENTS_JSON — как в sync_direct.py."""
+    default_token = os.environ.get("DIRECT_TOKEN", "").strip()
     raw = os.environ.get("DIRECT_CLIENTS_JSON", "").strip()
+    out: list[tuple[str, str]] = []
     if raw:
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                out = []
-                for item in data:
-                    if isinstance(item, str):
-                        out.append(item)
-                    elif isinstance(item, dict):
-                        v = item.get("login") or item.get("Login") or item.get("client_login")
-                        if v:
-                            out.append(v)
-                if out:
-                    return out
-            if isinstance(data, dict):
-                return list(data.keys())
-        except Exception as exc:  # noqa: BLE001
-            print(f"  DIRECT_CLIENTS_JSON не разобран: {exc}")
-    single = os.environ.get("DIRECT_LOGIN", "").strip()
-    return [single] if single else [""]
+        data = json.loads(raw)
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, str):
+                    out.append((item.strip(), default_token))
+                elif isinstance(item, dict):
+                    login = str(item.get("login") or item.get("client_login") or "").strip()
+                    token = str(item.get("token") or "").strip() or default_token
+                    if login:
+                        out.append((login, token))
+        elif isinstance(data, dict):
+            for login, token in data.items():
+                out.append((login, str(token) or default_token))
+    if not out:
+        out.append((os.environ.get("DIRECT_CLIENT_LOGIN", "").strip(), default_token))
+    return out
 
 
 def dump(title: str, rows: list[dict], keys: list[str], limit: int = 200) -> None:
@@ -271,8 +271,10 @@ def probe_account(login: str, token: str) -> None:
 
 
 def main() -> None:
-    token = os.environ["DIRECT_TOKEN"]
-    for login in logins(token):
+    for login, token in clients():
+        if not token:
+            print(f"аккаунт {login}: токена нет ни в DIRECT_CLIENTS_JSON, ни в DIRECT_TOKEN — пропуск")
+            continue
         try:
             probe_account(login, token)
         except Exception as exc:  # noqa: BLE001
