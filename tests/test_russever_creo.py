@@ -16,8 +16,9 @@ def states(day: dt.date):
 def test_phases_switch_by_date():
     C = CITY["magadan"]           # 2–13 сентября
     assert phase(C, dt.date(2026, 9, 1))[0] == "анонс"
-    assert phase(C, dt.date(2026, 9, 2))[0] == "идёт"
-    assert phase(C, dt.date(2026, 9, 9))[0] == "идёт"
+    # «идёт» больше нет: с первого дня работы — финальные тексты
+    assert phase(C, dt.date(2026, 9, 2))[0] == "финал"
+    assert phase(C, dt.date(2026, 9, 9))[0] == "финал"
     assert phase(C, dt.date(2026, 9, 10))[0] == "финал"
     assert phase(C, dt.date(2026, 9, 13))[0] == "последний день"
 

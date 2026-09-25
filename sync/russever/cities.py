@@ -5,7 +5,9 @@
 таблица расходилась с лендингом (Челябинск до 14.10, а не 06.10).
 
 Фаза определяет, какие заголовки и тексты должны стоять в кампаниях:
-анонс → идёт → финал (последние три дня) → последний день.
+анонс → финал → последний день. Отдельной фазы «идёт» нет: с первого дня
+работы выставки в городе идут финальные тексты («последние дни, успей»),
+так решил Павел 25.09 — срочность работает лучше спокойного «мы открылись».
 """
 import datetime as dt
 from typing import Dict, Tuple
@@ -152,7 +154,7 @@ SEARCH: Dict[str, list] = {
     "surgut": [714491089],
 }
 
-PHASES = ("анонс", "идёт", "финал", "последний день")
+PHASES = ("анонс", "финал", "последний день")
 
 
 def phase(C: dict, today: dt.date) -> Tuple[str, int, int]:
@@ -163,9 +165,7 @@ def phase(C: dict, today: dt.date) -> Tuple[str, int, int]:
         return "анонс", d_start, d_left
     if d_left <= 0:
         return "последний день", d_start, d_left
-    if d_left <= 3:
-        return "финал", d_start, d_left
-    return "идёт", d_start, d_left
+    return "финал", d_start, d_left
 
 
 def is_over(C: dict, today: dt.date) -> bool:
