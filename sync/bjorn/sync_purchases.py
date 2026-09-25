@@ -44,11 +44,13 @@ def date_chunks(date_from: str, date_to: str, days: int = 14) -> list[tuple[str,
 def fetch_purchases(date_from: str, date_to: str) -> list[dict]:
     headers = {"Authorization": f"OAuth {env_required('METRICA_TOKEN')}"}
     counter = env_required("METRICA_COUNTER_ID")
+    # ym:s:clientID в измерениях НЕ добавлять: на счётчике BJORN любая выборка с ним
+    # возвращает 0 строк (проба probe_bjorn_purchases_dims.py, 25.09.2026).
+    # client_id заказа приходит из Bitrix в bjorn_orders (с 21.09).
     dimensions = ",".join(
         [
             "ym:s:purchaseID",
             "ym:s:date",
-            "ym:s:clientID",
             "ym:s:lastsignTrafficSource",
             "ym:s:lastsignSourceEngine",
             "ym:s:lastsignUTMSource",
@@ -85,12 +87,11 @@ def fetch_purchases(date_from: str, date_to: str) -> list[dict]:
                     {
                         "order_id": dims[0].strip(),
                         "purchase_date": dims[1],
-                        "client_id": dims[2],
-                        "traffic_source": dims[3],
-                        "source_engine": dims[4],
-                        "utm_source": dims[5],
-                        "utm_medium": dims[6],
-                        "utm_campaign": dims[7],
+                        "traffic_source": dims[2],
+                        "source_engine": dims[3],
+                        "utm_source": dims[4],
+                        "utm_medium": dims[5],
+                        "utm_campaign": dims[6],
                         "purchases": int(metrics[0] or 0),
                         "revenue": float(metrics[1] or 0),
                     }
