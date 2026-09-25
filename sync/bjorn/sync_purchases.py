@@ -58,7 +58,6 @@ def fetch_purchases(date_from: str, date_to: str) -> list[dict]:
                 "attribution": "lastsign",
                 "accuracy": "full",
                 "proposed_accuracy": "false",
-                "filters": "ym:s:ecommercePurchases>0",
                 "lang": "ru",
                 "limit": 10000,
                 "offset": offset,
@@ -91,7 +90,7 @@ def fetch_purchases(date_from: str, date_to: str) -> list[dict]:
     by_order: dict[str, dict] = {}
     for row in raw:
         oid = row["order_id"]
-        if oid in SKIP_ORDER_IDS:
+        if oid in SKIP_ORDER_IDS or row["purchases"] <= 0:
             continue
         kept = by_order.get(oid)
         if kept is None or row["purchase_date"] < kept["purchase_date"]:
