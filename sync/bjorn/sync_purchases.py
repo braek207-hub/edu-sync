@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from datetime import date, timedelta
 
 import requests
 
@@ -29,6 +30,17 @@ def stat_get(params: dict, headers: dict) -> dict:
     raise RuntimeError("retry loop exhausted")
 
 
+def date_chunks(date_from: str, date_to: str, days: int = 14) -> list[tuple[str, str]]:
+    start = date.fromisoformat(date_from)
+    end = date.fromisoformat(date_to)
+    chunks: list[tuple[str, str]] = []
+    while start <= end:
+        stop = min(start + timedelta(days=days - 1), end)
+        chunks.append((start.isoformat(), stop.isoformat()))
+        start = stop + timedelta(days=1)
+    return chunks
+
+
 def fetch_purchases(date_from: str, date_to: str) -> list[dict]:
     headers = {"Authorization": f"OAuth {env_required('METRICA_TOKEN')}"}
     counter = env_required("METRICA_COUNTER_ID")
@@ -46,45 +58,46 @@ def fetch_purchases(date_from: str, date_to: str) -> list[dict]:
     )
 
     raw: list[dict] = []
-    offset = 1
-    while True:
-        body = stat_get(
-            {
-                "ids": counter,
-                "metrics": "ym:s:ecommercePurchases,ym:s:ecommerceRevenue",
-                "dimensions": dimensions,
-                "date1": date_from,
-                "date2": date_to,
-                "attribution": "lastsign",
-                "accuracy": "full",
-                "proposed_accuracy": "false",
-                "lang": "ru",
-                "limit": 10000,
-                "offset": offset,
-            },
-            headers,
-        )
-        data = body.get("data", [])
-        for item in data:
-            dims = [str(d.get("name") or "") for d in item.get("dimensions", [])]
-            metrics = item.get("metrics", [])
-            raw.append(
+    for chunk_from, chunk_to in date_chunks(date_from, date_to):
+        offset = 1
+        while True:
+            body = stat_get(
                 {
-                    "order_id": dims[0].strip(),
-                    "purchase_date": dims[1],
-                    "client_id": dims[2],
-                    "traffic_source": dims[3],
-                    "source_engine": dims[4],
-                    "utm_source": dims[5],
-                    "utm_medium": dims[6],
-                    "utm_campaign": dims[7],
-                    "purchases": int(metrics[0] or 0),
-                    "revenue": float(metrics[1] or 0),
-                }
+                    "ids": counter,
+                    "metrics": "ym:s:ecommercePurchases,ym:s:ecommerceRevenue",
+                    "dimensions": dimensions,
+                    "date1": chunk_from,
+                    "date2": chunk_to,
+                    "attribution": "lastsign",
+                    "accuracy": "full",
+                    "proposed_accuracy": "false",
+                    "lang": "ru",
+                    "limit": 10000,
+                    "offset": offset,
+                },
+                headers,
             )
-        if len(data) < 10000:
-            break
-        offset += len(data)
+            data = body.get("data", [])
+            for item in data:
+                dims = [str(d.get("name") or "") for d in item.get("dimensions", [])]
+                metrics = item.get("metrics", [])
+                raw.append(
+                    {
+                        "order_id": dims[0].strip(),
+                        "purchase_date": dims[1],
+                        "client_id": dims[2],
+                        "traffic_source": dims[3],
+                        "source_engine": dims[4],
+                        "utm_source": dims[5],
+                        "utm_medium": dims[6],
+                        "utm_campaign": dims[7],
+                        "purchases": int(metrics[0] or 0),
+                        "revenue": float(metrics[1] or 0),
+                    }
+                )
+            if len(data) < 10000:
+                break
+            offset += len(data)
 
     # Один заказ может дать несколько строк (разные визиты) — оставляем самую раннюю дату.
     by_order: dict[str, dict] = {}
