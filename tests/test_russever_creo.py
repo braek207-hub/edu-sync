@@ -16,11 +16,11 @@ def states(day: dt.date):
 def test_phases_switch_by_date():
     C = CITY["magadan"]           # 2–13 сентября
     assert phase(C, dt.date(2026, 9, 1))[0] == "анонс"
-    # «идёт» больше нет: с первого дня работы — финальные тексты
+    # фаз «идёт» и «последний день» больше нет: всё время работы — финальные тексты
     assert phase(C, dt.date(2026, 9, 2))[0] == "финал"
     assert phase(C, dt.date(2026, 9, 9))[0] == "финал"
     assert phase(C, dt.date(2026, 9, 10))[0] == "финал"
-    assert phase(C, dt.date(2026, 9, 13))[0] == "последний день"
+    assert phase(C, dt.date(2026, 9, 13))[0] == "финал"
 
 
 def test_quiet_when_nothing_changes():
@@ -29,12 +29,11 @@ def test_quiet_when_nothing_changes():
 
 
 def test_transition_day_asks_to_change():
-    day = dt.date(2026, 9, 13)     # Магадан и Салехард уходят в последний день
+    day = dt.date(2026, 9, 2)      # Магадан открывается: анонс → финал
     msg = build_message(day, states(day))
     assert msg is not None
     assert "МЕНЯТЬ СЕЙЧАС — Магадан" in msg
-    assert "МЕНЯТЬ СЕЙЧАС — Салехард" in msg
-    assert "Только сегодня" in msg
+    assert "Последние дни" in msg
     # Кампании города названы — иначе напоминание не довести до дела.
     assert "713748690" in msg
 
