@@ -52,11 +52,22 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Шаги те же и в том же порядке, что в bjorn-dashboard: витрина собирается
-      # из двух источников (Метрика и Директ), затем сверяется. Порядок важен —
-      # build_fact читает то, что положили sync_*.
+      # Сначала то, из чего собирается главная витрина дашборда: staging Метрики и
+      # Директа → build_fact → сверка. Товарные и объявленческие шаги идут ПОСЛЕ, потому
+      # что витрина от них не зависит (build_fact/verify_fact читают только stg_*).
+      # До 26.09.2026 порядок был обратный, и падение любого товарного шага (Logs API,
+      # «запрос слишком сложный», таймаут DELETE) оставляло дашборд без данных за вчера.
       - name: Метрика — staging
         run: python -m sync.bjorn.sync_metrica
+
+      - name: Директ — staging
+        run: python -m sync.bjorn.sync_direct
+
+      - name: Сборка витрины
+        run: python -m sync.bjorn.build_fact
+
+      - name: Сверка итогов
+        run: python -m sync.bjorn.verify_fact
 
       - name: Метрика — строки ecommerce
         run: python -m sync.bjorn.sync_metrica_ecommerce
@@ -64,20 +75,13 @@ jobs:
       - name: Метрика — атрибуция заказов (purchaseID)
         run: python -m sync.bjorn.sync_purchases
 
+      # Товарная воронка — до просмотров карточек: sync_card_views берёт из неё справочник
+      # товаров (load_products читает bjorn_product_daily).
       - name: Метрика — товарная воронка
         run: python -m sync.bjorn.sync_products
 
       - name: Метрика — просмотры карточек (Logs API)
         run: python -m sync.bjorn.sync_card_views
 
-      - name: Директ — staging
-        run: python -m sync.bjorn.sync_direct
-
       - name: Директ — объявления и картинки
         run: python -m sync.bjorn.sync_ads
-
-      - name: Сборка витрины
-        run: python -m sync.bjorn.build_fact
-
-      - name: Сверка итогов
-        run: python -m sync.bjorn.verify_fact

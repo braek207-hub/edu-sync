@@ -334,12 +334,20 @@ class SupabaseRest:
         raise RuntimeError(f"Supabase request failed: {method} {path}: {last_error}")
 
     def delete_date_range(self, table: str, date_from: str, date_to: str) -> None:
-        self.request(
-            "DELETE",
-            table,
-            params={"date": [f"gte.{date_from}", f"lte.{date_to}"]},
-            headers={"Prefer": "return=minimal"},
-        )
+        # По одному дню за запрос: у PostgREST-роли statement_timeout=8s, и на выросших
+        # витринах (bjorn_card_views_daily — 137 тыс. строк, 69 МБ) DELETE сразу за 7 дней
+        # в него не укладывался — 26.09.2026 синк упал на 57014 и витрина осталась без вчера.
+        day = datetime.strptime(date_from, DATE_FMT).date()
+        last = datetime.strptime(date_to, DATE_FMT).date()
+        while day <= last:
+            stamp = day.strftime(DATE_FMT)
+            self.request(
+                "DELETE",
+                table,
+                params={"date": f"eq.{stamp}"},
+                headers={"Prefer": "return=minimal"},
+            )
+            day += timedelta(days=1)
 
     def upsert(self, table: str, rows: list[dict[str, Any]], on_conflict: str, chunk_size: int = 500) -> None:
         if not rows:
