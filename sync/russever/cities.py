@@ -153,7 +153,13 @@ SEARCH: Dict[str, list] = {
     "surgut": [714491089],
 }
 
-PHASES = ("анонс", "финал")
+PHASES = ("анонс", "идёт", "финал")
+
+# Сколько дней до конца ещё считается «идёт», а не «финал». Короткие выставки
+# (5 дней) с первого дня живут в «финале» — так решил Павел 25.09. Челябинск
+# работает 22 дня, и «осталось пару дней» на 18-й день до конца — уже неправда:
+# для таких городов между анонсом и финалом стоит фаза «идёт».
+FINAL_DAYS = 6
 
 
 def phase(C: dict, today: dt.date) -> Tuple[str, int, int]:
@@ -162,6 +168,8 @@ def phase(C: dict, today: dt.date) -> Tuple[str, int, int]:
     d_left = (C["конец"] - today).days
     if d_start > 0:
         return "анонс", d_start, d_left
+    if d_left > FINAL_DAYS:
+        return "идёт", d_start, d_left
     return "финал", d_start, d_left
 
 
