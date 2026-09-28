@@ -152,7 +152,7 @@ def build(login: str, token: str) -> None:
 
     # видеодополнение: берём любой готовый видеокреатив аккаунта
     cre = call("creatives", {
-        "SelectionCriteria": {"Types": ["VIDEO_EXTENSION"]},
+        "SelectionCriteria": {"Types": ["VIDEO_EXTENSION_CREATIVE"]},
         "FieldNames": ["Id", "Type", "Name"],
         "Page": {"Limit": 20},
     }, login, token)
