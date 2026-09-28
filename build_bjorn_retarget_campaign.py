@@ -181,6 +181,14 @@ def ensure_segment(counter_id: int) -> int:
     r = requests.post(f"{METRIKA}/counter/{counter_id}/segments",
                       headers={**h, "Content-Type": "application/json; charset=utf-8"},
                       data=payload, timeout=60)
+    if r.status_code == 403:
+        # Токен читает счётчик, но не пишет в него. Сегмент — единственный способ выразить
+        # «визит не отказ»: срок жизни для сегментов Директ игнорирует, а исключение сегмента
+        # «Отказы» выкинуло бы всех, у кого когда-либо был отказный визит. Без сегмента
+        # собираем условие без этого фильтра и говорим об этом вслух.
+        print("   !!! нет прав на создание сегмента Метрики (403) — "
+              "условие будет БЕЗ фильтра «не отказ»")
+        return 0
     if r.status_code not in (200, 201):
         fail("создание сегмента Метрики", {"error": {"error_string": f"HTTP {r.status_code}",
                                                      "error_detail": r.text[:400]}})
@@ -315,16 +323,21 @@ def build(login: str, token: str) -> None:
     print(f"3/7 группа: {gr_id}")
 
     # ── 4. условие ретаргетинга и привязка к группе ───────────────────────────
+    all_args = [{"MembershipLifeSpan": VISIT_DAYS, "ExternalId": GOAL_VISITED}]
+    if seg_id:
+        all_args.append({"MembershipLifeSpan": VISIT_DAYS, "ExternalId": seg_id})
+        rl_name = "BJORN Был 7д · не отказ · без покупки"
+        rl_descr = "Посетил сайт за 7 дней, есть неотказный визит, покупки за 30 дней нет"
+    else:
+        rl_name = "BJORN Был 7д без покупки"
+        rl_descr = ("Посетил сайт за 7 дней, покупки за 30 дней нет. Фильтр «не отказ» "
+                    "не подключён: нужен сегмент Метрики ym:s:bounce=='No'")
     rl = call("retargetinglists", {"RetargetingLists": [{
-        "Name": "BJORN Был 7д · не отказ · без покупки",
-        "Description": ("Посетил сайт за 7 дней, есть неотказный визит, "
-                        "покупки за 30 дней нет"),
+        "Name": rl_name,
+        "Description": rl_descr,
         "Type": "RETARGETING",
         "Rules": [
-            {"Operator": "ALL", "Arguments": [
-                {"MembershipLifeSpan": VISIT_DAYS, "ExternalId": GOAL_VISITED},
-                {"MembershipLifeSpan": VISIT_DAYS, "ExternalId": seg_id},
-            ]},
+            {"Operator": "ALL", "Arguments": all_args},
             {"Operator": "NONE", "Arguments": [
                 {"MembershipLifeSpan": PURCHASE_DAYS, "ExternalId": GOAL_PURCHASE}]},
         ],
