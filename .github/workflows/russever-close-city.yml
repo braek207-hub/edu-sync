@@ -1,0 +1,82 @@
+name: russever-close-city
+# Снять рекламу города в 18:00 по местному в день закрытия выставки.
+#
+# Города живут в UTC+5 … UTC+11, поэтому 18:00 местного приходится на 07:00–13:00
+# UTC — будильники стоят с запасом на весь этот промежуток. Расписанию Actions
+# одной точки доверять нельзя: замер по чистильщику площадок (07–09.09.2026)
+# показал, что запуски по расписанию массово отбрасываются и реальный шаг
+# получается 2,6–5,5 часа вместо часа.
+#
+# Поэтому точность держит не расписание, а дежурство внутри прогона: если
+# сегодня день закрытия, такт не выходит, а досиживает до 18:00 местного и
+# гасит кампании в нужную минуту. Будильники — только чтобы дежурство
+# кто-нибудь начал.
+on:
+  schedule:
+    - cron: "*/30 2-14 * * *"   # окно, в которое попадает 18:00 всех городов
+    - cron: "40 16 * * *"       # подчистить, если день закрытия уже прошёл
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Только показать (true/false)"
+        required: false
+        default: "true"
+      now:
+        description: "Время UTC вида 2026-10-04T13:00 для проверки"
+        required: false
+        default: ""
+
+concurrency:
+  # Новый будильник заменяет дежурного: два такта делают одно и то же, а
+  # очередь из недождавшихся прогонов только съедает минуты.
+  group: russever-close-city
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Close finished cities
+        env:
+          RUSSEVER_DIRECT: ${{ secrets.RUSSEVER_DIRECT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.now }}" ]; then
+            ARGS="$ARGS --now ${{ github.event.inputs.now }}"
+          fi
+          # По расписанию — боевой прогон; руками по умолчанию репетиция.
+          if [ "${{ github.event_name }}" = "schedule" ] \
+             || [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
+            ARGS="$ARGS --apply"
+          else
+            ARGS="$ARGS --dry-run"
+          fi
+
+          started=$(date +%s)
+          budget=$((300 * 60))
+          while : ; do
+            out=$(python -m sync.russever.close_city $ARGS) || exit 1
+            echo "$out"
+            left=$(echo "$out" | sed -n 's/^WATCH \([0-9]*\)$/\1/p' | head -1)
+            # Нечего ждать — сегодня никто не закрывается.
+            [ -n "$left" ] || break
+            # До закрытия ещё далеко: дежурить полдня нет смысла, начнёт
+            # следующий будильник.
+            [ "$left" -le 240 ] || break
+            # Ручной прогон должен отвечать сразу, а не занимать раннер.
+            [ "${{ github.event_name }}" = "schedule" ] || break
+            [ $(( $(date +%s) - started )) -lt "$budget" ] || break
+            # У самого закрытия шаг мелкий, чтобы попасть в минуту; вдали —
+            # десять минут, чтобы не долбить API впустую.
+            if [ "$left" -le 12 ]; then nap=$(( (left + 1) * 60 )); else nap=600; fi
+            echo "дежурю, до закрытия $left мин — пауза $((nap / 60)) мин"
+            sleep "$nap"
+          done

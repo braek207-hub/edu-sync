@@ -1,0 +1,55 @@
+name: russever-checkup
+# Ежедневный чекап кабинета РосСеверЭкспо: бюджеты по плану Павла, запрет
+# площадок по качеству, сверка отказов и цены клика с требованиями.
+#
+# Такт идёт утром по Москве, когда вчерашний день в отчётах Директа уже полный.
+# Расписание Actions регулярно опаздывает на часы — здесь это не страшно:
+# такт идемпотентный, он каждый раз пересчитывает лимиты от плана и факта, а не
+# прибавляет к предыдущему решению. Пропущенный день догоняется следующим.
+on:
+  schedule:
+    - cron: "40 5 * * *"    # 08:40 МСК
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Только показать, ничего не писать (true/false)"
+        required: false
+        default: "true"
+      date:
+        description: "Дата ГГГГ-ММ-ДД (пусто — сегодня по МСК)"
+        required: false
+        default: ""
+
+concurrency:
+  group: russever-checkup
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Checkup
+        env:
+          RUSSEVER_DIRECT: ${{ secrets.RUSSEVER_DIRECT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          # По расписанию — боевой прогон; руками по умолчанию репетиция,
+          # чтобы проверка формулировок не трогала кабинет.
+          if [ "${{ github.event_name }}" = "schedule" ] \
+             || [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
+            ARGS="$ARGS --apply"
+          else
+            ARGS="$ARGS --dry-run"
+          fi
+          python -m sync.russever.checkup $ARGS
