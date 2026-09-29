@@ -1,0 +1,29 @@
+name: Metrika retarget segments
+
+# Создаёт в Метрике (счётчики vuz/vse) сегменты «Ретаргет-интерес: <направление> (поиск)»
+# по utm_campaign поисковых кампаний. Идемпотентно: существующие по имени не трогает.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  segments:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Create segments
+        env:
+          YM_TOKEN: ${{ secrets.YM_TOKEN }}
+          PYTHONIOENCODING: "utf-8"
+        run: python create_retarget_segments.py
