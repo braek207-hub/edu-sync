@@ -6,6 +6,10 @@ on:
         description: "1 — записывать в Директ, пусто — только показать план"
         required: false
         default: ""
+      script:
+        description: "Файл скрипта (по умолчанию сборщик кампании)"
+        required: false
+        default: "build_bjorn_retarget_campaign.py"
       start_date:
         description: "Дата старта кампании (YYYY-MM-DD), пусто — сегодня"
         required: false
@@ -29,4 +33,4 @@ jobs:
           APPLY: ${{ github.event.inputs.apply }}
           START_DATE: ${{ github.event.inputs.start_date }}
           PYTHONIOENCODING: "utf-8"
-        run: python build_bjorn_retarget_campaign.py
+        run: python ${{ github.event.inputs.script || 'build_bjorn_retarget_campaign.py' }}
