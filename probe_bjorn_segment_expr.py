@@ -31,6 +31,8 @@ CANDIDATES = [
     ("давность последнего визита", "ym:u:daysSinceLastVisit<=10"),
     ("давность первого визита", "ym:s:daysSinceFirstVisit<=10"),
     ("URL + давность визита", "ym:pv:URL=@'narvik' AND ym:u:daysSinceLastVisit<=10"),
+    ("URL + дата визита", "ym:pv:URL=@'narvik' AND ym:s:date>='2026-09-19'"),
+    ("URL + дата просмотра", "ym:pv:URL=@'narvik' AND ym:pv:date>='2026-09-19'"),
 ]
 
 
