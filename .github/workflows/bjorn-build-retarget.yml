@@ -26,7 +26,8 @@ jobs:
       - run: pip install requests
       - name: Build BJORN retargeting mini-campaign
         env:
-          METRICA_TOKEN: ${{ secrets.BJORN_METRICA_TOKEN }}
+          # Агентский токен умеет писать в счётчик BJORN, BJORN_METRICA_TOKEN — только читать
+          METRICA_TOKEN: ${{ secrets.APPROVE_AGENCY_TOKEN || secrets.BJORN_METRICA_TOKEN }}
           METRICA_COUNTER_ID: ${{ secrets.BJORN_METRICA_COUNTER_ID }}
           DIRECT_TOKEN: ${{ secrets.BJORN_DIRECT_TOKEN }}
           DIRECT_CLIENTS_JSON: ${{ secrets.BJORN_DIRECT_CLIENTS_JSON }}
