@@ -439,31 +439,40 @@ def build_groups(login: str, token: str, src: dict, cid: int | None,
             }]}, login, token, "add"), f"audiencetargets.add в группу {gid}")
             warnings(tres, "таргетинг")
 
-        moved = 0
+        # На чтении корректировка приходит как одиночный блок с Type, на записи — массивом
+        # во множественном числе и без Type. Все корректировки группы уходят одним
+        # запросом: порознь Директ ловит конфликты вроде «TABLET поверх DESKTOP» (6000).
+        demo, weather = [], []
         for m in (() if gid in have_mods else p["mods"]):
-            # Type в add не передаётся (как и Scope у условий) — вид корректировки Директ
-            # определяет по тому, какой блок пришёл в теле
-            item = {"AdGroupId": gid}
             if m["Type"] == "DEMOGRAPHICS_ADJUSTMENT":
-                item["DemographicsAdjustment"] = {
-                    k: v for k, v in (m.get("DemographicsAdjustment") or {}).items()
-                    if v is not None}
+                demo.append({k: v for k, v in (m.get("DemographicsAdjustment") or {}).items()
+                             if v is not None and k != "Enabled"})
             elif m["Type"] == "WEATHER_ADJUSTMENT":
-                item["WeatherAdjustment"] = {
-                    k: v for k, v in (m.get("WeatherAdjustment") or {}).items()
-                    if v is not None}
-            else:
-                continue
+                weather.append({k: v for k, v in (m.get("WeatherAdjustment") or {}).items()
+                                if v is not None and k != "Enabled"})
+
+        moved = 0
+        item = {"AdGroupId": gid}
+        if demo:
+            item["DemographicsAdjustments"] = demo
+        if weather:
+            item["WeatherAdjustments"] = weather
+        if demo or weather:
             mres = call("bidmodifiers", {"BidModifiers": [item]}, login, token, "add")
             if mres.get("error"):
-                print(f"     ! корректировка {m['Type']} не перенеслась: "
+                print(f"     ! корректировки не перенеслись: "
                       f"{mres['error'].get('error_detail') or mres['error'].get('error_string')}")
-                continue
-            for r0 in mres.get("result", {}).get("AddResults", []):
-                if r0.get("Errors"):
-                    print(f"     ! корректировка {m['Type']}: {r0['Errors']}")
-                else:
-                    moved += 1
+            else:
+                results = mres.get("result", {}).get("AddResults", [])
+                errs = [r0["Errors"] for r0 in results if r0.get("Errors")]
+                for e in errs:
+                    print(f"     ! корректировка: {e}")
+                for r0 in results:
+                    for w in (r0.get("Warnings") or []):
+                        print(f"     ! корректировка предупреждение {w.get('Code')}: "
+                              f"{w.get('Message')}")
+                if not errs:
+                    moved = len(demo) + len(weather)
 
         print(f"  группа {gid} «{g['Name']}» | ТГО {aid} | условие "
               f"{conditions[p['slug']]} ({name} {window}д) | корректировок перенесено {moved}")
