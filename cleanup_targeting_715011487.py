@@ -117,7 +117,12 @@ def main() -> None:
         print(f"  State={k[0]} Status={k[1]} -> {v}")
     if ads:
         print(f"  пример: {json.dumps(ads[0], ensure_ascii=False)}")
-    to_stop = [a["Id"] for a in ads if a.get("State") != "SUSPENDED"]
+    # Черновик не показывается и suspend к нему не применяется — такие не трогаем
+    to_stop = [a["Id"] for a in ads
+               if a.get("State") != "SUSPENDED" and a.get("Status") != "DRAFT"]
+    drafts = sum(1 for a in ads if a.get("Status") == "DRAFT")
+    if drafts:
+        print(f"  из них черновиков (уже не показываются, остановка не нужна): {drafts}")
 
     if not apply:
         print(f"\nплан: остановить {len(alien)} чужих условий и {len(to_stop)} товарных")
