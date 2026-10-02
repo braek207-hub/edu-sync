@@ -306,7 +306,10 @@ def create_campaign(login: str, token: str, src: dict, apply: bool) -> int | Non
         "StartDate": date.today().isoformat(),
         "TimeZone": camp.get("TimeZone") or "Europe/Moscow",
         "ExcludedSites": camp.get("ExcludedSites") or None,
-        "TimeTargeting": camp.get("TimeTargeting") or None,
+        # Директ отдаёт TimeTargeting с null в незаполненных полях (HolidaysSchedule),
+        # а на add то же null не принимает — чистим перед отправкой
+        "TimeTargeting": {k: v for k, v in (camp.get("TimeTargeting") or {}).items()
+                          if v is not None} or None,
         "TextCampaign": {
             "BiddingStrategy": {
                 "Search": {"BiddingStrategyType": "SERVING_OFF"},
