@@ -452,13 +452,15 @@ def build_groups(login: str, token: str, src: dict, cid: int | None,
                                 if v is not None and k != "Enabled"})
 
         moved = 0
-        item = {"AdGroupId": gid}
+        # В одном элементе BidModifiers допустимо ровно одно поле (ошибка 5009), поэтому
+        # демография и погода — два элемента одного запроса
+        items = []
         if demo:
-            item["DemographicsAdjustments"] = demo
+            items.append({"AdGroupId": gid, "DemographicsAdjustments": demo})
         if weather:
-            item["WeatherAdjustments"] = weather
-        if demo or weather:
-            mres = call("bidmodifiers", {"BidModifiers": [item]}, login, token, "add")
+            items.append({"AdGroupId": gid, "WeatherAdjustments": weather})
+        if items:
+            mres = call("bidmodifiers", {"BidModifiers": items}, login, token, "add")
             if mres.get("error"):
                 print(f"     ! корректировки не перенеслись: "
                       f"{mres['error'].get('error_detail') or mres['error'].get('error_string')}")
