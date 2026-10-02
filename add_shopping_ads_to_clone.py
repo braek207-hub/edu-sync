@@ -47,7 +47,15 @@ def call(service: str, params: dict, login: str, token: str, method: str = "get"
 
 
 def clean(block: dict) -> dict:
-    return {k: v for k, v in block.items() if v is not None and k not in DROP}
+    """Чтение отдаёт {"Items": [...]}, запись ждёт голый массив — разворачиваем обёртку."""
+    out = {}
+    for k, v in block.items():
+        if v is None or k in DROP:
+            continue
+        if isinstance(v, dict) and set(v) == {"Items"}:
+            v = v["Items"]
+        out[k] = v
+    return out
 
 
 def groups(camp: int, login: str, token: str) -> dict:
