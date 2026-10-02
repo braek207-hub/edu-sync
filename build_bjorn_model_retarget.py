@@ -299,6 +299,15 @@ def ensure_conditions(login: str, token: str, segments: dict[str, int],
 
 def create_campaign(login: str, token: str, src: dict, apply: bool) -> int | None:
     print("\n### ЭТАП 3 — КАМПАНИЯ")
+    found = call("campaigns", {
+        "SelectionCriteria": {},
+        "FieldNames": ["Id", "Name"],
+        "Page": {"Limit": 1000}}, login, token)
+    for row in (found.get("result") or {}).get("Campaigns", []):
+        if row.get("Name") == CAMPAIGN_NAME:
+            print(f"  есть {row['Id']} «{CAMPAIGN_NAME}» — переиспользую")
+            return row["Id"]
+
     camp = src["campaign"]
     tc = camp.get("TextCampaign", {})
     payload = {
@@ -361,17 +370,50 @@ def build_groups(login: str, token: str, src: dict, cid: int | None,
                   f"{len(ta.get('AdExtensions') or [])} | корректировок {len(p['mods'])}")
         return
 
+    # Что в кампании уже есть: прогон добивает недостающее, а не плодит дубли
+    have_groups: dict[str, int] = {}
+    have_ads: dict[int, int] = {}
+    have_targets: set[int] = set()
+    have_mods: set[int] = set()
+    gr = call("adgroups", {"SelectionCriteria": {"CampaignIds": [cid]},
+                           "FieldNames": ["Id", "Name"],
+                           "Page": {"Limit": 1000}}, login, token)
+    for row in (gr.get("result") or {}).get("AdGroups", []):
+        have_groups[row["Name"]] = row["Id"]
+    gids = list(have_groups.values())
+    if gids:
+        ar = call("ads", {"SelectionCriteria": {"AdGroupIds": gids},
+                          "FieldNames": ["Id", "AdGroupId"],
+                          "Page": {"Limit": 1000}}, login, token)
+        for row in (ar.get("result") or {}).get("Ads", []):
+            have_ads.setdefault(row["AdGroupId"], row["Id"])
+        tr = call("audiencetargets", {"SelectionCriteria": {"AdGroupIds": gids},
+                                      "FieldNames": ["Id", "AdGroupId"],
+                                      "Page": {"Limit": 1000}}, login, token)
+        for row in (tr.get("result") or {}).get("AudienceTargets", []):
+            have_targets.add(row["AdGroupId"])
+        mr = call("bidmodifiers", {"SelectionCriteria": {"AdGroupIds": gids},
+                                   "FieldNames": ["Id", "AdGroupId"],
+                                   "Page": {"Limit": 1000}}, login, token)
+        for row in (mr.get("result") or {}).get("BidModifiers", []):
+            have_mods.add(row["AdGroupId"])
+    if have_groups:
+        print(f"  уже в кампании: групп {len(have_groups)}, объявлений {len(have_ads)}, "
+              f"таргетингов {len(have_targets)}, групп с корректировками {len(have_mods)}")
+
     for p in src["plan"]:
         g = p["group"]
         name, window = MODELS[p["slug"]]
-        gres = need(call("adgroups", {"AdGroups": [{
-            "Name": g["Name"],
-            "CampaignId": cid,
-            "RegionIds": g.get("RegionIds") or [225],
-        }]}, login, token, "add"), f"adgroups.add «{g['Name']}»")
-        warnings(gres, "группа")
-        gid = gres["AddResults"][0].get("Id")
-        CREATED.append(f"группа {gid} «{g['Name']}»")
+        gid = have_groups.get(g["Name"])
+        if not gid:
+            gres = need(call("adgroups", {"AdGroups": [{
+                "Name": g["Name"],
+                "CampaignId": cid,
+                "RegionIds": g.get("RegionIds") or [225],
+            }]}, login, token, "add"), f"adgroups.add «{g['Name']}»")
+            warnings(gres, "группа")
+            gid = gres["AddResults"][0].get("Id")
+            CREATED.append(f"группа {gid} «{g['Name']}»")
 
         ta = dict(p["ad"]["TextAd"])
         ext_ids = [e["AdExtensionId"] for e in (ta.pop("AdExtensions", None) or [])]
@@ -382,21 +424,26 @@ def build_groups(login: str, token: str, src: dict, cid: int | None,
             text_ad["AdExtensionIds"] = ext_ids
         if video and video.get("CreativeId"):
             text_ad["VideoExtension"] = {"CreativeId": video["CreativeId"]}
-        ares = need(call("ads", {"Ads": [{"AdGroupId": gid, "TextAd": text_ad}]},
-                         login, token, "add"), f"ads.add в группу {gid}")
-        warnings(ares, "объявление")
-        aid = ares["AddResults"][0].get("Id")
-        CREATED.append(f"объявление {aid} в группе {gid}")
+        aid = have_ads.get(gid)
+        if not aid:
+            ares = need(call("ads", {"Ads": [{"AdGroupId": gid, "TextAd": text_ad}]},
+                             login, token, "add"), f"ads.add в группу {gid}")
+            warnings(ares, "объявление")
+            aid = ares["AddResults"][0].get("Id")
+            CREATED.append(f"объявление {aid} в группе {gid}")
 
-        tres = need(call("audiencetargets", {"AudienceTargets": [{
-            "AdGroupId": gid,
-            "RetargetingListId": conditions[p["slug"]],
-        }]}, login, token, "add"), f"audiencetargets.add в группу {gid}")
-        warnings(tres, "таргетинг")
+        if gid not in have_targets:
+            tres = need(call("audiencetargets", {"AudienceTargets": [{
+                "AdGroupId": gid,
+                "RetargetingListId": conditions[p["slug"]],
+            }]}, login, token, "add"), f"audiencetargets.add в группу {gid}")
+            warnings(tres, "таргетинг")
 
         moved = 0
-        for m in p["mods"]:
-            item = {"AdGroupId": gid, "Type": m["Type"]}
+        for m in (() if gid in have_mods else p["mods"]):
+            # Type в add не передаётся (как и Scope у условий) — вид корректировки Директ
+            # определяет по тому, какой блок пришёл в теле
+            item = {"AdGroupId": gid}
             if m["Type"] == "DEMOGRAPHICS_ADJUSTMENT":
                 item["DemographicsAdjustment"] = {
                     k: v for k, v in (m.get("DemographicsAdjustment") or {}).items()
