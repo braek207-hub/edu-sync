@@ -30,8 +30,9 @@ SHOPPING_FIELDS = ["SitelinkSetId", "AdExtensions", "BusinessId", "TrackingPhone
                    "FeedId", "FeedFilterConditions", "TitleSources", "TextSources",
                    "DefaultTexts", "GenerationScopes", "ListingFeedFilterConditions",
                    "ListingTitleSources", "ListingTextSources"]
-# Модерация и статус обработки фида вычисляются Директом, на записи их не ждут
-DROP = {"FeedProcessingStatus", "SitelinksModeration"}
+# Модерация и статус обработки фида вычисляются Директом, а уточнения (AdExtensions)
+# на записи объявления не принимаются — привязываются отдельно
+DROP = {"FeedProcessingStatus", "SitelinksModeration", "AdExtensions"}
 
 
 def call(service: str, params: dict, login: str, token: str, method: str = "get") -> dict:
