@@ -1,0 +1,34 @@
+name: BJORN — скольжение окна RT-сегментов
+
+# Сегменты «RT: <модель> · Nд · не отказ» несут в выражении абсолютную дату: для сегментов
+# Метрики Директ игнорирует срок в правилах (всегда 540 дней), поэтому окно двигаем сами.
+# Расписание GH Actions в этом репозитории стартует на 4-5 часов позже заявленного —
+# для сдвига окна это безразлично, лишь бы раз в сутки.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "1 — писать, пусто — только показать"
+        required: false
+        default: "1"
+
+jobs:
+  slide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Slide RT segment windows
+        env:
+          METRICA_TOKEN: ${{ secrets.METRICA_WRITE_TOKEN }}
+          METRICA_COUNTER_ID: ${{ secrets.BJORN_METRICA_COUNTER_ID }}
+          APPLY: ${{ github.event.inputs.apply || '1' }}
+          PYTHONIOENCODING: "utf-8"
+        run: python slide_bjorn_rt_segments.py
