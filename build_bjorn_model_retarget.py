@@ -272,8 +272,9 @@ def ensure_conditions(login: str, token: str, segments: dict[str, int],
             fail(f"нет сегмента под модель {name}")
         payload = {
             "Name": cond_name,
+            # Scope в add не передаётся — API считает его неизвестным параметром; на чтении
+            # поле есть и выставляется само по составу правил
             "Type": "RETARGETING",
-            "Scope": "FOR_TARGETS_AND_ADJUSTMENTS",
             "Rules": [
                 {"Operator": "ALL", "Arguments": [
                     {"MembershipLifeSpan": SEGMENT_LIFESPAN, "ExternalId": seg_id}]},
