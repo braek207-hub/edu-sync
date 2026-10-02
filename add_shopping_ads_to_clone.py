@@ -25,12 +25,13 @@ SOURCE = 714000003
 CLONE = 714996447
 EXPECTED_LOGIN_PART = "bjorn"
 
+# BodySources и DefaultBodies Директ на чтении не принимает — проверено полем за полем
 SHOPPING_FIELDS = ["SitelinkSetId", "AdExtensions", "BusinessId", "TrackingPhoneId",
                    "FeedId", "FeedFilterConditions", "TitleSources", "TextSources",
-                   "DefaultTexts", "BodySources", "DefaultBodies", "GenerationScopes",
-                   "ListingFeedFilterConditions", "ListingTitleSources",
-                   "ListingTextSources"]
-DROP = {"FeedProcessingStatus", "SitelinksModeration", "AdExtensions"}
+                   "DefaultTexts", "GenerationScopes", "ListingFeedFilterConditions",
+                   "ListingTitleSources", "ListingTextSources"]
+# Модерация и статус обработки фида вычисляются Директом, на записи их не ждут
+DROP = {"FeedProcessingStatus", "SitelinksModeration"}
 
 
 def call(service: str, params: dict, login: str, token: str, method: str = "get") -> dict:
