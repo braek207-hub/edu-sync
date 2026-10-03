@@ -1,21 +1,21 @@
-"""Акция −15% до 11 октября в заголовках 715011487 + цены (старая/новая) в объявлениях.
+"""Акция −15% до 11 октября в заголовках 715011487 + таблица цен (старая/новая).
 
-Что делает:
-  1. читает 33 ТГО (Title, Text, Href);
-  2. тянет текущую цену модели с её карточки на bjornlarsen.ru — «старая» цена берётся
-     с сайта, «новая» считается как −15% с округлением вниз до 10 ₽;
-  3. в первый заголовок добавляет «-15%» (если не влезает в 56 — «BJORN LARSEN»
-     сокращается до «BJORN»), во второй кладёт срок акции, формулировки ротируются;
-  4. пробует записать блок цены: у TEXT_AD в читающем enum его нет, поэтому проверяем
-     записью на одном объявлении и печатаем ответ Директа как есть.
+Второй заголовок на комбинаторных ТГО через API молча теряется — Директ отвечает
+предупреждением 10252 «Комбинаторный баннер изменён через устаревший API текстовых
+баннеров», и Title2 не сохраняется. Поэтому вся акция живёт в первом заголовке:
+модель + −15% + срок, формулировки ротируются между группами.
 
-Все 33 объявления сейчас DRAFT/OFF — ничего не показывается, правка обратима.
+Цена: поля цены у TEXT_AD в API нет (читающий enum его не содержит). Скрипт пробует
+записать PriceExtension и честно печатает ответ, но считать это сделанным нельзя —
+прочитать обратно API не даёт. Для ручной простановки внизу печатается таблица
+«модель; старая цена; новая (−15%)». Старая цена берётся с карточки товара строго
+из JSON-LD Product.offers.
+
 APPLY=1 — писать. Без него план с проверкой длин.
 """
 
 from __future__ import annotations
 
-import html
 import json
 import os
 import re
@@ -30,19 +30,17 @@ DISCOUNT = 0.15
 PROMO_TAG = "-15%"
 
 TITLE1_MAX = 56          # считаются все символы, включая узкие
-TITLE2_MAX = 30          # узкие символы не считаются, их сверху до 15
-NARROW = set('!,.;:"')
 WORD_MAX = 22
 
-# Во всех вариантах есть и −15%, и срок — Директ ротирует их между группами
-TITLE2_VARIANTS = [
-    "-15% только до 11 октября",
-    "Скидка 15% до 11 октября",
-    "Успейте: -15% до 11 октября",
-    "-15% на модель до 11.10",
-    "Только до 11 октября: -15%",
-    "Скидка 15%, успейте до 11.10",
+TITLE_VARIANTS = [
+    "{p} BJORN LARSEN: -15% до 11 октября",
+    "{p}: скидка 15% только до 11 октября",
+    "{p} BJORN LARSEN: скидка 15% до 11.10",
+    "{p}: -15%, успейте до 11 октября",
+    "{p}: скидка 15% — до 11 октября",
+    "{p} BJORN LARSEN: -15% до 11.10",
 ]
+
 
 def call(service: str, params: dict, login: str, token: str, method: str = "get") -> dict:
     body = json.dumps({"method": method, "params": params}, ensure_ascii=False).encode("utf-8")
@@ -64,12 +62,6 @@ def need(body: dict, what: str) -> dict:
     return body.get("result", {})
 
 
-def visible_len(text: str, count_narrow: bool) -> int:
-    if count_narrow:
-        return len(text)
-    return sum(1 for ch in text if ch not in NARROW)
-
-
 def longest_word(text: str) -> int:
     return max((len(w) for w in re.split(r"[\s\-/]+", text) if w), default=0)
 
@@ -77,8 +69,8 @@ def longest_word(text: str) -> int:
 def fetch_price(url: str) -> tuple[int | None, str]:
     """Текущая цена с карточки — строго из JSON-LD Product.offers.
 
-    Регуляркой по всей странице нельзя: в блоках «похожие товары» лежат цены
-    других моделей, и у Нарвика так находилось 19 900 вместо настоящих 47 900.
+    Регуляркой по всей странице нельзя: в блоках «похожие товары» лежат цены других
+    моделей, и у Нарвика так находилось 19 900 вместо настоящих 47 900.
     """
     try:
         resp = requests.get(url, timeout=60, headers={
@@ -120,15 +112,13 @@ def fetch_price(url: str) -> tuple[int | None, str]:
                 walk(v)
 
     for block in re.findall(
-            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
-            resp.text, re.S):
+            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', resp.text, re.S):
         try:
             walk(json.loads(block))
         except Exception:
             continue
     if not found:
         return None, "в JSON-LD нет Product.offers"
-    # price точнее, чем диапазон lowPrice/highPrice
     exact = [n for n, key in found if key == "price"]
     if exact:
         return max(exact), f"price {sorted(set(exact))}"
@@ -168,78 +158,76 @@ def main() -> None:
         title = (ta.get("Title") or "").strip()
         href = ta.get("Href") or ""
 
-        new_title = title
-        if PROMO_TAG not in new_title:
-            cand = f"{title} {PROMO_TAG}"
-            if visible_len(cand, True) > TITLE1_MAX:
-                cand = f"{title.replace('BJORN LARSEN', 'BJORN')} {PROMO_TAG}"
-            new_title = cand
-        title2 = TITLE2_VARIANTS[i % len(TITLE2_VARIANTS)]
+        # «Аляска Нарвик BJORN LARSEN: гусиный пух, −50°C -15%» -> «Аляска Нарвик»
+        base = re.sub(r"\s*-15%\s*$", "", title)
+        model = base.split(" BJORN LARSEN")[0].split(":")[0].strip()
+
+        new_title = TITLE_VARIANTS[i % len(TITLE_VARIANTS)].format(p=model)
+        if len(new_title) > TITLE1_MAX:
+            new_title = new_title.replace(" BJORN LARSEN", "")
 
         bad = []
-        if visible_len(new_title, True) > TITLE1_MAX:
-            bad.append(f"Title {visible_len(new_title, True)}>{TITLE1_MAX}")
+        if len(new_title) > TITLE1_MAX:
+            bad.append(f"Title {len(new_title)}>{TITLE1_MAX}")
         if longest_word(new_title) > WORD_MAX:
             bad.append(f"слово в Title {longest_word(new_title)}>{WORD_MAX}")
-        if visible_len(title2, False) > TITLE2_MAX:
-            bad.append(f"Title2 {visible_len(title2, False)}>{TITLE2_MAX}")
+        if PROMO_TAG not in new_title and "скидка 15%" not in new_title.lower():
+            bad.append("нет упоминания скидки")
         if bad:
             problems.append((a["Id"], new_title, "; ".join(bad)))
             continue
 
-        old_price, raw = fetch_price(href)
+        old_price, note = fetch_price(href)
         new_price = round_down_10(old_price * (1 - DISCOUNT)) if old_price else None
-        prices.append((a["Id"], href.rsplit("/product/", 1)[-1][:46], old_price, new_price, raw))
-
-        upd: dict = {"Id": a["Id"], "TextAd": {"Title": new_title, "Title2": title2}}
-        updates.append((upd, old_price, new_price))
-        print(f"  {a['Id']} | {visible_len(new_title, True)}/{TITLE1_MAX} «{new_title}»")
-        print(f"      Title2 {visible_len(title2, False)}/{TITLE2_MAX} «{title2}» | "
-              f"цена {old_price} -> {new_price}")
+        prices.append((a["Id"], model, old_price, new_price, note))
+        updates.append(({"Id": a["Id"], "TextAd": {"Title": new_title}}, old_price, new_price))
+        print(f"  {a['Id']} | {len(new_title)}/{TITLE1_MAX} «{new_title}»")
+        print(f"      цена {old_price} -> {new_price}")
 
     if problems:
         print("\nне прошли проверку длин:")
         for aid, t, why in problems:
             print(f"  ! {aid} «{t}» — {why}")
 
-    got = sum(1 for p in prices if p[2])
-    print(f"\nцены с сайта: {got} из {len(prices)}")
-    for aid, slug, old, new, raw in prices:
+    print(f"\nцены с сайта: {sum(1 for p in prices if p[2])} из {len(prices)}")
+    for aid, model, old, new, note in prices:
         if not old:
-            print(f"  ! {aid} {slug} — цена не найдена: {raw}")
+            print(f"  ! {aid} {model} — цена не найдена: {note}")
 
     if not apply:
         print(f"\nбез APPLY=1 ничего не меняю (готово к записи: {len(updates)})")
         return
 
-    # Заголовки
-    payload = [u for u, _, _ in updates]
-    out = need(call("ads", {"Ads": payload}, login, token, "update"), "обновление заголовков")
+    out = need(call("ads", {"Ads": [u for u, _, _ in updates]},
+                    login, token, "update"), "обновление заголовков")
     ok = sum(1 for r in out.get("UpdateResults", []) if r.get("Id"))
-    print(f"\nобновлено заголовков: {ok} из {len(payload)}")
+    print(f"\nобновлено заголовков: {ok} из {len(updates)}")
+    warn: dict = {}
     for r in out.get("UpdateResults", []):
         for er in r.get("Errors", []):
             print(f"    ошибка {er.get('Code')}: {er.get('Message')} {er.get('Details') or ''}")
+        for w in r.get("Warnings", []):
+            warn[w.get("Code")] = warn.get(w.get("Code"), 0) + 1
+    if warn:
+        print(f"    предупреждения: {warn}")
 
-    # Блок цены: в читающем enum его нет, проверяем записью на одном объявлении
     probe = next(((u, o, n) for u, o, n in updates if o and n), None)
     if probe:
         u, old, new = probe
-        for field, body in (
-            ("PriceExtension", {"Price": new * 1_000_000, "OldPrice": old * 1_000_000,
-                                "PriceQualifier": "NONE", "PriceCurrency": "RUB"}),
-            ("PriceExtension (целые рубли)", {"Price": new, "OldPrice": old,
-                                              "PriceQualifier": "NONE",
-                                              "PriceCurrency": "RUB"}),
+        for label, body in (
+            ("микро", {"Price": new * 1_000_000, "OldPrice": old * 1_000_000,
+                       "PriceQualifier": "NONE", "PriceCurrency": "RUB"}),
+            ("рубли", {"Price": new, "OldPrice": old,
+                       "PriceQualifier": "NONE", "PriceCurrency": "RUB"}),
         ):
-            test = call("ads", {"Ads": [{"Id": u["Id"], "TextAd": {
-                "PriceExtension": body}}]}, login, token, "update")
+            test = call("ads", {"Ads": [{"Id": u["Id"], "TextAd": {"PriceExtension": body}}]},
+                        login, token, "update")
             if test.get("error"):
-                print(f"  цена [{field}]: {test['error'].get('error_string')} | "
+                print(f"  цена [{label}]: {test['error'].get('error_string')} | "
                       f"{test['error'].get('error_detail')}")
                 continue
             r0 = (test.get("result") or {}).get("UpdateResults", [{}])[0]
-            print(f"  цена [{field}]: {json.dumps(r0, ensure_ascii=False)}")
+            print(f"  цена [{label}]: {json.dumps(r0, ensure_ascii=False)}")
             if r0.get("Id") and not r0.get("Errors"):
                 break
 
@@ -250,16 +238,18 @@ def main() -> None:
         "Page": {"Limit": 1000}}, login, token), "сверка")
     rows = chk.get("Ads", [])
     with_promo = sum(1 for a in rows
-                     if PROMO_TAG in ((a.get("TextAd") or {}).get("Title") or ""))
-    with_t2 = sum(1 for a in rows if (a.get("TextAd") or {}).get("Title2"))
-    print(f"  ТГО {len(rows)}: с «{PROMO_TAG}» в первом заголовке {with_promo}, "
-          f"со вторым заголовком {with_t2}")
-    variants: dict = {}
-    for a in rows:
-        t2 = (a.get("TextAd") or {}).get("Title2") or ""
-        variants[t2] = variants.get(t2, 0) + 1
-    for t2, n in sorted(variants.items(), key=lambda x: -x[1]):
-        print(f"  {n}x «{t2}»")
+                     if PROMO_TAG in ((a.get("TextAd") or {}).get("Title") or "")
+                     or "скидка 15%" in ((a.get("TextAd") or {}).get("Title") or "").lower())
+    print(f"  ТГО {len(rows)}: со скидкой в первом заголовке {with_promo}")
+    seen = {(a.get("TextAd") or {}).get("Title") or "" for a in rows}
+    print(f"  уникальных заголовков: {len(seen)}")
+    for t in sorted(seen):
+        print(f"    «{t}»")
+
+    print("\n### цены для простановки: модель; старая; новая -15%")
+    for aid, model, old, new, note in prices:
+        shown_old = old if old else f"НЕ НАЙДЕНА ({note})"
+        print(f"  {model}; {shown_old}; {new if new else '—'}")
     sys.stdout.flush()
 
 
