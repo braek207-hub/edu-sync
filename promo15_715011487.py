@@ -44,14 +44,6 @@ TITLE2_VARIANTS = [
     "Скидка 15%, успейте до 11.10",
 ]
 
-PRICE_PATTERNS = [
-    r'"price"\s*:\s*"?(\d[\d\s.,]*)',
-    r'og:price:amount"\s+content="(\d[\d\s.,]*)"',
-    r'itemprop="price"\s+content="(\d[\d\s.,]*)"',
-    r'<bdi>\s*(\d[\d\s  ]*)\s*(?:&nbsp;| |\s)*(?:₽|руб)',
-]
-
-
 def call(service: str, params: dict, login: str, token: str, method: str = "get") -> dict:
     body = json.dumps({"method": method, "params": params}, ensure_ascii=False).encode("utf-8")
     resp = requests.post(API + service, data=body, headers={
@@ -82,33 +74,65 @@ def longest_word(text: str) -> int:
     return max((len(w) for w in re.split(r"[\s\-/]+", text) if w), default=0)
 
 
-def fetch_price(url: str) -> tuple[int | None, list[str]]:
-    """Текущая цена с карточки. Возвращает цену и найденных кандидатов для контроля."""
+def fetch_price(url: str) -> tuple[int | None, str]:
+    """Текущая цена с карточки — строго из JSON-LD Product.offers.
+
+    Регуляркой по всей странице нельзя: в блоках «похожие товары» лежат цены
+    других моделей, и у Нарвика так находилось 19 900 вместо настоящих 47 900.
+    """
     try:
         resp = requests.get(url, timeout=60, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Accept-Language": "ru-RU,ru;q=0.9"})
     except Exception as exc:
-        return None, [f"ошибка запроса: {exc}"]
+        return None, f"ошибка запроса: {exc}"
     if resp.status_code != 200:
-        return None, [f"HTTP {resp.status_code}"]
-    page = html.unescape(resp.text)
-    found: list[int] = []
-    raw: list[str] = []
-    for pat in PRICE_PATTERNS:
-        for m in re.finditer(pat, page):
-            s = re.sub(r"[\s  ]", "", m.group(1)).replace(",", ".")
-            raw.append(s)
+        return None, f"HTTP {resp.status_code}"
+
+    found: list[tuple[int, str]] = []
+
+    def take_offer(offer: dict) -> None:
+        for key in ("price", "lowPrice", "highPrice"):
+            val = offer.get(key)
+            if val is None:
+                continue
             try:
-                val = int(float(s))
+                num = int(float(str(val).replace(" ", "").replace(",", ".")))
             except ValueError:
                 continue
-            if 3000 <= val <= 300000:
-                found.append(val)
+            if num > 0:
+                found.append((num, key))
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            if node.get("@type") in ("Product", "ProductGroup"):
+                offers = node.get("offers")
+                for off in (offers if isinstance(offers, list) else [offers]):
+                    if isinstance(off, dict):
+                        take_offer(off)
+                        for sub in (off.get("offers") or []):
+                            if isinstance(sub, dict):
+                                take_offer(sub)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    for block in re.findall(
+            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+            resp.text, re.S):
+        try:
+            walk(json.loads(block))
+        except Exception:
+            continue
     if not found:
-        return None, raw[:6]
-    # на карточке может быть и зачёркнутая, и акционная — берём минимальную как текущую
-    return min(found), raw[:6]
+        return None, "в JSON-LD нет Product.offers"
+    # price точнее, чем диапазон lowPrice/highPrice
+    exact = [n for n, key in found if key == "price"]
+    if exact:
+        return max(exact), f"price {sorted(set(exact))}"
+    return min(n for n, _ in found), f"диапазон {sorted({n for n, _ in found})}"
 
 
 def round_down_10(value: float) -> int:
@@ -182,7 +206,7 @@ def main() -> None:
     print(f"\nцены с сайта: {got} из {len(prices)}")
     for aid, slug, old, new, raw in prices:
         if not old:
-            print(f"  ! {aid} {slug} — цена не найдена, кандидаты: {raw}")
+            print(f"  ! {aid} {slug} — цена не найдена: {raw}")
 
     if not apply:
         print(f"\nбез APPLY=1 ничего не меняю (готово к записи: {len(updates)})")
