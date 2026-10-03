@@ -162,9 +162,18 @@ def main() -> None:
         base = re.sub(r"\s*-15%\s*$", "", title)
         model = base.split(" BJORN LARSEN")[0].split(":")[0].strip()
 
-        new_title = TITLE_VARIANTS[i % len(TITLE_VARIANTS)].format(p=model)
-        if len(new_title) > TITLE1_MAX:
-            new_title = new_title.replace(" BJORN LARSEN", "")
+        # назначенный вариант, а если не влезает — следующие по кругу, затем без бренда
+        new_title = ""
+        for shift in range(len(TITLE_VARIANTS)):
+            cand = TITLE_VARIANTS[(i + shift) % len(TITLE_VARIANTS)].format(p=model)
+            for variant in (cand, cand.replace(" BJORN LARSEN", "")):
+                if len(variant) <= TITLE1_MAX:
+                    new_title = variant
+                    break
+            if new_title:
+                break
+        if not new_title:
+            new_title = f"{model}: -15% до 11.10"
 
         bad = []
         if len(new_title) > TITLE1_MAX:
