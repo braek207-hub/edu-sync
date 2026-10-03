@@ -1,7 +1,7 @@
-"""Что сейчас в ТГО дубля 715011487 и образца 714000003: заголовки, тексты, цены.
+"""Что сейчас в ТГО дубля 715011487 и образца 714000003: заголовки, тексты, расширения.
 
-Нужно перед правкой: откуда брать «старую» цену (вдруг PriceExtension уже заполнен
-в образце) и в каком виде Директ её отдаёт — целое, микро, строка.
+PriceExtension у TEXT_AD в API нет — допустимые поля перечислила сама ошибка Директа.
+Смотрим, где в образце живут цены: AdExtensions, Carousel, ButtonExtension.
 Только чтение.
 """
 
@@ -18,9 +18,9 @@ CAMPAIGNS = [715011487, 714000003]
 EXPECTED_LOGIN_PART = "bjorn"
 
 TEXT_FIELDS = [
-    "Title", "Title2", "Text", "Href", "DisplayUrlPath",
-    "AdImageHash", "SitelinkSetId", "AdExtensionIds", "PriceExtension",
-    "VideoExtension", "TurboPageId", "BusinessId", "VCardId",
+    "Title", "Title2", "Text", "Href", "DisplayUrlPath", "AdImageHash",
+    "SitelinkSetId", "AdExtensions", "Carousel", "ButtonExtension",
+    "VideoExtension", "TurboPageId", "BusinessId", "VCardId", "TrackingParams",
 ]
 
 
@@ -61,20 +61,38 @@ def main() -> None:
                   f"{res['error'].get('error_detail')}")
             continue
         ads = (res.get("result") or {}).get("Ads", [])
-        with_price = sum(1 for a in ads if (a.get("TextAd") or {}).get("PriceExtension"))
-        print(f"\n=== кампания {camp}: ТГО {len(ads)}, с блоком цены {with_price}")
-        for a in ads[:3]:
+        print(f"\n=== кампания {camp}: ТГО {len(ads)}")
+        keys: dict = {}
+        for a in ads:
+            for k, v in (a.get("TextAd") or {}).items():
+                if v not in (None, [], {}):
+                    keys[k] = keys.get(k, 0) + 1
+        print(f"заполненные поля: {json.dumps(keys, ensure_ascii=False)}")
+        for a in ads[:2]:
             print(json.dumps(a, ensure_ascii=False))
-        if len(ads) > 3:
-            print(f"... ещё {len(ads) - 3}")
-        # все уникальные заголовки — чтобы видеть, что правим
         titles = {}
         for a in ads:
-            t = (a.get("TextAd") or {}).get("Title", "")
-            titles[t] = titles.get(t, 0) + 1
-        print(f"уникальных Title: {len(titles)}")
-        for t, n in sorted(titles.items(), key=lambda x: -x[1])[:8]:
-            print(f"  {n}x «{t}»")
+            ta = a.get("TextAd") or {}
+            titles[(ta.get("Title", ""), ta.get("Title2") or "")] = \
+                titles.get((ta.get("Title", ""), ta.get("Title2") or ""), 0) + 1
+        print(f"уникальных пар заголовков: {len(titles)}")
+        for (t1, t2), n in sorted(titles.items(), key=lambda x: -x[1])[:6]:
+            print(f"  {n}x «{t1}» | «{t2}»")
+        texts = {(a.get("TextAd") or {}).get("Text", "") for a in ads}
+        print(f"уникальных текстов: {len(texts)}")
+        for t in list(texts)[:4]:
+            print(f"  «{t}»")
+
+    ext = call("adextensions", {
+        "SelectionCriteria": {}, "FieldNames": ["Id", "Type", "Associated", "State"],
+        "CalloutFieldNames": ["CalloutText"], "Page": {"Limit": 100}}, login, token)
+    if ext.get("error"):
+        print(f"\nadextensions: ОШИБКА {ext['error'].get('error_detail')}")
+    else:
+        rows = (ext.get("result") or {}).get("AdExtensions", [])
+        print(f"\nрасширений в кабинете {len(rows)}")
+        for r in rows[:10]:
+            print(f"  {json.dumps(r, ensure_ascii=False)}")
     sys.stdout.flush()
 
 
