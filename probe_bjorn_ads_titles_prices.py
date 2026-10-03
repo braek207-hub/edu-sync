@@ -19,8 +19,7 @@ EXPECTED_LOGIN_PART = "bjorn"
 
 TEXT_FIELDS = [
     "Title", "Title2", "Text", "Href", "DisplayUrlPath", "AdImageHash",
-    "SitelinkSetId", "AdExtensions", "Carousel", "ButtonExtension",
-    "VideoExtension", "TurboPageId", "BusinessId", "VCardId", "TrackingParams",
+    "SitelinkSetId", "AdExtensions", "VideoExtension", "TurboPageId", "BusinessId", "VCardId", "TrackingParams",
 ]
 
 
