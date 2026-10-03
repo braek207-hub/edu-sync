@@ -19,7 +19,7 @@ EXPECTED_LOGIN_PART = "bjorn"
 
 FIELDS = ["Titles", "Texts", "Href", "AdImages", "VideoExtensions", "AdExtensions",
           "ButtonExtension", "Carousel", "SitelinkSetId", "BusinessId",
-          "DisplayUrlPath", "PriceExtension", "TrackingParams"]
+          "DisplayUrlPath", "PriceExtension"]
 
 
 def call(service: str, params: dict, login: str, token: str, method: str = "get") -> dict:
