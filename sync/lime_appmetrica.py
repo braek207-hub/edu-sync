@@ -13,7 +13,9 @@ from urllib.parse import parse_qs
 import psycopg2
 import psycopg2.extras
 
-from sync.appmetrica_logs import app_country, fetch_installations, fetch_purchase_events, only_country
+# month_chunks — чтобы не тянуть события с event_json за всё окно одним запросом.
+from sync.appmetrica_logs import (app_country, fetch_installations, fetch_purchase_events,
+                                  month_chunks, only_country)
 
 
 def parse_dt(s: str) -> datetime:
@@ -494,22 +496,6 @@ def sync_window(months: int, today: date) -> tuple[str, str]:
         y -= 1
     since = date(y, mo, 1)
     return since.isoformat(), today.isoformat()
-
-
-def month_chunks(since: str, until: str) -> list[tuple[str, str]]:
-    """Разбить окно на календарные месяцы: [(YYYY-MM-DD, YYYY-MM-DD), ...].
-
-    Нужно, чтобы не тянуть события с event_json за всё окно одним запросом.
-    """
-    start = datetime.strptime(since, "%Y-%m-%d").date()
-    end = datetime.strptime(until, "%Y-%m-%d").date()
-    out: list[tuple[str, str]] = []
-    cur = date(start.year, start.month, 1)
-    while cur <= end:
-        nxt = date(cur.year + (cur.month // 12), (cur.month % 12) + 1, 1)
-        out.append((max(cur, start).isoformat(), min(nxt - timedelta(days=1), end).isoformat()))
-        cur = nxt
-    return out
 
 
 def _pg_url() -> str:

@@ -6,6 +6,7 @@ Logs API асинхронный: первый запрос ставит подг
 """
 import os
 import time
+from datetime import date, datetime, timedelta
 
 import requests
 
@@ -35,11 +36,28 @@ def _export(endpoint: str, params: dict, token: str) -> list[dict]:
         r = requests.get(url, params=params, headers=headers, timeout=120)
         if r.status_code == 200:
             return r.json().get("data", [])
-        if r.status_code == 202:
+        # 429 «There are already 3 enqueued queries for given application_id»: в очереди
+        # приложения ещё готовятся файлы соседних синков (GCC, install-source) или брошенные
+        # упавшим прогоном. Они дозревают сами — ждём, как 202. 01–06.10.2026 синк падал на
+        # этом сразу, и каждый упавший прогон оставлял в очереди ещё один запрос.
+        if r.status_code in (202, 429):
             time.sleep(POLL_INTERVAL_SEC)
             continue
         raise RuntimeError(f"Logs API {endpoint} HTTP {r.status_code}: {r.text[:300]}")
     raise TimeoutError(f"Logs API {endpoint}: файл не готов за отведённое время")
+
+
+def month_chunks(since: str, until: str) -> list[tuple[str, str]]:
+    """Разбить окно на календарные месяцы: [(YYYY-MM-DD, YYYY-MM-DD), ...]."""
+    start = datetime.strptime(since, "%Y-%m-%d").date()
+    end = datetime.strptime(until, "%Y-%m-%d").date()
+    out: list[tuple[str, str]] = []
+    cur = date(start.year, start.month, 1)
+    while cur <= end:
+        nxt = date(cur.year + (cur.month // 12), (cur.month % 12) + 1, 1)
+        out.append((max(cur, start).isoformat(), min(nxt - timedelta(days=1), end).isoformat()))
+        cur = nxt
+    return out
 
 
 # Гео для GCC-разреза (по стране). AppMetrica отдаёт ISO-код страны события/установки.
@@ -76,14 +94,21 @@ SESSION_FIELDS = "appmetrica_device_id,session_start_datetime"
 
 def fetch_installations(app_id: str, token: str, date_since: str, date_until: str,
                         country: bool = False) -> list[dict]:
-    params = {
-        "application_id": app_id,
-        "date_since": f"{date_since} 00:00:00",
-        "date_until": f"{date_until} 23:59:59",
-        "date_dimension": "default",  # время события установки
-        "fields": INSTALL_FIELDS + (_GEO if country else ""),
-    }
-    return _export("installations", params, token)
+    """Помесячными файлами, а не одним за всё окно. Файл за 7 месяцев (~930 тыс. установок)
+    готовился ~14 мин 30.09.2026 и с 01.10 перестал укладываться в 20 мин поллинга. Месячный
+    файл меньше, а за закрытый месяц параметры запроса не меняются день ко дню — Logs API
+    отдаёт его из своего кэша за секунды (так же ведут себя месячные чанки покупок)."""
+    rows: list[dict] = []
+    for c_since, c_until in month_chunks(date_since, date_until):
+        params = {
+            "application_id": app_id,
+            "date_since": f"{c_since} 00:00:00",
+            "date_until": f"{c_until} 23:59:59",
+            "date_dimension": "default",  # время события установки
+            "fields": INSTALL_FIELDS + (_GEO if country else ""),
+        }
+        rows.extend(_export("installations", params, token))
+    return rows
 
 
 def fetch_purchase_events(app_id: str, token: str, date_since: str, date_until: str,
