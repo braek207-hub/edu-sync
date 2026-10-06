@@ -2,7 +2,7 @@
 """Такт чистильщика площадок РСЯ.
 
     python -m sync.placements_clean --dry-run
-    python -m sync.placements_clean --accounts russever
+    python -m sync.placements_clean --accounts lime
     python -m sync.placements_clean --apply
 
 По умолчанию — репетиция: боевая запись включается флагом, потому что
