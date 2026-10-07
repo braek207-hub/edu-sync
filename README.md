@@ -4,7 +4,6 @@
 
 - **Яндекс Директ API v5** → `direct_stats` (триггер: 7 дней; full: с `DIRECT_DATE_FROM`)
 - **Google Sheets** (листы `Лиды`, `Лиды 2025`, `Оплаты`, `Оплаты 2025`) → `crm_leads`, `crm_payments`
-- **Google Sheets** (лист `plan_monthly`) → `monthly_plans` (план vs факт в EDUNETWORK)
 - **LIME MySQL** (`lc_simple_view`) → `lime_stats` (workflow `sync-lime.yml`)
 - **Polina Repik** (Yandex Direct + Metrika) → `polinarepik_*` (workflow `sync-polinarepik.yml`)
 

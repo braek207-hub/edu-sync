@@ -102,13 +102,8 @@ def main() -> None:
         print(f"ОШИБКА crm_payments: {e}")
         errors.append(f"crm_payments: {e}")
 
-    try:
-        from sync.plan import sync_plan_monthly
-
-        sync_plan_monthly()
-    except Exception as e:
-        print(f"ОШИБКА plan: {e}")
-        errors.append(f"plan: {e}")
+    # План EDU УБРАН из daily: monthly_plans ведётся экраном планов Panda-BI
+    # (/p/edunetwork/plans). Ночной TRUNCATE из листа plan_monthly стирал бы правки.
 
     # Стратегии УБРАНЫ из daily: Sheets-лист strategies_daily умер вместе с GAS
     # (последние данные 2026-06-03). Снапшот стратегий теперь пишет

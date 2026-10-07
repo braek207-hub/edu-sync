@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 
 from sync.classify import DIRECT_SHEETS
-from sync.plan import PLAN_SHEET, normalize_month_key
 from sync.sheets import get_sheets_service, read_sheet
 from sync.utils import pick_index_loose
 
@@ -66,47 +65,6 @@ def _log_crm_sheet(service, spreadsheet_id: str, name: str) -> None:
     )
 
 
-def _log_plan_sheet(service, spreadsheet_id: str) -> None:
-    print("--- Validate: plan_monthly ---")
-    try:
-        values = read_sheet(service, spreadsheet_id, PLAN_SHEET)
-    except Exception as e:
-        print(f"  ошибка: {e}")
-        return
-    if len(values) < 2:
-        print("  пустой лист")
-        return
-    headers = [str(x).strip().lower() for x in values[0]]
-    i_month = pick_index_loose(headers, ["month", "месяц"])
-    i_proj = pick_index_loose(headers, ["project", "проект"])
-    i_dir = pick_index_loose(headers, ["direction", "направ"])
-    valid = 0
-    bad_month = 0
-    projects: set[str] = set()
-    directions: set[str] = set()
-    for r in values[1:]:
-        ym = normalize_month_key(r[i_month] if i_month != -1 and i_month < len(r) else "")
-        if not ym:
-            bad_month += 1
-            continue
-        valid += 1
-        p = (
-            str(r[i_proj]).strip().lower()
-            if i_proj != -1 and i_proj < len(r)
-            else ""
-        )
-        d = (
-            str(r[i_dir]).strip().lower()
-            if i_dir != -1 and i_dir < len(r)
-            else ""
-        )
-        projects.add(p or "(пусто)")
-        directions.add(d or "(пусто)")
-    print(f"  валидных строк: {valid}, битый month: {bad_month}")
-    print(f"  project: {sorted(projects)[:20]}")
-    print(f"  direction: {sorted(directions)[:20]}")
-
-
 def _log_db_direct_wavg() -> None:
     print("--- Validate: direct_stats w_avg (БД) ---")
     try:
@@ -141,7 +99,6 @@ def run_validation() -> None:
             _log_crm_sheet(service, spreadsheet_id, sheet)
         for sheet in crm_payments_sheets():
             _log_crm_sheet(service, spreadsheet_id, sheet)
-        _log_plan_sheet(service, spreadsheet_id)
     except Exception as e:
         print(f"Validate sheets: {e}")
     _log_db_direct_wavg()
