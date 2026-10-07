@@ -29,7 +29,12 @@ OWN = {"kaz": "root", "are": "ae", "sau": "sa", "kwt": "kw", "qat": "qa", "omn":
 INC = {"dimension": "query", "operator": "includingRegex", "expression": brand_regex("gcc")}
 
 
+OUT = open("layers.jsonl", "w", encoding="utf-8")  # артефакт: лог маскирует куски base64
+
+
 def emit(obj):
+    OUT.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    OUT.flush()
     print("B64:" + base64.b64encode(json.dumps(obj, ensure_ascii=False).encode("utf-8")).decode("ascii"))
 
 
