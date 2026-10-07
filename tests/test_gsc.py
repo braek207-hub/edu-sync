@@ -27,22 +27,20 @@ def test_parse_daily_totals_empty():
     assert parse_daily_totals({"rows": []}) == []
 
 
-def test_regions_match_pavel_sheets_method():
-    """Методика листов 1-в-1 (решение 2026-08-20): KZ — общий хост с гео-фильтром
-    Казахстан; GCC — витрины целиком, страна строки = страна витрины."""
+def test_regions_country_of_user_method():
+    """KZ — общий хост с гео Казахстан. GCC (решение 2026-10-07) — строка страны =
+    её пользователи: у каждой витрины свой гео-код, корень подмешивается отдельно."""
     kz = REGIONS["kz"]
     assert kz["sites"] == {"https://limestore.com/": ""}
     assert kz["country_filter"] == "kaz"  # без него на общем хосте — Россия
 
     gcc = REGIONS["gcc"]
-    assert gcc["country_filter"] is None  # витрина целиком, любые страны пользователей
-    # Только витрины Залива: корневой домен в GCC не входит (клики с него ведут на
-    # глобальный сайт, а не в магазин) — см. докстринг sync/gsc.py.
-    assert "https://limestore.com/" not in gcc["sites"]
-    assert len(gcc["sites"]) == 6
-    assert all(s.endswith(".limestore.com/") for s in gcc["sites"])
+    assert "https://limestore.com/" not in gcc["sites"]  # корень — не витрина, а добавка
+    assert gcc["root"] == "https://limestore.com/"
+    assert len(gcc["sites"]) == 6 and set(gcc["codes"]) == set(gcc["sites"])
     assert gcc["sites"]["https://ae.limestore.com/"] == "ОАЭ"
-    assert gcc["sites"]["https://sa.limestore.com/"] == "Саудовская Аравия"
+    assert gcc["codes"]["https://ae.limestore.com/"] == "are"
+    assert gcc["codes"]["https://bh.limestore.com/"] == "bhr"
 
 
 def test_aggregate_weekly_sums_days_into_iso_week():
@@ -138,20 +136,86 @@ def test_sync_gsc_seo_quality_brand_two_queries(monkeypatch):
     assert any(f["dimension"] == "query" and f["operator"] == "excludingRegex"
                for f in nb_filters)
 
+    # GCC без доступа к корню: 6 витрин × (тотал + небренд), каждый — с гео страны витрины
     gcc_bodies = []
     monkeypatch.setattr(
         gsc, "get_searchconsole_service",
         lambda: _fake_service(gcc_bodies, list(gsc.REGIONS["gcc"]["sites"])),
     )
     gsc.sync_gsc_seo("2026-06-22", "2026-08-19", "gcc")
-    assert len(gcc_bodies) == 12  # 6 витрин × (тотал + небренд)
-    totals = [b for b in gcc_bodies if "dimensionFilterGroups" not in b]
-    nbs = [b for b in gcc_bodies if "dimensionFilterGroups" in b]
-    assert len(totals) == 6 and len(nbs) == 6
-    for b in nbs:
+    assert len(gcc_bodies) == 12
+    codes = set(gsc.REGIONS["gcc"]["codes"].values())
+    for b in gcc_bodies:
         fil = b["dimensionFilterGroups"][0]["filters"]
-        assert fil[0]["operator"] == "excludingRegex"
-        assert "لايم" in fil[0]["expression"]  # арабские написания в GCC-регексе
+        assert fil[0]["dimension"] == "country" and fil[0]["expression"] in codes
+    nbs = [b for b in gcc_bodies if len(b["dimensionFilterGroups"][0]["filters"]) == 2]
+    assert len(nbs) == 6
+    for b in nbs:
+        q = b["dimensionFilterGroups"][0]["filters"][1]
+        assert q["operator"] == "excludingRegex"
+        assert "لايم" in q["expression"]  # арабские написания в GCC-регексе
+
+
+class _RowsService:
+    """Фейк GSC: ответ выбирается по (сайт, измерения, есть ли фильтр запроса и какой)."""
+
+    def __init__(self, table):
+        self.table = table
+
+    def searchanalytics(self):
+        svc = self
+
+        class SA:
+            def query(self, siteUrl, body):
+                fil = body.get("dimensionFilterGroups", [{}])[0].get("filters", [])
+                op = next((f["operator"] for f in fil if f["dimension"] == "query"), None)
+                rows = svc.table.get((siteUrl, tuple(body["dimensions"]), op), [])
+
+                class R:
+                    def execute(self_inner):
+                        return {"rows": rows}
+                return R()
+        return SA()
+
+
+def test_root_extra_impressions_counts_only_searches_without_storefront():
+    from sync.gsc import root_extra_impressions
+
+    home = [{"keys": ["2026-09-07", "lime", "MOBILE"], "impressions": 10}]
+    root = [
+        {"keys": ["2026-09-07", "lime", "MOBILE"], "impressions": 8},    # та же выдача → 0
+        {"keys": ["2026-09-07", "lime", "DESKTOP"], "impressions": 3},   # витрины не было → 3
+        {"keys": ["2026-09-08", "limestore", "MOBILE"], "impressions": 5},
+    ]
+    root.append({"keys": ["2026-09-07", "lime uae", "MOBILE"], "impressions": 4})
+    home.append({"keys": ["2026-09-07", "lime uae", "MOBILE"], "impressions": 1})  # превышение 3
+    assert root_extra_impressions(home, root) == {"2026-09-07": 6, "2026-09-08": 5}
+
+
+def test_fetch_gcc_country_adds_root_clicks_and_extra_impressions():
+    """Клики корня прибавляются целиком, показы — только сверх витрины."""
+    from sync.gsc import fetch_gcc_country
+
+    ae, root = "https://ae.limestore.com/", "https://limestore.com/"
+    d = "2026-09-07"
+    svc = _RowsService({
+        (ae, ("date",), None): [{"keys": [d], "clicks": 120, "impressions": 2000}],
+        (ae, ("date",), "excludingRegex"): [{"keys": [d], "clicks": 20, "impressions": 1000}],
+        (root, ("date",), None): [{"keys": [d], "clicks": 40, "impressions": 900}],
+        (root, ("date",), "excludingRegex"): [{"keys": [d], "clicks": 5, "impressions": 100}],
+        (ae, ("date", "query", "device"), "includingRegex"):
+            [{"keys": [d, "lime", "MOBILE"], "impressions": 700}],
+        (root, ("date", "query", "device"), "includingRegex"):
+            [{"keys": [d, "lime", "MOBILE"], "impressions": 600},
+             {"keys": [d, "lime", "DESKTOP"], "impressions": 30}],
+    })
+    assert fetch_gcc_country(svc, ae, "are", root, d, d) == [
+        {"date": d, "clicks": 100 + 35, "impressions": 1000 + 30},
+    ]
+    # без корня — только витрина
+    assert fetch_gcc_country(svc, ae, "are", None, d, d) == [
+        {"date": d, "clicks": 100, "impressions": 1000},
+    ]
 
 
 def test_subtract_days_clamps_negative():

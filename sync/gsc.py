@@ -6,22 +6,32 @@ Google доминирует). ОТДЕЛЬНО от Яндекс.Вебмаст�
 другой регион — не суммировать.
 
 МЕТОДИКА = «качественный бренд»: бренд + анонимные = тотал − видимый небренд
-(решение Павла 2026-08-21; замеры недели 33 — в докстринге fetch_site_totals):
-- KZ: limestore.com, страна пользователя Казахстан (общий с RU хост — без гео там
-  Россия, ~119 тыс кликов/нед). Небренда в KZ мало (34 клика, 3,5 тыс показов).
-- GCC: каждая витрина, «страна» строки = страна витрины (ae → ОАЭ), пользователи
-  любых стран. Небренд у ae — 53% показов при CTR 0,5% (категорийная выдача
-  «tank top»/«blazer»/«linen pants» на поз. 2–12) — он и раздувал «спрос» до
-  44,6 тыс показов при 2 тыс кликов; вычитается excludingRegex написаний бренда.
-Анонимные (GSC прячет редкие запросы) остаются В ряду: по поведению это бренд
-(CTR 5,4% против 0,5% у небренда — редкие длинные вариации написаний).
-Прежние методики — в git-истории (бренд+гео до 20.08; тоталы листов 20–21.08)
-и в отчёте panda-bi /reports/lime-brand-method-kz-gcc.
+(решение Павла 2026-08-21; замеры недели 33 — в докстринге fetch_site_totals).
+Небренд у ae — 53% показов при CTR 0,5% (категорийная выдача «tank top»/«blazer»),
+вычитается excludingRegex написаний бренда. Анонимные (GSC прячет редкие запросы)
+остаются В ряду: по поведению это бренд (CTR 6,8% против 0,5% у небренда, 07.09–04.10.2026).
+- KZ: limestore.com, пользователи из Казахстана (общий с RU хост — без гео там Россия,
+  ~119 тыс кликов/нед). Чужие витрины у казахстанцев — 7% ключей, дубли ≤1%: не берём.
+- GCC (решение Павла 2026-10-07; пробы scripts/probe_gsc_cross_sites.py,
+  probe_gsc_root_gcc.py): строка страны = её пользователи, а не витрина целиком.
+  1. Витрина страны с фильтром «пользователь из этой страны». Без фильтра половина и
+     больше показов витрин — глобальные поиски «lime» из США/UK/ЕС (у kw свои
+     пользователи всего 7% показов) — не спрос Залива.
+  2. Корневой limestore.com у тех же пользователей: КЛИКИ прибавляются целиком (клик
+     уходит на один сайт, дублей нет; у ОАЭ ~1 тыс кликов/мес), ПОКАЗЫ — только сверх
+     витрины. GSC засчитывает показ каждому URL-prefix ресурсу отдельно, а корень почти
+     всегда стоит в той же выдаче ниже витрины (ОАЭ: поз. 1,3 против 4,3; из 21,7 тыс
+     брендовых показов корня без витрины — 789). Сверх витрины = по ключам
+     дата×запрос×устройство видимого бренда max(0, корень − витрина); анонимные показы
+     корня сопоставить не с чем — не берём. В Бахрейне витрина мертва, бренд живёт на
+     корне — формула отдаёт его сама.
+  Идеал — доменный ресурс sc-domain:limestore.com (дедуплицирует хосты сам); у
+  сервис-аккаунта его нет.
+Прежние методики — в git-истории (бренд+гео до 20.08; тоталы листов 20–21.08; витрина
+целиком без гео 21.08–07.10) и в отчёте panda-bi /reports/lime-brand-method-kz-gcc.
 
-Корневой limestore.com в GCC не входит (решение 18.07): его клики ведут на глобальный
-сайт, а не в магазин; для ОАЭ он мал (199 кликов/нед против 2 028 у витрины).
-
-Контракт searchanalytics.query: rows[].{keys:[date], clicks, impressions} (dims=[date]).
+Контракт searchanalytics.query: rows[].{keys:[date], clicks, impressions} (dims=[date]);
+для сверки с корнем — keys:[date, query, device].
 
 Auth: сервис-аккаунт добавлен пользователем ресурсов в Search Console (siteFullUser на
 всех семи). Env: GOOGLE_APPLICATION_CREDENTIALS | GOOGLE_SERVICE_ACCOUNT, DATABASE_URL.
@@ -38,12 +48,13 @@ SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 ROW_LIMIT = 25000
 
 # Ресурсы по регионам. sites: {siteUrl: страна-строки в lime_gsc_seo.country}.
-# Для KZ страна строки пустая (регион целиком), но запрос фильтруется по гео
-# пользователя (country_filter): limestore.com — общий с RU хост, без фильтра
-# там Россия (~119 тыс брендовых кликов/нед против ~2 тыс казахстанских).
+# KZ: страна строки пустая (регион целиком), запрос с гео пользователя country_filter.
+# GCC: codes — гео пользователя для витрины (ISO alpha-3, как отдаёт GSC); root —
+# корневой ресурс, чьи клики и показы сверх витрины добавляются стране.
+ROOT_SITE = "https://limestore.com/"
 REGIONS = {
     "kz": {
-        "sites": {"https://limestore.com/": ""},
+        "sites": {ROOT_SITE: ""},
         "country_filter": "kaz",
     },
     "gcc": {
@@ -55,7 +66,15 @@ REGIONS = {
             "https://bh.limestore.com/": "Бахрейн",
             "https://om.limestore.com/": "Оман",
         },
-        "country_filter": None,
+        "codes": {
+            "https://ae.limestore.com/": "are",
+            "https://sa.limestore.com/": "sau",
+            "https://kw.limestore.com/": "kwt",
+            "https://qa.limestore.com/": "qat",
+            "https://bh.limestore.com/": "bhr",
+            "https://om.limestore.com/": "omn",
+        },
+        "root": ROOT_SITE,
     },
 }
 
@@ -133,18 +152,33 @@ def aggregate_daily(rows: list[dict]) -> dict[tuple, dict]:
     return out
 
 
-def _daily_query(service, site: str, start: str, end: str, filters: list[dict]) -> list[dict]:
+def _query(service, site: str, start: str, end: str, dims: list[str],
+           filters: list[dict]) -> list[dict]:
     body = {
         "startDate": start,
         "endDate": end,
-        "dimensions": ["date"],
+        "dimensions": dims,
         "rowLimit": ROW_LIMIT,
         "type": "web",
     }
     if filters:
         body["dimensionFilterGroups"] = [{"filters": filters}]
-    resp = service.searchanalytics().query(siteUrl=site, body=body).execute()
-    return parse_daily_totals(resp)
+    out: list[dict] = []
+    while True:
+        if out:
+            body["startRow"] = len(out)
+        rows = service.searchanalytics().query(siteUrl=site, body=body).execute().get("rows", [])
+        out += rows
+        if len(rows) < ROW_LIMIT:
+            return out
+
+
+def _daily_query(service, site: str, start: str, end: str, filters: list[dict]) -> list[dict]:
+    return parse_daily_totals({"rows": _query(service, site, start, end, ["date"], filters)})
+
+
+def _country(code: str | None) -> list[dict]:
+    return [{"dimension": "country", "operator": "equals", "expression": code}] if code else []
 
 
 def subtract_days(total: list[dict], nonbrand: list[dict]) -> list[dict]:
@@ -178,15 +212,49 @@ def fetch_site_totals(service, site: str, country_filter: str | None,
     Разность = бренд + анонимные. Анонимные по поведению — бренд (CTR 5,4% против
     0,5% у небренда): редкие длинные вариации, которые GSC прячет.
     Замер ae нед.33: 44 614 − 23 807 = 20 807 показов, 2 038 − 113 = 1 925 кликов.
-    country_filter — гео пользователя (только KZ: общий с RU хост).
+    country_filter — гео пользователя (KZ: общий с RU хост; GCC: страна витрины).
     """
-    country = ([{"dimension": "country", "operator": "equals", "expression": country_filter}]
-               if country_filter else [])
+    country = _country(country_filter)
     total = _daily_query(service, site, start, end, country)
     nonbrand = _daily_query(service, site, start, end, country + [
         {"dimension": "query", "operator": "excludingRegex", "expression": brand_regex(region)},
     ])
     return subtract_days(total, nonbrand)
+
+
+def root_extra_impressions(home_rows: list[dict], root_rows: list[dict]) -> dict[str, int]:
+    """Показы корня сверх витрины по дням: Σ по ключам дата×запрос×устройство
+    max(0, корень − витрина). Ключ, где в выдаче оба ресурса, — те же поиски,
+    засчитанные дважды; превышение корня — поиски, где витрины не было."""
+    home = {tuple(r["keys"]): int(r.get("impressions", 0) or 0) for r in home_rows}
+    out: dict[str, int] = {}
+    for r in root_rows:
+        key = tuple(r["keys"])
+        extra = int(r.get("impressions", 0) or 0) - home.get(key, 0)
+        if extra > 0:
+            out[key[0]] = out.get(key[0], 0) + extra
+    return out
+
+
+def fetch_gcc_country(service, site: str, code: str, root: str | None,
+                      start: str, end: str) -> list[dict]:
+    """Дневной ряд страны GCC = витрина у пользователей страны + корень у них же:
+    клики целиком, показы — сверх витрины (см. докстринг модуля)."""
+    days = {r["date"]: r for r in fetch_site_totals(service, site, code, start, end, "gcc")}
+    if root:
+        for r in fetch_site_totals(service, root, code, start, end, "gcc"):
+            days.setdefault(r["date"], {"date": r["date"], "clicks": 0, "impressions": 0})
+            days[r["date"]]["clicks"] += r["clicks"]
+        brand = _country(code) + [
+            {"dimension": "query", "operator": "includingRegex", "expression": brand_regex("gcc")},
+        ]
+        dims = ["date", "query", "device"]
+        extra = root_extra_impressions(_query(service, site, start, end, dims, brand),
+                                       _query(service, root, start, end, dims, brand))
+        for day, n in extra.items():
+            days.setdefault(day, {"date": day, "clicks": 0, "impressions": 0})
+            days[day]["impressions"] += n
+    return [days[d] for d in sorted(days)]
 
 
 def sync_gsc_seo(from_date: str, to_date: str, region: str = "kz") -> int:
@@ -206,7 +274,13 @@ def sync_gsc_seo(from_date: str, to_date: str, region: str = "kz") -> int:
         if site not in have:
             print(f"gsc[{region}]: пропуск {site} — нет доступа сервис-аккаунта")
             continue
-        batch = fetch_site_totals(service, site, cfg["country_filter"], from_date, to_date, region)
+        if region == "gcc":
+            root = cfg["root"] if cfg["root"] in have else None
+            if root is None:
+                print(f"gsc[{region}]: нет доступа к {cfg['root']} — {country_name} без корня")
+            batch = fetch_gcc_country(service, site, cfg["codes"][site], root, from_date, to_date)
+        else:
+            batch = fetch_site_totals(service, site, cfg["country_filter"], from_date, to_date, region)
         for r in batch:
             r["country"] = country_name
         all_rows += batch
