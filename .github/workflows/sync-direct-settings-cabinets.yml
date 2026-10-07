@@ -1,0 +1,52 @@
+name: Sync Direct Campaign Settings (BJORN, Polina)
+
+# Настройки кампаний Директа → <x>_campaign_settings + снимок дня в strategy_snapshots:
+# из снимков Panda-BI строит журнал изменений и флажки на графике. EDU — свой
+# workflow (sync-edu-direct-settings.yml), meshnflesh — свой (раз в 3 часа), LIME —
+# внутри sync-lime-direct.yml. Код общий: sync/direct_settings_cabinets.py.
+# Сброса кэша дашбордов нет намеренно: /api/chart-marks не кэшируется, а витрины
+# настроек BJORN/Polina обработчики дашбордов пока не читают.
+
+on:
+  schedule:
+    # 02:15 UTC = 05:15 МСК — рядом со снимком EDU (05:00): дни журнала у всех
+    # дашбордов режутся по одному и тому же утру.
+    - cron: "15 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: direct-settings-cabinets-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Кабинеты независимы: упавший BJORN не должен отменять Polina.
+      fail-fast: false
+      matrix:
+        cabinet: [bjorn, polinarepik]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync ${{ matrix.cabinet }} campaign settings
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONIOENCODING: "utf-8"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BJORN_DIRECT_CLIENTS_JSON: ${{ secrets.BJORN_DIRECT_CLIENTS_JSON }}
+          BJORN_METRICA_TOKEN: ${{ secrets.BJORN_METRICA_TOKEN }}
+          BJORN_METRICA_COUNTER_ID: ${{ secrets.BJORN_METRICA_COUNTER_ID }}
+          POLINAREPIK_YANDEX_TOKEN: ${{ secrets.POLINAREPIK_YANDEX_TOKEN }}
+        run: python -m sync.direct_settings_cabinets ${{ matrix.cabinet }}
+

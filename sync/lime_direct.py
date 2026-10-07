@@ -42,6 +42,7 @@ import psycopg2
 import psycopg2.extras
 
 from sync.fx import to_rub as fx_to_rub
+from sync.strategy_snapshots import write_snapshot
 
 REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports"
 CAMPAIGNS_URL = "https://api.direct.yandex.com/json/v5/campaigns"
@@ -2041,6 +2042,17 @@ def _convert_money(rows: List[Dict[str, Any]], src_currency: str, vat_mult: floa
                 r[f] = round(float(v) * factor, 2)
 
 
+def _snapshot_settings(campaign_ids: List[str]) -> None:
+    """Снимок дня в strategy_snapshots (журнал изменений Panda-BI) — только кампании
+    этого прогона и только рублёвого кабинета: настройки lime-kz1 в тенге (в отличие от
+    статистики, _convert_money их не трогает), и журнал показал бы тенге как рубли."""
+    cur = os.environ.get("LIME_DIRECT_SRC_CURRENCY", "").strip().upper()
+    if cur not in ("", "RUB", "RUR"):
+        print(f"[lime_direct] снимок настроек пропущен: кабинет в {cur}")
+        return
+    write_snapshot(_pg_url(), "lime", campaign_ids)
+
+
 def sync_lime_direct(days_back: int = 7) -> int:
     today = date.today()
     date_from = (today - timedelta(days=days_back)).isoformat()
@@ -2076,6 +2088,13 @@ def sync_lime_direct(days_back: int = 7) -> int:
         # синхронизировались — state/campaign_type оставались неполными.
         print(f"[lime_direct] WARN: настройки кампаний не синхронизированы: {e}")
         traceback.print_exc()
+    else:
+        try:
+            _snapshot_settings(campaign_ids)
+        except Exception as e:
+            # Не роняет синк статистики: журнал изменений потеряет день, дашборд — нет.
+            print(f"::warning::[lime_direct] снимок настроек не записан: {e}")
+            traceback.print_exc()
 
     merged: List[Dict[str, Any]] = []
     for r in report_rows:

@@ -6,8 +6,8 @@ sync/edu_direct_settings.py — синк настроек кампаний Ди�
 Стат-репортная часть не портирована — статистику EDU тянет sync/direct.py.
 
 _upsert_campaign_settings/_sync_campaign_settings принимают table/extra_counter_ids —
-этим же кодом переиспользуется sync/meshnflesh_direct_settings.py (кабинет meshnflesh,
-таблица mnf_campaign_settings), не копируя парсинг настроек второй раз.
+этим же кодом переиспользуется sync/direct_settings_cabinets.py (кабинеты meshnflesh,
+bjorn, polinarepik — каждый в свою <x>_campaign_settings), не копируя парсинг второй раз.
 
 Тянет на каждый логин из sync.direct._direct_clients() настройки кампаний (per campaign,
 edu_campaign_settings): стратегия, аудитория, таргетинг, корректировки, офферный
@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg2
+
+from sync.strategy_snapshots import write_snapshot
 
 CAMPAIGNS_URL = "https://api.direct.yandex.com/json/v5/campaigns"
 CAMPAIGNS_V501_URL = "https://api.direct.yandex.com/json/v501/campaigns"
@@ -1338,10 +1340,10 @@ def _build_campaign_settings(
     return settings
 
 
-# Таблица — параметр, не константа: sync/meshnflesh_direct_settings.py переиспользует
-# весь этот модуль под кабинет meshnflesh, подставляя mnf_campaign_settings вместо
-# edu_campaign_settings. Значение приходит только из своего же кода (см. вызовы ниже),
-# внешний ввод сюда не попадает.
+# Таблица — параметр, не константа: sync/direct_settings_cabinets.py переиспользует
+# весь этот модуль под кабинеты meshnflesh/bjorn/polinarepik, подставляя их
+# <x>_campaign_settings вместо edu_campaign_settings. Значение приходит только из своего
+# же кода (см. вызовы ниже), внешний ввод сюда не попадает.
 def _settings_upsert_sql(table: str) -> str:
     return f"""
     INSERT INTO {table} (campaign_id, campaign_name, settings, synced_at)
@@ -1497,42 +1499,10 @@ def _list_campaigns_for_login() -> Dict[str, str]:
 
 
 # Дневной снапшот стратегий из свежих настроек API (замена мёртвого Google Sheets
-# strategies_daily: лист заполнял GAS-скрипт, закрытый 2026-06). Дата — московский
-# день: Директ живёт по МСК, и снапшот «на сегодня» осмыслен именно в его сутках.
-_SNAPSHOT_STRATEGIES_SQL = """
-    INSERT INTO strategy_snapshots (
-        date, campaign_id, campaign_name, weekly_budget, target_cpa, state, status, strategy_type
-    )
-    SELECT (now() AT TIME ZONE 'Europe/Moscow')::date,
-           campaign_id,
-           COALESCE(campaign_name, ''),
-           COALESCE((settings #>> '{strategy,search,weeklyBudget}')::numeric,
-                    (settings #>> '{strategy,network,weeklyBudget}')::numeric),
-           COALESCE((settings #>> '{strategy,search,targetCpa}')::numeric,
-                    (settings #>> '{strategy,network,targetCpa}')::numeric),
-           COALESCE(settings #>> '{meta,state}', ''),
-           COALESCE(settings #>> '{meta,status}', ''),
-           COALESCE(settings #>> '{strategy,search,biddingStrategyType}',
-                    settings #>> '{strategy,network,biddingStrategyType}', '')
-    FROM edu_campaign_settings
-    ON CONFLICT (date, campaign_id) DO UPDATE SET
-        campaign_name = EXCLUDED.campaign_name,
-        weekly_budget = EXCLUDED.weekly_budget,
-        target_cpa    = EXCLUDED.target_cpa,
-        state         = EXCLUDED.state,
-        status        = EXCLUDED.status,
-        strategy_type = EXCLUDED.strategy_type
-"""
-
-
+# strategies_daily: лист заполнял GAS-скрипт, закрытый 2026-06). Запись общая для всех
+# дашбордов — sync/strategy_snapshots.py.
 def _snapshot_strategies() -> int:
-    with psycopg2.connect(_pg_url()) as conn:
-        with conn.cursor() as cur:
-            cur.execute(_SNAPSHOT_STRATEGIES_SQL)
-            n = cur.rowcount
-        conn.commit()
-    print(f"[edu_direct_settings] снапшот стратегий: {n} строк в strategy_snapshots")
-    return n
+    return write_snapshot(_pg_url(), "edunetwork")
 
 
 def sync_edu_campaign_settings() -> int:
