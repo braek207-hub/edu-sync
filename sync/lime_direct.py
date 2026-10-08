@@ -42,7 +42,7 @@ import psycopg2
 import psycopg2.extras
 
 from sync.fx import to_rub as fx_to_rub
-from sync.strategy_snapshots import write_snapshot
+from sync.strategy_snapshots import msk_today, write_snapshot
 
 REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports"
 CAMPAIGNS_URL = "https://api.direct.yandex.com/json/v5/campaigns"
@@ -920,7 +920,18 @@ def _extract_strategy_channel_full(strategy_block: Any) -> Dict[str, Any]:
         "targetDrr": None,
         "bidCeiling": None,
         "goalIds": [],
-        "placementTypes": list(strategy_block.get("PlacementTypes") or []),
+        # PlacementTypes от API = {SearchResults: "YES", ProductGallery: "NO", ...}:
+        # list(dict) брал все ключи, и выключенные площадки показывались включёнными
+        # (у EDU то же чинили в edu_direct_settings). Берём только Value=YES.
+        "placementTypes": (
+            [
+                k
+                for k, v in strategy_block["PlacementTypes"].items()
+                if str(v.get("Value") if isinstance(v, dict) else v).upper() == "YES"
+            ]
+            if isinstance(strategy_block.get("PlacementTypes"), dict)
+            else list(strategy_block.get("PlacementTypes") or [])
+        ),
     }
     goal_ids: List[int] = []
     for k, v in strategy_block.items():
@@ -1157,6 +1168,94 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
             except RuntimeError as e:
                 print(f"  [lime_direct] v501 campaigns.get: {e}")
 
+    # Добор тех, кого первый v5-запрос не отдал. Дело в типе кампании, а не в состоянии:
+    # v5 не видит часть ЕПК (их отдаёт только v501 — Campaign Launcher, 22.08: «синк не
+    # видел 7 ЕПК/РМП»), а РМП нового интерфейса и Мастер кампаний не отдаёт ни один
+    # эндпоинт (get по Id — пустой список без ошибки). Прежний добор повторял тот же v5,
+    # только с фильтром States, и не находил никого: 11 из 43 кампаний LIME RU (все — РМП
+    # «APP. …») оставались без статуса и стратегии. Добор — до разбора пакетных стратегий,
+    # иначе у добранных пакетная стратегия осталась бы голым id.
+    missing = [cid for cid in campaign_ids if cid not in out]
+    if missing:
+        print(f"  [lime_direct] WARN: campaigns.get (v5) не вернул {len(missing)} кампаний, добираю")
+        all_states = ["ON", "OFF", "SUSPENDED", "ENDED", "CONVERTED", "ARCHIVED"]
+        unified_placements = [
+            "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
+        ]
+
+        def _full_params(ids: List[str]) -> Dict[str, Any]:
+            return {
+                "method": "get",
+                "params": {
+                    "SelectionCriteria": {"Ids": [int(x) for x in ids], "States": all_states},
+                    "FieldNames": field_names,
+                    "TextCampaignFieldNames": type_fields,
+                    "UnifiedCampaignFieldNames": type_fields,
+                    "MobileAppCampaignFieldNames": mobile_app_fields,
+                    "TextCampaignSearchStrategyPlacementTypesFieldNames": [
+                        "SearchResults", "ProductGallery", "DynamicPlaces",
+                    ],
+                    "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": unified_placements,
+                },
+            }
+
+        def _parse_all(result: Dict[str, Any]) -> None:
+            for c in result.get("Campaigns") or []:
+                _parse_campaign(c)
+
+        # 1) v501: ЕПК, невидимые для v5, приходят с полными настройками, прочие типы —
+        #    с общими полями (тип/состояние).
+        for part in _chunked(missing, 1000):
+            try:
+                _parse_all(_direct_post(CAMPAIGNS_V501_URL, {
+                    "method": "get",
+                    "params": {
+                        "SelectionCriteria": {"Ids": [int(x) for x in part], "States": all_states},
+                        "FieldNames": field_names,
+                        "UnifiedCampaignFieldNames": type_fields,
+                        "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": unified_placements,
+                    },
+                }))
+            except RuntimeError as e:
+                print(f"  [lime_direct] v501 campaigns.get добор: {e}")
+
+        # 2) v5 со всеми состояниями, батчем. Упавший батч — поштучно: одна кампания с
+        #    неподходящими type-полями не должна тянуть за собой пачку; у неё самой —
+        #    откат на общие поля, чтобы карточка получила хотя бы тип и состояние.
+        for part in _chunked([c for c in missing if c not in out], 100):
+            try:
+                _parse_all(_direct_post(CAMPAIGNS_URL, _full_params(part)))
+                continue
+            except RuntimeError as e:
+                print(f"  [lime_direct] campaigns.get добор батч: {e}")
+            for cid in part:
+                try:
+                    _parse_all(_direct_post(CAMPAIGNS_URL, _full_params([cid])))
+                    continue
+                except RuntimeError as e:
+                    print(f"  [lime_direct] campaigns.get id={cid} полные поля: {e}")
+                try:
+                    _parse_all(_direct_post(CAMPAIGNS_URL, {
+                        "method": "get",
+                        "params": {
+                            "SelectionCriteria": {"Ids": [int(cid)], "States": all_states},
+                            "FieldNames": field_names,
+                        },
+                    }))
+                    if cid in out:
+                        print(f"  [lime_direct] id={cid} добран только общими полями, "
+                              f"Type={out[cid]['meta'].get('campaignType')}")
+                except RuntimeError as e:
+                    print(f"  [lime_direct] campaigns.get id={cid} общие поля: {e}")
+
+        unreachable = [c for c in missing if c not in out]
+        if unreachable:
+            print(
+                f"  [lime_direct] API не отдаёт {len(unreachable)} кампаний ни в v5, ни в v501 "
+                f"(РМП нового интерфейса / Мастер кампаний): {', '.join(unreachable)} — "
+                "без настроек и без снимка журнала"
+            )
+
     packages, pkg_counters = _fetch_package_strategies_full(sorted(package_ids))
     counter_ids.update(pkg_counters)
     for cid, row in out.items():
@@ -1173,65 +1272,6 @@ def _fetch_campaigns_for_settings(campaign_ids: List[str]) -> Dict[str, Dict[str
                 bs = str(ch.get("biddingStrategyType") or "")
                 if "CRR" in bs.upper() and not ch.get("targetDrr") and full.get("targetDrr"):
                     ch["targetDrr"] = full["targetDrr"]
-
-    missing = [cid for cid in campaign_ids if cid not in out]
-    if missing:
-        print(f"  [lime_direct] WARN: campaigns.get не вернул {len(missing)} кампаний, добираю")
-        all_states = ["ON", "OFF", "SUSPENDED", "ENDED", "CONVERTED", "ARCHIVED"]
-
-        def _full_params(ids: List[int]) -> Dict[str, Any]:
-            return {
-                "method": "get",
-                "params": {
-                    "SelectionCriteria": {"Ids": ids, "States": all_states},
-                    "FieldNames": field_names,
-                    "TextCampaignFieldNames": type_fields,
-                    "UnifiedCampaignFieldNames": type_fields,
-                    "MobileAppCampaignFieldNames": mobile_app_fields,
-                    "TextCampaignSearchStrategyPlacementTypesFieldNames": [
-                        "SearchResults", "ProductGallery", "DynamicPlaces",
-                    ],
-                    "UnifiedCampaignSearchStrategyPlacementTypesFieldNames": [
-                        "SearchResults", "ProductGallery", "DynamicPlaces", "Maps", "SearchOrganizationList",
-                    ],
-                },
-            }
-
-        # 1) батч с полными type-полями (continue, не break — один сбой не роняет остальные пачки)
-        for part in _chunked(missing, 100):
-            try:
-                result_retry = _direct_post(CAMPAIGNS_URL, _full_params([int(x) for x in part]))
-                for c in result_retry.get("Campaigns") or []:
-                    _parse_campaign(c)
-            except RuntimeError as e:
-                print(f"  [lime_direct] campaigns.get retry батч: {e}")
-
-        # 2) кто всё ещё не добран — поштучно: сначала полные поля, иначе только общие.
-        #    Общие поля (Id/Name/Type/State) не падают на отсутствии type-полей и
-        #    гарантируют, что карточка получит тип/статус. Лог Type — диагностика,
-        #    какие *FieldNames добавить, чтобы дотянуть полные настройки.
-        for cid in [c for c in missing if c not in out]:
-            try:
-                r = _direct_post(CAMPAIGNS_URL, _full_params([int(cid)]))
-                for c in r.get("Campaigns") or []:
-                    _parse_campaign(c)
-            except RuntimeError as e:
-                print(f"  [lime_direct] campaigns.get id={cid} полные поля: {e}")
-            if cid in out:
-                continue
-            try:
-                r = _direct_post(CAMPAIGNS_URL, {
-                    "method": "get",
-                    "params": {
-                        "SelectionCriteria": {"Ids": [int(cid)], "States": all_states},
-                        "FieldNames": field_names,
-                    },
-                })
-                for c in r.get("Campaigns") or []:
-                    _parse_campaign(c)
-                    print(f"  [lime_direct] id={cid} добран только общими полями, Type={c.get('Type')}")
-            except RuntimeError as e:
-                print(f"  [lime_direct] campaigns.get id={cid} общие поля: {e}")
 
     _backfill_missing_crr(out, campaign_ids)
 
@@ -1267,9 +1307,12 @@ def _fetch_adgroups_by_campaign(campaign_ids: List[str]) -> Dict[str, List[Dict[
                     "name": ag.get("Name"),
                     "type": ag.get("Type"),
                     "status": ag.get("Status"),
-                    "regionIds": list(ag.get("RegionIds") or []),
-                    "restrictedRegionIds": list(ag.get("RestrictedRegionIds") or []),
-                    "negativeKeywords": list((ag.get("NegativeKeywords") or {}).get("Items") or []),
+                    # RestrictedRegionIds в API — обёртка {"Items": [...]}: list(dict) давал
+                    # ['Items'], и int('Items') ронял синк настроек кабинета KZ каждый день
+                    # (прогон 37734560179). Разворачиваем здесь, у источника, а не у читателей.
+                    "regionIds": _as_list(ag.get("RegionIds")),
+                    "restrictedRegionIds": _as_list(ag.get("RestrictedRegionIds")),
+                    "negativeKeywords": _as_list(ag.get("NegativeKeywords")),
                     "feedId": feed_id,
                     "offerRetargeting": (
                         (ag.get("UnifiedAdGroup") or {}).get("OfferRetargeting")
@@ -2045,14 +2088,32 @@ def _convert_money(rows: List[Dict[str, Any]], src_currency: str, vat_mult: floa
 
 
 def _snapshot_settings(campaign_ids: List[str]) -> None:
-    """Снимок дня в strategy_snapshots (журнал изменений Panda-BI) — только кампании
-    этого прогона и только рублёвого кабинета: настройки lime-kz1 в тенге (в отличие от
-    статистики, _convert_money их не трогает), и журнал показал бы тенге как рубли."""
+    """Снимок дня в strategy_snapshots (журнал изменений Panda-BI) — кампании этого
+    прогона. Деньги — в рубли по той же конвенции, что статистика (_convert_money):
+    курс ЦБ на сегодня (МСК) × LIME_DIRECT_VAT_MULT. Настройки lime-kz1 приходят в
+    тенге без НДС, а журнал показывает рубли рядом с рублёвым расходом дашборда."""
     cur = os.environ.get("LIME_DIRECT_SRC_CURRENCY", "").strip().upper()
+    factor = float(os.environ.get("LIME_DIRECT_VAT_MULT", "1") or "1")
     if cur not in ("", "RUB", "RUR"):
-        print(f"[lime_direct] снимок настроек пропущен: кабинет в {cur}")
-        return
-    write_snapshot(_pg_url(), "lime", campaign_ids)
+        factor *= fx_to_rub(cur, msk_today().isoformat())
+    write_snapshot(_pg_url(), "lime", campaign_ids, money_factor=factor)
+
+
+def _list_cabinet_campaigns() -> Dict[str, str]:
+    """{campaign_id: name} всех неархивных кампаний кабинета.
+
+    Журналу нужны все кампании, а не только с показами за окно отчёта: иначе кампания
+    на паузе выпадает из снимков, и её остановка и запуск не видны — после паузы она
+    всплывает «новой». Состояния — как у EDU (_list_campaigns_for_login). Через v501:
+    v5 часть ЕПК не видит."""
+    items = _paginate_items(CAMPAIGNS_V501_URL, "Campaigns", {
+        "method": "get",
+        "params": {
+            "SelectionCriteria": {"States": ["ON", "OFF", "SUSPENDED", "ENDED"]},
+            "FieldNames": ["Id", "Name"],
+        },
+    })
+    return {str(c["Id"]): str(c.get("Name") or "") for c in items if c.get("Id") is not None}
 
 
 def sync_lime_direct(days_back: int = 7) -> int:
@@ -2081,8 +2142,17 @@ def sync_lime_direct(days_back: int = 7) -> int:
     campaigns = _fetch_campaigns(campaign_ids)
     print(f"[lime_direct] стратегии/бюджеты по {len(campaigns)} кампаниям")
 
+    # Настройки и снимок журнала — по всем кампаниям кабинета, статистика — по отчёту.
     try:
-        _sync_campaign_settings(campaign_ids, campaign_names)
+        cabinet = _list_cabinet_campaigns()
+    except Exception as e:
+        print(f"::warning::[lime_direct] список кампаний кабинета не получен, настройки только "
+              f"по отчёту: {e}")
+        cabinet = {}
+    settings_ids = sorted(set(campaign_ids) | set(cabinet))
+    settings_names = {**cabinet, **campaign_names}
+    try:
+        _sync_campaign_settings(settings_ids, settings_names)
     except Exception as e:
         # С traceback, а не только текстом: «invalid literal for int(): 'Items'»
         # повторялся неделями, и по одному сообщению нельзя было понять, в какой
@@ -2092,7 +2162,7 @@ def sync_lime_direct(days_back: int = 7) -> int:
         traceback.print_exc()
     else:
         try:
-            _snapshot_settings(campaign_ids)
+            _snapshot_settings(settings_ids)
         except Exception as e:
             # Не роняет синк статистики: журнал изменений потеряет день, дашборд — нет.
             print(f"::warning::[lime_direct] снимок настроек не записан: {e}")
