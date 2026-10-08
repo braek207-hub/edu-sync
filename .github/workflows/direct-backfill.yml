@@ -63,3 +63,9 @@ jobs:
           if n <= 0:
               raise SystemExit('Direct sync returned 0 rows')
           "
+
+      - name: Revalidate dashboard cache
+        if: success()
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: python scripts/revalidate_panda.py edunetwork

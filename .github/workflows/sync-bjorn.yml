@@ -89,3 +89,9 @@ jobs:
 
       - name: Директ — объявления и картинки
         run: python -m sync.bjorn.sync_ads
+
+      - name: Revalidate dashboard cache
+        if: success()
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: python scripts/revalidate_panda.py bjorn

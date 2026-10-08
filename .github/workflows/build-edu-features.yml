@@ -17,3 +17,9 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DATABASE_POOLER_URL: ${{ secrets.DATABASE_POOLER_URL }}
         run: python -m sync.ml_features_build
+
+      - name: Revalidate dashboard cache
+        if: success()
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: python scripts/revalidate_panda.py edunetwork

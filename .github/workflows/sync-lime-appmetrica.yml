@@ -38,3 +38,9 @@ jobs:
           APPMETRICA_POLL_MAX: "150"
           APP_COHORT_MONTHS: ${{ github.event.inputs.cohort_months }}
           APP_MAX_LIFE: ${{ github.event.inputs.max_life }}
+
+      - name: Revalidate dashboard cache
+        if: success()
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: python scripts/revalidate_panda.py lime

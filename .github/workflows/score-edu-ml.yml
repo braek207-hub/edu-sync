@@ -18,3 +18,9 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m sync.ml_score
+
+      - name: Revalidate dashboard cache
+        if: success()
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: python scripts/revalidate_panda.py edunetwork

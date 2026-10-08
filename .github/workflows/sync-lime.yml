@@ -50,4 +50,6 @@ jobs:
 
       - name: Revalidate dashboard cache
         if: success()
-        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: python scripts/revalidate_panda.py lime

@@ -35,3 +35,5 @@ jobs:
           YM_TOKEN: ${{ secrets.YM_TOKEN }}
           EDU_VISITS_DAYS: ${{ github.event.inputs.days }}
         run: python -m sync.edu_visits
+      # Сброса кэша Panda-BI здесь нет намеренно: edu_visit_behavior читают /api/edunetwork/lead-details
+      # (force-dynamic) и пробы свежести (свой тег source-probe:*), в кэш edunetwork-data она не входит.

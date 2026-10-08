@@ -52,3 +52,5 @@ jobs:
           GSC_FROM: ${{ github.event.inputs.gsc_from }}
           GCC_GSC_FROM: ${{ github.event.inputs.gcc_gsc_from }}
           ORGANIC_FROM: ${{ github.event.inputs.organic_from }}
+      # Сброса кэша Panda-BI здесь нет намеренно: спрос/SEO/органику (v_lime_brand_traffic)
+      # читает только /api/lime/brand-traffic с force-dynamic, тегом lime-data они не кэшируются.

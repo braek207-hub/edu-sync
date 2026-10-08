@@ -32,6 +32,6 @@ jobs:
           YANDEX_SEARCHAPI_KEY: ${{ secrets.YANDEX_SEARCHAPI_KEY }}
           WORDSTAT_FROM: ${{ github.event.inputs.wordstat_from }}
           ECOM_DEMAND_SLUGS: ${{ github.event.inputs.slugs }}
-      - name: Revalidate dashboard cache
-        if: success()
-        run: curl -sf -X POST https://panda-bi.vercel.app/api/revalidate
+      # Сброса кэша Panda-BI здесь нет намеренно: ecom_wordstat_demand читают роуты
+      # /api/<slug>/demand-traffic с force-dynamic, тегом <slug>-data спрос не кэшируется.
+      # Прежний сброс обнулял все дашборды и ничего не освежал.

@@ -43,3 +43,9 @@ jobs:
           POLINAREPIK_SYNC_DAYS: ${{ github.event.inputs.sync_days || '60' }}
           PYTHONIOENCODING: "utf-8"
         run: python -m sync.polinarepik
+
+      - name: Revalidate dashboard cache
+        if: success()
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: python scripts/revalidate_panda.py polinarepik
