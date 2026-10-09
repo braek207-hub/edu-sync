@@ -57,9 +57,9 @@ def _database_url() -> str:
     return url
 
 
-def ensure_schema() -> None:
-    """Миграции схемы под GAS (метрики Директа, сегменты CRM)."""
-    statements = [
+# Миграции схемы под GAS (метрики Директа, сегменты CRM, детализация лидов, визиты).
+# Все идемпотентны и в проде давно применены — нужны свежей базе.
+_SCHEMA_DDL: List[str] = [
         """
         ALTER TABLE direct_stats
           ADD COLUMN IF NOT EXISTS w_avg_eff_bid DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -154,97 +154,147 @@ def ensure_schema() -> None:
           PRIMARY KEY (counter_id, visit_date, client_id)
         )
         """,
-    ]
+        """
+        DO $$ BEGIN
+          ALTER TABLE crm_leads
+            DROP CONSTRAINT IF EXISTS crm_leads_date_campaign_id_key;
+        EXCEPTION WHEN undefined_object THEN NULL;
+        END $$;
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS crm_leads_segment_key
+        ON crm_leads (date, campaign_id, city_ip_segment, b24_grad_year, b24_edu_level, audience)
+        """,
+        """
+        DO $$ BEGIN
+          ALTER TABLE crm_payments
+            DROP CONSTRAINT IF EXISTS crm_payments_date_campaign_id_key;
+        EXCEPTION WHEN undefined_object THEN NULL;
+        END $$;
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS crm_payments_segment_key
+        ON crm_payments (date, campaign_id, city_ip_segment, b24_grad_year, b24_edu_level)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_crm_lead_details_campaign_created
+        ON crm_lead_details (campaign_id, created_date)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_crm_lead_details_created_project
+        ON crm_lead_details (created_date, project)
+        """,
+        # Разбор продукта на измерения (для существующей таблицы в проде).
+        """
+        ALTER TABLE crm_lead_details
+          ADD COLUMN IF NOT EXISTS prod_level     TEXT,
+          ADD COLUMN IF NOT EXISTS prod_stage     TEXT,
+          ADD COLUMN IF NOT EXISTS prod_form      TEXT,
+          ADD COLUMN IF NOT EXISTS prod_ugsn      TEXT,
+          ADD COLUMN IF NOT EXISTS prod_direction TEXT,
+          ADD COLUMN IF NOT EXISTS prod_specialty TEXT,
+          ADD COLUMN IF NOT EXISTS prod_profile   TEXT,
+          ADD COLUMN IF NOT EXISTS prod_faculty   TEXT
+        """,
+        # Ф2: точное время заявки/дозвона (для существующей таблицы в проде).
+        """
+        ALTER TABLE crm_lead_details
+          ADD COLUMN IF NOT EXISTS created_ts   timestamptz,
+          ADD COLUMN IF NOT EXISTS connected_ts timestamptz
+        """,
+        # RLS on: доступ только серверный (см. аудит panda-bi-audit-cleanup).
+        "ALTER TABLE crm_lead_details ENABLE ROW LEVEL SECURITY",
+        """
+        CREATE INDEX IF NOT EXISTS idx_edu_visit_behavior_client
+        ON edu_visit_behavior (client_id)
+        """,
+        # Признаки визита для скоринга (доминирующее значение на client_id×дата).
+        """
+        ALTER TABLE edu_visit_behavior
+          ADD COLUMN IF NOT EXISTS device_category TEXT,
+          ADD COLUMN IF NOT EXISTS os              TEXT,
+          ADD COLUMN IF NOT EXISTS browser         TEXT,
+          ADD COLUMN IF NOT EXISTS region_city     TEXT,
+          ADD COLUMN IF NOT EXISTS traffic_source  TEXT
+        """,
+        "ALTER TABLE edu_visit_behavior ENABLE ROW LEVEL SECURITY",
+]
+
+_IDENT = r"([A-Za-z_][A-Za-z0-9_]*)"
+_DDL_CHECKS = (
+    (re.compile(rf"^CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+{_IDENT}", re.I), "table"),
+    (re.compile(rf"^CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+{_IDENT}", re.I), "index"),
+    (re.compile(rf"^ALTER\s+TABLE\s+{_IDENT}\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY$", re.I), "rls"),
+    (re.compile(rf"^ALTER\s+TABLE\s+{_IDENT}\s+DROP\s+CONSTRAINT\s+IF\s+EXISTS\s+{_IDENT}", re.I), "no_constraint"),
+)
+_ADD_COLUMN_RE = re.compile(rf"ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+{_IDENT}", re.I)
+_ALTER_TABLE_RE = re.compile(rf"^ALTER\s+TABLE\s+{_IDENT}\s+ADD\s+COLUMN", re.I)
+_DO_BLOCK_RE = re.compile(r"^DO\s+\$\$\s*BEGIN\s+([\s\S]*?);\s*EXCEPTION", re.I)
+
+
+def _ddl_done(cur, sql: str) -> bool:
+    """Уже ли применён этот оператор — по каталогу, без блокировок таблицы.
+
+    Нераспознанный оператор считается неприменённым: лучше лишний раз прогнать
+    идемпотентный DDL, чем молча пропустить новую миграцию.
+    """
+    stmt = " ".join(sql.split())
+    do_block = _DO_BLOCK_RE.match(stmt)
+    if do_block:
+        stmt = do_block.group(1)
+    alter = _ALTER_TABLE_RE.match(stmt)
+    if alter:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s",
+            (alter.group(1),),
+        )
+        have = {r[0] for r in cur.fetchall()}
+        return all(c in have for c in _ADD_COLUMN_RE.findall(stmt))
+    for pattern, kind in _DDL_CHECKS:
+        m = pattern.match(stmt)
+        if not m:
+            continue
+        if kind in ("table", "index"):
+            cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"public.{m.group(1)}",))
+        elif kind == "rls":
+            cur.execute(
+                "SELECT coalesce(bool_or(relrowsecurity), false) FROM pg_class "
+                "WHERE oid = to_regclass(%s)",
+                (f"public.{m.group(1)}",),
+            )
+        else:
+            cur.execute(
+                "SELECT NOT EXISTS (SELECT 1 FROM pg_constraint "
+                "WHERE conrelid = to_regclass(%s) AND conname = %s)",
+                (f"public.{m.group(1)}", m.group(2)),
+            )
+        return bool(cur.fetchone()[0])
+    return False
+
+
+_schema_ready = False
+
+
+def ensure_schema() -> None:
+    """Догнать схему до _SCHEMA_DDL — только если в каталоге чего-то не хватает.
+
+    Раньше DDL гонялся на каждой записи, а ALTER TABLE (даже ADD COLUMN IF NOT EXISTS
+    на уже существующую колонку) берёт AccessExclusiveLock по очереди на шесть горячих
+    таблиц. Читатель дашборда, державший одну из них и шедший за другой, замыкал цикл:
+    09.10 edu_visits упал с «deadlock detected», прогон sync.yml покраснел. Теперь
+    проверка идёт по каталогу без блокировок, и один раз на процесс.
+    """
+    global _schema_ready
+    if _schema_ready:
+        return
     with get_connection() as conn:
         with conn.cursor() as cur:
-            for sql in statements:
-                cur.execute(sql)
-            cur.execute(
-                """
-                DO $$ BEGIN
-                  ALTER TABLE crm_leads
-                    DROP CONSTRAINT IF EXISTS crm_leads_date_campaign_id_key;
-                EXCEPTION WHEN undefined_object THEN NULL;
-                END $$;
-                """
-            )
-            cur.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS crm_leads_segment_key
-                ON crm_leads (date, campaign_id, city_ip_segment, b24_grad_year, b24_edu_level, audience)
-                """
-            )
-            cur.execute(
-                """
-                DO $$ BEGIN
-                  ALTER TABLE crm_payments
-                    DROP CONSTRAINT IF EXISTS crm_payments_date_campaign_id_key;
-                EXCEPTION WHEN undefined_object THEN NULL;
-                END $$;
-                """
-            )
-            cur.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS crm_payments_segment_key
-                ON crm_payments (date, campaign_id, city_ip_segment, b24_grad_year, b24_edu_level)
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_crm_lead_details_campaign_created
-                ON crm_lead_details (campaign_id, created_date)
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_crm_lead_details_created_project
-                ON crm_lead_details (created_date, project)
-                """
-            )
-            # Разбор продукта на измерения (для существующей таблицы в проде).
-            cur.execute(
-                """
-                ALTER TABLE crm_lead_details
-                  ADD COLUMN IF NOT EXISTS prod_level     TEXT,
-                  ADD COLUMN IF NOT EXISTS prod_stage     TEXT,
-                  ADD COLUMN IF NOT EXISTS prod_form      TEXT,
-                  ADD COLUMN IF NOT EXISTS prod_ugsn      TEXT,
-                  ADD COLUMN IF NOT EXISTS prod_direction TEXT,
-                  ADD COLUMN IF NOT EXISTS prod_specialty TEXT,
-                  ADD COLUMN IF NOT EXISTS prod_profile   TEXT,
-                  ADD COLUMN IF NOT EXISTS prod_faculty   TEXT
-                """
-            )
-            # Ф2: точное время заявки/дозвона (для существующей таблицы в проде).
-            cur.execute(
-                """
-                ALTER TABLE crm_lead_details
-                  ADD COLUMN IF NOT EXISTS created_ts   timestamptz,
-                  ADD COLUMN IF NOT EXISTS connected_ts timestamptz
-                """
-            )
-            # RLS on: доступ только серверный (см. аудит panda-bi-audit-cleanup).
-            cur.execute("ALTER TABLE crm_lead_details ENABLE ROW LEVEL SECURITY")
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_edu_visit_behavior_client
-                ON edu_visit_behavior (client_id)
-                """
-            )
-            # Признаки визита для скоринга (доминирующее значение на client_id×дата).
-            cur.execute(
-                """
-                ALTER TABLE edu_visit_behavior
-                  ADD COLUMN IF NOT EXISTS device_category TEXT,
-                  ADD COLUMN IF NOT EXISTS os              TEXT,
-                  ADD COLUMN IF NOT EXISTS browser         TEXT,
-                  ADD COLUMN IF NOT EXISTS region_city     TEXT,
-                  ADD COLUMN IF NOT EXISTS traffic_source  TEXT
-                """
-            )
-            cur.execute("ALTER TABLE edu_visit_behavior ENABLE ROW LEVEL SECURITY")
+            if not all(_ddl_done(cur, sql) for sql in _SCHEMA_DDL):
+                for sql in _SCHEMA_DDL:
+                    cur.execute(sql)
         conn.commit()
-
+    _schema_ready = True
 
 def _new_connection():
     parsed = urlparse(_database_url())
