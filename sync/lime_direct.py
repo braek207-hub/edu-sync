@@ -447,7 +447,7 @@ def _fetch_report_chunk(
         r.encoding = "utf-8"
         if r.status_code == 200:
             break
-        # 204 — недокументированный пустой ответ (BJORN, 11.10.2026), не «данных нет»: повтор.
+        # 204 без RequestId — балансер Яндекса при лежащем API (11.10.2026), не «данных нет»: повтор.
         if r.status_code in (201, 202, 204):
             retry_in = int(r.headers.get("retryIn", "30"))
             print(f"  [lime_direct] отчёт формируется, ждём {retry_in}с...")

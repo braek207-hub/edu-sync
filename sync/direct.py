@@ -179,8 +179,8 @@ def _fetch_report(login: str, date_from: str, date_to: str, goals: List[str]) ->
 
         if resp.status_code == 200:
             break
-        # 204 с пустым телом нет в списке кодов Reports API, но BJORN поймал его 11.10.2026;
-        # «данных нет» он не значит — повторяем, как офлайн-ожидание (retryIn у него нет).
+        # 204 с пустым телом и без RequestId — ответ балансера Яндекса при лежащем API (сбой
+        # 11.10.2026), не «данных нет»: повторяем, как офлайн-ожидание (retryIn у него нет).
         if resp.status_code in (201, 202, 204):
             # Уважаем retryIn Директа (обычно несколько секунд), не форсируем 30с минимум.
             retry_in = int(resp.headers.get("retryIn", 5))
