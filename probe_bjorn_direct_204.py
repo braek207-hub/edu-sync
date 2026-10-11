@@ -72,7 +72,12 @@ def main() -> None:
                      "Accept-Language": "ru", "Content-Type": "application/json; charset=utf-8"},
             timeout=120,
         )
-        data = resp.json()
+        print(f"[campaigns] HTTP {resp.status_code} RequestId={resp.headers.get('RequestId')} "
+              f"Content-Type={resp.headers.get('Content-Type')} тело[:300]={resp.text[:300]!r}")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"error": "не JSON"}
         if "error" in data:
             print(f"[campaigns] ошибка: {data['error']}")
         else:
