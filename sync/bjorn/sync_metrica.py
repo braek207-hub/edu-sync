@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import time
 from collections import defaultdict
 from typing import Any
-
-import requests
 
 from .common import (
     SupabaseRest,
@@ -16,6 +13,7 @@ from .common import (
     env_optional,
     env_required,
     expand_metrica_dimension,
+    metrica_stat_rows,
     money,
     normalize_campaign_id,
     normalize_source,
@@ -25,23 +23,7 @@ from .common import (
 )
 
 
-API_URL = "https://api-metrika.yandex.net/stat/v1/data"
 ATTRIBUTIONS_DEFAULT = "automatic,first,lastsign"
-
-
-def metrica_get(params: dict[str, Any], token: str) -> dict[str, Any]:
-    headers = {"Authorization": f"OAuth {token}"}
-    backoff = 2
-    for attempt in range(6):
-        response = requests.get(API_URL, params=params, headers=headers, timeout=120)
-        if response.status_code == 200:
-            return response.json()
-        if response.status_code in {429, 500, 502, 503, 504} and attempt < 5:
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-            continue
-        raise RuntimeError(f"Metrica API error {response.status_code}: {response.text[:500]}")
-    raise RuntimeError("Metrica API retry loop exhausted")
 
 
 def goal_metric(goal_id: str) -> str:
@@ -111,65 +93,51 @@ def fetch_rows_for_attribution(date_from: str, date_to: str, attribution: str) -
         }
     )
 
-    limit = 100000
-    offset = 1
-    while True:
-        params = {
-            "ids": counter_id,
-            "metrics": metrics,
-            "dimensions": dimensions,
-            "date1": date_from,
-            "date2": date_to,
-            "accuracy": "full",
-            "proposed_accuracy": "false",
-            "attribution": attribution,
-            "lang": lang,
-            "limit": limit,
-            "offset": offset,
-        }
-        payload = metrica_get(params, token)
-        data = payload.get("data", [])
-        if not data:
-            break
+    params = {
+        "ids": counter_id,
+        "metrics": metrics,
+        "dimensions": dimensions,
+        "date1": date_from,
+        "date2": date_to,
+        "accuracy": "full",
+        "proposed_accuracy": "false",
+        "attribution": attribution,
+        "lang": lang,
+    }
+    for record in metrica_stat_rows(params, token):
+        visits_row = 0
+        dims = [clean_text(d.get("name", "")) for d in record.get("dimensions", [])]
+        metrics_values = record.get("metrics", [])
+        row_date = dims[0] if len(dims) > 0 else ""
+        if not row_date:
+            continue
+        source        = normalize_source(dims[1] if len(dims) > 1 else "")
+        source_eng    = dims[2] if len(dims) > 2 else ""
+        utm_src_raw   = dims[3] if len(dims) > 3 else ""
+        campaign_id   = normalize_campaign_id(dims[4] if len(dims) > 4 else "")
+        source_detail = derive_source_detail(source_eng, utm_src_raw, source)
+        item = aggregate[(row_date, source, source_detail, campaign_id)]
 
-        for record in data:
-            visits_row = 0
-            dims = [clean_text(d.get("name", "")) for d in record.get("dimensions", [])]
-            metrics_values = record.get("metrics", [])
-            row_date = dims[0] if len(dims) > 0 else ""
-            if not row_date:
-                continue
-            source        = normalize_source(dims[1] if len(dims) > 1 else "")
-            source_eng    = dims[2] if len(dims) > 2 else ""
-            utm_src_raw   = dims[3] if len(dims) > 3 else ""
-            campaign_id   = normalize_campaign_id(dims[4] if len(dims) > 4 else "")
-            source_detail = derive_source_detail(source_eng, utm_src_raw, source)
-            item = aggregate[(row_date, source, source_detail, campaign_id)]
-
-            visits_row = 0
-            for idx, (name, _) in enumerate(metric_defs):
-                value = metrics_values[idx] if idx < len(metrics_values) else 0
-                if name == "visits":
-                    visits_row = parse_int(value)
-                    item["visits"] += visits_row
-                elif name == "revenue":
-                    item[name] += money(value)
-                elif name == "bounce_rate":
-                    bp = parse_optional_float(value)
-                    if visits_row > 0 and bp is not None:
-                        item["bounce_weight"] += bp * visits_row
-                        item["bounce_visits"] += visits_row
-                elif name == "page_depth":
-                    dp = parse_optional_float(value)
-                    if visits_row > 0 and dp is not None:
-                        item["depth_weight"] += dp * visits_row
-                        item["depth_visits"] += visits_row
-                else:
-                    item[name] += parse_int(value)
-
-        if len(data) < limit:
-            break
-        offset += limit
+        visits_row = 0
+        for idx, (name, _) in enumerate(metric_defs):
+            value = metrics_values[idx] if idx < len(metrics_values) else 0
+            if name == "visits":
+                visits_row = parse_int(value)
+                item["visits"] += visits_row
+            elif name == "revenue":
+                item[name] += money(value)
+            elif name == "bounce_rate":
+                bp = parse_optional_float(value)
+                if visits_row > 0 and bp is not None:
+                    item["bounce_weight"] += bp * visits_row
+                    item["bounce_visits"] += visits_row
+            elif name == "page_depth":
+                dp = parse_optional_float(value)
+                if visits_row > 0 and dp is not None:
+                    item["depth_weight"] += dp * visits_row
+                    item["depth_visits"] += visits_row
+            else:
+                item[name] += parse_int(value)
 
     _max_daily_rev = float(env_optional("METRICA_MAX_DAILY_REVENUE", "10000000"))
     for _key, _item in aggregate.items():

@@ -40,6 +40,7 @@ import requests
 from .common import (
     SupabaseRest,
     add_date_range_args,
+    env_optional,
     env_required,
     normalize_campaign_id,
     resolve_date_range,
@@ -108,9 +109,12 @@ def logs_create(counter: str, headers: dict[str, str], source: str, fields: str,
     return resp.json()["log_request"]["request_id"]
 
 
-def logs_wait(counter: str, headers: dict[str, str], request_id: int) -> dict[str, Any]:
-    # Замер пробы 10: день готовится за 33 секунды; окно в четыре недели — дольше, отсюда потолок.
-    for _ in range(80):
+def logs_wait(counter: str, headers: dict[str, str], request_id: int, deadline: float) -> dict[str, Any]:
+    # Замер пробы 10: день готовится за 33 секунды, но это без очереди. В прогонах 7-дневное
+    # окно (три запроса) занимало от 3,5 до 11 минут, а 04.10.2026 один запрос не успел
+    # за прежний потолок в 20 минут. Поэтому потолок общий на шаг, а не на запрос.
+    status = ""
+    while True:
         resp = requests.get(
             BASE.format(counter=counter) + f"/logrequest/{request_id}",
             headers=headers,
@@ -119,12 +123,19 @@ def logs_wait(counter: str, headers: dict[str, str], request_id: int) -> dict[st
         if resp.status_code != 200:
             raise RuntimeError(f"Logs API status: {resp.status_code} {resp.text[:300]}")
         info = resp.json()["log_request"]
-        if info["status"] == "processed":
+        if info["status"] != status:
+            status = info["status"]
+            print(f"[bjorn/card_views] запрос {request_id}: {status}")
+        if status == "processed":
             return info
-        if info["status"] in {"processing_failed", "canceled"}:
-            raise RuntimeError(f"Logs API request {request_id} закончился статусом {info['status']}")
+        # awaiting_retry — Метрика сама перезапускает обработку, ждём дальше.
+        if status in {"processing_failed", "canceled"}:
+            raise RuntimeError(f"Logs API request {request_id} закончился статусом {status}")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Logs API request {request_id} не подготовился за отведённое время, статус {status}"
+            )
         time.sleep(15)
-    raise RuntimeError(f"Logs API request {request_id} не подготовился за 20 минут")
 
 
 def logs_text(counter: str, headers: dict[str, str], request_id: int, info: dict[str, Any]) -> str:
@@ -149,10 +160,12 @@ def logs_clean(counter: str, headers: dict[str, str], request_id: int) -> None:
     )
 
 
-def fetch(counter: str, headers: dict[str, str], source: str, fields: str, d1: str, d2: str) -> str:
+def fetch(
+    counter: str, headers: dict[str, str], source: str, fields: str, d1: str, d2: str, deadline: float
+) -> str:
     request_id = logs_create(counter, headers, source, fields, d1, d2)
     try:
-        return logs_text(counter, headers, request_id, logs_wait(counter, headers, request_id))
+        return logs_text(counter, headers, request_id, logs_wait(counter, headers, request_id, deadline))
     finally:
         logs_clean(counter, headers, request_id)
 
@@ -280,13 +293,16 @@ def main() -> None:
     counter = env_required("METRICA_COUNTER_ID")
     headers = {"Authorization": f"OAuth {env_required('METRICA_TOKEN')}"}
 
-    hits = fetch(counter, headers, "hits", HIT_FIELDS, date_from, date_to)
+    # 35 минут на три запроса: остальные шаги прогона занимают около 10 минут, задача
+    # ограничена 60 (timeout-minutes в sync-bjorn.yml).
+    deadline = time.monotonic() + 60 * float(env_optional("CARD_VIEWS_WAIT_MINUTES", "35"))
+    hits = fetch(counter, headers, "hits", HIT_FIELDS, date_from, date_to, deadline)
     views = parse_card_views(hits)
     print(f"[bjorn/card_views] просмотров карточек: {len(views)}")
 
     visits_by_attribution = {
         attribution: parse_visits(
-            fetch(counter, headers, "visits", visit_fields(prefix), date_from, date_to)
+            fetch(counter, headers, "visits", visit_fields(prefix), date_from, date_to, deadline)
         )
         for attribution, prefix in ATTRIBUTION_PREFIX.items()
     }

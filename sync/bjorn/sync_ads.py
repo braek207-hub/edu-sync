@@ -26,7 +26,6 @@ import csv
 import io
 import json
 import time
-from collections import defaultdict
 from typing import Any
 
 import requests
@@ -37,6 +36,7 @@ from .common import (
     clean_text,
     env_optional,
     env_required,
+    metrica_stat_rows,
     money,
     parse_int,
     parse_optional_float,
@@ -45,7 +45,6 @@ from .common import (
 from .sync_direct import fetch_report, load_client_logins
 
 DIRECT_API = "https://api.direct.yandex.com/json/v5/{service}"
-STAT_URL = "https://api-metrika.yandex.net/stat/v1/data"
 
 DAILY_TABLE = "bjorn_ad_daily"
 DAILY_ON_CONFLICT = "date,ad_id"
@@ -165,48 +164,32 @@ def fetch_metrica(date_from: str, date_to: str) -> dict[str, dict[str, Any]]:
     token = env_required("METRICA_TOKEN")
     counter = env_required("METRICA_COUNTER_ID")
     out: dict[str, dict[str, Any]] = {}
-    limit = 100000
-    offset = 1
-    while True:
-        resp = requests.get(
-            STAT_URL,
-            params={
-                "ids": counter,
-                "metrics": ",".join(METRICS),
-                "dimensions": "ym:s:date,ym:s:lastsignDirectBanner",
-                "date1": date_from,
-                "date2": date_to,
-                "accuracy": "full",
-                "attribution": "lastsign",
-                "limit": limit,
-                "offset": offset,
-            },
-            headers={"Authorization": f"OAuth {token}"},
-            timeout=180,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Metrica stat: {resp.status_code} {resp.text[:300]}")
-        data = resp.json().get("data", [])
-        for item in data:
-            dims = [d.get("name") for d in item.get("dimensions", [])]
-            values = item.get("metrics", [])
-            if len(dims) < 2 or len(values) < len(METRICS):
-                continue
-            ad_id = strip_banner(dims[1])
-            if not ad_id:
-                continue
-            out[f"{clean_text(dims[0])}|{ad_id}"] = {
-                "visits": parse_int(values[0]),
-                "users": parse_int(values[1]),
-                "bounce_rate": parse_optional_float(values[2]),
-                "page_depth": parse_optional_float(values[3]),
-                "baskets_uniq": parse_int(values[4]),
-                "purchased": parse_int(values[5]),
-                "revenue": round(money(values[6]), 2),
-            }
-        if len(data) < limit:
-            break
-        offset += limit
+    params = {
+        "ids": counter,
+        "metrics": ",".join(METRICS),
+        "dimensions": "ym:s:date,ym:s:lastsignDirectBanner",
+        "date1": date_from,
+        "date2": date_to,
+        "accuracy": "full",
+        "attribution": "lastsign",
+    }
+    for item in metrica_stat_rows(params, token, timeout=180):
+        dims = [d.get("name") for d in item.get("dimensions", [])]
+        values = item.get("metrics", [])
+        if len(dims) < 2 or len(values) < len(METRICS):
+            continue
+        ad_id = strip_banner(dims[1])
+        if not ad_id:
+            continue
+        out[f"{clean_text(dims[0])}|{ad_id}"] = {
+            "visits": parse_int(values[0]),
+            "users": parse_int(values[1]),
+            "bounce_rate": parse_optional_float(values[2]),
+            "page_depth": parse_optional_float(values[3]),
+            "baskets_uniq": parse_int(values[4]),
+            "purchased": parse_int(values[5]),
+            "revenue": round(money(values[6]), 2),
+        }
     return out
 
 

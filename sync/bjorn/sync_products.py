@@ -12,11 +12,8 @@
 from __future__ import annotations
 
 import argparse
-import time
 from collections import defaultdict
 from typing import Any
-
-import requests
 
 from .common import (
     SupabaseRest,
@@ -24,6 +21,7 @@ from .common import (
     clean_text,
     env_optional,
     env_required,
+    metrica_stat_rows,
     money,
     normalize_campaign_id,
     normalize_source,
@@ -31,7 +29,6 @@ from .common import (
     resolve_date_range,
 )
 
-API_URL = "https://api-metrika.yandex.net/stat/v1/data"
 ATTRIBUTIONS_DEFAULT = "automatic,first,lastsign"
 TABLE = "bjorn_product_daily"
 ON_CONFLICT = "date,attribution,source,campaign_id,ad_id,product_id,product_name"
@@ -59,21 +56,6 @@ METRIC_COLUMNS = [
     "purchased",
     "purchased_uniq",
 ]
-
-
-def metrica_get(params: dict[str, Any], token: str) -> dict[str, Any]:
-    headers = {"Authorization": f"OAuth {token}"}
-    backoff = 2
-    for attempt in range(6):
-        response = requests.get(API_URL, params=params, headers=headers, timeout=180)
-        if response.status_code == 200:
-            return response.json()
-        if response.status_code in {429, 500, 502, 503, 504} and attempt < 5:
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-            continue
-        raise RuntimeError(f"Metrica API error {response.status_code}: {response.text[:500]}")
-    raise RuntimeError("Metrica API retry loop exhausted")
 
 
 def dim_text(value: Any) -> str:
@@ -113,52 +95,39 @@ def fetch_attribution(date_from: str, date_to: str, attribution: str) -> list[di
         lambda: {name: 0.0 for name in [*METRIC_COLUMNS, "revenue"]}
     )
 
-    limit = 100000
-    offset = 1
-    while True:
-        body = metrica_get(
-            {
-                "ids": counter_id,
-                "metrics": ",".join(METRICS),
-                "dimensions": dimensions,
-                "date1": date_from,
-                "date2": date_to,
-                "attribution": attribution,
-                "accuracy": "full",
-                "proposed_accuracy": "false",
-                "lang": env_optional("METRICA_LANG", "ru"),
-                "limit": limit,
-                "offset": offset,
-            },
-            token,
+    params = {
+        "ids": counter_id,
+        "metrics": ",".join(METRICS),
+        "dimensions": dimensions,
+        "date1": date_from,
+        "date2": date_to,
+        "attribution": attribution,
+        "accuracy": "full",
+        "proposed_accuracy": "false",
+        "lang": env_optional("METRICA_LANG", "ru"),
+    }
+    for item in metrica_stat_rows(params, token, timeout=180):
+        dims = [d.get("name") for d in item.get("dimensions", [])]
+        values = item.get("metrics", [])
+        if len(dims) < 6 or len(values) < len(METRICS):
+            continue
+        product_name = dim_text(dims[5])
+        if not product_name:
+            # Строка без товара — это обычный трафик, он уже лежит в marketing_daily_fact.
+            continue
+        key = (
+            clean_text(dims[0]),
+            attribution,
+            normalize_source(dim_text(dims[1])),
+            normalize_campaign_id(dim_text(dims[2])),
+            strip_banner(dims[3]),
+            dim_text(dims[4]),
+            product_name,
         )
-        data = body.get("data", [])
-        for item in data:
-            dims = [d.get("name") for d in item.get("dimensions", [])]
-            values = item.get("metrics", [])
-            if len(dims) < 6 or len(values) < len(METRICS):
-                continue
-            product_name = dim_text(dims[5])
-            if not product_name:
-                # Строка без товара — это обычный трафик, он уже лежит в marketing_daily_fact.
-                continue
-            key = (
-                clean_text(dims[0]),
-                attribution,
-                normalize_source(dim_text(dims[1])),
-                normalize_campaign_id(dim_text(dims[2])),
-                strip_banner(dims[3]),
-                dim_text(dims[4]),
-                product_name,
-            )
-            bucket = aggregate[key]
-            for index, column in enumerate(METRIC_COLUMNS):
-                bucket[column] += parse_int(values[index])
-            bucket["revenue"] += money(values[8])
-
-        if len(data) < limit:
-            break
-        offset += limit
+        bucket = aggregate[key]
+        for index, column in enumerate(METRIC_COLUMNS):
+            bucket[column] += parse_int(values[index])
+        bucket["revenue"] += money(values[8])
 
     rows: list[dict[str, Any]] = []
     for key, values in sorted(aggregate.items()):
@@ -190,14 +159,19 @@ def main() -> None:
         if item.strip()
     ]
 
+    # Сначала все модели, потом запись: ошибка Метрики на второй модели иначе оставляла окно
+    # удалённым и заполненным одной моделью из трёх.
+    rows_by_attribution = {
+        attribution: fetch_attribution(date_from, date_to, attribution) for attribution in attributions
+    }
+
     supabase = SupabaseRest()
     # Удаляем окно целиком до записи: строка могла исчезнуть из выборки (товар переименован,
     # источник переклассифицирован), и upsert сам по себе её бы не убрал.
     supabase.delete_date_range(TABLE, date_from, date_to)
 
     total = 0
-    for attribution in attributions:
-        rows = fetch_attribution(date_from, date_to, attribution)
+    for attribution, rows in rows_by_attribution.items():
         supabase.upsert(TABLE, rows, ON_CONFLICT)
         total += len(rows)
         print(f"[bjorn/products] {attribution}: {len(rows)} строк")

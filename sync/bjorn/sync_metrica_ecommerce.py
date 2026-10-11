@@ -4,8 +4,6 @@ import argparse
 from collections import defaultdict
 from typing import Any
 
-import requests
-
 from .common import (
     SupabaseRest,
     add_date_range_args,
@@ -14,6 +12,7 @@ from .common import (
     env_optional,
     env_required,
     expand_metrica_dimension,
+    metrica_stat_rows,
     money,
     normalize_campaign_id,
     normalize_source,
@@ -22,22 +21,6 @@ from .common import (
 )
 
 
-API_URL = "https://api-metrika.yandex.net/stat/v1/data"
-
-
-def metrica_get(params: dict[str, Any], token: str) -> dict[str, Any]:
-    headers = {"Authorization": f"OAuth {token}"}
-    backoff = 2
-    for attempt in range(6):
-        response = requests.get(API_URL, params=params, headers=headers, timeout=120)
-        if response.status_code == 200:
-            return response.json()
-        if response.status_code in {429, 500, 502, 503, 504} and attempt < 5:
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-            continue
-        raise RuntimeError(f"Metrica API error {response.status_code}: {response.text[:500]}")
-    raise RuntimeError("Metrica API retry loop exhausted")
 
 
 def build_dimensions(attribution: str) -> tuple[str, dict[str, int]]:
@@ -86,57 +69,43 @@ def fetch_rows(date_from: str, date_to: str) -> list[dict[str, Any]]:
         lambda: {"quantity": 0, "revenue": 0.0}
     )
 
-    limit = 100000
-    offset = 1
-    while True:
-        params = {
-            "ids": counter_id,
-            "metrics": metrics_raw,
-            "dimensions": dimensions,
-            "date1": date_from,
-            "date2": date_to,
-            "accuracy": "full",
-            "proposed_accuracy": "false",
-            "attribution": attribution,
-            "lang": lang,
-            "limit": limit,
-            "offset": offset,
-        }
-        payload = metrica_get(params, token)
-        data = payload.get("data", [])
-        if not data:
-            break
+    params = {
+        "ids": counter_id,
+        "metrics": metrics_raw,
+        "dimensions": dimensions,
+        "date1": date_from,
+        "date2": date_to,
+        "accuracy": "full",
+        "proposed_accuracy": "false",
+        "attribution": attribution,
+        "lang": lang,
+    }
+    for record in metrica_stat_rows(params, token):
+        dims = [clean_text(d.get("name", "")) for d in record.get("dimensions", [])]
+        mv = record.get("metrics", [])
+        row_date = dims[dim_idx["date"]] if dim_idx["date"] < len(dims) else ""
+        if not row_date:
+            continue
 
-        for record in data:
-            dims = [clean_text(d.get("name", "")) for d in record.get("dimensions", [])]
-            mv = record.get("metrics", [])
-            row_date = dims[dim_idx["date"]] if dim_idx["date"] < len(dims) else ""
-            if not row_date:
-                continue
+        source = normalize_source(dims[dim_idx["source"]] if dim_idx["source"] < len(dims) else "")
+        campaign_raw = dims[dim_idx["campaign"]] if dim_idx["campaign"] < len(dims) else ""
+        campaign_id = normalize_campaign_id(campaign_raw)
 
-            source = normalize_source(dims[dim_idx["source"]] if dim_idx["source"] < len(dims) else "")
-            campaign_raw = dims[dim_idx["campaign"]] if dim_idx["campaign"] < len(dims) else ""
-            campaign_id = normalize_campaign_id(campaign_raw)
+        order_i = dim_idx.get("order")
+        sku_i = dim_idx.get("sku")
+        pn_i = dim_idx["product_name"]
 
-            order_i = dim_idx.get("order")
-            sku_i = dim_idx.get("sku")
-            pn_i = dim_idx["product_name"]
+        order_id = clean_text(dims[order_i]) if order_i is not None and order_i < len(dims) else ""
+        product_sku = clean_text(dims[sku_i]) if sku_i is not None and sku_i < len(dims) else ""
+        product_name = clean_text(dims[pn_i]) if pn_i < len(dims) else ""
 
-            order_id = clean_text(dims[order_i]) if order_i is not None and order_i < len(dims) else ""
-            product_sku = clean_text(dims[sku_i]) if sku_i is not None and sku_i < len(dims) else ""
-            product_name = clean_text(dims[pn_i]) if pn_i < len(dims) else ""
+        qty = parse_int(mv[0] if len(mv) > 0 else 0)
+        rev = money(mv[1] if len(mv) > 1 else 0)
 
-            qty = parse_int(mv[0] if len(mv) > 0 else 0)
-            rev = money(mv[1] if len(mv) > 1 else 0)
-
-            key = (row_date, source, campaign_id, order_id, product_sku, product_name)
-            bucket = aggregate[key]
-            bucket["quantity"] += qty
-            bucket["revenue"] += rev
-
-        if len(data) < limit:
-            break
-        offset += limit
+        key = (row_date, source, campaign_id, order_id, product_sku, product_name)
+        bucket = aggregate[key]
+        bucket["quantity"] += qty
+        bucket["revenue"] += rev
 
     rows: list[dict[str, Any]] = []
     for (row_date, source, campaign_id, order_id, product_sku, product_name), vals in sorted(aggregate.items()):

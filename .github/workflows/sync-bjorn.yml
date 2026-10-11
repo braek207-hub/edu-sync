@@ -84,14 +84,18 @@ jobs:
       - name: Метрика — товарная воронка
         run: python -m sync.bjorn.sync_products
 
-      - name: Метрика — просмотры карточек (Logs API)
-        run: python -m sync.bjorn.sync_card_views
-
       - name: Директ — объявления и картинки
         run: python -m sync.bjorn.sync_ads
 
+      # Последним: Logs API — самый долгий и самый очередной шаг (3,5–11 минут, 04.10.2026
+      # не дождались вовсе), его падение не должно отменять объявления.
+      - name: Метрика — просмотры карточек (Logs API)
+        run: python -m sync.bjorn.sync_card_views
+
+      # Каждый шаг пишет в базу только после того, как всё получил, поэтому записанное до
+      # падения цело — и дашборд должен его увидеть. Прогон при этом остаётся красным.
       - name: Revalidate dashboard cache
-        if: success()
+        if: ${{ !cancelled() }}
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: python scripts/revalidate_panda.py bjorn

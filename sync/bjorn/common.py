@@ -102,6 +102,82 @@ def expand_metrica_dimension(template: str, attribution: str) -> str:
     return template.replace("<attribution>", attribution)
 
 
+METRICA_STAT_URL = "https://api-metrika.yandex.net/stat/v1/data"
+_METRICA_RETRY_STATUSES = {429, 500, 502, 503, 504}
+# Текст ошибки — единственный признак: error_type у неё общий query_error. Язык зависит от
+# параметра lang запроса — оба варианта пойманы в логах синка (02.10 и 07.10.2026).
+_TOO_COMPLEX_MARKERS = ("слишком сложный", "too complicated")
+
+
+class MetricaQueryTooComplex(RuntimeError):
+    pass
+
+
+def _metrica_stat_page(params: dict[str, Any], token: str, timeout: int) -> dict[str, Any]:
+    headers = {"Authorization": f"OAuth {token}"}
+    backoff = 2
+    for attempt in range(6):
+        response = requests.get(METRICA_STAT_URL, params=params, headers=headers, timeout=timeout)
+        if response.status_code == 200:
+            return response.json()
+        if response.status_code in _METRICA_RETRY_STATUSES and attempt < 5:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+        message = f"Metrica API error {response.status_code}: {response.text[:500]}"
+        if response.status_code == 400 and any(m in response.text.lower() for m in _TOO_COMPLEX_MARKERS):
+            raise MetricaQueryTooComplex(message)
+        raise RuntimeError(message)
+    raise RuntimeError("Metrica API retry loop exhausted")
+
+
+def _metrica_range_rows(
+    params: dict[str, Any], token: str, timeout: int, page_limit: int, date1: str, date2: str
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    offset = 1
+    try:
+        while True:
+            body = _metrica_stat_page(
+                {**params, "date1": date1, "date2": date2, "limit": page_limit, "offset": offset},
+                token,
+                timeout,
+            )
+            data = body.get("data") or []
+            rows.extend(data)
+            if len(data) < page_limit:
+                return rows
+            offset += page_limit
+    except MetricaQueryTooComplex:
+        # Страницы этого интервала, полученные до ошибки, отбрасываются вместе с ним: иначе
+        # половины повторили бы их и строки задвоились.
+        start, end = parse_iso_date(date1), parse_iso_date(date2)
+        if start >= end:
+            raise
+        middle = start + timedelta(days=(end - start).days // 2)
+        after = middle + timedelta(days=1)
+        print(f"[metrica] {date1}..{date2}: запрос слишком сложный, делю на {date1}..{middle} и {after}..{date2}")
+        head = _metrica_range_rows(params, token, timeout, page_limit, date1, middle.isoformat())
+        tail = _metrica_range_rows(params, token, timeout, page_limit, after.isoformat(), date2)
+        return head + tail
+
+
+def metrica_stat_rows(
+    params: dict[str, Any], token: str, *, timeout: int = 120, page_limit: int = 100000
+) -> list[dict[str, Any]]:
+    """Все строки отчёта stat API за date1..date2 со всех страниц.
+
+    На «Запрос слишком сложный» (BJORN, accuracy=full и пять-шесть измерений) интервал
+    делится пополам, пока не пройдёт; не прошёл и один день — ошибка уходит наверх.
+    """
+    # Деление по датам точно только тогда, когда каждая строка — один день: без ym:s:date
+    # половины дали бы две строки на одно сочетание измерений, и неаддитивные метрики
+    # (отказы, глубина, посетители) было бы не сложить.
+    if "ym:s:date" not in params["dimensions"].split(","):
+        raise ValueError("metrica_stat_rows: в dimensions нужен ym:s:date")
+    return _metrica_range_rows(params, token, timeout, page_limit, params["date1"], params["date2"])
+
+
 def money(value: Any) -> float:
     dec = Decimal(str(parse_money(value))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return float(dec)
