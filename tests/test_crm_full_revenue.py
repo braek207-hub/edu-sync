@@ -12,7 +12,12 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from sync import crm
-from sync.crm import CITY_UNKNOWN, _load_paid_by_lead_id, _payments_only_rows
+from sync.crm import (
+    CITY_UNKNOWN,
+    _load_paid_by_lead_id,
+    _payments_only_rows,
+    _window_floor,
+)
 
 HEADERS = [
     "ID", "ID Сделки в Битрикс", "ID лида в SCRM", "Дата создания", "Ленд",
@@ -109,3 +114,13 @@ def test_payments_only_defers_rows_older_than_window(monkeypatch):
     paid = _paid([_row("700", "2025-03-01", "2026-08-22", 185000, 1)], monkeypatch)
     agg, details = _payments_only_rows(paid, set(), "2026-01-01")
     assert (agg, details) == ({}, [])
+
+
+def test_window_floor_blocks_only_when_db_remembers_more_than_batch():
+    # Ежедневный прогон: батч с октября, в базе живёт 2025 — расширять окно нельзя.
+    assert _window_floor("2026-10-05", "2025-01-01") == "2026-10-05"
+    # Полный прогон: база не помнит ничего раньше батча — терять нечего.
+    assert _window_floor("2025-01-01", "2025-01-01") == ""
+    # Пустая база и пустой батч — границы нет.
+    assert _window_floor("2025-01-01", "") == ""
+    assert _window_floor("", "2025-01-01") == ""

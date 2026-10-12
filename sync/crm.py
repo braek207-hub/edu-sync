@@ -672,6 +672,20 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, A
     return paid
 
 
+def _window_floor(batch_min: str, db_min: str) -> str:
+    """Левая граница, левее которой достраивать лида по оплате нельзя.
+
+    upsert_lead_details удаляет всё от min(created_date) батча. Лид старше батча
+    расширяет это окно влево — и сносит строки, которых в батче нет. Если в базе нет
+    ничего старше батча (полный прогон: прочитаны все листы), сносить нечего, и граница
+    не нужна: такие оплаты доезжают. В ежедневном прогоне (лист только за 2026) база
+    помнит 2025 год — там граница обязательна, иначе один лид из 2024 снёс бы всю историю.
+    """
+    if not batch_min or not db_min or db_min >= batch_min:
+        return ""
+    return batch_min
+
+
 def _payments_only_rows(
     paid_by_lead_id: Dict[str, Dict[str, Any]],
     skip_lead_ids: set[str],
@@ -941,11 +955,13 @@ def sync_crm_leads() -> int:
 
     # Оплаты по лидам, которых в прочитанных листах «Лиды» нет: достраиваем цепочку.
     # Лиды, уже лежащие в crm_lead_details, пропускаем — там строка полнее (см. docstring).
-    from sync.db import existing_lead_ids
+    from sync.db import existing_lead_ids, existing_lead_min_created
 
     min_created = min(str(d["created_date"]) for d in lead_details) if lead_details else ""
     po_agg, po_details = _payments_only_rows(
-        paid_by_lead_id, seen_lead_ids | existing_lead_ids(), min_created
+        paid_by_lead_id,
+        seen_lead_ids | existing_lead_ids(),
+        _window_floor(min_created, existing_lead_min_created()),
     )
     if po_agg:
         merge_leads_agg(agg, po_agg)

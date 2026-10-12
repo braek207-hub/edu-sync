@@ -574,6 +574,20 @@ def existing_lead_ids() -> set:
             return {r[0] for r in cur.fetchall()}
 
 
+def existing_lead_min_created() -> str:
+    """Самая ранняя created_date в crm_lead_details ("" — таблица пуста).
+
+    Нужна, чтобы понять, теряет ли что-нибудь расширение окна удаления влево
+    (sync/crm.py, _window_floor).
+    """
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT min(created_date) FROM crm_lead_details")
+            row = cur.fetchone()
+            return str(row[0]) if row and row[0] else ""
+
+
 def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
     """Индивидуальные лиды (детализация drill-down). ОТДЕЛЬНЫЙ путь — агрегат не трогает.
 
