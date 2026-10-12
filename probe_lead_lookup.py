@@ -68,8 +68,8 @@ def main() -> int:
 
 
     # Значение может быть не id лида, а id сделки/клиента — ищем его в ЛЮБОЙ колонке.
-    print("
--- поиск значения в любой колонке --")
+    print()
+    print("-- поиск значения в любой колонке --")
     for sheet in list(crm_payments_sheets()) + list(crm_leads_sheets()):
         values = read_sheet(svc, sid, sheet)
         if len(values) < 2:
