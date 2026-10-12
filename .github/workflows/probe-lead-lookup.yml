@@ -1,0 +1,29 @@
+name: probe-lead-lookup
+# Все строки листов CRM по конкретным лидам + строка витрины. Только чтение.
+on:
+  workflow_dispatch:
+    inputs:
+      lead_ids:
+        description: "ID лидов через запятую"
+        required: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Ключ сервис-аккаунта
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: printf '%s' "$GCP_SA_KEY" > sa.json
+      - name: Сверка
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LEAD_IDS: ${{ github.event.inputs.lead_ids }}
+        run: python probe_lead_lookup.py
