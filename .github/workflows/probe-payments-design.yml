@@ -1,0 +1,25 @@
+name: probe-payments-design
+# Сверка листов CRM «Оплаты»/«Лиды» с витриной crm_lead_details: что синк
+# отбрасывает, какие оплаты не доехали, сходятся ли лиды по дням. Только чтение.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Ключ сервис-аккаунта
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: printf '%s' "$GCP_SA_KEY" > sa.json
+      - name: Сверка
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python probe_payments_design.py
