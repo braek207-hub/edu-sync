@@ -66,6 +66,25 @@ def main() -> int:
                   f"дата сырое={_cell(r, i_date)!r} → {to_iso_date(_cell(r, i_date))!r}; "
                   f"кампания={_cell(r, i_camp)}")
 
+
+    # Значение может быть не id лида, а id сделки/клиента — ищем его в ЛЮБОЙ колонке.
+    print("
+-- поиск значения в любой колонке --")
+    for sheet in list(crm_payments_sheets()) + list(crm_leads_sheets()):
+        values = read_sheet(svc, sid, sheet)
+        if len(values) < 2:
+            continue
+        h = [str(x) for x in values[0]]
+        for n, r in enumerate(values[1:], start=2):
+            for i, cell in enumerate(r):
+                if normalize_campaign_id(str(cell or "").strip()) in ids:
+                    col = h[i] if i < len(h) else f"#{i}"
+                    print(f"[{sheet}] строка {n}, колонка «{col}»: {cell!r}")
+                    print("    вся строка: " + " | ".join(
+                        f"{(h[j] if j < len(h) else j)}={str(v or '').strip()}"
+                        for j, v in enumerate(r) if str(v or "").strip()))
+                    break
+
     with get_connection() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
