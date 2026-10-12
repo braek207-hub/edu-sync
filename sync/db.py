@@ -560,6 +560,20 @@ def upsert_crm_leads(rows: List[Dict[str, Any]]) -> int:
     return replace_crm_leads(rows)
 
 
+def existing_lead_ids() -> set:
+    """lead_id, уже лежащие в crm_lead_details.
+
+    Нужен, чтобы оплату по лиду из непрочитанного в этом прогоне листа не приняли за
+    безлидовую и не затёрли настоящую строку синтетической (sync/crm.py,
+    _payments_only_rows). Одна колонка на ~115 тыс. строк — дешевле, чем ошибка.
+    """
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT lead_id FROM crm_lead_details")
+            return {r[0] for r in cur.fetchall()}
+
+
 def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
     """Индивидуальные лиды (детализация drill-down). ОТДЕЛЬНЫЙ путь — агрегат не трогает.
 

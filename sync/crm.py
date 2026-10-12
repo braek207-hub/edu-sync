@@ -23,6 +23,11 @@ from sync.utils import (
 CRM_LEADS_SHEET = "Лиды"
 CRM_PAYMENTS_SHEET = "Оплаты"
 
+# Город у лида, достроенного по оплате: в листе «Оплаты» города нет. Третье значение рядом
+# с msk_mo и rf, на дашборде подписано «Нет данных». Писать таким лидам rf нельзя — это
+# утверждение «не из Москвы», которого мы не знаем.
+CITY_UNKNOWN = "unknown"
+
 
 def _sheet_names(env_key: str, default: str) -> List[str]:
     raw = os.environ.get(env_key, default)
@@ -557,11 +562,23 @@ def _load_all_lead_dims(
 def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, Any]]:
     """leadId → {count, revenue, pay_date, + описательные поля сделки/оплаты} из «Оплаты».
 
-    Источник: лист «Оплаты», колонка orders (==1) + выручка + «ID лида в SCRM»
+    Источник: лист «Оплаты», колонка orders + выручка + «ID лида в SCRM»
     + «date pay»/«дата оплаты» (берём самую раннюю дату для окна конверсии).
     Используется для атрибуции оплат, выручки и дней до оплаты к дате создания лида;
     описательные поля (deal_id/этап/utm_source/продукт/группа/сумма-оборот/сертификат) —
     для детализации (crm_lead_details), берутся из репрезентативной (самой ранней) оплаты.
+
+    orders ≠ 1 — это ДОПЛАТА по той же сделке (вторая программа, рассрочка): денег больше,
+    сделок столько же. Поэтому выручку и оборот суммируем у всех строк лида, а count растёт
+    только на orders==1. До 12.10.2026 такие строки отбрасывались целиком вместе с выручкой,
+    и витрина недосчитывала 65,8 млн ₽ (617 строк), хотя crm_payments их деньги считала.
+
+    Вся выручка лида ложится на дату ПЕРВОЙ оплаты (грань витрины — лид, нескольких дат
+    платежа строка не несёт). Цена решения: 131 доплата (9,6 млн ₽) попадает в gross не в
+    свой день, из них 26 строк — в соседний месяц. Согласовано с Павлом 12.10.2026.
+
+    Поля created_date/campaign_id/land нужны для лидов, которых нет в листах «Лиды»:
+    по ним достраивается строка лида (см. _payments_only_rows).
     """
     paid: Dict[str, Dict[str, Any]] = {}
     for sheet_name in crm_payments_sheets():
@@ -601,13 +618,16 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, A
         )
         i_turnover = pick_index_loose(headers, ["сумма (в оборот)", "в оборот", "сумма"])
         i_cert = pick_index_loose(headers, ["дата получения сертификата", "сертификат"])
+        # Поля лида в самой строке оплаты — для тех, кого нет в листах «Лиды».
+        # «Дата создания» в листе оплат встречается дважды (с временем и ISO) — годится любая.
+        i_created = [i for i, h in enumerate(headers) if "дата создания" in str(h or "").lower()]
+        i_camp = pick_index_loose(headers, ["кампания", "utm campaign", "utm_campaign"])
+        i_land = pick_index_loose(headers, ["ленд", "land"])
         for row in values[1:]:
             lead_id = normalize_campaign_id(_cell(row, i_lead))
             if not lead_id:
                 continue
             cnt = (1 if round(to_num(_cell(row, i_orders))) == 1 else 0) if i_orders != -1 else 1
-            if not cnt:
-                continue
             rev = to_num(_cell(row, i_rev)) if i_rev != -1 else 0.0
             turnover = to_num(_cell(row, i_turnover)) if i_turnover != -1 else 0.0
             pay_date_iso = to_iso_date(_cell(row, i_pay_date)) if i_pay_date != -1 else ""
@@ -617,17 +637,21 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, A
                     "count": 0.0, "revenue": 0.0, "pay_date": None, "amount_turnover": 0.0,
                     "_desc_rank": None, "deal_id": "", "payment_stage": "", "utm_source": "",
                     "product": "", "product_group": "", "cert_date": "",
+                    "created_date": "", "campaign_id": "", "campaign_raw": "", "land": "",
                 },
             )
             agg["count"] += cnt
             agg["revenue"] += rev
             agg["amount_turnover"] += turnover
-            # Сохраняем самую раннюю дату оплаты для окна конверсии
-            if pay_date_iso:
+            # Дата оплаты — самая ранняя среди строк-сделок (orders==1): доплата не должна
+            # утаскивать когорту на свою дату. Лидов вообще без orders==1 в листах нет
+            # (замер 12.10.2026), но если появятся — берём раннюю дату из того, что есть.
+            if pay_date_iso and (cnt or agg["pay_date"] is None):
                 if agg["pay_date"] is None or pay_date_iso < agg["pay_date"]:
                     agg["pay_date"] = pay_date_iso
-            # Описательные поля — из репрезентативной (самой ранней по pay_date) оплаты.
-            rank = pay_date_iso or "9999-99-99"
+            # Описательные поля — из репрезентативной оплаты: строка-сделка раньше доплаты
+            # (префикс ранга), внутри группы — самая ранняя по дате.
+            rank = f"{0 if cnt else 1}{pay_date_iso or '9999-99-99'}"
             if agg["_desc_rank"] is None or rank < agg["_desc_rank"]:
                 agg["_desc_rank"] = rank
                 agg["deal_id"] = normalize_campaign_id(_cell(row, i_deal)) if i_deal != -1 else ""
@@ -636,10 +660,120 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, A
                 agg["product"] = str(_cell(row, i_product) or "").strip() if i_product != -1 else ""
                 agg["product_group"] = str(_cell(row, i_pgroup) or "").strip() if i_pgroup != -1 else ""
                 agg["cert_date"] = to_iso_date(_cell(row, i_cert)) if i_cert != -1 else ""
+                agg["created_date"] = next(
+                    (d for d in (to_iso_date(_cell(row, i)) for i in i_created) if d), ""
+                )
+                agg["campaign_raw"] = str(_cell(row, i_camp) or "").strip() if i_camp != -1 else ""
+                agg["campaign_id"] = normalize_campaign_id(agg["campaign_raw"])
+                agg["land"] = str(_cell(row, i_land) or "").strip().lower() if i_land != -1 else ""
     total_c = sum(p["count"] for p in paid.values())
     total_r = sum(p["revenue"] for p in paid.values())
     print(f"CRM Оплаты→лиды: {len(paid)} лидов с оплатами, оплат {int(total_c)}, выручка {total_r:.0f}")
     return paid
+
+
+def _payments_only_rows(
+    paid_by_lead_id: Dict[str, Dict[str, Any]],
+    skip_lead_ids: set[str],
+    min_created_date: str,
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    """Лиды, которых нет в листах «Лиды», но по ним есть оплата → достроенная цепочка.
+
+    Деньги наши, и терять их нельзя (6,5 млн ₽ на 12.10.2026, 29 оплат — на живых
+    кампаниях Директа). Раз оплата была, значит были и лид, и дозвон, и сделка: ставим всю
+    цепочку, а поля, которых в листе оплат нет (город, год выпуска, уровень образования,
+    этап, ответственный, дата дозвона), оставляем «нет данных». Отдельной грани и флага
+    не заводим — решение Павла 12.10.2026.
+
+    skip_lead_ids — лиды, уже посчитанные по листам «Лиды» ИЛИ живущие в crm_lead_details
+    с прошлых прогонов. Второе обязательно: ежедневный синк читает только лист «Лиды»
+    (2026), и без этой проверки лид из «Лиды 2025» выглядел бы безлидовым, а синтетическая
+    строка затёрла бы настоящую — с её этапом, датой дозвона и городом.
+
+    min_created_date — левая граница окна, которое этот прогон и так переписывает. Строку
+    старше неё НЕ достраиваем: upsert_lead_details удаляет всё от min(created_date) батча,
+    и один лид из 2025 в ежедневном прогоне (читает только лист «Лиды» за 2026) снёс бы
+    всю историю 2025 года. Такие подтянет полный прогон, где прочитаны оба листа.
+    """
+    agg: Dict[str, Dict[str, Any]] = {}
+    details: List[Dict[str, Any]] = []
+    deferred = 0
+    for lead_id, pm in paid_by_lead_id.items():
+        if lead_id in skip_lead_ids:
+            continue
+        date_iso = pm.get("created_date") or ""
+        if date_iso and date_iso < min_created_date:
+            deferred += 1
+            continue
+        cid = pm.get("campaign_id") or ""
+        land = pm.get("land") or ""
+        if not cid and land:
+            cid = f"land:{land}"
+        if not date_iso or not cid:
+            continue  # без даты создания или кампании строку не к чему привязать
+
+        key = f"{date_iso}|{cid}|{CITY_UNKNOWN}|unknown|unknown|unknown"
+        bucket = agg.setdefault(
+            key,
+            {
+                "date": date_iso, "campaign_id": cid,
+                "city_ip_segment": CITY_UNKNOWN, "b24_grad_year": "unknown",
+                "b24_edu_level": "unknown", "audience": "unknown",
+                "leads": 0, "eff_leads": 0, "connections": 0.0, "deals": 0.0,
+                "payments_from_leads": 0, "revenue_from_leads": 0.0,
+                "days_to_pay_sum": 0.0, "days_to_pay_count": 0,
+                "project": "unknown", "direction": "other", "campaign_name": "", "land": land,
+            },
+        )
+        _apply_meta(bucket, pm.get("campaign_raw", ""), land)
+        if land:
+            bucket["project"] = resolve_row_project(None, bucket.get("campaign_name", ""), land)
+        bucket["leads"] += 1
+        bucket["eff_leads"] += 1
+        bucket["connections"] += 1
+        bucket["deals"] += 1
+        bucket["payments_from_leads"] += pm["count"]
+        bucket["revenue_from_leads"] += pm["revenue"]
+        pay_date = pm.get("pay_date")
+        if pay_date:
+            try:
+                days = (_date.fromisoformat(pay_date) - _date.fromisoformat(date_iso)).days
+                if days >= 0:
+                    bucket["days_to_pay_sum"] += days
+                    bucket["days_to_pay_count"] += 1
+            except (ValueError, TypeError):
+                pass
+
+        details.append(
+            {
+                "lead_id": lead_id, "client_id": None, "campaign_id": cid,
+                "land": land or None, "utm_term": None,
+                "created_date": date_iso, "connection_date": None,
+                "created_ts": None, "connected_ts": None,
+                "payment_date": pay_date,
+                "stage": None, "responsible": None, "dispatcher": None, "subdivision": None,
+                "city_raw": None, "city_ip_segment": CITY_UNKNOWN,
+                "b24_grad_year": "unknown", "b24_edu_level": "unknown", "audience": "unknown",
+                "is_eff": True, "is_connected": True, "is_deal": True, "is_paid": True,
+                "deal_id": pm.get("deal_id") or None,
+                "payment_stage": pm.get("payment_stage") or None,
+                "utm_source": pm.get("utm_source") or None,
+                "product": pm.get("product") or None,
+                "product_group": pm.get("product_group") or None,
+                "amount_turnover": pm.get("amount_turnover"),
+                "amount": pm.get("revenue"),
+                "cert_date": pm.get("cert_date") or None,
+                "_key": key,
+            }
+        )
+    if details or deferred:
+        money = sum(d["amount"] or 0 for d in details)
+        print(
+            f"CRM Оплаты без лида: достроено {len(details)} лидов, выручка {money:.0f} "
+            f"(города/этапа/дозвона в листе оплат нет → «{CITY_UNKNOWN}»/NULL); "
+            f"отложено до полного прогона (лид старше окна {min_created_date}): {deferred}"
+        )
+    return agg, details
 
 
 def _parse_payments_sheet(
@@ -805,6 +939,19 @@ def sync_crm_leads() -> int:
         _log_spreadsheet_tabs(service, spreadsheet_id)
         raise ValueError(f"CRM(Лиды): нет строк после разбора листов {sheet_names}")
 
+    # Оплаты по лидам, которых в прочитанных листах «Лиды» нет: достраиваем цепочку.
+    # Лиды, уже лежащие в crm_lead_details, пропускаем — там строка полнее (см. docstring).
+    from sync.db import existing_lead_ids
+
+    min_created = min(str(d["created_date"]) for d in lead_details) if lead_details else ""
+    po_agg, po_details = _payments_only_rows(
+        paid_by_lead_id, seen_lead_ids | existing_lead_ids(), min_created
+    )
+    if po_agg:
+        merge_leads_agg(agg, po_agg)
+        lead_details.extend(po_details)
+        seen_lead_ids.update(d["lead_id"] for d in po_details)
+
     _enrich_project_from_direct(agg)
 
     rows = []
@@ -861,7 +1008,50 @@ def sync_crm_leads() -> int:
         f"CRM Детализация: {nd} лидов в crm_lead_details "
         f"(оплачено {paid_details}; агрегат crm_leads не изменён — отдельный путь)"
     )
+
+    _assert_revenue_complete(paid_by_lead_id, seen_lead_ids, lead_details, rows)
     return n
+
+
+def _assert_revenue_complete(
+    paid_by_lead_id: Dict[str, Dict[str, Any]],
+    processed_lead_ids: set[str],
+    lead_details: List[Dict[str, Any]],
+    agg_rows: List[Dict[str, Any]],
+) -> None:
+    """Вся выручка листа «Оплаты» по разобранным лидам доехала в обе витрины.
+
+    Без этой проверки недостача живёт незаметно: 65,8 млн ₽ доплат и 6,5 млн ₽ безлидовых
+    оплат отсутствовали в витрине месяцами, и ни один гейт этого не видел (12.10.2026).
+    Сверяем три суммы — лист, детализация, агрегат, — потому что наполняются они разными
+    путями одного синка и разойтись может любая пара.
+
+    Лиды, пропущенные как уже лежащие в crm_lead_details (их листа в этом прогоне не
+    читали), в ожидание не входят: их выручка осталась в базе с прошлого полного прогона.
+    """
+    expected = sum(
+        p["revenue"] for lid, p in paid_by_lead_id.items() if lid in processed_lead_ids
+    )
+    got_details = sum(float(d.get("amount") or 0) for d in lead_details if d.get("is_paid"))
+    got_agg = sum(float(r.get("revenue_from_leads") or 0) for r in agg_rows)
+    skipped = sum(
+        p["revenue"] for lid, p in paid_by_lead_id.items() if lid not in processed_lead_ids
+    )
+    print(
+        f"CRM Сверка выручки: лист {expected:.0f} = детализация {got_details:.0f} "
+        f"= агрегат {got_agg:.0f}; вне прогона (лид из непрочитанного листа) {skipped:.0f}"
+    )
+    # Рубль допуска: float8 в агрегате против numeric(14,2) в детализации.
+    bad = [
+        name
+        for name, got in (("детализация", got_details), ("агрегат", got_agg))
+        if abs(got - expected) > 1.0
+    ]
+    if bad:
+        raise ValueError(
+            f"CRM(Выручка): недостача в {', '.join(bad)} — лист {expected:.2f}, "
+            f"детализация {got_details:.2f}, агрегат {got_agg:.2f}"
+        )
 
 
 def sync_crm_payments() -> int:
