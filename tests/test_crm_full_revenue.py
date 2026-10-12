@@ -93,6 +93,8 @@ def test_payments_only_builds_full_chain(monkeypatch):
     assert d["amount"] == 185000
     # Чего в листе оплат нет — «нет данных», а не выдуманное значение.
     assert d["city_ip_segment"] == CITY_UNKNOWN
+    # Без этой пометки прогон принял бы строку за настоящую и перестал её пересобирать.
+    assert d["is_synthetic"] is True
     assert d["connection_date"] is None and d["stage"] is None
 
     bucket = next(iter(agg.values()))
@@ -124,3 +126,18 @@ def test_window_floor_blocks_only_when_db_remembers_more_than_batch():
     # Пустая база и пустой батч — границы нет.
     assert _window_floor("2025-01-01", "") == ""
     assert _window_floor("", "2025-01-01") == ""
+
+
+def test_synthetic_rows_are_rebuilt_not_skipped():
+    """Прошлая синтетическая строка не попадает в skip: SQL отбирает только настоящие.
+
+    Регрессия 12.10.2026: второй полный прогон недосчитал 5 020 296 ₽ — синтетические
+    строки первого прогона попали в skip по lead_id, не были собраны заново, а DELETE
+    диапазона их снёс.
+    """
+    import inspect
+
+    from sync import db
+
+    assert "WHERE NOT is_synthetic" in inspect.getsource(db.existing_real_lead_ids)
+    assert "is_synthetic" in inspect.getsource(db.upsert_lead_details)

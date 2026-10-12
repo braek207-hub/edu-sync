@@ -699,10 +699,12 @@ def _payments_only_rows(
     этап, ответственный, дата дозвона), оставляем «нет данных». Отдельной грани и флага
     не заводим — решение Павла 12.10.2026.
 
-    skip_lead_ids — лиды, уже посчитанные по листам «Лиды» ИЛИ живущие в crm_lead_details
-    с прошлых прогонов. Второе обязательно: ежедневный синк читает только лист «Лиды»
-    (2026), и без этой проверки лид из «Лиды 2025» выглядел бы безлидовым, а синтетическая
-    строка затёрла бы настоящую — с её этапом, датой дозвона и городом.
+    skip_lead_ids — лиды, уже посчитанные по листам «Лиды» ИЛИ лежащие в crm_lead_details
+    настоящей строкой (is_synthetic = false). Второе обязательно: ежедневный синк читает
+    только лист «Лиды» (2026), и без этой проверки лид из «Лиды 2025» выглядел бы
+    безлидовым, а синтетическая строка затёрла бы настоящую — с её этапом, датой дозвона
+    и городом. Свои прошлые синтетические строки сюда НЕ входят: прогон переписывает
+    диапазон целиком, поэтому их надо собирать заново каждый раз.
 
     min_created_date — левая граница окна, которое этот прогон и так переписывает. Строку
     старше неё НЕ достраиваем: upsert_lead_details удаляет всё от min(created_date) батча,
@@ -769,6 +771,7 @@ def _payments_only_rows(
                 "city_raw": None, "city_ip_segment": CITY_UNKNOWN,
                 "b24_grad_year": "unknown", "b24_edu_level": "unknown", "audience": "unknown",
                 "is_eff": True, "is_connected": True, "is_deal": True, "is_paid": True,
+                "is_synthetic": True,
                 "deal_id": pm.get("deal_id") or None,
                 "payment_stage": pm.get("payment_stage") or None,
                 "utm_source": pm.get("utm_source") or None,
@@ -955,12 +958,12 @@ def sync_crm_leads() -> int:
 
     # Оплаты по лидам, которых в прочитанных листах «Лиды» нет: достраиваем цепочку.
     # Лиды, уже лежащие в crm_lead_details, пропускаем — там строка полнее (см. docstring).
-    from sync.db import existing_lead_ids, existing_lead_min_created
+    from sync.db import existing_lead_min_created, existing_real_lead_ids
 
     min_created = min(str(d["created_date"]) for d in lead_details) if lead_details else ""
     po_agg, po_details = _payments_only_rows(
         paid_by_lead_id,
-        seen_lead_ids | existing_lead_ids(),
+        seen_lead_ids | existing_real_lead_ids(),
         _window_floor(min_created, existing_lead_min_created()),
     )
     if po_agg:

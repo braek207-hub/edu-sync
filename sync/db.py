@@ -118,6 +118,10 @@ _SCHEMA_DDL: List[str] = [
           is_connected     BOOLEAN NOT NULL DEFAULT false,
           is_deal          BOOLEAN NOT NULL DEFAULT false,
           is_paid          BOOLEAN NOT NULL DEFAULT false,
+          -- Строка достроена по листу «Оплаты»: лида в листах «Лиды» нет (sync/crm.py,
+          -- _payments_only_rows). Отличать обязательно: настоящую строку перезаписывать
+          -- синтетической нельзя, а синтетическую нужно пересобирать каждый прогон.
+          is_synthetic     BOOLEAN NOT NULL DEFAULT false,
           project          TEXT,
           direction        TEXT,
           deal_id          TEXT,
@@ -201,6 +205,11 @@ _SCHEMA_DDL: List[str] = [
         ALTER TABLE crm_lead_details
           ADD COLUMN IF NOT EXISTS created_ts   timestamptz,
           ADD COLUMN IF NOT EXISTS connected_ts timestamptz
+        """,
+        # Лид, достроенный по оплате (для существующей таблицы в проде).
+        """
+        ALTER TABLE crm_lead_details
+          ADD COLUMN IF NOT EXISTS is_synthetic BOOLEAN NOT NULL DEFAULT false
         """,
         # RLS on: доступ только серверный (см. аудит panda-bi-audit-cleanup).
         "ALTER TABLE crm_lead_details ENABLE ROW LEVEL SECURITY",
@@ -560,17 +569,21 @@ def upsert_crm_leads(rows: List[Dict[str, Any]]) -> int:
     return replace_crm_leads(rows)
 
 
-def existing_lead_ids() -> set:
-    """lead_id, уже лежащие в crm_lead_details.
+def existing_real_lead_ids() -> set:
+    """lead_id настоящих (не достроенных по оплате) строк crm_lead_details.
 
     Нужен, чтобы оплату по лиду из непрочитанного в этом прогоне листа не приняли за
     безлидовую и не затёрли настоящую строку синтетической (sync/crm.py,
     _payments_only_rows). Одна колонка на ~115 тыс. строк — дешевле, чем ошибка.
+
+    Синтетические строки здесь НЕ возвращаются: прогон удаляет диапазон и пишет его
+    заново, поэтому их надо собирать каждый раз. Иначе они исчезают на следующем же
+    прогоне (проверено 12.10.2026: второй полный прогон недосчитал 5 020 296 ₽).
     """
     ensure_schema()
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT lead_id FROM crm_lead_details")
+            cur.execute("SELECT lead_id FROM crm_lead_details WHERE NOT is_synthetic")
             return {r[0] for r in cur.fetchall()}
 
 
@@ -604,7 +617,7 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
             created_date, connection_date, created_ts, connected_ts, payment_date,
             stage, responsible, dispatcher, subdivision,
             city_raw, city_ip_segment, b24_grad_year, b24_edu_level, audience,
-            is_eff, is_connected, is_deal, is_paid,
+            is_eff, is_connected, is_deal, is_paid, is_synthetic,
             project, direction,
             deal_id, payment_stage, utm_source, product, product_group,
             prod_level, prod_stage, prod_form, prod_ugsn, prod_direction, prod_specialty, prod_profile, prod_faculty,
@@ -617,7 +630,7 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
             %(payment_date)s::date,
             %(stage)s, %(responsible)s, %(dispatcher)s, %(subdivision)s,
             %(city_raw)s, %(city_ip_segment)s, %(b24_grad_year)s, %(b24_edu_level)s, %(audience)s,
-            %(is_eff)s, %(is_connected)s, %(is_deal)s, %(is_paid)s,
+            %(is_eff)s, %(is_connected)s, %(is_deal)s, %(is_paid)s, %(is_synthetic)s,
             %(project)s, %(direction)s,
             %(deal_id)s, %(payment_stage)s, %(utm_source)s, %(product)s, %(product_group)s,
             %(prod_level)s, %(prod_stage)s, %(prod_form)s, %(prod_ugsn)s, %(prod_direction)s, %(prod_specialty)s, %(prod_profile)s, %(prod_faculty)s,
@@ -646,6 +659,7 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
             is_connected    = EXCLUDED.is_connected,
             is_deal         = EXCLUDED.is_deal,
             is_paid         = EXCLUDED.is_paid,
+            is_synthetic    = EXCLUDED.is_synthetic,
             project         = EXCLUDED.project,
             direction       = EXCLUDED.direction,
             deal_id         = EXCLUDED.deal_id,
@@ -666,6 +680,8 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
             cert_date       = EXCLUDED.cert_date,
             synced_at       = NOW()
     """
+    for r in rows:
+        r.setdefault("is_synthetic", False)  # строки из листов «Лиды» про этот флаг не знают
     min_date = min(str(r["created_date"]) for r in rows)
     with get_connection() as conn:
         with conn.cursor() as cur:
