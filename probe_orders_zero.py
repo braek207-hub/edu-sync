@@ -74,6 +74,43 @@ def main() -> int:
     print(f"\n-- всего строк с orders≠1 во всех листах: {tot_zero}, выручка {tot_zero_money:.0f} --")
     for (o, stage), n in stages.most_common(20):
         print(f"   orders={o:3d}  этап={stage or '—':<30} {n}")
+
+    # Дубль или вторая оплата: у строки orders=0 ищем у того же лида строку orders=1
+    # с той же суммой (вероятный дубль одной сделки, разнесённой по продуктам).
+    import collections as _c
+    rows_all = _c.defaultdict(list)
+    for sheet in crm_payments_sheets():
+        values = read_sheet(svc, sid, sheet)
+        if len(values) < 2:
+            continue
+        h = [str(x) for x in values[0]]
+        i_lead = pick_index_loose(h, ["id лида в scrm", "lead id", "id лида"])
+        i_pay = pick_index_loose(h, ["date pay", "дата оплаты"])
+        i_ord, i_rev = find_orders_index(h), find_revenue_index(h)
+        for r in values[1:]:
+            lid = normalize_campaign_id(_cell(r, i_lead))
+            if not lid:
+                continue
+            rows_all[lid].append((round(to_num(_cell(r, i_ord))) if i_ord != -1 else 1,
+                                  to_num(_cell(r, i_rev)) if i_rev != -1 else 0.0,
+                                  to_iso_date(_cell(r, i_pay)) if i_pay != -1 else ""))
+    dup_n = dup_m = uniq_n = uniq_m = orphan_n = orphan_m = 0
+    for lid, rs in rows_all.items():
+        ones = [x for x in rs if x[0] == 1]
+        for o, rev, pay in rs:
+            if o == 1:
+                continue
+            if any(abs(rev - x[1]) < 0.5 for x in ones):
+                dup_n += 1; dup_m += rev
+            elif ones:
+                uniq_n += 1; uniq_m += rev
+            else:
+                orphan_n += 1; orphan_m += rev
+    print()
+    print("-- строки orders!=1: дубль суммы или отдельные деньги --")
+    print(f"   сумма совпадает со строкой orders=1 того же лида: {dup_n} строк / {dup_m:.0f}")
+    print(f"   сумма другая, но у лида есть orders=1:            {uniq_n} строк / {uniq_m:.0f}")
+    print(f"   у лида вообще нет строки orders=1:                {orphan_n} строк / {orphan_m:.0f}")
     return 0
 
 
