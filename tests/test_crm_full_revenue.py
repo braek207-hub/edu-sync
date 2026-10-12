@@ -12,12 +12,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from sync import crm
-from sync.crm import (
-    CITY_UNKNOWN,
-    _load_paid_by_lead_id,
-    _payments_only_rows,
-    _window_floor,
-)
+from sync.crm import CITY_UNKNOWN, _load_paid_by_lead_id, _payments_only_rows
 
 HEADERS = [
     "ID", "ID Сделки в Битрикс", "ID лида в SCRM", "Дата создания", "Ленд",
@@ -83,7 +78,7 @@ def test_lead_fields_captured_for_payments_only(monkeypatch):
 
 def test_payments_only_builds_full_chain(monkeypatch):
     paid = _paid([_row("500", "2026-08-10", "2026-08-22", 185000, 1)], monkeypatch)
-    agg, details = _payments_only_rows(paid, set(), "2026-01-01")
+    agg, details = _payments_only_rows(paid, set())
 
     assert len(details) == 1
     d = details[0]
@@ -107,25 +102,19 @@ def test_payments_only_builds_full_chain(monkeypatch):
 def test_payments_only_skips_known_lead(monkeypatch):
     """Лид уже есть в листах или в базе → настоящую строку не трогаем."""
     paid = _paid([_row("600", "2026-08-10", "2026-08-22", 185000, 1)], monkeypatch)
-    agg, details = _payments_only_rows(paid, {"600"}, "2026-01-01")
+    agg, details = _payments_only_rows(paid, {"600"})
     assert (agg, details) == ({}, [])
 
 
-def test_payments_only_defers_rows_older_than_window(monkeypatch):
-    """Лид старше окна прогона отложен: upsert удаляет всё от min(created_date) батча."""
-    paid = _paid([_row("700", "2025-03-01", "2026-08-22", 185000, 1)], monkeypatch)
-    agg, details = _payments_only_rows(paid, set(), "2026-01-01")
-    assert (agg, details) == ({}, [])
+def test_payments_only_keeps_rows_older_than_sheets(monkeypatch):
+    """Лид старше прочитанных листов доезжает: удаляемый диапазон задан отдельно.
 
-
-def test_window_floor_blocks_only_when_db_remembers_more_than_batch():
-    # Ежедневный прогон: батч с октября, в базе живёт 2025 — расширять окно нельзя.
-    assert _window_floor("2026-10-05", "2025-01-01") == "2026-10-05"
-    # Полный прогон: база не помнит ничего раньше батча — терять нечего.
-    assert _window_floor("2025-01-01", "2025-01-01") == ""
-    # Пустая база и пустой батч — границы нет.
-    assert _window_floor("2025-01-01", "") == ""
-    assert _window_floor("", "2025-01-01") == ""
+    Раньше такую строку откладывали «до полного прогона», и полный откладывал её тоже —
+    3 лида на 757 500 ₽ висели вне витрины.
+    """
+    paid = _paid([_row("700", "2024-09-27", "2025-07-06", 135000, 1)], monkeypatch)
+    agg, details = _payments_only_rows(paid, set())
+    assert [d["created_date"] for d in details] == ["2024-09-27"]
 
 
 def test_synthetic_rows_are_rebuilt_not_skipped():
@@ -141,3 +130,17 @@ def test_synthetic_rows_are_rebuilt_not_skipped():
 
     assert "WHERE NOT is_synthetic" in inspect.getsource(db.existing_real_lead_ids)
     assert "is_synthetic" in inspect.getsource(db.upsert_lead_details)
+
+
+def test_delete_window_comes_from_sheets_not_from_batch():
+    """Границу удаления синк задаёт отдельным аргументом, иначе достроенная строка 2024
+    расширила бы DELETE на всю историю."""
+    import inspect
+
+    from sync import crm, db
+
+    assert "delete_from" in inspect.signature(db.upsert_lead_details).parameters
+    assert 'delete_from or min(str(r["created_date"]) for r in rows)' in inspect.getsource(
+        db.upsert_lead_details
+    )
+    assert "delete_from=sheets_min_created" in inspect.getsource(crm.sync_crm_leads)

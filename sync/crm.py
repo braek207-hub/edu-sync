@@ -672,24 +672,9 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, A
     return paid
 
 
-def _window_floor(batch_min: str, db_min: str) -> str:
-    """Левая граница, левее которой достраивать лида по оплате нельзя.
-
-    upsert_lead_details удаляет всё от min(created_date) батча. Лид старше батча
-    расширяет это окно влево — и сносит строки, которых в батче нет. Если в базе нет
-    ничего старше батча (полный прогон: прочитаны все листы), сносить нечего, и граница
-    не нужна: такие оплаты доезжают. В ежедневном прогоне (лист только за 2026) база
-    помнит 2025 год — там граница обязательна, иначе один лид из 2024 снёс бы всю историю.
-    """
-    if not batch_min or not db_min or db_min >= batch_min:
-        return ""
-    return batch_min
-
-
 def _payments_only_rows(
     paid_by_lead_id: Dict[str, Dict[str, Any]],
     skip_lead_ids: set[str],
-    min_created_date: str,
 ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     """Лиды, которых нет в листах «Лиды», но по ним есть оплата → достроенная цепочка.
 
@@ -706,21 +691,16 @@ def _payments_only_rows(
     и городом. Свои прошлые синтетические строки сюда НЕ входят: прогон переписывает
     диапазон целиком, поэтому их надо собирать заново каждый раз.
 
-    min_created_date — левая граница окна, которое этот прогон и так переписывает. Строку
-    старше неё НЕ достраиваем: upsert_lead_details удаляет всё от min(created_date) батча,
-    и один лид из 2025 в ежедневном прогоне (читает только лист «Лиды» за 2026) снёс бы
-    всю историю 2025 года. Такие подтянет полный прогон, где прочитаны оба листа.
+    Дата создания такой строки может быть старше прочитанных листов «Лиды» (в листе
+    «Оплаты» есть оплаты 2024 года). Удаляемый диапазон от этого не расширяется:
+    upsert_lead_details получает границу отдельно, по строкам из листов (delete_from).
     """
     agg: Dict[str, Dict[str, Any]] = {}
     details: List[Dict[str, Any]] = []
-    deferred = 0
     for lead_id, pm in paid_by_lead_id.items():
         if lead_id in skip_lead_ids:
             continue
         date_iso = pm.get("created_date") or ""
-        if date_iso and date_iso < min_created_date:
-            deferred += 1
-            continue
         cid = pm.get("campaign_id") or ""
         land = pm.get("land") or ""
         if not cid and land:
@@ -783,12 +763,11 @@ def _payments_only_rows(
                 "_key": key,
             }
         )
-    if details or deferred:
+    if details:
         money = sum(d["amount"] or 0 for d in details)
         print(
             f"CRM Оплаты без лида: достроено {len(details)} лидов, выручка {money:.0f} "
-            f"(города/этапа/дозвона в листе оплат нет → «{CITY_UNKNOWN}»/NULL); "
-            f"отложено до полного прогона (лид старше окна {min_created_date}): {deferred}"
+            f"(города/этапа/дозвона в листе оплат нет → «{CITY_UNKNOWN}»/NULL)"
         )
     return agg, details
 
@@ -958,13 +937,13 @@ def sync_crm_leads() -> int:
 
     # Оплаты по лидам, которых в прочитанных листах «Лиды» нет: достраиваем цепочку.
     # Лиды, уже лежащие в crm_lead_details, пропускаем — там строка полнее (см. docstring).
-    from sync.db import existing_lead_min_created, existing_real_lead_ids
+    from sync.db import existing_real_lead_ids
 
-    min_created = min(str(d["created_date"]) for d in lead_details) if lead_details else ""
+    # Граница удаляемого диапазона — по строкам ИЗ ЛИСТОВ: достроенная по оплате строка
+    # может быть старше них, и расширять удаление до её даты нельзя.
+    sheets_min_created = min(str(d["created_date"]) for d in lead_details) if lead_details else ""
     po_agg, po_details = _payments_only_rows(
-        paid_by_lead_id,
-        seen_lead_ids | existing_real_lead_ids(),
-        _window_floor(min_created, existing_lead_min_created()),
+        paid_by_lead_id, seen_lead_ids | existing_real_lead_ids()
     )
     if po_agg:
         merge_leads_agg(agg, po_agg)
@@ -1021,7 +1000,7 @@ def sync_crm_leads() -> int:
 
     from sync.db import upsert_lead_details
 
-    nd = upsert_lead_details(lead_details)
+    nd = upsert_lead_details(lead_details, delete_from=sheets_min_created)
     paid_details = sum(1 for d in lead_details if d.get("is_paid"))
     print(
         f"CRM Детализация: {nd} лидов в crm_lead_details "

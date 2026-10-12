@@ -587,26 +587,18 @@ def existing_real_lead_ids() -> set:
             return {r[0] for r in cur.fetchall()}
 
 
-def existing_lead_min_created() -> str:
-    """Самая ранняя created_date в crm_lead_details ("" — таблица пуста).
-
-    Нужна, чтобы понять, теряет ли что-нибудь расширение окна удаления влево
-    (sync/crm.py, _window_floor).
-    """
-    ensure_schema()
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT min(created_date) FROM crm_lead_details")
-            row = cur.fetchone()
-            return str(row[0]) if row and row[0] else ""
-
-
-def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
+def upsert_lead_details(rows: List[Dict[str, Any]], delete_from: str = "") -> int:
     """Индивидуальные лиды (детализация drill-down). ОТДЕЛЬНЫЙ путь — агрегат не трогает.
 
     Заменяет диапазон created_date >= min(created_date) (историю вне окна сохраняем),
     как replace_crm_leads. ON CONFLICT (lead_id) — идемпотентный upsert (дедуп внутри
     батча при одном lead_id в двух листах).
+
+    delete_from — левая граница удаляемого диапазона, если она не равна min(created_date)
+    батча. Нужна лидам, достроенным по листу «Оплаты» (sync/crm.py, _payments_only_rows):
+    их дата создания может быть старше прочитанных листов «Лиды», и расширять удаление до
+    неё нельзя — снесло бы историю, которой в батче нет. Такая строка просто upsert-ится
+    поверх, без удаления диапазона.
     """
     if not rows:
         return 0
@@ -682,7 +674,7 @@ def upsert_lead_details(rows: List[Dict[str, Any]]) -> int:
     """
     for r in rows:
         r.setdefault("is_synthetic", False)  # строки из листов «Лиды» про этот флаг не знают
-    min_date = min(str(r["created_date"]) for r in rows)
+    min_date = delete_from or min(str(r["created_date"]) for r in rows)
     with get_connection() as conn:
         with conn.cursor() as cur:
             _guard_window_replace(cur, "crm_lead_details", "created_date", "1", rows, len(rows), min_date)
