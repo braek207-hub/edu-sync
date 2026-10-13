@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date, timedelta
 from typing import Any
 
 from .common import (
@@ -29,18 +30,61 @@ def _is_number_only(s: str) -> bool:
     return bool(stripped) and stripped.isdigit()
 
 
-def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    direct_by_key = {
+DirectIndex = tuple[dict[tuple[str, str], dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]
+
+
+def direct_index(direct_rows: list[dict[str, Any]]) -> DirectIndex:
+    by_key = {
         (str(row["date"]), str(row["campaign_id"])): row
         for row in direct_rows
         if row.get("date") and row.get("campaign_id")
     }
     # Secondary index by campaign name — matches Metrica rows that use text names in utm_campaign
-    direct_by_name = {
+    by_name = {
         (str(row["date"]), _norm_campaign_name(str(row.get("campaign_name") or ""))): row
         for row in direct_rows
         if row.get("date") and row.get("campaign_name")
     }
+    return by_key, by_name
+
+
+def match_direct(
+    row_date: str, source: str, metrica_campaign_id: str, index: DirectIndex
+) -> tuple[str, dict[str, Any] | None]:
+    """Кампания витрины до схлопывания + строка Директа за этот день (или None)."""
+    direct_by_key, direct_by_name = index
+    campaign_id = fact_campaign_id(source, metrica_campaign_id)
+    direct_row = None
+    if is_paid_source(source) and campaign_id:
+        direct_row = direct_by_key.get((row_date, campaign_id))
+        # Secondary lookup: if utm_campaign is a text name (not a number), try matching by name
+        if not direct_row and not _is_number_only(metrica_campaign_id) and metrica_campaign_id:
+            direct_row = direct_by_name.get((row_date, _norm_campaign_name(metrica_campaign_id)))
+    return campaign_id, direct_row
+
+
+def resolve_fact_campaign(
+    source: str, campaign_id: str, metrica_name: str, direct_row: dict[str, Any] | None
+) -> tuple[str, str, str]:
+    """(campaign_id, campaign_name, source_type) строки витрины. Общий для marketing_daily_fact
+    и поштучных покупок (sync_purchase_fact.py): покупка обязана лечь в ту же кампанию, что
+    и строка витрины, иначе ячейка «ПОКУПКИ» и её список в Panda-BI разойдутся."""
+    direct_name = str(direct_row.get("campaign_name") or "") if direct_row else ""
+    campaign_name = campaign_name_or_default(source, campaign_id, direct_name or metrica_name)
+    # Number-only campaign_id with no Direct match → collapse into nameless bucket
+    # (shows as "Не определено" in table rather than an unreadable numeric ID)
+    if _is_number_only(campaign_id) and not direct_row:
+        campaign_id = ""
+        campaign_name = ""
+    source_type = str(direct_row.get("source_type") or "") if direct_row else ""
+    if is_paid_source(source) and not source_type:
+        source_type = infer_source_type(campaign_name)
+    return campaign_id, campaign_name, source_type
+
+
+def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    index = direct_index(direct_rows)
+    direct_by_key = index[0]
     # Track which direct keys are consumed under "automatic" attribution to avoid
     # triple-counting unmatched Direct-only rows across attributions.
     consumed_direct_keys: set[tuple[str, str]] = set()
@@ -57,15 +101,8 @@ def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[s
         source = str(row.get("source") or "organic")
         source_detail = str(row.get("source_detail") or "")
         metrica_campaign_id = str(row.get("utm_campaign") or "")
-        campaign_id = fact_campaign_id(source, metrica_campaign_id)
+        campaign_id, direct_row = match_direct(row_date, source, metrica_campaign_id, index)
         direct_key = (row_date, campaign_id)
-        direct_row = None
-        if is_paid_source(source) and campaign_id:
-            direct_row = direct_by_key.get(direct_key)
-            # Secondary lookup: if utm_campaign is a text name (not a number), try matching by name
-            if not direct_row and not _is_number_only(metrica_campaign_id) and metrica_campaign_id:
-                name_key = (row_date, _norm_campaign_name(metrica_campaign_id))
-                direct_row = direct_by_name.get(name_key)
         if direct_row and attribution == "automatic":
             consumed_direct_keys.add(direct_key)
             # For name-based matches the Direct row's numeric ID differs from the Metrica text key.
@@ -76,23 +113,17 @@ def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[s
                 consumed_direct_keys.add(direct_actual_key)
         # Apply Direct cost (impressions/clicks/cost) only once per campaign per day.
         # Same campaign_id can appear in multiple rows with different source_detail.
+        # До 13.10.2026 здесь обнулялся сам direct_row — и вторая строка кампании за день
+        # теряла связь с Директом: номерная кампания схлопывалась в «Не определено» вместе с
+        # визитами и покупками (сентябрь: 10–12 пар «кампания × день» на модель).
         direct_cost_key = (row_date, attribution, campaign_id)
-        if direct_row and direct_cost_key in direct_cost_applied:
-            direct_row = None
-        elif direct_row:
+        cost_row = direct_row if direct_row and direct_cost_key not in direct_cost_applied else None
+        if cost_row:
             direct_cost_applied.add(direct_cost_key)
 
-        direct_name = str(direct_row.get("campaign_name") or "") if direct_row else ""
-        metrica_name = str(row.get("campaign_name") or "")
-        campaign_name = campaign_name_or_default(source, campaign_id, direct_name or metrica_name)
-        # Number-only campaign_id with no Direct match → collapse into nameless bucket
-        # (shows as "Не определено" in table rather than an unreadable numeric ID)
-        if _is_number_only(campaign_id) and not direct_row:
-            campaign_id = ""
-            campaign_name = ""
-        source_type = str(direct_row.get("source_type") or "") if direct_row else ""
-        if is_paid_source(source) and not source_type:
-            source_type = infer_source_type(campaign_name)
+        campaign_id, campaign_name, source_type = resolve_fact_campaign(
+            source, campaign_id, str(row.get("campaign_name") or ""), direct_row
+        )
 
         br_m = parse_optional_float(row.get("bounce_rate"))
         pd_m = parse_optional_float(row.get("page_depth"))
@@ -132,9 +163,9 @@ def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[s
                     "begin_checkout": parse_int(row.get("begin_checkout")),
                     "purchases": parse_int(row.get("purchases")),
                     "revenue": money(row.get("revenue")),
-                    "impressions": parse_int(direct_row.get("impressions")) if direct_row else 0,
-                    "clicks": parse_int(direct_row.get("clicks")) if direct_row else 0,
-                    "cost_vat": money(direct_row.get("cost_vat")) if direct_row else 0.0,
+                    "impressions": parse_int(cost_row.get("impressions")) if cost_row else 0,
+                    "clicks": parse_int(cost_row.get("clicks")) if cost_row else 0,
+                    "cost_vat": money(cost_row.get("cost_vat")) if cost_row else 0.0,
                     "bounce_rate": br_m,
                     "page_depth": pd_m,
                 }
@@ -171,6 +202,20 @@ def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[s
     return sorted(fact_rows, key=lambda item: (item["date"], item["attribution"], item["source"], item["campaign_id"]))
 
 
+def missing_staging_days(metrica_rows: list[dict[str, Any]], date_from: str, date_to: str) -> list[str]:
+    """Дни окна без строк staging Метрики. Витрина окна стирается целиком, а staging лежит
+    только с 21.05.2026 (витрина — с 01.06.2024, раньше её собирал другой конвейер):
+    пересборка дня без staging стёрла бы его без замены."""
+    have = {str(row.get("date")) for row in metrica_rows}
+    day, end = date.fromisoformat(date_from), date.fromisoformat(date_to)
+    missing: list[str] = []
+    while day <= end:
+        if day.isoformat() not in have:
+            missing.append(day.isoformat())
+        day += timedelta(days=1)
+    return missing
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build marketing_daily_fact from Metrica and Direct staging tables.")
     add_date_range_args(parser)
@@ -179,6 +224,12 @@ def main() -> None:
 
     supabase = SupabaseRest()
     metrica_rows = supabase.select_date_range("stg_metrica_daily_campaign", date_from, date_to)
+    missing = missing_staging_days(metrica_rows, date_from, date_to)
+    if missing:
+        raise RuntimeError(
+            f"build_fact {date_from}..{date_to}: нет staging Метрики за {len(missing)} дн. "
+            f"({missing[0]}..{missing[-1]}) — витрину не трогаю"
+        )
     direct_rows = supabase.select_date_range("stg_direct_daily_campaign", date_from, date_to)
     fact_rows = build_fact_rows(metrica_rows, direct_rows)
 

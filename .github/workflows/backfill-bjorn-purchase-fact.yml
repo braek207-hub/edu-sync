@@ -1,0 +1,69 @@
+name: Backfill BJORN purchase fact
+
+# Разовый перенакат окна: витрина (build_fact — фикс схлопывания второй строки кампании,
+# 13.10.2026) и покупки поштучно по моделям (sync_purchase_fact). Метрику и Директ staging
+# не трогает — build_fact читает уже лежащие stg_*. Окно — по месяцам, чтобы шаг не упёрся
+# в таймаут.
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "Начало окна (YYYY-MM-DD)"
+        required: true
+      date_to:
+        description: "Конец окна (YYYY-MM-DD)"
+        required: true
+
+concurrency:
+  group: bjorn-marketing-sync
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      SUPABASE_URL: ${{ secrets.BJORN_SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.BJORN_SUPABASE_SERVICE_KEY }}
+      METRICA_TOKEN: ${{ secrets.BJORN_METRICA_TOKEN }}
+      METRICA_COUNTER_ID: ${{ secrets.BJORN_METRICA_COUNTER_ID }}
+      METRICA_ATTRIBUTIONS: "automatic,first,lastsign"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Витрина и покупки по месяцам
+        env:
+          DATE_FROM: ${{ github.event.inputs.date_from }}
+          DATE_TO: ${{ github.event.inputs.date_to }}
+        run: |
+          python - <<'PY'
+          import os, subprocess, sys
+          from datetime import date, timedelta
+          start = date.fromisoformat(os.environ["DATE_FROM"])
+          end = date.fromisoformat(os.environ["DATE_TO"])
+          while start <= end:
+              nxt = (start.replace(day=1) + timedelta(days=32)).replace(day=1)
+              stop = min(nxt - timedelta(days=1), end)
+              for mod in ("sync.bjorn.build_fact", "sync.bjorn.verify_fact", "sync.bjorn.sync_purchase_fact"):
+                  print(f"== {mod} {start}..{stop}", flush=True)
+                  subprocess.run([sys.executable, "-m", mod, "--from", str(start), "--to", str(stop)], check=True)
+              start = stop + timedelta(days=1)
+          PY
+
+      - name: Revalidate dashboard cache
+        if: ${{ !cancelled() }}
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: python scripts/revalidate_panda.py bjorn
