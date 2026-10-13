@@ -1,8 +1,9 @@
 name: Backfill BJORN purchase fact
 
 # Разовый перенакат окна: витрина (build_fact — фикс схлопывания второй строки кампании,
-# 13.10.2026) и покупки поштучно по моделям (sync_purchase_fact). Метрику и Директ staging
-# не трогает — build_fact читает уже лежащие stg_*. Окно — по месяцам, чтобы шаг не упёрся
+# 13.10.2026) и покупки поштучно по моделям (sync_purchase_fact). Staging Директа не
+# трогает; staging Метрики — только с refresh_metrica=true (правка нормализации меток,
+# например «Яндекс Директ: Не определено» 13.10). Окно — по месяцам, чтобы шаг не упёрся
 # в таймаут.
 
 on:
@@ -14,6 +15,10 @@ on:
       date_to:
         description: "Конец окна (YYYY-MM-DD)"
         required: true
+      refresh_metrica:
+        description: "Сначала пересинхронизировать staging Метрики (sync_metrica)"
+        type: boolean
+        default: false
 
 concurrency:
   group: bjorn-marketing-sync
@@ -30,6 +35,9 @@ jobs:
       METRICA_TOKEN: ${{ secrets.BJORN_METRICA_TOKEN }}
       METRICA_COUNTER_ID: ${{ secrets.BJORN_METRICA_COUNTER_ID }}
       METRICA_ATTRIBUTIONS: "automatic,first,lastsign"
+      METRICA_GOAL_ADD_TO_CART: ${{ secrets.BJORN_METRICA_GOAL_ADD_TO_CART }}
+      METRICA_GOAL_BEGIN_CHECKOUT: ${{ secrets.BJORN_METRICA_GOAL_BEGIN_CHECKOUT }}
+      METRICA_GOAL_PURCHASE: ${{ secrets.BJORN_METRICA_GOAL_PURCHASE }}
       PYTHONIOENCODING: "utf-8"
 
     steps:
@@ -47,6 +55,7 @@ jobs:
         env:
           DATE_FROM: ${{ github.event.inputs.date_from }}
           DATE_TO: ${{ github.event.inputs.date_to }}
+          REFRESH_METRICA: ${{ github.event.inputs.refresh_metrica }}
         run: |
           python - <<'PY'
           import os, subprocess, sys
@@ -56,7 +65,10 @@ jobs:
           while start <= end:
               nxt = (start.replace(day=1) + timedelta(days=32)).replace(day=1)
               stop = min(nxt - timedelta(days=1), end)
-              for mod in ("sync.bjorn.build_fact", "sync.bjorn.verify_fact", "sync.bjorn.sync_purchase_fact"):
+              mods = ["sync.bjorn.build_fact", "sync.bjorn.verify_fact", "sync.bjorn.sync_purchase_fact"]
+              if os.environ.get("REFRESH_METRICA") == "true":
+                  mods.insert(0, "sync.bjorn.sync_metrica")
+              for mod in mods:
                   print(f"== {mod} {start}..{stop}", flush=True)
                   subprocess.run([sys.executable, "-m", mod, "--from", str(start), "--to", str(stop)], check=True)
               start = stop + timedelta(days=1)

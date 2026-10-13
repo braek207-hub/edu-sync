@@ -88,6 +88,13 @@ def test_one_row_per_purchase_and_model_earliest_wins():
     assert [(r["order_id"], r["date"]) for r in rows] == [("A1", "2026-09-10")]
 
 
+def test_direct_not_set_label_both_spellings():
+    from sync.bjorn.common import derive_source_detail
+
+    for raw in ("Яндекс.Директ: Не определено", "Яндекс Директ: Не определено"):
+        assert derive_source_detail(raw, "", PAID) == "Яндекс.Директ"
+
+
 def test_build_fact_refuses_window_without_staging():
     from sync.bjorn.build_fact import missing_staging_days
 
