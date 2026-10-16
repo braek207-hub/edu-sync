@@ -217,23 +217,39 @@ def sync_direct_api_range(
             print(f"  [{login}] ОШИБКА: {e}")
             errors.append(f"{login}: {e}")
 
-    if errors and not all_rows:
-        print(f"Директ API: все клиенты с ошибками: {'; '.join(errors)}")
-        return 0
-    if not all_rows:
-        return 0
+    # Ни один кабинет не загрузился — сбой, а не «нет данных»: раньше здесь был return 0, и
+    # прогон, где у всех четырёх «Reports API: превышено число попыток», выходил с кодом 0
+    # при витрине, застывшей на позавчера.
+    if errors and len(errors) == len(clients):
+        raise RuntimeError(f"Директ API: ни один кабинет не загрузился: {'; '.join(errors)}")
+    # Full-перезагрузка удаляет окно у ВСЕХ кабинетов (delete_direct_stats_from без фильтра по
+    # логину): при частичном сбое упавший кабинет потерял бы историю. Ничего не трогаем.
+    if errors and replace_from:
+        raise RuntimeError(
+            "Директ API: full-перезагрузка отменена, удаление не выполнялось — "
+            f"не загрузились: {'; '.join(errors)}"
+        )
 
     all_rows = [r for r in all_rows if str(r.get("date", "")) >= date_from]
-    if not all_rows:
-        return 0
+    written = 0
+    if all_rows:
+        from sync.db import delete_direct_stats_from, upsert_direct_stats
 
-    from sync.db import delete_direct_stats_from, upsert_direct_stats
+        if replace_from:
+            deleted = delete_direct_stats_from(date_from)
+            print(f"Директ API: удалено {deleted} строк с {date_from}")
+        written = upsert_direct_stats(all_rows)
 
-    if replace_from:
-        deleted = delete_direct_stats_from(date_from)
-        print(f"Директ API: удалено {deleted} строк с {date_from}")
-
-    return upsert_direct_stats(all_rows)
+    # Частичный сбой: загрузившиеся кабинеты записаны (upsert чужие строки не задевает), но
+    # прогон красный. WARN в логе зелёного прогона не читает никто, а сторож свежести кабинет
+    # не видит: соседи двигают max(date) витрины, и расход одного направления застывает
+    # незаметно — так три кабинета из четырёх месяцами стояли у настроек
+    # (sync/edu_direct_settings.py). Кэш дашборда сбрасывается и при красном исходе.
+    if errors:
+        raise RuntimeError(
+            f"Директ API: записано {written} строк, не загрузились кабинеты: {'; '.join(errors)}"
+        )
+    return written
 
 
 def sync_direct_incremental(days_back: int = DEFAULT_INCREMENTAL_DAYS) -> int:

@@ -217,13 +217,41 @@ def _chunked(seq: List[str], n: int):
         yield seq[i:i + n]
 
 
+# 204 с пустым телом и без RequestId — так отвечает балансер Яндекса, когда лежит сам API
+# Директа (сбой 11.10.2026; тот же разбор в sync/direct.py и sync/bjorn/sync_direct.py).
+# Это не «данных нет»: r.json() на пустом теле падал JSONDecodeError, и по логу нельзя было
+# понять, что недоступен Директ. 429/5xx — перегрузка того же API. Короткий повтор
+# переживает мигание балансера; не поднялся — понятная ошибка, кабинет уходит в failed.
+_API_RETRY_STATUSES = frozenset({204, 429, 500, 502, 503, 504})
+_API_ATTEMPTS = 5
+_API_BACKOFF_SEC = 5  # 5, 10, 20, 40 с — около минуты с четвертью на вызов
+_API_TIMEOUT_SEC = 120
+
+
 def _direct_post(url: str, body: Dict[str, Any]) -> Dict[str, Any]:
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    r = requests.post(url, data=data, headers=_json_headers())
-    r.encoding = "utf-8"
-    if r.status_code != 200:
+    for attempt in range(1, _API_ATTEMPTS + 1):
+        r = requests.post(url, data=data, headers=_json_headers(), timeout=_API_TIMEOUT_SEC)
+        r.encoding = "utf-8"
+        empty = not (r.content or b"").strip()
+        if r.status_code == 200 and not empty:
+            break
+        if (empty or r.status_code in _API_RETRY_STATUSES) and attempt < _API_ATTEMPTS:
+            wait = _API_BACKOFF_SEC * 2 ** (attempt - 1)
+            print(f"  [edu_direct_settings] Директ API {r.status_code}"
+                  f"{' пустое тело' if empty else ''}: повтор через {wait} с "
+                  f"({attempt}/{_API_ATTEMPTS})")
+            time.sleep(wait)
+            continue
+        if empty:
+            raise RuntimeError(
+                f"Директ API {r.status_code} (недоступен): пустой ответ {url}, попыток {attempt}"
+            )
         raise RuntimeError(f"Direct API {url} {r.status_code}: {r.text[:300]}")
-    js = r.json()
+    try:
+        js = r.json()
+    except ValueError:
+        raise RuntimeError(f"Директ API {url}: ответ не JSON: {r.text[:300]}") from None
     if "error" in js:
         raise RuntimeError(f"Direct API error: {json.dumps(js['error'], ensure_ascii=False)}")
     return js.get("result") or {}
@@ -1492,10 +1520,9 @@ def _list_campaigns_for_login() -> Dict[str, str]:
             "Page": {"Limit": 10000},
         },
     }
-    r = requests.post(CAMPAIGNS_URL, headers=_json_headers(),
-                      data=json.dumps(body, ensure_ascii=False).encode("utf-8"), timeout=120)
-    r.raise_for_status()
-    items = (r.json().get("result") or {}).get("Campaigns") or []
+    # Через _direct_post: прямой requests.post здесь падал на 204 JSONDecodeError, а ответ
+    # {"error": …} молча читал как «0 кампаний».
+    items = _direct_post(CAMPAIGNS_URL, body).get("Campaigns") or []
     return {str(c["Id"]): c.get("Name", "") for c in items}
 
 

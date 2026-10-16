@@ -73,7 +73,14 @@ def call(token: str, login: str, service: str, payload: Dict[str, Any]) -> Dict[
     req = urllib.request.Request(API + service, data=data,
                                  headers=_headers(token, login))
     with urllib.request.urlopen(req, timeout=120) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
+        status, raw = resp.status, resp.read()
+    # 204 с пустым телом — json.loads падал «Expecting value: line 1 column 1», и по логу
+    # нельзя было понять, что не ответил Директ (12–16.10.2026 так стояли четыре кабинета EDU
+    # каждый такт). Без повтора внутри: повтор — сам цикл тактов через PASS_GAP, а пауза на
+    # каждый из двадцати логинов съела бы бюджет такта.
+    if status == 204 or not raw.strip():
+        raise DirectError("%s: Директ API %s (недоступен) — пустой ответ" % (service, status))
+    body = json.loads(raw.decode("utf-8"))
     if "error" in body:
         err = body["error"]
         raise DirectError("%s [%s] %s: %s" % (

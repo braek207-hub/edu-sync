@@ -25,9 +25,9 @@ from typing import Any
 
 import requests
 
-INGEST_URL = os.environ.get(
-    "MESHNFLESH_INGEST_URL", "https://panda-bi.vercel.app/api/ingest/meshnflesh"
-).strip()
+from sync.panda_url import ingest_url
+
+INGEST_URL = ingest_url("meshnflesh", "MESHNFLESH_INGEST_URL")
 SYNC_DAYS = int(os.environ.get("MESHNFLESH_SYNC_DAYS", "7"))
 PER_PAGE = 100
 BATCH_SIZE = 200

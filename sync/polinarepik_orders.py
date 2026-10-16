@@ -18,12 +18,12 @@ from typing import Any
 
 import requests
 
+from sync.panda_url import ingest_url
+
 SOURCE_URL = os.environ.get(
     "POLINAREPIK_ORDERS_API_URL", "https://polinarepik.com/api/metrikaorder/get"
 ).strip()
-INGEST_URL = os.environ.get(
-    "POLINAREPIK_INGEST_URL", "https://panda-bi.vercel.app/api/ingest/polinarepik"
-).strip()
+INGEST_URL = ingest_url("polinarepik", "POLINAREPIK_INGEST_URL")
 BATCH_SIZE = int(os.environ.get("POLINAREPIK_ORDERS_BATCH", "200"))
 # 30.08–01.09.26 их сайт стал стопорить TLS-хендшейк для зарубежных IP (раннеры GH):
 # «Read timed out (15)» на этапе connect. Из РФ отвечает за 3 с. Длинные ретраи с большим

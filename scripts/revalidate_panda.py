@@ -9,7 +9,7 @@ Panda-BI (/api/revalidate) сбрасывает тег `<slug>-data` назва�
 
 Env:
     CRON_SECRET   — тот же секрет, что в Vercel (Bearer); без него роут отвечает 401.
-    PANDA_BI_URL  — база Panda-BI, по умолчанию прод.
+    PANDA_BI_URL  — база Panda-BI, по умолчанию прод (sync/panda_url.py).
 """
 import json
 import os
@@ -17,8 +17,14 @@ import socket
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
-DEFAULT_URL = "https://panda-bi.vercel.app"
+# Запуск файлом (python scripts/revalidate_panda.py) кладёт в sys.path только scripts/ —
+# пакет sync без корня репозитория не найдётся (тот же приём в scripts/agent_feedback.py).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from sync.panda_url import DEFAULT_BASE_URL as DEFAULT_URL, panda_base_url  # noqa: E402
+
 # Слаги, у которых в Panda-BI есть тег данных (lib/cache-tags.ts, DATA_SLUGS). Опечатку ловим
 # здесь, до сети: в логе синка она понятнее, чем 400 от сервера.
 SLUGS = ("lime", "edunetwork", "bjorn", "polinarepik", "meshnflesh")
@@ -53,7 +59,7 @@ def main(argv=None):
         print("::error::CRON_SECRET не задан — кэш Panda-BI не сброшен")
         return 1
 
-    req = build_request(slugs, secret, os.environ.get("PANDA_BI_URL") or DEFAULT_URL)
+    req = build_request(slugs, secret, panda_base_url())
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             print(resp.read().decode("utf-8", errors="replace"))
