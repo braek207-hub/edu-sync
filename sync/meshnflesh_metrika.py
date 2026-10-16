@@ -458,53 +458,63 @@ def main() -> int:
     date_from = (today - timedelta(days=days)).isoformat()
     date_to = today.isoformat()
     errors: list[str] = []
+    # Пилот Panda-BI запускает источники отдельными юнитами: лёг Директ — Метрика всё равно
+    # идёт и отчитывается успехом. Пусто — все источники, как в workflow sync-meshnflesh-metrika.yml.
+    sources = {s.strip() for s in _env("MESHNFLESH_SOURCES").split(",") if s.strip()}
+    unknown = sources - {"direct", "metrica"}
+    if unknown:
+        print(f"ERROR: MESHNFLESH_SOURCES: неизвестные {sorted(unknown)} (есть direct, metrica)")
+        return 1
+    sources = sources or {"direct", "metrica"}
 
-    direct_token = _env("MESHNFLESH_DIRECT_TOKEN")
-    if not direct_token:
-        print("Direct: MESHNFLESH_DIRECT_TOKEN не задан, блок пропущен")
-    else:
+    if "direct" in sources:
+        direct_token = _env("MESHNFLESH_DIRECT_TOKEN")
+        if not direct_token:
+            print("Direct: MESHNFLESH_DIRECT_TOKEN не задан, блок пропущен")
+        else:
+            try:
+                print(f"Direct: {date_from} — {date_to} [{DIRECT_CLIENT_LOGIN}]")
+                rows = fetch_direct_report(direct_token, date_from, date_to)
+                print(f"  rows: {len(rows)}")
+                if rows:
+                    print(f"  upserted: {upsert_direct(rows)}")
+            except Exception as e:
+                print(f"ERROR direct: {e}")
+                errors.append(f"direct: {e}")
+
+    if "metrica" in sources:
         try:
-            print(f"Direct: {date_from} — {date_to} [{DIRECT_CLIENT_LOGIN}]")
-            rows = fetch_direct_report(direct_token, date_from, date_to)
+            print(f"Metrica sources: {date_from} — {date_to}")
+            rows = _fetch_with_split(fetch_metrica_sources, token, date_from, date_to)
             print(f"  rows: {len(rows)}")
             if rows:
-                print(f"  upserted: {upsert_direct(rows)}")
+                deleted = delete_sources_from(date_from)
+                print(f"  deleted from {date_from}: {deleted}")
+                print(f"  upserted: {upsert_sources(rows)}")
         except Exception as e:
-            print(f"ERROR direct: {e}")
-            errors.append(f"direct: {e}")
+            print(f"ERROR metrica sources: {e}")
+            errors.append(f"sources: {e}")
 
-    try:
-        print(f"Metrica sources: {date_from} — {date_to}")
-        rows = _fetch_with_split(fetch_metrica_sources, token, date_from, date_to)
-        print(f"  rows: {len(rows)}")
-        if rows:
-            deleted = delete_sources_from(date_from)
-            print(f"  deleted from {date_from}: {deleted}")
-            print(f"  upserted: {upsert_sources(rows)}")
-    except Exception as e:
-        print(f"ERROR metrica sources: {e}")
-        errors.append(f"sources: {e}")
-
-    try:
-        print(f"Metrica purchases: {date_from} — {date_to}")
-        rows = _fetch_with_split(fetch_metrica_purchases, token, date_from, date_to)
-        # после разбиения заказ может попасть в оба под-окна — оставляем позднюю дату,
-        # иначе execute_batch упадёт на двойном ON CONFLICT по order_id
-        by_order = {}
-        for r in rows:
-            prev = by_order.get(r["order_id"])
-            if prev and prev["purchase_date"] > r["purchase_date"]:
-                continue
-            by_order[r["order_id"]] = r
-        rows = list(by_order.values())
-        print(f"  rows: {len(rows)}")
-        if rows:
-            deleted = delete_purchases_from(date_from)
-            print(f"  deleted from {date_from}: {deleted}")
-            print(f"  upserted: {upsert_purchases(rows)}")
-    except Exception as e:
-        print(f"ERROR metrica purchases: {e}")
-        errors.append(f"purchases: {e}")
+        try:
+            print(f"Metrica purchases: {date_from} — {date_to}")
+            rows = _fetch_with_split(fetch_metrica_purchases, token, date_from, date_to)
+            # после разбиения заказ может попасть в оба под-окна — оставляем позднюю дату,
+            # иначе execute_batch упадёт на двойном ON CONFLICT по order_id
+            by_order = {}
+            for r in rows:
+                prev = by_order.get(r["order_id"])
+                if prev and prev["purchase_date"] > r["purchase_date"]:
+                    continue
+                by_order[r["order_id"]] = r
+            rows = list(by_order.values())
+            print(f"  rows: {len(rows)}")
+            if rows:
+                deleted = delete_purchases_from(date_from)
+                print(f"  deleted from {date_from}: {deleted}")
+                print(f"  upserted: {upsert_purchases(rows)}")
+        except Exception as e:
+            print(f"ERROR metrica purchases: {e}")
+            errors.append(f"purchases: {e}")
 
     print("=== Mesh-n-Flesh Metrika Sync DONE ===")
     if errors:
