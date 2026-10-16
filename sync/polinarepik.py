@@ -538,34 +538,44 @@ def main() -> int:
 
     days = int(os.environ.get("POLINAREPIK_SYNC_DAYS", str(DEFAULT_SYNC_DAYS)))
     errors: list[str] = []
+    # Пилот Panda-BI запускает источники отдельными юнитами: лёг Директ — Метрика всё равно
+    # идёт и отчитывается успехом. Пусто — все источники, как в workflow sync-polinarepik.yml.
+    sources = {s.strip() for s in os.environ.get("POLINAREPIK_SOURCES", "").split(",") if s.strip()}
+    unknown = sources - {"direct", "metrica"}
+    if unknown:
+        print(f"ERROR: POLINAREPIK_SOURCES: неизвестные {sorted(unknown)} (есть direct, metrica)")
+        return 1
+    sources = sources or {"direct", "metrica"}
 
-    try:
-        n = sync_direct(days)
-        print(f"Direct upserted: {n}")
-    except Exception as e:
-        print(f"ERROR direct: {e}")
-        errors.append(f"direct: {e}")
+    if "direct" in sources:
+        try:
+            n = sync_direct(days)
+            print(f"Direct upserted: {n}")
+        except Exception as e:
+            print(f"ERROR direct: {e}")
+            errors.append(f"direct: {e}")
 
-    try:
-        n = sync_metrica(days)
-        print(f"Metrica visits upserted: {n}")
-    except Exception as e:
-        print(f"ERROR metrica visits: {e}")
-        errors.append(f"metrica visits: {e}")
+    if "metrica" in sources:
+        try:
+            n = sync_metrica(days)
+            print(f"Metrica visits upserted: {n}")
+        except Exception as e:
+            print(f"ERROR metrica visits: {e}")
+            errors.append(f"metrica visits: {e}")
 
-    try:
-        n = sync_metrica_sources(days)
-        print(f"Metrica sources upserted: {n}")
-    except Exception as e:
-        print(f"ERROR metrica sources: {e}")
-        errors.append(f"metrica sources: {e}")
+        try:
+            n = sync_metrica_sources(days)
+            print(f"Metrica sources upserted: {n}")
+        except Exception as e:
+            print(f"ERROR metrica sources: {e}")
+            errors.append(f"metrica sources: {e}")
 
-    try:
-        n = sync_metrica_purchases(days)
-        print(f"Metrica purchases upserted: {n}")
-    except Exception as e:
-        print(f"ERROR metrica purchases: {e}")
-        errors.append(f"metrica purchases: {e}")
+        try:
+            n = sync_metrica_purchases(days)
+            print(f"Metrica purchases upserted: {n}")
+        except Exception as e:
+            print(f"ERROR metrica purchases: {e}")
+            errors.append(f"metrica purchases: {e}")
 
     print("=== Polinarepik Sync DONE ===")
 
