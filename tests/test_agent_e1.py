@@ -24,6 +24,17 @@ from sync.agent.writer.apply import SandboxApplyRefusal, apply_actions
 from sync.agent.writer import risk
 
 
+@pytest.fixture(autouse=True)
+def _isolated_argv(monkeypatch):
+    """main() разбирает sys.argv строго (неизвестный флаг → REFUSED, код 2).
+
+    Без этого тест видит argv самого pytest: прогон с «--ignore=…» или
+    «--deselect=…» превращал каждый вызов main() в отказ. Тест, которому
+    нужны флаги, переопределяет argv поверх.
+    """
+    monkeypatch.setattr(sys, "argv", ["agent_e1"])
+
+
 class _FakeLease:
     """Аренда прогона без БД: считает перепроверки и умеет «потеряться».
 
@@ -662,8 +673,9 @@ def _patch_run(monkeypatch, computed_by_login, campaigns_by_login, daily_cost,
     if prod_apply:
         args += ["--prod", "--apply"]
     args += list(argv)
-    if len(args) > 1:
-        monkeypatch.setattr(sys, "argv", args)
+    # Всегда, а не только при флагах: иначе main() читает argv самого pytest,
+    # и его «--ignore=…» — для parse_campaign_scope неизвестный флаг → REFUSED (2).
+    monkeypatch.setattr(sys, "argv", args)
     _MultiCabinetClient.instances = []
     _MultiCabinetClient.campaigns_by_login = campaigns_by_login
     logins = list(computed_by_login.keys())

@@ -268,7 +268,7 @@ def test_fractional_orders_written_as_is():
     rows = [dict(zip(COLS, r)) for r in merge_rows([], orders, [], 1.0, "2026-07-17")]
     got = {r["subchannel"]: r["purchases_count"] for r in rows}
     assert got == {"Google.Adwords": 0.6, "SEO Google": 0.4}
-    assert sum(r["purchases_count"] for r in rows) == 1
+    assert sum(r["purchases_count"] for r in rows) == pytest.approx(1, abs=1e-9)
     assert {r["purchases_revenue"] for r in rows} == {600.0, 400.0}
 
 
@@ -291,7 +291,10 @@ def test_day_total_equals_sum_of_fractions():
               _o("ОАЭ", "SEO", "SEO Google", 1.9),
               _o("ОАЭ", "CRM", "Mindbox", 0.45)]
     rows = [dict(zip(COLS, r)) for r in merge_rows([], orders, [], 1.0, "2026-07-17")]
-    assert sum(r["purchases_count"] for r in rows) == 8.05
+    # Сравнение с допуском: прод пишет каждую строку точно (round(…, 6), double precision),
+    # а 3.2+2.5+1.9+0.45 в двоичной плавающей точке даёт 8.049999999999999. Допуск 1e-9
+    # мельче шага прод-округления (1e-6) — округление тотала до целого он не пропустит.
+    assert sum(r["purchases_count"] for r in rows) == pytest.approx(8.05, abs=1e-9)
 
 
 def test_integer_orders_pass_through_unchanged():
@@ -307,6 +310,6 @@ def test_app_order_rows_keep_fractions():
            _o("ОАЭ", "SEO", "SEO Google", 0.3, 300.0)]
     rows = [dict(zip(COLS, r)) for r in app_order_rows(app, 1.0, "2026-07-17")]
     assert all(r["data_source"] == "app" for r in rows)
-    assert sum(r["purchases_count"] for r in rows) == 1
+    assert sum(r["purchases_count"] for r in rows) == pytest.approx(1, abs=1e-9)
     got = {r["subchannel"]: r["purchases_count"] for r in rows}
     assert got["Google.Adwords"] == 0.7 and got["SEO Google"] == 0.3
