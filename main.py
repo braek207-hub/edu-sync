@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Ежедневный синк EDU Dashboard: Директ API + Google Sheets → Supabase."""
 
+import importlib
 import os
 import sys
 
@@ -42,118 +43,90 @@ def _resolve_env() -> None:
         os.environ["DATABASE_URL"] = os.environ["DIRECT_URL"]
 
 
-def main() -> None:
+# Шаги по источникам: (источник, модуль, функция). EDU_SOURCES=direct,crm,… выбирает подмножество —
+# пилот Panda-BI запускает их отдельными юнитами; пусто — все, как в workflow sync.yml.
+STEPS = [
+    ("direct", "sync.direct", "sync_direct_all"),
+    ("crm", "sync.crm", "sync_crm_leads"),
+    ("crm", "sync.crm", "sync_crm_payments"),
+    # План EDU УБРАН из daily: monthly_plans ведётся экраном планов Panda-BI
+    # (/p/edunetwork/plans). Ночной TRUNCATE из листа plan_monthly стирал бы правки.
+    # Стратегии УБРАНЫ из daily: снапшот стратегий пишет sync.edu_direct_settings из API Директа.
+    # CRM lite УБРАН (аудит 2026-08-21): источник оплат и выручки от лидов —
+    # колонки crm_leads.payments_from_leads / revenue_from_leads.
+    # Офлайн-конверсии в Я.Метрику (если задан YM_TOKEN) — ЗАПИСЬ в Метрику, дедуп через журнал
+    # в БД: двум базам нельзя гонять его одновременно, иначе конверсии уйдут дважды.
+    ("metrika_offline", "sync.metrika_offline", "sync_metrika_offline"),
+    # Поведение визитов Метрики (vuz) для AI-скоринга лидов (если задан YM_TOKEN).
+    ("visits", "sync.edu_visits", "sync_edu_visits"),
+    # LIME · AppMetrica: установки + когорты покупателей (если задан APPMETRICA_TOKEN).
+    ("lime_appmetrica", "sync.lime_appmetrica", "sync_lime_appmetrica"),
+]
+SOURCES = sorted({src for src, _, _ in STEPS})
+
+
+def selected_sources() -> set[str] | None:
+    """Источники из EDU_SOURCES; None — неизвестное имя (ошибка конфигурации)."""
+    sources = {s.strip() for s in os.environ.get("EDU_SOURCES", "").split(",") if s.strip()}
+    unknown = sources - set(SOURCES)
+    if unknown:
+        print(f"ОШИБКА: EDU_SOURCES: неизвестные {sorted(unknown)} (есть {', '.join(SOURCES)})")
+        return None
+    return sources or set(SOURCES)
+
+
+def missing_env(sources: set[str]) -> list[str]:
+    missing = [] if os.environ.get("DATABASE_URL") else ["DATABASE_URL"]
+    if "direct" in sources:
+        if not os.environ.get("DIRECT_TOKEN"):
+            missing.append("DIRECT_TOKEN")
+        if not (os.environ.get("DIRECT_CLIENTS_JSON") or os.environ.get("DIRECT_CLIENT_LOGIN")):
+            missing.append("DIRECT_CLIENTS_JSON")
+    # Таблица CRM: лиды/оплаты и client_id для офлайн-конверсий.
+    if sources & {"crm", "metrika_offline"}:
+        if not os.environ.get("GOOGLE_SHEETS_ID"):
+            missing.append("GOOGLE_SHEETS_ID")
+        if not (os.environ.get("GOOGLE_SERVICE_ACCOUNT") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")):
+            missing.append("GOOGLE_CREDENTIALS")
+    return missing
+
+
+def main() -> int:
     print("=== EDU Sync START ===")
     _resolve_env()
 
-    required = ["DATABASE_URL", "DIRECT_TOKEN", "GOOGLE_SHEETS_ID"]
-    has_direct_client = bool(
-        os.environ.get("DIRECT_CLIENTS_JSON")
-        or os.environ.get("DIRECT_CLIENT_LOGIN")
-    )
-    if not has_direct_client:
-        required.append("DIRECT_CLIENTS_JSON (или DIRECT_CLIENT_LOGIN)")
-
-    has_google = bool(
-        os.environ.get("GOOGLE_SERVICE_ACCOUNT")
-        or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    )
-    if not has_google:
-        required.append("GCP_SA_KEY / GOOGLE_SERVICE_ACCOUNT")
-
-    missing = []
-    for k in required:
-        if "или" in k:
-            continue
-        if not os.environ.get(k):
-            missing.append(k)
-    if not has_direct_client:
-        missing.append("DIRECT_CLIENTS_JSON")
-    if not has_google:
-        missing.append("GOOGLE_CREDENTIALS")
-
+    sources = selected_sources()
+    if sources is None:
+        return 1
+    missing = missing_env(sources)
     if missing:
         print(f"ОШИБКА: отсутствуют: {', '.join(missing)}")
-        sys.exit(1)
+        return 1
 
     errors: list[str] = []
+    for src, module, func in STEPS:
+        if src not in sources:
+            continue
+        try:
+            getattr(importlib.import_module(module), func)()
+        except Exception as e:
+            print(f"ОШИБКА {func}: {e}")
+            errors.append(f"{func}: {e}")
 
-    try:
-        from sync.direct import sync_direct_all
+    if "crm" in sources:
+        try:
+            from sync.validate_sheets import run_validation
 
-        sync_direct_all()
-    except Exception as e:
-        print(f"ОШИБКА direct: {e}")
-        errors.append(f"direct: {e}")
-
-    try:
-        from sync.crm import sync_crm_leads
-
-        sync_crm_leads()
-    except Exception as e:
-        print(f"ОШИБКА crm_leads: {e}")
-        errors.append(f"crm_leads: {e}")
-
-    try:
-        from sync.crm import sync_crm_payments
-
-        sync_crm_payments()
-    except Exception as e:
-        print(f"ОШИБКА crm_payments: {e}")
-        errors.append(f"crm_payments: {e}")
-
-    # План EDU УБРАН из daily: monthly_plans ведётся экраном планов Panda-BI
-    # (/p/edunetwork/plans). Ночной TRUNCATE из листа plan_monthly стирал бы правки.
-
-    # Стратегии УБРАНЫ из daily: Sheets-лист strategies_daily умер вместе с GAS
-    # (последние данные 2026-06-03). Снапшот стратегий теперь пишет
-    # sync.edu_direct_settings из API Директа (workflow sync-edu-direct-settings).
-
-    # CRM lite УБРАН: считал когортный fallback по всем годам (174k лидов, тяжёлый
-    # JSONB ~минуты) — был сломан (orders=0) и больше не нужен. Источник оплат и
-    # выручки от лидов — колонки crm_leads.payments_from_leads / revenue_from_leads.
-    # Модуль sync/crm_lite.py и таблица dashboard_extras удалены (аудит 2026-08-21):
-    # «случай возврата» за 2.5 месяца не наступил, приложение таблицу не читало.
-
-    # Офлайн-конверсии в Я.Метрику (если задан YM_TOKEN). Дедуп через журнал.
-    try:
-        from sync.metrika_offline import sync_metrika_offline
-
-        sync_metrika_offline()
-    except Exception as e:
-        print(f"ОШИБКА metrika_offline: {e}")
-        errors.append(f"metrika_offline: {e}")
-
-    # Поведение визитов Метрики (vuz) для AI-скоринга лидов (если задан YM_TOKEN).
-    try:
-        from sync.edu_visits import sync_edu_visits
-
-        sync_edu_visits()
-    except Exception as e:
-        print(f"ОШИБКА edu_visits: {e}")
-        errors.append(f"edu_visits: {e}")
-
-    # LIME · AppMetrica: установки + когорты покупателей (если задан APPMETRICA_TOKEN).
-    try:
-        from sync.lime_appmetrica import sync_lime_appmetrica
-
-        sync_lime_appmetrica()
-    except Exception as e:
-        print(f"ОШИБКА lime_appmetrica: {e}")
-        errors.append(f"lime_appmetrica: {e}")
-
-    try:
-        from sync.validate_sheets import run_validation
-
-        run_validation()
-    except Exception as e:
-        print(f"WARN validate: {e}")
+            run_validation()
+        except Exception as e:
+            print(f"WARN validate: {e}")
 
     print("=== EDU Sync DONE ===")
     if errors:
         print(f"Завершено с ошибками: {errors}")
-        sys.exit(1)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
