@@ -16,8 +16,10 @@ import requests
 MANAGEMENT_URL = "https://api-metrika.yandex.net/management/v1/counter/{counter}/goals"
 STAT_URL = "https://api-metrika.yandex.net/stat/v1/data"
 
-RETRIES = int(os.environ.get("LIME_METRIKA_GOALS_RETRIES") or "3")
-RETRY_SLEEP = int(os.environ.get("LIME_METRIKA_GOALS_RETRY_SLEEP") or "5")
+# 400 «Query is too complicated» у Stat API зависит от нагрузки Яндекса: тот же день через минуту
+# отдаётся (16.10.2026 — две попытки за 15 с не хватило). Терпение дешевле урезания accuracy=full.
+RETRIES = int(os.environ.get("LIME_METRIKA_GOALS_RETRIES") or "5")
+RETRY_SLEEP = int(os.environ.get("LIME_METRIKA_GOALS_RETRY_SLEEP") or "15")
 
 # Stat API принимает до 20 метрик за запрос; берём с запасом, чтобы не упереться в лимит
 # при добавлении служебной метрики.

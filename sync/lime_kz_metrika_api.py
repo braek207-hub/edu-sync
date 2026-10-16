@@ -12,8 +12,10 @@ import time
 import requests
 
 # Повторы на транзиентные ошибки Stat API (см. fetch_kz_traffic). Пауза растёт линейно.
-RETRIES = int(os.environ.get("LIME_KZ_METRIKA_RETRIES") or "3")
-RETRY_SLEEP = int(os.environ.get("LIME_KZ_METRIKA_RETRY_SLEEP") or "5")
+# 400 «Query is too complicated» у Stat API зависит от нагрузки Яндекса: тот же день через минуту
+# отдаётся (16.10.2026 — две попытки за 15 с не хватило). Терпение дешевле урезания accuracy=full.
+RETRIES = int(os.environ.get("LIME_KZ_METRIKA_RETRIES") or "5")
+RETRY_SLEEP = int(os.environ.get("LIME_KZ_METRIKA_RETRY_SLEEP") or "15")
 
 # Порядок важен только для нашего запроса: разбор читает позиции из эха ответа.
 DIMENSIONS = (
