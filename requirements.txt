@@ -9,6 +9,7 @@ httplib2==0.32.0  # decode_limit_* появились в 0.32 — см. sync/she
 python-dotenv==1.0.0
 playwright==1.61.0
 pytest==7.4.4
+pyyaml==6.0.3  # тесты читают workflow-файлы (test_agent_reprice_workflow_permissions)
 catboost==1.2.5
 scikit-learn==1.4.2
 pandas==2.2.2
