@@ -66,8 +66,10 @@ def fetch_day(page, day: str) -> list:
     return (data.get("data") or {}).get("campaignsStatistics") or []
 
 
-def build_rows(page, date_from: date, date_to: date) -> list:
+def build_rows(page, date_from: date, date_to: date) -> tuple[list, int]:
+    """Строки периода и число дней, которые не удалось снять."""
     rows = []
+    failed = 0
     d = date_from
     while d <= date_to:
         day = d.isoformat()
@@ -75,6 +77,7 @@ def build_rows(page, date_from: date, date_to: date) -> list:
             camps = fetch_day(page, day)
         except Exception as e:
             print(f"[geo] день {day}: {e}")
+            failed += 1
             d += timedelta(days=1)
             continue
         for c in camps:
@@ -95,7 +98,7 @@ def build_rows(page, date_from: date, date_to: date) -> list:
                 "conversions": json.dumps({}, ensure_ascii=False),
             })
         d += timedelta(days=1)
-    return rows
+    return rows, failed
 
 
 def main() -> None:
@@ -105,9 +108,14 @@ def main() -> None:
     print(f"[geo] company={COMPANY_ID} период {date_from}..{date_to}")
 
     with yandex_page(ORIGIN) as page:
-        rows = build_rows(page, date_from, date_to)
+        rows, failed = build_rows(page, date_from, date_to)
 
-    print(f"[geo] строк к записи: {len(rows)}")
+    print(f"[geo] строк к записи: {len(rows)}, дней с ошибкой: {failed} из {days_back}")
+    # Ни один день не снялся — почти всегда протухла сессия Яндекса (страница уводит на вход, и
+    # getStatisticsSummary не приходит). Раньше прогон выходил с 0 и ничего не писал — геомедийка
+    # молча вставала. Красный прогон = алерт: перезахватить scripts/capture_yandex_session.py.
+    if failed == days_back:
+        raise SystemExit("[geo] не снят ни один день — сессия Яндекса протухла? Перезахватить сессию")
     if rows[:1]:
         print(f"[geo] пример: {rows[0]}")
 
