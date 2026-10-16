@@ -128,9 +128,13 @@ def fetch_kz_traffic(counter_id, token: str, date_from: str, date_to: str) -> li
         if resp.status_code == 200:
             return parse_metrika_kz(resp.json())
         if attempt < RETRIES:
+            # Тело ответа — единственный ключ к причине осечки (квота, параллельность, сбой API):
+            # без него транзиентный 400 не отличить от настоящей ошибки запроса.
             print(f"lime_kz_metrika_api: WARN {date_from} HTTP {resp.status_code}, "
-                  f"попытка {attempt} из {RETRIES}, повтор через {RETRY_SLEEP * attempt}с")
+                  f"попытка {attempt} из {RETRIES}, повтор через {RETRY_SLEEP * attempt}с: "
+                  f"{resp.text[:300]}")
             time.sleep(RETRY_SLEEP * attempt)
 
+    print(f"lime_kz_metrika_api: ERROR {date_from} HTTP {resp.status_code}: {resp.text[:300]}")
     resp.raise_for_status()
     return []  # недостижимо: raise_for_status уже бросил на не-200

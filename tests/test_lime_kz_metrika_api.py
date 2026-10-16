@@ -80,9 +80,10 @@ def test_geo_filter_targets_kazakhstan():
 
 
 class _Resp:
-    def __init__(self, status, payload=None):
+    def __init__(self, status, payload=None, text=""):
         self.status_code = status
         self._payload = payload or {}
+        self.text = text
 
     def json(self):
         return self._payload
@@ -127,3 +128,16 @@ def test_fetch_raises_after_all_retries(monkeypatch):
 
     with pytest.raises(requests.HTTPError):
         api.fetch_kz_traffic(23504302, "tok", "2026-04-05", "2026-04-05")
+
+
+def test_fetch_logs_error_body(monkeypatch, capsys):
+    """Причина осечки — только в теле ответа: без него в журнале «HTTP 400» и ничего больше
+    (16.10.2026 на пилоте: две 400 подряд, повтор вручную — 200, причину не установить)."""
+    body = '{"errors":[{"error_type":"quota_requests_by_uid","message":"Quota exceeded"}],"code":429}'
+    monkeypatch.setattr(api.requests, "get", lambda url, **kw: _Resp(400, text=body))
+    monkeypatch.setattr(api.time, "sleep", lambda s: None)
+
+    with pytest.raises(requests.HTTPError):
+        api.fetch_kz_traffic(23504302, "tok", "2026-04-05", "2026-04-05")
+    out = capsys.readouterr().out
+    assert out.count("quota_requests_by_uid") == api.RETRIES, "тело ответа есть не в каждой попытке"
