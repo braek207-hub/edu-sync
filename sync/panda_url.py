@@ -2,13 +2,13 @@
 """Адрес Panda-BI, в который синки шлют заказы (ingest) и сброс кэша (revalidate).
 
 База — из PANDA_BI_URL: это имя уже передают юниты panda-sync@ на сервере (sync.env,
-http://127.0.0.1:3100) и читал scripts/revalidate_panda.py. Умолчание — прод на Vercel:
-прогоны GitHub Actions адрес не передают, и до дня переключения ходят туда же, что и раньше.
+http://127.0.0.1:3100) и читал scripts/revalidate_panda.py. Умолчание — прод: с 17.10.2026
+panda-bi.ru на своём сервере, а сборка Vercel осталась со старой базой Cloud.
 Пустое значение равно отсутствию: GitHub отдаёт незаведённый секрет пустой строкой.
 """
 import os
 
-DEFAULT_BASE_URL = "https://panda-bi.vercel.app"
+DEFAULT_BASE_URL = "https://panda-bi.ru"
 
 
 def panda_base_url() -> str:

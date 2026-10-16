@@ -37,7 +37,7 @@ def test_posts_own_slugs_with_bearer():
     code, sent = _run(["bjorn", "meshnflesh"], {"CRON_SECRET": "s3", "PANDA_BI_URL": ""})
     assert code == 0
     (req,) = sent
-    assert req.full_url == "https://panda-bi.vercel.app/api/revalidate"
+    assert req.full_url == "https://panda-bi.ru/api/revalidate"
     assert req.get_method() == "POST"
     assert req.get_header("Authorization") == "Bearer s3"
     assert req.get_header("Content-type").startswith("application/json")

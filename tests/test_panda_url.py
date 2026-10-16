@@ -14,7 +14,7 @@ def clean_env(monkeypatch):
 
 
 def test_default_is_prod_until_cutover():
-    assert P.panda_base_url() == "https://panda-bi.vercel.app"
+    assert P.panda_base_url() == "https://panda-bi.ru"
 
 
 def test_empty_value_means_unset(monkeypatch):
@@ -22,7 +22,7 @@ def test_empty_value_means_unset(monkeypatch):
     monkeypatch.setenv("PANDA_BI_URL", "  ")
     monkeypatch.setenv("MESHNFLESH_INGEST_URL", "")
     assert P.ingest_url("meshnflesh", "MESHNFLESH_INGEST_URL") == \
-        "https://panda-bi.vercel.app/api/ingest/meshnflesh"
+        "https://panda-bi.ru/api/ingest/meshnflesh"
 
 
 def test_base_from_env_feeds_ingest(monkeypatch):
