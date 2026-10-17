@@ -1,0 +1,31 @@
+# Одноразовый: переносит API_LIME_SHOPIFY на сервер Timeweb (день Х 17.10.2026).
+# Токен шифруется публичным ключом сервера; в логе — только шифротекст.
+# Удаляется сразу после переноса.
+name: xfer-shopify-token
+on: workflow_dispatch
+permissions: {}
+jobs:
+  xfer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: encrypt
+        env:
+          TOKEN: ${{ secrets.API_LIME_SHOPIFY }}
+        run: |
+          cat > pub.pem <<'KEY'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA2cJD1T06eFxrbN2I/Zt4
+          8na0oIzYvs7ip34i7wFK/T2daKkcRY6E1MkhUUWYVeYYcQtKfRFFOkFvnLzdX60S
+          F2g4s8F7YjfGqX9G9p2tZTQRRLge/ACCHoZ9yzeFFS4ybc2TzL8VtTw+7K8Ss5gx
+          2PIPZVZ8K+ZkHOVqTrbNan+ItdG9rZVfs5ifeJA/rL5iTpFTKvuGhbQ/Qz/08Rhp
+          DBQnBdKIWOW8eBzFkhLhxFJqkRxd18vJT75vqqCSD3NL7L0bUm4M6sglEjq8W405
+          UtuuV0kECuZrAKqaWbR9NQOmXHgZbGcIluQUYRUcO5613HBkLiXxmRprn5T5WN0N
+          A/+Gu8QuISm159JjX0+cjbrnhT3QZWSpwccQdrUTogYiQHwSy9KAiUEzXY5rs89h
+          DwMjLHEeDsAqna+qOH2KyUGXNwCBItDxw/qzmL9nrX1CfaBpW8CEViPed2OISeMa
+          PLUp2KWrwWR6gVEy0HD0urSr+6wKrITTTPqcyiIYTw4HAgMBAAE=
+          -----END PUBLIC KEY-----
+          KEY
+          sed -i 's/^ *//' pub.pem
+          case "$TOKEN" in shpat_*|shpca_*) echo "форма токена: ok, длина ${#TOKEN}";; *) echo "форма токена: НЕ shpat_/shpca_"; exit 1;; esac
+          printf '%s' "$TOKEN" | openssl pkeyutl -encrypt -pubin -inkey pub.pem -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 | base64 -w0 > ct.txt
+          printf 'CT_BEGIN%sCT_END\n' "$(cat ct.txt)"
