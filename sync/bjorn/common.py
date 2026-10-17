@@ -359,6 +359,17 @@ def chunked(items: list[dict[str, Any]], size: int) -> Iterable[list[dict[str, A
         yield items[start:start + size]
 
 
+# Первичные ключи таблиц, которые листает select_date_range. Offset-пагинация без полного
+# порядка дублирует и теряет строки на стыке страниц (17.10.2026: перезалив за 26 дней
+# удвоил строки 15.10 в marketing_daily_fact). Новой таблице — сначала ключ сюда.
+PAGINATION_KEYS: dict[str, tuple[str, ...]] = {
+    "stg_metrica_daily_campaign": ("date", "attribution", "source", "source_detail", "utm_campaign"),
+    "stg_direct_daily_campaign": ("date", "campaign_id"),
+    "marketing_daily_fact": ("date", "attribution", "source", "source_detail", "campaign_id"),
+    "bjorn_product_daily": ("date", "attribution", "source", "campaign_id", "ad_id", "product_id", "product_name"),
+}
+
+
 class SupabaseRest:
     def __init__(self) -> None:
         self.url = env_required("SUPABASE_URL").rstrip("/")
@@ -443,6 +454,7 @@ class SupabaseRest:
         print(f"{table}: upserted {len(rows)} rows")
 
     def select_date_range(self, table: str, date_from: str, date_to: str, select: str = "*") -> list[dict[str, Any]]:
+        order = ",".join(f"{col}.asc" for col in PAGINATION_KEYS[table])
         rows: list[dict[str, Any]] = []
         limit = 1000
         offset = 0
@@ -453,7 +465,7 @@ class SupabaseRest:
                 params={
                     "select": select,
                     "date": [f"gte.{date_from}", f"lte.{date_to}"],
-                    "order": "date.asc",
+                    "order": order,
                     "limit": limit,
                     "offset": offset,
                 },
