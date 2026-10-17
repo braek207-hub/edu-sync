@@ -41,10 +41,13 @@ import requests
 import psycopg2
 import psycopg2.extras
 
+from sync.direct_reports_limit import MIN_POLL_SECONDS, is_rate_limited, poll_delay
 from sync.fx import to_rub as fx_to_rub
 from sync.strategy_snapshots import msk_today, write_snapshot
 
 REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports"
+# Опрос не чаще раза в 11 с: 30 попыток — до ~6 мин на офлайн-отчёт.
+REPORT_POLL_ATTEMPTS = 30
 CAMPAIGNS_URL = "https://api.direct.yandex.com/json/v5/campaigns"
 CAMPAIGNS_V501_URL = "https://api.direct.yandex.com/json/v501/campaigns"
 STRATEGIES_URL = "https://api.direct.yandex.com/json/v5/strategies"
@@ -442,16 +445,20 @@ def _fetch_report_chunk(
     body = {"params": params}
     payload = json.dumps(body).encode("utf-8")
 
-    for _ in range(8):
+    for _ in range(REPORT_POLL_ATTEMPTS):
         r = requests.post(REPORTS_URL, data=payload, headers=_report_headers())
         r.encoding = "utf-8"
         if r.status_code == 200:
             break
         # 204 без RequestId — балансер Яндекса при лежащем API (11.10.2026), не «данных нет»: повтор.
         if r.status_code in (201, 202, 204):
-            retry_in = int(r.headers.get("retryIn", "30"))
+            retry_in = poll_delay(r.headers.get("retryIn"), 30)
             print(f"  [lime_direct] отчёт формируется, ждём {retry_in}с...")
             time.sleep(retry_in)
+            continue
+        if is_rate_limited(r.status_code, r.text):
+            print(f"  [lime_direct] лимит опроса Reports API, ждём {MIN_POLL_SECONDS}с...")
+            time.sleep(MIN_POLL_SECONDS)
             continue
         raise RuntimeError(f"Reports API {r.status_code}: {r.text[:300]}")
     else:
@@ -509,13 +516,13 @@ def _fetch_video_report(date_from: str, date_to: str) -> Dict[tuple, Dict[str, i
     out: Dict[tuple, Dict[str, int]] = {}
     try:
         r = None
-        for _ in range(8):
+        for _ in range(REPORT_POLL_ATTEMPTS):
             r = requests.post(REPORTS_URL, data=payload, headers=_report_headers())
             r.encoding = "utf-8"
             if r.status_code == 200:
                 break
-            if r.status_code in (201, 202):
-                time.sleep(int(r.headers.get("retryIn", "10")))
+            if r.status_code in (201, 202) or is_rate_limited(r.status_code, r.text):
+                time.sleep(poll_delay(r.headers.get("retryIn"), MIN_POLL_SECONDS))
                 continue
             print(f"[lime_direct] видео-отчёт {r.status_code}: {r.text[:200]}")
             return out

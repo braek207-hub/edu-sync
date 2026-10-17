@@ -11,6 +11,7 @@ from typing import Any
 
 import requests
 
+from ..direct_reports_limit import MIN_POLL_SECONDS, is_rate_limited, poll_delay
 from .common import (
     SupabaseRest,
     add_date_range_args,
@@ -84,6 +85,7 @@ def fetch_report(login: str, date_from: str, date_to: str, fields: list[str], *,
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
     backoff = 10
     server_error_attempts = 0
+    rate_limited_attempts = 0
 
     while True:
         response = requests.post(
@@ -99,7 +101,13 @@ def fetch_report(login: str, date_from: str, date_to: str, fields: list[str], *,
             time.sleep(60)
             continue
         if response.status_code == 202:
-            time.sleep(int(response.headers.get("retryIn", 60)))
+            time.sleep(poll_delay(response.headers.get("retryIn"), 60))
+            continue
+        if is_rate_limited(response.status_code, response.text):
+            rate_limited_attempts += 1
+            if rate_limited_attempts >= 10:
+                break
+            time.sleep(MIN_POLL_SECONDS)
             continue
         # 204 с пустым телом и без RequestId в списке кодов Reports API нет: так отвечает
         # балансер Яндекса, когда сам API лежит (11.10.2026 — на любой метод, любой кабинет,

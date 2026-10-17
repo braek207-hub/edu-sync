@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 import requests
 
 from sync.classify import detect_direction, detect_project, project_from_client
+from sync.direct_reports_limit import MIN_POLL_SECONDS, is_rate_limited, poll_delay
 from sync.utils import to_num_gas
 
 DIRECT_API_URL = "https://api.direct.yandex.com/json/v5/reports"
@@ -81,7 +82,7 @@ def _report_headers(login: str) -> dict:
         "Accept-Language": "ru",
         # auto: Директ сам выбирает online (мгновенно) для малых отчётов или offline
         # для крупных. Явный online давал error 8312 на больших аккаунтах EDU.
-        # Скорость офлайна обеспечивает быстрый поллинг ниже (retryIn, не 30с-минимум).
+        # Опрос — по retryIn, но не чаще лимита метода (sync/direct_reports_limit.py).
         "processingMode": "auto",
         "returnMoneyInMicros": "false",
         "skipReportHeader": "true",
@@ -182,11 +183,13 @@ def _fetch_report(login: str, date_from: str, date_to: str, goals: List[str]) ->
         # 204 с пустым телом и без RequestId — ответ балансера Яндекса при лежащем API (сбой
         # 11.10.2026), не «данных нет»: повторяем, как офлайн-ожидание (retryIn у него нет).
         if resp.status_code in (201, 202, 204):
-            # Уважаем retryIn Директа (обычно несколько секунд), не форсируем 30с минимум.
-            retry_in = int(resp.headers.get("retryIn", 5))
-            retry_in = max(2, min(retry_in, 60))
+            retry_in = min(poll_delay(resp.headers.get("retryIn"), MIN_POLL_SECONDS), 60)
             print(f"  [{login}] ждём {retry_in}с (HTTP {resp.status_code})...")
             time.sleep(retry_in)
+            continue
+        if is_rate_limited(resp.status_code, resp.text):
+            print(f"  [{login}] лимит опроса Reports API, ждём {MIN_POLL_SECONDS}с...")
+            time.sleep(MIN_POLL_SECONDS)
             continue
         raise RuntimeError(
             f"Директ API [{login}] error {resp.status_code}: {resp.text[:500]}"
