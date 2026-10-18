@@ -743,6 +743,26 @@ def test_preview_truncates_with_full_totals_and_currency():
     assert all(isinstance(r, dict) for r in res["refused"])
     assert res["refused_lines"] == ["строка этапа 1"]
     assert res["logins_total"] == 2
+    assert res["currency_by_login"] == {"kz1": "KZT"}
+
+
+def test_preview_no_currency_by_login_when_all_rub():
+    out = RunOutput(findings=[_uf("a.ru")])
+    st = FakeStore([], previews=[_preview()])
+    _go(st, {"placements": OutModule("placements", out)})
+    assert "currency_by_login" not in _done(st)
+
+
+def test_preview_would_carries_family_fields():
+    f = _uf("слово", rule="phrase_waste", metrics_scope="family", family_queries=3,
+            broad={"queries": 4, "leads": 21, "clicks": 59})
+    out = RunOutput(findings=[f, _uf("b.ru")])
+    st = FakeStore([], previews=[_preview(mkey="queries")])
+    _go(st, {"queries": OutModule("queries", out)})
+    w = {x["object"]: x for x in _done(st)["would"]}
+    assert (w["слово"]["metrics_scope"], w["слово"]["family_queries"]) == ("family", 3)
+    assert w["слово"]["broad"] == {"queries": 4, "leads": 21, "clicks": 59}
+    assert not {"metrics_scope", "family_queries", "broad"} & w["b.ru"].keys()
 
 
 def test_preview_unverified_errors_skipped_shape():

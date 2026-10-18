@@ -325,9 +325,15 @@ def _would_row(f: Finding, cur: str) -> dict:
     # находки этапа 1 без снимка metrics несут клики и расход прямо в details
     metrics = m if isinstance(m, dict) else {
         k: d[k] for k in ("clicks", "cost", "conversions") if k in d}
-    return {"object": f.object_id, "campaign_id": f.campaign_id,
-            "campaign_name": f.campaign_name or None, "login": f.login, "rule": f.rule,
-            "currency": cur, "metrics": metrics, "action": f.action}
+    row = {"object": f.object_id, "campaign_id": f.campaign_id,
+           "campaign_name": f.campaign_name or None, "login": f.login, "rule": f.rule,
+           "currency": cur, "metrics": metrics, "action": f.action}
+    # Panda (familyTail, «шире, чем запрос») читает эти поля с would, а не из metrics:
+    # без них превью против настоящего раннера не показывает семью запросов
+    for k in ("metrics_scope", "family_queries", "broad"):
+        if k in d:
+            row[k] = d[k]
+    return row
 
 
 def _preview_result(out: RunOutput, rule_id: Optional[str], accts) -> dict:
@@ -379,6 +385,10 @@ def _preview_result(out: RunOutput, rule_id: Optional[str], accts) -> dict:
     }
     if disabled:
         result["disabled"] = disabled
+    # без валюты логина Panda рисует «₽» у отказа в тенговом кабинете
+    other_cur = {login: c for login, c in cur.items() if c != RUB}
+    if other_cur:
+        result["currency_by_login"] = other_cur
     if lines:
         result["refused_lines"] = lines[:PREVIEW_REFUSED_MAX]
     return result
