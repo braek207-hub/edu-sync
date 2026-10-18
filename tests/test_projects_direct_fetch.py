@@ -47,6 +47,28 @@ def test_max_wait_none_unchanged(monkeypatch, sleeps):
     assert sleeps == [60, 30]
 
 
+def test_max_wait_counts_server_error_backoff(monkeypatch, sleeps):
+    monkeypatch.setattr(bjorn_direct.requests, "post", lambda *a, **k: Resp(503))
+    with pytest.raises(TimeoutError):
+        bjorn_direct.fetch_report("lg", "2026-10-10", "2026-10-16", ["Date"], token="t", max_wait_sec=25)
+    assert sleeps and sum(sleeps) <= 25
+
+
+def test_max_wait_counts_rate_limit_sleep(monkeypatch, sleeps):
+    limit_56 = json.dumps({"error": {"error_code": "56", "error_string": "Exceeded limit of method requests"}})
+    monkeypatch.setattr(bjorn_direct.requests, "post", lambda *a, **k: Resp(400, limit_56))
+    with pytest.raises(TimeoutError):
+        bjorn_direct.fetch_report("lg", "2026-10-10", "2026-10-16", ["Date"], token="t", max_wait_sec=25)
+    assert sleeps and sum(sleeps) <= 25
+
+
+def test_max_wait_202_retry_in_over_budget(monkeypatch, sleeps):
+    monkeypatch.setattr(bjorn_direct.requests, "post", lambda *a, **k: Resp(202, headers={"retryIn": "200"}))
+    with pytest.raises(TimeoutError):
+        bjorn_direct.fetch_report("lg", "2026-10-10", "2026-10-16", ["Date"], token="t", max_wait_sec=150)
+    assert sleeps == []
+
+
 def test_parses_and_sums_duplicates(monkeypatch, sleeps):
     text = "\n".join([
         HEADER,

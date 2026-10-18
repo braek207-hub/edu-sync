@@ -91,7 +91,8 @@ def fetch_report(
     waited = 0.0
 
     def wait_report(seconds: float) -> None:
-        # Бюджет ожидания готовности отчёта (201/202); None — ждать без предела, как раньше.
+        # Бюджет всех пауз (201/202, лимит 56, 5xx); время самих HTTP-запросов не считается —
+        # у оркестратора свой бюджет на источник. None — без предела, как раньше.
         nonlocal waited
         if max_wait_sec is not None and waited + seconds > max_wait_sec:
             raise TimeoutError(f"Отчёт Директа {login} не готов за {max_wait_sec} с")
@@ -118,7 +119,7 @@ def fetch_report(
             rate_limited_attempts += 1
             if rate_limited_attempts >= 10:
                 break
-            time.sleep(MIN_POLL_SECONDS)
+            wait_report(MIN_POLL_SECONDS)
             continue
         # 204 с пустым телом и без RequestId в списке кодов Reports API нет: так отвечает
         # балансер Яндекса, когда сам API лежит (11.10.2026 — на любой метод, любой кабинет,
@@ -128,7 +129,7 @@ def fetch_report(
             server_error_attempts += 1
             if server_error_attempts >= 5:
                 break
-            time.sleep(backoff)
+            wait_report(backoff)
             backoff = min(backoff * 2, 120)
             continue
         raise RuntimeError(f"Direct API error for {login}: {response.status_code}: {response.text[:500]}")
