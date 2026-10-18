@@ -25,8 +25,8 @@ from sync.agent.writer.goal import PLACEHOLDER_GOAL_ID, read_goal_ids
 from sync.modules import direct_api, leads
 from sync.modules import rules as R
 from sync.modules.accounts import DirectAccount
-from sync.modules.reasons import refusal
-from sync.modules.text import yo
+from sync.modules.reasons import by_rule, refusal
+from sync.modules.text import word_list, yo
 from sync.modules.types import ApplyResult, Context, Finding, RunOutput, StoredFinding
 from sync.placements.direct import MAX_REPORT_GOALS, DirectError
 
@@ -155,7 +155,8 @@ def _report_goals(builtin: Dict[str, List[int]], lead: List[int]
     не больше потолка (leads.lead_goals сверх него отказывает с too_many_goals), так что
     пользовательские правила получают их всегда. Остаток мест — целям стратегий по
     возрастанию id, как в этапе 1. Кампания, чьи цели не поместились, встроенными не
-    судится: её «ноль конверсий» был бы по неспрошенной цели.
+    судится: её «ноль конверсий» был бы по неспрошенной цели (отказ report_goals_over_cap,
+    тройки встроенных в unverified).
     """
     first = set(lead)
     rest = sorted({g for gs in builtin.values() for g in gs} - first)
@@ -366,19 +367,13 @@ def _candidates(rows, settings, cpa_limit, own_words, own_phrases):
 
 def _rule_phrase(rule: R.Rule, row: R.Row) -> str:
     # Слово — из первого условия «содержит слово» (compile_rules без него правило
-    # отвергает); фраза — сам запрос строки.
-    if rule.action in R.WORD_ACTIONS:
-        return next(str(c.value) for c in rule.conditions
-                    if c.field == "query" and c.op == "has_word")
-    return row.object
-
-
-def _pct(part: float, base: float) -> Optional[float]:
-    return part * 100.0 / base if base > 0 else None
-
-
-def _div(a: float, b: float) -> Optional[float]:
-    return a / b if b > 0 else None
+    # отвергает), но в написании запроса: ё=е — только для сравнения, а пишется то,
+    # что человек увидит в запросе (как у minus_phrase и встроенных). Фраза — сам запрос.
+    if rule.action not in R.WORD_ACTIONS:
+        return row.object
+    word = next(str(c.value) for c in rule.conditions
+                if c.field == "query" and c.op == "has_word")
+    return next((w for w in word_list(row.object) if yo(w) == yo(word.lower())), word)
 
 
 @dataclass
@@ -425,6 +420,7 @@ class _Login:
         self.rub = (acc.currency or "RUB").upper() == "RUB"
         self.out = _Scan()
         self.live: Dict[str, dict] = {}
+        self.spend: Dict[str, float] = {}
         self.families: Dict[str, _Family] = {}
         self.attach: Dict[Tuple[str, str], List[dict]] = {}
         self._held: Dict[Tuple[str, int], Optional[Tuple[str, str, Optional[str]]]] = {}
@@ -462,6 +458,25 @@ class _Login:
             return self.lead_code, True
         return "goal_not_visible", False
 
+    def gnv(self, code: str, cid: Optional[Any]) -> dict:
+        # Текст goal_not_visible — «0 лидов при расходе X»: расход кампании за окно.
+        if code != "goal_not_visible" or cid is None:
+            return {}
+        return {"cost": round(self.spend.get(str(cid), 0.0), 2)}
+
+    def _named_unfit(self, every: Dict[str, dict]) -> None:
+        """Кампания из only правила, остановленная или не того типа, — отказ, а не тишина.
+
+        Только кампании этого логина: only — список на весь проект, чужие в нём не наши."""
+        for r in self.acting:
+            for cid in sorted(r.only):
+                c = every.get(str(cid))
+                if c is None or str(cid) in self.live:
+                    continue
+                code = ("campaign_type_unsupported" if c.get("Type") not in TYPES
+                        else "campaign_stopped")
+                self.refuse(refusal(code, USER + r.id, login=self.acc.login, campaign_id=cid))
+
     def builtin_keys(self) -> List[str]:
         return [k for k in TOGGLED if self.settings["builtin"][k]] + ["stop_word"]
 
@@ -472,8 +487,10 @@ class _Login:
         if not self.rub and not self.acting:
             # Пороги и CPA модуля в рублях; тенге без конвертации дали бы чужой масштаб.
             return out.skip_account(acc.login, NON_RUB % acc.currency)
-        self.live = {str(c["Id"]): c for c in _campaigns(acc)
+        every = {str(c["Id"]): c for c in _campaigns(acc)}
+        self.live = {cid: c for cid, c in every.items()
                      if c.get("Type") in TYPES and c.get("State") in STATES}
+        self._named_unfit(every)
         if not self.live:
             self.log("[%s] нечего чистить: ни одной запущенной текстовой кампании или ЕПК"
                      % acc.login)
@@ -487,7 +504,11 @@ class _Login:
             # Цель, не попавшая в отчёт, дала бы кампании «ноль конверсий» там, где их не спросили.
             self.skip(cid, "целей в кабинете больше %d, её цели не вошли в отчёт"
                       % MAX_REPORT_GOALS)
-            self.refuse(refusal("too_many_goals", None, login=acc.login, campaign_id=int(cid)))
+            self.refuse(refusal("report_goals_over_cap", None, login=acc.login,
+                                campaign_id=int(cid)))
+            # Встроенные кампанию не судили: их прошлые находки в ней reconcile не закрывает.
+            for key in self.builtin_keys():
+                self.unverified(key, cid)
             del goals_by_cid[cid]
         # Правилам пользователя нужны все запущенные кампании, не только с целью стратегии:
         # условие без лидов судится и там, а лиды считаются по целям-лидам.
@@ -578,7 +599,7 @@ class _Login:
                 return None, NO_CPA
             cpa_limit = cost / conv
         return _Builtin(by_cid=by_cid, rows=mine, cpa=float(cpa_limit), cpa_auto=auto,
-                        account={"cr": _pct(conv, clicks), "cpl": _div(cost, conv)}), None
+                        account={"cr": leads.pct(conv, clicks), "cpl": leads.div(cost, conv)}), None
 
     def _builtin_picks(self, b: _Builtin, keywords, never, covered
                        ) -> Dict[Tuple[str, str], Tuple[str, Dict[str, Any]]]:
@@ -677,7 +698,7 @@ class _Login:
                                obj=phrase, by=USER + by)
             if held is None:
                 held = refusal(code, key, login=self.acc.login, campaign_id=int(cid),
-                               obj=phrase, by=USER + by, held=True)
+                               obj=phrase, by=USER + by, held=True, **self.gnv(code, cid))
         return held
 
     def guarded(self, item: dict) -> None:
@@ -715,6 +736,7 @@ class _Login:
                 {"query": r.object, "clicks": m["clicks"], "cost": m["cost"],
                  "impressions": m["impressions"], "conversions": m["leads"], "row": r})
         self.families = {cid: _Family(items) for cid, items in by.items()}
+        self.spend = {cid: sum(q["cost"] or 0.0 for q in items) for cid, items in by.items()}
         self._login_wide()
         login = self.acc.login
         cands: Dict[Tuple[str, str], _Cand] = {}
@@ -726,7 +748,8 @@ class _Login:
                 code, whole = self.unknown(self.by_id[rid], row)
                 cid = None if whole else row.campaign_id
                 self.unverified(USER + rid, cid)
-                self.refuse(refusal(code, USER + rid, login=login, campaign_id=cid))
+                self.refuse(refusal(code, USER + rid, login=login, campaign_id=cid,
+                                    **self.gnv(code, cid)))
             # Строки идут по убыванию расхода: первая строка правила — его самая дорогая.
             for hit in m.matched:
                 rule = self.by_id[hit["id"]]
@@ -764,8 +787,8 @@ class _Login:
 
             valid, why = negatives.phrase_is_valid(phrase)
             if not valid:
-                # Операторы, длина слова и фразы: Директ отклонил бы запись.
-                no("direct_rejected", detail=why)
+                # Спецсимволы, длина слова и фразы: запись упала бы, отказ на скане виден сразу.
+                no("phrase_invalid", detail=why)
                 continue
             words = _words(phrase)
             guard = self._guard(cid, phrase, words, rule_key)
@@ -784,6 +807,19 @@ class _Login:
             if _key_conflict(words, own_phrases.get(cid, ())):
                 no("conflicts_keyword")
                 continue
+            if c.rule.action == "minus_word":
+                # Условия правила — по одной строке, а минус-слово режет все запросы кампании
+                # с этим словом и его формами (урок «высшее» 25.08). Слово, которое где-то
+                # в кампании приносит лиды, не минусуем; лиды неизвестны — не проверено.
+                wide = self.families[cid].stats(words, stems=True)
+                if wide["conversions"] is None:
+                    code = self.lead_code or "goal_not_visible"
+                    self.unverified(rule_key, cid)
+                    no(code, **self.gnv(code, cid))
+                    continue
+                if wide["conversions"] > 0:
+                    no("family_pays_off", leads=wide["conversions"])
+                    continue
             c.fam = self.families[cid].stats(words, stems=False)
             if c.fam["clicks"] <= 0:
                 continue
@@ -844,7 +880,7 @@ class _Login:
             metrics=leads.finding_metrics(
                 {"clicks": fam["clicks"], "cost": fam["cost"],
                  "impressions": fam["impressions"], "leads": conv,
-                 "cr": _pct(conv, fam["clicks"]), "cpl": _div(fam["cost"], conv)},
+                 "cr": leads.pct(conv, fam["clicks"]), "cpl": leads.div(fam["cost"], conv)},
                 b.account))
         return self._finding(rule, cid, phrase, details)
 
@@ -905,32 +941,6 @@ def _silent_keys(settings: dict, rules: List[R.Rule]) -> List[str]:
     return keys
 
 
-def _by_rule(rules: List[R.Rule], findings: List[Finding], refused: List[Any],
-             over: Dict[str, int], lines: Dict[str, int]) -> Dict[str, Dict[str, int]]:
-    """{правило: {found, refused, over_cap}}; у protect found — сколько раз защитил.
-    Правила пользователя — всегда, встроенные — когда есть что считать."""
-    out: Dict[str, Dict[str, int]] = {USER + r.id: {"found": 0, "refused": 0, "over_cap": 0}
-                                      for r in rules}
-
-    def bump(key, what, n=1):
-        out.setdefault(key, {"found": 0, "refused": 0, "over_cap": 0})[what] += n
-
-    for f in findings:
-        bump(f.rule, "found")
-    for item in refused:
-        if not isinstance(item, dict):
-            continue
-        if item.get("rule"):
-            bump(item["rule"], "refused")
-        if item.get("code") == "user_protect" and item.get("by"):
-            bump(item["by"], "found")
-    for key, n in lines.items():
-        bump(key, "refused", n)
-    for key, n in over.items():
-        bump(key, "over_cap", n)
-    return out
-
-
 def run(ctx: Context) -> RunOutput:
     settings, notes = checked_settings(ctx.settings)
     win = window(ctx.now, settings["window_days"])
@@ -942,6 +952,10 @@ def run(ctx: Context) -> RunOutput:
     refused: List[Any] = [refusal("rule_invalid",
                                   USER + n["rule_id"] if n.get("rule_id") else None,
                                   detail=n.get("detail")) for n in rule_notes]
+    if lead_code == "too_many_goals":
+        # Больше 10 целей-лидов приходит только из ролей целей проекта (форма модуля не
+        # пустит): встроенные тогда судят по целям стратегий, и это должно быть видно.
+        refused.append(refusal("too_many_goals", None))
     unverified: List[tuple] = []
     scanned: List[str] = []
     errors: List[str] = []
@@ -976,7 +990,8 @@ def run(ctx: Context) -> RunOutput:
     # over_cap — общий счёт, как в этапе 1; по правилам — в by_rule.
     summary: Dict[str, Any] = {"window": list(win), "skipped": skipped, "refused": refused,
                                "over_cap": over_cap, "read": read,
-                               "by_rule": _by_rule(rules, findings, refused, over, lines)}
+                               "by_rule": by_rule([USER + r.id for r in rules], findings, refused,
+                                                  over, lines)}
     if silent:
         # Те же ключи лежат в unverified каждого логина: по этому списку UI отличает
         # «выключено настройкой» от «не проверено».

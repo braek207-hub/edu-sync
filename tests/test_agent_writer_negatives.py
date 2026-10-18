@@ -56,6 +56,18 @@ def test_operators_are_refused():
         assert not ok, phrase
 
 
+def test_only_letters_digits_dot_apostrophe():
+    # «-» Директ читает как минус-оператор, «?» из запроса — отказ записи.
+    for phrase in ("курсы - бесплатно", "курсы -бесплатно", "мгу.рф отзывы?",
+                   "вуз, москва", "диплом_2", "вуз-"):
+        ok, reason = phrase_is_valid(phrase)
+        assert not ok and "робот пишет только" in reason, phrase
+    # дефис между буквами — часть слова, не минус-оператор
+    for phrase in ("мгу.рф отзывы", "o'reilly курс", "колледж 2026", "учёба онлайн",
+                   "санкт-петербург вуз"):
+        assert phrase_is_valid(phrase) == (True, ""), phrase
+
+
 # ------------------------------------------------------------------- план
 
 

@@ -452,7 +452,7 @@ def test_max_per_run_keeps_most_expensive(api):
     out = pm.run(_ctx({"max_per_run": 2, "rules": [_rule([("cost", "gte", 1)])]}))
     assert [f.object_id for f in out.findings] == ["beta.ru", "delta.ru"]
     assert out.summary["by_rule"]["u:" + RID] == {"found": 2, "refused": 0, "over_cap": 3}
-    assert out.summary["over_cap"] == {"u:" + RID: 3}
+    assert out.summary["over_cap"] == 3
 
 
 def test_max_per_run_does_not_cap_builtins(api):

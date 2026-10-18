@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from sync.modules import direct_api, leads
 from sync.modules import rules as R
 from sync.modules.accounts import DirectAccount
+from sync.modules.reasons import by_rule, refusal
 from sync.modules.queries import MSK
 from sync.modules.types import ApplyResult, Context, Finding, RunOutput, StoredFinding
 from sync.placements import classify, direct, journal, llm, spam
@@ -68,21 +69,10 @@ def _r2(value) -> Optional[float]:
 
 
 def _metrics(row: Optional[R.Row]) -> dict:
-    m = row.metrics if row is not None else {}
-    a = row.account if row is not None else {}
-    return {"clicks": int(m.get("clicks") or 0), "cost": _r2(m.get("cost") or 0.0),
-            "impressions": int(m.get("impressions") or 0), "leads": m.get("leads"),
-            "cr": _r2(m.get("cr")), "cpl": _r2(m.get("cpl")),
-            "account_cr": _r2(a.get("cr")), "account_cpl": _r2(a.get("cpl"))}
-
-
-def refusal(code: str, rule: Optional[str], *, login: Optional[str] = None,
-            campaign_id: Optional[int] = None, obj: Optional[str] = None, **extra) -> dict:
-    """Отказ с кодом из REASON_CODES: текст и совет к нему рисует Panda."""
-    out = {"code": code, "object": obj, "campaign_id": campaign_id, "rule": rule,
-           "login": login}
-    out.update(extra)
-    return out
+    # Строки площадки в окне встроенного может не быть: метрики тогда нулевые, а не пропуск.
+    if row is None:
+        return leads.finding_metrics({}, {})
+    return leads.finding_metrics(row.metrics, row.account)
 
 
 def ask_model(plan, ask, use_db: bool, log):
@@ -647,29 +637,6 @@ def _silent_keys(settings: dict, rules: List[R.Rule]) -> List[str]:
     return keys
 
 
-def _by_rule(rules: List[R.Rule], findings: List[Finding], refused: List[Any],
-             over: Dict[str, int]) -> Dict[str, Dict[str, int]]:
-    """{правило: {found, refused, over_cap}}; у protect found — сколько раз защитил."""
-    out: Dict[str, Dict[str, int]] = {USER + r.id: {"found": 0, "refused": 0, "over_cap": 0}
-                                      for r in rules}
-
-    def bump(key, what, n=1):
-        out.setdefault(key, {"found": 0, "refused": 0, "over_cap": 0})[what] += n
-
-    for f in findings:
-        bump(f.rule, "found")
-    for item in refused:
-        if not isinstance(item, dict):
-            continue
-        if item.get("rule"):
-            bump(item["rule"], "refused")
-        if item.get("code") == "user_protect" and item.get("by"):
-            bump(item["by"], "found")
-    for key, n in over.items():
-        bump(key, "over_cap", n)
-    return out
-
-
 def run(ctx: Context) -> RunOutput:
     use_db = bool(os.environ.get("DATABASE_URL"))
     ask = llm.asker() if os.environ.get(LLM_ENV) == "1" else None
@@ -722,13 +689,13 @@ def run(ctx: Context) -> RunOutput:
     chosen, over = _select(candidates, room, settings["max_per_run"], refused, ctx.now)
     findings += chosen
     summary: Dict[str, Any] = {"refused": refused, "read": read,
-                               "by_rule": _by_rule(rules, findings, refused, over)}
+                               "by_rule": by_rule([USER + r.id for r in rules], findings, refused, over),
+                               # Число, как в queries: по правилам счёт — в by_rule.
+                               "over_cap": sum(over.values())}
     if silent:
         # Те же ключи лежат в unverified каждого логина: по этому списку UI отличает
         # «выключено настройкой» от «не проверено» (спам выключен по умолчанию).
         summary["disabled"] = silent
-    if over:
-        summary["over_cap"] = over
     if errors:
         summary["errors"] = errors
     # Упавший логин не сканировали: его открытые находки не закрываем.

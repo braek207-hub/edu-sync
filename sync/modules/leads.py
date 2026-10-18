@@ -71,12 +71,12 @@ def _goal_sum(conv: Any, goals: Iterable[int]) -> int:
     return sum(int(_num(conv.get(g, conv.get(str(g))))) for g in goals)
 
 
-def _pct(part: float, base: float) -> Optional[float]:
+def pct(part: float, base: float) -> Optional[float]:
     # Сначала умножение: 7 / 100 * 100 даёт 7.000000000000001, а в журнал идёт число.
     return part * 100.0 / base if base > 0 else None
 
 
-def _div(a: float, b: float) -> Optional[float]:
+def div(a: float, b: float) -> Optional[float]:
     return a / b if b > 0 else None
 
 
@@ -132,7 +132,7 @@ def build_rows(raw: List[Dict[str, Any]], *, goals: List[int], by: str, currency
         clicks = sum(it[2] for it in seen)
         cost = sum(it[3] for it in seen)
         leads = sum(it[5] for it in seen)
-        account = {"cr": _pct(leads, clicks), "cpl": _div(cost, leads)}
+        account = {"cr": pct(leads, clicks), "cpl": div(cost, leads)}
 
     groups: Dict[Tuple[int, str], Dict[str, Any]] = {}
     for cid, obj, clicks, cost, impressions, leads in items:
@@ -152,9 +152,9 @@ def build_rows(raw: List[Dict[str, Any]], *, goals: List[int], by: str, currency
         rows.append(Row(
             object=obj, campaign_id=cid, category=None,
             metrics={"clicks": g["clicks"], "cost": g["cost"], "impressions": g["impressions"],
-                     "ctr": _pct(g["clicks"], g["impressions"]), "leads": leads,
-                     "cr": _pct(leads, g["clicks"]) if known else None,
-                     "cpl": _div(g["cost"], leads) if known else None},
+                     "ctr": pct(g["clicks"], g["impressions"]), "leads": leads,
+                     "cr": pct(leads, g["clicks"]) if known else None,
+                     "cpl": div(g["cost"], leads) if known else None},
             account=dict(account), leads_known=known, money_known=money_known, scope=by))
     # Порядок детерминирован и полезен лимиту записи: дорогие первыми.
     rows.sort(key=lambda r: (-r.metrics["cost"], r.campaign_id, r.object))

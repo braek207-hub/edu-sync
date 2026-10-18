@@ -62,7 +62,15 @@ MAX_PHRASES_PER_TICK = 10
 # запросов, их быть не может — значит это чужая правка или битые данные.
 OPERATOR_CHARS = set('"!+[]<>|')
 
+# Кроме букв и цифр робот пишет только пробел, точку, апостроф и дефис внутри слова.
+# Список намеренно узкий: «-» на краю слова Директ читает как минус-оператор, «?» и
+# прочая пунктуация из запроса дают отказ записи. Дефис между буквами («санкт-петербург»)
+# — часть слова, без него робот отказывал бы самым частым городским запросам. Отказ на
+# расчёте лучше упавшей записи: его видно сразу и с причиной.
+EXTRA_PHRASE_CHARS = frozenset(" .'")
+
 _SPACES = re.compile(r"\s+")
+_INWORD_HYPHEN = re.compile(r"(?<=\w)-(?=\w)")
 
 DISPLAY_CAMPAIGN_REASON = (
     "минус-фразы недоступны для этого типа кампании (не текстовая)"
@@ -82,6 +90,12 @@ def phrase_is_valid(phrase: str) -> Tuple[bool, str]:
     if OPERATOR_CHARS & set(normalized):
         return False, ("во фразе есть операторы языка запросов — "
                        "автоматический рычаг такие не ставит")
+    odd = sorted({ch for ch in _INWORD_HYPHEN.sub("", normalized)
+                  if not ch.isalnum() and ch not in EXTRA_PHRASE_CHARS})
+    if odd:
+        return False, ("во фразе символы %s — робот пишет только буквы, цифры, "
+                       "пробел, точку, апостроф и дефис внутри слова"
+                       % " ".join("«%s»" % ch for ch in odd))
     words = normalized.split(" ")
     if len(words) > MAX_WORDS_PER_PHRASE:
         return False, (f"во фразе {len(words)} слов при пределе "

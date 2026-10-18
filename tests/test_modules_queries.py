@@ -709,12 +709,13 @@ def test_builtin_phrase_waste_off(monkeypatch):
 
 def test_has_word_yo_equals_e(monkeypatch):
     rows = [_row(1, "высшее образование заочно", 100, 10000, 10),
-            _row(1, "учеба бесплатно", 4, 400, 0), _row(1, "учёба онлайн", 3, 300, 0)]
+            _row(1, "учёба бесплатно", 4, 400, 0), _row(1, "учеба онлайн", 3, 300, 0)]
     FakeDirect(monkeypatch, [_camp(1)], rows, keywords={"1": []})
     for word in ("учёба", "учеба"):
         out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [
             _rule("study1", "minus_word", ("query", "has_word", word), CLICKS3)]}))
-        assert [f.object_id for f in out.findings] == ["учеба"]
+        # Пишется написание запроса, где сработало правило, а не значение условия.
+        assert [f.object_id for f in out.findings] == ["учёба"]
         # «учеба» и «учёба» — один поток под одним минус-словом.
         assert out.findings[0].details["clicks"] == 7
 
@@ -771,7 +772,7 @@ def test_user_goal_not_visible_triple(monkeypatch):
     assert out.unverified == [("login1", "u:free01", 2)]
     assert _codes(out, "goal_not_visible") == [{
         "code": "goal_not_visible", "object": None, "campaign_id": 2, "rule": "u:free01",
-        "login": "login1"}]
+        "login": "login1", "cost": 3000.0}]
 
 
 def test_user_rule_sees_campaign_without_strategy_goal(monkeypatch):
@@ -779,11 +780,11 @@ def test_user_rule_sees_campaign_without_strategy_goal(monkeypatch):
     rows = _small() + [_row(4, "курсы бесплатно", 5, 500, 0)]
     fake = FakeDirect(monkeypatch, [_camp(1), _camp(4, goal=None)], rows,
                       keywords={"1": [], "4": []})
-    out = qm.run(_ctx({"rules": [_rule("free01", "minus_word", FREE, CLICKS3)]}))
+    out = qm.run(_ctx({"rules": [_rule("free01", "minus_phrase", FREE, CLICKS3)]}))
     assert any("login1 4 " in s and "судить без конверсий нельзя" in s
                for s in out.summary["skipped"])
-    assert {(f.campaign_id, f.object_id) for f in out.findings} == {(1, "бесплатно"),
-                                                                    (4, "бесплатно")}
+    assert {(f.campaign_id, f.object_id) for f in out.findings} == {
+        (1, "курсы бесплатно"), (4, "курсы бесплатно")}
     crit = fake.reports[0]["SelectionCriteria"]["Filter"]
     assert {"Field": "CampaignId", "Operator": "IN", "Values": ["1", "4"]} in crit
     # Цели-лиды проекта: встроенные и правила считают по ним и в кампании без цели стратегии.
@@ -820,11 +821,14 @@ def test_too_many_strategy_goals_refused_explicitly(monkeypatch):
     out = qm.run(_ctx())
     assert fake.reports[0]["Goals"] == [str(g) for g in range(101, 111)]
     assert any("login1 11 " in s and "не вошли в отчёт" in s for s in out.summary["skipped"])
-    assert _codes(out) == [{"code": "too_many_goals", "object": None, "campaign_id": 11,
-                            "rule": None, "login": "login1"}]
+    assert _codes(out) == [{"code": "report_goals_over_cap", "object": None,
+                            "campaign_id": 11, "rule": None, "login": "login1"}]
+    # Встроенные кампанию 11 не судили: их прошлые находки в ней остаются открытыми.
+    assert out.unverified == [("login1", k, 11)
+                              for k in ("phrase_waste", "word_zero_conv", "stop_word")]
     # Правило без лидов судит и кампанию, чьи цели стратегии не поместились.
     out = qm.run(_ctx({"max_per_run": 100,
-                       "rules": [_rule("free01", "minus_word", FREE, CLICKS3)]}))
+                       "rules": [_rule("free01", "minus_phrase", FREE, CLICKS3)]}))
     assert 11 in {f.campaign_id for f in out.findings if f.rule == "u:free01"}
     assert "11" in fake.reports[-1]["SelectionCriteria"]["Filter"][1]["Values"]
 
@@ -832,11 +836,11 @@ def test_too_many_strategy_goals_refused_explicitly(monkeypatch):
 def test_report_without_goals_when_none_needed(monkeypatch):
     rows = [{k: v for k, v in r.items() if not k.startswith("Conversions_")} for r in _small()]
     fake = FakeDirect(monkeypatch, [_camp(1, goal=None)], rows, keywords={"1": []})
-    out = qm.run(_ctx({"rules": [_rule("free01", "minus_word", FREE, CLICKS3)]}))
+    out = qm.run(_ctx({"rules": [_rule("free01", "minus_phrase", FREE, CLICKS3)]}))
     params = fake.reports[0]
     assert "Goals" not in params and "AttributionModels" not in params
     assert params["FieldNames"] == ["CampaignId", "Query", "Impressions", "Clicks", "Cost"]
-    assert [f.object_id for f in out.findings] == ["бесплатно"]
+    assert [f.object_id for f in out.findings] == ["курсы бесплатно"]
     assert out.scanned_logins == ["login1"]
 
 
@@ -844,7 +848,7 @@ def test_blind_report_with_user_rules(monkeypatch):
     rows = [{k: v for k, v in r.items() if not k.startswith("Conversions_")} for r in _small()]
     FakeDirect(monkeypatch, [_camp(1)], rows, keywords={"1": []})
     out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [
-        _rule("free01", "minus_word", FREE, CLICKS3),
+        _rule("free01", "minus_phrase", FREE, CLICKS3),
         _rule("free02", "minus_word", FREE, NO_LEADS)]}))
     assert any(s.startswith("login1:") and "без столбцов конверсий" in s
                for s in out.summary["skipped"])
@@ -916,7 +920,7 @@ def test_invalid_phrase_refused_with_code(monkeypatch):
     out = qm.run(_ctx({"rules": [_rule("long01", "minus_phrase", ("words", "gte", 8))]}))
     assert out.findings == []
     ref, = _codes(out)
-    assert ref["code"] == "direct_rejected" and ref["rule"] == "u:long01"
+    assert ref["code"] == "phrase_invalid" and ref["rule"] == "u:long01"
     assert "слов при пределе" in ref["detail"]
 
 
@@ -936,3 +940,119 @@ def test_progress_reported(monkeypatch):
     qm.run(ctx)
     assert seen == [{"step": "bad", "logins_done": 1, "logins_total": 2},
                     {"step": "login1", "logins_done": 2, "logins_total": 2}]
+
+
+# --- раунд правок 1 ---------------------------------------------------------------------
+
+def test_user_minus_word_refused_when_family_pays_off(monkeypatch):
+    # Проба ревью: условия правила верны для «курсы бесплатно», но минус-слово срезало бы
+    # и «бесплатно онлайн обучение» с 12 лидами.
+    rows = [_row(1, "высшее образование заочно", 100, 10000, 10),
+            _row(1, "курсы бесплатно", 3, 300, 0),
+            _row(1, "бесплатно онлайн обучение", 20, 2000, 12)]
+    FakeDirect(monkeypatch, [_camp(1)], rows, keywords={"1": []})
+    rule = _rule("free01", "minus_word", FREE, CLICKS3, NO_LEADS)
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [rule]}))
+    assert out.findings == []
+    assert _codes(out) == [{"code": "family_pays_off", "object": "бесплатно",
+                            "campaign_id": 1, "rule": "u:free01", "login": "login1",
+                            "leads": 12}]
+    assert out.summary["by_rule"]["u:free01"] == {"found": 0, "refused": 1, "over_cap": 0}
+    # Словоформа тоже в семье: Директ отрежет и «бесплатного».
+    rows[2] = _row(1, "бесплатного обучения", 20, 2000, 12)
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [rule]}))
+    assert [r["code"] for r in _codes(out)] == ["family_pays_off"]
+    # Минус-фраза режет только запросы со всеми её словами: семья по слову её не держит.
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [
+        _rule("free02", "minus_phrase", FREE, CLICKS3, NO_LEADS)]}))
+    assert [f.object_id for f in out.findings] == ["курсы бесплатно"]
+
+
+def test_user_minus_word_unverified_when_family_leads_unknown(monkeypatch):
+    FakeDirect(monkeypatch, [_camp(1)], _small(), keywords={"1": []})
+    out = qm.run(_ctx({"rules": [_rule("free01", "minus_word", FREE, CLICKS3)]}))
+    assert out.findings == []
+    assert out.unverified == [("login1", "u:free01", 1)]
+    assert _codes(out) == [{"code": "no_lead_goals", "object": "бесплатно", "campaign_id": 1,
+                            "rule": "u:free01", "login": "login1"}]
+    # Цель не видна кампании: тот же исход, с расходом кампании.
+    rows = [_row(2, "курсы бесплатно", 30, 3000, 0)]
+    FakeDirect(monkeypatch, [_camp(2)], rows, keywords={"2": []})
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL],
+                       "rules": [_rule("free01", "minus_word", FREE, CLICKS3)]}))
+    assert out.findings == [] and out.unverified == [("login1", "u:free01", 2)]
+    assert _codes(out) == [{"code": "goal_not_visible", "object": "бесплатно",
+                            "campaign_id": 2, "rule": "u:free01", "login": "login1",
+                            "cost": 3000.0}]
+
+
+def test_held_goal_not_visible_carries_cost(monkeypatch):
+    rows = [_row(1, "высшее образование заочно", 100, 10000, 10),
+            _row(1, "купить диплом", 100, 12000, 0),
+            _row(2, "курсы бесплатно", 30, 3000, 0)]
+    FakeDirect(monkeypatch, [_camp(1), _camp(2)], rows, keywords={"1": [], "2": []})
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [
+        _rule("prot01", "protect", FREE, ("leads", "gte", 1)),
+        _rule("free02", "minus_phrase", FREE, CLICKS3)]}))
+    held = [r for r in _codes(out) if r.get("held")]
+    assert held == [{"code": "goal_not_visible", "object": "курсы бесплатно",
+                     "campaign_id": 2, "rule": "u:free02", "login": "login1",
+                     "by": "u:prot01", "held": True, "cost": 3000.0}]
+
+
+def test_more_than_ten_lead_goals_marked_once_per_run(monkeypatch):
+    FakeDirect(monkeypatch, [_camp(1)], _base(), keywords={"1": []})
+    ctx = _ctx()
+    ctx.project_goals = list(range(1, 12))
+    out = qm.run(ctx)
+    # Встроенные судили по цели стратегии; видно, почему не по целям-лидам.
+    assert {f.rule for f in out.findings} == {"word_zero_conv", "phrase_waste"}
+    assert _codes(out) == [{"code": "too_many_goals", "object": None, "campaign_id": None,
+                            "rule": None, "login": None}]
+    assert out.unverified == []
+
+
+def test_only_names_stopped_or_unsupported_campaign(monkeypatch):
+    camps = [_camp(1), _camp(2, state="SUSPENDED"), _camp(3, ctype="MOBILE_APP_CAMPAIGN")]
+    FakeDirect(monkeypatch, camps, _small(), keywords={"1": []})
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [
+        _rule("free01", "minus_phrase", FREE, CLICKS3,
+              campaigns={"only": [1, 2, 3, 99]})]}))
+    assert [f.object_id for f in out.findings] == ["курсы бесплатно"]
+    # 99 — не кампания этого логина: only общий на проект, чужие кампании не наши.
+    assert [(r["code"], r["campaign_id"]) for r in _codes(out)] == [
+        ("campaign_stopped", 2), ("campaign_type_unsupported", 3)]
+
+
+def test_per_campaign_cap_applies_to_user_rules(monkeypatch):
+    rows = [_row(1, "высшее образование заочно", 100, 10000, 10)]
+    rows += [_row(1, "курсы бесплатно %d" % i, 3, 300 - i, 0) for i in range(12)]
+    rows += [_row(2, "высшее образование заочно", 100, 10000, 10),
+             _row(2, "курсы бесплатно 0", 3, 100, 0)]
+    FakeDirect(monkeypatch, [_camp(1), _camp(2)], rows, keywords={"1": [], "2": []})
+    # Встроенные выключены: «бесплатно» и «курсы» они взяли бы из тех же мест кампании.
+    off = {"phrase_waste": False, "word_zero_conv": False}
+    out = qm.run(_ctx({"max_per_run": 100, "lead_goal_ids": [GOAL], "builtin": off,
+                       "rules": [_rule("free01", "minus_phrase", FREE, CLICKS3)]}))
+    per = {}
+    for f in out.findings:
+        per[f.campaign_id] = per.get(f.campaign_id, 0) + 1
+    # Лимит 10 — на кампанию: соседняя кампания своё получает.
+    assert per == {1: 10, 2: 1}
+    assert out.summary["over_cap"] == 2
+    assert out.summary["by_rule"]["u:free01"] == {"found": 11, "refused": 0, "over_cap": 2}
+    # Отложены самые дешёвые.
+    assert "курсы бесплатно 10" not in _objects(out)
+    assert "курсы бесплатно 11" not in _objects(out)
+
+
+def test_user_phrase_with_special_chars_refused(monkeypatch):
+    rows = _small() + [_row(1, "курсы - бесплатно", 5, 500, 0),
+                       _row(1, "бесплатно ли учиться?", 6, 600, 0)]
+    FakeDirect(monkeypatch, [_camp(1)], rows, keywords={"1": []})
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [
+        _rule("free01", "minus_phrase", FREE, ("clicks", "gte", 5))]}))
+    assert out.findings == []
+    assert sorted((r["code"], r["object"]) for r in _codes(out)) == [
+        ("phrase_invalid", "бесплатно ли учиться?"), ("phrase_invalid", "курсы - бесплатно")]
+    assert all("робот пишет только" in r["detail"] for r in _codes(out))
