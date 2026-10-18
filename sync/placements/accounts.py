@@ -7,6 +7,7 @@
 и потеря одного не повод оставить остальных грязными.
 """
 
+import os
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from sync.modules.accounts import accounts_for
@@ -57,16 +58,20 @@ ACCOUNTS: List[Account] = [
 BY_KEY: Dict[str, Account] = {a.key: a for a in ACCOUNTS}
 
 
-def available(keys: Optional[List[str]] = None):
+def available(keys: Optional[List[str]] = None, env=os.environ):
     """Кабинеты, до которых есть доступ, и причины отказа по остальным."""
     ready, skipped = [], []
     for account in ACCOUNTS:
         if keys and account.key not in keys:
             continue
-        found, why = accounts_for(account.slug)
+        found, why = accounts_for(account.slug, env)
         if not found:
             skipped.append((account, "; ".join(why) or "нет кабинетов Директа"))
             continue
+        if why:
+            # Частичный пропуск (нет KZ-токена, запасной список клиентов) —
+            # в журнале прогона, иначе кабинет теряется молча.
+            skipped.append((account, "; ".join(why)))
         # Токены у клиентов одного проекта бывают разные (BJORN): прогон идёт
         # по группам с общим токеном, ключ журнала остаётся проектным.
         by_token: Dict[str, List[str]] = {}

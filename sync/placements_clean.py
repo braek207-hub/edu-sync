@@ -285,8 +285,9 @@ def main(argv=None) -> int:
         _out("\nитого затронуто кампаний: %d" % touched)
         return 0
 
-    _out("режим: %s, кабинетов %d, ворота топ-%d по кликам, второй судья: %s"
-         % ("БОЕВОЙ" if apply else "репетиция", len(ready), args.top_n,
+    _out("режим: %s, проектов %d, групп токенов %d, ворота топ-%d по кликам, второй судья: %s"
+         % ("БОЕВОЙ" if apply else "репетиция",
+            len({a[0].key for a in ready}), len(ready), args.top_n,
             ("модель %s" % llm_model(ask)) if ask else "выключен (нужен --llm)"))
 
     failures = 0

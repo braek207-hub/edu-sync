@@ -42,10 +42,6 @@ def agency_logins_by_token(token: str) -> List[str]:
         offset += len(chunk)
 
 
-def _agency_from_env(slug: str) -> List[str]:
-    return agency_logins_by_token(os.environ.get("DIRECT_TOKEN", "").strip())
-
-
 def _get(env: Mapping[str, str], name: str) -> str:
     return str(env.get(name, "") or "").strip()
 
@@ -103,7 +99,11 @@ def accounts_for(slug: str, env: Mapping[str, str] = os.environ,
                  agency_logins: Optional[Callable[[str], List[str]]] = None
                  ) -> Tuple[List[DirectAccount], List[str]]:
     """Кабинеты проекта и строки «почему пропущен». Пусто + причина, не исключение."""
-    agency_logins = agency_logins or _agency_from_env
+    if agency_logins is None:
+        # Токен из переданного env, а не из os.environ: иначе подставленное
+        # окружение тихо ходило бы в сеть с чужим токеном.
+        def agency_logins(_slug: str) -> List[str]:
+            return agency_logins_by_token(_get(env, "DIRECT_TOKEN"))
     why: List[str] = []
     if slug == "edunetwork":
         found = _edu(env, agency_logins, why)
