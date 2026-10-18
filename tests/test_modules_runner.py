@@ -36,6 +36,7 @@ class FakeStore:
         self.outcomes: List[tuple] = []
         self.runs: Dict[int, dict] = {}
         self.last_started: Dict[str, Optional[datetime]] = {}
+        self.last_ok: Dict[str, Optional[datetime]] = {}
         self.outcome_ok = True
 
     @contextmanager
@@ -47,8 +48,8 @@ class FakeStore:
         self.calls.append(("load", slug))
         return self.rows
 
-    def last_run_started(self, slug, mkey):
-        return self.last_started.get(mkey)
+    def last_run_started(self, slug, mkey, statuses=None):
+        return (self.last_ok if statuses else self.last_started).get(mkey)
 
     def start_run(self, slug, mkey, mode):
         rid = len(self.runs) + 1
@@ -231,9 +232,92 @@ def test_scanned_logins_default_from_ctx_accounts(monkeypatch):
 def test_not_due_module_not_run():
     m = FakeModule("queries")
     st = FakeStore([_row("queries")])
-    st.last_started["queries"] = NOW - timedelta(hours=1)
+    st.last_started["queries"] = st.last_ok["queries"] = NOW - timedelta(hours=1)
     _go(st, {"queries": m})
     assert m.trace == [] and st.runs == {}
+
+
+def test_error_run_retried_after_two_hours():
+    m = FakeModule("queries")
+    st = FakeStore([_row("queries")])
+    st.last_started["queries"] = NOW - timedelta(hours=3)  # упавший прогон, ok сегодня не было
+    _go(st, {"queries": m})
+    assert m.trace == [("run", "queries")]
+
+
+class BadApply(FakeModule):
+    def apply(self, ctx, items):
+        self.trace.append(("apply", self.KEY))
+        raise RuntimeError("direct 500")
+
+
+class BadRollback(FakeModule):
+    def rollback(self, ctx, items):
+        raise RuntimeError("direct 500")
+
+
+class NoneApply(FakeModule):
+    def apply(self, ctx, items):
+        return None
+
+
+def test_apply_raises_isolated_in_apply_phase():
+    trace = []
+    bad = BadApply("placements", trace=trace)
+    good = FakeModule("queries", trace=trace)
+    st = FakeStore([_row("placements"), _row("queries")], pending=[_stored(1, "approved")])
+    assert _go(st, {"placements": bad, "queries": good}) == 1
+    assert st.outcomes == [(1, "failed", False)]
+    assert ("run", "queries") in trace
+
+
+def test_apply_returning_none_same_as_raise():
+    st = FakeStore([_row()], pending=[_stored(1, "approved")])
+    assert _go(st, {"placements": NoneApply("placements")}) == 1
+    assert st.outcomes == [(1, "failed", False)]
+
+
+def test_rollback_raises_returns_to_applied():
+    st = FakeStore([_row()], pending=[_stored(2, "rollback_requested")])
+    assert _go(st, {"placements": BadRollback("placements")}) == 1
+    assert st.outcomes == [(2, "applied", True)]
+
+
+def test_auto_apply_raises_marks_failed_and_rc1():
+    m = BadApply("placements", findings=[_finding("a.ru")])
+    st = FakeStore([_row(mode="auto")])
+    assert _go(st, {"placements": m}) == 1
+    assert st.outcomes == [(100, "failed", False)]
+    assert st.runs[1]["status"] == "ok"
+
+
+def test_auto_applies_open_findings_recorded_earlier():
+    # находка записана под замком агента или до перехода в auto: в этом прогоне она не новая
+    old = dataclasses.replace(_stored(7, "open"), fingerprint="placements:r:login1:1:site.ru")
+    m = FakeModule("placements", findings=[_finding("site.ru")])
+    st = FakeStore([_row(mode="auto")], existing={"placements": [old]})
+    assert _go(st, {"placements": m}) == 0
+    assert m.applied == [7] and st.outcomes == [(7, "applied", False)]
+
+
+def test_only_off_module_logged_and_busy_message():
+    logs = []
+    st = FakeStore([])
+    runner.run_project("lime", store=st, accounts=lambda s: (ACC, []), modules={},
+                       now=NOW, only="queries", log=logs.append, agent_lock_fn=lambda s: None)
+    assert any("queries выключен" in l for l in logs)
+    logs.clear()
+    runner.run_project("lime", store=FakeStore([], lock=False), accounts=lambda s: (ACC, []),
+                       modules={}, now=NOW, log=logs.append, agent_lock_fn=lambda s: None)
+    assert any("уже идёт" in l for l in logs)
+
+
+def test_pending_without_module_is_logged():
+    logs = []
+    st = FakeStore([_row()], pending=[_stored(1, "approved")])
+    runner.run_project("lime", store=st, accounts=lambda s: (ACC, []), modules={},
+                       now=NOW, log=logs.append, agent_lock_fn=lambda s: None)
+    assert any("ждёт применения" in l for l in logs)
 
 
 def test_only_filters_modules():
@@ -247,20 +331,25 @@ def test_is_due():
     msk = lambda d, h, mi=0: datetime(2026, 10, d, h, mi, tzinfo=timezone(timedelta(hours=3)))
     utc = lambda d, h, mi=0: datetime(2026, 10, d, h, mi, tzinfo=timezone.utc)
     now = msk(18, 12)
+    due = runner.is_due  # (ключ, последний ok/skipped, последняя попытка, запрос, сейчас)
     # placements всегда
-    assert runner.is_due("placements", now - timedelta(minutes=1), None, now)
+    assert due("placements", now, now, None, now)
     # queries: прогона не было вообще
-    assert runner.is_due("queries", None, None, now)
-    # queries: уже был сегодня по МСК (04:00 UTC = 07:00 МСК)
-    assert not runner.is_due("queries", utc(18, 4), None, now)
+    assert due("queries", None, None, None, now)
+    # queries: ok сегодня по МСК (04:00 UTC = 07:00 МСК)
+    assert not due("queries", utc(18, 4), utc(18, 4), None, now)
     # 21:30 UTC 17-го = 00:30 МСК 18-го — это уже сегодня
-    assert not runner.is_due("audit", utc(17, 21, 30), None, now)
+    assert not due("audit", utc(17, 21, 30), utc(17, 21, 30), None, now)
     # 20:00 UTC 17-го = 23:00 МСК 17-го — вчера
-    assert runner.is_due("audit", utc(17, 20), None, now)
+    assert due("audit", utc(17, 20), utc(17, 20), None, now)
     # до 07:00 МСК не стартуем
-    assert not runner.is_due("queries", utc(17, 10), None, msk(18, 6, 59))
+    assert not due("queries", utc(17, 10), utc(17, 10), None, msk(18, 6, 59))
     # ручной запуск перебивает расписание
-    assert runner.is_due("queries", utc(18, 4), utc(18, 5), now)
+    assert due("queries", utc(18, 4), utc(18, 4), utc(18, 5), now)
+    # после error сутки не закрыты: повтор не раньше чем через 2 часа
+    assert not due("queries", None, msk(18, 11), None, now)
+    assert due("queries", None, msk(18, 9, 59), None, now)
+    assert due("queries", utc(17, 4), msk(18, 9, 59), None, now)
 
 
 def test_agent_lock():

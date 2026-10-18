@@ -195,3 +195,13 @@ def test_approve_auto_only_open_with_action_and_no_decision_trace(live):
                  (ids[0],))
     assert live.fetchone() == ("approved", None, None)
     assert store.set_outcome(ids[0], "applied", ApplyResult(ok=True, response={}))
+
+
+def test_last_run_started_filters_by_status(live):
+    bad = store.start_run(SLUG, "queries", "report")
+    store.finish_run(bad, "error", {}, error="x")
+    assert store.last_run_started(SLUG, "queries") is not None
+    assert store.last_run_started(SLUG, "queries", ("ok", "skipped")) is None
+    good = store.start_run(SLUG, "queries", "report")
+    store.finish_run(good, "skipped", {})
+    assert store.last_run_started(SLUG, "queries", ("ok", "skipped")) is not None

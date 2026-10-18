@@ -50,10 +50,15 @@ def load_project_modules(slug: str) -> List[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
-def last_run_started(slug: str, module_key: str) -> Optional[datetime]:
+def last_run_started(slug: str, module_key: str,
+                     statuses: Optional[Sequence[str]] = None) -> Optional[datetime]:
+    """Старт последнего прогона; statuses сужает до завершённых этими статусами."""
+    st = list(statuses) if statuses else None
     with db.get_connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT max(started_at) FROM module_runs "
-                    "WHERE dashboard_slug = %s AND module_key = %s", (slug, module_key))
+                    "WHERE dashboard_slug = %s AND module_key = %s "
+                    "AND (%s::text[] IS NULL OR status = ANY(%s))",
+                    (slug, module_key, st, st))
         return cur.fetchone()[0]
 
 
