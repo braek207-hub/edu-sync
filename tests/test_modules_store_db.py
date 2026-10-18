@@ -342,5 +342,12 @@ def test_project_lead_goals_from_metrika_sources(sources):
     sources("metrika", "300", '{}')
     # Кабинет Директа целей не несёт, даже если в settings что-то похожее.
     sources("direct", "login1", '{"currency": "RUB", "goals": [{"id": 99, "role": "lead"}]}')
-    assert store.project_lead_goals(SLUG) == [20, 30, 40]
+    # quality_lead срабатывает на той же заявке, что lead: при целях lead он не добавляется.
+    assert store.project_lead_goals(SLUG) == [30, 40]
     assert store.project_lead_goals("__no_such_project__") == []
+
+
+def test_project_lead_goals_quality_only_when_no_lead(sources):
+    sources("metrika", "100", '{"goals": [{"id": 20, "name": "Качественный лид", "role": "quality_lead"},'
+                              ' {"id": 10, "name": "Корзина", "role": "step"}]}')
+    assert store.project_lead_goals(SLUG) == [20]

@@ -9,10 +9,11 @@
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from sync.modules.rules import Row
+from sync.placements.direct import MAX_REPORT_GOALS
 
-# Потолок Reports API на число целей в одном отчёте: больше целей-лидов в один отчёт не
-# попадёт, а отрезанная цель дала бы «ноль лидов» там, где их просто не спросили.
-MAX_LEAD_GOALS = 10
+# Больше целей-лидов в один отчёт не попадёт, а отрезанная цель дала бы «ноль лидов»
+# там, где их просто не спросили.
+MAX_LEAD_GOALS = MAX_REPORT_GOALS
 BY = ("campaign", "account")
 # campaign_id строки по логину целиком (scope="account"): своей кампании у неё нет,
 # кампании для записи отбирает прогон.
@@ -26,7 +27,7 @@ def _ids(raw: Any) -> List[int]:
             continue
         if isinstance(g, int):
             gid = g
-        elif isinstance(g, str) and g.strip().isdigit():
+        elif isinstance(g, str) and g.strip().isdecimal():
             gid = int(g.strip())
         else:
             continue
@@ -60,7 +61,7 @@ def _num(value: Any) -> float:
 
 def _cid(value: Any) -> Optional[int]:
     text = str(value if value is not None else "").strip()
-    return int(text) if text.isdigit() and int(text) > 0 else None
+    return int(text) if text.isdecimal() and int(text) > 0 else None
 
 
 def _goal_sum(conv: Any, goals: Iterable[int]) -> int:

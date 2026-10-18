@@ -19,7 +19,7 @@ from sync.modules import direct_api
 from sync.modules.accounts import DirectAccount
 from sync.modules.text import yo
 from sync.modules.types import ApplyResult, Context, Finding, RunOutput, StoredFinding
-from sync.placements.direct import DirectError
+from sync.placements.direct import MAX_REPORT_GOALS, DirectError
 
 KEY = "queries"
 FIELD = "NegativeKeywords"
@@ -27,8 +27,6 @@ FIELD = "NegativeKeywords"
 TYPES = frozenset({"TEXT_CAMPAIGN", "UNIFIED_CAMPAIGN"})
 STATES = frozenset({"ON"})
 TYPE_BLOCKS = {"TEXT_CAMPAIGN": "TextCampaign", "UNIFIED_CAMPAIGN": "UnifiedCampaign"}
-# Потолок Reports API на число целей в одном отчёте (как в placements_with_goals).
-MAX_REPORT_GOALS = 10
 # Горсть на кампанию за прогон — та же, что у агента за такт: связь «отсекли -> упал поток»
 # должна оставаться видна по дням.
 PER_CAMPAIGN = negatives.MAX_PHRASES_PER_TICK

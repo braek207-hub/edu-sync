@@ -43,6 +43,8 @@ def test_no_goals_anywhere():
 def test_invalid_ids_dropped_before_chain():
     # Мусор вместо целей модуля — то же, что их нет: идём к целям проекта.
     assert leads.lead_goals({"lead_goal_ids": [True, "x", 0, -5]}, [G1]) == ([G1], None)
+    # isdigit() пропустил бы «²», а int() на нём падает
+    assert leads.lead_goals({"lead_goal_ids": ["²"]}, [G1]) == ([G1], None)
 
 
 def test_eleven_goals_refused_not_truncated():

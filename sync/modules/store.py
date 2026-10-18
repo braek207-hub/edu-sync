@@ -53,8 +53,10 @@ def load_project_modules(slug: str, include_off: bool = False) -> List[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
-# Роли целей Метрики, которые считаются лидом (lib/project/source-settings.ts: GoalRole).
-# «step» — промежуточный шаг воронки, не лид.
+# Роли целей Метрики, которые считаются лидом (lib/project/source-settings.ts: GoalRole),
+# по старшинству. «step» — промежуточный шаг воронки, не лид. quality_lead срабатывает на
+# той же заявке, что и lead (EDU quality_lead_ml), — их сумма посчитала бы заявку дважды,
+# поэтому качественные цели берутся, только когда целей с ролью lead нет.
 LEAD_ROLES = ("lead", "quality_lead")
 
 
@@ -68,7 +70,7 @@ def project_lead_goals(slug: str) -> List[int]:
         cur.execute("SELECT settings FROM project_sources "
                     "WHERE dashboard_slug = %s AND kind = 'metrika' ORDER BY id", (slug,))
         rows = cur.fetchall()
-    out = set()
+    by_role = {role: set() for role in LEAD_ROLES}
     for (settings,) in rows:
         goals = settings.get("goals") if isinstance(settings, dict) else None
         for g in goals if isinstance(goals, list) else []:
@@ -76,8 +78,11 @@ def project_lead_goals(slug: str) -> List[int]:
                 continue
             gid = g.get("id")
             if isinstance(gid, int) and not isinstance(gid, bool) and gid > 0:
-                out.add(gid)
-    return sorted(out)
+                by_role[g["role"]].add(gid)
+    for role in LEAD_ROLES:
+        if by_role[role]:
+            return sorted(by_role[role])
+    return []
 
 
 def last_run_started(slug: str, module_key: str,

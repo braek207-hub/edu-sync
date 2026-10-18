@@ -271,13 +271,13 @@ def placements_window(token: str, login: str, days: int,
     lines = _report_lines(token, login, body)
     if not lines:
         return []
-    header = lines[0].split("	")
+    header = lines[0].split("\t")
     conv_cols = [(i, int(m.group(1))) for i, h in enumerate(header)
                  for m in [re.match(r"Conversions_(\d+)", h)] if m]
     col = {h: i for i, h in enumerate(header)}
     rows = []
     for line in lines[1:]:
-        cells = line.split("	")
+        cells = line.split("\t")
         if len(cells) < len(header):
             continue
         if cells[col["AdNetworkType"]].upper() != "AD_NETWORK":
