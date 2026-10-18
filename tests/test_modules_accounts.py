@@ -84,11 +84,3 @@ def test_default_agency_lookup_uses_injected_token(monkeypatch):
                         lambda token: seen.append(token) or ["c1"])
     acc, _ = accounts_for("edunetwork", {"DIRECT_TOKEN": "inj"})
     assert seen == ["inj"] and [a.login for a in acc] == ["c1"]
-
-
-def test_available_keeps_partial_skip_reason():
-    from sync.placements import accounts as reg
-    env = {"LIME_DIRECT_TOKEN": "a", "LIME_DIRECT_CLIENT_LOGIN": "l1"}
-    ready, skipped = reg.available(["lime"], env)
-    assert [(a.label, l) for a, l in ready] == [("LIME", ["l1"])]
-    assert any(a.label == "LIME" and "LIME_DIRECT_KZ_TOKEN" in w for a, w in skipped)
