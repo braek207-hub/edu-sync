@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from sync.modules.accounts import DirectAccount
 
@@ -63,3 +63,6 @@ class RunOutput:
     summary: dict = field(default_factory=dict)
     # None — прочитаны все кабинеты ctx; иначе только эти логины (остальные не закрываем)
     scanned_logins: Optional[List[str]] = None
+    # (логин, правило), которые прогон не проверил: вход правила не прочитан или правило
+    # выключено настройкой. Их живые находки reconcile не трогает: молчание — не «исправлено».
+    unverified: List[Tuple[str, str]] = field(default_factory=list)

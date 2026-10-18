@@ -151,6 +151,7 @@ def run(ctx: Context) -> RunOutput:
     errors: List[str] = []
     skipped: Dict[str, Dict[str, int]] = {}
     unavailable: Dict[str, Dict[str, str]] = {}
+    unverified: List[Tuple[str, str]] = []
     for acc in ctx.accounts:
         try:
             snap = fetch_snapshot(acc, win)
@@ -163,6 +164,7 @@ def run(ctx: Context) -> RunOutput:
         # scanned_logins, и его открытые находки не закрываются как исправленные.
         findings += found
         scanned.append(acc.login)
+        unverified += [(acc.login, rule) for rule in sorted(snap.unverified)]
         for rule, by in snap.skipped.items():
             slot = skipped.setdefault(rule, {})
             for reason, n in by.items():
@@ -181,4 +183,5 @@ def run(ctx: Context) -> RunOutput:
         summary["unavailable"] = unavailable
     if errors:
         summary["errors"] = errors
-    return RunOutput(findings=findings, summary=summary, scanned_logins=scanned)
+    return RunOutput(findings=findings, summary=summary, scanned_logins=scanned,
+                     unverified=unverified)

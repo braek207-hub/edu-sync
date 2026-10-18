@@ -219,9 +219,9 @@ def test_scanned_logins_default_from_ctx_accounts(monkeypatch):
     seen = []
     orig = runner.reconcile
 
-    def spy(mkey, existing, found, now, scanned=None):
+    def spy(mkey, existing, found, now, scanned=None, **kw):
         seen.append(scanned)
-        return orig(mkey, existing, found, now, scanned)
+        return orig(mkey, existing, found, now, scanned, **kw)
 
     monkeypatch.setattr(runner, "reconcile", spy)
     _go(FakeStore([_row()]), {"placements": FakeModule("placements")})
@@ -410,3 +410,20 @@ def test_dry_run_db_read_fails_falls_back_to_defaults():
     rc, logs = _dry(st, {"placements": m})
     assert rc == 0 and m.trace == [("run", "placements")]
     assert any("предупреждение" in line for line in logs)
+
+
+def test_unverified_reaches_reconcile_and_summary(monkeypatch):
+    seen = []
+    orig = runner.reconcile
+
+    def spy(mkey, existing, found, now, scanned=None, **kw):
+        seen.append(kw.get("unverified"))
+        return orig(mkey, existing, found, now, scanned, **kw)
+
+    monkeypatch.setattr(runner, "reconcile", spy)
+    m = FakeModule("audit")
+    m.run = lambda ctx: RunOutput(findings=[], unverified=[("login1", "ads_rejected")])
+    st = FakeStore([_row("audit", mode="report")])
+    _go(st, {"audit": m})
+    assert seen == [[("login1", "ads_rejected")]]
+    assert st.runs[1]["summary"]["unverified"] == {"login1": ["ads_rejected"]}

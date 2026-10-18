@@ -12,7 +12,7 @@ API), оно записывает в snap.skipped: молчание правил
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from sync.modules.queries import TYPE_BLOCKS, strategy_goals
 from sync.modules.types import Finding
@@ -64,14 +64,21 @@ class Snapshot:
     impressions_from: str = ""
     # правило -> причина -> сколько объектов не проверено
     skipped: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    # правила, не проверившие кабинет целиком (вход не прочитан или правило выключено):
+    # их открытые находки в этом кабинете прогон не закрывает
+    unverified: Set[str] = field(default_factory=set)
 
 
 Check = Callable[[Snapshot, dict], List[Finding]]
 
 
-def skip(snap: Snapshot, rule: str, reason: str, count: int = 1) -> None:
+def skip(snap: Snapshot, rule: str, reason: str, count: int = 1, whole: bool = False) -> None:
+    """whole=True — правило не получило свой вход или выключено, а не просто не судит объект
+    неподходящего типа (такой объект находки и не давал): молчание правила тогда не «чисто»."""
     by = snap.skipped.setdefault(rule, {})
     by[reason] = by.get(reason, 0) + count
+    if whole:
+        snap.unverified.add(rule)
 
 
 def _block(campaign: dict) -> dict:
@@ -208,7 +215,7 @@ def ads_rejected(snap: Snapshot, settings: dict) -> List[Finding]:
     cmap = _camp_map(snap)
     out = []
     if snap.rejected_ads is None:
-        skip(snap, "ads_rejected", "запрос отклонённых объявлений не удался")
+        skip(snap, "ads_rejected", "запрос отклонённых объявлений не удался", whole=True)
         return out
     for ad in snap.rejected_ads:
         camp = cmap.get(int(ad.get("CampaignId") or 0))
@@ -260,11 +267,12 @@ def banned_words(snap: Snapshot, settings: dict) -> List[Finding]:
              if str(w).strip()]
     if not words:
         skip(snap, "banned_words", "список banned_words пуст — правило выключено",
-             sum(1 for _ in _ads(snap)))
+             sum(1 for _ in _ads(snap)), whole=True)
         return []
     unread = _count_unread_ads(snap) if snap.responsive_ads is None else 0
     if unread:
-        skip(snap, "banned_words", "объявления ЕПК: v501 не ответил, читать нечем", unread)
+        skip(snap, "banned_words", "объявления ЕПК: v501 не ответил, читать нечем", unread,
+             whole=True)
     out = []
     for camp, ad in _ads(snap):
         texts = _texts(ad)
@@ -296,7 +304,7 @@ def on_no_impressions(snap: Snapshot, settings: dict) -> List[Finding]:
             continue
         # Стартовавшая внутри окна или позже не обязана была показываться все три дня.
         if START_DATE in snap.unavailable:
-            skip(snap, "on_no_impressions", "поле StartDate не принято API")
+            skip(snap, "on_no_impressions", "поле StartDate не принято API", whole=True)
             continue
         start = str(c.get("StartDate") or "")
         if start and snap.impressions_from and start > snap.impressions_from:
@@ -345,7 +353,7 @@ def no_negatives(snap: Snapshot, settings: dict) -> List[Finding]:
             continue
         if SHARED_SETS in snap.unavailable:
             # Без наборов общих минус-слов «пусто» может быть ложным: не судим.
-            skip(snap, "no_negatives", "поле %s не принято API" % SHARED_SETS)
+            skip(snap, "no_negatives", "поле %s не принято API" % SHARED_SETS, whole=True)
             continue
         if _items(c.get("NegativeKeywords")) or _items(c.get(SHARED_SETS)):
             continue
@@ -365,7 +373,7 @@ def href_no_utm(snap: Snapshot, settings: dict) -> List[Finding]:
     groups = {int(g["Id"]): g for g in snap.groups}
     if not settings.get("require_utm", True):
         skip(snap, "href_no_utm", "require_utm выключен — правило выключено",
-             sum(1 for _ in _ads(snap)))
+             sum(1 for _ in _ads(snap)), whole=True)
         return []
     out = []
     for camp, ad in _ads(snap):
@@ -378,7 +386,7 @@ def href_no_utm(snap: Snapshot, settings: dict) -> List[Finding]:
             skip(snap, "href_no_utm", "тип кампании без чтения TrackingParams")
             continue
         if ctype == "UNIFIED_CAMPAIGN" and UNIFIED_TRACKING in snap.unavailable:
-            skip(snap, "href_no_utm", "поле TrackingParams не принято API (ЕПК)")
+            skip(snap, "href_no_utm", "поле TrackingParams не принято API (ЕПК)", whole=True)
             continue
         if str(block.get("TrackingParams") or "").strip():
             continue
@@ -405,7 +413,7 @@ def strategy_goal_not_allowed(snap: Snapshot, settings: dict) -> List[Finding]:
             continue
     if not allowed:
         skip(snap, "strategy_goal_not_allowed",
-             "список allowed_goal_ids пуст — правило выключено", len(snap.campaigns))
+             "список allowed_goal_ids пуст — правило выключено", len(snap.campaigns), whole=True)
         return []
     out = []
     for c in snap.campaigns:
@@ -474,7 +482,8 @@ def title_underused(snap: Snapshot, settings: dict) -> List[Finding]:
         fill = 0.6
     unread = _count_unread_ads(snap) if snap.responsive_ads is None else 0
     if unread:
-        skip(snap, "title_underused", "объявления ЕПК: v501 не ответил, читать нечем", unread)
+        skip(snap, "title_underused", "объявления ЕПК: v501 не ответил, читать нечем", unread,
+             whole=True)
     out = []
     for camp, ad in _ads(snap):
         texts = _texts(ad)

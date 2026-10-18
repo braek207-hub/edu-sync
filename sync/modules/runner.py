@@ -231,9 +231,14 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 scanned = out.scanned_logins if out.scanned_logins is not None \
                     else [a.login for a in accts]
                 rec = reconcile(mkey, store.existing_findings(slug, mkey), out.findings,
-                                now, scanned)
+                                now, scanned, unverified=out.unverified)
                 inserted = store.apply_reconciled(slug, mkey, run_id, rec)
                 summary = dict(out.summary)
+                if out.unverified:
+                    by_login: Dict[str, List[str]] = {}
+                    for login, rule in out.unverified:
+                        by_login.setdefault(login, []).append(rule)
+                    summary["unverified"] = by_login
                 summary.update(findings=len(out.findings), inserted=len(rec.insert),
                                resolved=len(rec.resolve), expired=len(rec.expire))
                 summary.update(stats.get(mkey, {}))

@@ -245,3 +245,17 @@ def test_live_seen_under_both_rules_deduped():
 def test_two_seen_with_one_action_insert_one():
     f1, f2 = finding(action=ACT, rule="a"), finding(action=ACT, rule="b")
     assert reconcile(MK, [], [f1, f2], NOW).insert == [f1]
+
+
+def test_unverified_pair_keeps_open_finding():
+    audit = stored(finding("ad1", rule="ads_rejected"), id=1, seen_ago=timedelta(hours=100))
+    other = stored(finding("ad2", rule="no_sitelinks"), id=2)
+    act = stored(finding("s.ru", action=ACT, rule="ads_rejected"), id=3,
+                 seen_ago=timedelta(hours=EXPIRE_HOURS + 1))
+    r = reconcile(MK, [audit, other, act], [], NOW, ["acc"],
+                  unverified=[("acc", "ads_rejected")])
+    # правило не отработало: ни resolve, ни expire; соседнее правило закрывается как обычно
+    assert r.resolve == [2] and r.expire == []
+    # другой кабинет с тем же правилом не держит
+    r = reconcile(MK, [audit], [], NOW, ["acc"], unverified=[("other", "ads_rejected")])
+    assert r.resolve == [1]

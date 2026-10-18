@@ -234,3 +234,73 @@ def test_start_date_is_optional_field(monkeypatch):
     assert out.summary["skipped"]["on_no_impressions"] == {
         "count": 12, "reason": "поле StartDate не принято API"}
     assert out.scanned_logins == ["login1"]
+
+
+# --- правило, которое не отработало, не закрывает свои находки (I1) ---
+
+from datetime import timedelta  # noqa: E402
+
+from sync.modules.lifecycle import reconcile  # noqa: E402
+from sync.modules.types import Finding, StoredFinding, fingerprint  # noqa: E402
+
+
+def _open(rule, obj, fid=1):
+    f = Finding(rule=rule, severity="critical", title="t", login="login1", campaign_id=1,
+                campaign_name="К1", object_type="ad", object_id=obj, details={})
+    return StoredFinding(**f.__dict__, id=fid, status="open",
+                         fingerprint=fingerprint("audit", f),
+                         last_seen_at=NOW - timedelta(days=1))
+
+
+def _reconcile(out, existing):
+    return reconcile("audit", existing, out.findings, NOW, out.scanned_logins,
+                     unverified=out.unverified)
+
+
+def test_rejected_unavailable_keeps_open_ads_rejected(monkeypatch):
+    Fake(monkeypatch, rejected_fails=True)
+    out = audit_mod.run(_ctx())
+    assert ("login1", "ads_rejected") in out.unverified
+    r = _reconcile(out, [_open("ads_rejected", "555")])
+    assert r.resolve == [] and r.expire == []
+    assert not [f for f in r.insert if f.rule == "ads_rejected"]
+
+
+def test_rejected_verified_without_hit_resolves(monkeypatch):
+    Fake(monkeypatch)
+    out = audit_mod.run(_ctx())
+    assert ("login1", "ads_rejected") not in out.unverified
+    r = _reconcile(out, [_open("ads_rejected", "555")])
+    assert r.resolve == [1]
+
+
+def test_v501_unavailable_keeps_open_banned_words(monkeypatch):
+    # v5 отдаёт ЕПК-объявление без TextAd: его текст читает только v501
+    orig = Fake.get_all
+
+    def get_all(self, token, login, service, criteria, fields, extra=None, **kw):
+        rows = orig(self, token, login, service, criteria, fields, extra, **kw)
+        if service == "ads" and "Statuses" not in criteria and not kw.get("version"):
+            return [{"Id": 300, "AdGroupId": 10, "CampaignId": 1, "Type": "TEXT_AD"}]
+        return rows
+
+    monkeypatch.setattr(Fake, "get_all", get_all)
+    Fake(monkeypatch, v501_fails=True)
+    out = audit_mod.run(_ctx(settings={"banned_words": ["займ"]}))
+    assert ("login1", "banned_words") in out.unverified
+    r = _reconcile(out, [_open("banned_words", "300")])
+    assert r.resolve == []
+    # v501 ответил, слово ушло из объявления — находка закрывается
+    monkeypatch.setattr(Fake, "get_all", orig)
+    Fake(monkeypatch)
+    out = audit_mod.run(_ctx(settings={"banned_words": ["кредит"]}))
+    assert ("login1", "banned_words") not in out.unverified
+    assert _reconcile(out, [_open("banned_words", "300")]).resolve == [1]
+
+
+def test_per_object_skip_does_not_hold_rule(monkeypatch):
+    # тип кампании без нужного поля — не «правило не отработало»: находок он и не давал
+    Fake(monkeypatch)
+    out = audit_mod.run(_ctx(settings={"banned_words": ["кредит"], "allowed_goal_ids": [1]}))
+    rules = {rule for _, rule in out.unverified}
+    assert "banned_words" not in rules and "strategy_goal_not_allowed" not in rules
