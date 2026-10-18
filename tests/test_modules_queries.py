@@ -33,10 +33,8 @@ def _camp(cid, goal=GOAL, state="ON", ctype="TEXT_CAMPAIGN", negatives=()):
                                         "Network": {"BiddingStrategyType": "SERVING_OFF"}}}}
 
 
-def _row(cid, query, clicks, cost, conv, goal=GOAL, key=""):
+def _row(cid, query, clicks, cost, conv, goal=GOAL):
     return {"CampaignId": str(cid), "Query": query,
-            "Criterion": key or "---autotargeting",
-            "CriterionType": "KEYWORD" if key else "AUTOTARGETING",
             "Clicks": str(clicks), "Cost": str(cost),
             "Conversions_%d_AUTO" % goal: str(conv) if conv else "--"}
 
@@ -314,12 +312,12 @@ def test_apply_campaign_off_or_invisible(monkeypatch):
 
 
 def test_rollback_removes_only_own_phrase(monkeypatch):
-    fake = FakeDirect(monkeypatch, [_camp(1, negatives=["Ручная", "бесплатно", "купить диплом"])])
+    fake = FakeDirect(monkeypatch, [_camp(1, negatives=["ручная", "бесплатно", "купить диплом"])])
     res = qm.rollback(_ctx(), [_stored(1, "бесплатно")])
     assert res[1].ok
-    assert fake.writes == [(1, ["Ручная", "купить диплом"])]
+    assert fake.writes == [(1, ["ручная", "купить диплом"])]
     # последняя фраза снимается null'ом, а не пустым Items
-    res = qm.rollback(_ctx(), [_stored(2, "Ручная"), _stored(3, "купить диплом")])
+    res = qm.rollback(_ctx(), [_stored(2, "ручная"), _stored(3, "купить диплом")])
     assert res[2].ok and res[3].ok and fake.writes[-1] == (1, None)
 
 
@@ -339,9 +337,136 @@ def test_module_registered():
     assert MODULES["queries"] is qm
 
 
-def test_snapshot_is_truth_over_matched_key(monkeypatch):
-    # Ключ в matched_key отчёта, но в свежем снимке его нет (удалён в окне): защищать нечего.
-    rows = _base()
-    rows[1] = _row(1, "курсы бесплатно", 40, 4000, 0, key="курсы бесплатно")
-    FakeDirect(monkeypatch, [_camp(1)], rows, keywords={})
-    assert "бесплатно" in _objects(qm.run(_ctx()))
+
+def test_report_request_shape(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(10), _camp(9), _camp(11, goal=None)], _base(cid=10))
+    qm.run(_ctx())
+    params = fake.reports[0]
+    assert {"Field": "CampaignId", "Operator": "IN",
+            "Values": ["9", "10"]} in params["SelectionCriteria"]["Filter"]
+    assert params["AttributionModels"] == ["AUTO"]
+    assert params["FieldNames"] == ["CampaignId", "Query", "Clicks", "Cost", "Conversions"]
+
+
+def test_rollback_leaves_human_variant(monkeypatch):
+    # наша «купить диплом» снята человеком, он поставил свой вариант в другом регистре
+    fake = FakeDirect(monkeypatch, [_camp(1, negatives=["Ручная", "Купить Диплом"])])
+    res = qm.rollback(_ctx(), [_stored(1, "купить диплом")])
+    assert not res[1].ok and res[1].error == "вариант поставлен не модулем"
+    assert fake.writes == []
+    # наш и ручной вариант с двойным пробелом: снимается только наш
+    fake = FakeDirect(monkeypatch, [_camp(1, negatives=["купить диплом", "Купить  диплом"])])
+    res = qm.rollback(_ctx(), [_stored(1, "купить диплом")])
+    assert res[1].ok and fake.writes == [(1, ["Купить  диплом"])]
+    # своей фразы уже нет — снимать нечего, запись не нужна
+    fake = FakeDirect(monkeypatch, [_camp(1, negatives=["ручная"])])
+    res = qm.rollback(_ctx(), [_stored(1, "купить диплом")])
+    assert res[1].ok and res[1].response["already_absent"] and fake.writes == []
+
+
+def test_word_forms_protect_keyword(monkeypatch):
+    rows = [_row(1, "высшее образование заочно", 100, 10000, 10),
+            _row(1, "диплом бесплатно", 40, 4000, 0),
+            _row(1, "диплом скачать", 40, 4000, 0),
+            _row(1, "диплом онлайн", 40, 4000, 0)]
+    FakeDirect(monkeypatch, [_camp(1)], rows, keywords={"1": ["дипломы купить"]})
+    out = qm.run(_ctx())
+    assert "диплом" not in _objects(out)
+    assert any("«диплом»: конфликт с ключом" in r for r in out.summary["refused"])
+    # контроль: без ключа слово уходит в минус
+    FakeDirect(monkeypatch, [_camp(1)], rows, keywords={"1": []})
+    assert "диплом" in _objects(qm.run(_ctx()))
+
+    fake = FakeDirect(monkeypatch, [_camp(1)], keywords={"1": ["дипломы купить"]})
+    res = qm.apply(_ctx(), [_stored(1, "диплом")])
+    assert not res[1].ok and "конфликт с ключом" in res[1].error and fake.writes == []
+    res = qm.apply(_ctx({"never_minus": ["Дипломы"]}), [_stored(1, "диплом")])
+    assert not res[1].ok and "never_minus" in res[1].error
+
+
+def test_word_forms_with_conversions_refused(monkeypatch):
+    rows = [_row(1, "высшее образование заочно", 100, 10000, 10),
+            _row(1, "дипломы бесплатно", 40, 4000, 0),
+            _row(1, "дипломы скачать", 40, 4000, 0),
+            _row(1, "дипломы онлайн", 40, 4000, 0)]
+    FakeDirect(monkeypatch, [_camp(1)], rows, keywords={"1": []})
+    assert "дипломы" in _objects(qm.run(_ctx()))
+    FakeDirect(monkeypatch, [_camp(1)], rows + [_row(1, "диплом мгу", 5, 500, 1)],
+               keywords={"1": []})
+    out = qm.run(_ctx())
+    assert "дипломы" not in _objects(out)
+    assert any("«дипломы»: словоформы" in r for r in out.summary["refused"])
+
+
+def test_multiword_conflict_direction(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1)], keywords={"1": ["купить диплом москва"]})
+    res = qm.apply(_ctx(), [_stored(1, "купить диплом"), _stored(2, "купить дипломы дёшево")])
+    # все слова минус-фразы есть в ключе — ключ погаснет
+    assert not res[1].ok and "конфликт с ключом" in res[1].error
+    # у минус-фразы есть слово, которого нет в ключе, — ключ живёт
+    assert res[2].ok and fake.writes == [(1, ["купить дипломы дёшево"])]
+
+
+def test_phrase_waste_judged_per_campaign(monkeypatch):
+    # «курсы онлайн» в К1 окупается (CPA 1000), в К2 жжёт; общий CPA выше 2×потолка
+    rows = [_row(1, "база один", 200, 20000, 20), _row(2, "база два", 200, 20000, 20),
+            _row(1, "курсы онлайн", 30, 3000, 3), _row(2, "курсы онлайн", 400, 80000, 0)]
+    FakeDirect(monkeypatch, [_camp(1), _camp(2)], rows, keywords={"1": [], "2": []})
+    out = qm.run(_ctx({"cpa_limit": 1500}))
+    assert [(f.campaign_id, f.object_id) for f in out.findings] == [(2, "курсы онлайн")]
+    assert any(r.startswith("login1 1 «курсы онлайн»") and "окупается" in r
+               for r in out.summary["refused"])
+
+
+def test_write_timeout_after_accept_is_applied(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1, negatives=["ручная"])])
+    real = fake.update_campaign_list
+
+    def accepted_then_timeout(token, login, cid, field, items):
+        real(token, login, cid, field, items)
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(qm.direct_api, "update_campaign_list", accepted_then_timeout)
+    res = qm.apply(_ctx(), [_stored(1, "бесплатно")])
+    assert res[1].ok
+    res = qm.rollback(_ctx(), [_stored(1, "бесплатно")])
+    assert res[1].ok and fake.c[1]["NegativeKeywords"] == {"Items": ["ручная"]}
+
+    def refused(token, login, cid, field, items):
+        raise TimeoutError("connect timed out")
+
+    monkeypatch.setattr(qm.direct_api, "update_campaign_list", refused)
+    res = qm.apply(_ctx(), [_stored(1, "мусор")])
+    assert not res[1].ok and res[1].error == "TimeoutError: connect timed out"
+
+    monkeypatch.setattr(qm.direct_api, "update_campaign_list", real)
+    monkeypatch.setattr(qm.direct_api, "read_campaign_list", lambda *a: None)
+    res = qm.apply(_ctx(), [_stored(1, "мусор")])
+    assert not res[1].ok and res[1].error == "кампания не найдена при чтении обратно"
+
+
+def test_account_skip_keeps_campaign_reasons(monkeypatch):
+    rows = [{k: v for k, v in r.items() if not k.startswith("Conversions_")} for r in _base()]
+    FakeDirect(monkeypatch, [_camp(1), _camp(2, goal=None)], rows)
+    skipped = qm.run(_ctx()).summary["skipped"]
+    assert any("login1 2 " in s and "судить без конверсий" in s for s in skipped)
+    assert any(s.startswith("login1:") and "без столбцов конверсий" in s for s in skipped)
+
+
+def test_settings_guarded(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1)], _base(goal=541664134))
+    out = qm.run(_ctx({"goal_ids": ["abc", 541664134, " 541664135", True]}))
+    assert fake.reports[0]["Goals"] == ["541664134", "541664135"]
+    assert len(out.summary["settings_notes"]) == 2
+    for bad in ({"multiplier": 0.5}, {"multiplier": 11}, {"window_days": 3},
+                {"max_per_run": 0}, {"cpa_limit": -1}):
+        with pytest.raises(ValueError, match="неверные настройки"):
+            qm.run(_ctx(bad))
+
+
+def test_apply_duplicate_phrase_in_group(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1)])
+    res = qm.apply(_ctx(), [_stored(1, "бесплатно"), _stored(2, "бесплатно", rule="stop_word")])
+    assert res[1].ok
+    assert not res[2].ok and "дубль" in res[2].error
+    assert fake.writes == [(1, ["бесплатно"])]

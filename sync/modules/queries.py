@@ -35,8 +35,7 @@ SAMPLE = 5
 # Москва без перехода на летнее время с 2014 (как в runner.MSK; импорт оттуда дал бы цикл
 # runner -> registry -> queries).
 MSK = timezone(timedelta(hours=3))
-REPORT_FIELDS = ["CampaignId", "Query", "Criterion", "CriterionType", "Clicks", "Cost",
-                 "Conversions"]
+REPORT_FIELDS = ["CampaignId", "Query", "Clicks", "Cost", "Conversions"]
 # Колонка конверсий приходит на цель: Conversions_<цель>_<модель атрибуции>.
 _GOAL_COLUMN = re.compile(r"^Conversions_(\d+)_")
 NO_DATA = "--"
@@ -147,30 +146,51 @@ def _query_rows(raw: List[Dict[str, str]], goals_by_cid: Dict[str, List[int]]
             continue
         conv = max((_num(rec.get(c)) for g in goals_by_cid[cid] for c in cols.get(g, ())),
                    default=0.0)
-        # Ключ — только у строки ключевой фразы; автотаргетинг и аудитории закупкой не являются.
-        key = (rec.get("Criterion") or "") if rec.get("CriterionType") == "KEYWORD" else ""
+        # matched_key пуст намеренно: «что мы купили» берётся только из свежего снимка
+        # ключей (каждая судимая кампания в нём есть), колонке отчёта не верим.
         slot = agg.setdefault((cid, query), {"query": query, "campaign_id": cid,
                                              "cost": 0.0, "clicks": 0, "conversions": 0,
-                                             "matched_key": key})
+                                             "matched_key": ""})
         slot["cost"] += _num(rec.get("Cost"))
         slot["clicks"] += int(_num(rec.get("Clicks")))
         slot["conversions"] += int(conv)
-        if key and not slot["matched_key"]:
-            slot["matched_key"] = key
     return list(agg.values())
 
 
+# Минус-слово Директ применяет ко всем словоформам, а морфологии в проекте нет. Сравнение
+# по общему началу — грубое и только запрещающее: ложное совпадение лишь снимает кандидата,
+# пропущенное отрезало бы свой ключ. Короткие слова совпадают только целиком.
+STEM_MIN = 4
+STEM_TAIL = 2
+
+
+def _same_stem(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n >= max(STEM_MIN, min(len(a), len(b)) - STEM_TAIL)
+
+
+def _covers(words: FrozenSet[str], target: FrozenSet[str]) -> bool:
+    """Гасит ли минус-фраза words текст со словами target: каждое её слово есть там в какой-то форме."""
+    return bool(words) and all(any(_same_stem(w, t) for t in target) for w in words)
+
+
 def _key_conflict(words: FrozenSet[str], keys: Iterable[FrozenSet[str]]) -> bool:
-    # Минус-фраза гасит любой запрос, где есть все её слова: ключ, содержащий их все,
-    # перестанет показываться. Словоформы не сводятся (морфологии в проекте нет) —
-    # проверка нижняя, как и семейства агента.
-    return bool(words) and any(words <= k for k in keys)
+    # Минус-фраза гасит любой запрос, где есть все её слова: ключ, содержащий их все
+    # (в любой форме), перестанет показываться.
+    return any(_covers(words, k) for k in keys)
 
 
 def _never_hit(words: FrozenSet[str], never: List[FrozenSet[str]]) -> Optional[FrozenSet[str]]:
-    # never_minus — «не трогать вовсе»: фраза, задевающая хоть одно его слово, не ставится.
+    # never_minus — «не трогать вовсе»: фраза, задевающая хоть одно его слово в любой форме,
+    # не ставится.
     for item in never:
-        if words & item:
+        if any(_same_stem(w, n) for w in words for n in item):
             return item
     return None
 
@@ -181,7 +201,8 @@ def _never_list(settings: dict) -> List[FrozenSet[str]]:
 
 
 def _family(rows: List[Dict[str, Any]], words: FrozenSet[str]) -> Dict[str, Any]:
-    hit = sorted((q for q in rows if words <= _words(q["query"])),
+    # Семейство — со словоформами: Директ отрежет и их, и судить надо то, что отрежется.
+    hit = sorted((q for q in rows if _covers(words, _words(q["query"]))),
                  key=lambda q: -q["cost"])
     return {"clicks": sum(q["clicks"] for q in hit),
             "cost": round(sum(q["cost"] for q in hit), 2),
@@ -198,9 +219,12 @@ class _Scan:
     # False — кабинет целиком не судили: его открытые находки не закрываем
     judged: bool = True
 
-
-def _skip_account(login: str, reason: str) -> _Scan:
-    return _Scan(skipped=["%s: %s" % (login, reason)], judged=False)
+    def skip_account(self, login: str, reason: str) -> "_Scan":
+        # Причины по кампаниям, собранные до пропуска кабинета, остаются в отчёте.
+        self.skipped.append("%s: %s" % (login, reason))
+        self.findings = []
+        self.judged = False
+        return self
 
 
 def _candidates(rows, settings, cpa_limit, own_words, own_phrases):
@@ -223,28 +247,31 @@ def _candidates(rows, settings, cpa_limit, own_words, own_phrases):
     for stop in settings.get("stop_words") or []:
         sw = _words(stop)
         for cid in cids:
-            if sw and any(sw <= _words(q["query"]) for q in rows if q["campaign_id"] == cid):
+            if any(_covers(sw, _words(q["query"])) for q in rows if q["campaign_id"] == cid):
                 out.append(("stop_word", stop, cid))
     return out
 
 
 def _scan_login(acc: DirectAccount, settings: dict, win: Tuple[str, str], log) -> _Scan:
+    scan = _Scan()
     if (acc.currency or "RUB").upper() != "RUB":
         # Пороги и CPA модуля в рублях; тенге без конвертации дали бы чужой масштаб.
-        return _skip_account(acc.login, "кабинет в %s, пороги модуля в рублях" % acc.currency)
+        return scan.skip_account(acc.login, "кабинет в %s, пороги модуля в рублях"
+                                 % acc.currency)
     live = {str(c["Id"]): c for c in _campaigns(acc)
             if c.get("Type") in TYPES and c.get("State") in STATES}
     if not live:
         log("[%s] нечего чистить: ни одной запущенной текстовой кампании или ЕПК" % acc.login)
-        return _Scan()
-
-    scan = _Scan()
+        return scan
 
     def skip(cid, reason):
         scan.skipped.append("%s %s (%s): %s" % (acc.login, cid, live[cid].get("Name") or "",
                                                 reason))
 
-    override = sorted({int(g) for g in settings.get("goal_ids") or []})
+    def refuse(cid, phrase, reason):
+        scan.refused.append("%s %s «%s»: %s" % (acc.login, cid, phrase, reason))
+
+    override = settings["goal_ids"]
     goals_by_cid: Dict[str, List[int]] = {}
     for cid, c in live.items():
         goals = override or strategy_goals(c)
@@ -263,7 +290,7 @@ def _scan_login(acc: DirectAccount, settings: dict, win: Tuple[str, str], log) -
 
     raw = _report(acc, win, report_goals, list(goals_by_cid))
     if raw and not any(_GOAL_COLUMN.match(k) for k in raw[0]):
-        return _skip_account(acc.login, "отчёт пришёл без столбцов конверсий — судить нечем")
+        return scan.skip_account(acc.login, "отчёт пришёл без столбцов конверсий — судить нечем")
     rows = _query_rows(raw, goals_by_cid)
 
     by_cid: Dict[str, List[Dict[str, Any]]] = {}
@@ -283,8 +310,9 @@ def _scan_login(acc: DirectAccount, settings: dict, win: Tuple[str, str], log) -
     if not cpa_limit or cpa_limit <= 0:
         conv = sum(q["conversions"] for q in rows)
         if not conv:
-            return _skip_account(acc.login, "конверсий в окне нет — CPA кабинета не посчитать")
+            return scan.skip_account(acc.login, "конверсий в окне нет — CPA кабинета не посчитать")
         cpa_limit = sum(q["cost"] for q in rows) / conv
+    payoff = float(cpa_limit) * float(settings["multiplier"])
 
     # Снимок ключей каждый прогон: matched_key отчёта — в основном подбор автотаргетинга
     # (замер агента 29.08: 1,9 % совпадений оказались ключами кабинета).
@@ -310,19 +338,30 @@ def _scan_login(acc: DirectAccount, settings: dict, win: Tuple[str, str], log) -
         ok, why = negatives.phrase_is_valid(phrase)
         words = _words(phrase)
         if not ok:
-            scan.refused.append("%s %s «%s»: %s" % (acc.login, cid, phrase, why))
+            refuse(cid, phrase, why)
             continue
         if _never_hit(words, never) is not None:
-            scan.refused.append("%s %s «%s»: в списке never_minus" % (acc.login, cid, phrase))
+            refuse(cid, phrase, "в списке never_minus")
             continue
-        if any(w <= words for w in covered[cid]):
+        if any(_covers(w, words) for w in covered[cid]):
             continue
         if _key_conflict(words, own_phrases.get(cid, ())):
             # Отказ при применении всё равно случился бы: находку, обречённую на failed, не ставим.
-            scan.refused.append("%s %s «%s»: конфликт с ключом" % (acc.login, cid, phrase))
+            refuse(cid, phrase, "конфликт с ключом")
             continue
         fam = _family(by_cid[cid], words)
         if fam["clicks"] <= 0:
+            continue
+        if rule == "word_zero_conv" and fam["conversions"] > 0:
+            # Агент судил слово в точной форме; Директ отрежет и формы, а у них конверсии есть.
+            refuse(cid, phrase, "словоформы слова приносят конверсии")
+            continue
+        if (rule == "phrase_waste" and fam["conversions"] > 0
+                and fam["cost"] / fam["conversions"] <= payoff):
+            # Семейство агент проверял по всему кабинету; запрет пишется в кампанию, и там,
+            # где поток окупается, ему не место.
+            refuse(cid, phrase, "в этой кампании семейство окупается (CPA %.0f ₽)"
+                   % (fam["cost"] / fam["conversions"]))
             continue
         picked[(cid, phrase)] = (rule, fam)
 
@@ -348,8 +387,40 @@ def _scan_login(acc: DirectAccount, settings: dict, win: Tuple[str, str], log) -
     return scan
 
 
+# Границы — те же, что у формы настроек в Panda-BI (lib/modules/catalog.ts): значение вне
+# них туда не ввести, значит пришло мимо формы, и молча подставлять умолчание нельзя.
+BOUNDS = {"window_days": (7, 90), "multiplier": (1, 10), "max_per_run": (1, 100)}
+
+
+def checked_settings(settings: dict) -> Tuple[dict, List[str]]:
+    """Настройки после settings_for -> (годные, заметки об отброшенном). Вне границ — ошибка."""
+    bad = ["%s=%r вне [%s, %s]" % (k, settings[k], lo, hi)
+           for k, (lo, hi) in BOUNDS.items() if not lo <= settings[k] <= hi]
+    if settings["cpa_limit"] is not None and settings["cpa_limit"] < 0:
+        bad.append("cpa_limit=%r меньше 0" % settings["cpa_limit"])
+    if bad:
+        raise ValueError("неверные настройки: " + "; ".join(bad))
+    out = dict(settings)
+    notes: List[str] = []
+    goals = set()
+    for g in settings["goal_ids"]:
+        text = str(g).strip()
+        if isinstance(g, bool) or not text.isdigit():
+            notes.append("goal_ids: «%s» не идентификатор цели — отброшено" % g)
+        else:
+            goals.add(int(text))
+    out["goal_ids"] = sorted(goals)
+    for key in ("stop_words", "never_minus"):
+        good = [x for x in settings[key] if isinstance(x, str) and x.strip()]
+        if len(good) != len(settings[key]):
+            notes.append("%s: нестроковые и пустые элементы отброшены" % key)
+        out[key] = good
+    return out, notes
+
+
 def run(ctx: Context) -> RunOutput:
-    win = window(ctx.now, ctx.settings["window_days"])
+    settings, notes = checked_settings(ctx.settings)
+    win = window(ctx.now, settings["window_days"])
     findings: List[Finding] = []
     skipped: List[str] = []
     refused: List[str] = []
@@ -359,7 +430,7 @@ def run(ctx: Context) -> RunOutput:
     read = 0
     for acc in ctx.accounts:
         try:
-            scan = _scan_login(acc, ctx.settings, win, ctx.log)
+            scan = _scan_login(acc, settings, win, ctx.log)
         except Exception as err:  # кабинет не должен ронять остальные
             errors.append("%s: %s" % (acc.login, err))
             ctx.log("[%s] ошибка: %s" % (acc.login, err))
@@ -377,6 +448,8 @@ def run(ctx: Context) -> RunOutput:
                                "over_cap": over_cap}
     if errors:
         summary["errors"] = errors
+    if notes:
+        summary["settings_notes"] = notes
     # Упавший и пропущенный целиком логин не судили: его открытые находки не закрываем.
     return RunOutput(findings=findings, summary=summary, scanned_logins=scanned)
 
@@ -397,6 +470,31 @@ def _write(acc: DirectAccount, campaign_id: int, items: Optional[List[str]]) -> 
     if errors:
         raise DirectError("; ".join(
             "%s %s" % (e.get("Code"), e.get("Message")) for e in errors))
+
+
+NOT_FOUND_BACK = "кампания не найдена при чтении обратно"
+
+
+def _write_and_read(acc: DirectAccount, cid: int, items: Optional[List[str]]):
+    """Запись и чтение обратно: (что в списке сейчас, ошибка записи или None).
+
+    Таймаут мог прийти уже после того, как Директ запись принял, поэтому чтение идёт
+    при любом исходе записи, и решает оно (как placements._write_and_read). Не
+    прочиталось и оно: исход неизвестен, ошибка уходит наверх."""
+    werr = None
+    try:
+        _write(acc, cid, items)
+    except Exception as err:
+        werr = err
+    try:
+        back = direct_api.read_campaign_list(acc.token, acc.login, cid, FIELD)
+    except Exception as rerr:
+        raise werr or rerr
+    return back, werr
+
+
+def _write_error(err: Optional[Exception]) -> Optional[str]:
+    return "%s: %s" % (type(err).__name__, err) if err is not None else None
 
 
 def _chars(items: Iterable[str]) -> int:
@@ -452,7 +550,8 @@ def _apply_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
             # Не наша запись: «применено» отдало бы ручную фразу под откат модуля.
             out[f.id] = ApplyResult(False, {}, "фраза уже стоит в кампании — поставлена не модулем")
         elif phrase in to_add:
-            continue
+            # Вторая находка на то же действие: запись одна, засчитать её дважды нельзя.
+            out[f.id] = ApplyResult(False, {}, "дубль: та же фраза в этом применении")
         elif used + len(phrase) > negatives.MAX_TOTAL_CHARS:
             # Список сверх лимита Директ отклонит целиком: не поместившаяся фраза не едет.
             out[f.id] = ApplyResult(False, {}, "список минус-фраз заполнен (%d из %d символов)"
@@ -460,21 +559,25 @@ def _apply_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
         else:
             to_add.append(phrase)
             used += len(phrase)
+    if not to_add:
+        return out
     # Прежние фразы остаются как есть и первыми: в списке есть и ручные минус-фразы.
-    if to_add:
-        _write(acc, cid, existing + to_add)
-    back = direct_api.read_campaign_list(acc.token, acc.login, cid, FIELD)
-    present = {negatives.normalize_phrase(p) for p in (back or [])}
+    back, werr = _write_and_read(acc, cid, existing + to_add)
+    if back is None:
+        out.update({f.id: ApplyResult(False, {}, NOT_FOUND_BACK) for f in group
+                    if f.id not in out})
+        return out
+    present = {negatives.normalize_phrase(p) for p in back}
     for f in group:
         if f.id in out:
             continue
         phrase = _phrase(f)
         if phrase in present:
             out[f.id] = ApplyResult(True, {"campaign_id": cid, "phrase": phrase,
-                                           "chars_after": _chars(back or [])})
+                                           "chars_after": _chars(back)})
         else:
             out[f.id] = ApplyResult(False, {"campaign_id": cid, "phrase": phrase},
-                                    "Директ принял, но не применил")
+                                    _write_error(werr) or "Директ принял, но не применил")
     return out
 
 
@@ -483,24 +586,44 @@ def _rollback_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
     if fresh is None:
         return _fail_all(group, "кампания не видна API (Мастер кампаний)")
     existing = fresh[2]
-    # Вычесть ровно своё из свежего списка (writer/negatives.remove_added), порядок чужих
-    # фраз сохранить: между применением и откатом список правят руками.
-    drop = {_phrase(f) for f in group}
-    keep = [p for p in existing if negatives.normalize_phrase(p) not in drop]
-    if len(keep) != len(existing):
-        # Пустой список — null: NegativeKeywords в campaigns.update nillable, а Items в нём
-        # обязателен (direct_api.update_campaign_list).
-        _write(acc, cid, keep or None)
-    back = direct_api.read_campaign_list(acc.token, acc.login, cid, FIELD)
-    present = {negatives.normalize_phrase(p) for p in (back or [])}
     out: Dict[int, ApplyResult] = {}
+    drop: List[str] = []
     for f in group:
+        # Модуль пишет нормализованную форму: своё — только точное совпадение. Вариант в
+        # другом регистре или с другими пробелами поставил человек (writer/negatives.remove_added
+        # вычитает «ровно своё», а не похожее).
         phrase = _phrase(f)
-        if back is not None and phrase not in present:
+        if phrase in drop:
+            out[f.id] = ApplyResult(False, {}, "дубль: та же фраза в этом откате")
+        elif any(p.strip() == phrase for p in existing):
+            drop.append(phrase)
+        elif any(negatives.normalize_phrase(p) == phrase for p in existing):
+            out[f.id] = ApplyResult(False, {"campaign_id": cid, "phrase": phrase},
+                                    "вариант поставлен не модулем")
+        else:
+            out[f.id] = ApplyResult(True, {"campaign_id": cid, "phrase": phrase,
+                                           "already_absent": True})
+    if not drop:
+        return out
+    keep = [p for p in existing if p.strip() not in drop]
+    # Пустой список — null: NegativeKeywords в campaigns.update nillable, а Items в нём
+    # обязателен (direct_api.update_campaign_list).
+    back, werr = _write_and_read(acc, cid, keep or None)
+    if back is None:
+        out.update({f.id: ApplyResult(False, {}, NOT_FOUND_BACK) for f in group
+                    if f.id not in out})
+        return out
+    present = {p.strip() for p in back}
+    for f in group:
+        if f.id in out:
+            continue
+        phrase = _phrase(f)
+        if phrase not in present:
             out[f.id] = ApplyResult(True, {"campaign_id": cid, "phrase": phrase})
         else:
             out[f.id] = ApplyResult(False, {"campaign_id": cid, "phrase": phrase},
-                                    "минус-фраза осталась в списке после снятия")
+                                    _write_error(werr)
+                                    or "минус-фраза осталась в списке после снятия")
     return out
 
 
