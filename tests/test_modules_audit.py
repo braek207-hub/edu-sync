@@ -22,7 +22,9 @@ def _ctx(accounts=(ACC,), settings=None):
 
 
 class Fake:
-    def __init__(self, monkeypatch, n_campaigns=12, fail_login=None, reject=(), v501_fails=False):
+    def __init__(self, monkeypatch, n_campaigns=12, fail_login=None, reject=(), v501_fails=False,
+                 rejected_fails=False):
+        self.rejected_fails = rejected_fails
         self.reject = tuple(reject)
         self.v501_fails = v501_fails
         self.calls, self.reports = [], []
@@ -35,6 +37,8 @@ class Fake:
         self.calls.append((login, service, criteria, fields, extra, kw))
         if login == self.fail_login and service == "ads" and "Statuses" not in criteria:
             raise RuntimeError("Директ лёг")
+        if service == "ads" and "Statuses" in criteria and self.rejected_fails:
+            raise DirectError("ads [52] Сбой")
         if kw.get("version") == "v501":
             if self.v501_fails:
                 raise DirectError("ads [8000] Неизвестный параметр ResponsiveAdFieldNames")
@@ -44,6 +48,8 @@ class Fake:
         if service == "campaigns":
             if "NegativeKeywordSharedSetIds" in fields and "NegativeKeywordSharedSetIds" in self.reject:
                 raise DirectError("campaigns [4000] Неизвестное поле NegativeKeywordSharedSetIds")
+            if "StartDate" in fields and "StartDate" in self.reject:
+                raise DirectError("campaigns [4000] Неизвестное поле StartDate")
             unified = (extra or {}).get("UnifiedCampaignFieldNames") or []
             if "TrackingParams" in unified and "UnifiedTrackingParams" in self.reject:
                 raise DirectError("campaigns [8000] Недопустимое поле TrackingParams")
@@ -77,7 +83,9 @@ def test_snapshot_fetch_calls(monkeypatch):
     on, rejected, v501 = ads
     assert "Title" in on[4]["TextAdFieldNames"] and "SitelinkSetId" in on[4]["TextAdFieldNames"]
     # отклонённые — по Statuses и без фильтра State
-    assert rejected[2] == {"Statuses": ["REJECTED"]}
+    assert rejected[2] == {"Statuses": ["REJECTED"],
+                           "States": ["ON", "OFF", "SUSPENDED", "OFF_BY_MONITORING"]}
+    assert "ARCHIVED" not in rejected[2]["States"]
     assert v501[5]["version"] == "v501"
     assert v501[4]["ResponsiveAdFieldNames"] == ["Titles", "Texts"]
     assert [a["Id"] for a in snap.responsive_ads] == [300]
@@ -205,3 +213,24 @@ def test_summary_skipped_shape(monkeypatch):
     assert sk["banned_words"]["reason"] == "список banned_words пуст — правило выключено"
     assert sk["strategy_goal_not_allowed"] == {
         "count": 12, "reason": "список allowed_goal_ids пуст — правило выключено"}
+
+
+def test_rejected_request_failure_is_isolated(monkeypatch):
+    Fake(monkeypatch, rejected_fails=True)
+    out = audit_mod.run(_ctx())
+    assert out.scanned_logins == ["login1"]
+    assert "RejectedAds" in out.summary["unavailable"]["login1"]
+    assert out.summary["skipped"]["ads_rejected"]["count"] == 1
+    assert out.summary["by_rule"]["no_negatives"] == 12  # остальные правила работают
+
+
+def test_start_date_is_optional_field(monkeypatch):
+    fake = Fake(monkeypatch, reject=["StartDate"])
+    out = audit_mod.run(_ctx())
+    camp_calls = [c for c in fake.calls if c[1] == "campaigns"]
+    assert len(camp_calls) == 2 and "StartDate" not in camp_calls[1][3]
+    # остальные необязательные поля при этом не потеряны
+    assert "NegativeKeywordSharedSetIds" in camp_calls[1][3]
+    assert out.summary["skipped"]["on_no_impressions"] == {
+        "count": 12, "reason": "поле StartDate не принято API"}
+    assert out.scanned_logins == ["login1"]

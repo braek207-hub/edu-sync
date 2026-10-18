@@ -54,7 +54,8 @@ def _snap(campaigns=None, groups=(), ads=(), keywords=(), aud=None, imp=None, re
     return Snapshot(login=LOGIN, campaigns=campaigns if campaigns is not None else [_camp()],
                     groups=list(groups), ads=list(ads), keywords=list(keywords),
                     audiences_by_group=aud or {}, impressions_3d=imp if imp is not None else {1: 5},
-                    rejected_ads=list(rejected), responsive_ads=responsive,
+                    rejected_ads=None if rejected is None else list(rejected),
+                    responsive_ads=responsive,
                     unavailable=unavailable or {}, impressions_from=frm)
 
 
@@ -354,3 +355,32 @@ def test_responsive_unread_reported_when_v501_failed():
     reason = "объявления ЕПК: v501 не ответил, читать нечем"
     assert snap.skipped["banned_words"] == {reason: 1}
     assert snap.skipped["title_underused"] == {reason: 1}
+
+
+def test_rejected_archived_ad_is_not_a_finding():
+    live = _ad(status="REJECTED")
+    old = dict(_ad(101, status="REJECTED"), State="ARCHIVED")
+    out = _run("ads_rejected", _snap(rejected=[live, old]))
+    assert [f.object_id for f in out] == ["100"]
+
+
+def test_rejected_request_failed_reported_in_skipped():
+    snap = _snap(rejected=None)
+    assert _run("ads_rejected", snap) == []
+    assert snap.skipped["ads_rejected"] == {"запрос отклонённых объявлений не удался": 1}
+
+
+def test_same_ad_from_v5_and_v501_judged_once():
+    v5 = _ad(200, title="Займы онлайн")  # v5 отдал комбинаторное как TextAd
+    r = _resp(200, titles=("Займы", "Займы онлайн"), texts=("Текст",))
+    snap = _snap(ads=[v5], responsive=[r])
+    assert len(_run("banned_words", snap, banned_words=["займ"])) == 1
+    assert len(_run("title_underused", snap)) == 1
+    # предпочтена версия v501: самый длинный заголовок 12, а не TextAd
+    assert _run("title_underused", snap)[0].details["length"] == 12
+
+
+def test_start_date_unavailable_skips_rule():
+    snap = _snap(imp={}, unavailable={"StartDate": "4000"})
+    assert _run("on_no_impressions", snap) == []
+    assert snap.skipped["on_no_impressions"] == {"поле StartDate не принято API": 1}

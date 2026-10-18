@@ -35,6 +35,7 @@ BANNER_EDIT_URL = "https://direct.yandex.ru/dna/banners-edit"
 # Поля, которые запрашиваются с запасным путём: не принял API — зависимое правило не судит.
 SHARED_SETS = "NegativeKeywordSharedSetIds"
 UNIFIED_TRACKING = "UnifiedTrackingParams"
+START_DATE = "StartDate"
 
 # Формы глагола «занять»: «займёт 2 года» — не реклама микрозаймов, а обычная речь. Корень
 # «займ» из banned_words ловит и их, поэтому исключаем явно (ё сведена к е).
@@ -53,8 +54,8 @@ class Snapshot:
     audiences_by_group: Dict[int, int] = field(default_factory=dict)
     # id кампании -> показы за 3 дня; нет записи = 0
     impressions_3d: Dict[int, int] = field(default_factory=dict)
-    # отклонённые объявления любого State (отдельный запрос Statuses=REJECTED)
-    rejected_ads: List[dict] = field(default_factory=list)
+    # отклонённые неархивные объявления (отдельный запрос Statuses=REJECTED); None — запрос не удался
+    rejected_ads: Optional[List[dict]] = field(default_factory=list)
     # комбинаторные объявления ЕПК из v501; None — v501 не ответил
     responsive_ads: Optional[List[dict]] = field(default_factory=list)
     # поля, которые API не принял: SHARED_SETS, UNIFIED_TRACKING
@@ -118,7 +119,12 @@ def _ad_link(snap: Snapshot, camp: dict, ad: dict) -> str:
 def _ads(snap: Snapshot) -> Iterable[Tuple[dict, dict]]:
     """(кампания, объявление) для всех прочитанных объявлений ON-кампаний."""
     cmap = _camp_map(snap)
+    # v5 может отдать комбинаторное объявление ЕПК как TextAd, а v501 — как ResponsiveAd:
+    # один Id — одна запись, версия v501 полнее (все заголовки и тексты).
+    by_id: Dict[Any, dict] = {}
     for ad in list(snap.ads) + list(snap.responsive_ads or []):
+        by_id[ad.get("Id")] = ad
+    for ad in by_id.values():
         camp = cmap.get(int(ad.get("CampaignId") or 0))
         if camp is not None:
             yield camp, ad
@@ -201,9 +207,12 @@ def group_no_targeting(snap: Snapshot, settings: dict) -> List[Finding]:
 def ads_rejected(snap: Snapshot, settings: dict) -> List[Finding]:
     cmap = _camp_map(snap)
     out = []
+    if snap.rejected_ads is None:
+        skip(snap, "ads_rejected", "запрос отклонённых объявлений не удался")
+        return out
     for ad in snap.rejected_ads:
         camp = cmap.get(int(ad.get("CampaignId") or 0))
-        if camp is None:
+        if camp is None or ad.get("State") == "ARCHIVED":
             continue
         title = (ad.get("TextAd") or {}).get("Title") or ""
         out.append(_finding(
@@ -286,6 +295,9 @@ def on_no_impressions(snap: Snapshot, settings: dict) -> List[Finding]:
             skip(snap, "on_no_impressions", "кампания не прошла модерацию или в черновике")
             continue
         # Стартовавшая внутри окна или позже не обязана была показываться все три дня.
+        if START_DATE in snap.unavailable:
+            skip(snap, "on_no_impressions", "поле StartDate не принято API")
+            continue
         start = str(c.get("StartDate") or "")
         if start and snap.impressions_from and start > snap.impressions_from:
             skip(snap, "on_no_impressions", "кампания стартовала после начала окна показов")

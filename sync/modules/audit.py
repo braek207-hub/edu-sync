@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sync.modules import direct_api
 from sync.modules.accounts import DirectAccount
-from sync.modules.audit_rules import RULES, SHARED_SETS, UNIFIED_TRACKING, Snapshot
+from sync.modules.audit_rules import RULES, SHARED_SETS, START_DATE, UNIFIED_TRACKING, Snapshot
 from sync.modules.queries import window
 from sync.modules.types import Context, Finding, RunOutput
 
@@ -19,8 +19,7 @@ KEY = "audit"
 # Отчёт показов — за три полных дня по вчера: сегодняшний отчёт Директа зависает.
 IMPRESSION_DAYS = 3
 
-CAMPAIGN_FIELDS = ["Id", "Name", "Type", "State", "Status", "StartDate", "NegativeKeywords",
-                   "ExcludedSites"]
+CAMPAIGN_FIELDS = ["Id", "Name", "Type", "State", "Status", "NegativeKeywords", "ExcludedSites"]
 # TrackingParams подтверждён кодом только у текстовых кампаний (build_bjorn_*,
 # probe_bjorn_clone_shape2); у ЕПК и NegativeKeywordSharedSetIds — по документации API,
 # поэтому запрашиваются с запасным путём (_campaigns): не принял API — читаем без поля.
@@ -29,6 +28,8 @@ UNIFIED_BLOCK = ["CounterIds", "Settings", "BiddingStrategy", "PriorityGoals"]
 UNIFIED_TRACKING_FIELD = "TrackingParams"
 # TrackingParams у группы принимает adgroups.get (probe_bjorn_clone_shape2.py).
 GROUP_FIELDS = ["Id", "Name", "CampaignId", "Status", "Type", "TrackingParams"]
+# Состояния объявления без архивного: отклонённое в архиве исправлять незачем.
+LIVE_AD_STATES = ["ON", "OFF", "SUSPENDED", "OFF_BY_MONITORING"]
 V501_AD_FIELDS = ["Id", "CampaignId", "AdGroupId", "State", "Type"]
 # Тексты объявлений — только в TextAdFieldNames (ads.get отвергает "TextAd" в FieldNames,
 # agent/segments.py). Комбинаторные объявления (ResponsiveAd) живут лишь в API v501, а
@@ -58,9 +59,9 @@ def _report(acc: DirectAccount, win: Tuple[str, str], ids: List[int]) -> List[Di
 
 def _campaigns(acc: DirectAccount, unavailable: Dict[str, str]) -> List[dict]:
     """Кампании ON. Необязательные поля, которых API не принял, отбрасываются по одному."""
-    optional = [SHARED_SETS, UNIFIED_TRACKING]
+    optional = [SHARED_SETS, UNIFIED_TRACKING, START_DATE]
     while True:
-        fields = CAMPAIGN_FIELDS + ([SHARED_SETS] if SHARED_SETS in optional else [])
+        fields = CAMPAIGN_FIELDS + [f for f in (SHARED_SETS, START_DATE) if f in optional]
         unified = UNIFIED_BLOCK + ([UNIFIED_TRACKING_FIELD] if UNIFIED_TRACKING in optional
                                    else [])
         try:
@@ -112,10 +113,15 @@ def fetch_snapshot(acc: DirectAccount, win: Tuple[str, str]) -> Snapshot:
     snap.groups = chunked("adgroups", {}, GROUP_FIELDS)
     snap.ads = chunked("ads", {"States": ["ON"]}, AD_FIELDS,
                        extra={"TextAdFieldNames": TEXT_AD_FIELDS})
-    # Отклонённые — отдельным запросом по Statuses и без фильтра State: у отклонённого
-    # объявления State может быть любым, и фильтр ON их терял бы.
-    snap.rejected_ads = chunked("ads", {"Statuses": ["REJECTED"]}, AD_FIELDS,
-                                extra={"TextAdFieldNames": TEXT_AD_FIELDS})
+    # Отклонённые — отдельным запросом по Statuses: у отклонённого объявления State бывает
+    # и OFF, и SUSPENDED, фильтр ON их терял бы. Архивные — не находка, их исключаем.
+    try:
+        snap.rejected_ads = chunked(
+            "ads", {"Statuses": ["REJECTED"], "States": LIVE_AD_STATES}, AD_FIELDS,
+            extra={"TextAdFieldNames": TEXT_AD_FIELDS})
+    except Exception as err:  # доп. запрос: его сбой не роняет остальные правила
+        snap.rejected_ads = None
+        unavailable["RejectedAds"] = str(err)[:300]
     snap.responsive_ads = _responsive_ads(acc, ids, unavailable)
     snap.keywords = chunked("keywords", {"States": ["ON"]}, KEYWORD_FIELDS)
     for t in chunked("audiencetargets", {}, AUDIENCE_FIELDS, result_key="AudienceTargets"):
