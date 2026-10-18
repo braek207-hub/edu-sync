@@ -18,10 +18,17 @@ ALLOWED_MODES: Dict[str, Tuple[str, ...]] = {
 
 DEFAULTS: Dict[str, Dict[str, Any]] = {
     "placements": {"top_n": 30, "always_block": [], "extra_allow": [],
-                   "spam_rule": False},
+                   "spam_rule": False, "lead_goal_ids": [], "rules": [],
+                   "max_per_run": 100,
+                   "dictionary": {"categories": ["app", "dsp", "game", "junk"]},
+                   # min_cr — проценты, дробный порог законен: при целом умолчании
+                   # 7.5 молча заменялся бы на 8. Panda хранит то же число 8.
+                   "spam": {"min_leads": 5, "min_cr": 8.0, "ratio": 2.5,
+                            "goals": "strategy"}},
     "queries": {"window_days": 30, "cpa_limit": None, "multiplier": 2.0,
-                "goal_ids": [], "stop_words": [], "never_minus": [],
-                "max_per_run": 20},
+                "lead_goal_ids": [], "stop_words": [], "never_minus": [],
+                "max_per_run": 20, "rules": [],
+                "builtin": {"phrase_waste": True, "word_zero_conv": True}},
     "audit": {"banned_words": [], "allowed_goal_ids": [], "require_utm": True,
               "title_fill_min": 0.6},
 }
@@ -44,14 +51,18 @@ def _fits(default: Any, value: Any) -> bool:
     return isinstance(value, type(default))
 
 
+def _coerce(default: Any, value: Any) -> Any:
+    # Вложенная настройка сливается с умолчанием поключево, а не целиком: иначе
+    # spam {"min_leads": 3} без остальных порогов оставил бы прогон без ratio.
+    if not _fits(default, value):
+        value = default
+    if isinstance(default, dict):
+        return {k: _coerce(d, value.get(k, d)) for k, d in default.items()}
+    return list(value) if isinstance(value, list) else value
+
+
 def settings_for(module_key: str, raw: Optional[dict]) -> dict:
     """Настройки модуля: умолчания + то, что подошло по типу. Чужие ключи отбрасываются."""
-    base = DEFAULTS[module_key]
     raw = raw if isinstance(raw, dict) else {}
-    out: Dict[str, Any] = {}
-    for key, default in base.items():
-        value = raw.get(key, default)
-        if not _fits(default, value):
-            value = default
-        out[key] = list(value) if isinstance(value, list) else value
-    return out
+    return {key: _coerce(default, raw.get(key, default))
+            for key, default in DEFAULTS[module_key].items()}

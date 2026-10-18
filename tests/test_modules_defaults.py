@@ -6,10 +6,15 @@ def test_defaults_pinned():
     assert MODULE_KEYS == ("placements", "queries", "audit")
     assert DEFAULTS == {
         "placements": {"top_n": 30, "always_block": [], "extra_allow": [],
-                       "spam_rule": False},
+                       "spam_rule": False, "lead_goal_ids": [], "rules": [],
+                       "max_per_run": 100,
+                       "dictionary": {"categories": ["app", "dsp", "game", "junk"]},
+                       "spam": {"min_leads": 5, "min_cr": 8, "ratio": 2.5,
+                                "goals": "strategy"}},
         "queries": {"window_days": 30, "cpa_limit": None, "multiplier": 2.0,
-                    "goal_ids": [], "stop_words": [], "never_minus": [],
-                    "max_per_run": 20},
+                    "lead_goal_ids": [], "stop_words": [], "never_minus": [],
+                    "max_per_run": 20, "rules": [],
+                    "builtin": {"phrase_waste": True, "word_zero_conv": True}},
         "audit": {"banned_words": [], "allowed_goal_ids": [],
                   "require_utm": True, "title_fill_min": 0.6},
     }
@@ -32,3 +37,36 @@ def test_settings_for_does_not_share_lists():
 def test_allowed_modes():
     assert ALLOWED_MODES["audit"] == ("off", "report")
     assert ALLOWED_MODES["queries"] == ("off", "report", "approve", "auto")
+
+
+def test_goal_ids_key_gone():
+    assert "goal_ids" not in settings_for("queries", {"goal_ids": [1]})
+
+
+def test_nested_dict_merged_per_key():
+    s = settings_for("placements", {"spam": {"min_leads": 3, "ratio": "x", "junk": 1,
+                                             "min_cr": 7.5}})
+    assert s["spam"] == {"min_leads": 3, "min_cr": 7.5, "ratio": 2.5, "goals": "strategy"}
+    s = settings_for("queries", {"builtin": {"phrase_waste": False}})
+    assert s["builtin"] == {"phrase_waste": False, "word_zero_conv": True}
+    s = settings_for("placements", {"dictionary": {"categories": ["app"], "enabled": 1}})
+    assert s["dictionary"] == {"categories": ["app"]}
+    for bad in ("app", ["app"], None, 5):
+        assert settings_for("placements", {"dictionary": bad})["dictionary"] == {
+            "categories": ["app", "dsp", "game", "junk"]}
+    s = settings_for("placements", {"dictionary": {"categories": "app"}})
+    assert s["dictionary"]["categories"] == ["app", "dsp", "game", "junk"]
+
+
+def test_nested_lists_not_shared():
+    settings_for("placements", None)["dictionary"]["categories"].append("site")
+    assert DEFAULTS["placements"]["dictionary"]["categories"] == ["app", "dsp", "game", "junk"]
+    raw = {"dictionary": {"categories": ["app"]}}
+    settings_for("placements", raw)["dictionary"]["categories"].append("dsp")
+    assert raw["dictionary"]["categories"] == ["app"]
+
+
+def test_rules_list_passes_through():
+    rule = {"id": "abc123", "name": "x"}
+    assert settings_for("placements", {"rules": [rule]})["rules"] == [rule]
+    assert settings_for("queries", {"rules": {"id": "abc123"}})["rules"] == []

@@ -108,7 +108,7 @@ def test_window_ends_yesterday(monkeypatch):
 
 def test_goals_from_settings_override_strategy(monkeypatch):
     fake = FakeDirect(monkeypatch, [_camp(1, goal=GOAL)], _base(goal=541664134))
-    out = qm.run(_ctx({"goal_ids": [541664134]}))
+    out = qm.run(_ctx({"lead_goal_ids": [541664134]}))
     assert fake.reports[0]["Goals"] == ["541664134"]
     assert {"бесплатно", "купить диплом"} <= _objects(out)
 
@@ -455,7 +455,7 @@ def test_account_skip_keeps_campaign_reasons(monkeypatch):
 
 def test_settings_guarded(monkeypatch):
     fake = FakeDirect(monkeypatch, [_camp(1)], _base(goal=541664134))
-    out = qm.run(_ctx({"goal_ids": ["abc", 541664134, " 541664135", True]}))
+    out = qm.run(_ctx({"lead_goal_ids": ["abc", 541664134, " 541664135", True]}))
     assert fake.reports[0]["Goals"] == ["541664134", "541664135"]
     assert len(out.summary["settings_notes"]) == 2
     for bad in ({"multiplier": 0.5}, {"multiplier": 11}, {"window_days": 3},

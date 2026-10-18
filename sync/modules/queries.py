@@ -17,6 +17,7 @@ from sync.agent.writer import negatives
 from sync.agent.writer.goal import PLACEHOLDER_GOAL_ID, read_goal_ids
 from sync.modules import direct_api
 from sync.modules.accounts import DirectAccount
+from sync.modules.text import yo
 from sync.modules.types import ApplyResult, Context, Finding, RunOutput, StoredFinding
 from sync.placements.direct import DirectError
 
@@ -164,18 +165,12 @@ STEM_MIN = 4
 STEM_TAIL = 2
 
 
-def _yo(text: str) -> str:
-    # Директ не различает ё и е: «учеба» в минусе гасит ключ «учёба». Только для сравнений,
-    # записываемая фраза остаётся как есть.
-    return text.replace("ё", "е")
-
-
 def _fold(words: FrozenSet[str]) -> FrozenSet[str]:
-    return frozenset(_yo(w) for w in words)
+    return frozenset(yo(w) for w in words)
 
 
 def _same_stem(a: str, b: str) -> bool:
-    a, b = _yo(a), _yo(b)
+    a, b = yo(a), yo(b)
     if a == b:
         return True
     n = 0
@@ -290,14 +285,14 @@ def _scan_login(acc: DirectAccount, settings: dict, win: Tuple[str, str], log) -
     def refuse(cid, phrase, reason):
         scan.refused.append("%s %s «%s»: %s" % (acc.login, cid, phrase, reason))
 
-    override = settings["goal_ids"]
+    override = settings["lead_goal_ids"]
     goals_by_cid: Dict[str, List[int]] = {}
     for cid, c in live.items():
         goals = override or strategy_goals(c)
         if goals:
             goals_by_cid[cid] = goals
         else:
-            skip(cid, "судить без конверсий нельзя: у стратегии нет цели, goal_ids пуст")
+            skip(cid, "судить без конверсий нельзя: у стратегии нет цели, lead_goal_ids пуст")
     report_goals = sorted({g for gs in goals_by_cid.values() for g in gs})[:MAX_REPORT_GOALS]
     for cid in list(goals_by_cid):
         # Цель, не попавшая в отчёт, дала бы кампании «ноль конверсий» там, где их не спросили.
@@ -353,7 +348,7 @@ def _scan_login(acc: DirectAccount, settings: dict, win: Tuple[str, str], log) -
     for rule, text, cid in _candidates(rows, settings, float(cpa_limit), own_words,
                                        own_phrases):
         phrase = negatives.normalize_phrase(text)
-        if (cid, _yo(phrase)) in seen or cid not in by_cid:
+        if (cid, yo(phrase)) in seen or cid not in by_cid:
             continue
         ok, why = negatives.phrase_is_valid(phrase)
         words = _words(phrase)
@@ -386,7 +381,7 @@ def _scan_login(acc: DirectAccount, settings: dict, win: Tuple[str, str], log) -
                    % (paying[0]["cost"] / paying[0]["conversions"]))
             continue
         picked[(cid, phrase)] = (rule, fam)
-        seen.add((cid, _yo(phrase)))
+        seen.add((cid, yo(phrase)))
 
     order = sorted(picked.items(), key=lambda kv: (-kv[1][1]["cost"], kv[0]))
     per_cid: Dict[str, int] = {}
@@ -426,13 +421,13 @@ def checked_settings(settings: dict) -> Tuple[dict, List[str]]:
     out = dict(settings)
     notes: List[str] = []
     goals = set()
-    for g in settings["goal_ids"]:
+    for g in settings["lead_goal_ids"]:
         text = str(g).strip()
         if isinstance(g, bool) or not text.isdigit():
-            notes.append("goal_ids: «%s» не идентификатор цели — отброшено" % g)
+            notes.append("lead_goal_ids: «%s» не идентификатор цели — отброшено" % g)
         else:
             goals.add(int(text))
-    out["goal_ids"] = sorted(goals)
+    out["lead_goal_ids"] = sorted(goals)
     for key in ("stop_words", "never_minus"):
         good = [x for x in settings[key] if isinstance(x, str) and x.strip()]
         if len(good) != len(settings[key]):
@@ -553,7 +548,7 @@ def _apply_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
     keys = [_words(k) for k in direct_api.keywords_by_campaign(
         acc.token, acc.login, [int(cid)]).get(str(cid), [])]
     never = _never_list(settings)
-    have = {_yo(negatives.normalize_phrase(p)) for p in existing}
+    have = {yo(negatives.normalize_phrase(p)) for p in existing}
     used = _chars(existing)
     out: Dict[int, ApplyResult] = {}
     to_add: List[str] = []
@@ -569,10 +564,10 @@ def _apply_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
                                     % " ".join(sorted(hit)))
         elif _key_conflict(words, keys):
             out[f.id] = ApplyResult(False, {}, "конфликт с ключом кампании")
-        elif _yo(phrase) in have:
+        elif yo(phrase) in have:
             # Не наша запись: «применено» отдало бы ручную фразу под откат модуля.
             out[f.id] = ApplyResult(False, {}, "фраза уже стоит в кампании — поставлена не модулем")
-        elif _yo(phrase) in {_yo(x) for x in to_add}:
+        elif yo(phrase) in {yo(x) for x in to_add}:
             # Вторая находка на то же действие: запись одна, засчитать её дважды нельзя.
             out[f.id] = ApplyResult(False, {}, "дубль: та же фраза в этом применении")
         elif used + len(phrase) > negatives.MAX_TOTAL_CHARS:
@@ -623,7 +618,7 @@ def _rollback_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
             dups.add(f.id)
         elif any(p.strip() == phrase for p in existing):
             drop.append(phrase)
-        elif any(_yo(negatives.normalize_phrase(p)) == _yo(phrase) for p in existing):
+        elif any(yo(negatives.normalize_phrase(p)) == yo(phrase) for p in existing):
             out[f.id] = ApplyResult(False, {"campaign_id": cid, "phrase": phrase},
                                     "вариант поставлен не модулем")
         else:
