@@ -283,3 +283,64 @@ def test_load_project_modules_include_off(live):
     assert store.load_project_modules(SLUG) == []
     (row,) = store.load_project_modules(SLUG, include_off=True)
     assert row["mode"] == "off" and row["settings"] == {"max_per_run": 7}
+
+
+class _Shared:
+    """Одно соединение на все вызовы хранилища: close() не закрывает его по-настоящему."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def close(self):
+        pass
+
+
+# project_sources ведёт другая миграция Panda (20261017153700_project_onboarding_core.sql),
+# на scratch-базе её может не быть. Таблица — копия той DDL временной таблицей сессии:
+# временные таблицы стоят в search_path первыми и умирают вместе с соединением, так что
+# база после теста остаётся какой была, а живая public.project_sources, если она есть,
+# тестом не задевается. Внешних ключей нет: временной таблице на постоянную ссылаться нельзя.
+_SOURCES_DDL = """
+CREATE TEMP TABLE project_sources (
+  id                bigserial PRIMARY KEY,
+  dashboard_slug    text NOT NULL,
+  kind              text NOT NULL CHECK (kind IN ('direct', 'metrika')),
+  external_id       text NOT NULL,
+  yandex_account_id bigint NOT NULL,
+  settings          jsonb NOT NULL DEFAULT '{}',
+  status            text NOT NULL DEFAULT 'new',
+  UNIQUE (dashboard_slug, kind, external_id)
+)"""
+
+
+@pytest.fixture
+def sources(live, monkeypatch):
+    conn = psycopg2.connect(TEST_URL)
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute(_SOURCES_DDL)
+    monkeypatch.setattr(db, "_new_connection", lambda: _Shared(conn))
+    yield lambda kind, ext, settings: cur.execute(
+        "INSERT INTO project_sources (dashboard_slug, kind, external_id, yandex_account_id, "
+        "settings) VALUES (%s, %s, %s, 1, %s::jsonb)", (SLUG, kind, ext, settings))
+    conn.close()
+
+
+def test_project_lead_goals_from_metrika_sources(sources):
+    assert store.project_lead_goals(SLUG) == []
+    sources("metrika", "100", '{"goals": [{"id": 30, "name": "Заявка", "role": "lead"},'
+                              ' {"id": 10, "name": "Корзина", "role": "step"},'
+                              ' {"id": 20, "name": "Качественный лид", "role": "quality_lead"}],'
+                              ' "ecommerce": false, "result": "goal"}')
+    # Второй счётчик: цели складываются, повтор не дублируется, кривые пропускаются.
+    sources("metrika", "200", '{"goals": [{"id": 30, "name": "Заявка", "role": "lead"},'
+                              ' {"id": "5", "name": "x", "role": "lead"}, "мусор",'
+                              ' {"id": 40, "name": "Звонок", "role": "lead"}]}')
+    sources("metrika", "300", '{}')
+    # Кабинет Директа целей не несёт, даже если в settings что-то похожее.
+    sources("direct", "login1", '{"currency": "RUB", "goals": [{"id": 99, "role": "lead"}]}')
+    assert store.project_lead_goals(SLUG) == [20, 30, 40]
+    assert store.project_lead_goals("__no_such_project__") == []

@@ -36,7 +36,8 @@ SAMPLE = 5
 # Москва без перехода на летнее время с 2014 (как в runner.MSK; импорт оттуда дал бы цикл
 # runner -> registry -> queries).
 MSK = timezone(timedelta(hours=3))
-REPORT_FIELDS = ["CampaignId", "Query", "Clicks", "Cost", "Conversions"]
+# Показы — для условий по CTR в пользовательских правилах: без них ctr не определён.
+REPORT_FIELDS = ["CampaignId", "Query", "Impressions", "Clicks", "Cost", "Conversions"]
 # Колонка конверсий приходит на цель: Conversions_<цель>_<модель атрибуции>.
 _GOAL_COLUMN = re.compile(r"^Conversions_(\d+)_")
 NO_DATA = "--"
@@ -132,6 +133,9 @@ def _query_rows(raw: List[Dict[str, str]], goals_by_cid: Dict[str, List[int]]
     Конверсии строки — максимум по колонкам целей ЕЁ кампании, а не сумма: цели
     пересекаются (агент видел одно действие под двумя id, segments.primary_goal_column),
     и сумма удвоила бы конверсии. Ноль/не ноль от выбора не зависит.
+
+    goal_conversions — достижения по КАЖДОЙ цели отчёта, а не только целям кампании:
+    пользовательские правила считают лиды по целям-лидам проекта (rule_raw).
     """
     cols: Dict[int, List[str]] = {}
     for rec in raw[:1]:
@@ -150,12 +154,25 @@ def _query_rows(raw: List[Dict[str, str]], goals_by_cid: Dict[str, List[int]]
         # matched_key пуст намеренно: «что мы купили» берётся только из свежего снимка
         # ключей (каждая судимая кампания в нём есть), колонке отчёта не верим.
         slot = agg.setdefault((cid, query), {"query": query, "campaign_id": cid,
-                                             "cost": 0.0, "clicks": 0, "conversions": 0,
+                                             "cost": 0.0, "clicks": 0, "impressions": 0,
+                                             "conversions": 0, "goal_conversions": {},
                                              "matched_key": ""})
         slot["cost"] += _num(rec.get("Cost"))
         slot["clicks"] += int(_num(rec.get("Clicks")))
+        slot["impressions"] += int(_num(rec.get("Impressions")))
         slot["conversions"] += int(conv)
+        for goal, names in cols.items():
+            got = int(max(_num(rec.get(c)) for c in names))
+            slot["goal_conversions"][goal] = slot["goal_conversions"].get(goal, 0) + got
     return list(agg.values())
+
+
+def rule_raw(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Строки запросов -> вид отчёта площадок (direct.placements_window) для leads.build_rows:
+    один путь расчёта лидов, CR и цены лида у обоих модулей. Объект — ключ "query"."""
+    return [{"campaign_id": q["campaign_id"], "query": q["query"], "clicks": q["clicks"],
+             "cost": q["cost"], "impressions": q["impressions"],
+             "conversions": dict(q["goal_conversions"])} for q in rows]
 
 
 # Минус-слово Директ применяет ко всем словоформам, а морфологии в проекте нет. Сравнение

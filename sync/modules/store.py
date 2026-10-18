@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Хранилище модулей Директа: project_modules, module_runs, module_findings.
+"""Хранилище модулей Директа: project_modules, module_runs, module_findings;
+чтение целей-лидов из project_sources.
 
-Схему ведёт миграция Panda-BI (supabase/migrations/20261018193100_direct_modules.sql);
-здесь таблицы не создаются.
+Схему ведут миграции Panda-BI (supabase/migrations/20261018193100_direct_modules.sql,
+project_sources — 20261017153700_project_onboarding_core.sql); здесь таблицы не создаются.
 """
 
 import json
@@ -50,6 +51,33 @@ def load_project_modules(slug: str, include_off: bool = False) -> List[dict]:
             "WHERE dashboard_slug = %s AND (%s OR mode <> 'off') ORDER BY module_key",
             (slug, include_off))
         return [dict(r) for r in cur.fetchall()]
+
+
+# Роли целей Метрики, которые считаются лидом (lib/project/source-settings.ts: GoalRole).
+# «step» — промежуточный шаг воронки, не лид.
+LEAD_ROLES = ("lead", "quality_lead")
+
+
+def project_lead_goals(slug: str) -> List[int]:
+    """Цели-лиды проекта из настроек его счётчиков Метрики; нет счётчика — [].
+
+    Счётчиков у проекта может быть несколько: цели всех складываются. Форма settings
+    приходит из Panda; разбираем терпимо, кривую цель пропускаем, а не роняем прогон.
+    """
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT settings FROM project_sources "
+                    "WHERE dashboard_slug = %s AND kind = 'metrika' ORDER BY id", (slug,))
+        rows = cur.fetchall()
+    out = set()
+    for (settings,) in rows:
+        goals = settings.get("goals") if isinstance(settings, dict) else None
+        for g in goals if isinstance(goals, list) else []:
+            if not isinstance(g, dict) or g.get("role") not in LEAD_ROLES:
+                continue
+            gid = g.get("id")
+            if isinstance(gid, int) and not isinstance(gid, bool) and gid > 0:
+                out.add(gid)
+    return sorted(out)
 
 
 def last_run_started(slug: str, module_key: str,

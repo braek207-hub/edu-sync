@@ -34,7 +34,7 @@ def _camp(cid, goal=GOAL, state="ON", ctype="TEXT_CAMPAIGN", negatives=()):
 
 
 def _row(cid, query, clicks, cost, conv, goal=GOAL):
-    return {"CampaignId": str(cid), "Query": query,
+    return {"CampaignId": str(cid), "Query": query, "Impressions": str(clicks * 10),
             "Clicks": str(clicks), "Cost": str(cost),
             "Conversions_%d_AUTO" % goal: str(conv) if conv else "--"}
 
@@ -345,7 +345,8 @@ def test_report_request_shape(monkeypatch):
     assert {"Field": "CampaignId", "Operator": "IN",
             "Values": ["9", "10"]} in params["SelectionCriteria"]["Filter"]
     assert params["AttributionModels"] == ["AUTO"]
-    assert params["FieldNames"] == ["CampaignId", "Query", "Clicks", "Cost", "Conversions"]
+    assert params["FieldNames"] == ["CampaignId", "Query", "Impressions", "Clicks", "Cost",
+                                   "Conversions"]
 
 
 def test_rollback_leaves_human_variant(monkeypatch):
@@ -547,3 +548,15 @@ def test_rollback_duplicate_in_group_already_absent(monkeypatch):
     assert res[1].ok and not res[1].response.get("already_absent")
     assert res[2].ok and res[2].response["already_absent"]
     assert fake.writes == [(1, ["ручная"])]
+
+
+def test_query_rows_carry_impressions_and_per_goal_conversions():
+    raw = _base() + [_row(1, "высшее образование заочно", 10, 1000, 2)]
+    rows = {q["query"]: q for q in qm._query_rows(raw, {"1": [GOAL]})}
+    top = rows["высшее образование заочно"]
+    assert top["impressions"] == 1100 and top["clicks"] == 110
+    assert top["conversions"] == 12 and top["goal_conversions"] == {GOAL: 12}
+    assert rows["купить диплом"]["goal_conversions"] == {GOAL: 0}
+    # Без колонки показов (старый отчёт) — ноль, а не падение.
+    bare = [{k: v for k, v in r.items() if k != "Impressions"} for r in _base()]
+    assert all(q["impressions"] == 0 for q in qm._query_rows(bare, {"1": [GOAL]}))
