@@ -17,7 +17,7 @@ from sync.modules.lifecycle import (FAILED_RETRY_HOURS, LIVE_STATUSES, REJECT_SU
                                     Reconciled, can_transition)
 from sync.modules.types import ApplyResult, StoredFinding, fingerprint
 
-_FINDING_COLS = ("id, status, fingerprint, last_seen_at, decided_at, rule, severity, title, "
+_FINDING_COLS = ("id, status, fingerprint, last_seen_at, decided_at, outcome_at, rule, severity, title, "
                  "login, campaign_id, campaign_name, object_type, object_id, details, action")
 
 
@@ -29,7 +29,7 @@ def _json(value):
 def _stored(row: dict) -> StoredFinding:
     return StoredFinding(
         id=row["id"], status=row["status"], fingerprint=row["fingerprint"],
-        last_seen_at=row["last_seen_at"], decided_at=row["decided_at"],
+        last_seen_at=row["last_seen_at"], decided_at=row["decided_at"], outcome_at=row["outcome_at"],
         rule=row["rule"], severity=row["severity"], title=row["title"],
         login=row["login"] or "", campaign_id=row["campaign_id"],
         campaign_name=row["campaign_name"] or "", object_type=row["object_type"] or "",
@@ -77,11 +77,14 @@ def existing_findings(slug: str, module_key: str) -> List[StoredFinding]:
             f"SELECT {_FINDING_COLS} FROM module_findings "
             "WHERE dashboard_slug = %s AND module_key = %s AND ("
             "  status = ANY(%s) OR status = 'dismissed' "
-            "  OR (status IN ('rejected', 'rolled_back') "
+            "  OR (status = 'rejected' "
             "      AND coalesce(decided_at, last_seen_at) > now() - make_interval(days => %s)) "
-            "  OR (status = 'failed' "
-            "      AND coalesce(decided_at, last_seen_at) > now() - make_interval(hours => %s)))",
-            (slug, module_key, list(LIVE_STATUSES), REJECT_SUPPRESS_DAYS, FAILED_RETRY_HOURS))
+            "  OR (status = 'rolled_back' AND coalesce(outcome_at, decided_at, last_seen_at) "
+            "      > now() - make_interval(days => %s)) "
+            "  OR (status = 'failed' AND coalesce(outcome_at, decided_at, last_seen_at) "
+            "      > now() - make_interval(hours => %s)))",
+            (slug, module_key, list(LIVE_STATUSES), REJECT_SUPPRESS_DAYS, REJECT_SUPPRESS_DAYS,
+             FAILED_RETRY_HOURS))
         return [_stored(r) for r in cur.fetchall()]
 
 
@@ -137,6 +140,7 @@ def set_outcome(finding_id: int, status: str, result: ApplyResult,
     (rollback=True: rollback_requested -> rolled_back, либо назад в applied при отказе).
 
     Источник у каждой цели один, поэтому гонка двух исполнителей не пишет дважды.
+    decided_at/decided_by не трогаем: это след решения человека, итог раннера — outcome_at.
     Переход вне схемы не пишется (False).
     """
     source = "rollback_requested" if rollback else "approved"
@@ -148,20 +152,17 @@ def set_outcome(finding_id: int, status: str, result: ApplyResult,
             cur.execute(
                 "UPDATE module_findings SET status = %s, "
                 "response = coalesce(response, '{}'::jsonb) || jsonb_build_object('rollback', %s::jsonb), "
-                "error = %s, "
-                "decided_at = CASE WHEN %s = 'rolled_back' THEN now() ELSE decided_at END "
+                "error = %s, outcome_at = now() "
                 "WHERE id = %s AND status = %s",
                 (status, json.dumps({"ok": result.ok, "response": result.response,
                                      "error": result.error}, ensure_ascii=False),
-                 result.error, status, finding_id, source))
+                 result.error, finding_id, source))
         else:
             cur.execute(
                 "UPDATE module_findings SET status = %s, response = %s, error = %s, "
                 "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END, "
-                "decided_at = CASE WHEN %s = 'failed' THEN now() ELSE decided_at END "
-                "WHERE id = %s AND status = %s",
-                (status, _json(result.response), result.error, status, status,
-                 finding_id, source))
+                "outcome_at = now() WHERE id = %s AND status = %s",
+                (status, _json(result.response), result.error, status, finding_id, source))
         return cur.rowcount == 1
 
 

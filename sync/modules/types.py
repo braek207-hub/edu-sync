@@ -35,6 +35,8 @@ class StoredFinding(Finding):
     fingerprint: str
     last_seen_at: datetime
     decided_at: Optional[datetime] = None
+    # время итога раннера (применил/упал/откатил); decided_at пишет только человек
+    outcome_at: Optional[datetime] = None
 
 
 @dataclass

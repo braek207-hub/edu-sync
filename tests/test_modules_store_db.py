@@ -168,12 +168,15 @@ def test_rolled_back_and_failed_are_loaded_for_suppression(live):
     live.execute("UPDATE module_findings SET status = 'applied' WHERE id = %s", (a,))
     store.request_rollback(SLUG, "placements", ["a.ru"])
     assert store.set_outcome(a, "rolled_back", ApplyResult(ok=True, response={}), rollback=True)
+    live.execute("SELECT decided_at, outcome_at FROM module_findings WHERE id IN (%s, %s)", (a, b))
+    # decided_at — след решения человека, раннер его не пишет
+    assert all(r[0] is None and r[1] is not None for r in live.fetchall())
     ex = store.existing_findings(SLUG, "placements")
     assert {e.status for e in ex} == {"rolled_back", "failed"}
     r = reconcile("placements", ex, [_f("a.ru"), _f("b.ru")], now)
     assert r.insert == []
     # давнее решение больше не держит
-    live.execute("UPDATE module_findings SET decided_at = now() - interval '2 days' "
-                 "WHERE id = %s", (b,))
+    live.execute("UPDATE module_findings SET decided_at = now(), "
+                 "outcome_at = now() - interval '2 days' WHERE id = %s", (b,))
     ex = store.existing_findings(SLUG, "placements")
     assert [e.status for e in ex] == ["rolled_back"]

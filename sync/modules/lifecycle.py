@@ -40,10 +40,13 @@ class Reconciled:
 
 def _suppressed(s: StoredFinding, now: datetime) -> bool:
     """Не вставлять заново: решение человека или недавний отказ Директа ещё в силе."""
-    # decided_at пуст — берём last_seen_at: «давно» нельзя выводить из отсутствия даты
-    ref = s.decided_at or s.last_seen_at
-    if s.status in ("rejected", "rolled_back"):
-        # rolled_back: человек снял запрет, auto-режим не должен вернуть его сразу
+    # даты нет — берём следующую по списку: «давно» нельзя выводить из отсутствия даты
+    if s.status == "rejected":
+        return now - (s.decided_at or s.last_seen_at) < timedelta(days=REJECT_SUPPRESS_DAYS)
+    # итоги раннера меряем от момента итога, а не решения человека (одобрить могли давно)
+    ref = s.outcome_at or s.decided_at or s.last_seen_at
+    if s.status == "rolled_back":
+        # человек снял запрет, auto-режим не должен вернуть его сразу
         return now - ref < timedelta(days=REJECT_SUPPRESS_DAYS)
     if s.status == "failed":
         return now - ref < timedelta(hours=FAILED_RETRY_HOURS)
@@ -53,6 +56,10 @@ def _suppressed(s: StoredFinding, now: datetime) -> bool:
 def reconcile(module_key: str, existing: List[StoredFinding],
               seen: List[Finding], now: datetime,
               scanned_logins: Optional[Collection[str]] = None) -> Reconciled:
+    """scanned_logins: кабинеты, прочитанные в этом прогоне (None — все). Открытые находки
+    непрочитанных кабинетов не закрываются; находки с login "" относятся к проекту целиком
+    и считаются прочитанными, когда scanned_logins непуст.
+    """
     by_fp: Dict[str, List[StoredFinding]] = {}
     for s in existing:
         by_fp.setdefault(s.fingerprint, []).append(s)
@@ -84,7 +91,9 @@ def reconcile(module_key: str, existing: List[StoredFinding],
         if s.status != "open" or s.fingerprint in seen_fps:
             continue
         # кабинет, который не удалось прочитать, ничего не «не показал»
-        if scanned_logins is not None and s.login not in scanned_logins:
+        # login "" — находка уровня проекта: прочитана, если прочитан хоть один кабинет
+        if (scanned_logins is not None and s.login not in scanned_logins
+                and not (s.login == "" and scanned_logins)):
             continue
         if s.action is None:
             out.resolve.append(s.id)

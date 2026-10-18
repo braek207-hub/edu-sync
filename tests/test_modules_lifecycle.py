@@ -17,10 +17,12 @@ def finding(obj="site.ru", action=None, **kw):
     return Finding(**base)
 
 
-def stored(f, id=1, status="open", seen_ago=timedelta(hours=1), decided_ago=None):
+def stored(f, id=1, status="open", seen_ago=timedelta(hours=1), decided_ago=None,
+           outcome_ago=None):
     return StoredFinding(**{**f.__dict__}, id=id, status=status,
                          fingerprint=fingerprint(MK, f), last_seen_at=NOW - seen_ago,
-                         decided_at=None if decided_ago is None else NOW - decided_ago)
+                         decided_at=None if decided_ago is None else NOW - decided_ago,
+                         outcome_at=None if outcome_ago is None else NOW - outcome_ago)
 
 
 ACT = {"op": "exclude_site"}
@@ -159,3 +161,22 @@ def test_failed_suppresses_24_hours():
     assert r.insert == []
     r = reconcile(MK, [stored(f, status="failed", decided_ago=timedelta(hours=25))], [f], NOW)
     assert r.insert == [f]
+
+
+def test_outcome_windows_measured_from_outcome_at():
+    f = finding(action=ACT)
+    # одобрено давно, упало только что: окно считается от итога
+    r = reconcile(MK, [stored(f, status="failed", decided_ago=timedelta(days=5),
+                              outcome_ago=timedelta(hours=1))], [f], NOW)
+    assert r.insert == []
+    r = reconcile(MK, [stored(f, status="rolled_back", decided_ago=timedelta(days=1),
+                              outcome_ago=timedelta(days=40))], [f], NOW)
+    assert r.insert == [f]
+
+
+def test_project_level_login_counts_as_scanned():
+    proj = finding(login="")
+    ex = [stored(proj, id=1)]
+    assert reconcile(MK, ex, [], NOW, scanned_logins=["good"]).resolve == [1]
+    assert reconcile(MK, ex, [], NOW, scanned_logins=[]).resolve == []
+    assert reconcile(MK, ex, [], NOW).resolve == [1]
