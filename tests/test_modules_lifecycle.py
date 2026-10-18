@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime, timedelta, timezone
 
-from sync.modules.lifecycle import EXPIRE_HOURS, REJECT_SUPPRESS_DAYS, can_transition, reconcile
+from sync.modules.lifecycle import (EXPIRE_HOURS, FAILED_RETRY_HOURS, REJECT_SUPPRESS_DAYS, can_transition,
+                                    reconcile)
 from sync.modules.types import Finding, StoredFinding, fingerprint
 
 NOW = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
@@ -106,3 +107,55 @@ def test_can_transition():
           ("open", "applied")]
     assert all(can_transition(a, b) for a, b in yes)
     assert not any(can_transition(a, b) for a, b in no)
+
+
+def test_transitions_for_refused_rollback_and_failed():
+    assert can_transition("rollback_requested", "applied")
+    assert not can_transition("rollback_requested", "failed")
+    assert can_transition("approved", "failed")
+    assert not can_transition("applied", "failed")
+
+
+def test_failed_login_open_finding_is_not_resolved_or_expired():
+    audit = finding(login="bad")
+    act = finding(obj="x.ru", login="bad", action=ACT)
+    old = timedelta(hours=100)
+    ex = [stored(audit, id=1, seen_ago=old), stored(act, id=2, seen_ago=old)]
+    r = reconcile(MK, ex, [], NOW, scanned_logins=["good"])
+    assert r.resolve == [] and r.expire == []
+    r = reconcile(MK, ex, [], NOW, scanned_logins=["bad"])
+    assert r.resolve == [1] and r.expire == [2]
+    r = reconcile(MK, ex, [], NOW)
+    assert r.resolve == [1] and r.expire == [2]
+
+
+def test_live_non_open_seen_again_goes_to_seen_live_only():
+    f = finding(action=ACT)
+    for st in ("approved", "applied", "rollback_requested"):
+        r = reconcile(MK, [stored(f, id=9, status=st)], [f], NOW)
+        assert r.seen_live == [9] and r.touch == [] and r.insert == [], st
+
+
+def test_rejected_without_decided_at_uses_last_seen_at():
+    f = finding(action=ACT)
+    fresh = stored(f, status="rejected", seen_ago=timedelta(days=2))
+    old = stored(f, status="rejected", seen_ago=timedelta(days=45))
+    assert reconcile(MK, [fresh], [f], NOW).insert == []
+    assert reconcile(MK, [old], [f], NOW).insert == [f]
+
+
+def test_rolled_back_suppresses_30_days():
+    f = finding(action=ACT)
+    r = reconcile(MK, [stored(f, status="rolled_back", decided_ago=timedelta(days=5))], [f], NOW)
+    assert r.insert == []
+    r = reconcile(MK, [stored(f, status="rolled_back", decided_ago=timedelta(days=31))], [f], NOW)
+    assert r.insert == [f]
+
+
+def test_failed_suppresses_24_hours():
+    f = finding(action=ACT)
+    assert FAILED_RETRY_HOURS == 24
+    r = reconcile(MK, [stored(f, status="failed", decided_ago=timedelta(hours=23))], [f], NOW)
+    assert r.insert == []
+    r = reconcile(MK, [stored(f, status="failed", decided_ago=timedelta(hours=25))], [f], NOW)
+    assert r.insert == [f]

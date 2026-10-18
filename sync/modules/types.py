@@ -59,3 +59,5 @@ class Context:
 class RunOutput:
     findings: List[Finding]
     summary: dict = field(default_factory=dict)
+    # None — прочитаны все кабинеты ctx; иначе только эти логины (остальные не закрываем)
+    scanned_logins: Optional[List[str]] = None

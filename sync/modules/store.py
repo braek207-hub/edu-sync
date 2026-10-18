@@ -13,7 +13,8 @@ from typing import Iterator, List, Optional, Sequence
 import psycopg2.extras
 
 from sync import db
-from sync.modules.lifecycle import LIVE_STATUSES, REJECT_SUPPRESS_DAYS, Reconciled, can_transition
+from sync.modules.lifecycle import (FAILED_RETRY_HOURS, LIVE_STATUSES, REJECT_SUPPRESS_DAYS,
+                                    Reconciled, can_transition)
 from sync.modules.types import ApplyResult, StoredFinding, fingerprint
 
 _FINDING_COLS = ("id, status, fingerprint, last_seen_at, decided_at, rule, severity, title, "
@@ -76,9 +77,11 @@ def existing_findings(slug: str, module_key: str) -> List[StoredFinding]:
             f"SELECT {_FINDING_COLS} FROM module_findings "
             "WHERE dashboard_slug = %s AND module_key = %s AND ("
             "  status = ANY(%s) OR status = 'dismissed' "
-            "  OR (status = 'rejected' AND (decided_at IS NULL "
-            "       OR decided_at > now() - make_interval(days => %s))))",
-            (slug, module_key, list(LIVE_STATUSES), REJECT_SUPPRESS_DAYS))
+            "  OR (status IN ('rejected', 'rolled_back') "
+            "      AND coalesce(decided_at, last_seen_at) > now() - make_interval(days => %s)) "
+            "  OR (status = 'failed' "
+            "      AND coalesce(decided_at, last_seen_at) > now() - make_interval(hours => %s)))",
+            (slug, module_key, list(LIVE_STATUSES), REJECT_SUPPRESS_DAYS, FAILED_RETRY_HOURS))
         return [_stored(r) for r in cur.fetchall()]
 
 
@@ -93,6 +96,11 @@ def apply_reconciled(slug: str, module_key: str, run_id: int, r: Reconciled) -> 
                 "action = %s, title = %s, severity = %s WHERE id = %s AND status = 'open'",
                 (run_id, _json(f.details), _json(f.action) if f.action is not None else None,
                  f.title, f.severity, fid))
+        if r.seen_live:
+            # только метка «видели»: одобренное/применённое прогон не переписывает
+            cur.execute("UPDATE module_findings SET last_seen_at = now(), run_id = %s "
+                        "WHERE id = ANY(%s) AND status IN ('approved', 'applied', "
+                        "'rollback_requested')", (run_id, list(r.seen_live)))
         for new_status, ids in (("resolved", r.resolve), ("expired", r.expire)):
             if ids:
                 cur.execute("UPDATE module_findings SET status = %s WHERE id = ANY(%s) "
@@ -123,22 +131,42 @@ def pending(slug: str) -> List[StoredFinding]:
         return [_stored(r) for r in cur.fetchall()]
 
 
-def set_outcome(finding_id: int, status: str, result: ApplyResult) -> bool:
-    """Итог применения/отката. Переход, которого нет в схеме, не пишется (False)."""
-    sources = [s for s in ("approved", "applied", "rollback_requested")
-               if can_transition(s, status)]
-    if not sources:
+def set_outcome(finding_id: int, status: str, result: ApplyResult,
+                rollback: bool = False) -> bool:
+    """Итог применения (rollback=False: approved -> applied/failed) или отката
+    (rollback=True: rollback_requested -> rolled_back, либо назад в applied при отказе).
+
+    Источник у каждой цели один, поэтому гонка двух исполнителей не пишет дважды.
+    Переход вне схемы не пишется (False).
+    """
+    source = "rollback_requested" if rollback else "approved"
+    if not can_transition(source, status):
         return False
     with db.get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            "UPDATE module_findings SET status = %s, response = %s, error = %s, "
-            "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END "
-            "WHERE id = %s AND status = ANY(%s)",
-            (status, _json(result.response), result.error, status, finding_id, sources))
+        if rollback:
+            # исходный ответ применения сохраняем: по нему видно, что именно было запрещено
+            cur.execute(
+                "UPDATE module_findings SET status = %s, "
+                "response = coalesce(response, '{}'::jsonb) || jsonb_build_object('rollback', %s::jsonb), "
+                "error = %s, "
+                "decided_at = CASE WHEN %s = 'rolled_back' THEN now() ELSE decided_at END "
+                "WHERE id = %s AND status = %s",
+                (status, json.dumps({"ok": result.ok, "response": result.response,
+                                     "error": result.error}, ensure_ascii=False),
+                 result.error, status, finding_id, source))
+        else:
+            cur.execute(
+                "UPDATE module_findings SET status = %s, response = %s, error = %s, "
+                "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END, "
+                "decided_at = CASE WHEN %s = 'failed' THEN now() ELSE decided_at END "
+                "WHERE id = %s AND status = %s",
+                (status, _json(result.response), result.error, status, status,
+                 finding_id, source))
         return cur.rowcount == 1
 
 
-def request_rollback(slug: str, module_key: str, object_ids: Sequence[str]) -> int:
+def request_rollback(slug: str, module_key: str, object_ids: Sequence[str],
+                     login: Optional[str] = None) -> int:
     """Откат по списку объектов (путь --unban): применённые -> rollback_requested."""
     if not object_ids:
         return 0
@@ -146,7 +174,8 @@ def request_rollback(slug: str, module_key: str, object_ids: Sequence[str]) -> i
         cur.execute(
             "UPDATE module_findings SET status = 'rollback_requested' "
             "WHERE dashboard_slug = %s AND module_key = %s AND status = 'applied' "
-            "AND object_id = ANY(%s)", (slug, module_key, list(object_ids)))
+            "AND object_id = ANY(%s) AND (%s::text IS NULL OR login = %s)",
+            (slug, module_key, list(object_ids), login, login))
         return cur.rowcount
 
 
@@ -154,7 +183,10 @@ def request_rollback(slug: str, module_key: str, object_ids: Sequence[str]) -> i
 def hold_project_lock(slug: str) -> Iterator[bool]:
     """Advisory-замок проекта на всё время прогона; False — замок держит другой прогон.
 
-    Замок живёт на сессии, поэтому соединение выделенное и закрывается только в конце.
+    Замок сессионный: нужно прямое соединение, не пулер в транзакционном режиме (через него
+    сессия между запросами меняется и замок молча теряется) — тот же довод, почему аренда
+    в sync/agent/writer/db.py:228-233 сделана таблицей. Оборванное соединение замок снимает.
+    Соединение выделенное и закрывается только в конце прогона.
     """
     conn = db._open_connection()
     conn.autocommit = True

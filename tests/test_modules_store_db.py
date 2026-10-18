@@ -99,7 +99,7 @@ def test_full_cycle(live):
     assert store.request_rollback(SLUG, "placements", ["a.ru", "zzz"]) == 1
     assert store.request_rollback(SLUG, "placements", []) == 0
     assert [p.status for p in store.pending(SLUG)] == ["rollback_requested"]
-    assert store.set_outcome(ids[0], "rolled_back", ApplyResult(ok=True, response={}))
+    assert store.set_outcome(ids[0], "rolled_back", ApplyResult(ok=True, response={}), rollback=True)
 
     # аудит, которого прогон не увидел, закрывается
     r3 = reconcile("placements", store.existing_findings(SLUG, "placements"), [], now)
@@ -123,3 +123,57 @@ def test_project_lock_is_exclusive(live):
             assert other is True
     with store.hold_project_lock(SLUG) as again:
         assert again is True
+
+
+def _insert_applied(run, f):
+    ids = store.apply_reconciled(SLUG, "placements", run, Reconciled(insert=[f]))
+    assert len(ids) == 1
+    return ids[0]
+
+
+def test_refused_rollback_returns_to_applied_keeping_response(live):
+    run = store.start_run(SLUG, "placements", "approve")
+    fid = _insert_applied(run, _f("a.ru"))
+    live.execute("UPDATE module_findings SET status = 'approved' WHERE id = %s", (fid,))
+    assert store.set_outcome(fid, "applied", ApplyResult(ok=True, response={"ответ": "ок"}))
+    assert store.request_rollback(SLUG, "placements", ["a.ru"], login="other") == 0
+    assert store.request_rollback(SLUG, "placements", ["a.ru"], login="acc") == 1
+    assert store.set_outcome(fid, "applied", ApplyResult(ok=False, response={"код": 1},
+                                                         error="Директ отказал"), rollback=True)
+    live.execute("SELECT status, response->>'ответ', response->'rollback'->>'error', error "
+                 "FROM module_findings WHERE id = %s", (fid,))
+    assert live.fetchone() == ("applied", "ок", "Директ отказал", "Директ отказал")
+    # источник один: повторный исход с того же шага не проходит
+    assert not store.set_outcome(fid, "rolled_back", ApplyResult(ok=True, response={}),
+                                 rollback=True)
+
+
+def test_seen_live_updates_only_last_seen_and_run(live):
+    run = store.start_run(SLUG, "placements", "approve")
+    fid = _insert_applied(run, _f("a.ru"))
+    live.execute("UPDATE module_findings SET status = 'approved' WHERE id = %s", (fid,))
+    run2 = store.start_run(SLUG, "placements", "approve")
+    store.apply_reconciled(SLUG, "placements", run2, Reconciled(seen_live=[fid]))
+    live.execute("SELECT status, run_id, details->>'clicks' FROM module_findings WHERE id = %s",
+                 (fid,))
+    assert live.fetchone() == ("approved", run2, "3")
+
+
+def test_rolled_back_and_failed_are_loaded_for_suppression(live):
+    now = datetime.now(timezone.utc)
+    run = store.start_run(SLUG, "placements", "approve")
+    a, b = _insert_applied(run, _f("a.ru")), _insert_applied(run, _f("b.ru"))
+    live.execute("UPDATE module_findings SET status = 'approved' WHERE id = %s", (b,))
+    assert store.set_outcome(b, "failed", ApplyResult(ok=False, response={}, error="e"))
+    live.execute("UPDATE module_findings SET status = 'applied' WHERE id = %s", (a,))
+    store.request_rollback(SLUG, "placements", ["a.ru"])
+    assert store.set_outcome(a, "rolled_back", ApplyResult(ok=True, response={}), rollback=True)
+    ex = store.existing_findings(SLUG, "placements")
+    assert {e.status for e in ex} == {"rolled_back", "failed"}
+    r = reconcile("placements", ex, [_f("a.ru"), _f("b.ru")], now)
+    assert r.insert == []
+    # давнее решение больше не держит
+    live.execute("UPDATE module_findings SET decided_at = now() - interval '2 days' "
+                 "WHERE id = %s", (b,))
+    ex = store.existing_findings(SLUG, "placements")
+    assert [e.status for e in ex] == ["rolled_back"]
