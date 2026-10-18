@@ -28,7 +28,7 @@ class FakeCursor:
         self.conn.executed.append((" ".join(sql.split()), params))
 
     def fetchone(self):
-        return self.conn.row
+        return self.conn.rows.pop(0) if self.conn.rows else self.conn.row
 
 
 class FakeConn:
@@ -36,12 +36,17 @@ class FakeConn:
         self.row = row
         self.executed = []
         self.commits = 0
+        self.rollbacks = 0
+        self.rows = []  # очередь ответов fetchone; пуста — всегда self.row
 
     def cursor(self):
         return FakeCursor(self)
 
     def commit(self):
         self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
 
     def updates(self):
         return [e for e in self.executed if e[0].upper().startswith("UPDATE")]
@@ -163,6 +168,7 @@ def test_upstream_error_falls_back_while_valid(post):
 
     assert A.access_token(conn, 1, key_b64=KEY, now=NOW) == OLD_ACCESS
     assert conn.updates() == []
+    assert conn.commits >= 1
 
 
 def test_network_error_falls_back_while_valid(post):
@@ -199,6 +205,7 @@ def test_secret_not_in_errors(post):
     for bad in ("client_secret", "SECRET-VALUE", OLD_REFRESH, OLD_ACCESS):
         assert bad not in text
     assert ei.value.__cause__ is None
+    assert ei.value.__context__ is None
 
 
 def test_mark_reconnect_updates_both_tables():
@@ -208,3 +215,42 @@ def test_mark_reconnect_updates_both_tables():
     assert "yandex_accounts" in ups[0][0] and "status = 'reconnect'" in ups[0][0]
     assert "project_sources" in ups[1][0] and "last_error" in ups[1][0]
     assert "доступ отозван" in ups[1][1]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"access_token": ""}, {"expires_in": 5}, {"access_token": "x", "error": "oops"}],
+)
+def test_malformed_200_is_failure(post, body):
+    post["resp"] = Resp(200, body)
+    conn = make_conn(-1)
+    with pytest.raises(A.AccessTokenError):
+        A.access_token(conn, 1, key_b64=KEY, now=NOW)
+    assert conn.updates() == []
+
+
+def test_non_2xx_with_token_is_failure(post):
+    post["resp"] = Resp(302, {"access_token": "x"})
+    conn = make_conn(-1)
+    with pytest.raises(A.AccessTokenError):
+        A.access_token(conn, 1, key_b64=KEY, now=NOW)
+
+
+def test_decrypt_failure_under_lock_rolls_back(post):
+    wrong = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
+    conn = make_conn(3)
+    with pytest.raises(ValueError):
+        A.access_token(conn, 1, key_b64=wrong, now=NOW)
+    assert conn.rollbacks == 1
+    assert post["calls"] == []
+
+
+def test_race_recheck_under_lock_skips_refresh(post):
+    stale = make_conn(3).row
+    fresh = (encrypt("fresh-by-peer", KEY), encrypt(OLD_REFRESH, KEY), NOW + timedelta(days=30), "ok")
+    conn = FakeConn(fresh)
+    conn.rows = [stale, fresh]
+
+    assert A.access_token(conn, 1, key_b64=KEY, now=NOW) == "fresh-by-peer"
+    assert post["calls"] == []
+    assert conn.updates() == []

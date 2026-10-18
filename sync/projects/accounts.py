@@ -36,6 +36,8 @@ class NeedsReconnect(AccessTokenError):
 
 
 def mark_reconnect(conn, account_id: int, reason: str) -> None:
+    """Помечает подключение и его источники; КОММИТИТ. Вызывать на границе транзакции:
+    незакоммиченных записей вызывающего на conn быть не должно (они уйдут вместе с коммитом)."""
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE public.yandex_accounts SET status = 'reconnect', updated_at = now() "
@@ -69,6 +71,7 @@ def _request_refresh(refresh_token: str) -> dict:
     client_secret = os.environ.get("YANDEX_OAUTH_CLIENT_SECRET", "").strip()
     if not client_id or not client_secret:
         raise AccessTokenError("OAuth-приложение Яндекса не настроено")
+    failed = False
     try:
         resp = requests.post(
             TOKEN_URL,
@@ -86,17 +89,25 @@ def _request_refresh(refresh_token: str) -> dict:
         except ValueError:
             body = {}
     except requests.RequestException:
-        raise AccessTokenError("Яндекс не ответил на обновление токена") from None
+        failed = True
+    # Бросаем вне except: иначе в __context__ остался бы текст requests (мог нести секрет).
+    if failed:
+        raise AccessTokenError("Яндекс не ответил на обновление токена")
     if not isinstance(body, dict):
         body = {}
     if body.get("error") in BAD_GRANT_ERRORS:
         raise NeedsReconnect("Доступ к Яндексу отозван — переподключите аккаунт")
-    if status != 200 or not isinstance(body.get("access_token"), str):
+    # Как requestTokens в lib/yandex/oauth.ts: не 2xx, «error» в теле или нет access_token — сбой.
+    token = body.get("access_token")
+    if not 200 <= status < 300 or "error" in body or not isinstance(token, str) or not token:
         raise AccessTokenError(f"Яндекс отклонил обновление токена (HTTP {status})")
     return body
 
 
 def access_token(conn, account_id: int, *, key_b64: str, now: datetime | None = None) -> str:
+    """Рабочий access-токен подключения; при необходимости обновляет его. КОММИТИТ (и при
+    ошибке под замком делает rollback). Вызывать на границе транзакции: незакоммиченных
+    записей вызывающего на conn быть не должно."""
     now = now or datetime.now(timezone.utc)
     access_enc, refresh_enc, expires_at, status = _load(conn, account_id, lock=False)
     if status == "reconnect":
@@ -104,8 +115,16 @@ def access_token(conn, account_id: int, *, key_b64: str, now: datetime | None = 
     if not _needs_refresh(expires_at, refresh_enc, now):
         return decrypt(access_enc, key_b64)
 
-    # Под замком перечитываем: параллельный прогон мог обновить токен (refresh_token
-    # одноразовый — второе обновление по старому вернуло бы invalid_grant).
+    # Под замком перечитываем: параллельный прогон мог уже обновить токен; замок исключает
+    # дублирующие обновления между процессами синка.
+    try:
+        return _refresh_locked(conn, account_id, key_b64, now)
+    except Exception:
+        conn.rollback()  # не оставлять строку под FOR UPDATE
+        raise
+
+
+def _refresh_locked(conn, account_id: int, key_b64: str, now: datetime) -> str:
     access_enc, refresh_enc, expires_at, status = _load(conn, account_id, lock=True)
     if status == "reconnect":
         conn.commit()
