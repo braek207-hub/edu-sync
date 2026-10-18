@@ -158,6 +158,13 @@ class _Frame:
                      account=dict(self.base), leads_known=known,
                      money_known=self.money_known, scope=scope)
 
+    def spend(self, cid: Optional[int]) -> float:
+        """Расход кампании за окно (None — всего логина): для текста «0 лидов при
+        расходе X» у отказа goal_not_visible."""
+        rows = (self.account.values() if cid is None
+                else [r for r in self.seen.values() if r.campaign_id == cid])
+        return _r2(sum(r.metrics.get("cost") or 0.0 for r in rows))
+
 
 def _frame(raw: List[Dict[str, Any]], goals: List[int], currency: str,
            category: Callable[[str], str]) -> _Frame:
@@ -322,15 +329,18 @@ class _Login:
             # Защиту не проверить — площадка держится: закрыть, не зная, защищена ли
             # она, нельзя. Сработавшая защита ниже по списку решает и без неё.
             if held is None:
-                held = refusal(self.unknown(rule, row)[0], None, login=login,
-                               campaign_id=cid, obj=site, by=USER + rule.id, held=True)
-        if held is not None:
-            return held
+                code = self.unknown(rule, row)[0]
+                extra = ({"cost": _r2(row.metrics.get("cost") or 0.0)}
+                         if code == "goal_not_visible" else {})
+                held = refusal(code, None, login=login, campaign_id=cid, obj=site,
+                               by=USER + rule.id, held=True, **extra)
+        # Твёрдые защиты раньше удержания: площадка из списка «никогда» защищена при
+        # любых лидах, и лишняя тройка unverified держала бы её старую находку открытой.
         if site in self.extra:
             return refusal("in_never_list", None, login=login, campaign_id=cid, obj=site)
         if system and _system_allowed(site):
             return refusal("system_allowlist", None, login=login, campaign_id=cid, obj=site)
-        return None
+        return held
 
     def guarded(self, item: dict) -> None:
         if item.get("held"):
@@ -513,13 +523,17 @@ class _Login:
                     code, whole = self.unknown(rule, row)
                     cid = None if whole else row.campaign_id
                     self.unverified(key, cid)
-                    self.refuse(refusal(code, key, login=login, campaign_id=cid))
+                    extra = ({"cost": frame.spend(cid)} if code == "goal_not_visible"
+                             else {})
+                    self.refuse(refusal(code, key, login=login, campaign_id=cid, **extra))
                     continue
                 hit = {"id": key, "name": rule.name, "conds": m.matched[0]["conds"]}
                 if rule.where == "account":
-                    targets = [cid for cid in live_ids
-                               if (not rule.only or cid in rule.only)
-                               and cid not in rule.except_]
+                    # Кампания, названная в only, но остановленная или не того типа, идёт
+                    # дальше к проверке пригодности: человек должен увидеть отказ, а не
+                    # тишину, — как у where:"seen".
+                    targets = [cid for cid in (sorted(rule.only) if rule.only else live_ids)
+                               if cid not in rule.except_]
                 else:
                     targets = [row.campaign_id]
                 for cid in targets:

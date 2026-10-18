@@ -40,7 +40,7 @@ def _rows(cids, sites=SITES):
 @pytest.fixture
 def api(monkeypatch):
     state = {"campaigns": [_camp(1), _camp(2)], "rows": _rows([1, 2]), "today_calls": 0,
-             "window": {}, "window_calls": []}
+             "window": {}, "window_calls": [], "window_fail": set()}
 
     def today(token, login):
         state["today_calls"] += 1
@@ -50,6 +50,8 @@ def api(monkeypatch):
         state["window_calls"].append((login, days, list(goals)))
         if isinstance(state["window"], Exception):
             raise state["window"]
+        if login in state["window_fail"]:
+            raise direct.DirectError("отчёт не готов")
         return state["window"].get(days, [])
 
     monkeypatch.setattr(direct, "campaigns", lambda t, l: state["campaigns"])
@@ -484,7 +486,9 @@ def test_lead_rule_without_visible_goal_is_unverified(api):
                                        window=7)]}, project_goals=[G]))
     assert [(f.campaign_id, f.object_id) for f in out.findings] == [(1, "x1.example.ru")]
     assert ("login1", "u:" + RID, 2) in out.unverified
-    assert _refused(out, "goal_not_visible", campaign_id=2, rule="u:" + RID, object=None)
+    # расход кампании за окно — для текста «0 лидов при расходе X»
+    assert _refused(out, "goal_not_visible", campaign_id=2, rule="u:" + RID, object=None,
+                    cost=100.0)
 
 
 def test_lead_rule_without_lead_goals_refused_for_login(api):
@@ -620,13 +624,50 @@ def test_unverifiable_protect_holds_row(api):
     out = pm.run(_ctx({"rules": [protect, block]}, project_goals=[G]))
     assert out.findings == []
     assert ("login1", "u:" + RID, 1) in out.unverified
-    assert _refused(out, "goal_not_visible", rule="u:" + RID, by="u:ppp111", held=True)
+    assert _refused(out, "goal_not_visible", rule="u:" + RID, by="u:ppp111", held=True,
+                    cost=200.0)
+
+
+def test_never_list_beats_unverifiable_protect(api):
+    # твёрдая защита решает раньше удержания: без лишней тройки unverified
+    api["rows"] = []
+    api["window"] = {7: [_win(1, "beta.ru", 20, 200.0, leads=0)]}
+    protect = _rule([("leads", "gte", 1)], rid="ppp111", action="protect", window=7)
+    block = _rule([("clicks", "gte", 10)], window=7)
+    out = pm.run(_ctx({"extra_allow": ["beta.ru"], "rules": [protect, block]},
+                      project_goals=[G]))
+    assert out.findings == []
+    assert _refused(out, "in_never_list", object="beta.ru", campaign_id=1, rule="u:" + RID)
+    assert not _refused(out, "goal_not_visible", held=True)
+    assert ("login1", "u:" + RID, 1) not in out.unverified
+
+
+def test_account_rule_only_names_unusable_campaigns(api):
+    api["campaigns"] = [_camp(1), _camp(3, state="SUSPENDED"),
+                        _camp(5, ctype="SMART_CAMPAIGN")]
+    api["rows"] = []
+    api["window"] = {7: [_win(1, "bad.example.ru", 20, 100.0)]}
+    rule = _rule([("clicks", "gte", 10)], window=7, where="account", only=[1, 3, 5])
+    out = pm.run(_ctx({"rules": [rule]}))
+    assert [f.campaign_id for f in out.findings] == [1]
+    assert _refused(out, "campaign_stopped", rule="u:" + RID, campaign_id=3)
+    assert _refused(out, "campaign_type_unsupported", rule="u:" + RID, campaign_id=5)
 
 
 def test_protect_report_failure_fails_login(api):
-    api["window"] = direct.DirectError("отчёт не готов")
+    # не зная защит, логин не закрывает ничего; соседний логин работает
+    api["window_fail"] = {"login1"}
     protect = _rule([("clicks", "gte", 10)], rid="ppp111", action="protect", window=7)
     accs = (ACC, DirectAccount("login2", "t", "RUB", "Y"))
+    out = pm.run(_ctx({"rules": [protect]}, accounts=accs))
+    assert {f.login for f in out.findings} == {"login2"}
+    assert len(out.findings) == 6
+    assert out.scanned_logins == ["login2"]
+    assert len(out.summary["errors"]) == 1
+    assert out.summary["errors"][0].startswith("login1:")
+    assert "защит правил" in out.summary["errors"][0]
+    # упали все логины — прогон падает целиком
+    api["window_fail"] = {"login1", "login2"}
     with pytest.raises(RuntimeError, match="защит правил"):
         pm.run(_ctx({"rules": [protect]}, accounts=accs))
 
