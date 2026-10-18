@@ -70,3 +70,14 @@ def test_rules_list_passes_through():
     rule = {"id": "abc123", "name": "x"}
     assert settings_for("placements", {"rules": [rule]})["rules"] == [rule]
     assert settings_for("queries", {"rules": {"id": "abc123"}})["rules"] == []
+
+
+def test_nested_choices_validated():
+    s = settings_for("placements", {"dictionary": {"categories": ["game", "casino", "site", 1]}})
+    assert s["dictionary"]["categories"] == ["game"]
+    # Пустой список — словарь выключен, умолчанием не подменяется.
+    assert settings_for("placements", {"dictionary": {"categories": []}})["dictionary"] == {
+        "categories": []}
+    assert settings_for("placements", {"spam": {"goals": "leads"}})["spam"]["goals"] == "leads"
+    for bad in ("lead", "LEADS", ""):
+        assert settings_for("placements", {"spam": {"goals": bad}})["spam"]["goals"] == "strategy"

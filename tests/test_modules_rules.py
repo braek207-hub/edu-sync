@@ -35,17 +35,31 @@ ACCOUNT = {"cr": 2.0, "cpl": 1000.0}
 
 
 def _row(obj="play.google.com/game.puzzle", category="game", metrics=None, account=None,
-         leads_known=True, money_known=True, campaign_id=1):
+         leads_known=True, money_known=True, campaign_id=1, scope="campaign"):
     return R.Row(object=obj, campaign_id=campaign_id, category=category,
                  metrics=dict(METRICS if metrics is None else metrics),
                  account=dict(ACCOUNT if account is None else account),
-                 leads_known=leads_known, money_known=money_known)
+                 leads_known=leads_known, money_known=money_known, scope=scope)
+
+
+def _eval(module, field, op, value, row):
+    make = _rule if module == "placements" else _qrule
+    action = "block" if module == "placements" else "minus_phrase"
+    return R.evaluate(_one(module, make(conds=[(field, op, value)], action=action)), row)
+
+
+def _assert_outcome(m, expected):
+    # Ложь обязана быть чистым промахом (None), а не «не проверено»: иначе
+    # неопределённая метрика молча держала бы находки вместо отказа.
+    if expected:
+        assert m is not None and m.rule is not None
+        assert m.unverified == [] and m.held_by is None
+    else:
+        assert m is None
 
 
 def _hit(module, field, op, value, row):
-    make = _rule if module == "placements" else _qrule
-    action = "block" if module == "placements" else "minus_phrase"
-    m = R.evaluate(_one(module, make(conds=[(field, op, value)], action=action)), row)
+    m = _eval(module, field, op, value, row)
     return m is not None and m.rule is not None
 
 
@@ -108,12 +122,21 @@ P_CASES = [
     ("cpl_x", "gte", 0.75, _row(), True),
     ("cpl_x", "gte", 0.76, _row(), False),
     ("cpl_x", "gte", 0, _row(account={"cr": 2.0, "cpl": None}), False),
+    # Неопределённые метрики движок решает сам, что бы ни прислал вызывающий.
+    ("cpl", "lte", 100, _row(metrics=dict(METRICS, leads=0.0, cpl=0.0)), False),
+    ("cpl", "gte", 0, _row(metrics=dict(METRICS, leads=None, cpl=0.0)), False),
+    ("cpl_x", "gte", 0, _row(metrics=dict(METRICS, leads=0.0, cpl=0.0)), False),
+    ("cr", "lte", 100, _row(metrics=dict(METRICS, clicks=0.0, cr=0.0)), False),
+    ("cr_x", "lte", 100, _row(metrics=dict(METRICS, clicks=0.0, cr=0.0)), False),
+    ("ctr", "lte", 100, _row(metrics=dict(METRICS, impressions=0.0, ctr=0.0)), False),
+    ("ctr", "lte", 100, _row(metrics=dict(METRICS, impressions=None, ctr=0.0)), False),
+    ("leads", "eq", 0, _row(metrics=dict(METRICS, leads=0.0, cpl=None)), True),
 ]
 
 
 @pytest.mark.parametrize("field,op,value,row,expected", P_CASES)
 def test_placements_field_op(field, op, value, row, expected):
-    assert _hit("placements", field, op, value, row) is expected
+    _assert_outcome(_eval("placements", field, op, value, row), expected)
 
 
 def _qrow(query, **kw):
@@ -145,7 +168,7 @@ Q_CASES = [
 
 @pytest.mark.parametrize("field,op,value,row,expected", Q_CASES)
 def test_queries_field_op(field, op, value, row, expected):
-    assert _hit("queries", field, op, value, row) is expected
+    _assert_outcome(_eval("queries", field, op, value, row), expected)
 
 
 def test_eq_rounds_to_two_digits():
@@ -210,28 +233,84 @@ def test_money_unknown_goes_unverified():
     assert m.rule.id == "ctr001"
 
 
-def test_only_only_unverified_returns_match_without_rule():
-    rules = _one("placements", _rule(conds=[("leads", "eq", 0)]))
-    m = R.evaluate(rules, _row(leads_known=False))
-    assert m.rule is None and m.matched == [] and m.unverified == ["aaaaaa"]
-
-
 def test_protect_beats_earlier_block():
     rules, _ = R.compile_rules("placements", [
         _rule("block1", [("clicks", "gte", 10)]),
         _rule("prot01", [("name", "contains", "game")], action="protect")])
     m = R.evaluate(rules, _row())
-    assert m.rule.id == "prot01"
+    assert (m.rule.id, m.held_by, m.unverified) == ("prot01", None, [])
     assert [x["id"] for x in m.matched] == ["block1", "prot01"]
 
 
-def test_unverified_protect_holds_row():
+def test_shape_matched():
+    rules, _ = R.compile_rules("placements", [_rule("block1", [("clicks", "gte", 10)])])
+    m = R.evaluate(rules, _row())
+    assert (m.rule.id, m.held_by, m.unverified) == ("block1", None, [])
+
+
+def test_shape_held_by_protect():
     rules, _ = R.compile_rules("placements", [
         _rule("block1", [("clicks", "gte", 10)]),
+        _rule("lead01", [("leads", "eq", 0)]),
         _rule("prot01", [("leads", "gte", 1)], action="protect")])
     m = R.evaluate(rules, _row(leads_known=False))
-    assert m.rule is None
-    assert m.unverified == ["prot01", "block1"]
+    assert m.rule is None and m.held_by == "prot01"
+    # unverified — только правила, чьи собственные условия не проверить.
+    assert m.unverified == ["lead01", "prot01"]
+    assert [x["id"] for x in m.matched] == ["block1"]
+
+
+def test_shape_held_by_protect_without_any_match():
+    # Держит строку и тогда, когда пользовательские не сработали: словарь и спам
+    # по ней тоже не действуют (решает прогон по held_by).
+    rules = _one("placements", _rule("prot01", [("cpl", "gte", 1)], action="protect"))
+    m = R.evaluate(rules, _row(money_known=False))
+    assert (m.rule, m.held_by, m.matched, m.unverified) == (None, "prot01", [], ["prot01"])
+
+
+def test_shape_only_unverified():
+    rules = _one("placements", _rule("lead01", [("leads", "eq", 0)]))
+    m = R.evaluate(rules, _row(leads_known=False))
+    assert (m.rule, m.held_by, m.matched, m.unverified) == (None, None, [], ["lead01"])
+
+
+def test_matched_protect_beats_unverified_protect():
+    rules, _ = R.compile_rules("placements", [
+        _rule("prot01", [("leads", "gte", 1)], action="protect"),
+        _rule("prot02", [("name", "contains", "game")], action="protect"),
+        _rule("block1", [("clicks", "gte", 10)])])
+    m = R.evaluate(rules, _row(leads_known=False))
+    assert (m.rule.id, m.held_by, m.unverified) == ("prot02", None, ["prot01"])
+
+
+def test_scope_account_rule_not_on_campaign_row():
+    acc = _one("placements", _rule("acc001", [("clicks", "gte", 1)], where="account"))
+    assert R.evaluate(acc, _row(scope="campaign")) is None
+    assert R.evaluate(acc, _row(scope="account", campaign_id=0)).rule.id == "acc001"
+    seen = _one("placements", _rule("seen01", [("clicks", "gte", 1)]))
+    assert R.evaluate(seen, _row(scope="account", campaign_id=0)) is None
+
+
+def test_scope_protect_applies_to_both():
+    for where in ("seen", "account"):
+        rules = _one("placements", _rule("prot01", [("name", "contains", "game")],
+                                         action="protect", where=where))
+        for scope in ("campaign", "account"):
+            assert R.evaluate(rules, _row(scope=scope)).rule.id == "prot01"
+
+
+def test_scope_queries_rules_are_campaign():
+    rules = _one("queries", _qrule(conds=[("clicks", "gte", 1)]))
+    assert R.evaluate(rules, _row(obj="x", scope="campaign")).rule is not None
+    assert R.evaluate(rules, _row(obj="x", scope="account")) is None
+
+
+def test_except_refuses_on_campaign_row_for_every_action():
+    for action in ("block", "propose", "protect"):
+        rules = _one("placements", _rule(conds=[("clicks", "gte", 1)], action=action,
+                                         campaigns={"only": [], "except": [1]}))
+        assert R.evaluate(rules, _row(campaign_id=1)) is None
+        assert R.evaluate(rules, _row(campaign_id=2)).rule is not None
 
 
 def test_campaign_filters():
@@ -243,7 +322,8 @@ def test_campaign_filters():
     assert R.evaluate(_one("placements", exc), _row(campaign_id=2)).rule is not None
     # where=account: строка по логину, кампании выбирает прогон.
     acc = dict(only, where="account")
-    assert R.evaluate(_one("placements", acc), _row(campaign_id=0)).rule is not None
+    assert R.evaluate(_one("placements", acc),
+                      _row(campaign_id=0, scope="account")).rule is not None
 
 
 def _invalid(module, raw_list):
@@ -312,10 +392,26 @@ def test_invalid_rules(module, raw):
     assert rules == [] and len(notes) == 1
 
 
-def test_duplicate_id_invalid():
+def test_duplicate_id_invalid_both():
     raw = [_rule(conds=[("clicks", "gte", 1)]), _rule(conds=[("cost", "gte", 1)])]
     rules, notes = _invalid("placements", raw)
-    assert len(rules) == 1 and notes[0]["rule_id"] == "aaaaaa"
+    assert rules == [] and [n["rule_id"] for n in notes] == ["aaaaaa", "aaaaaa"]
+
+
+def test_duplicate_id_invalid_even_if_first_invalid():
+    raw = [_rule(conds=[]), _rule(conds=[("cost", "gte", 1)]),
+           _rule("other1", [("cost", "gte", 1)])]
+    rules, notes = _invalid("placements", raw)
+    assert [r.id for r in rules] == ["other1"]
+    assert [n["rule_id"] for n in notes] == ["aaaaaa", "aaaaaa"]
+
+
+def test_has_word_rejects_hyphenated():
+    # Директ делит слово через дефис на два: минус-словом это не одно слово.
+    rules, notes = _invalid("queries", [_qrule(conds=[("query", "has_word", "санкт-петербург")],
+                                               action="minus_word")])
+    assert rules == [] and len(notes) == 1
+    assert _one("queries", _qrule(conds=[("query", "has_phrase", "санкт-петербург")]))
 
 
 def test_queries_window_not_stored_and_minus_word_ok():

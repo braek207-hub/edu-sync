@@ -20,6 +20,7 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
     "placements": {"top_n": 30, "always_block": [], "extra_allow": [],
                    "spam_rule": False, "lead_goal_ids": [], "rules": [],
                    "max_per_run": 100,
+                   # Пустой список категорий — словарь выключен; отдельного enabled нет.
                    "dictionary": {"categories": ["app", "dsp", "game", "junk"]},
                    # min_cr — проценты, дробный порог законен: при целом умолчании
                    # 7.5 молча заменялся бы на 8. Panda хранит то же число 8.
@@ -31,6 +32,14 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
                 "builtin": {"phrase_waste": True, "word_zero_conv": True}},
     "audit": {"banned_words": [], "allowed_goal_ids": [], "require_utm": True,
               "title_fill_min": 0.6},
+}
+
+# Допустимые значения внутри вложенных настроек: тип проверяет _fits, а смысл —
+# здесь. Опечатка в goals иначе молча считалась бы «не leads», а неизвестная
+# категория висела бы в настройке, ничего не включая.
+CHOICES: Dict[Tuple[str, ...], Tuple[str, ...]] = {
+    ("placements", "dictionary", "categories"): ("app", "dsp", "game", "junk"),
+    ("placements", "spam", "goals"): ("strategy", "leads"),
 }
 
 
@@ -51,18 +60,23 @@ def _fits(default: Any, value: Any) -> bool:
     return isinstance(value, type(default))
 
 
-def _coerce(default: Any, value: Any) -> Any:
+def _coerce(path: Tuple[str, ...], default: Any, value: Any) -> Any:
     # Вложенная настройка сливается с умолчанием поключево, а не целиком: иначе
     # spam {"min_leads": 3} без остальных порогов оставил бы прогон без ratio.
     if not _fits(default, value):
         value = default
     if isinstance(default, dict):
-        return {k: _coerce(d, value.get(k, d)) for k, d in default.items()}
-    return list(value) if isinstance(value, list) else value
+        return {k: _coerce(path + (k,), d, value.get(k, d)) for k, d in default.items()}
+    allowed = CHOICES.get(path)
+    if isinstance(value, list):
+        return [x for x in value if x in allowed] if allowed else list(value)
+    if allowed and value not in allowed:
+        return default
+    return value
 
 
 def settings_for(module_key: str, raw: Optional[dict]) -> dict:
     """Настройки модуля: умолчания + то, что подошло по типу. Чужие ключи отбрасываются."""
     raw = raw if isinstance(raw, dict) else {}
-    return {key: _coerce(default, raw.get(key, default))
+    return {key: _coerce((module_key, key), default, raw.get(key, default))
             for key, default in DEFAULTS[module_key].items()}

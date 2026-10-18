@@ -10,6 +10,7 @@
 
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple, Union
 
@@ -32,6 +33,8 @@ WORD_ACTIONS = frozenset({"minus_word", "propose_word"})
 WINDOWS: Tuple[int, ...] = (0, 7, 30)
 WHERE: Tuple[str, ...] = ("seen", "account")
 CATEGORIES: Tuple[str, ...] = ("app", "dsp", "game", "junk", "site")
+# У queries where нет: запрос всегда судится в своей кампании.
+_SCOPE_OF_WHERE = {"seen": "campaign", "account": "account", None: "campaign"}
 
 _RANGE = ("gte", "lte")
 _COUNT = ("gte", "lte", "eq")
@@ -45,6 +48,8 @@ FIELDS: Dict[str, Dict[str, Tuple[str, ...]]] = {
 TEXT_FIELDS = frozenset({"name", "category", "query"})
 LEAD_FIELDS = frozenset({"leads", "cr", "cr_x", "cpl", "cpl_x"})
 MONEY_FIELDS = frozenset({"cost", "cpl", "cpl_x"})
+# Доля и цена без базы не определены: 0 лидов — это не «цена лида 0 ₽», а цены нет.
+_BASE = {"ctr": "impressions", "cr": "clicks", "cr_x": "clicks", "cpl": "leads", "cpl_x": "leads"}
 
 
 @dataclass(frozen=True)
@@ -68,12 +73,14 @@ class Rule:
 
 @dataclass
 class Row:
-    """Строка для правил: площадка или запрос × кампания (у where=account — × логин).
+    """Строка для правил: площадка или запрос × кампания (scope="campaign")
+    или площадка по логину целиком (scope="account", для where=account).
 
-    metrics: clicks, cost (₽ с НДС), impressions, ctr и cr (в процентах), leads,
-    cpl (None при 0 лидов). account: cr и cpl кабинета за то же окно.
-    leads_known=False — лиды нельзя посчитать (нет целей-лидов, цель не видна
-    кампании); money_known=False — кабинет не в рублях.
+    metrics: clicks, cost (₽ с НДС), impressions, ctr и cr (в процентах), leads, cpl.
+    account: cr и cpl кабинета за то же окно. ctr, cr, cpl и их «_x» без базы
+    (показов, кликов, лидов > 0) движок считает неопределёнными сам, что бы ни
+    пришло в metrics. leads_known=False — лиды нельзя посчитать (нет целей-лидов,
+    цель не видна кампании); money_known=False — кабинет не в рублях.
     """
     object: str
     campaign_id: int
@@ -82,16 +89,28 @@ class Row:
     account: Dict[str, Optional[float]]
     leads_known: bool
     money_known: bool
+    scope: str
 
 
 @dataclass
 class Match:
-    """rule — правило, которое действует (None: решить нельзя, см. evaluate);
-    matched — все сработавшие в порядке списка; unverified — id правил, чей исход
-    по строке не установить."""
+    """Итог правил по строке — одна из трёх форм:
+
+    1. rule задан, held_by=None — действует rule (сработавший protect или первое
+       сработавшее по списку);
+    2. rule=None, held_by=<id> — защиту held_by проверить нельзя, строка держится:
+       ни словарь, ни спам, ни правила по ней не действуют, их находки — unverified
+       от имени held_by;
+    3. rule=None, held_by=None, matched=[] — ничего не сработало, но часть правил
+       проверить нельзя.
+
+    matched — все сработавшие в порядке списка; unverified — id правил, чьи
+    собственные условия не проверить.
+    """
     rule: Optional[Rule]
     matched: List[dict]
     unverified: List[str]
+    held_by: Optional[str]
 
 
 class _Invalid(ValueError):
@@ -154,7 +173,8 @@ def _cond(module_key: str, raw: Any) -> Cond:
         if field == "category" and value not in CATEGORIES:
             raise _Invalid("category: «%s» не категория словаря" % value)
         # Слово сравнивается точно: из двух слов или со знаками оно не совпало бы
-        # ни с одним запросом, а minus_word поставил бы мусор.
+        # ни с одним запросом, а minus_word поставил бы мусор. Слово через дефис
+        # Директ тоже делит на два: «санкт-петербург» минус-словом не одно слово.
         if op == "has_word" and word_list(value) != [value]:
             raise _Invalid("has_word: «%s» не одно слово" % value)
         if op == "has_phrase" and not word_list(value):
@@ -213,23 +233,25 @@ def compile_rules(module_key: str, raw: list) -> Tuple[List[Rule], List[dict]]:
     """
     rules: List[Rule] = []
     notes: List[dict] = []
-    seen = set()
-    for pos, item in enumerate(raw if isinstance(raw, list) else []):
+    items = raw if isinstance(raw, list) else []
+    # Id входит в fingerprint находки: какое из двух правил с одним id владеет её
+    # историей, не решить, поэтому отбрасываются оба — и при невалидном первом.
+    counts = Counter(i.get("id") for i in items
+                     if isinstance(i, dict) and isinstance(i.get("id"), str))
+    for pos, item in enumerate(items):
         if isinstance(item, dict) and item.get("enabled", True) is False:
             continue
         rule_id = item.get("id") if isinstance(item, dict) else None
         try:
             if pos >= MAX_RULES:
                 raise _Invalid("правило №%d сверх предела %d" % (pos + 1, MAX_RULES))
+            if isinstance(rule_id, str) and counts[rule_id] > 1:
+                raise _Invalid("id «%s» повторяется" % rule_id)
             rule = _compile(module_key, item)
-            # Id входит в fingerprint находки: два правила с одним id делили бы находки.
-            if rule.id in seen:
-                raise _Invalid("id «%s» повторяется" % rule.id)
         except _Invalid as e:
             notes.append({"rule_id": rule_id if isinstance(rule_id, str) else None,
                           "code": "rule_invalid", "detail": str(e)})
             continue
-        seen.add(rule.id)
         rules.append(rule)
     return rules, notes
 
@@ -268,6 +290,9 @@ def _check(cond: Cond, row: Row, name: str, query: str) -> Tuple[Optional[bool],
         if op == "has_word":
             return v in words, query
         return _has_seq(words, word_list(v)), query
+    base = _BASE.get(f)
+    if base is not None and not (row.metrics.get(base) or 0) > 0:
+        return False, None
     if f == "words":
         actual: Optional[float] = len(word_list(query))
     elif f == "cr_x":
@@ -302,9 +327,12 @@ def _judge(rule: Rule, row: Row, name: str, query: str) -> Tuple[Optional[bool],
 
 
 def _applies(rule: Rule, row: Row) -> bool:
-    # where=account: строка — площадка по логину целиком, кампании фильтрует прогон
-    # при выборе, куда ставить запрет.
-    if rule.where == "account":
+    # Защита действует на обоих уровнях: площадка, защищённая в кампании, не должна
+    # уйти и под запрет по логину. Лишняя защита только отказывает.
+    if rule.action != PROTECT and _SCOPE_OF_WHERE[rule.where] != row.scope:
+        return False
+    if row.scope == "account":
+        # Строка — площадка по логину целиком: кампании для записи отбирает прогон.
         return True
     if rule.only and row.campaign_id not in rule.only:
         return False
@@ -314,14 +342,14 @@ def _applies(rule: Rule, row: Row) -> bool:
 def evaluate(rules: List[Rule], row: Row) -> Optional[Match]:
     """Правила против строки. None — ни одно не сработало и все проверены.
 
-    Действует первое сработавшее по списку, но protect — сильнее любого
-    правила независимо от места. Непроверенная защита держит строку: rule=None,
-    а сработавшие правила уходят в unverified — закрыть, не зная, защищена ли
-    площадка, нельзя, и снимать их прежние находки тоже.
+    Правила берутся только своего уровня (where ↔ row.scope), protect — любого.
+    Действует первое сработавшее по списку, но protect сильнее любого правила
+    независимо от места. Непроверенная защита без сработавшей держит строку
+    (held_by, форма 2 в Match): закрыть, не зная, защищена ли площадка, нельзя.
     """
     matched: List[Tuple[Rule, List[dict]]] = []
     unverified: List[str] = []
-    protect_unknown = False
+    held_by: Optional[str] = None
     name, query = _norm("name", row.object), _norm("query", row.object)
     for rule in rules:
         if not _applies(rule, row):
@@ -329,20 +357,21 @@ def evaluate(rules: List[Rule], row: Row) -> Optional[Match]:
         state, conds = _judge(rule, row, name, query)
         if state is None:
             unverified.append(rule.id)
-            protect_unknown = protect_unknown or rule.action == PROTECT
+            if rule.action == PROTECT and held_by is None:
+                held_by = rule.id
         elif state:
             matched.append((rule, conds))
     if not matched and not unverified:
         return None
     first = next((r for r, _ in matched if r.action == PROTECT), None)
-    if first is None and matched:
-        if protect_unknown:
-            unverified += [r.id for r, _ in matched]
-        else:
-            first = matched[0][0]
+    if first is not None:
+        # Сработавшая защита решает и без непроверенной.
+        held_by = None
+    elif held_by is None and matched:
+        first = matched[0][0]
     return Match(rule=first,
                  matched=[{"id": r.id, "name": r.name, "conds": c} for r, c in matched],
-                 unverified=unverified)
+                 unverified=unverified, held_by=held_by)
 
 
 def snapshot(rule: Rule) -> dict:
