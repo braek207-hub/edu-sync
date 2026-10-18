@@ -26,7 +26,7 @@ def _site(name) -> str:
 
 
 def ask_model(plan, ask, use_db: bool, log):
-    """Второй судья по кандидатам плана: (поправки, строка отчёта).
+    """Второй судья по кандидатам плана: (поправки, строка отчёта, модель не ответила).
 
     Модель видит только имена в окне ворот, которые словарь оставил обычными
     сайтами и о которых её ещё не спрашивали: вердикт кэшируется навсегда,
@@ -35,7 +35,7 @@ def ask_model(plan, ask, use_db: bool, log):
     """
     candidates = plan.get("candidates") or []
     if not candidates:
-        return {}, None
+        return {}, None, False
 
     cached = {}
     if use_db:
@@ -61,21 +61,22 @@ def ask_model(plan, ask, use_db: bool, log):
     if errors:
         # Без этой строки мёртвый провайдер неотличим от чистого кабинета.
         note += ("\n  МОДЕЛЬ НЕ ОТВЕТИЛА (%d раз): %s" % (len(errors), errors[0]))
-    return overrides, note
+    return overrides, note, bool(errors)
 
 
-def spam_sites(token: str, login: str, log) -> Dict[str, str]:
-    """Спам-площадки логина по недельной статистике. Пусто, если отчёт не дался:
-    правило дополняет чистку, а не блокирует её."""
+def spam_sites(token: str, login: str, log):
+    """Спам-площадки логина по недельной статистике и ошибка отчёта (или None).
+    Правило дополняет чистку, а не блокирует её, но без него логин считается
+    просмотренным не до конца."""
     try:
         goals = direct.campaign_goals(token, login)
         if not goals:
-            return {}
+            return {}, None
         week = direct.placements_with_goals(token, login, sorted(set(goals.values())))
-        return spam.suspicious_sites(week, goals)
+        return spam.suspicious_sites(week, goals), None
     except Exception as err:
         log("  спам-правило пропущено: %s" % err)
-        return {}
+        return {}, "спам-правило: %s" % err
 
 
 def _refusal_line(login: str, item: dict) -> str:
@@ -91,7 +92,7 @@ def _refusal_line(login: str, item: dict) -> str:
 
 
 def _scan_login(acc: DirectAccount, settings: dict, log, ask, use_db: bool):
-    """Находки и отказы одного логина: (findings, refused)."""
+    """Находки, отказы и сбои вспомогательных источников одного логина."""
     token = acc.token
     campaigns = direct.campaigns(token, acc.login)
     live = [c for c in campaigns
@@ -101,11 +102,16 @@ def _scan_login(acc: DirectAccount, settings: dict, log, ask, use_db: bool):
         # У агентского кабинета половина клиентов пустая или выключена:
         # заказывать по ним отчёт — минуты прогона впустую.
         log("[%s] нечего чистить: ни одной запущенной кампании с рычагом" % acc.login)
-        return [], []
+        return [], [], []
 
     rows = direct.placements_today(token, acc.login)
     forced = [_site(s) for s in settings["always_block"] if _site(s)]
-    suspicious = spam_sites(token, acc.login, log) if settings["spam_rule"] else {}
+    problems: List[str] = []
+    suspicious: Dict[str, str] = {}
+    if settings["spam_rule"]:
+        suspicious, bad = spam_sites(token, acc.login, log)
+        if bad:
+            problems.append(bad)
     kwargs = {}
     extra = {_site(s) for s in settings["extra_allow"] if _site(s)}
     if extra:
@@ -114,9 +120,11 @@ def _scan_login(acc: DirectAccount, settings: dict, log, ask, use_db: bool):
     plan = planner.plan_account(rows, campaigns, top_n=top_n, always_block=forced,
                                 spam=suspicious, **kwargs)
     if ask is not None:
-        overrides, note = ask_model(plan, ask, use_db, log)
+        overrides, note, failed = ask_model(plan, ask, use_db, log)
         if note:
             log(note)
+        if failed:
+            problems.append("модель не ответила")
         if overrides:
             plan = planner.plan_account(rows, campaigns, top_n=top_n, overrides=overrides,
                                         always_block=forced, spam=suspicious, **kwargs)
@@ -134,7 +142,7 @@ def _scan_login(acc: DirectAccount, settings: dict, log, ask, use_db: bool):
                 details={"clicks": a["clicks"], "cost": a["cost"],
                          "reason": a["reason"], "fill_after": action["fill_after"]},
                 action={"op": "exclude_site", "campaign_id": cid, "site": a["placement"]}))
-    return findings, [_refusal_line(acc.login, r) for r in plan["refused"]]
+    return findings, [_refusal_line(acc.login, r) for r in plan["refused"]], problems
 
 
 def run(ctx: Context) -> RunOutput:
@@ -151,17 +159,23 @@ def run(ctx: Context) -> RunOutput:
     refused: List[str] = []
     scanned: List[str] = []
     errors: List[str] = []
+    read_any = False
     for acc in ctx.accounts:
         try:
-            f, r = _scan_login(acc, ctx.settings, ctx.log, ask, use_db)
+            f, r, problems = _scan_login(acc, ctx.settings, ctx.log, ask, use_db)
         except Exception as err:  # кабинет не должен ронять остальные
             errors.append("%s: %s" % (acc.login, err))
             ctx.log("[%s] ошибка: %s" % (acc.login, err))
             continue
+        read_any = True
         findings += f
         refused += r
+        if problems:
+            # Улики неполные: не закрываем и не гасим его находки по устаревшим данным.
+            errors += ["%s: %s" % (acc.login, p) for p in problems]
+            continue
         scanned.append(acc.login)
-    if errors and not scanned:
+    if errors and not read_any:
         raise RuntimeError("ни один логин не прочитан: " + "; ".join(errors))
     summary = {"refused": refused}
     if errors:
@@ -182,11 +196,33 @@ def _fresh(acc: DirectAccount, campaign_id: int):
 
 def _write(acc: DirectAccount, campaign_id: int, items: List[str]) -> None:
     """Записать список; отказ Директа поднимается ошибкой с его кодом и текстом."""
-    res = direct_api.update_campaign_list(acc.token, acc.login, campaign_id, FIELD, items)
+    # Пустой список уходит как null: ExcludedSites в спецификации Директа v5
+    # (campaigns/update) nillable, а Items в нём обязателен, так что {"Items": []}
+    # мог бы быть отклонён.
+    res = direct_api.update_campaign_list(acc.token, acc.login, campaign_id, FIELD,
+                                          items or None)
     errors = (res or {}).get("Errors") or []
     if errors:
         raise direct.DirectError("; ".join(
             "%s %s" % (e.get("Code"), e.get("Message")) for e in errors))
+
+
+def _write_and_read(acc: DirectAccount, cid: int, items: List[str]):
+    """Запись и чтение обратно: (что в списке сейчас, ошибка записи или None).
+
+    Таймаут мог прийти уже после того, как Директ запись принял, поэтому чтение
+    идёт при любом исходе записи, и решает оно. Не прочиталось и оно: исход
+    неизвестен, ошибка уходит наверх."""
+    werr = None
+    try:
+        _write(acc, cid, items)
+    except Exception as err:
+        werr = err
+    try:
+        back = direct_api.read_campaign_list(acc.token, acc.login, cid, FIELD)
+    except Exception as rerr:
+        raise werr or rerr
+    return back, werr
 
 
 def _groups(items: List[StoredFinding]) -> Dict[Tuple[str, int], List[StoredFinding]]:
@@ -198,6 +234,9 @@ def _groups(items: List[StoredFinding]) -> Dict[Tuple[str, int], List[StoredFind
 
 def _fail_all(group, error) -> Dict[int, ApplyResult]:
     return {f.id: ApplyResult(False, {}, error) for f in group}
+
+
+NOT_FOUND_BACK = "кампания не найдена при чтении обратно"
 
 
 def _apply_group(acc, cid, group) -> Dict[int, ApplyResult]:
@@ -216,25 +255,36 @@ def _apply_group(acc, cid, group) -> Dict[int, ApplyResult]:
     to_add: List[str] = []
     for f in group:
         site = _site(f.action["site"])
-        if site in have or site in to_add:
+        if site in have:
+            # Это не наш запрет: помечать applied нельзя, иначе откат снимет чужое.
+            out[f.id] = ApplyResult(False, {"already_present": True, "site": site},
+                                    "площадка уже запрещена в кампании — запрет не робота")
+        elif site in to_add:
             continue
-        if len(to_add) >= room:
+        elif len(to_add) >= room:
             out[f.id] = ApplyResult(False, {}, "список запретов заполнен (%d из %d)"
                                     % (len(existing), limit))
-            continue
-        to_add.append(site)
+        else:
+            to_add.append(site)
+    if not to_add:
+        return out
     # Прежние элементы остаются как есть и первыми: в списке есть и ручные запреты.
-    if to_add:
-        _write(acc, cid, existing + to_add)
-    back = direct_api.read_campaign_list(acc.token, acc.login, cid, FIELD)
-    present = {_site(s) for s in (back or [])}
+    back, werr = _write_and_read(acc, cid, existing + to_add)
+    if back is None:
+        out.update({f.id: ApplyResult(False, {}, NOT_FOUND_BACK)
+                    for f in group if f.id not in out})
+        return out
+    present = {_site(s) for s in back}
     for f in group:
         if f.id in out:
             continue
         site = _site(f.action["site"])
         if site in present:
             out[f.id] = ApplyResult(True, {"campaign_id": cid, "site": site,
-                                           "fill_after": len(back or [])})
+                                           "fill_after": len(back)})
+        elif werr is not None:
+            out[f.id] = ApplyResult(False, {"campaign_id": cid, "site": site},
+                                    "%s: %s" % (type(werr).__name__, werr))
         else:
             out[f.id] = ApplyResult(False, {"campaign_id": cid, "site": site},
                                     "Директ принял, но не применил")
@@ -246,17 +296,37 @@ def _rollback_group(acc, cid, group) -> Dict[int, ApplyResult]:
     if fresh is None:
         return _fail_all(group, "кампания не видна API (Мастер кампаний)")
     existing = fresh[2]
-    drop = {_site(f.action["site"]) for f in group}
-    keep = [s for s in existing if _site(s) not in drop]
-    if len(keep) != len(existing):
-        _write(acc, cid, keep)
-    back = direct_api.read_campaign_list(acc.token, acc.login, cid, FIELD)
-    present = {_site(s) for s in (back or [])}
     out: Dict[int, ApplyResult] = {}
+    drop = set()
     for f in group:
-        site = _site(f.action["site"])
-        if back is not None and site not in present:
+        site = f.action["site"]
+        if any(s.strip() == site for s in existing):
+            drop.add(site)
+        elif any(_site(s) == _site(site) for s in existing):
+            # Робот писал нормализованную форму; вариант в другом регистре поставил человек.
+            out[f.id] = ApplyResult(False, {"campaign_id": cid, "site": site},
+                                    "в списке вариант в другом регистре — запрет не робота")
+        else:
+            out[f.id] = ApplyResult(True, {"campaign_id": cid, "site": site,
+                                           "already_absent": True})
+    if not drop:
+        return out
+    keep = [s for s in existing if s.strip() not in drop]
+    back, werr = _write_and_read(acc, cid, keep)
+    if back is None:
+        out.update({f.id: ApplyResult(False, {}, NOT_FOUND_BACK)
+                    for f in group if f.id not in out})
+        return out
+    present = {s.strip() for s in back}
+    for f in group:
+        if f.id in out:
+            continue
+        site = f.action["site"]
+        if site not in present:
             out[f.id] = ApplyResult(True, {"campaign_id": cid, "site": site})
+        elif werr is not None:
+            out[f.id] = ApplyResult(False, {"campaign_id": cid, "site": site},
+                                    "%s: %s" % (type(werr).__name__, werr))
         else:
             out[f.id] = ApplyResult(False, {"campaign_id": cid, "site": site},
                                     "площадка осталась в списке после снятия")

@@ -143,10 +143,13 @@ def keywords_by_campaign(token: str, login: str, campaign_ids: Sequence[int],
 
 
 def update_campaign_list(token: str, login: str, campaign_id: int, field: str,
-                         items: List[str], call_fn=call) -> dict:
+                         items: Optional[List[str]], call_fn=call) -> dict:
+    # items=None очищает поле целиком (null вместо {"Items": []}): спецификация
+    # Директа v5 campaigns/update делает ExcludedSites nillable, а Items в нём обязателен.
+    value = None if items is None else {"Items": items}
     res = call_fn(token, login, "campaigns", {
         "method": "update",
-        "params": {"Campaigns": [{"Id": int(campaign_id), field: {"Items": items}}]},
+        "params": {"Campaigns": [{"Id": int(campaign_id), field: value}]},
     })
     results = res.get("UpdateResults") or []
     if not results:

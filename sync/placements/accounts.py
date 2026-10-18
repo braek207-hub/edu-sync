@@ -8,7 +8,7 @@
 """
 
 import os
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional
 
 from sync.modules.accounts import accounts_for
 
@@ -17,15 +17,8 @@ class Account(NamedTuple):
     key: str            # короткое имя кабинета в журнале и логах
     label: str          # человекочитаемое
     slug: str           # проект Panda-BI в реестре sync.modules.accounts
-    # Площадки, которые в этом кабинете запрещаются всегда: не по вердикту
-    # словаря и не по кликам, а решением человека. Список кабинетный —
-    # почта и Дзен у одного клиента сливают бюджет, у другого приносят лиды.
-    always_block: Tuple[str, ...] = ()
-    # Резать площадки, которые «достигают» цель автостратегии кратно чаще
-    # кабинета (spam.py). Нужно там, где стратегия учится на лид-форме и
-    # спам-заявки выглядят для Директа успехом; у e-com цель — оплата, и
-    # накрутить её площадка не может.
-    spam_rule: bool = False
+    # always_block и spam_rule кабинета переехали в настройки модуля
+    # (project_modules.settings): источник правды теперь они.
     # Токен подставляет available(): имена переменных и их разбор живут в
     # sync.modules.accounts, чтобы не разъезжаться с остальными модулями.
     token_value: str = ""
@@ -45,10 +38,9 @@ ACCOUNTS: List[Account] = [
     # Директа. Секрет DIRECT_CLIENTS_JSON перечисляет только тех, у кого
     # проставлены цели, — чистить надо всех, включая новых, о которых секрет
     # ещё не знает.
-    Account("edu", "EDUNETWORK", "edunetwork",
-            # Решение Павла 14.09.2026: площадки с аномально частым
-            # «Спасибо» выключать — это спам-заявки, а не студенты.
-            spam_rule=True),
+    # Решение Павла 14.09.2026: площадки с аномально частым «Спасибо» выключать
+    # (спам-заявки, не студенты) — теперь spam_rule=true в настройках EDU.
+    Account("edu", "EDUNETWORK", "edunetwork"),
     Account("lime", "LIME", "lime"),
     Account("bjorn", "BJORN", "bjorn"),
     Account("polinarepik", "Polinarepik", "polinarepik"),

@@ -18,9 +18,11 @@ from datetime import datetime, timezone
 from sync.modules import store
 from sync.modules.runner import run_project
 from sync.placements import accounts as reg
+from sync.placements.classify import normalize
 
 MODULE = "placements"
 DEFAULT_SLUG = "edunetwork"
+WRITE_MODES = ("approve", "auto")
 
 
 def _out(text: str = "") -> None:
@@ -41,6 +43,18 @@ def _slugs(keys) -> list:
     return seen
 
 
+def _warn_if_module_idle(slug: str) -> None:
+    try:
+        rows = {r["module_key"]: r for r in store.load_project_modules(slug)}
+    except Exception as err:
+        _out("[%s] режим модуля не прочитан (%s)" % (slug, err))
+        return
+    mode = (rows.get(MODULE) or {}).get("mode")
+    if mode not in WRITE_MODES:
+        _out("[%s] модуль %s в режиме %s: раннер не выполнит откат, пока модуль не "
+             "переведён в approve или auto" % (slug, MODULE, mode or "off"))
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Чистильщик площадок РСЯ")
     parser.add_argument("--apply", action="store_true",
@@ -51,7 +65,7 @@ def main(argv=None) -> int:
                         help="кабинеты через запятую; пусто — edunetwork")
     parser.add_argument("--unban", default="",
                         help="попросить снять эти площадки (через запятую) "
-                             "и выйти: снимает раннер")
+                             "и выйти: снимает раннер; в базу пишет только с --apply")
     parser.add_argument("--llm", action="store_true",
                         help="спрашивать модель по кандидатам (нужен ключ)")
     parser.add_argument("--top-n", type=int, default=None,
@@ -70,16 +84,23 @@ def main(argv=None) -> int:
             _out("%s проигнорирован: настройки модуля берутся из project_modules" % flag)
 
     if args.unban:
-        sites = sorted({s.strip().lower() for s in args.unban.split(",") if s.strip()})
+        sites = sorted({normalize(x) for x in args.unban.split(",") if normalize(x)})
         _out("снятие запретов: %s" % ", ".join(sites))
-        if args.dry_run:
-            return 0
+        write = args.apply and not args.dry_run
         for slug in slugs:
             # Запрос касается только находок в статусе applied, то есть записанных
             # самим роботом: ручные запреты директолога в них не входят.
+            if not write:
+                _out("[%s] репетиция, в базу ничего не пишу; затронуло бы:" % slug)
+                hits = [f for f in store.existing_findings(slug, MODULE)
+                        if f.status == "applied" and f.object_id in sites]
+                for f in hits:
+                    _out("    %s / кампания %s / %s" % (f.login, f.campaign_id, f.object_id))
+                _out("    итого: %d (для записи добавьте --apply)" % len(hits))
+                continue
             n = store.request_rollback(slug, MODULE, sites)
-            _out("[%s] поставлено на откат находок: %d (снимет следующий прогон)"
-                 % (slug, n))
+            _out("[%s] поставлено на откат находок: %d" % (slug, n))
+            _warn_if_module_idle(slug)
         return 0
 
     if args.llm:

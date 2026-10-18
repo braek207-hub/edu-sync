@@ -11,7 +11,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 API = "https://api.direct.yandex.com/json/v5/"
 REPORTS = "https://api.direct.yandex.com/json/v5/reports"
@@ -281,36 +281,3 @@ def placements_with_goals(token: str, login: str, goals: List[int],
             "conversions": conv,
         })
     return rows
-
-
-def set_excluded_sites(token: str, login: str,
-                       campaign_id: str, sites: List[str]) -> Tuple[bool, str]:
-    """Записать полный список запрещённых площадок кампании.
-
-    Возвращает (успех, сообщение). Ошибка одной кампании не должна ронять
-    прогон: у кабинета их десятки, и остальные вычистить всё равно надо.
-    """
-    try:
-        res = call(token, login, "campaigns", {
-            "method": "update",
-            "params": {"Campaigns": [{
-                "Id": int(campaign_id),
-                "ExcludedSites": {"Items": sites},
-            }]},
-        })
-    except DirectError as err:
-        return False, str(err)
-    except urllib.error.URLError as err:
-        return False, "сеть: %s" % err
-
-    results = res.get("UpdateResults") or []
-    if not results:
-        return False, "Директ не вернул результат обновления"
-    item = results[0]
-    errors = item.get("Errors") or []
-    if errors:
-        return False, "; ".join("%s %s" % (e.get("Code"), e.get("Message"))
-                                for e in errors)
-    warnings = item.get("Warnings") or []
-    note = "; ".join(w.get("Message", "") for w in warnings)
-    return True, note

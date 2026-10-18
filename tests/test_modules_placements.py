@@ -118,7 +118,8 @@ class FakeDirect:
         return [c] if c else []
 
     def update(self, token, login, cid, field, items):
-        self.writes.append((cid, list(items)))
+        self.writes.append((cid, None if items is None else list(items)))
+        items = items or []  # None — поле очищено целиком
         self.c[cid]["ExcludedSites"] = {"Items": [i for i in items if i not in self.drop]}
         return {"Id": cid}
 
@@ -183,17 +184,141 @@ def test_module_registered():
     assert MODULES["placements"] is pm
 
 
-def test_old_cli_delegates_to_runner(monkeypatch):
+def test_apply_site_already_present_is_not_ours(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1, items=[SITES[0]])])
+    res = pm.apply(_ctx(), [_stored(1, SITES[0])])
+    assert not res[1].ok and res[1].response["already_present"] is True
+    assert "запрет не робота" in res[1].error
+    assert fake.writes == []
+
+
+def test_rollback_keeps_human_case_variant(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1, items=["COM.AAA.BBB", "Ручной.ru"])])
+    res = pm.rollback(_ctx(), [_stored(1, "com.aaa.bbb")])
+    assert not res[1].ok and "другом регистре" in res[1].error
+    assert fake.writes == []
+    assert fake.c[1]["ExcludedSites"]["Items"] == ["COM.AAA.BBB", "Ручной.ru"]
+
+
+def test_rollback_site_absent_is_ok_without_write(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1, items=["Ручной.ru"])])
+    res = pm.rollback(_ctx(), [_stored(1, SITES[0])])
+    assert res[1].ok and fake.writes == []
+
+
+def test_write_timeout_but_direct_took_it_is_ok(monkeypatch):
+    class Timeout(FakeDirect):
+        def update(self, token, login, cid, field, items):
+            super().update(token, login, cid, field, items)
+            raise TimeoutError("timed out")
+
+    Timeout(monkeypatch, [_camp(1)])
+    res = pm.apply(_ctx(), [_stored(1, SITES[0])])
+    assert res[1].ok
+
+
+def test_write_error_and_readback_error_fails(monkeypatch):
+    class Dead(FakeDirect):
+        def update(self, token, login, cid, field, items):
+            raise TimeoutError("timed out")
+
+        def read(self, token, login, cid, field):
+            raise ConnectionError("down")
+
+    Dead(monkeypatch, [_camp(1)])
+    with pytest.raises(TimeoutError):
+        pm._apply_group(ACC, 1, [_stored(1, SITES[0])])
+    res = pm.apply(_ctx(), [_stored(1, SITES[0])])
+    assert not res[1].ok and "TimeoutError" in res[1].error
+
+
+def test_write_error_site_missing_reports_the_error(monkeypatch):
+    class Refuse(FakeDirect):
+        def update(self, token, login, cid, field, items):
+            raise direct.DirectError("5005 bad")
+
+    Refuse(monkeypatch, [_camp(1)])
+    res = pm.apply(_ctx(), [_stored(1, SITES[0])])
+    assert not res[1].ok and "5005 bad" in res[1].error
+
+
+def test_rollback_to_empty_list_sends_null(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1, items=[SITES[0]])])
+    res = pm.rollback(_ctx(), [_stored(1, SITES[0])])
+    assert res[1].ok
+    assert fake.writes == [(1, None)]
+
+
+def test_update_campaign_list_null_payload():
+    from sync.modules import direct_api
+    sent = []
+    direct_api.update_campaign_list(
+        "t", "l", 5, "ExcludedSites", None,
+        call_fn=lambda *a: sent.append(a[3]) or {"UpdateResults": [{"Id": 5}]})
+    assert sent[0]["params"]["Campaigns"] == [{"Id": 5, "ExcludedSites": None}]
+
+
+def test_readback_none_has_own_reason(monkeypatch):
+    class Gone(FakeDirect):
+        def read(self, token, login, cid, field):
+            return None
+
+    Gone(monkeypatch, [_camp(1)])
+    res = pm.apply(_ctx(), [_stored(1, SITES[0])])
+    assert res[1].error == "кампания не найдена при чтении обратно"
+
+
+def test_failed_spam_report_keeps_login_out_of_scanned(api, monkeypatch):
+    monkeypatch.setattr(direct, "campaign_goals", lambda t, l: (_ for _ in ()).throw(
+        direct.DirectError("204")))
+    out = pm.run(_ctx({"spam_rule": True}))
+    assert out.scanned_logins == []
+    assert len(out.findings) == 6  # чистка не блокируется
+    assert any("спам-правило" in e for e in out.summary["errors"])
+
+
+def test_failed_model_keeps_login_out_of_scanned(api, monkeypatch):
+    api["rows"] = _rows([1], sites=["blog.example.com"])
+    monkeypatch.setenv(pm.LLM_ENV, "1")
+    monkeypatch.setattr(pm.llm, "asker", lambda: (lambda prompt: 1 / 0))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    out = pm.run(_ctx())
+    assert out.scanned_logins == []
+    assert any("модель" in e for e in out.summary["errors"])
+
+
+def _cli(monkeypatch):
     calls = []
     monkeypatch.setattr(placements_clean, "run_project",
                         lambda slug, **kw: calls.append((slug, kw)) or 0)
+    return calls
+
+
+def test_old_cli_delegates_to_runner(monkeypatch):
+    calls = _cli(monkeypatch)
     assert placements_clean.main(["--apply"]) == 0
     assert calls[0][0] == "edunetwork" and calls[0][1]["only"] == "placements"
     assert calls[0][1]["dry_run"] is False
+    assert placements_clean.main([]) == 0
+    assert calls[1][1]["dry_run"] is True
 
+
+def test_unban_writes_only_with_apply(monkeypatch, capsys):
+    calls = _cli(monkeypatch)
     asked = []
     monkeypatch.setattr(placements_clean.store, "request_rollback",
                         lambda *a, **k: asked.append(a) or 2)
-    assert placements_clean.main(["--unban", "A.ru"]) == 0
+    monkeypatch.setattr(placements_clean.store, "existing_findings",
+                        lambda slug, mod: [_stored(1, "a.ru"), _stored(2, "b.ru")])
+    monkeypatch.setattr(placements_clean.store, "load_project_modules",
+                        lambda slug: [{"module_key": "placements", "mode": "report"}])
+    assert placements_clean.main(["--unban", "Com.Block/"]) == 0
+    assert placements_clean.main(["--unban", "a.ru", "--dry-run"]) == 0
+    assert asked == []
+    shown = capsys.readouterr().out
+    assert "a.ru" in shown and "b.ru" not in shown
+
+    assert placements_clean.main(["--unban", "A.ru", "--apply"]) == 0
     assert asked == [("edunetwork", "placements", ["a.ru"])]
-    assert len(calls) == 1
+    assert "раннер не выполнит откат" in capsys.readouterr().out
+    assert calls == []
