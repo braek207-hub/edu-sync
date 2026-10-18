@@ -470,3 +470,80 @@ def test_apply_duplicate_phrase_in_group(monkeypatch):
     assert res[1].ok
     assert not res[2].ok and "дубль" in res[2].error
     assert fake.writes == [(1, ["бесплатно"])]
+    # ё=е: «учёба» и «учеба» — одна фраза для Директа, вторая запись была бы дублем
+    fake = FakeDirect(monkeypatch, [_camp(1)], keywords={"1": []})
+    res = qm.apply(_ctx(), [_stored(1, "учёба"), _stored(2, "учеба", rule="stop_word")])
+    assert res[1].ok and not res[2].ok and "дубль" in res[2].error
+    assert fake.writes == [(1, ["учёба"])]
+
+
+def test_yo_keyword_protected(monkeypatch):
+    # Директ не различает ё и е: минус «учеба» погасит ключ «учёба в колледже»
+    rows = [_row(1, "высшее образование заочно", 100, 10000, 10),
+            _row(1, "учеба бесплатно", 40, 4000, 0),
+            _row(1, "учеба скачать", 40, 4000, 0),
+            _row(1, "учеба онлайн", 40, 4000, 0)]
+    FakeDirect(monkeypatch, [_camp(1)], rows, keywords={"1": ["учёба в колледже"]})
+    out = qm.run(_ctx())
+    assert "учеба" not in _objects(out)
+    assert any("«учеба»: конфликт с ключом" in r for r in out.summary["refused"])
+    FakeDirect(monkeypatch, [_camp(1)], rows, keywords={"1": []})
+    assert "учеба" in _objects(qm.run(_ctx()))
+
+    fake = FakeDirect(monkeypatch, [_camp(1)], keywords={"1": ["учёба в колледже"]})
+    res = qm.apply(_ctx(), [_stored(1, "учеба")])
+    assert not res[1].ok and "конфликт с ключом" in res[1].error and fake.writes == []
+    fake = FakeDirect(monkeypatch, [_camp(1)], keywords={"1": []})
+    res = qm.apply(_ctx({"never_minus": ["учёба"]}), [_stored(1, "учеба")])
+    assert not res[1].ok and "never_minus" in res[1].error and fake.writes == []
+
+
+def test_yo_existing_negative_and_variant(monkeypatch):
+    # стоит «учёба» руками — «учеба» модуля это та же фраза: не ставим и не трогаем при откате
+    rows = [_row(1, "высшее образование заочно", 100, 10000, 10),
+            _row(1, "учеба бесплатно", 40, 4000, 0),
+            _row(1, "учеба скачать", 40, 4000, 0),
+            _row(1, "учеба онлайн", 40, 4000, 0)]
+    FakeDirect(monkeypatch, [_camp(1, negatives=["учёба"])], rows, keywords={"1": []})
+    assert "учеба" not in _objects(qm.run(_ctx()))
+    fake = FakeDirect(monkeypatch, [_camp(1, negatives=["Учёба"])], keywords={"1": []})
+    res = qm.apply(_ctx(), [_stored(1, "учеба")])
+    assert not res[1].ok and "поставлена не модулем" in res[1].error and fake.writes == []
+    res = qm.rollback(_ctx(), [_stored(1, "учеба")])
+    assert not res[1].ok and res[1].error == "вариант поставлен не модулем"
+    assert fake.writes == []
+
+
+def test_stop_word_exact_form_not_stem(monkeypatch):
+    # «скачать» и «скачки» делят 5 букв, но это разные слова: минус по скачкам лишний
+    # К2: стоп-слова нет вовсе — ни находки, ни ложного отказа по ключу «скачать игры».
+    # К3: оно есть — в деталях только точная форма (20 кл), скачки (30 кл) не в счёт.
+    rows = _base() + [_row(2, "база два", 100, 1000, 10),
+                      _row(2, "скачки на ипподроме", 30, 3000, 0),
+                      _row(3, "база три", 100, 1000, 10),
+                      _row(3, "скачать торрент", 20, 2000, 0),
+                      _row(3, "скачки на ипподроме", 30, 3000, 0)]
+    FakeDirect(monkeypatch, [_camp(1), _camp(2), _camp(3)], rows,
+               keywords={"1": [], "2": ["скачать игры"], "3": []})
+    out = qm.run(_ctx({"stop_words": ["скачать"]}))
+    stop = {f.campaign_id: f.details["clicks"] for f in out.findings if f.rule == "stop_word"}
+    assert stop == {1: 40, 3: 20}
+    assert not any(r.startswith("login1 2 ") for r in out.summary["refused"])
+    # ё=е и регистр при этом совпадают
+    FakeDirect(monkeypatch, [_camp(1)], _base() + [_row(1, "учеба заочно", 20, 2000, 0)],
+               keywords={"1": []})
+    out = qm.run(_ctx({"stop_words": ["Учёба"]}))
+    stop = [f for f in out.findings if f.rule == "stop_word"]
+    assert [f.object_id for f in stop] == ["учёба"] and stop[0].details["clicks"] == 20
+    # стоп-слово в обоих написаниях — одна находка на кампанию
+    out = qm.run(_ctx({"stop_words": ["учёба", "учеба"]}))
+    assert [f.object_id for f in out.findings if f.rule == "stop_word"] == ["учёба"]
+
+
+def test_rollback_duplicate_in_group_already_absent(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1, negatives=["ручная", "бесплатно"])])
+    res = qm.rollback(_ctx(), [_stored(1, "бесплатно"),
+                               _stored(2, "бесплатно", rule="stop_word")])
+    assert res[1].ok and not res[1].response.get("already_absent")
+    assert res[2].ok and res[2].response["already_absent"]
+    assert fake.writes == [(1, ["ручная"])]

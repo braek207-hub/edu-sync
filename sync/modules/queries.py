@@ -164,7 +164,18 @@ STEM_MIN = 4
 STEM_TAIL = 2
 
 
+def _yo(text: str) -> str:
+    # Директ не различает ё и е: «учеба» в минусе гасит ключ «учёба». Только для сравнений,
+    # записываемая фраза остаётся как есть.
+    return text.replace("ё", "е")
+
+
+def _fold(words: FrozenSet[str]) -> FrozenSet[str]:
+    return frozenset(_yo(w) for w in words)
+
+
 def _same_stem(a: str, b: str) -> bool:
+    a, b = _yo(a), _yo(b)
     if a == b:
         return True
     n = 0
@@ -200,10 +211,15 @@ def _never_list(settings: dict) -> List[FrozenSet[str]]:
                         for x in settings.get("never_minus") or []) if w]
 
 
-def _family(rows: List[Dict[str, Any]], words: FrozenSet[str]) -> Dict[str, Any]:
-    # Семейство — со словоформами: Директ отрежет и их, и судить надо то, что отрежется.
-    hit = sorted((q for q in rows if _covers(words, _words(q["query"]))),
-                 key=lambda q: -q["cost"])
+def _family(rows: List[Dict[str, Any]], words: FrozenSet[str], stems: bool) -> Dict[str, Any]:
+    """Поток кампании под минус-фразой. stems=False — точные формы (ё=е): это видно в
+    находке. stems=True — с грубыми словоформами: только для отказов, где лишнее совпадение
+    снимает кандидата, а не добавляет минус."""
+    if stems:
+        hit = [q for q in rows if _covers(words, _words(q["query"]))]
+    else:
+        hit = [q for q in rows if _fold(words) <= _fold(_words(q["query"]))]
+    hit.sort(key=lambda q: -q["cost"])
     return {"clicks": sum(q["clicks"] for q in hit),
             "cost": round(sum(q["cost"] for q in hit), 2),
             "conversions": sum(q["conversions"] for q in hit),
@@ -247,7 +263,10 @@ def _candidates(rows, settings, cpa_limit, own_words, own_phrases):
     for stop in settings.get("stop_words") or []:
         sw = _words(stop)
         for cid in cids:
-            if any(_covers(sw, _words(q["query"])) for q in rows if q["campaign_id"] == cid):
+            # Стоп-слово ищется точной формой (с ё=е), а не по основе: оно добавляет минус, и
+            # ложная основа («скачать»/«скачки») дала бы лишний. Основа — только для отказов.
+            if sw and any(_fold(sw) <= _fold(_words(q["query"]))
+                          for q in rows if q["campaign_id"] == cid):
                 out.append(("stop_word", stop, cid))
     return out
 
@@ -330,10 +349,11 @@ def _scan_login(acc: DirectAccount, settings: dict, win: Tuple[str, str], log) -
                for cid in by_cid}
 
     picked: Dict[Tuple[str, str], Tuple[str, Dict[str, Any]]] = {}
+    seen = set()  # (кампания, фраза с ё=е): «учёба» и «учеба» — одна запись в Директе
     for rule, text, cid in _candidates(rows, settings, float(cpa_limit), own_words,
                                        own_phrases):
         phrase = negatives.normalize_phrase(text)
-        if (cid, phrase) in picked or cid not in by_cid:
+        if (cid, _yo(phrase)) in seen or cid not in by_cid:
             continue
         ok, why = negatives.phrase_is_valid(phrase)
         words = _words(phrase)
@@ -349,21 +369,24 @@ def _scan_login(acc: DirectAccount, settings: dict, win: Tuple[str, str], log) -
             # Отказ при применении всё равно случился бы: находку, обречённую на failed, не ставим.
             refuse(cid, phrase, "конфликт с ключом")
             continue
-        fam = _family(by_cid[cid], words)
+        fam = _family(by_cid[cid], words, stems=False)
         if fam["clicks"] <= 0:
             continue
-        if rule == "word_zero_conv" and fam["conversions"] > 0:
+        wide = _family(by_cid[cid], words, stems=True)
+        if rule == "word_zero_conv" and wide["conversions"] > 0:
             # Агент судил слово в точной форме; Директ отрежет и формы, а у них конверсии есть.
             refuse(cid, phrase, "словоформы слова приносят конверсии")
             continue
-        if (rule == "phrase_waste" and fam["conversions"] > 0
-                and fam["cost"] / fam["conversions"] <= payoff):
+        paying = [f for f in (fam, wide)
+                  if f["conversions"] > 0 and f["cost"] / f["conversions"] <= payoff]
+        if rule == "phrase_waste" and paying:
             # Семейство агент проверял по всему кабинету; запрет пишется в кампанию, и там,
-            # где поток окупается, ему не место.
+            # где поток окупается (в точных формах или со словоформами), ему не место.
             refuse(cid, phrase, "в этой кампании семейство окупается (CPA %.0f ₽)"
-                   % (fam["cost"] / fam["conversions"]))
+                   % (paying[0]["cost"] / paying[0]["conversions"]))
             continue
         picked[(cid, phrase)] = (rule, fam)
+        seen.add((cid, _yo(phrase)))
 
     order = sorted(picked.items(), key=lambda kv: (-kv[1][1]["cost"], kv[0]))
     per_cid: Dict[str, int] = {}
@@ -530,7 +553,7 @@ def _apply_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
     keys = [_words(k) for k in direct_api.keywords_by_campaign(
         acc.token, acc.login, [int(cid)]).get(str(cid), [])]
     never = _never_list(settings)
-    have = {negatives.normalize_phrase(p) for p in existing}
+    have = {_yo(negatives.normalize_phrase(p)) for p in existing}
     used = _chars(existing)
     out: Dict[int, ApplyResult] = {}
     to_add: List[str] = []
@@ -546,10 +569,10 @@ def _apply_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
                                     % " ".join(sorted(hit)))
         elif _key_conflict(words, keys):
             out[f.id] = ApplyResult(False, {}, "конфликт с ключом кампании")
-        elif phrase in have:
+        elif _yo(phrase) in have:
             # Не наша запись: «применено» отдало бы ручную фразу под откат модуля.
             out[f.id] = ApplyResult(False, {}, "фраза уже стоит в кампании — поставлена не модулем")
-        elif phrase in to_add:
+        elif _yo(phrase) in {_yo(x) for x in to_add}:
             # Вторая находка на то же действие: запись одна, засчитать её дважды нельзя.
             out[f.id] = ApplyResult(False, {}, "дубль: та же фраза в этом применении")
         elif used + len(phrase) > negatives.MAX_TOTAL_CHARS:
@@ -588,16 +611,19 @@ def _rollback_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
     existing = fresh[2]
     out: Dict[int, ApplyResult] = {}
     drop: List[str] = []
+    dups = set()
     for f in group:
         # Модуль пишет нормализованную форму: своё — только точное совпадение. Вариант в
         # другом регистре или с другими пробелами поставил человек (writer/negatives.remove_added
         # вычитает «ровно своё», а не похожее).
         phrase = _phrase(f)
         if phrase in drop:
-            out[f.id] = ApplyResult(False, {}, "дубль: та же фраза в этом откате")
+            # Вторая находка на ту же фразу: судит то же чтение обратно, что и первую. failed
+            # вернул бы её в applied, хотя фразы уже нет.
+            dups.add(f.id)
         elif any(p.strip() == phrase for p in existing):
             drop.append(phrase)
-        elif any(negatives.normalize_phrase(p) == phrase for p in existing):
+        elif any(_yo(negatives.normalize_phrase(p)) == _yo(phrase) for p in existing):
             out[f.id] = ApplyResult(False, {"campaign_id": cid, "phrase": phrase},
                                     "вариант поставлен не модулем")
         else:
@@ -619,7 +645,10 @@ def _rollback_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
             continue
         phrase = _phrase(f)
         if phrase not in present:
-            out[f.id] = ApplyResult(True, {"campaign_id": cid, "phrase": phrase})
+            resp = {"campaign_id": cid, "phrase": phrase}
+            if f.id in dups:
+                resp["already_absent"] = True
+            out[f.id] = ApplyResult(True, resp)
         else:
             out[f.id] = ApplyResult(False, {"campaign_id": cid, "phrase": phrase},
                                     _write_error(werr)
