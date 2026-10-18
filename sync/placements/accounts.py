@@ -1,24 +1,21 @@
 # -*- coding: utf-8 -*-
 """Реестр кабинетов Директа для чистильщика площадок.
 
-Кабинет описывается декларативно: где взять токен, какой Client-Login
-подставить. Кабинет без доступа не роняет прогон — он пропускается с
-внятной строкой, потому что чистильщик ходит по пяти клиентам, и потеря
-одного не повод оставить остальных грязными.
+Кабинет описывается декларативно: ключ, проект и кабинетные правила; токены и
+логины даёт sync.modules.accounts. Кабинет без доступа не роняет прогон — он
+пропускается с внятной строкой, потому что чистильщик ходит по пяти клиентам,
+и потеря одного не повод оставить остальных грязными.
 """
 
-import json
-import os
 from typing import Dict, List, NamedTuple, Optional, Tuple
+
+from sync.modules.accounts import accounts_for
 
 
 class Account(NamedTuple):
     key: str            # короткое имя кабинета в журнале и логах
     label: str          # человекочитаемое
-    token_env: str      # переменная окружения с OAuth-токеном
-    login: Optional[str] = None       # Client-Login; None — прямой кабинет
-    logins_env: Optional[str] = None  # JSON со списком клиентов агентства
-    agency: bool = False              # спросить список клиентов у Директа
+    slug: str           # проект Panda-BI в реестре sync.modules.accounts
     # Площадки, которые в этом кабинете запрещаются всегда: не по вердикту
     # словаря и не по кликам, а решением человека. Список кабинетный —
     # почта и Дзен у одного клиента сливают бюджет, у другого приносят лиды.
@@ -28,9 +25,12 @@ class Account(NamedTuple):
     # спам-заявки выглядят для Директа успехом; у e-com цель — оплата, и
     # накрутить её площадка не может.
     spam_rule: bool = False
+    # Токен подставляет available(): имена переменных и их разбор живут в
+    # sync.modules.accounts, чтобы не разъезжаться с остальными модулями.
+    token_value: str = ""
 
     def token(self) -> str:
-        return os.environ.get(self.token_env, "").strip()
+        return self.token_value
 
 
 # Russever (Групп Орсо, orso-groupmedia) снят 06.10.2026: работа с клиентом
@@ -44,73 +44,17 @@ ACCOUNTS: List[Account] = [
     # Директа. Секрет DIRECT_CLIENTS_JSON перечисляет только тех, у кого
     # проставлены цели, — чистить надо всех, включая новых, о которых секрет
     # ещё не знает.
-    Account("edu", "EDUNETWORK", "DIRECT_TOKEN",
-            logins_env="DIRECT_CLIENTS_JSON", agency=True,
+    Account("edu", "EDUNETWORK", "edunetwork",
             # Решение Павла 14.09.2026: площадки с аномально частым
             # «Спасибо» выключать — это спам-заявки, а не студенты.
             spam_rule=True),
-    Account("lime", "LIME", "LIME_DIRECT_TOKEN",
-            login=os.environ.get("LIME_DIRECT_CLIENT_LOGIN") or None),
-    Account("bjorn", "BJORN", "BJORN_DIRECT_TOKEN",
-            login=os.environ.get("BJORN_DIRECT_CLIENT_LOGIN") or None),
-    Account("polinarepik", "Polinarepik", "POLINA_DIRECT_TOKEN",
-            login=os.environ.get("POLINA_DIRECT_CLIENT_LOGIN") or None),
-    Account("meshnflesh", "mesh-n-flesh", "MNF_DIRECT_TOKEN",
-            login=os.environ.get("MNF_DIRECT_CLIENT_LOGIN") or None),
+    Account("lime", "LIME", "lime"),
+    Account("bjorn", "BJORN", "bjorn"),
+    Account("polinarepik", "Polinarepik", "polinarepik"),
+    Account("meshnflesh", "mesh-n-flesh", "meshnflesh"),
 ]
 
 BY_KEY: Dict[str, Account] = {a.key: a for a in ACCOUNTS}
-
-
-def agency_logins(account: Account) -> List[str]:
-    """Клиенты агентства прямо из Директа. Пустой список — не повод падать."""
-    from sync.placements.direct import DirectError, call
-
-    out: List[str] = []
-    offset = 0
-    while True:
-        try:
-            res = call(account.token(), "", "agencyclients", {
-                "method": "get",
-                "params": {"SelectionCriteria": {},
-                           "FieldNames": ["Login"],
-                           "Page": {"Limit": 1000, "Offset": offset}},
-            })
-        except (DirectError, Exception):
-            return out
-        chunk = res.get("Clients", [])
-        out.extend(str(c.get("Login", "")).strip() for c in chunk
-                   if str(c.get("Login", "")).strip())
-        if len(chunk) < 1000:
-            return out
-        offset += len(chunk)
-
-
-def logins_of(account: Account) -> List[str]:
-    """Клиентские логины кабинета.
-
-    У агентского кабинета их несколько (EDU: ВУЗ, СПО, ПроВУЗ…), и чистить
-    надо каждый: запрет площадок живёт на кампании, а кампании — у клиента.
-    """
-    if account.agency:
-        logins = agency_logins(account)
-        if logins:
-            return logins
-    if account.logins_env:
-        raw = os.environ.get(account.logins_env, "").strip()
-        if not raw:
-            return []
-        try:
-            items = json.loads(raw)
-        except json.JSONDecodeError:
-            return []
-        out = []
-        for item in items:
-            login = str(item.get("login", "")).strip() if isinstance(item, dict) else str(item).strip()
-            if login:
-                out.append(login)
-        return out
-    return [account.login] if account.login else []
 
 
 def available(keys: Optional[List[str]] = None):
@@ -119,12 +63,15 @@ def available(keys: Optional[List[str]] = None):
     for account in ACCOUNTS:
         if keys and account.key not in keys:
             continue
-        if not account.token():
-            skipped.append((account, "нет токена в %s" % account.token_env))
+        found, why = accounts_for(account.slug)
+        if not found:
+            skipped.append((account, "; ".join(why) or "нет кабинетов Директа"))
             continue
-        logins = logins_of(account)
-        if not logins:
-            skipped.append((account, "не задан Client-Login"))
-            continue
-        ready.append((account, logins))
+        # Токены у клиентов одного проекта бывают разные (BJORN): прогон идёт
+        # по группам с общим токеном, ключ журнала остаётся проектным.
+        by_token: Dict[str, List[str]] = {}
+        for d in found:
+            by_token.setdefault(d.token, []).append(d.login)
+        for token, logins in by_token.items():
+            ready.append((account._replace(token_value=token), logins))
     return ready, skipped
