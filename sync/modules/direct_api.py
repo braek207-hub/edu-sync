@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from sync.direct_reports_limit import (MIN_POLL_SECONDS, RATE_LIMIT_CODE,
+from sync.direct_reports_limit import (MIN_POLL_SECONDS, is_rate_limited,
                                        poll_delay)
 from sync.placements.direct import REPORTS, DirectError, _headers, call
 
@@ -16,6 +16,9 @@ from sync.placements.direct import REPORTS, DirectError, _headers, call
 MAX_WAIT_SECONDS = 600
 CHUNK = 10
 PAGE_LIMIT = 1000
+
+RESULT_KEYS = {"campaigns": "Campaigns", "keywords": "Keywords",
+               "adgroups": "AdGroups", "ads": "Ads"}
 
 Post = Callable[[str, bytes, Dict[str, str]], Tuple[int, Dict[str, str], str]]
 
@@ -49,17 +52,9 @@ def _header(headers: Dict[str, str], name: str) -> Any:
     return None
 
 
-def _is_rate_limited(status: int, text: str) -> bool:
-    if status != 400:
-        return False
-    try:
-        return str(json.loads(text)["error"]["error_code"]) == RATE_LIMIT_CODE
-    except (ValueError, KeyError, TypeError):
-        return False
-
-
 def report_rows(token: str, login: str, params: dict, *, prefix: str,
-                sleep=time.sleep, post: Post = _http_post) -> List[Dict[str, str]]:
+                sleep=time.sleep, post: Post = _http_post,
+                clock=time.monotonic) -> List[Dict[str, str]]:
     params = dict(params)
     params["ReportName"] = _report_name(prefix, params)
     body = json.dumps({"params": params}, ensure_ascii=False).encode("utf-8")
@@ -67,22 +62,33 @@ def report_rows(token: str, login: str, params: dict, *, prefix: str,
     headers.update({"processingMode": "auto", "returnMoneyInMicros": "false",
                     "skipReportHeader": "true", "skipReportSummary": "true"})
 
-    waited = 0
+    # Бюджет считаем по стенным часам: медленные запросы тоже съедают время такта.
+    start = clock()
+    last_error = ""
     while True:
-        status, hdrs, text = post(REPORTS, body, headers)
-        if status == 200:
-            break
-        if status in (201, 202):
-            delay = poll_delay(_header(hdrs, "retryIn"), MIN_POLL_SECONDS)
-        elif status == 500 or _is_rate_limited(status, text):
-            # 500 = очередь отчётов занята; имя не меняем, иначе встанем в очередь заново.
+        try:
+            status, hdrs, text = post(REPORTS, body, headers)
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as err:
+            # Сеть моргнула: повтор под тем же именем, как и при 500.
+            status, hdrs, text = None, {}, ""
+            last_error = "сеть: %s" % err
             delay = MIN_POLL_SECONDS
         else:
-            raise DirectError("reports HTTP %s: %s" % (status, text[:400]))
-        if waited >= MAX_WAIT_SECONDS:
-            raise DirectError("отчёт не готов за %d с" % MAX_WAIT_SECONDS)
-        sleep(delay)
-        waited += delay
+            if status == 200:
+                break
+            if status in (201, 202):
+                delay = poll_delay(_header(hdrs, "retryIn"), MIN_POLL_SECONDS)
+            elif status == 500 or is_rate_limited(status, text):
+                # 500 = очередь отчётов занята; имя не меняем, иначе встанем в очередь заново.
+                delay = MIN_POLL_SECONDS
+            else:
+                raise DirectError("reports HTTP %s: %s" % (status, text[:400]))
+        # Огромный retryIn не должен выводить за бюджет: паузу режем по остатку.
+        remaining = MAX_WAIT_SECONDS - (clock() - start)
+        if remaining <= 0:
+            msg = "отчёт не готов за %d с" % MAX_WAIT_SECONDS
+            raise DirectError(msg + (" (%s)" % last_error if last_error else ""))
+        sleep(min(delay, remaining))
 
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if not lines:
@@ -94,10 +100,11 @@ def report_rows(token: str, login: str, params: dict, *, prefix: str,
 def get_all(token: str, login: str, service: str, criteria: dict,
             field_names: List[str], extra: Optional[dict] = None,
             chunk_key: Optional[str] = None, ids: Sequence = (),
-            call_fn=call) -> List[dict]:
+            result_key: Optional[str] = None, call_fn=call) -> List[dict]:
     chunks: List[Optional[list]] = [None]
     if chunk_key:
         chunks = [list(ids[i:i + CHUNK]) for i in range(0, len(ids), CHUNK)]
+    key = result_key or RESULT_KEYS.get(service) or service.capitalize()
     out: List[dict] = []
     for chunk in chunks:
         crit = dict(criteria)
@@ -109,11 +116,13 @@ def get_all(token: str, login: str, service: str, criteria: dict,
                       "Page": {"Limit": PAGE_LIMIT, "Offset": offset}}
             params.update(extra or {})
             res = call_fn(token, login, service, {"method": "get", "params": params})
-            # Ключ списка зависит от сервиса (Campaigns, Keywords, AdGroups): берём единственный список.
-            out.extend(next((v for v in res.values() if isinstance(v, list)), []))
+            page = res.get(key) or []
+            out.extend(page)
             # LimitedBy есть только когда страница обрезана и данные остались.
             if "LimitedBy" not in res:
                 break
+            if not page:
+                raise DirectError("%s.get: LimitedBy при пустой странице" % service)
             offset = res["LimitedBy"]
     return out
 

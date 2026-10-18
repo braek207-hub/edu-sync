@@ -9,6 +9,17 @@ from sync.placements.direct import DirectError
 PARAMS = {"FieldNames": ["Query"], "ReportType": "SEARCH_QUERY_PERFORMANCE_REPORT"}
 
 
+def fake_time():
+    """Часы, которые идут только от sleep."""
+    state = {"t": 0.0}
+
+    class Sleeps(list):
+        def append(self, s):
+            super().append(s)
+            state["t"] += s
+    return Sleeps(), lambda: state["t"]
+
+
 def scripted(responses):
     """post, отдающий ответы по очереди; запоминает тела запросов."""
     sent = []
@@ -49,10 +60,46 @@ def test_report_retries_on_error_56():
 def test_report_gives_up_after_600s():
     def post(url, body, headers):
         return 202, {"retryIn": "60"}, ""
-    sleeps = []
+    sleeps, clock = fake_time()
     with pytest.raises(DirectError, match="не готов за 600 с"):
-        d.report_rows("t", "l", dict(PARAMS), prefix="p", sleep=sleeps.append, post=post)
-    assert sum(sleeps) <= 660
+        d.report_rows("t", "l", dict(PARAMS), prefix="p", sleep=sleeps.append,
+                      post=post, clock=clock)
+    assert sum(sleeps) <= 600
+
+
+def test_huge_retry_in_capped_by_budget():
+    def post(url, body, headers):
+        return 201, {"retryIn": "3000"}, ""
+    sleeps, clock = fake_time()
+    with pytest.raises(DirectError, match="не готов за 600 с"):
+        d.report_rows("t", "l", dict(PARAMS), prefix="p", sleep=sleeps.append,
+                      post=post, clock=clock)
+    assert sleeps == [600]
+
+
+def test_network_error_retried_same_name():
+    import urllib.error
+    sent = []
+
+    def post(url, body, headers):
+        sent.append(json.loads(body.decode("utf-8"))["params"]["ReportName"])
+        if len(sent) == 1:
+            raise urllib.error.URLError("reset")
+        return 200, {}, "A\n1\n"
+
+    sleeps, clock = fake_time()
+    rows = d.report_rows("t", "l", dict(PARAMS), prefix="p", sleep=sleeps.append,
+                         post=post, clock=clock)
+    assert rows == [{"A": "1"}] and len(set(sent)) == 1 and sleeps == [11]
+
+
+def test_network_error_budget_carries_last_error():
+    def post(url, body, headers):
+        raise TimeoutError("timed out")
+    sleeps, clock = fake_time()
+    with pytest.raises(DirectError, match="timed out"):
+        d.report_rows("t", "l", dict(PARAMS), prefix="p", sleep=sleeps.append,
+                      post=post, clock=clock)
 
 
 def test_report_name_changes_with_params():
@@ -129,3 +176,17 @@ def test_read_campaign_list():
                                 call_fn=lambda *a: {"Campaigns": [{"Id": 5}]}) == []
     assert d.read_campaign_list("t", "l", 5, "ExcludedSites",
                                 call_fn=lambda *a: {"Campaigns": []}) is None
+
+
+def test_get_all_uses_explicit_key():
+    def fake(token, login, service, payload):
+        return {"Other": [{"Id": 9}], "AdGroups": [{"Id": 1}]}
+    assert d.get_all("t", "l", "adgroups", {}, ["Id"], call_fn=fake) == [{"Id": 1}]
+    assert d.get_all("t", "l", "x", {}, ["Id"], result_key="Other", call_fn=fake) == [{"Id": 9}]
+
+
+def test_get_all_limited_by_empty_page_raises():
+    def fake(token, login, service, payload):
+        return {"Campaigns": [], "LimitedBy": 5}
+    with pytest.raises(DirectError):
+        d.get_all("t", "l", "campaigns", {}, ["Id"], call_fn=fake)
