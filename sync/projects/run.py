@@ -9,6 +9,8 @@
 Транзакции: одна на источник × окно (кусок). access_token и mark_reconnect коммитят сами,
 поэтому токен берётся до первой записи окна, а при сбое сначала rollback, потом статус.
 Advisory lock источника — сессионный: переживает commit/rollback, снимается в finally.
+Бюджет SOURCE_BUDGET_SEC — на каждое окно (кусок истории), а не на источник целиком:
+медленная очередь отчётов Директа не должна ронять 90 дней из-за суммы четырёх кусков.
 """
 
 from __future__ import annotations
@@ -71,8 +73,9 @@ def _is_reconnect(exc: BaseException) -> bool:
 
 
 def _check_deadline(deadline: float, source: Source) -> None:
+    # Предел проверяется между запросами: fetch_* Метрики его не принимают, один запрос может его перейти.
     if time.monotonic() >= deadline:
-        raise TimeoutError(f"Источник {source.id} не уложился в {SOURCE_BUDGET_SEC} с")
+        raise TimeoutError(f"Окно источника {source.id} не уложилось в {SOURCE_BUDGET_SEC} с")
 
 
 def _metrika_plan(source: Source):
@@ -200,13 +203,13 @@ def _start_job(conn, source: Source, job: dict, yesterday: date) -> dict:
 
 def _run_job(conn, source: Source, *, yesterday: date, key_b64: str) -> bool:
     job = dict(source.backfill or {})
-    deadline = time.monotonic() + SOURCE_BUDGET_SEC
     try:
         if job.get("state") == "queued":
             job = _start_job(conn, source, job, yesterday)
         chunks = _job_chunks(job)
         for i in range(int(job.get("chunks_done", 0)), len(chunks)):
             chunk_from, chunk_to = (d.isoformat() for d in chunks[i])
+            deadline = time.monotonic() + SOURCE_BUDGET_SEC
             n = sync_source(conn, source, chunk_from, chunk_to, key_b64=key_b64, deadline=deadline)
             job["chunks_done"] = i + 1
             store.save_backfill(conn, source.id, job)
@@ -263,7 +266,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         key_b64 = secret_box.key_from_env()
-        secret_box._load_key(key_b64)  # битый ключ — ошибка конфига сервера, а не всех источников
+        # Пробное шифрование проверяет ключ: битый ключ — ошибка конфига сервера, а не всех источников.
+        secret_box.encrypt("", key_b64)
     except secret_box.SecretBoxError as exc:
         print(f"ERROR: {exc}")
         return 1

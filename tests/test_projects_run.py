@@ -341,11 +341,45 @@ def test_midwrite_failure_rolls_back_before_mark(world):
     assert not w.events("ok")
 
 
-def test_deadline_passed_to_direct(world):
-    w = world(src(1))
-    daily(w)
-    max_wait = w.fetches("direct")[0][5]
-    assert 0 < max_wait <= run.SOURCE_BUDGET_SEC
+class Clock:
+    """Подмена run.time: время идёт только тогда, когда его двигает тест."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+
+def slow_direct(monkeypatch, w, clock, step):
+    real_fetch = w.fetch_direct_daily
+
+    def fetch(*a, **kw):
+        rows = real_fetch(*a, **kw)
+        clock.now += step
+        return rows
+
+    monkeypatch.setattr(direct_fetch, "fetch_direct_daily", fetch)
+
+
+def test_deadline_passed_to_direct(world, monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(run, "time", clock)
+    w = world(src(1), src(2))
+    slow_direct(monkeypatch, w, clock, 1100)  # первый источник съел почти весь свой бюджет
+    assert daily(w) == 0
+    # у каждого окна свой бюджет: второй источник не наследует остаток первого
+    assert [e[5] for e in w.fetches("direct")] == [run.SOURCE_BUDGET_SEC] * 2
+
+
+def test_history_chunk_gets_fresh_budget(world, monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(run, "time", clock)
+    w = world(src(1, status="new", backfill=history_job()))
+    slow_direct(monkeypatch, w, clock, 1000)  # 1000 из 1200 с на кусок: общий бюджет уронил бы кусок 2
+    assert queue(w) == 0
+    assert [e[5] for e in w.fetches("direct")] == [run.SOURCE_BUDGET_SEC] * 4
+    assert w.sources[1].backfill["state"] == "done"
 
 
 def test_deadline_already_passed_raises_before_fetch(world):
@@ -555,6 +589,12 @@ def test_main_bad_key_exits_1_without_value(monkeypatch, capsys):
     assert run.main(["queue"]) == 1
     out = capsys.readouterr().out
     assert "PANDA_SECRET_KEY" in out and "not-a-key-value-xyz" not in out
+
+
+def test_main_does_not_use_private_secret_box_api():
+    import inspect
+
+    assert "_load_key" not in inspect.getsource(run)
 
 
 def test_main_runs_mode_with_slug(monkeypatch):
