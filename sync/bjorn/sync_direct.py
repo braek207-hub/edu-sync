@@ -66,7 +66,9 @@ def direct_headers(token: str, login: str, include_column_header: bool = False) 
     }
 
 
-def fetch_report(login: str, date_from: str, date_to: str, fields: list[str], *, token: str = "") -> str:
+def fetch_report(
+    login: str, date_from: str, date_to: str, fields: list[str], *, token: str = "", max_wait_sec: float | None = None
+) -> str:
     if not token:
         token = env_required("DIRECT_TOKEN")
     signature = hashlib.md5("|".join(fields + [login, date_from, date_to]).encode("utf-8")).hexdigest()[:10]
@@ -86,6 +88,15 @@ def fetch_report(login: str, date_from: str, date_to: str, fields: list[str], *,
     backoff = 10
     server_error_attempts = 0
     rate_limited_attempts = 0
+    waited = 0.0
+
+    def wait_report(seconds: float) -> None:
+        # Бюджет ожидания готовности отчёта (201/202); None — ждать без предела, как раньше.
+        nonlocal waited
+        if max_wait_sec is not None and waited + seconds > max_wait_sec:
+            raise TimeoutError(f"Отчёт Директа {login} не готов за {max_wait_sec} с")
+        waited += seconds
+        time.sleep(seconds)
 
     while True:
         response = requests.post(
@@ -98,10 +109,10 @@ def fetch_report(login: str, date_from: str, date_to: str, fields: list[str], *,
         if response.status_code == 200:
             return response.text
         if response.status_code == 201:
-            time.sleep(60)
+            wait_report(60)
             continue
         if response.status_code == 202:
-            time.sleep(poll_delay(response.headers.get("retryIn"), 60))
+            wait_report(poll_delay(response.headers.get("retryIn"), 60))
             continue
         if is_rate_limited(response.status_code, response.text):
             rate_limited_attempts += 1
