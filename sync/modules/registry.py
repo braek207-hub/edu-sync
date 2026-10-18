@@ -8,3 +8,8 @@
 from typing import Any, Dict
 
 MODULES: Dict[str, Any] = {}
+
+# Импорт внизу: модуль не знает о реестре, цикла нет.
+from sync.modules import placements as _placements  # noqa: E402
+
+MODULES["placements"] = _placements
