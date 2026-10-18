@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sync.bjorn.common import (
-    clean_text,
+    dim_text,
     derive_source_detail,
     expand_metrica_dimension,
     metrica_stat_rows,
@@ -117,14 +117,8 @@ def build_params(
     return params
 
 
-def _dim_text(value: Any) -> str:
-    """Метрика отдаёт литерал "None" для пустого измерения (sync/bjorn/sync_products.py:dim_text)."""
-    text = clean_text(value)
-    return "" if text in {"None", "null", "--", "(not set)"} else text
-
-
 def _name(dim: dict[str, Any]) -> str:
-    return _dim_text((dim or {}).get("name"))
+    return dim_text((dim or {}).get("name"))
 
 
 def _direct_campaign_id(direct: dict[str, Any]) -> str:
@@ -134,12 +128,12 @@ def _direct_campaign_id(direct: dict[str, Any]) -> str:
     CampaignId, поэтому по нему идёт джойн с project_direct_daily. id — внутренний номер заказа
     Метрики и лишь иногда равен CampaignId (живая проба 17.10: id 218498117 при direct_id N-118498117).
     """
-    direct_part = _dim_text(direct.get("direct_id"))
+    direct_part = dim_text(direct.get("direct_id"))
     if direct_part.startswith("N-"):
         direct_part = direct_part[2:]
     if direct_part.isdigit():
         return direct_part
-    element_id = _dim_text(direct.get("id"))
+    element_id = dim_text(direct.get("id"))
     if element_id.isdigit():
         return element_id
     return normalize_campaign_id(_name(direct))
@@ -171,13 +165,15 @@ def parse_traffic(data: list[dict[str, Any]]) -> list[TrafficRow]:
         dims = rec["dimensions"]
         key = (_name(dims[0]), *_source_dims(dims[1:7]))
         visits, bounce, depth = (float(m or 0) for m in rec["metrics"][:3])
+        if visits <= 0:
+            continue
         acc = merged.setdefault(key, [0.0, 0.0, 0.0])
         acc[0] += visits
         acc[1] += bounce * visits
         acc[2] += depth * visits
     rows = []
     for key, (visits, bounce_sum, depth_sum) in merged.items():
-        weight = visits or 1.0
+        weight = visits
         rows.append(
             TrafficRow(*key, int(round(visits)), round(bounce_sum / weight, 2), round(depth_sum / weight, 3))
         )
@@ -235,6 +231,7 @@ def fetch_traffic(counter: int, token: str, date_from: str, date_to: str) -> lis
 
 
 def fetch_goals(counter: int, token: str, date_from: str, date_to: str, goal_ids: list[int]) -> list[GoalRow]:
+    goal_ids = list(dict.fromkeys(goal_ids))
     rows: list[GoalRow] = []
     for i in range(0, len(goal_ids), GOALS_PER_REQUEST):
         batch = goal_ids[i : i + GOALS_PER_REQUEST]

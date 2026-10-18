@@ -1,6 +1,7 @@
 """Проба stat API Метрики для синка проектов: снимает фикстуры tests/fixtures/projects_metrika_<kind>.json.
 
-Токен и счётчик — из BJORN_METRICA_TOKEN / BJORN_METRICA_COUNTER_ID (.env через python-dotenv).
+Токен — из переменной окружения --token-var (по умолчанию BJORN_METRICA_TOKEN), счётчик — из
+--counter или BJORN_METRICA_COUNTER_ID. Файл с переменными: --env, иначе ROOT/.env (python-dotenv).
 Токен не печатается и не пишется.
 
   python scripts/probe_project_metrika.py --kind traffic|goals|purchases|products|all [--goals id,id]
@@ -25,7 +26,6 @@ sys.path.insert(0, str(ROOT))
 from sync.bjorn.common import metrica_stat_rows  # noqa: E402
 from sync.projects.metrika_fetch import build_params  # noqa: E402
 
-FALLBACK_ENV = Path("C:/vscode/edu-sync/.env")
 KINDS = ["traffic", "goals", "purchases", "products"]
 # Голые длинные числа не ловим: это id заказов и кампаний. Телефон — с плюсом или разделителями.
 PII = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|\+\d[\d\s\-()]{9,}\d|\(?\d{3}\)?[\s-]\d{3}[\s-]\d{2}[\s-]?\d{2}")
@@ -34,7 +34,7 @@ PII = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|\+\d[\d\s\-()]{9,}\d|\(?\d{3}\)?[\s-]
 def load_env(path: str | None) -> None:
     from dotenv import load_dotenv
 
-    candidates = [Path(path)] if path else [ROOT / ".env", FALLBACK_ENV]
+    candidates = [Path(path)] if path else [ROOT / ".env"]
     for c in candidates:
         if c.is_file():
             load_dotenv(c, override=False)

@@ -74,6 +74,16 @@ def clean_text(value: Any) -> str:
     return str(value or "").strip().lstrip("'").strip()
 
 
+def dim_text(value: Any) -> str:
+    """Метрика отдаёт литерал "None" для пустого измерения, и clean_text его не чистит.
+
+    Без этой чистки в витрину попадёт кампания с именем «None» — ровно та ловушка, на которой
+    у LIME молча умерла стадия обогащения витрины.
+    """
+    text = clean_text(value)
+    return "" if text in {"None", "null", "--", "(not set)"} else text
+
+
 def parse_int(value: Any) -> int:
     text = clean_text(value).replace(" ", "").replace(",", ".")
     if not text or text in {"--", "null", "None"}:

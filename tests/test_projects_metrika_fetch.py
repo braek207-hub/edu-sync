@@ -166,3 +166,53 @@ def test_params_use_automatic_attribution(calls):
     assert "DirectClickOrder" in calls[0]["dimensions"]
     assert "clientID" not in calls[2]["dimensions"]
     assert calls[2]["filters"] == "ym:s:ecommercePurchases>0"
+
+
+def _traffic_dims(utm_campaign):
+    return [
+        "2026-10-17",
+        {"id": "ad", "name": "Переходы по рекламе"},
+        {"name": "Яндекс: Директ"},
+        {"name": "ya.direct"},
+        {"name": "cpc"},
+        {"name": utm_campaign},
+        {"id": None, "owner": None, "name": None, "direct_id": None},
+    ]
+
+
+def test_traffic_merge_colliding_keys_weighted_and_skip_zero_visits():
+    data = [
+        row(_traffic_dims("703083615-x"), [100.0, 10.0, 2.0]),
+        row(_traffic_dims("703083615"), [300.0, 30.0, 4.0]),
+        row(_traffic_dims("999999999"), [0.0, 50.0, 9.0]),
+    ]
+    rows = mf.parse_traffic(data)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.utm_campaign == "703083615"
+    assert r.visits == 400
+    assert r.bounce_rate == 25.0  # (10*100 + 30*300) / 400
+    assert r.page_depth == 3.5  # (2*100 + 4*300) / 400
+
+
+def test_goal_merge_colliding_keys_sums_reaches():
+    data = [
+        row(_traffic_dims("703083615-x"), [2.0, 0.0]),
+        row(_traffic_dims("703083615"), [3.0, 4.0]),
+    ]
+    rows = mf.parse_goals(data, [1, 2])
+    assert {(r.goal_id, r.reaches) for r in rows} == {(1, 5), (2, 4)}
+
+
+def test_products_merge_colliding_keys_sums():
+    data = [
+        row(["2026-10-17", "None", "None"], [1.0, 10.0]),
+        row(["2026-10-17", "", ""], [2.0, 5.5]),
+    ]
+    rows = mf.parse_products(data)
+    assert [(r.product_id, r.product_name, r.quantity, r.revenue) for r in rows] == [("", "", 3, 15.5)]
+
+
+def test_fetch_goals_dedupes_goal_ids(calls):
+    mf.fetch_goals(1, "t", "2026-10-01", "2026-10-02", [7, 8, 7, 8, 9])
+    assert [p["metrics"] for p in calls] == ["ym:s:goal7reaches,ym:s:goal8reaches,ym:s:goal9reaches"]

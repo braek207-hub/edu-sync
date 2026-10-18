@@ -19,6 +19,7 @@ from .common import (
     SupabaseRest,
     add_date_range_args,
     clean_text,
+    dim_text,
     env_optional,
     env_required,
     metrica_stat_rows,
@@ -56,16 +57,6 @@ METRIC_COLUMNS = [
     "purchased",
     "purchased_uniq",
 ]
-
-
-def dim_text(value: Any) -> str:
-    """Метрика отдаёт литерал "None" для пустого измерения, и clean_text его не чистит.
-
-    Без этой чистки в витрину попадёт кампания с именем «None» — ровно та ловушка, на которой
-    у LIME молча умерла стадия обогащения витрины.
-    """
-    text = clean_text(value)
-    return "" if text in {"None", "null", "--", "(not set)"} else text
 
 
 def strip_banner(value: Any) -> str:
