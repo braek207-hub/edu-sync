@@ -974,12 +974,13 @@ def test_family_with_leads_not_cut(monkeypatch):
     assert out.findings == []
     # Отдельного отказа нет: условие правила не выполнено на семье.
     assert _codes(out) == []
-    # Предложение видит те же лиды семьи, что и автоматическое действие.
+    # В находке — точная семья; широкая (со словоформами) — рядом, для объяснения отказов.
     out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [
         _rule("free03", "propose_word", FREE, CLICKS3)]}))
     f, = out.findings
-    assert (f.details["metrics"]["leads"], f.details["family_queries"]) == (21, 4)
-    assert f.details["conversions"] == 21
+    assert (f.details["metrics"]["leads"], f.details["family_queries"]) == (9, 3)
+    assert f.details["conversions"] == 9
+    assert f.details["broad"] == {"queries": 4, "leads": 21, "clicks": 59}
 
 
 def test_expensive_family_cpl_rule(monkeypatch):
@@ -1105,3 +1106,60 @@ def test_user_phrase_with_special_chars_refused(monkeypatch):
     assert sorted((r["code"], r["object"]) for r in _codes(out)) == [
         ("phrase_invalid", "бесплатно ли учиться?"), ("phrase_invalid", "курсы - бесплатно")]
     assert all("робот пишет только" in r["detail"] for r in _codes(out))
+
+
+# --- раунд правок 3 ---------------------------------------------------------------------
+
+def test_false_stem_does_not_inflate_family(monkeypatch):
+    # Проба ревью: «скачки на лошадях» — не форма слова «скачать». По широкой семье поток
+    # был бы 23 клика, по точной — 3: «≥ 10» держит точная.
+    rows = [_row(1, "высшее образование заочно", 100, 10000, 10),
+            _row(1, "скачать курсы", 3, 300, 0),
+            _row(1, "скачки на лошадях", 20, 2000, 0)]
+    FakeDirect(monkeypatch, [_camp(1)], rows, keywords={"1": []})
+    off = {"phrase_waste": False, "word_zero_conv": False}
+    word = ("query", "has_word", "скачать")
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL], "builtin": off, "rules": [
+        _rule("sk0001", "minus_word", word, ("clicks", "gte", 10))]}))
+    assert out.findings == [] and _codes(out) == []
+    # Порог по силам точной семье — находка, и в ней только точная семья.
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL], "builtin": off, "rules": [
+        _rule("sk0002", "minus_word", word, ("clicks", "gte", 3))]}))
+    f, = out.findings
+    d = f.details
+    assert (d["clicks"], d["queries_sample"], d["family_queries"]) == (3, ["скачать курсы"], 1)
+    assert d["metrics"]["clicks"] == 3
+    assert d["broad"] == {"queries": 2, "leads": 0, "clicks": 23}
+
+
+def test_phrase_covered_by_word_finding_same_run(monkeypatch):
+    FakeDirect(monkeypatch, [_camp(1)], _base(), keywords={"1": []})
+    # Встроенное слово «бесплатно» гасит фразу правила «курсы бесплатно»: она не находка.
+    out = qm.run(_ctx({"rules": [_rule("cour01", "minus_phrase",
+                                       ("query", "has_word", "курсы"), CLICKS3)]}))
+    assert ("word_zero_conv", "бесплатно") in {(f.rule, f.object_id) for f in out.findings}
+    assert "курсы бесплатно" not in _objects(out)
+    assert _codes(out) == [{"code": "covered_by_minus", "object": "курсы бесплатно",
+                            "campaign_id": 1, "rule": "u:cour01", "login": "login1",
+                            "word": "бесплатно", "by": "word_zero_conv"}]
+    # Слово правила гасит встроенную фразу «купить диплом» той же кампании.
+    out = qm.run(_ctx({"rules": [_rule("dipl01", "minus_word",
+                                       ("query", "has_word", "диплом"), CLICKS3)]}))
+    assert ("u:dipl01", "диплом") in {(f.rule, f.object_id) for f in out.findings}
+    assert "купить диплом" not in _objects(out)
+    # Слово-предложение фразу не гасит: человек может его отклонить.
+    out = qm.run(_ctx({"rules": [_rule("dipl02", "propose_word",
+                                       ("query", "has_word", "диплом"), CLICKS3)]}))
+    assert {"диплом", "купить диплом"} <= _objects(out)
+
+
+def test_word_covers_phrase_only_in_its_campaign(monkeypatch):
+    rows = _small(1) + _small(2)
+    FakeDirect(monkeypatch, [_camp(1), _camp(2)], rows, keywords={"1": [], "2": []})
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [
+        _rule("free01", "minus_word", FREE, CLICKS3, campaigns={"only": [1]}),
+        _rule("cour01", "minus_phrase", ("query", "has_word", "курсы"), CLICKS3)]}))
+    # Слово стоит только в кампании 1: там фраза лишняя, в кампании 2 — нет.
+    assert {(f.rule, f.campaign_id, f.object_id) for f in out.findings} == {
+        ("u:free01", 1, "бесплатно"), ("u:cour01", 2, "курсы бесплатно")}
+    assert [(r["code"], r["campaign_id"]) for r in _codes(out)] == [("covered_by_minus", 1)]
