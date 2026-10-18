@@ -1,0 +1,108 @@
+# -*- coding: utf-8 -*-
+from datetime import datetime, timedelta, timezone
+
+from sync.modules.lifecycle import EXPIRE_HOURS, REJECT_SUPPRESS_DAYS, can_transition, reconcile
+from sync.modules.types import Finding, StoredFinding, fingerprint
+
+NOW = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
+MK = "placements"
+
+
+def finding(obj="site.ru", action=None, **kw):
+    base = dict(rule="junk", severity="info", title="t", login="acc", campaign_id=7,
+                campaign_name="К", object_type="site", object_id=obj, details={"clicks": 1},
+                action=action)
+    base.update(kw)
+    return Finding(**base)
+
+
+def stored(f, id=1, status="open", seen_ago=timedelta(hours=1), decided_ago=None):
+    return StoredFinding(**{**f.__dict__}, id=id, status=status,
+                         fingerprint=fingerprint(MK, f), last_seen_at=NOW - seen_ago,
+                         decided_at=None if decided_ago is None else NOW - decided_ago)
+
+
+ACT = {"op": "exclude_site"}
+
+
+def test_fingerprint_format():
+    assert fingerprint(MK, finding()) == "placements:junk:acc:7:site.ru"
+    assert fingerprint(MK, finding(campaign_id=None)) == "placements:junk:acc::site.ru"
+
+
+def test_new_finding_is_inserted():
+    f = finding()
+    r = reconcile(MK, [], [f], NOW)
+    assert r.insert == [f] and not r.touch and not r.resolve and not r.expire
+
+
+def test_duplicate_seen_inserted_once():
+    f = finding()
+    assert reconcile(MK, [], [f, finding()], NOW).insert == [f]
+
+
+def test_open_seen_again_is_touched_not_inserted():
+    f = finding(action=ACT)
+    r = reconcile(MK, [stored(f, id=5)], [f], NOW)
+    assert r.insert == [] and r.touch == [(5, f)] and r.expire == []
+
+
+def test_open_audit_not_seen_is_resolved():
+    r = reconcile(MK, [stored(finding(), id=3)], [], NOW)
+    assert r.resolve == [3] and r.expire == []
+
+
+def test_open_action_not_seen_73h_expires_but_71h_does_not():
+    f = finding(action=ACT)
+    assert EXPIRE_HOURS == 72
+    r = reconcile(MK, [stored(f, id=1, seen_ago=timedelta(hours=73))], [], NOW)
+    assert r.expire == [1] and r.resolve == []
+    r = reconcile(MK, [stored(f, id=1, seen_ago=timedelta(hours=71))], [], NOW)
+    assert r.expire == [] and r.resolve == []
+
+
+def test_non_open_not_seen_is_left_alone():
+    f = finding(action=ACT)
+    for st in ("approved", "applied", "rollback_requested"):
+        r = reconcile(MK, [stored(f, status=st, seen_ago=timedelta(days=9))], [], NOW)
+        assert not r.resolve and not r.expire
+
+
+def test_rejected_suppresses_30_days_then_reinserts():
+    f = finding(action=ACT)
+    assert REJECT_SUPPRESS_DAYS == 30
+    r = reconcile(MK, [stored(f, status="rejected", decided_ago=timedelta(days=10))], [f], NOW)
+    assert r.insert == []
+    r = reconcile(MK, [stored(f, status="rejected", decided_ago=timedelta(days=31))], [f], NOW)
+    assert r.insert == [f]
+
+
+def test_dismissed_never_reinserted():
+    f = finding()
+    r = reconcile(MK, [stored(f, status="dismissed", decided_ago=timedelta(days=400))], [f], NOW)
+    assert r.insert == [] and r.touch == []
+
+
+def test_live_statuses_block_insert():
+    f = finding(action=ACT)
+    for st in ("applied", "approved", "rollback_requested"):
+        r = reconcile(MK, [stored(f, status=st)], [f], NOW)
+        assert r.insert == [], st
+
+
+def test_old_rejected_plus_live_open_touches():
+    f = finding(action=ACT)
+    ex = [stored(f, id=1, status="rejected", decided_ago=timedelta(days=40)),
+          stored(f, id=2, status="open")]
+    r = reconcile(MK, ex, [f], NOW)
+    assert r.insert == [] and r.touch == [(2, f)]
+
+
+def test_can_transition():
+    yes = [("open", "approved"), ("open", "rejected"), ("open", "dismissed"),
+           ("approved", "applied"), ("approved", "failed"), ("applied", "rollback_requested"),
+           ("rollback_requested", "rolled_back"), ("open", "resolved"), ("open", "expired")]
+    no = [("rejected", "approved"), ("applied", "approved"), ("dismissed", "open"),
+          ("open", "applied")]
+    assert all(can_transition(a, b) for a, b in yes)
+    assert not any(can_transition(a, b) for a, b in no)
