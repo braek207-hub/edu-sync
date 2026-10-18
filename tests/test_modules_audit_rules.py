@@ -384,3 +384,42 @@ def test_start_date_unavailable_skips_rule():
     snap = _snap(imp={}, unavailable={"StartDate": "4000"})
     assert _run("on_no_impressions", snap) == []
     assert snap.skipped["on_no_impressions"] == {"поле StartDate не принято API": 1}
+
+
+def _open_ad(rule, obj, cid=1):
+    from datetime import datetime, timezone
+
+    from sync.modules.types import Finding, StoredFinding
+    f = Finding(rule=rule, severity="info", title="t", login=LOGIN, campaign_id=cid,
+                campaign_name="К%d" % cid, object_type="ad", object_id=obj, details={})
+    return StoredFinding(**f.__dict__, id=1, status="open", fingerprint=fingerprint("audit", f),
+                         last_seen_at=datetime(2026, 10, 17, tzinfo=timezone.utc))
+
+
+def test_epk_ads_not_judged_without_v501():
+    # v5 отдаёт объявление ЕПК то как TextAd, то без него: без v501 вердикт по нему зависел бы
+    # от версии API — находка то появлялась бы, то закрывалась
+    from datetime import datetime, timezone
+
+    from sync.modules.lifecycle import reconcile
+    epk = _camp(cid=2, ctype="UNIFIED_CAMPAIGN")
+    ad = _ad(aid=200, cid=2, sitelink=0, href="https://x.ru/")
+    now = datetime(2026, 10, 18, tzinfo=timezone.utc)
+    for rule in ("no_sitelinks", "href_no_utm"):
+        snap = _snap([_camp(), epk], ads=[ad], responsive=None)
+        assert _run(rule, snap) == []
+        assert rule in snap.unverified
+        r = reconcile("audit", [_open_ad(rule, "200", cid=2)], [], now, [LOGIN],
+                      unverified=[(LOGIN, x) for x in snap.unverified])
+        assert r.resolve == [] and r.expire == []
+        # v501 ответил — правило судит ЕПК как обычно
+        snap = _snap([_camp(), epk], ads=[ad], responsive=[])
+        assert [f.object_id for f in _run(rule, snap)] == ["200"]
+        assert rule not in snap.unverified
+
+
+def test_text_campaign_ads_judged_without_v501():
+    # без ЕПК в кабинете недоступность v501 правило не держит
+    snap = _snap(ads=[_ad(sitelink=0)], responsive=None)
+    assert len(_run("no_sitelinks", snap)) == 1
+    assert "no_sitelinks" not in snap.unverified

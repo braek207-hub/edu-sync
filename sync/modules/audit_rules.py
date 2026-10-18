@@ -163,6 +163,19 @@ def _count_unread_ads(snap: Snapshot) -> int:
                if int(ad.get("CampaignId") or 0) in cmap and _texts(ad) is None)
 
 
+def _epk_blind(snap: Snapshot, rule: str) -> bool:
+    """v501 не ответил: объявление ЕПК v5 отдаёт то как TextAd, то без него, и вердикт правила
+    по нему зависел бы от того, какая версия API ответила (находка то есть, то закрыта). Такие
+    объявления правило в этом прогоне не судит, а его открытые находки не закрываются."""
+    if snap.responsive_ads is not None:
+        return False
+    n = sum(1 for camp, _ in _ads(snap) if camp.get("Type") == "UNIFIED_CAMPAIGN")
+    if n:
+        skip(snap, rule, "объявления ЕПК: v501 не ответил, вердикт зависел бы от версии API", n,
+             whole=True)
+    return True
+
+
 def _group_keywords(snap: Snapshot) -> Dict[int, List[dict]]:
     out: Dict[int, List[dict]] = {}
     for k in snap.keywords:
@@ -375,8 +388,11 @@ def href_no_utm(snap: Snapshot, settings: dict) -> List[Finding]:
         skip(snap, "href_no_utm", "require_utm выключен — правило выключено",
              sum(1 for _ in _ads(snap)), whole=True)
         return []
+    blind = _epk_blind(snap, "href_no_utm")
     out = []
     for camp, ad in _ads(snap):
+        if blind and camp.get("Type") == "UNIFIED_CAMPAIGN":
+            continue
         text = ad.get("TextAd")
         if not isinstance(text, dict):
             continue
@@ -458,9 +474,13 @@ def negatives_near_limit(snap: Snapshot, settings: dict) -> List[Finding]:
 
 
 def no_sitelinks(snap: Snapshot, settings: dict) -> List[Finding]:
+    blind = _epk_blind(snap, "no_sitelinks")
     out = []
     for camp, ad in _ads(snap):
+        if blind and camp.get("Type") == "UNIFIED_CAMPAIGN":
+            continue
         text = ad.get("TextAd")
+
         if not isinstance(text, dict):
             # SitelinkSetId читается из TextAd; у комбинаторных его в запросе нет.
             if ad.get("ResponsiveAd") is not None:
