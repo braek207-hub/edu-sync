@@ -714,22 +714,32 @@ def test_preview_rule_id_filters_would_only():
     assert res["refused"] == [{"code": "list_full", "rule": "u:bbb222"}]
 
 
+HELD = {"code": "goal_not_visible", "object": None, "campaign_id": None, "rule": None,
+        "login": "login1", "held": True, "by": "u:ppp111"}
+
+
 def test_preview_truncates_with_full_totals_and_currency():
     kz = DirectAccount("kz1", "tok", "KZT", "X")
     findings = [_uf("s%03d.ru" % i, clicks=1, cost=1.0) for i in range(550)]
     findings += [_uf("kz%d.ru" % i, login="kz1", clicks=2, cost=100.0) for i in range(3)]
+    findings += [_uf("top.ru", clicks=1, cost=50.0)]
     refused = [{"code": "list_full", "rule": "u:aaa111", "object": str(i)} for i in range(350)]
-    out = RunOutput(findings=findings, summary={"refused": ["строка этапа 1"] + refused})
+    out = RunOutput(findings=findings,
+                    summary={"refused": ["строка этапа 1"] + refused + [HELD]})
     st = FakeStore([], previews=[_preview()])
     runner.run_project("lime", store=st, accounts=lambda s: (ACC + [kz], []),
                        modules={"placements": OutModule("placements", out)}, now=NOW,
                        log=lambda m: None, agent_lock_fn=lambda s: None)
     res = _done(st)
     assert len(res["would"]) == 500 and len(res["refused"]) == 300
-    assert res["totals"] == {"would": 553, "clicks": 556, "cost": 550.0, "refused": 350,
+    assert res["totals"] == {"would": 554, "clicks": 557, "cost": 600.0, "refused": 351,
                              "cost_other": {"KZT": 300.0}}
-    # дорогие строки первыми: усечение режет дешёвый хвост
-    assert [w["currency"] for w in res["would"][:3]] == ["KZT"] * 3
+    # курса нет: рубли первыми по убыванию расхода, обрезка режет сначала чужую валюту
+    assert res["would"][0]["object"] == "top.ru"
+    assert {w["currency"] for w in res["would"]} == {"RUB"}
+    # удержание защитой не теряется за обычными отказами
+    assert res["refused"][0] == HELD
+    assert res["refused_by_code"] == {"list_full": 350, "goal_not_visible": 1}
     assert all(isinstance(r, dict) for r in res["refused"])
     assert res["refused_lines"] == ["строка этапа 1"]
     assert res["logins_total"] == 2
@@ -746,7 +756,8 @@ def test_preview_unverified_errors_skipped_shape():
     # выключенное настройкой — не «не проверено»: оно лежит в disabled
     assert res["unverified"] == {"login1": ["u:aaa111", ["u:bbb222", 5]]}
     assert res["disabled"] == ["spam"]
-    assert res["errors"] == ["кабинет login1: отчёт не готов"]
+    # та же форма, что summary.errors скана: Panda разбирает обе одним errorLogins
+    assert res["errors"] == ["login1: отчёт не готов"]
     assert res["skipped"] == ["login1: off"]
     assert res["totals"] == {"would": 0, "clicks": 0, "cost": 0.0, "refused": 0}
 
@@ -809,7 +820,7 @@ def test_run_preview_by_id_runs_only_that_preview():
 
 def test_scan_summary_triples_refused_cap_logins_currency():
     kz = DirectAccount("kz1", "tok", "KZT", "X")
-    refused = [{"code": "list_full", "rule": "u:aaa111"}] * 350
+    refused = ["строка этапа 1"] + [{"code": "list_full", "rule": "u:aaa111"}] * 349 + [HELD]
     out = RunOutput(findings=[_uf("a.ru"), _uf("k.ru", login="kz1")],
                     summary={"refused": refused},
                     unverified=[("login1", "u:aaa111"), ("login1", "u:bbb222", 5),
@@ -821,7 +832,10 @@ def test_scan_summary_triples_refused_cap_logins_currency():
     assert rc == 0 and st.runs[1]["status"] == "ok"
     s = st.runs[1]["summary"]
     assert s["unverified"] == {"login1": ["u:aaa111", ["u:bbb222", 5]], "kz1": [["u:bbb222", 6]]}
-    assert len(s["refused"]) == 300 and s["refused_total"] == 350
+    assert len(s["refused"]) == 300 and s["refused_total"] == 351
+    # удержание поднято наверх, остальной порядок модуля сохранён
+    assert s["refused"][:2] == [HELD, "строка этапа 1"]
+    assert s["refused_by_code"] == {"list_full": 349, "goal_not_visible": 1}
     assert s["logins_total"] == 2
     assert s["currency_by_login"] == {"kz1": "KZT"}
     by_obj = {f.object_id: f for f in st.inserted["placements"]}
@@ -879,3 +893,141 @@ def test_cli_preview_id_runs_preview_not_scan(monkeypatch):
     assert modules_run.main(["--project", "lime", "--preview-id", "12"]) == 0
     assert modules_run.main(["--project", "lime"]) == 0
     assert calls == [("preview", "lime", 12), ("scan", "lime")]
+
+
+# --- раунд правок 1 ---
+
+def test_preview_filed_during_apply_taken_at_end_without_scans():
+    st = FakeStore([_row("queries")], pending=[_stored(1, "approved", key="queries")])
+    st.last_started["queries"] = st.last_ok["queries"] = NOW - timedelta(hours=1)
+
+    class Q(OutModule):
+        def apply(self, ctx, items):
+            st.previews.append(_preview(5, "queries"))
+            return super().apply(ctx, items)
+
+    _go(st, {"queries": Q("queries", RunOutput(findings=[]))})
+    assert _done(st, 5)["totals"]["would"] == 0
+    # сканов не было: превью взял вызов в конце такта
+    assert [r["phase"] for r in st.runs.values()] == ["apply"]
+
+
+def _flaky_finish(st, fail_fallback=False):
+    orig = st.finish_preview
+
+    def finish(pid, status, result, error=None):
+        if pid == 1 and (status == "done" or fail_fallback):
+            raise ValueError("jsonb не принял NaN")
+        return orig(pid, status, result, error=error)
+    st.finish_preview = finish
+
+
+def test_finish_preview_failure_falls_back_to_error_and_queue_goes_on():
+    st = FakeStore([], previews=[_preview(1), _preview(2)])
+    _flaky_finish(st)
+    logs = []
+    runner.run_project("lime", store=st, accounts=lambda s: (ACC, []),
+                       modules={"placements": OutModule("placements", RunOutput(findings=[]))},
+                       now=NOW, log=logs.append, agent_lock_fn=lambda s: None)
+    p1 = st._preview(1)
+    assert p1["status"] == "error" and p1["result"] is None
+    assert p1["error"].startswith("не удалось сохранить результат: ") and "NaN" in p1["error"]
+    assert st._preview(2)["status"] == "done"
+    assert any("NaN" in line for line in logs)
+
+
+def test_finish_preview_fallback_failure_still_continues_queue():
+    st = FakeStore([], previews=[_preview(1), _preview(2)])
+    _flaky_finish(st, fail_fallback=True)
+    logs = []
+    runner.run_project("lime", store=st, accounts=lambda s: (ACC, []),
+                       modules={"placements": OutModule("placements", RunOutput(findings=[]))},
+                       now=NOW, log=logs.append, agent_lock_fn=lambda s: None)
+    # строка останется running и закроется как прерванная; соседнее превью не страдает
+    assert st._preview(1)["status"] == "running"
+    assert st._preview(2)["status"] == "done"
+    assert any("не записан" in line for line in logs)
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def spend(self, minutes):
+        self.t += minutes * 60
+
+
+def _go_clock(st, modules, clock, **kw):
+    return runner.run_project("lime", store=st, accounts=kw.pop("accounts", lambda s: (ACC, [])),
+                              modules=modules, now=NOW, log=lambda m: None,
+                              agent_lock_fn=lambda s: None, clock=clock, **kw)
+
+
+def test_preview_budget_skips_between_modules_after_20_min():
+    clock = _Clock()
+    st = FakeStore([_row("placements"), _row("queries")])
+
+    class Slow(OutModule):
+        def run(self, ctx):
+            if ctx.mode != "report":
+                clock.spend(21)
+                st.previews.append(_preview(1, "queries"))
+            return super().run(ctx)
+
+    _go_clock(st, {"placements": Slow("placements", RunOutput(findings=[])),
+                   "queries": OutModule("queries", RunOutput(findings=[]))}, clock)
+    order = [c for c in st.calls if c[0] in ("finish_run", "finish_preview")]
+    # 21 минута такта прошла: между модулями не берём, в конце — без бюджета
+    assert order == [("finish_run", "placements", "ok"), ("finish_run", "queries", "ok"),
+                     ("finish_preview", 1, "done")]
+
+
+def test_preview_budget_before_apply_and_inside_queue():
+    clock = _Clock()
+    st = FakeStore([_row("placements")], previews=[_preview(1)])
+
+    def slow_accounts(slug):
+        clock.spend(21)
+        return ACC, []
+
+    _go_clock(st, {"placements": OutModule("placements", RunOutput(findings=[]))}, clock,
+              accounts=slow_accounts)
+    order = [c for c in st.calls if c[0] in ("finish_run", "finish_preview")]
+    assert order == [("finish_run", "placements", "ok"), ("finish_preview", 1, "done")]
+
+    # внутри очереди бюджет проверяется перед каждым превью
+    clock = _Clock()
+    st = FakeStore([_row("placements")], previews=[_preview(1), _preview(2, "queries")])
+
+    class SlowPreview(OutModule):
+        def run(self, ctx):
+            if ctx.mode == "report" and ctx.module_key == "placements":
+                clock.spend(21)
+            return super().run(ctx)
+
+    _go_clock(st, {"placements": SlowPreview("placements", RunOutput(findings=[])),
+                   "queries": OutModule("queries", RunOutput(findings=[]))}, clock)
+    order = [c for c in st.calls if c[0] in ("finish_run", "finish_preview")]
+    assert order == [("finish_preview", 1, "done"), ("finish_run", "placements", "ok"),
+                     ("finish_preview", 2, "done")]
+
+
+def test_preview_busy_lock_has_no_budget():
+    clock = _Clock()
+    clock.spend(60)
+    st = FakeStore([_row()], lock=False, previews=[_preview()])
+    _go_clock(st, {"placements": OutModule("placements", RunOutput(findings=[]))}, clock)
+    assert _done(st)["totals"]["would"] == 0
+
+
+def test_cleanup_previews_once_per_tick():
+    st = FakeStore([_row("placements"), _row("queries")])
+    _go(st, {"placements": OutModule("placements", RunOutput(findings=[])),
+             "queries": OutModule("queries", RunOutput(findings=[]))})
+    assert st.calls.count(("cleanup_previews",)) == 1
+    st = FakeStore([_row()], lock=False)
+    _go(st, {"placements": OutModule("placements", RunOutput(findings=[]))})
+    assert st.calls.count(("cleanup_previews",)) == 1

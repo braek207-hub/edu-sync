@@ -481,6 +481,32 @@ def test_claim_preview_skips_row_locked_by_other_connection(live):
         other.close()
 
 
+def test_claim_preview_waits_for_concurrent_claim_of_same_project(live):
+    pid = _queue(live)
+    other = psycopg2.connect(TEST_URL)
+    got = []
+    try:
+        with other.cursor() as cur:
+            # другой claim того же проекта посреди транзакции
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('module_previews:' || %s))",
+                        (SLUG,))
+            t = threading.Thread(target=lambda: got.append(store.claim_preview(SLUG)))
+            t.start()
+            t.join(timeout=1.0)
+            assert t.is_alive() and got == []
+        other.rollback()
+        t.join(timeout=10)
+        assert not t.is_alive() and got[0]["id"] == pid
+        # замок чужого проекта claim не задерживает
+        with other.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('module_previews:' || %s))",
+                        ("__other_slug__",))
+            assert store.claim_preview(SLUG) is None
+        other.rollback()
+    finally:
+        other.close()
+
+
 def test_claim_preview_by_id(live):
     done = _queue(live, status="done")
     live.execute("UPDATE module_previews SET result = '{\"would\": []}', error = 'x' "

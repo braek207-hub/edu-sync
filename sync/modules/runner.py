@@ -6,6 +6,7 @@
 """
 
 import dataclasses
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -39,6 +40,11 @@ PREVIEW_WOULD_MAX = 500
 PREVIEW_REFUSED_MAX = 300
 SUMMARY_REFUSED_MAX = 300
 RUB = "RUB"
+# Юнит живёт 40 минут (см. STALE_RUN_AFTER). Превью до применения и между модулями берём,
+# только пока такт моложе половины: остальное время — применению одобренного и сканам,
+# иначе systemd убьёт процесс посреди скана. Конец такта бюджета не имеет: работы после
+# него нет, а заявка иначе ждала бы следующего такта.
+PREVIEW_TICK_BUDGET = timedelta(minutes=20)
 
 
 def _aware(dt: datetime) -> datetime:
@@ -269,6 +275,23 @@ def _dry_run(slug, store, accts, modules, now, only, log) -> int:
     return rc
 
 
+def _held_first(items: list) -> list:
+    """Удержания защитой (held) — наверх, остальной порядок модуля как был. Panda громко
+    пишет «защита не проверяется» только по элементам с held: обрезка до 300 не должна
+    прятать их за сотнями обычных отказов большого проекта."""
+    return sorted(items, key=lambda x: not (isinstance(x, dict) and x.get("held")))
+
+
+def _by_code(items: Iterable[Any]) -> Dict[str, int]:
+    """Полный счёт отказов по коду: группы в UI не должны заниживаться обрезкой списка."""
+    out: Dict[str, int] = {}
+    for x in items:
+        code = x.get("code") if isinstance(x, dict) else None
+        if code:
+            out[code] = out.get(code, 0) + 1
+    return out
+
+
 def _scan_summary(out: RunOutput, accts, cur: Dict[str, str]) -> dict:
     """summary строки module_runs из итога модуля: unverified по логинам, отказы с пределом."""
     summary = dict(out.summary)
@@ -278,7 +301,8 @@ def _scan_summary(out: RunOutput, accts, cur: Dict[str, str]) -> dict:
     if isinstance(refused, list):
         # by_rule модуль посчитал по полному списку; урезаем только то, что ляжет в jsonb
         summary["refused_total"] = len(refused)
-        summary["refused"] = refused[:SUMMARY_REFUSED_MAX]
+        summary["refused_by_code"] = _by_code(refused)
+        summary["refused"] = _held_first(refused)[:SUMMARY_REFUSED_MAX]
     # «кабинет N из M»: из errors M не вывести — проблемы прочитанного логина тоже там
     summary["logins_total"] = len(accts)
     other = {login: c for login, c in cur.items() if c != RUB}
@@ -315,8 +339,9 @@ def _preview_result(out: RunOutput, rule_id: Optional[str], accts) -> dict:
         key = rule_id if rule_id.startswith(USER_RULE) else USER_RULE + rule_id
         findings = [f for f in findings if f.rule == key]
     rows = [_would_row(f, cur.get(f.login, RUB)) for f in findings]
-    # дорогие первыми: усечение до 500 должно резать дешёвый хвост
-    rows.sort(key=lambda r: -_num(r["metrics"].get("cost")))
+    # дорогие первыми: усечение до 500 должно резать дешёвый хвост. Курса в раннере нет,
+    # тенге численно в разы больше рублей — поэтому сначала рубли, затем прочие валюты
+    rows.sort(key=lambda r: (r["currency"] != RUB, -_num(r["metrics"].get("cost"))))
     cost_other: Dict[str, float] = {}
     rub = 0.0
     for r in rows:
@@ -338,7 +363,8 @@ def _preview_result(out: RunOutput, rule_id: Optional[str], accts) -> dict:
     disabled = list(summary.get("disabled") or [])
     result: Dict[str, Any] = {
         "would": rows[:PREVIEW_WOULD_MAX],
-        "refused": coded[:PREVIEW_REFUSED_MAX],
+        "refused": _held_first(coded)[:PREVIEW_REFUSED_MAX],
+        "refused_by_code": _by_code(coded),
         "by_rule": {k: {"would": v.get("found", 0), "refused": v.get("refused", 0),
                         "over_cap": v.get("over_cap", 0)}
                     for k, v in (summary.get("by_rule") or {}).items() if isinstance(v, dict)},
@@ -346,7 +372,8 @@ def _preview_result(out: RunOutput, rule_id: Optional[str], accts) -> dict:
         # строками про спам, выключенный по умолчанию
         "unverified": _unverified_by_login(out.unverified, skip=disabled),
         "skipped": list(summary.get("skipped") or []),
-        "errors": ["кабинет %s" % e for e in summary.get("errors") or [] if isinstance(e, str)],
+        # та же форма «логин: текст», что summary.errors скана (Panda: errorLogins)
+        "errors": [e for e in summary.get("errors") or [] if isinstance(e, str)],
         "totals": totals,
         "logins_total": len(accts),
     }
@@ -394,23 +421,42 @@ def _one_preview(slug, store, row, get_accounts, get_goals, modules, now, log) -
         status, result = "error", None
         error = str(err) if isinstance(err, _NotRun) else "%s: %s" % (type(err).__name__, err)
         log("[превью %s %s] ошибка: %s" % (pid, mkey, error))
-    if not store.finish_preview(pid, status, result, error=error):
+    try:
+        saved = store.finish_preview(pid, status, result, error=error)
+    except Exception as err:
+        # итог не лёг (обрыв связи, jsonb не принял значение): без второй попытки строка
+        # через 20 минут закрылась бы ложным «прерван», хотя модуль отработал
+        error = "не удалось сохранить результат: %s: %s" % (type(err).__name__, err)
+        log("превью %s: %s" % (pid, error))
+        status = "error"
+        try:
+            saved = store.finish_preview(pid, "error", None, error=error)
+        except Exception as err2:
+            log("превью %s: итог не записан (%s: %s)" % (pid, type(err2).__name__, err2))
+            return False
+    if not saved:
         log("превью %s закрыто как прерванное раньше, итог не записан" % pid)
     return status == "done"
 
 
 def _run_previews(slug, store, accts: Callable[[], Tuple[list, list]], modules, now,
-                  log) -> None:
+                  log, *, cleanup: bool = True,
+                  keep_going: Optional[Callable[[], bool]] = None) -> None:
     """Вся очередь превью проекта. accts — функция () -> (кабинеты, почему нет): при занятом
     замке кабинеты читаются, только когда превью взято (у EDU это запрос в Директ).
+    keep_going проверяется перед каждым превью: бюджет такта (PREVIEW_TICK_BUDGET).
     Сбой базы здесь не роняет такт: превью останется running и закроется как прерванное."""
-    try:
-        store.cleanup_previews(slug)
-    except Exception as err:
-        log("превью: старые не удалены (%s: %s)" % (type(err).__name__, err))
+    if cleanup:
+        try:
+            store.cleanup_previews(slug)
+        except Exception as err:
+            log("превью: старые не удалены (%s: %s)" % (type(err).__name__, err))
     goals = _memo(lambda: store.project_lead_goals(slug))
     try:
         while True:
+            if keep_going is not None and not keep_going():
+                log("превью: бюджет такта исчерпан, очередь возьмёт конец такта")
+                return
             row = store.claim_preview(slug)
             if row is None:
                 return
@@ -433,15 +479,17 @@ def run_preview(slug: str, preview_id: int, *, store=_store, accounts=_accounts.
 
 def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, modules=MODULES,
                 now: datetime, only: Optional[str] = None, dry_run: bool = False,
-                log=print, agent_lock_fn=agent_lock) -> int:
+                log=print, agent_lock_fn=agent_lock,
+                clock: Callable[[], float] = time.monotonic) -> int:
     """Код 1, если упал хоть один модуль; занятый замок — не ошибка."""
     if dry_run:
         accts, _why = accounts(slug)
         return _dry_run(slug, store, accts, modules, now, only, log)
+    started = clock()
     with store.hold_project_lock(slug) as got:
         if not got:
             # превью только читает: идущий прогон проекта ему не помеха, а ждать его конца
-            # человеку незачем
+            # человеку незачем. Бюджета нет: применения и сканов в этом процессе не будет
             _run_previews(slug, store, _memo(lambda: accounts(slug)), modules, now, log)
             log("проект %s: уже идёт" % slug)
             return 0
@@ -456,9 +504,16 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
             log("модуль %s выключен" % only)
         goals = store.project_lead_goals(slug)
 
-        def previews() -> None:
-            _run_previews(slug, store, lambda: (accts, why), modules, now, log)
-        previews()
+        cleaned = False
+
+        def previews(budget: bool) -> None:
+            nonlocal cleaned
+            within = (lambda: clock() - started < PREVIEW_TICK_BUDGET.total_seconds()) \
+                if budget else None
+            _run_previews(slug, store, lambda: (accts, why), modules, now, log,
+                          cleanup=not cleaned, keep_going=within)
+            cleaned = True
+        previews(budget=True)
         lock_line = agent_lock_fn(slug)
         rc = 1 if _apply_phase(slug, store, rows, modules, accts, now, log, lock_line) else 0
         scanned_any = False
@@ -470,7 +525,7 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 continue
             # заявка, поданная во время скана, не ждёт следующего такта
             if scanned_any:
-                previews()
+                previews(budget=True)
             scanned_any = True
             run_id = store.start_run(slug, mkey, mode)
             module = modules.get(mkey)
@@ -514,6 +569,6 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 text = "%s: %s" % (type(err).__name__, err)
                 log("[%s] ошибка: %s" % (mkey, text))
                 store.finish_run(run_id, "error", summary, error=text)
-        if scanned_any:
-            previews()
+        # и без сканов: заявка, поданная во время применения, иначе ждала бы следующего такта
+        previews(budget=False)
         return rc

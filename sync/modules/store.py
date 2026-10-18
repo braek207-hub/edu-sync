@@ -293,14 +293,20 @@ def claim_preview(slug: str, preview_id: Optional[int] = None) -> Optional[dict]
 
     Одна транзакция: зависшие running закрываются как прерванные; из нескольких queued
     одного модуля живо только последнее, старые — error «заменено новым»; берётся старейшее
-    из оставшихся у модулей, где ничего не идёт («running дожидается»). SKIP LOCKED: два
-    раннера проекта (под замком и без) одну строку не получат оба.
+    из оставшихся у модулей, где ничего не идёт («running дожидается»).
+
+    Выдача по проекту сериализована транзакционным advisory-замком: без него в READ
+    COMMITTED второй claim, начатый до коммита первого, видит его строку ещё queued, а
+    свежую заявку того же модуля — уже вставленной, и берёт её: два running одного модуля.
+    Замок транзакционный, поэтому снимается коммитом и переживает транзакционный пулер.
+    SKIP LOCKED остаётся страховкой.
 
     preview_id — ручной прогон одного превью (modules_run --preview-id): берётся в любом
     статусе, кроме идущего, без замены соседей.
     """
     stale = PREVIEW_STALE_AFTER.total_seconds()
     with db.get_connection() as conn, _dict_cursor(conn) as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext('module_previews:' || %s))", (slug,))
         cur.execute(
             "UPDATE module_previews SET status = 'error', finished_at = now(), "
             "error = 'прерван: ' || %s || ' мин без хода' "
