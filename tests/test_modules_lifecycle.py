@@ -215,3 +215,33 @@ def test_findings_without_action_suppressed_by_fingerprint_only():
     other = finding(rule="b")
     assert reconcile(MK, [old], [other], NOW).insert == [other]
     assert reconcile(MK, [old], [finding(rule="a")], NOW).insert == []
+
+
+def test_live_same_action_other_rule_blocks_insert_and_touches():
+    a = finding(action=ACT, rule="a")
+    b = finding(action=ACT, rule="b")
+    old = stored(a, id=3, seen_ago=timedelta(hours=100))
+    r = reconcile(MK, [old], [b], NOW)
+    assert r.insert == [] and r.touch == [(3, b)] and r.expire == [] and r.resolve == []
+
+
+def test_live_applied_same_action_goes_to_seen_live():
+    a = finding(action=ACT, rule="a")
+    old = stored(a, id=4, status="applied", seen_ago=timedelta(hours=100))
+    r = reconcile(MK, [old], [finding(action=ACT, rule="b")], NOW)
+    assert r.insert == [] and r.seen_live == [4] and r.touch == []
+
+
+def test_live_seen_under_both_rules_deduped():
+    a = finding(action=ACT, rule="a")
+    old = stored(a, id=3)
+    r = reconcile(MK, [old], [a, finding(action=ACT, rule="b")], NOW)
+    assert [t[0] for t in r.touch] == [3] and r.insert == []
+    old = stored(a, id=4, status="applied")
+    r = reconcile(MK, [old], [a, finding(action=ACT, rule="b")], NOW)
+    assert r.seen_live == [4]
+
+
+def test_two_seen_with_one_action_insert_one():
+    f1, f2 = finding(action=ACT, rule="a"), finding(action=ACT, rule="b")
+    assert reconcile(MK, [], [f1, f2], NOW).insert == [f1]

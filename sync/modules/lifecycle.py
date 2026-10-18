@@ -81,6 +81,7 @@ def reconcile(module_key: str, existing: List[StoredFinding],
 
     out = Reconciled()
     seen_fps = set()
+    inserted_actions = set()
     for f in seen:
         fp = fingerprint(module_key, f)
         if fp in seen_fps:
@@ -97,12 +98,32 @@ def reconcile(module_key: str, existing: List[StoredFinding],
                 out.seen_live.append(live[0].id)
             continue
         akey = _action_key(f)
+        if akey is not None:
+            if akey in inserted_actions:
+                continue
+            # то же действие уже живёт под другим правилом: второй записи в очереди не нужно,
+            # а в auto обе применились бы к одному элементу Директа
+            live_a = [s for s in by_action.get(akey, []) if s.status in LIVE_STATUSES]
+            if live_a:
+                a = next((s for s in live_a if s.status == "open"), live_a[0])
+                seen_fps.add(a.fingerprint)
+                if a.status == "open":
+                    out.touch.append((a.id, f))
+                else:
+                    out.seen_live.append(a.id)
+                continue
         blockers = rows + (by_action.get(akey, []) if akey is not None else [])
         if any(s.status == "dismissed" for s in blockers):
             continue
         if any(_suppressed(s, now) for s in blockers):
             continue
         out.insert.append(f)
+        if akey is not None:
+            inserted_actions.add(akey)
+
+    # одну и ту же находку могли подтвердить и по своему fingerprint, и по действию
+    out.touch = list({fid: (fid, f) for fid, f in reversed(out.touch)}.values())[::-1]
+    out.seen_live = list(dict.fromkeys(out.seen_live))
 
     for s in existing:
         if s.status != "open" or s.fingerprint in seen_fps:
