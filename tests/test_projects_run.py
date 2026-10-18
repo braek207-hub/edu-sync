@@ -168,6 +168,13 @@ class World:
         return [e for e in self.events("fetch") if fn is None or e[1] == fn]
 
 
+@pytest.fixture(autouse=True)
+def _no_real_revalidate(monkeypatch):
+    # Конец прогона зовёт сброс кэша: без env он ничего не шлёт, даже если у разработчика они заданы.
+    monkeypatch.delenv("PANDA_BI_URL", raising=False)
+    monkeypatch.delenv("CRON_SECRET", raising=False)
+
+
 @pytest.fixture
 def world(monkeypatch):
     holder = {}
