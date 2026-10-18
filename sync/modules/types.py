@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 from sync.modules.accounts import DirectAccount
 
@@ -55,6 +55,11 @@ class Context:
     accounts: List[DirectAccount]
     now: datetime
     log: Callable[[str], None]
+    # Цели-лиды проекта (store.project_lead_goals): вторая ступень цепочки leads.lead_goals.
+    project_goals: List[int] = field(default_factory=list)
+    # Ход прогона {"step", "logins_done", "logins_total"} после каждого логина: пробный
+    # прогон показывает его человеку, обычный скан — никому.
+    progress: Callable[[dict], None] = lambda _p: None
 
 
 @dataclass
@@ -63,6 +68,7 @@ class RunOutput:
     summary: dict = field(default_factory=dict)
     # None — прочитаны все кабинеты ctx; иначе только эти логины (остальные не закрываем)
     scanned_logins: Optional[List[str]] = None
-    # (логин, правило), которые прогон не проверил: вход правила не прочитан или правило
-    # выключено настройкой. Их живые находки reconcile не трогает: молчание — не «исправлено».
-    unverified: List[Tuple[str, str]] = field(default_factory=list)
+    # (логин, правило) или (логин, правило, кампания), которые прогон не проверил: вход
+    # правила не прочитан, правило выключено настройкой или цель не видна кампании (тройка).
+    # Их живые находки reconcile не трогает: молчание — не «исправлено».
+    unverified: List[Union[Tuple[str, str], Tuple[str, str, int]]] = field(default_factory=list)

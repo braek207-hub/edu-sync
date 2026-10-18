@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Ворота такта и план запретов: строки отчёта → что писать в каждую кампанию."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from sync.placements.classify import CUT_VERDICTS, classify, normalize
 from sync.placements.direct import (CLEANABLE_STATES, CLEANABLE_TYPES,
@@ -19,6 +19,11 @@ TOP_N = 30
 # рычаг. Считается от лимита ТИПА кампании — у медийной он вдесятеро короче.
 FILL_SHARE = 0.9
 FILL_CEILING = int(MAX_EXCLUDED_SITES * FILL_SHARE)
+
+
+def ceiling_for(limit: int, fill_ceiling: int = FILL_CEILING) -> int:
+    """Сколько элементов списка запретов вправе занять робот при лимите типа кампании."""
+    return fill_ceiling if limit >= MAX_EXCLUDED_SITES else int(limit * FILL_SHARE)
 
 
 def site_is_valid(site: str):
@@ -60,11 +65,19 @@ def plan_account(rows: List[Dict[str, Any]],
                  allow_prefix=None,
                  overrides: Optional[Dict[str, Any]] = None,
                  always_block=None,
-                 spam: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+                 spam: Optional[Dict[str, str]] = None,
+                 cut_verdicts=CUT_VERDICTS,
+                 guard: Optional[Callable[[str, str, str], Optional[dict]]] = None
+                 ) -> Dict[str, Any]:
     """Строки отчёта + кампании кабинета → план запретов по кампаниям.
 
     Возвращает действия (что писать), отказы (почему не пишем) и сводку
     по вердиктам за день — она едет в журнал и в отчёт человеку.
+
+    cut_verdicts — вердикты, которые режутся: выключенная категория словаря
+    остаётся вердиктом, но не режется. guard(площадка, кампания, вердикт) —
+    защита человека (правило protect, «Никогда не закрывать»): вернула отказ —
+    площадка в этой кампании не пишется, отказ уходит в plan["guarded"].
     """
     kwargs = {}
     if allow_exact is not None:
@@ -127,6 +140,7 @@ def plan_account(rows: List[Dict[str, Any]],
 
     actions: List[Dict[str, Any]] = []
     refused: List[Dict[str, Any]] = []
+    guarded: List[dict] = []
     # Имена в окне ворот, которые словарь оставил обычными сайтами: их и
     # показываем модели. Спрашивать про весь день незачем — за воротами
     # площадка всё равно не будет запрещена этим тактом.
@@ -191,6 +205,12 @@ def plan_account(rows: List[Dict[str, Any]],
         for site, (verdict, why) in pinned.items():
             if site in known:
                 continue
+            held = guard(site, cid, verdict) if guard else None
+            if held:
+                guarded.append(held)
+                # Отказ один: ниже словарь увидел бы ту же площадку с тем же вердиктом.
+                known.add(site)
+                continue
             ok, bad = site_is_valid(site)
             if not ok:
                 refused.append({"campaign_id": cid, "placement": site,
@@ -206,9 +226,13 @@ def plan_account(rows: List[Dict[str, Any]],
             if site in known:
                 continue  # уже взят обязательным списком выше
             verdict, why = verdicts[site]
-            if verdict not in CUT_VERDICTS:
+            if verdict not in cut_verdicts:
                 if verdict == "site":
                     candidates[site] = max(candidates.get(site, 0), clicks)
+                continue
+            held = guard(site, cid, verdict) if guard else None
+            if held:
+                guarded.append(held)
                 continue
             ok, bad = site_is_valid(site)
             if not ok:
@@ -223,8 +247,7 @@ def plan_account(rows: List[Dict[str, Any]],
             continue
 
         limit = sites_limit(campaign.get("Type"))
-        ceiling = (fill_ceiling if limit >= MAX_EXCLUDED_SITES
-                   else int(limit * FILL_SHARE))
+        ceiling = ceiling_for(limit, fill_ceiling)
         room = ceiling - len(existing)
         if room <= 0:
             refused.append({
@@ -256,6 +279,7 @@ def plan_account(rows: List[Dict[str, Any]],
     return {
         "actions": actions,
         "refused": refused,
+        "guarded": guarded,
         "candidates": [site for site, _ in
                        sorted(candidates.items(), key=lambda kv: -kv[1])],
         "summary": summary,

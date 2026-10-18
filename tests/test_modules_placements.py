@@ -19,10 +19,12 @@ ACC = DirectAccount("login1", "tok", "RUB", "X")
 SITES = ["com.aaa.bbb", "com.ccc.ddd", "com.eee.fff"]
 
 
-def _ctx(settings=None, accounts=(ACC,)):
+def _ctx(settings=None, accounts=(ACC,), project_goals=(), progress=None):
+    extra = {"progress": progress} if progress else {}
     return Context(slug="edunetwork", module_key="placements", mode="report",
                    settings=settings_for("placements", settings),
-                   accounts=list(accounts), now=NOW, log=lambda m: None)
+                   accounts=list(accounts), now=NOW, log=lambda m: None,
+                   project_goals=list(project_goals), **extra)
 
 
 def _camp(cid, items=(), state="ON", ctype="TEXT_CAMPAIGN"):
@@ -37,16 +39,24 @@ def _rows(cids, sites=SITES):
 
 @pytest.fixture
 def api(monkeypatch):
-    state = {"campaigns": [_camp(1), _camp(2)], "rows": _rows([1, 2]), "today_calls": 0}
+    state = {"campaigns": [_camp(1), _camp(2)], "rows": _rows([1, 2]), "today_calls": 0,
+             "window": {}, "window_calls": []}
 
     def today(token, login):
         state["today_calls"] += 1
         return state["rows"]
 
+    def window(token, login, days, goals):
+        state["window_calls"].append((login, days, list(goals)))
+        if isinstance(state["window"], Exception):
+            raise state["window"]
+        return state["window"].get(days, [])
+
     monkeypatch.setattr(direct, "campaigns", lambda t, l: state["campaigns"])
     monkeypatch.setattr(direct, "placements_today", today)
     monkeypatch.setattr(direct, "campaign_goals", lambda t, l: {})
     monkeypatch.setattr(direct, "placements_with_goals", lambda t, l, g: [])
+    monkeypatch.setattr(direct, "placements_window", window)
     return state
 
 
@@ -60,7 +70,9 @@ def test_run_maps_plan_actions_to_findings(api):
                             "site": f.object_id}
         assert fingerprint("placements", f) == "placements:app:login1:%d:%s" % (
             f.campaign_id, f.object_id)
-        assert set(f.details) == {"clicks", "cost", "reason", "fill_after"}
+        # ключи этапа 1 на месте (по ним рисуются старые находки), плюс снимок этапа 2
+        assert set(f.details) == {"clicks", "cost", "reason", "fill_after", "rule",
+                                  "matched", "window", "metrics", "list_fill"}
 
 
 def test_login_without_live_campaigns_orders_no_report(api):
@@ -79,7 +91,7 @@ def test_settings_feed_planner(api, monkeypatch):
         return real(rows, campaigns, **kw)
 
     monkeypatch.setattr(planner, "plan_account", spy)
-    monkeypatch.setattr(pm.spam, "suspicious_sites", lambda w, g: {"spam.ru": "аномалия"})
+    monkeypatch.setattr(pm.spam, "suspicious_sites", lambda w, g, **kw: {"spam.ru": "аномалия"})
     monkeypatch.setattr(direct, "campaign_goals", lambda t, l: {"1": 7})
     out = pm.run(_ctx({"top_n": 5, "always_block": ["Mail.ru"], "spam_rule": True,
                        "extra_allow": ["com.aaa.bbb"]}))
@@ -353,3 +365,316 @@ def test_second_finding_same_site_same_campaign_is_a_named_duplicate(monkeypatch
     assert res[1].ok
     assert not res[2].ok and "дубль" in res[2].error
     assert fake.writes == [(1, [SITES[0]])]
+
+
+# --- этап 2: правила, словарь, пороги спама ---------------------------------------
+
+RID = "aaa111"
+G = 111
+
+
+def _rule(conds, rid=RID, action="block", window=0, where="seen", only=(), except_=(),
+          enabled=True):
+    return {"id": rid, "name": "Правило %s" % rid, "enabled": enabled, "action": action,
+            "window": window, "where": where,
+            "campaigns": {"only": list(only), "except": list(except_)},
+            "conditions": [{"field": f, "op": o, "value": v} for f, o, v in conds]}
+
+
+def _day(cid, site, clicks, cost, impressions=None):
+    return {"campaign_id": str(cid), "placement": site, "clicks": clicks, "cost": cost,
+            "impressions": clicks * 10 if impressions is None else impressions}
+
+
+def _win(cid, site, clicks, cost, leads=None, impressions=None):
+    row = _day(cid, site, clicks, cost, impressions)
+    row["conversions"] = {} if leads is None else {G: leads}
+    return row
+
+
+def _codes(out):
+    return [r for r in out.summary["refused"] if isinstance(r, dict)]
+
+
+def _refused(out, code, **match):
+    return [r for r in _codes(out)
+            if r["code"] == code and all(r.get(k) == v for k, v in match.items())]
+
+
+def test_disabled_category_reaches_user_rule(api):
+    api["rows"] = [_day(1, "games.example.ru", 12, 30.0)]
+    rule = _rule([("category", "is", "game"), ("clicks", "gte", 10)])
+    out = pm.run(_ctx({"dictionary": {"categories": ["app", "dsp", "junk"]},
+                       "rules": [rule]}))
+    assert [(f.rule, f.campaign_id, f.object_id) for f in out.findings] == [
+        ("u:" + RID, 1, "games.example.ru")]
+    assert fingerprint("placements", out.findings[0]) == \
+        "placements:u:%s:login1:1:games.example.ru" % RID
+    # выключенная категория не закрывает свои прошлые находки
+    assert ("login1", "game") in out.unverified
+    assert out.summary["disabled"] == ["game", "spam"]
+
+    # включённая категория действует раньше правила, правило — «сработало также»
+    on = pm.run(_ctx({"rules": [rule]}))
+    assert [f.rule for f in on.findings] == ["game"]
+    assert [m["id"] for m in on.findings[0].details["matched"]] == ["game", "u:" + RID]
+
+
+def test_extra_allow_beats_stat_rule(api):
+    api["rows"] = [_day(1, "good.example.ru", 50, 300.0)]
+    out = pm.run(_ctx({"extra_allow": ["Good.example.ru"],
+                       "rules": [_rule([("clicks", "gte", 10)])]}))
+    assert out.findings == []
+    assert _refused(out, "in_never_list", object="good.example.ru", campaign_id=1,
+                    rule="u:" + RID)
+
+
+def test_system_allowlist_beats_rule_by_stats(api):
+    api["rows"] = []
+    api["window"] = {7: [_win(1, "avito.ru", 100, 1000.0, leads=30),
+                         _win(1, "plain.example.ru", 1000, 900.0, leads=10)]}
+    out = pm.run(_ctx({"rules": [_rule([("cr_x", "gte", 3)], window=7)]},
+                      project_goals=[G]))
+    assert out.findings == []
+    assert _refused(out, "system_allowlist", object="avito.ru", campaign_id=1,
+                    rule="u:" + RID)
+    assert api["window_calls"] == [("login1", 7, [G])]
+
+
+def test_max_per_run_keeps_most_expensive(api):
+    sites = {"alpha.ru": 10.0, "beta.ru": 50.0, "gamma.ru": 30.0, "delta.ru": 40.0,
+             "omega.ru": 20.0}
+    api["rows"] = [_day(1, s, 1, c) for s, c in sites.items()]
+    out = pm.run(_ctx({"max_per_run": 2, "rules": [_rule([("cost", "gte", 1)])]}))
+    assert [f.object_id for f in out.findings] == ["beta.ru", "delta.ru"]
+    assert out.summary["by_rule"]["u:" + RID] == {"found": 2, "refused": 0, "over_cap": 3}
+    assert out.summary["over_cap"] == {"u:" + RID: 3}
+
+
+def test_max_per_run_does_not_cap_builtins(api):
+    # 6 находок словаря при лимите 1: лимит только для правил пользователя
+    out = pm.run(_ctx({"max_per_run": 1}))
+    assert len(out.findings) == 6 and {f.rule for f in out.findings} == {"app"}
+
+
+def test_account_rule_closes_all_eligible_campaigns(api):
+    api["campaigns"] = [_camp(1), _camp(2), _camp(3, state="SUSPENDED"),
+                        _camp(4, items=["Bad.example.ru"]),
+                        _camp(5, ctype="SMART_CAMPAIGN")]
+    api["rows"] = []
+    api["window"] = {7: [_win(1, "bad.example.ru", 20, 100.0)]}
+    rule = _rule([("name", "equals", "bad.example.ru"), ("clicks", "gte", 10)],
+                 window=7, where="account")
+    out = pm.run(_ctx({"rules": [rule]}))
+    assert sorted(f.campaign_id for f in out.findings) == [1, 2]
+    assert {f.rule for f in out.findings} == {"u:" + RID}
+    # без целей-лидов отчёт всё равно заказан — правилу по кликам цели не нужны
+    assert api["window_calls"] == [("login1", 7, [])]
+
+    only = pm.run(_ctx({"rules": [dict(rule, campaigns={"only": [], "except": [2]})]}))
+    assert [f.campaign_id for f in only.findings] == [1]
+
+
+def test_lead_rule_without_visible_goal_is_unverified(api):
+    api["rows"] = []
+    api["window"] = {7: [_win(1, "x1.example.ru", 10, 100.0, leads=0),
+                         _win(1, "lead.example.ru", 10, 50.0, leads=3),
+                         _win(2, "x2.example.ru", 10, 100.0, leads=0)]}
+    out = pm.run(_ctx({"rules": [_rule([("leads", "eq", 0), ("clicks", "gte", 5)],
+                                       window=7)]}, project_goals=[G]))
+    assert [(f.campaign_id, f.object_id) for f in out.findings] == [(1, "x1.example.ru")]
+    assert ("login1", "u:" + RID, 2) in out.unverified
+    assert _refused(out, "goal_not_visible", campaign_id=2, rule="u:" + RID, object=None)
+
+
+def test_lead_rule_without_lead_goals_refused_for_login(api):
+    api["rows"] = []
+    api["window"] = {7: [_win(1, "x1.example.ru", 10, 100.0)]}
+    out = pm.run(_ctx({"rules": [_rule([("leads", "eq", 0)], window=7)]}))
+    assert out.findings == []
+    assert ("login1", "u:" + RID) in out.unverified
+    assert _refused(out, "no_lead_goals", rule="u:" + RID, campaign_id=None)
+
+
+def test_non_rub_cabinet_refuses_money_rule(api):
+    api["rows"] = [_day(1, "beta.ru", 10, 500.0)]
+    kzt = DirectAccount("login1", "tok", "KZT", "X")
+    out = pm.run(_ctx({"rules": [_rule([("cost", "gte", 100)])]}, accounts=(kzt,)))
+    assert out.findings == []
+    assert _refused(out, "non_rub_money", rule="u:" + RID)
+    assert ("login1", "u:" + RID) in out.unverified
+
+
+def test_user_finding_details(api):
+    api["rows"] = []
+    api["window"] = {7: [_win(1, "beta.ru", 20, 200.0, leads=2, impressions=400)]}
+    out = pm.run(_ctx({"rules": [_rule([("clicks", "gte", 10)], action="propose",
+                                       window=7)]}, project_goals=[G]))
+    (f,) = out.findings
+    assert f.rule == "u:" + RID
+    assert f.action == {"op": "exclude_site", "campaign_id": 1, "site": "beta.ru"}
+    d = f.details
+    assert {"rule", "matched", "window", "metrics", "list_fill"} <= set(d)
+    assert d["propose"] is True
+    assert d["rule"] == {"id": "u:" + RID, "name": "Правило " + RID, "action": "propose",
+                         "window": 7, "where": "seen",
+                         "conditions": [{"field": "clicks", "op": "gte", "value": 10}]}
+    assert d["matched"] == [{"id": "u:" + RID, "name": "Правило " + RID,
+                             "conds": [{"field": "clicks", "op": "gte", "value": 10,
+                                        "actual": 20.0}]}]
+    # NOW 09:00 UTC = 12:00 МСК 18.10; LAST_7_DAYS сегодня не включает
+    assert d["window"] == {"from": "2026-10-11", "to": "2026-10-17"}
+    assert d["metrics"] == {"clicks": 20, "cost": 200.0, "impressions": 400, "leads": 2,
+                            "cr": 10.0, "cpl": 100.0, "account_cr": 10.0,
+                            "account_cpl": 100.0}
+    assert d["list_fill"] == {"before": 0, "limit": direct.MAX_EXCLUDED_SITES}
+
+
+def test_block_rule_has_no_propose_flag(api):
+    api["rows"] = [_day(1, "beta.ru", 20, 200.0)]
+    (f,) = pm.run(_ctx({"rules": [_rule([("clicks", "gte", 10)])]})).findings
+    assert "propose" not in f.details
+    assert f.details["window"] == {"from": "2026-10-18", "to": "2026-10-18"}
+
+
+def test_builtin_app_fingerprint_is_stage_one(api):
+    # регрессия перенесённых находок этапа 1: правило рядом не меняет fingerprint
+    rule = _rule([("name", "starts", "com.")])
+    for settings in (None, {"rules": [rule]}):
+        out = pm.run(_ctx(settings))
+        assert sorted(fingerprint("placements", f) for f in out.findings) == sorted(
+            "placements:app:login1:%d:%s" % (c, s) for c in (1, 2) for s in SITES)
+    f = out.findings[0]
+    assert f.details["rule"] == {"id": "app", "name": "Словарь мусора", "builtin": True,
+                                 "params": {"categories": ["app", "dsp", "game", "junk"],
+                                            "top_n": 30}}
+    assert [m["id"] for m in f.details["matched"]] == ["app", "u:" + RID]
+
+
+def _spam_week(monkeypatch):
+    monkeypatch.setattr(direct, "campaign_goals", lambda t, l: {"1": 7})
+    monkeypatch.setattr(direct, "placements_with_goals", lambda t, l, g: [
+        {"campaign_id": "1", "placement": "lucky.example.ru", "clicks": 20,
+         "conversions": {7: 4}},
+        {"campaign_id": "1", "placement": "other.example.ru", "clicks": 400,
+         "conversions": {7: 4}}])
+
+
+def test_spam_thresholds_from_settings(api, monkeypatch):
+    _spam_week(monkeypatch)
+    default = pm.run(_ctx({"spam_rule": True}))
+    assert not [f for f in default.findings if f.rule == "spam"]
+    low = pm.run(_ctx({"spam_rule": True, "spam": {"min_leads": 3}}))
+    spam_f = [f for f in low.findings if f.rule == "spam"]
+    assert sorted(f.campaign_id for f in spam_f) == [1, 2]
+    assert {f.object_id for f in spam_f} == {"lucky.example.ru"}
+    assert spam_f[0].details["rule"]["params"]["min_leads"] == 3
+
+
+def test_suspicious_sites_threshold_kwargs():
+    rows = [{"campaign_id": "1", "placement": "lucky.example.ru", "clicks": 20,
+             "conversions": {7: 4}},
+            {"campaign_id": "1", "placement": "other.example.ru", "clicks": 400,
+             "conversions": {7: 4}}]
+    assert pm.spam.suspicious_sites(rows, {"1": 7}) == {}
+    assert set(pm.spam.suspicious_sites(rows, {"1": 7}, min_leads=3)) == {"lucky.example.ru"}
+    # CR площадки 20 %: при пороге 25 % уже не спам
+    assert pm.spam.suspicious_sites(rows, {"1": 7}, min_leads=3, min_cr=25) == {}
+
+
+def test_spam_on_lead_goals_shares_rule_report(api, monkeypatch):
+    called = []
+    monkeypatch.setattr(direct, "campaign_goals", lambda t, l: called.append(1) or {"1": 7})
+    api["window"] = {7: [_win(1, "lucky.example.ru", 20, 10.0, leads=6),
+                         _win(1, "other.example.ru", 400, 10.0, leads=4)]}
+    out = pm.run(_ctx({"spam_rule": True, "spam": {"goals": "leads"},
+                       "rules": [_rule([("clicks", "gte", 1000)], window=7)]},
+                      project_goals=[G]))
+    assert called == []
+    assert api["window_calls"] == [("login1", 7, [G])]
+    assert {f.object_id for f in out.findings if f.rule == "spam"} == {"lucky.example.ru"}
+
+
+def test_user_protect_beats_dictionary_and_spam(api, monkeypatch):
+    monkeypatch.setattr(pm.spam, "suspicious_sites",
+                        lambda w, g, **kw: {"spam.example.ru": "аномалия"})
+    monkeypatch.setattr(direct, "campaign_goals", lambda t, l: {"1": 7})
+    protect = _rule([("name", "equals", SITES[0])], rid="ppp111", action="protect")
+    guard_spam = _rule([("name", "equals", "spam.example.ru")], rid="ppp222",
+                       action="protect", only=[1])
+    out = pm.run(_ctx({"spam_rule": True, "rules": [protect, guard_spam]}))
+    objs = {(f.campaign_id, f.object_id) for f in out.findings}
+    assert not {o for o in objs if o[1] == SITES[0]}
+    # защита only=[1] держит спам только в кампании 1
+    assert (2, "spam.example.ru") in objs and (1, "spam.example.ru") not in objs
+    assert _refused(out, "user_protect", rule="app", object=SITES[0], by="u:ppp111")
+    assert _refused(out, "user_protect", rule="spam", campaign_id=1, by="u:ppp222")
+    assert out.summary["by_rule"]["u:ppp111"]["found"] == 2
+
+
+def test_unverifiable_protect_holds_row(api):
+    api["rows"] = []
+    api["window"] = {7: [_win(1, "beta.ru", 20, 200.0, leads=0)]}
+    protect = _rule([("leads", "gte", 1)], rid="ppp111", action="protect", window=7)
+    block = _rule([("clicks", "gte", 10)], window=7)
+    out = pm.run(_ctx({"rules": [protect, block]}, project_goals=[G]))
+    assert out.findings == []
+    assert ("login1", "u:" + RID, 1) in out.unverified
+    assert _refused(out, "goal_not_visible", rule="u:" + RID, by="u:ppp111", held=True)
+
+
+def test_protect_report_failure_fails_login(api):
+    api["window"] = direct.DirectError("отчёт не готов")
+    protect = _rule([("clicks", "gte", 10)], rid="ppp111", action="protect", window=7)
+    accs = (ACC, DirectAccount("login2", "t", "RUB", "Y"))
+    with pytest.raises(RuntimeError, match="защит правил"):
+        pm.run(_ctx({"rules": [protect]}, accounts=accs))
+
+
+def test_rule_report_failure_keeps_builtins_but_not_scanned(api):
+    api["window"] = direct.DirectError("отчёт не готов")
+    out = pm.run(_ctx({"rules": [_rule([("clicks", "gte", 10)], window=30)]}))
+    assert len(out.findings) == 6 and out.scanned_logins == []
+    assert _refused(out, "report_failed", rule="u:" + RID)
+
+
+def test_disabled_and_invalid_rules_keep_their_findings(api):
+    off = _rule([("clicks", "gte", 10)], rid="off111", enabled=False)
+    bad = dict(_rule([("clicks", "gte", 10)], rid="bad111"), window=14)
+    out = pm.run(_ctx({"rules": [off, bad]}))
+    assert ("login1", "u:off111") in out.unverified
+    assert ("login1", "u:bad111") in out.unverified
+    assert _refused(out, "rule_invalid", rule="u:bad111")
+
+
+def test_progress_and_read_summary(api):
+    seen = []
+    accs = (ACC, DirectAccount("login2", "t", "RUB", "Y"))
+    out = pm.run(_ctx(accounts=accs, progress=seen.append))
+    assert seen == [{"step": "login1", "logins_done": 1, "logins_total": 2},
+                    {"step": "login2", "logins_done": 2, "logins_total": 2}]
+    assert out.summary["read"] == {"logins": 2, "campaigns": 4, "objects": 6}
+    assert out.summary["by_rule"]["app"] == {"found": 12, "refused": 0, "over_cap": 0}
+
+
+def test_list_room_shared_with_builtins(api):
+    # 899 своих + 1 словаря = потолок 900: правилу места нет
+    api["campaigns"] = [_camp(1, items=["x%d.ru" % i for i in range(899)])]
+    api["rows"] = [_day(1, SITES[0], 10, 5.0), _day(1, "beta.ru", 10, 50.0)]
+    out = pm.run(_ctx({"rules": [_rule([("clicks", "gte", 1)])]}))
+    assert [(f.rule, f.object_id) for f in out.findings] == [("app", SITES[0])]
+    assert _refused(out, "list_full", rule="u:" + RID, campaign_id=1)
+
+
+def test_account_protect_respects_campaign_filter(api):
+    # защита по логину с only=[1]: кампания 2 вне защиты, словарь её закрывает
+    protect = _rule([("name", "equals", SITES[0])], rid="ppp111", action="protect",
+                    where="account", only=[1])
+    out = pm.run(_ctx({"rules": [protect]}))
+    assert sorted(f.campaign_id for f in out.findings if f.object_id == SITES[0]) == [2]
+
+
+def test_spam_constants_match_settings_defaults():
+    d = settings_for("placements", None)["spam"]
+    assert (pm.spam.MIN_LEADS, pm.spam.MIN_CR, pm.spam.CR_RATIO) == (
+        d["min_leads"], d["min_cr"], d["ratio"])

@@ -241,26 +241,33 @@ def placements_window(token: str, login: str, days: int,
     Конверсии приходят по колонке на цель (Conversions_<goal>_<модель>); строка несёт
     словарь goal → достижения. Цели сверх потолка не урезаются молча, а отклоняются:
     отрезанная цель дала бы кампании «ноль лидов» там, где их просто не спросили.
+
+    Без целей отчёт всё равно строится, только без конверсий (conversions = {}):
+    правилу «клики ≥ 10 за 30 дней» цели не нужны, и проекту без целей-лидов
+    оно обязано работать, а не молча не находить ничего.
     """
     if days not in WINDOW_RANGES:
         raise ValueError("окно %r не из %s" % (days, sorted(WINDOW_RANGES)))
     goals = sorted({int(g) for g in goals})
-    if not goals:
-        return []
     if len(goals) > MAX_REPORT_GOALS:
         raise ValueError("целей %d при потолке отчёта %d" % (len(goals), MAX_REPORT_GOALS))
     # Окно и цели в имени: имя отчёта Директ связывает с параметрами, и два отчёта
     # одного логина в одну секунду (спам по целям стратегий и правила по целям-лидам)
     # с одним именем получили бы отказ «отчёт с таким именем уже есть».
     tag = zlib.crc32(",".join(map(str, goals)).encode("ascii"))
+    fields = ["CampaignId", "Placement", "AdNetworkType", "Cost", "Clicks", "Impressions"]
+    with_goals = {}
+    if goals:
+        # Без своих целей колонка конверсий несла бы чужие (по умолчанию Директа),
+        # и лиды правил посчитались бы не по тем целям — поэтому только вместе с Goals.
+        fields.append("Conversions")
+        with_goals = {"Goals": [str(g) for g in goals], "AttributionModels": ["AUTO"]}
     body = {"params": {
         "SelectionCriteria": {"Filter": [{"Field": "Clicks",
                                           "Operator": "GREATER_THAN",
                                           "Values": ["0"]}]},
-        "Goals": [str(g) for g in goals],
-        "AttributionModels": ["AUTO"],
-        "FieldNames": ["CampaignId", "Placement", "AdNetworkType", "Cost",
-                       "Clicks", "Impressions", "Conversions"],
+        **with_goals,
+        "FieldNames": fields,
         "ReportName": "placement-goals-%s-%dd-%08x-%d" % (login, days, tag, int(time.time())),
         "ReportType": "CUSTOM_REPORT",
         "DateRangeType": WINDOW_RANGES[days],

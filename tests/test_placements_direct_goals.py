@@ -58,9 +58,16 @@ def test_report_name_differs_by_window_and_goals(report):
     assert len({n.rsplit("-", 1)[0] for n in names}) == 3
 
 
-def test_no_goals_no_report(report):
-    assert D.placements_window("tok", "login1", 7, []) == []
-    assert report == []
+def test_no_goals_report_without_conversions(report, monkeypatch):
+    plain = [HEADER.split("\tConversions_111_AUTO", 1)[0],
+             "1\tsite.ru\tAD_NETWORK\t1500.5\t30\t900"]
+    monkeypatch.setattr(D, "_report_lines", lambda t, l, body: report.append(body) or plain)
+    rows = D.placements_window("tok", "login1", 7, [])
+    params = report[-1]["params"]
+    assert "Goals" not in params and "AttributionModels" not in params
+    assert "Conversions" not in params["FieldNames"]
+    assert rows == [{"campaign_id": "1", "placement": "site.ru", "clicks": 30,
+                     "cost": 1500.5, "impressions": 900, "conversions": {}}]
 
 
 def test_bad_window_and_goal_overflow_rejected(report):
