@@ -5,8 +5,12 @@
 аудит только сообщает. object_id везде — id объекта (или нормализованная фраза),
 а не его текст: исправленное правило перестаёт срабатывать на тот же отпечаток,
 и reconcile закрывает находку как resolved.
+
+Чего правило не проверило (тип без нужных полей, выключено настройкой, поле не принято
+API), оно записывает в snap.skipped: молчание правила не должно читаться как чистый кабинет.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -24,7 +28,18 @@ NEGATIVES_NEAR_CHARS = 18000
 # Лимит Title объявления в Директе — 56 символов.
 TITLE_LIMIT = 56
 AREA_OF_INTEREST = "ENABLE_AREA_OF_INTEREST_TARGETING"
-BASE_URL = "https://direct.yandex.ru/dna/grid/campaigns"
+GRID_URL = "https://direct.yandex.ru/dna/grid/campaigns"
+CAMPAIGN_EDIT_URL = "https://direct.yandex.ru/dna/campaigns-edit"
+BANNER_EDIT_URL = "https://direct.yandex.ru/dna/banners-edit"
+
+# Поля, которые запрашиваются с запасным путём: не принял API — зависимое правило не судит.
+SHARED_SETS = "NegativeKeywordSharedSetIds"
+UNIFIED_TRACKING = "UnifiedTrackingParams"
+
+# Формы глагола «занять»: «займёт 2 года» — не реклама микрозаймов, а обычная речь. Корень
+# «займ» из banned_words ловит и их, поэтому исключаем явно (ё сведена к е).
+_ZANYAT_FORMS = frozenset({"займу", "займешь", "займет", "займем", "займете", "займут"})
+_WORD = re.compile(r"\w+")
 
 
 @dataclass
@@ -38,9 +53,24 @@ class Snapshot:
     audiences_by_group: Dict[int, int] = field(default_factory=dict)
     # id кампании -> показы за 3 дня; нет записи = 0
     impressions_3d: Dict[int, int] = field(default_factory=dict)
+    # отклонённые объявления любого State (отдельный запрос Statuses=REJECTED)
+    rejected_ads: List[dict] = field(default_factory=list)
+    # комбинаторные объявления ЕПК из v501; None — v501 не ответил
+    responsive_ads: Optional[List[dict]] = field(default_factory=list)
+    # поля, которые API не принял: SHARED_SETS, UNIFIED_TRACKING
+    unavailable: Dict[str, str] = field(default_factory=dict)
+    # начало окна показов (ГГГГ-ММ-ДД): кампания, стартовавшая позже, не успела показаться
+    impressions_from: str = ""
+    # правило -> причина -> сколько объектов не проверено
+    skipped: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
 
 Check = Callable[[Snapshot, dict], List[Finding]]
+
+
+def skip(snap: Snapshot, rule: str, reason: str, count: int = 1) -> None:
+    by = snap.skipped.setdefault(rule, {})
+    by[reason] = by.get(reason, 0) + count
 
 
 def _block(campaign: dict) -> dict:
@@ -56,12 +86,13 @@ def _items(value: Any) -> List[Any]:
 
 
 def url(login: str, campaign_id: Any, *, group: Any = None, banner: Any = None) -> str:
-    out = "%s?ulogin=%s&campaigns-ids=%s" % (BASE_URL, login, campaign_id)
-    if group is not None:
-        out += "&groups-ids=%s" % group
     if banner is not None:
-        out += "&banners-ids=%s" % banner
-    return out
+        return "%s?ulogin=%s&campaigns-ids=%s&banners-ids=%s" % (
+            BANNER_EDIT_URL, login, campaign_id, banner)
+    if group is not None:
+        return "%s?ulogin=%s&campaigns-ids=%s&groups-ids=%s" % (
+            GRID_URL, login, campaign_id, group)
+    return "%s?ulogin=%s&campaigns-ids=%s" % (CAMPAIGN_EDIT_URL, login, campaign_id)
 
 
 def _camp_map(snap: Snapshot) -> Dict[int, dict]:
@@ -80,14 +111,43 @@ def _finding(snap: Snapshot, rule: str, severity: str, camp: dict, object_type: 
                    action=None)
 
 
-def _text_ads(snap: Snapshot) -> Iterable[Tuple[dict, dict, dict]]:
-    """(кампания, объявление, его TextAd) — только текстовые объявления ON-кампаний."""
+def _ad_link(snap: Snapshot, camp: dict, ad: dict) -> str:
+    return url(snap.login, camp["Id"], banner=ad["Id"])
+
+
+def _ads(snap: Snapshot) -> Iterable[Tuple[dict, dict]]:
+    """(кампания, объявление) для всех прочитанных объявлений ON-кампаний."""
     cmap = _camp_map(snap)
-    for ad in snap.ads:
+    for ad in list(snap.ads) + list(snap.responsive_ads or []):
         camp = cmap.get(int(ad.get("CampaignId") or 0))
-        text = ad.get("TextAd")
-        if camp is not None and isinstance(text, dict):
-            yield camp, ad, text
+        if camp is not None:
+            yield camp, ad
+
+
+def _texts(ad: dict) -> Optional[Tuple[List[str], List[str]]]:
+    """(заголовки, тексты): TextAd — Title/Title2/Text, ResponsiveAd — Titles/Texts."""
+    text = ad.get("TextAd")
+    if isinstance(text, dict):
+        titles = [str(t) for t in (text.get("Title"), text.get("Title2")) if t]
+        return titles, [str(text["Text"])] if text.get("Text") else []
+    resp = ad.get("ResponsiveAd")
+    if isinstance(resp, dict):
+        def pick(items, key):
+            out = []
+            for it in _items(items):
+                value = it.get(key) if isinstance(it, dict) else it
+                if value:
+                    out.append(str(value))
+            return out
+        return pick(resp.get("Titles"), "Title"), pick(resp.get("Texts"), "Text")
+    return None
+
+
+def _count_unread_ads(snap: Snapshot) -> int:
+    """Объявления v5 без TextAd (ЕПК): их тексты читает только v501."""
+    cmap = _camp_map(snap)
+    return sum(1 for ad in snap.ads
+               if int(ad.get("CampaignId") or 0) in cmap and _texts(ad) is None)
 
 
 def _group_keywords(snap: Snapshot) -> Dict[int, List[dict]]:
@@ -105,15 +165,26 @@ def _phrase(k: dict) -> str:
     return " ".join(str(k.get("Keyword") or "").lower().split())
 
 
+def _norm(text: str) -> str:
+    return text.casefold().replace("ё", "е")
+
+
 def group_no_targeting(snap: Snapshot, settings: dict) -> List[Finding]:
     cmap = _camp_map(snap)
     kws = _group_keywords(snap)
     out = []
     for g in snap.groups:
         camp = cmap.get(int(g.get("CampaignId") or 0))
+        if camp is None:
+            continue
         # Динамические и товарные группы таргетируются фильтрами и фидом, а не фразами:
         # судить их по ключам значило бы ложно кричать «показов не будет».
-        if camp is None or g.get("Type") != TEXT_GROUP:
+        if g.get("Type") != TEXT_GROUP:
+            skip(snap, "group_no_targeting", "группа не текстовая (таргет не по фразам)")
+            continue
+        # Черновик ещё не запущен: условий показа у него может не быть законно.
+        if g.get("Status") == "DRAFT":
+            skip(snap, "group_no_targeting", "группа в черновике")
             continue
         gid = int(g["Id"])
         on = [k for k in kws.get(gid, []) if k.get("State", "ON") == "ON"]
@@ -130,17 +201,16 @@ def group_no_targeting(snap: Snapshot, settings: dict) -> List[Finding]:
 def ads_rejected(snap: Snapshot, settings: dict) -> List[Finding]:
     cmap = _camp_map(snap)
     out = []
-    for ad in snap.ads:
+    for ad in snap.rejected_ads:
         camp = cmap.get(int(ad.get("CampaignId") or 0))
-        if camp is None or ad.get("Status") != "REJECTED" or ad.get("State", "ON") != "ON":
+        if camp is None:
             continue
         title = (ad.get("TextAd") or {}).get("Title") or ""
         out.append(_finding(
             snap, "ads_rejected", "critical", camp, "ad", ad["Id"],
             "Объявление %s отклонено модерацией" % ad["Id"],
             "Откройте причину отклонения в интерфейсе, поправьте текст и отправьте на повторную проверку.",
-            url(snap.login, camp["Id"], group=ad.get("AdGroupId"), banner=ad["Id"]),
-            {"title": title}))
+            _ad_link(snap, camp, ad), {"title": title, "state": ad.get("State")}))
     return out
 
 
@@ -150,6 +220,7 @@ def no_metrika_counter(snap: Snapshot, settings: dict) -> List[Finding]:
         # CounterIds запрашивается только у текстовых и ЕПК; у остальных типов
         # отсутствие поля в ответе ничего не значит.
         if c.get("Type") not in TYPE_BLOCKS:
+            skip(snap, "no_metrika_counter", "тип кампании без запроса счётчика")
             continue
         if _items(_block(c).get("CounterIds")):
             continue
@@ -161,27 +232,49 @@ def no_metrika_counter(snap: Snapshot, settings: dict) -> List[Finding]:
     return out
 
 
+def _banned_hits(text: str, words: List[str]) -> List[str]:
+    """Слова из banned_words, с которых начинается слово текста (ё = е, регистр не важен)."""
+    norm = _norm(text)
+    hit = []
+    for w in words:
+        for m in re.finditer(r"(?<!\w)" + re.escape(w), norm):
+            token = _WORD.match(norm, m.start())
+            if token and token.group(0) in _ZANYAT_FORMS:
+                continue
+            hit.append(w)
+            break
+    return hit
+
+
 def banned_words(snap: Snapshot, settings: dict) -> List[Finding]:
-    words = [str(w).strip().casefold() for w in settings.get("banned_words") or []
+    words = [_norm(str(w).strip()) for w in settings.get("banned_words") or []
              if str(w).strip()]
     if not words:
+        skip(snap, "banned_words", "список banned_words пуст — правило выключено",
+             sum(1 for _ in _ads(snap)))
         return []
+    unread = _count_unread_ads(snap) if snap.responsive_ads is None else 0
+    if unread:
+        skip(snap, "banned_words", "объявления ЕПК: v501 не ответил, читать нечем", unread)
     out = []
-    for camp, ad, text in _text_ads(snap):
+    for camp, ad in _ads(snap):
+        texts = _texts(ad)
+        if texts is None:
+            continue
+        titles, bodies = texts
         hit: Dict[str, List[str]] = {}
-        for fld in ("Title", "Title2", "Text"):
-            value = str(text.get(fld) or "").casefold()
-            for w in words:
-                if w in value:
-                    hit.setdefault(w, []).append(fld)
+        for fld, values in (("Title", titles), ("Text", bodies)):
+            for value in values:
+                for w in _banned_hits(value, words):
+                    if fld not in hit.setdefault(w, []):
+                        hit[w].append(fld)
         if not hit:
             continue
         out.append(_finding(
             snap, "banned_words", "critical", camp, "ad", ad["Id"],
             "В объявлении %s запрещённое слово: %s" % (ad["Id"], ", ".join(sorted(hit))),
             "Уберите слово из заголовка и текста: тема запрещена для проекта.",
-            url(snap.login, camp["Id"], group=ad.get("AdGroupId"), banner=ad["Id"]),
-            {"words": sorted(hit), "fields": hit}))
+            _ad_link(snap, camp, ad), {"words": sorted(hit), "fields": hit}))
     return out
 
 
@@ -190,6 +283,12 @@ def on_no_impressions(snap: Snapshot, settings: dict) -> List[Finding]:
     for c in snap.campaigns:
         # Кампания не прошла модерацию или в черновике — это не «включена и молчит».
         if c.get("Status") not in (None, "ACCEPTED"):
+            skip(snap, "on_no_impressions", "кампания не прошла модерацию или в черновике")
+            continue
+        # Стартовавшая внутри окна или позже не обязана была показываться все три дня.
+        start = str(c.get("StartDate") or "")
+        if start and snap.impressions_from and start > snap.impressions_from:
+            skip(snap, "on_no_impressions", "кампания стартовала после начала окна показов")
             continue
         if snap.impressions_3d.get(int(c["Id"]), 0) > 0:
             continue
@@ -222,8 +321,6 @@ def autotargeting_with_keywords(snap: Snapshot, settings: dict) -> List[Finding]
 
 
 def _searches(campaign: dict) -> bool:
-    if campaign.get("Type") not in TYPE_BLOCKS:
-        return False
     search = (_block(campaign).get("BiddingStrategy") or {}).get("Search") or {}
     return search.get("BiddingStrategyType") != "SERVING_OFF"
 
@@ -231,7 +328,14 @@ def _searches(campaign: dict) -> bool:
 def no_negatives(snap: Snapshot, settings: dict) -> List[Finding]:
     out = []
     for c in snap.campaigns:
-        if not _searches(c) or _items(c.get("NegativeKeywords")):
+        if c.get("Type") not in TYPE_BLOCKS or not _searches(c):
+            skip(snap, "no_negatives", "не поисковая кампания или тип без минус-фраз")
+            continue
+        if SHARED_SETS in snap.unavailable:
+            # Без наборов общих минус-слов «пусто» может быть ложным: не судим.
+            skip(snap, "no_negatives", "поле %s не принято API" % SHARED_SETS)
+            continue
+        if _items(c.get("NegativeKeywords")) or _items(c.get(SHARED_SETS)):
             continue
         out.append(_finding(
             snap, "no_negatives", "warning", c, "campaign", c["Id"],
@@ -246,16 +350,28 @@ def _has_utm(href: str) -> bool:
 
 
 def href_no_utm(snap: Snapshot, settings: dict) -> List[Finding]:
+    groups = {int(g["Id"]): g for g in snap.groups}
     if not settings.get("require_utm", True):
+        skip(snap, "href_no_utm", "require_utm выключен — правило выключено",
+             sum(1 for _ in _ads(snap)))
         return []
     out = []
-    for camp, ad, text in _text_ads(snap):
+    for camp, ad in _ads(snap):
+        text = ad.get("TextAd")
+        if not isinstance(text, dict):
+            continue
         block = _block(camp)
-        # TrackingParams запрашивается только у текстовых кампаний; у остальных его
-        # отсутствие в ответе ничего не значит, и судить ссылку нельзя.
-        if camp.get("Type") != "TEXT_CAMPAIGN" and "TrackingParams" not in block:
+        ctype = camp.get("Type")
+        if ctype not in TYPE_BLOCKS:
+            skip(snap, "href_no_utm", "тип кампании без чтения TrackingParams")
+            continue
+        if ctype == "UNIFIED_CAMPAIGN" and UNIFIED_TRACKING in snap.unavailable:
+            skip(snap, "href_no_utm", "поле TrackingParams не принято API (ЕПК)")
             continue
         if str(block.get("TrackingParams") or "").strip():
+            continue
+        group = groups.get(int(ad.get("AdGroupId") or 0)) or {}
+        if str(group.get("TrackingParams") or "").strip():
             continue
         href = str(text.get("Href") or "").strip()
         if not href or _has_utm(href):
@@ -264,8 +380,7 @@ def href_no_utm(snap: Snapshot, settings: dict) -> List[Finding]:
             snap, "href_no_utm", "warning", camp, "ad", ad["Id"],
             "Ссылка объявления %s без utm_source и utm_campaign" % ad["Id"],
             "Добавьте разметку в ссылку или задайте TrackingParams на кампанию.",
-            url(snap.login, camp["Id"], group=ad.get("AdGroupId"), banner=ad["Id"]),
-            {"href": href}))
+            _ad_link(snap, camp, ad), {"href": href}))
     return out
 
 
@@ -277,6 +392,8 @@ def strategy_goal_not_allowed(snap: Snapshot, settings: dict) -> List[Finding]:
         except (TypeError, ValueError):
             continue
     if not allowed:
+        skip(snap, "strategy_goal_not_allowed",
+             "список allowed_goal_ids пуст — правило выключено", len(snap.campaigns))
         return []
     out = []
     for c in snap.campaigns:
@@ -322,14 +439,19 @@ def negatives_near_limit(snap: Snapshot, settings: dict) -> List[Finding]:
 
 def no_sitelinks(snap: Snapshot, settings: dict) -> List[Finding]:
     out = []
-    for camp, ad, text in _text_ads(snap):
+    for camp, ad in _ads(snap):
+        text = ad.get("TextAd")
+        if not isinstance(text, dict):
+            # SitelinkSetId читается из TextAd; у комбинаторных его в запросе нет.
+            if ad.get("ResponsiveAd") is not None:
+                skip(snap, "no_sitelinks", "объявление ЕПК: быстрые ссылки не читаются")
+            continue
         if text.get("SitelinkSetId"):
             continue
         out.append(_finding(
             snap, "no_sitelinks", "info", camp, "ad", ad["Id"],
             "У объявления %s нет быстрых ссылок" % ad["Id"],
-            "Добавьте набор быстрых ссылок.",
-            url(snap.login, camp["Id"], group=ad.get("AdGroupId"), banner=ad["Id"])))
+            "Добавьте набор быстрых ссылок.", _ad_link(snap, camp, ad)))
     return out
 
 
@@ -338,17 +460,27 @@ def title_underused(snap: Snapshot, settings: dict) -> List[Finding]:
         fill = float(settings.get("title_fill_min", 0.6))
     except (TypeError, ValueError):
         fill = 0.6
+    unread = _count_unread_ads(snap) if snap.responsive_ads is None else 0
+    if unread:
+        skip(snap, "title_underused", "объявления ЕПК: v501 не ответил, читать нечем", unread)
     out = []
-    for camp, ad, text in _text_ads(snap):
-        title = str(text.get("Title") or "").strip()
-        if not title or len(title) >= TITLE_LIMIT * fill:
+    for camp, ad in _ads(snap):
+        texts = _texts(ad)
+        if texts is None or not texts[0]:
+            continue
+        if isinstance(ad.get("TextAd"), dict):
+            # Title2 короче по лимиту и в заполнение заголовка не входит.
+            longest = len(str(ad["TextAd"].get("Title") or "").strip())
+        else:
+            # У комбинаторного объявления заголовков несколько: судим по самому длинному.
+            longest = max(len(t.strip()) for t in texts[0])
+        if not longest or longest >= TITLE_LIMIT * fill:
             continue
         out.append(_finding(
             snap, "title_underused", "info", camp, "ad", ad["Id"],
-            "Заголовок объявления %s занимает %d из %d символов" % (ad["Id"], len(title), TITLE_LIMIT),
+            "Заголовок объявления %s занимает %d из %d символов" % (ad["Id"], longest, TITLE_LIMIT),
             "Расширьте заголовок: добавьте выгоду или уточнение.",
-            url(snap.login, camp["Id"], group=ad.get("AdGroupId"), banner=ad["Id"]),
-            {"length": len(title), "limit": TITLE_LIMIT}))
+            _ad_link(snap, camp, ad), {"length": longest, "limit": TITLE_LIMIT}))
     return out
 
 
@@ -378,10 +510,11 @@ def duplicate_keywords(snap: Snapshot, settings: dict) -> List[Finding]:
 def area_of_interest_on(snap: Snapshot, settings: dict) -> List[Finding]:
     out = []
     for c in snap.campaigns:
-        opts = _block(c).get("Settings")
-        on = isinstance(opts, list) and any(
-            isinstance(o, dict) and o.get("Option") == AREA_OF_INTEREST
-            and o.get("Value") == "YES" for o in opts)
+        if c.get("Type") not in TYPE_BLOCKS:
+            skip(snap, "area_of_interest_on", "тип кампании без чтения Settings")
+            continue
+        on = any(isinstance(o, dict) and o.get("Option") == AREA_OF_INTEREST
+                 and o.get("Value") == "YES" for o in _items(_block(c).get("Settings")))
         if not on:
             continue
         out.append(_finding(

@@ -190,3 +190,64 @@ def test_get_all_limited_by_empty_page_raises():
         return {"Campaigns": [], "LimitedBy": 5}
     with pytest.raises(DirectError):
         d.get_all("t", "l", "campaigns", {}, ["Id"], call_fn=fake)
+
+
+def test_get_all_v501_goes_to_v501_url(monkeypatch):
+    seen = {}
+
+    class Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"result": {"Ads": [{"Id": 1}]}}'
+
+    def fake_open(req, timeout=0):
+        seen["url"] = req.full_url
+        return Resp()
+    monkeypatch.setattr(d.urllib.request, "urlopen", fake_open)
+    out = d.get_all("t", "l", "ads", {}, ["Id"], version="v501")
+    assert seen["url"] == "https://api.direct.yandex.com/json/v501/ads"
+    assert out == [{"Id": 1}]
+
+
+def test_get_all_without_version_keeps_default_call():
+    seen = []
+
+    def fake(token, login, service, payload):
+        seen.append(service)
+        return {"Ads": []}
+    # подставной call_fn версией не подменяется
+    d.get_all("t", "l", "ads", {}, ["Id"], call_fn=fake, version="v501")
+    assert seen == ["ads"]
+
+
+def test_v501_error_is_direct_error(monkeypatch):
+    class Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return ('{"error": {"error_code": 8000, "error_string": "Неверный запрос",'
+                    ' "error_detail": "x"}}').encode("utf-8")
+    monkeypatch.setattr(d.urllib.request, "urlopen", lambda req, timeout=0: Resp())
+    with pytest.raises(DirectError) as exc:
+        d.call_versioned("t", "l", "ads", {"method": "get"}, "v501")
+    assert d.is_unknown_field_error(exc.value)
+
+
+def test_is_unknown_field_error():
+    assert d.is_unknown_field_error(DirectError("campaigns [4000] поле"))
+    assert d.is_unknown_field_error(DirectError("campaigns [53] Неизвестный параметр"))
+    assert not d.is_unknown_field_error(DirectError("campaigns [53] Авторизация не прошла"))
+    assert not d.is_unknown_field_error(DirectError("reports HTTP 500"))

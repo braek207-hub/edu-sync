@@ -4,6 +4,7 @@
 import hashlib
 import http.client
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -11,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sync.direct_reports_limit import (MIN_POLL_SECONDS, is_rate_limited,
                                        poll_delay)
-from sync.placements.direct import REPORTS, DirectError, _headers, call
+from sync.placements.direct import API, REPORTS, DirectError, _headers, call
 
 # Потолок суммарного ожидания отчёта: дольше очередь Директа не стоит ждать в такте.
 MAX_WAIT_SECONDS = 600
@@ -99,10 +100,41 @@ def report_rows(token: str, login: str, params: dict, *, prefix: str,
     return [dict(zip(header, ln.split("\t"))) for ln in lines[1:]]
 
 
+def call_versioned(token: str, login: str, service: str, payload: Dict[str, Any],
+                   version: str = "v5") -> Dict[str, Any]:
+    """Вызов другой версии API (v501: комбинаторные объявления ЕПК). v5 идёт прежним call."""
+    if version == "v5":
+        return call(token, login, service, payload)
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    url = API.replace("/v5/", "/%s/" % version) + service
+    req = urllib.request.Request(url, data=data, headers=_headers(token, login))
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        status, raw = resp.status, resp.read()
+    if status == 204 or not raw.strip():
+        raise DirectError("%s: Директ API %s (недоступен) — пустой ответ" % (service, status))
+    body = json.loads(raw.decode("utf-8"))
+    if "error" in body:
+        err = body["error"]
+        raise DirectError("%s [%s] %s: %s" % (
+            service, err.get("error_code"), err.get("error_string"), err.get("error_detail")))
+    return body.get("result", {})
+
+
+def is_unknown_field_error(err: Exception) -> bool:
+    """Директ не принял имя поля или параметра: код 4000/8000 в тексте DirectError."""
+    text = str(err)
+    return bool(re.search(r"\[(4000|8000)\]", text)) or "неизвестн" in text.lower()
+
+
 def get_all(token: str, login: str, service: str, criteria: dict,
             field_names: List[str], extra: Optional[dict] = None,
             chunk_key: Optional[str] = None, ids: Sequence = (),
-            result_key: Optional[str] = None, call_fn=call) -> List[dict]:
+            result_key: Optional[str] = None, call_fn=call,
+            version: Optional[str] = None) -> List[dict]:
+    # version — необязательная другая версия API; без неё поведение прежнее. Подставной
+    # call_fn (тесты) версией не подменяется.
+    if version and call_fn is call:
+        call_fn = lambda t, l, s, p: call_versioned(t, l, s, p, version)  # noqa: E731
     chunks: List[Optional[list]] = [None]
     if chunk_key:
         chunks = [list(ids[i:i + CHUNK]) for i in range(0, len(ids), CHUNK)]

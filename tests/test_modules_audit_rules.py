@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Правила audit: пара «срабатывает / молчит» на каждое из 15, на маленьких снимках."""
 
-from sync.modules.audit_rules import RULES, Snapshot
+from sync.modules.audit_rules import RULES, SHARED_SETS, UNIFIED_TRACKING, Snapshot
 from sync.modules.defaults import settings_for
 from sync.modules.types import fingerprint
 
@@ -10,12 +10,14 @@ LOGIN = "login1"
 
 def _camp(cid=1, ctype="TEXT_CAMPAIGN", counters=(77,), tracking=None, negatives=("а",),
           sites=0, settings=None, search=None, goal=None, **extra):
-    block = {"CounterIds": list(counters), "BiddingStrategy": {"Search": search or {
+    block = {"BiddingStrategy": {"Search": search or {
         "BiddingStrategyType": "HIGHEST_POSITION"}}}
     if goal:
         block["BiddingStrategy"]["Search"] = {
             "BiddingStrategyType": "WB_MAXIMUM_CONVERSION_RATE",
             "WbMaximumConversionRate": {"GoalId": goal}}
+    if counters:
+        block["CounterIds"] = {"Items": list(counters)}
     if tracking is not None:
         block["TrackingParams"] = tracking
     if settings is not None:
@@ -47,10 +49,13 @@ def _kw(kid, gid=10, cid=1, word="купить диплом"):
     return {"Id": kid, "AdGroupId": gid, "CampaignId": cid, "Keyword": word, "State": "ON"}
 
 
-def _snap(campaigns=None, groups=(), ads=(), keywords=(), aud=None, imp=None):
+def _snap(campaigns=None, groups=(), ads=(), keywords=(), aud=None, imp=None, rejected=(),
+          responsive=(), unavailable=None, frm=""):
     return Snapshot(login=LOGIN, campaigns=campaigns if campaigns is not None else [_camp()],
                     groups=list(groups), ads=list(ads), keywords=list(keywords),
-                    audiences_by_group=aud or {}, impressions_3d=imp if imp is not None else {1: 5})
+                    audiences_by_group=aud or {}, impressions_3d=imp if imp is not None else {1: 5},
+                    rejected_ads=list(rejected), responsive_ads=responsive,
+                    unavailable=unavailable or {}, impressions_from=frm)
 
 
 def _run(rule, snap, **settings):
@@ -82,7 +87,9 @@ def test_group_no_targeting():
 
 
 def test_ads_rejected():
-    (f,) = _run("ads_rejected", _snap(ads=[_ad(status="REJECTED")]))
+    bad = _ad(status="REJECTED")
+    bad["State"] = "SUSPENDED"  # отклонённое может быть любого State: фильтра нет
+    (f,) = _run("ads_rejected", _snap(rejected=[bad]))
     assert f.object_id == "100"
     assert _run("ads_rejected", _snap(ads=[_ad()])) == []
 
@@ -150,8 +157,13 @@ def test_href_with_campaign_tracking_params_ok():
 
 def test_href_silent_when_tracking_params_not_read():
     # у ЕПК TrackingParams не запрашивается: пустой ответ не значит «разметки нет»
-    snap = _snap([_camp(ctype="UNIFIED_CAMPAIGN")], ads=[_ad(href="https://x.ru/")])
+    snap = _snap([_camp(ctype="UNIFIED_CAMPAIGN")], ads=[_ad(href="https://x.ru/")],
+                 unavailable={UNIFIED_TRACKING: "4000"})
     assert _run("href_no_utm", snap) == []
+    assert snap.skipped["href_no_utm"] == {"поле TrackingParams не принято API (ЕПК)": 1}
+    # поле принято и пусто — это «разметки нет», правило судит
+    ok = _snap([_camp(ctype="UNIFIED_CAMPAIGN")], ads=[_ad(href="https://x.ru/")])
+    assert len(_run("href_no_utm", ok)) == 1
 
 
 def test_strategy_goal_rule_silent_without_list():
@@ -222,20 +234,123 @@ def test_area_of_interest_on():
 
 def test_findings_have_fix_url_and_no_action():
     snap = _snap([_camp(counters=(), negatives=())], groups=[_group()],
-                 ads=[_ad(status="REJECTED", sitelink=0, title="Д", href="https://x.ru/")],
-                 imp={})
+                 ads=[_ad(sitelink=0, title="Д", href="https://x.ru/")],
+                 rejected=[_ad(status="REJECTED")], imp={})
     allf = [f for _r, _s, chk in RULES for f in chk(snap, settings_for("audit", {}))]
     assert {f.rule for f in allf} >= {"group_no_targeting", "ads_rejected",
                                        "no_metrika_counter", "on_no_impressions"}
     for f in allf:
         assert f.action is None and f.login == LOGIN
         assert f.details["fix"] and f.details["url"].startswith(
-            "https://direct.yandex.ru/dna/grid/campaigns?ulogin=login1&campaigns-ids=1")
+            "https://direct.yandex.ru/dna/") and "ulogin=login1&campaigns-ids=1" in f.details["url"]
     ad_f = next(f for f in allf if f.rule == "ads_rejected")
-    assert ad_f.details["url"].endswith("&groups-ids=10&banners-ids=100")
+    assert ad_f.details["url"] == (
+        "https://direct.yandex.ru/dna/banners-edit?ulogin=login1&campaigns-ids=1&banners-ids=100")
 
 
 def test_object_id_stable_across_text_changes():
     a = _run("banned_words", _snap(ads=[_ad(title="Кредит")]), banned_words=["кредит"])[0]
     b = _run("banned_words", _snap(ads=[_ad(title="Ещё кредит тут")]), banned_words=["кредит"])[0]
     assert fingerprint("audit", a) == fingerprint("audit", b)
+
+
+def test_campaign_and_group_links():
+    (c,) = _run("no_negatives", _snap([_camp(negatives=())]))
+    assert c.details["url"] == (
+        "https://direct.yandex.ru/dna/campaigns-edit?ulogin=login1&campaigns-ids=1")
+    (g,) = _run("group_no_targeting", _snap(groups=[_group()]))
+    assert g.details["url"] == (
+        "https://direct.yandex.ru/dna/grid/campaigns?ulogin=login1&campaigns-ids=1&groups-ids=10")
+
+
+def test_banned_words_prefix_yo_and_zanyat():
+    def hits(title, word="займ"):
+        return _run("banned_words", _snap(ads=[_ad(title=title)]), banned_words=[word])
+    assert hits("Займы онлайн")
+    assert hits("Кредит наличными", "кредит")
+    assert hits("Всё ещё в армии", "все") and hits("Все ещё", "всё")  # ё = е
+    for form in ("займёт 2 года", "займет", "займу", "займешь", "займем", "займете", "займут"):
+        assert hits("Обучение " + form) == [], form
+    # слово не с начала — не срабатывает
+    assert hits("подзаймы") == []
+
+
+def test_skipped_counts_silent_rules():
+    snap = _snap([_camp(ctype="CPM_BANNER_CAMPAIGN"), _camp(2)], ads=[_ad(), _ad(101, cid=2)],
+                 groups=[_group(10, 2), _group(11, 2, gtype="DYNAMIC_TEXT_AD_GROUP"),
+                         dict(_group(12, 2), Status="DRAFT")])
+    for _rule, _s, chk in RULES:
+        chk(snap, settings_for("audit", {}))
+    sk = snap.skipped
+    assert sk["no_metrika_counter"] == {"тип кампании без запроса счётчика": 1}
+    assert sk["banned_words"] == {"список banned_words пуст — правило выключено": 2}
+    assert sk["strategy_goal_not_allowed"] == {
+        "список allowed_goal_ids пуст — правило выключено": 2}
+    assert sk["group_no_targeting"] == {"группа не текстовая (таргет не по фразам)": 1,
+                                        "группа в черновике": 1}
+    assert sk["area_of_interest_on"] == {"тип кампании без чтения Settings": 1}
+    assert sk["no_negatives"] == {"не поисковая кампания или тип без минус-фраз": 1}
+
+
+def test_href_rule_off_is_reported():
+    snap = _snap(ads=[_ad()])
+    _run("href_no_utm", snap, require_utm=False)
+    assert snap.skipped["href_no_utm"] == {"require_utm выключен — правило выключено": 1}
+
+
+def test_on_no_impressions_skips_campaign_started_in_window():
+    snap = _snap([_camp(StartDate="2026-10-17")], imp={}, frm="2026-10-16")
+    assert _run("on_no_impressions", snap) == []
+    assert snap.skipped["on_no_impressions"] == {
+        "кампания стартовала после начала окна показов": 1}
+    old = _camp(StartDate="2026-09-01")
+    assert len(_run("on_no_impressions", _snap([old], imp={}, frm="2026-10-16"))) == 1
+
+
+def test_shared_negative_set_counts_as_negatives():
+    c = _camp(negatives=())
+    c[SHARED_SETS] = {"Items": [5]}
+    assert _run("no_negatives", _snap([c])) == []
+
+
+def test_no_negatives_skipped_when_shared_sets_field_rejected():
+    snap = _snap([_camp(negatives=())], unavailable={SHARED_SETS: "8000"})
+    assert _run("no_negatives", snap) == []
+    assert snap.skipped["no_negatives"] == {"поле %s не принято API" % SHARED_SETS: 1}
+
+
+def test_group_tracking_params_close_href_rule():
+    g = dict(_group(), TrackingParams="utm_source=y&utm_campaign=z")
+    assert _run("href_no_utm", _snap(groups=[g], ads=[_ad(href="https://x.ru/")])) == []
+
+
+def test_group_draft_not_flagged():
+    g = dict(_group(), Status="DRAFT")
+    assert _run("group_no_targeting", _snap(groups=[g])) == []
+
+
+def _resp(aid=200, titles=("Короткий",), texts=("Текст",)):
+    return {"Id": aid, "AdGroupId": 10, "CampaignId": 1, "State": "ON",
+            "Type": "RESPONSIVE_AD",
+            "ResponsiveAd": {"Titles": [{"Title": t, "Status": "ACCEPTED"} for t in titles],
+                             "Texts": [{"Text": t, "Status": "ACCEPTED"} for t in texts]}}
+
+
+def test_responsive_ads_banned_words_and_title_longest():
+    r = _resp(titles=("Ок", "Займы без отказа тут"), texts=("Текст",))
+    (f,) = _run("banned_words", _snap(responsive=[r]), banned_words=["займ"])
+    assert f.object_id == "200" and f.details["fields"] == {"займ": ["Title"]}
+    # самый длинный заголовок 20 символов < 33.6 — недоиспользован
+    (u,) = _run("title_underused", _snap(responsive=[r]))
+    assert u.details["length"] == 20
+    assert _run("title_underused", _snap(responsive=[_resp(titles=("Ок", "Д" * 40))])) == []
+
+
+def test_responsive_unread_reported_when_v501_failed():
+    ep = {"Id": 300, "AdGroupId": 10, "CampaignId": 1, "State": "ON", "Type": "RESPONSIVE_AD"}
+    snap = _snap(ads=[ep, _ad()], responsive=None)
+    _run("banned_words", snap, banned_words=["кредит"])
+    _run("title_underused", snap)
+    reason = "объявления ЕПК: v501 не ответил, читать нечем"
+    assert snap.skipped["banned_words"] == {reason: 1}
+    assert snap.skipped["title_underused"] == {reason: 1}
