@@ -40,7 +40,8 @@ def _rows(cids, sites=SITES):
 @pytest.fixture
 def api(monkeypatch):
     state = {"campaigns": [_camp(1), _camp(2)], "rows": _rows([1, 2]), "today_calls": 0,
-             "window": {}, "window_calls": [], "window_fail": set()}
+             "window": {}, "window_calls": [], "window_fail": set(),
+             "campaigns_by": {}, "window_by": {}}
 
     def today(token, login):
         state["today_calls"] += 1
@@ -52,9 +53,10 @@ def api(monkeypatch):
             raise state["window"]
         if login in state["window_fail"]:
             raise direct.DirectError("отчёт не готов")
-        return state["window"].get(days, [])
+        return state["window_by"].get(login, state["window"]).get(days, [])
 
-    monkeypatch.setattr(direct, "campaigns", lambda t, l: state["campaigns"])
+    monkeypatch.setattr(direct, "campaigns",
+                        lambda t, l: state["campaigns_by"].get(l, state["campaigns"]))
     monkeypatch.setattr(direct, "placements_today", today)
     monkeypatch.setattr(direct, "campaign_goals", lambda t, l: {})
     monkeypatch.setattr(direct, "placements_with_goals", lambda t, l, g: [])
@@ -491,6 +493,18 @@ def test_lead_rule_without_visible_goal_is_unverified(api):
                     cost=100.0)
 
 
+def test_account_rule_invisible_goal_cost_is_of_invisible_campaigns(api):
+    # строка по логину не проверена из-за кампании 2: расход в отказе — её, не логина
+    api["rows"] = []
+    api["window"] = {7: [_win(1, "x1.example.ru", 10, 100.0, leads=3),
+                         _win(2, "x1.example.ru", 10, 40.0, leads=0),
+                         _win(2, "x2.example.ru", 10, 60.0, leads=0)]}
+    rule = _rule([("leads", "eq", 0)], window=7, where="account")
+    out = pm.run(_ctx({"rules": [rule]}, project_goals=[G]))
+    assert out.findings == []
+    assert _refused(out, "goal_not_visible", rule="u:" + RID, campaign_id=None, cost=100.0)
+
+
 def test_lead_rule_without_lead_goals_refused_for_login(api):
     api["rows"] = []
     api["window"] = {7: [_win(1, "x1.example.ru", 10, 100.0)]}
@@ -640,6 +654,20 @@ def test_never_list_beats_unverifiable_protect(api):
     assert _refused(out, "in_never_list", object="beta.ru", campaign_id=1, rule="u:" + RID)
     assert not _refused(out, "goal_not_visible", held=True)
     assert ("login1", "u:" + RID, 1) not in out.unverified
+
+
+def test_account_rule_only_is_limited_to_own_campaigns(api):
+    # only — список на проект: кампания 1 у login1, login2 о ней не отказывает
+    api["campaigns_by"] = {"login1": [_camp(1)], "login2": [_camp(7)]}
+    api["rows"] = []
+    api["window_by"] = {"login1": {7: [_win(1, "bad.example.ru", 20, 100.0)]},
+                        "login2": {7: [_win(7, "bad.example.ru", 20, 100.0)]}}
+    rule = _rule([("clicks", "gte", 10)], window=7, where="account", only=[1])
+    accs = (ACC, DirectAccount("login2", "t", "RUB", "Y"))
+    out = pm.run(_ctx({"rules": [rule]}, accounts=accs))
+    assert [(f.login, f.campaign_id) for f in out.findings] == [("login1", 1)]
+    assert not [r for r in _codes(out) if r.get("login") == "login2"]
+    assert out.scanned_logins == ["login1", "login2"]
 
 
 def test_account_rule_only_names_unusable_campaigns(api):

@@ -145,6 +145,8 @@ class _Frame:
     base: Dict[str, Optional[float]]
     money_known: bool
     has_goals: bool
+    # Расход кампании за окно по всем её площадкам; ключи — кампании, что есть в отчёте.
+    cost_by_campaign: Dict[int, float]
 
     def empty(self, site: str, cid: int, scope: str, category: str) -> R.Row:
         # Площадки нет в прочитанном окне: ноль кликов и ноль лидов — факт, а не
@@ -159,11 +161,11 @@ class _Frame:
                      money_known=self.money_known, scope=scope)
 
     def spend(self, cid: Optional[int]) -> float:
-        """Расход кампании за окно (None — всего логина): для текста «0 лидов при
-        расходе X» у отказа goal_not_visible."""
-        rows = (self.account.values() if cid is None
-                else [r for r in self.seen.values() if r.campaign_id == cid])
-        return _r2(sum(r.metrics.get("cost") or 0.0 for r in rows))
+        """Расход за окно для текста «0 лидов при расходе X» у goal_not_visible:
+        кампании cid, а для строки по логину (None) — кампаний с невидимой целью:
+        лиды неизвестны из-за них, а не из-за всего логина."""
+        cids = self.invisible if cid is None else (cid,)
+        return _r2(sum(self.cost_by_campaign.get(c, 0.0) for c in cids))
 
 
 def _frame(raw: List[Dict[str, Any]], goals: List[int], currency: str,
@@ -175,9 +177,13 @@ def _frame(raw: List[Dict[str, Any]], goals: List[int], currency: str,
     for row in seen + acct:
         row.category = category(row.object)
     base = dict(seen[0].account) if seen else {"cr": None, "cpl": None}
+    cost_by: Dict[int, float] = {}
+    for r in seen:
+        cost_by[r.campaign_id] = cost_by.get(r.campaign_id, 0.0) + (r.metrics.get("cost") or 0.0)
     return _Frame(seen={(r.campaign_id, r.object): r for r in seen},
                   account={r.object: r for r in acct}, invisible=invisible, base=base,
-                  money_known=(currency or "RUB").upper() == "RUB", has_goals=bool(goals))
+                  money_known=(currency or "RUB").upper() == "RUB", has_goals=bool(goals),
+                  cost_by_campaign=cost_by)
 
 
 @dataclass
@@ -508,6 +514,9 @@ class _Login:
     def _user(self, live: List[dict]) -> None:
         login = self.acc.login
         live_ids = sorted(int(c["Id"]) for c in live)
+        # Кампании этого логина: из API и из строк отчётов (Мастер кампаний API не
+        # отдаёт). only — список на весь проект, чужие кампании в нём не наши.
+        owned = set(self.by_id).union(*(f.cost_by_campaign for f in self.frames.values()))
         results: Dict[Tuple[int, str], dict] = {}
         for rule in self.rules:
             if rule.action == R.PROTECT or rule.window not in self.frames:
@@ -532,8 +541,8 @@ class _Login:
                     # Кампания, названная в only, но остановленная или не того типа, идёт
                     # дальше к проверке пригодности: человек должен увидеть отказ, а не
                     # тишину, — как у where:"seen".
-                    targets = [cid for cid in (sorted(rule.only) if rule.only else live_ids)
-                               if cid not in rule.except_]
+                    pool = sorted(rule.only & owned) if rule.only else live_ids
+                    targets = [cid for cid in pool if cid not in rule.except_]
                 else:
                     targets = [row.campaign_id]
                 for cid in targets:
