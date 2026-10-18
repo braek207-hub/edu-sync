@@ -240,11 +240,12 @@ def test_month_chunks():
 def test_short_error_strips_tokens():
     exc = RuntimeError(
         f"Direct API error: {TOKEN} v1.AbC-12_x.YZ refresh=y0_other "
-        "client_secret=s3cr3tValue&x=1 {\"client_secret\": \"jsonSecret\"} " + "z" * 1000
+        "client_secret=s3cr3tValue&x=1 {\"client_secret\": \"jsonSecret\"} "
+        "AQAAAAOLDaccess-1_x 1:OLDrefresh.abc:defghijklmnopqrstuv " + "z" * 1000
     )
     msg = run.short_error(exc)
     assert len(msg) <= 500
-    for secret in ("SECRETtoken123", "y0_other", "AbC-12_x", "s3cr3tValue", "jsonSecret"):
+    for secret in ("SECRETtoken123", "y0_other", "AbC-12_x", "s3cr3tValue", "jsonSecret", "OLDaccess", "OLDrefresh"):
         assert secret not in msg
     assert msg.startswith("Direct API error")
 
@@ -500,8 +501,46 @@ def test_backfill_resume_from_running(world):
     w = world(src(1, status="backfilling", backfill=job))
     assert queue(w, today=date(2026, 10, 21)) == 0  # границы — из сохранённых from/to
     assert [e[3:5] for e in w.fetches("direct")] == [("2026-09-01", "2026-09-30"), ("2026-10-01", "2026-10-18")]
-    assert [s[2]["chunks_done"] for s in w.events("backfill") if s[2]["state"] == "running"] == [3, 4]
+    # первый save — счётчик заходов перед первым куском
+    assert [s[2]["chunks_done"] for s in w.events("backfill") if s[2]["state"] == "running"] == [2, 3, 4]
     assert w.sources[1].backfill["state"] == "done"
+
+
+def test_attempts_incremented_on_start_and_resume(world):
+    w = world(src(1, status="new", backfill=history_job()))
+    queue(w)
+    assert w.events("backfill")[0][2]["attempts"] == 1
+    assert w.sources[1].backfill["attempts"] == 1
+
+    job = {
+        "state": "running", "kind": "history", "days": 90, "from": "2026-07-21", "to": "2026-10-18",
+        "chunks_total": 4, "chunks_done": 2, "attempts": 1,
+    }
+    w2 = world(src(1, status="backfilling", backfill=job))
+    queue(w2)
+    first = w2.events("backfill")[0]
+    assert first[2]["attempts"] == 2 and first[2]["chunks_done"] == 2
+    assert w2.log.index(first) < w2.log.index(w2.fetches()[0])
+    assert w2.log[w2.log.index(first) + 1] == ("commit",)
+
+    job.pop("attempts")
+    w3 = world(src(1, status="backfilling", backfill=job))
+    queue(w3)
+    assert w3.events("backfill")[0][2]["attempts"] == 1
+
+
+def test_running_job_fails_after_max_attempts(world):
+    job = {
+        "state": "running", "kind": "history", "days": 90, "from": "2026-07-21", "to": "2026-10-18",
+        "chunks_total": 4, "chunks_done": 2, "attempts": 3,
+    }
+    w = world(src(1, status="backfilling", backfill=job), src(2, backfill=refresh_job()))
+    assert queue(w) == 1
+    message = "История прервалась 3 раза подряд — запустите заново"
+    assert w.sources[1].backfill["state"] == "failed" and w.sources[1].backfill["error"] == message
+    assert w.events("error") == [("error", 1, message)]
+    assert [e for e in w.fetches() if e[2] == "login1"] == []
+    assert w.sources[2].backfill["state"] == "done"
 
 
 def test_backfill_picks_request_arrived_mid_run(world):

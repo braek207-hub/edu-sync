@@ -28,6 +28,7 @@ from sync.projects.store import Source
 DAILY_DAYS = 7
 BACKFILL_DAYS = 90
 SOURCE_BUDGET_SEC = 1200
+MAX_JOB_ATTEMPTS = 3  # прерванное (процесс убит на середине) задание резюмируется не больше стольких раз
 
 MSK = timezone(timedelta(hours=3))
 METRIKA_401 = "Metrica API error 401"  # префикс RuntimeError из sync/bjorn/common.py _metrica_stat_page
@@ -36,6 +37,8 @@ ERROR_MAX = 500
 _SECRET_PATTERNS = (
     (re.compile(r"y0_\S+"), "y0_***"),
     (re.compile(r"v1\.[\w.-]+"), "v1.***"),
+    (re.compile(r"AQAAAA[\w-]+"), "AQAAAA***"),  # старый access-токен Яндекса
+    (re.compile(r"\b1:[\w.:-]{20,}"), "1:***"),  # старый refresh-токен Яндекса
     (re.compile(r"""(client_secret["']?\s*[:=]\s*["']?)[^"'&\s,}]+"""), r"\1***"),
 )
 _JOB_DAYS = {"history": BACKFILL_DAYS, "refresh": DAILY_DAYS}
@@ -210,7 +213,8 @@ def _start_job(conn, source: Source, job: dict, yesterday: date) -> dict:
     if not isinstance(days, int) or isinstance(days, bool) or days < 1:
         raise ValueError(f"Некорректная глубина задания: {days}")
     job = {k: v for k, v in job.items() if k not in ("error", "finished_at")}
-    job.update(state="running", kind=kind, days=days, chunks_done=0, started_at=_now_iso())
+    attempts = int(job.get("attempts", 0)) + 1
+    job.update(state="running", kind=kind, days=days, chunks_done=0, started_at=_now_iso(), attempts=attempts)
     job["from"] = (yesterday - timedelta(days=days - 1)).isoformat()
     job["to"] = yesterday.isoformat()
     job["chunks_total"] = len(_job_chunks(job))
@@ -224,6 +228,21 @@ def _run_job(conn, source: Source, *, yesterday: date, key_b64: str) -> bool:
     try:
         if job.get("state") == "queued":
             job = _start_job(conn, source, job, yesterday)
+        else:
+            # Процесс, убитый на середине куска, оставляет running без записи о причине: считаем заходы,
+            # иначе задание, которое каждый раз роняет процесс, резюмировалось бы вечно.
+            attempts = int(job.get("attempts", 0))
+            if attempts >= MAX_JOB_ATTEMPTS:
+                message = f"История прервалась {MAX_JOB_ATTEMPTS} раза подряд — запустите заново"
+                log("queue", f"источник {source.id} ({source.slug}/{source.kind}): {message}")
+                job.update(state="failed", error=message, finished_at=_now_iso())
+                store.save_backfill(conn, source.id, job)
+                store.mark_error(conn, source.id, message)
+                conn.commit()
+                return False
+            job["attempts"] = attempts + 1
+            store.save_backfill(conn, source.id, job)
+            conn.commit()
         chunks = _job_chunks(job)
         for i in range(int(job.get("chunks_done", 0)), len(chunks)):
             chunk_from, chunk_to = (d.isoformat() for d in chunks[i])

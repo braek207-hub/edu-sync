@@ -56,7 +56,29 @@ def _load(conn, where: str, slug: str | None) -> list[Source]:
 
 
 def load_daily_sources(conn, slug: str | None = None) -> list[Source]:
-    return _load(conn, "status IN ('ok','error')", slug)
+    """Источники для ночного прогона.
+
+    reconnect берём: статус снимается переподключением аккаунта, а mark_ok вернёт источнику ok.
+    Но только при ya.status = 'ok' — иначе каждую ночь впустую стучимся с мёртвым токеном.
+    Источник без загруженной истории (last_synced_at IS NULL) ночью не трогаем: 7 дней
+    без остальной истории и mark_ok оставили бы дыру, которую уже не видно по статусу.
+    Давно не грузившиеся идут первыми — при общем бюджете им достанется время.
+    """
+    q = (
+        "SELECT ps.id, ps.dashboard_slug AS slug, ps.kind, ps.external_id,"
+        " ps.yandex_account_id AS account_id, ps.settings, ps.status, ps.backfill"
+        " FROM project_sources ps JOIN yandex_accounts ya ON ya.id = ps.yandex_account_id"
+        " WHERE ps.status IN ('ok','error','reconnect') AND ya.status = 'ok'"
+        " AND ps.last_synced_at IS NOT NULL"
+    )
+    args: list = []
+    if slug is not None:
+        q += " AND ps.dashboard_slug = %s"
+        args.append(slug)
+    q += " ORDER BY ps.last_synced_at NULLS FIRST, ps.id"
+    with conn.cursor() as cur:
+        cur.execute(q, args)
+        return [Source(*r) for r in cur.fetchall()]
 
 
 def load_queued_sources(conn, slug: str | None = None) -> list[Source]:

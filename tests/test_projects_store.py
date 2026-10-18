@@ -145,8 +145,14 @@ def test_load_sources_maps_columns_and_filters():
     got = S.load_daily_sources(conn, "acme")
     assert got == [S.Source(1, "acme", "direct", "lg", 3, {"a": 1}, "ok", None)]
     q, args = conn.log[0][1], conn.log[0][2]
-    assert "dashboard_slug AS slug" in q and "yandex_account_id AS account_id" in q
-    assert "status IN ('ok','error')" in q and q.endswith("ORDER BY id") and args == ["acme"]
+    assert "ps.dashboard_slug AS slug" in q and "ps.yandex_account_id AS account_id" in q
+    assert "JOIN yandex_accounts ya ON ya.id = ps.yandex_account_id" in q
+    assert "ps.status IN ('ok','error','reconnect')" in q and "ya.status = 'ok'" in q
+    assert "ps.last_synced_at IS NOT NULL" in q and "ps.dashboard_slug = %s" in q
+    assert q.endswith("ORDER BY ps.last_synced_at NULLS FIRST, ps.id") and args == ["acme"]
+    conn_all = Conn()
+    S.load_daily_sources(conn_all)
+    assert "ps.dashboard_slug = %s" not in conn_all.log[0][1] and conn_all.log[0][2] == []
     conn2 = Conn()
     S.load_queued_sources(conn2)
     assert "backfill->>'state' IN ('queued','running')" in conn2.log[0][1] and conn2.log[0][2] == []
