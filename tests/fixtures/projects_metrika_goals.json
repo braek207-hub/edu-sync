@@ -1,0 +1,187 @@
+[
+  {
+    "dimensions": [
+      {
+        "name": "2026-10-17"
+      },
+      {
+        "icon_id": "0",
+        "icon_type": "traffic-source",
+        "name": "Прямые заходы",
+        "id": "direct"
+      },
+      {
+        "name": null,
+        "url": null
+      },
+      {
+        "name": null
+      },
+      {
+        "name": null
+      },
+      {
+        "name": null
+      },
+      {
+        "id": null,
+        "owner": null,
+        "name": null,
+        "direct_id": null
+      }
+    ],
+    "metrics": [
+      153.0,
+      3899.0,
+      56664.0
+    ]
+  },
+  {
+    "dimensions": [
+      {
+        "name": "2026-10-17"
+      },
+      {
+        "icon_id": "2",
+        "icon_type": "traffic-source",
+        "name": "Переходы из поисковых систем",
+        "id": "organic"
+      },
+      {
+        "name": "Google",
+        "url": null
+      },
+      {
+        "name": null
+      },
+      {
+        "name": null
+      },
+      {
+        "name": null
+      },
+      {
+        "id": null,
+        "owner": null,
+        "name": null,
+        "direct_id": null
+      }
+    ],
+    "metrics": [
+      136.0,
+      3900.0,
+      52483.0
+    ]
+  },
+  {
+    "dimensions": [
+      {
+        "name": "2026-10-17"
+      },
+      {
+        "icon_id": "3",
+        "icon_type": "traffic-source",
+        "name": "Переходы по рекламе",
+        "id": "ad"
+      },
+      {
+        "name": "Яндекс: Директ",
+        "url": null
+      },
+      {
+        "name": "ya.direct"
+      },
+      {
+        "name": "cpc"
+      },
+      {
+        "name": "118498117"
+      },
+      {
+        "id": "218498117",
+        "owner": "1",
+        "name": "Смарт Баннеры Ретаргет. CPO 2",
+        "direct_id": "N-118498117"
+      }
+    ],
+    "metrics": [
+      33.0,
+      657.0,
+      10186.0
+    ]
+  },
+  {
+    "dimensions": [
+      {
+        "name": "2026-10-17"
+      },
+      {
+        "icon_id": "3",
+        "icon_type": "traffic-source",
+        "name": "Переходы по рекламе",
+        "id": "ad"
+      },
+      {
+        "name": "Яндекс: Директ",
+        "url": null
+      },
+      {
+        "name": "ya.direct"
+      },
+      {
+        "name": "cpc"
+      },
+      {
+        "name": "703083615"
+      },
+      {
+        "id": "703083615",
+        "owner": "1",
+        "name": "МОБ. Поиск. Бренд. WEB to APP.",
+        "direct_id": "N-703083615"
+      }
+    ],
+    "metrics": [
+      32.0,
+      1353.0,
+      17895.0
+    ]
+  },
+  {
+    "dimensions": [
+      {
+        "name": "2026-10-17"
+      },
+      {
+        "icon_id": "3",
+        "icon_type": "traffic-source",
+        "name": "Переходы по рекламе",
+        "id": "ad"
+      },
+      {
+        "name": "Яндекс: Директ",
+        "url": null
+      },
+      {
+        "name": "ya.direct"
+      },
+      {
+        "name": "cpc"
+      },
+      {
+        "name": "703083618"
+      },
+      {
+        "id": "703083618",
+        "owner": "1",
+        "name": "МОБ. Поиск. Бренд. Удержание APP.",
+        "direct_id": "N-703083618"
+      }
+    ],
+    "metrics": [
+      31.0,
+      621.0,
+      6546.0
+    ]
+  }
+]
