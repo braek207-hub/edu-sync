@@ -7,7 +7,7 @@
 
 import json
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterator, List, Optional, Sequence
 
 import psycopg2.extras
@@ -41,32 +41,57 @@ def _dict_cursor(conn):
     return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
-def load_project_modules(slug: str) -> List[dict]:
-    """Только включённые модули: off раннер не трогает."""
+def load_project_modules(slug: str, include_off: bool = False) -> List[dict]:
+    """По умолчанию только включённые модули: off раннер не трогает. include_off — для
+    репетиции, которая гоняет явно названный модуль с его сохранёнными настройками."""
     with db.get_connection() as conn, _dict_cursor(conn) as cur:
         cur.execute(
             "SELECT module_key, mode, settings, run_requested_at FROM project_modules "
-            "WHERE dashboard_slug = %s AND mode <> 'off' ORDER BY module_key", (slug,))
+            "WHERE dashboard_slug = %s AND (%s OR mode <> 'off') ORDER BY module_key",
+            (slug, include_off))
         return [dict(r) for r in cur.fetchall()]
 
 
 def last_run_started(slug: str, module_key: str,
                      statuses: Optional[Sequence[str]] = None) -> Optional[datetime]:
-    """Старт последнего прогона; statuses сужает до завершённых этими статусами."""
+    """Старт последнего скана; statuses сужает до завершённых этими статусами.
+
+    Строки фазы применения (summary.phase = 'apply') не сканы: иначе применение утром
+    закрыло бы суточный скан, а ручной запуск, поставленный до него, потерялся бы.
+    """
     st = list(statuses) if statuses else None
     with db.get_connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT max(started_at) FROM module_runs "
                     "WHERE dashboard_slug = %s AND module_key = %s "
-                    "AND (%s::text[] IS NULL OR status = ANY(%s))",
+                    "AND (%s::text[] IS NULL OR status = ANY(%s)) "
+                    "AND summary->>'phase' IS DISTINCT FROM 'apply'",
                     (slug, module_key, st, st))
         return cur.fetchone()[0]
 
 
-def start_run(slug: str, module_key: str, mode: str) -> int:
+def start_run(slug: str, module_key: str, mode: str, phase: Optional[str] = None) -> int:
+    """phase пишется в summary сразу: убитая на полпути строка применения не станет «сканом»."""
     with db.get_connection() as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO module_runs (dashboard_slug, module_key, mode) "
-                    "VALUES (%s, %s, %s) RETURNING id", (slug, module_key, mode))
+        cur.execute("INSERT INTO module_runs (dashboard_slug, module_key, mode, summary) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    (slug, module_key, mode, _json({"phase": phase} if phase else {})))
         return cur.fetchone()[0]
+
+
+def fail_stale_runs(slug: str, older_than: timedelta) -> int:
+    """Прогоны проекта, оставшиеся «идёт» дольше older_than, закрыть как прерванные.
+
+    Зовётся под замком проекта; статуса failed в CHECK нет — пишем error.
+    """
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE module_runs SET status = 'error', finished_at = now(), "
+            "summary = summary || jsonb_build_object('reason', 'прерван'), "
+            "error = coalesce(error, 'прогон прерван: не завершился за ' || %s || ' мин') "
+            "WHERE dashboard_slug = %s AND status = 'running' "
+            "AND started_at < now() - make_interval(secs => %s)",
+            (int(older_than.total_seconds() // 60), slug, older_than.total_seconds()))
+        return cur.rowcount
 
 
 def finish_run(run_id: int, status: str, summary: dict, error: Optional[str] = None) -> None:
@@ -121,8 +146,10 @@ def apply_reconciled(slug: str, module_key: str, run_id: int, r: Reconciled) -> 
                 "title, details, action) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT DO NOTHING RETURNING id",
+                # пустая строка — «нет значения»: NULL, иначе подписи-заглушки Panda (??) молчат
                 (slug, module_key, run_id, fingerprint(module_key, f), f.rule, f.severity,
-                 f.login, f.campaign_id, f.campaign_name, f.object_type, f.object_id, f.title,
+                 f.login or None, f.campaign_id, f.campaign_name or None,
+                 f.object_type or None, f.object_id, f.title,
                  _json(f.details), _json(f.action) if f.action is not None else None))
             row = cur.fetchone()
             if row:
@@ -176,14 +203,26 @@ def approve_auto(slug: str, module_key: str, ids: Sequence[int]) -> List[int]:
 
     decided_at/decided_by не пишем: это след решения человека; итог применения
     запишет set_outcome в outcome_at.
+
+    Действие, которое человек хоть раз откатил (rolled_back в истории, за любой срок), сам
+    раннер больше не одобряет: после окна подавления оно возвращается только предложением,
+    и одобрить его может лишь человек. Тождество действия — как lifecycle._action_key.
     """
     if not ids:
         return []
     with db.get_connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "UPDATE module_findings SET status = 'approved' "
-            "WHERE dashboard_slug = %s AND module_key = %s AND id = ANY(%s) "
-            "AND status = 'open' AND action IS NOT NULL RETURNING id",
+            "UPDATE module_findings f SET status = 'approved' "
+            "WHERE f.dashboard_slug = %s AND f.module_key = %s AND f.id = ANY(%s) "
+            "AND f.status = 'open' AND f.action IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM module_findings h "
+            "  WHERE h.dashboard_slug = f.dashboard_slug AND h.module_key = f.module_key "
+            "    AND h.status = 'rolled_back' "
+            "    AND coalesce(h.login, '') = coalesce(f.login, '') "
+            "    AND h.campaign_id IS NOT DISTINCT FROM f.campaign_id "
+            "    AND coalesce(h.object_id, '') = coalesce(f.object_id, '') "
+            "    AND h.action->>'op' IS NOT DISTINCT FROM f.action->>'op') "
+            "RETURNING f.id",
             (slug, module_key, list(ids)))
         return [r[0] for r in cur.fetchall()]
 

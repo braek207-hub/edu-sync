@@ -6,7 +6,7 @@ DATABASE_URL здесь не годится: в развёрнутых окру�
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import psycopg2
 import pytest
@@ -205,3 +205,81 @@ def test_last_run_started_filters_by_status(live):
     good = store.start_run(SLUG, "queries", "report")
     store.finish_run(good, "skipped", {})
     assert store.last_run_started(SLUG, "queries", ("ok", "skipped")) is not None
+
+
+def test_apply_phase_rows_are_not_scans(live):
+    scan = store.start_run(SLUG, "queries", "approve")
+    store.finish_run(scan, "ok", {"findings": 0})
+    live.execute("UPDATE module_runs SET started_at = now() - interval '1 day' WHERE id = %s",
+                 (scan,))
+    applied = store.start_run(SLUG, "queries", "approve", phase="apply")
+    live.execute("SELECT summary->>'phase' FROM module_runs WHERE id = %s", (applied,))
+    assert live.fetchone()[0] == "apply"
+    store.finish_run(applied, "ok", {"phase": "apply", "apply": {"applied": 1}})
+    live.execute("SELECT started_at FROM module_runs WHERE id = %s", (scan,))
+    scan_started = live.fetchone()[0]
+    assert store.last_run_started(SLUG, "queries") == scan_started
+    assert store.last_run_started(SLUG, "queries", ("ok", "skipped")) == scan_started
+
+
+def test_stale_running_runs_marked_interrupted(live):
+    old = store.start_run(SLUG, "audit", "report")
+    fresh = store.start_run(SLUG, "audit", "report", phase="apply")
+    done = store.start_run(SLUG, "audit", "report")
+    store.finish_run(done, "ok", {})
+    live.execute("UPDATE module_runs SET started_at = now() - interval '81 minutes' "
+                 "WHERE id IN (%s, %s)", (old, done))
+    assert store.fail_stale_runs(SLUG, timedelta(minutes=80)) == 1
+    live.execute("SELECT id, status, summary->>'reason', finished_at IS NOT NULL, error "
+                 "FROM module_runs WHERE id IN (%s, %s, %s) ORDER BY id", (old, fresh, done))
+    rows = live.fetchall()
+    assert rows[0][:4] == (old, "error", "прерван", True) and "80 мин" in rows[0][4]
+    assert rows[1][1] == "running" and rows[2][1] == "ok"
+    # день прерванный прогон не закрывает
+    assert store.last_run_started(SLUG, "audit", ("ok", "skipped")) is not None
+    assert store.fail_stale_runs("__other_slug__", timedelta(minutes=80)) == 0
+
+
+def test_auto_never_reapproves_human_rolled_back_action(live):
+    run = store.start_run(SLUG, "placements", "auto")
+    fid = _insert_applied(run, _f("a.ru"))
+    live.execute("UPDATE module_findings SET status = 'applied' WHERE id = %s", (fid,))
+    store.request_rollback(SLUG, "placements", ["a.ru"])
+    assert store.set_outcome(fid, "rolled_back", ApplyResult(ok=True, response={}), rollback=True)
+    # окно подавления давно прошло — находка вернулась предложением под другим правилом
+    live.execute("UPDATE module_findings SET outcome_at = now() - interval '40 days' "
+                 "WHERE id = %s", (fid,))
+    back = _f("a.ru")
+    back.rule = "spam"
+    other = _f("b.ru")
+    again = store.apply_reconciled(SLUG, "placements", run, Reconciled(insert=[back, other]))
+    assert len(again) == 2
+    assert store.approve_auto(SLUG, "placements", again) == [again[1]]
+    live.execute("SELECT status FROM module_findings WHERE id = %s", (again[0],))
+    assert live.fetchone()[0] == "open"
+    # человек одобряет сам — это его решение, раннер его применит
+    live.execute("UPDATE module_findings SET status = 'approved' WHERE id = %s", (again[0],))
+    assert again[0] in [p.id for p in store.pending(SLUG)]
+
+
+def test_empty_strings_are_stored_as_null(live):
+    run = store.start_run(SLUG, "audit", "report")
+    f = Finding(rule="proj", severity="info", title="t", login="", campaign_id=None,
+                campaign_name="", object_type="", object_id="x", details={})
+    (fid,) = store.apply_reconciled(SLUG, "audit", run, Reconciled(insert=[f]))
+    live.execute("SELECT login, campaign_name, object_type FROM module_findings WHERE id = %s",
+                 (fid,))
+    assert live.fetchone() == (None, None, None)
+    (back,) = [s for s in store.existing_findings(SLUG, "audit") if s.id == fid]
+    assert (back.login, back.campaign_name, back.object_type) == ("", "", "")
+    # находка уровня проекта с login NULL по-прежнему закрывается прочитанным прогоном
+    now = datetime.now(timezone.utc)
+    assert reconcile("audit", [back], [], now, ["acc"]).resolve == [fid]
+
+
+def test_load_project_modules_include_off(live):
+    live.execute("INSERT INTO project_modules (dashboard_slug, module_key, mode, settings) "
+                 "VALUES (%s, 'queries', 'off', '{\"max_per_run\": 7}')", (SLUG,))
+    assert store.load_project_modules(SLUG) == []
+    (row,) = store.load_project_modules(SLUG, include_off=True)
+    assert row["mode"] == "off" and row["settings"] == {"max_per_run": 7}

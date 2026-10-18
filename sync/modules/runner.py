@@ -19,6 +19,12 @@ RETRY_AFTER = timedelta(hours=2)
 # Сутки закрывает только прогон, дошедший до конца; error день не закрывает.
 DONE_STATUSES = ("ok", "skipped")
 WRITE_MODES = ("approve", "auto")
+# Откат — снятие нашей же записи по просьбе человека: выполняется и в report, но не в off.
+ROLLBACK_MODES = ("report", "approve", "auto")
+# Строка module_runs фазы применения: её не считают сканом ни расписание, ни ручной запуск.
+APPLY_PHASE = "apply"
+# Юнит модулей ограничен 40 минутами; «идёт» вдвое дольше — прогон убит и уже не завершится.
+STALE_RUN_AFTER = timedelta(minutes=80)
 EDU_LOCK_LINE = "агент EDU включён — запись у него"
 
 
@@ -72,16 +78,17 @@ def _ctx(slug, mkey, mode, raw_settings, accts, now, log) -> Context:
 
 
 def _safe_call(fn, ctx, items, log, what):
-    """Результат модуля по id; сбой или не-словарь превращаем в отказ для каждой находки."""
+    """Результат модуля по id и текст сбоя (None — сбоя не было); сбой или не-словарь
+    превращаем в отказ для каждой находки."""
     try:
         res = fn(ctx, items)
         if isinstance(res, dict):
-            return res, False
+            return res, None
         err = "модуль вернул %s вместо словаря результатов" % type(res).__name__
     except Exception as exc:
         err = "%s: %s" % (type(exc).__name__, exc)
     log("[%s] ошибка: %s" % (what, err))
-    return {f.id: ApplyResult(False, {}, err) for f in items}, True
+    return {f.id: ApplyResult(False, {}, err) for f in items}, err
 
 
 def _record(store, f, res, rollback, st, log) -> None:
@@ -97,44 +104,73 @@ def _record(store, f, res, rollback, st, log) -> None:
         log("находка %s: статус изменился во время применения" % f.id)
 
 
-def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line):
-    """Одобренное применяем, запрошенный откат снимаем. Вернуть (счётчики по модулям, были сбои)."""
-    stats: Dict[str, dict] = {}
+def _wanted(f: StoredFinding, mode: str) -> bool:
+    """Откат — явная отмена человека и всегда в безопасную сторону (снимает нашу же запись),
+    поэтому идёт и в report; одобренное пишется в Директ только в approve/auto."""
+    if f.status == "rollback_requested":
+        return mode in ROLLBACK_MODES
+    return mode in WRITE_MODES
+
+
+def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line) -> bool:
+    """Одобренное применяем, запрошенный откат снимаем; True — были сбои.
+
+    Каждый модуль, у которого была работа, получает свою строку module_runs с
+    summary.phase = "apply": queries и audit сканируются раз в сутки, и без неё итог
+    применения не попал бы ни в один прогон.
+    """
     failed = False
-    # модуль в off/report: его находки остаются как есть
-    writable = {r["module_key"]: r for r in rows if r["mode"] in WRITE_MODES}
+    # rows — только включённые модули: в off находки остаются как есть
+    by_key = {r["module_key"]: r for r in rows}
     pend: Dict[str, List[StoredFinding]] = {}
     for f in store.pending(slug):
         mkey = f.fingerprint.split(":", 1)[0]
-        if mkey in writable:
+        row = by_key.get(mkey)
+        if row is not None and _wanted(f, row["mode"]):
             pend.setdefault(mkey, []).append(f)
     if pend and lock_line:
         log("запись заблокирована: %s" % lock_line)
-        return stats, failed
+        return failed
     for mkey, items in pend.items():
         module = modules.get(mkey)
         if module is None or not accts:
             log("[%s] ждёт применения %d находок, но %s" % (
                 mkey, len(items), "модуль не реализован" if module is None else "нет кабинетов"))
             continue
-        row = writable[mkey]
-        ctx = _ctx(slug, mkey, row["mode"], row.get("settings"), accts, now, log)
-        st = stats.setdefault(mkey, {})
+        parts = []
         for rollback in (False, True):
             part = [f for f in items if (f.status == "rollback_requested") == rollback]
             fn = getattr(module, "rollback" if rollback else "apply", None)
-            if not part or fn is None:
-                continue
-            results, bad = _safe_call(fn, ctx, part, log,
-                                      "%s.%s" % (mkey, "rollback" if rollback else "apply"))
-            if bad:
-                failed = True
-                st["errors"] = st.get("errors", 0) + 1
-            for f in part:
-                res = results.get(f.id) or ApplyResult(False, {}, "модуль не вернул результат")
-                _record(store, f, res, rollback, st, log)
+            if part and fn is not None:
+                parts.append((rollback, fn, part))
+        if not parts:
+            continue
+        row = by_key[mkey]
+        ctx = _ctx(slug, mkey, row["mode"], row.get("settings"), accts, now, log)
+        run_id = store.start_run(slug, mkey, row["mode"], phase=APPLY_PHASE)
+        st: dict = {}
+        errors: List[str] = []
+        try:
+            for rollback, fn, part in parts:
+                results, err = _safe_call(fn, ctx, part, log,
+                                          "%s.%s" % (mkey, "rollback" if rollback else "apply"))
+                if err is not None:
+                    # не "errors": это имя у модулей занято списком строк по кабинетам
+                    st["apply_errors"] = st.get("apply_errors", 0) + 1
+                    errors.append(err)
+                for f in part:
+                    res = results.get(f.id) or ApplyResult(False, {}, "модуль не вернул результат")
+                    _record(store, f, res, rollback, st, log)
+        except Exception as exc:
+            errors.append("%s: %s" % (type(exc).__name__, exc))
+            store.finish_run(run_id, "error", {"phase": APPLY_PHASE, "apply": st},
+                             error="; ".join(errors))
+            raise
         log("[%s] применение: %s" % (mkey, st))
-    return stats, failed
+        store.finish_run(run_id, "error" if errors else "ok", {"phase": APPLY_PHASE, "apply": st},
+                         error="; ".join(errors) or None)
+        failed = failed or bool(errors)
+    return failed
 
 
 def _auto_apply(slug, mkey, module, ctx, store, fresh, confirmed, log):
@@ -147,25 +183,31 @@ def _auto_apply(slug, mkey, module, ctx, store, fresh, confirmed, log):
         return out, False
     cand = [f.id for f in fresh if f.id in confirmed and f.status == "open"
             and f.action is not None]
+    # approve_auto не одобряет то, что человек уже откатывал: оно ждёт его решения
     ids = set(store.approve_auto(slug, mkey, cand)) if cand else set()
+    if len(ids) < len(cand):
+        out["held"] = len(cand) - len(ids)
     items = [dataclasses.replace(f, status="approved") for f in fresh if f.id in ids]
     if not items:
         return out, False
-    results, bad = _safe_call(module.apply, ctx, items, log, "%s.apply" % mkey)
+    results, err = _safe_call(module.apply, ctx, items, log, "%s.apply" % mkey)
     for f in items:
         res = results.get(f.id) or ApplyResult(False, {}, "модуль не вернул результат")
         _record(store, f, res, False, out, log)
-    return out, bad
+    return out, err is not None
 
 
 def _dry_run(slug, store, accts, modules, now, only, log) -> int:
     """Чтение базы можно (настройки проекта), запись и замок — нет."""
     try:
-        rows = store.load_project_modules(slug)
+        rows = store.load_project_modules(slug, include_off=True)
         if only:
-            # явно названный модуль гоняем, даже если в проекте он выключен
+            # явно названный модуль гоняем, даже если в проекте он выключен, — со своими
+            # сохранёнными настройками, а не умолчаниями
             by_key = {r["module_key"]: r for r in rows}
             rows = [by_key.get(only) or {"module_key": only, "settings": None}]
+        else:
+            rows = [r for r in rows if r["mode"] != "off"]
     except Exception as err:
         log("предупреждение: настройки проекта не прочитаны (%s: %s), беру умолчания"
             % (type(err).__name__, err))
@@ -200,14 +242,17 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
         if not got:
             log("проект %s: уже идёт" % slug)
             return 0
+        # убитый прогон (OOM, таймаут юнита) так и остался бы «идёт» навсегда
+        stale = store.fail_stale_runs(slug, STALE_RUN_AFTER)
+        if stale:
+            log("прерванных прогонов закрыто: %d" % stale)
         accts, why = accounts(slug)
         rows = [r for r in store.load_project_modules(slug)
                 if not only or r["module_key"] == only]
         if only and not rows:
             log("модуль %s выключен" % only)
         lock_line = agent_lock_fn(slug)
-        stats, apply_failed = _apply_phase(slug, store, rows, modules, accts, now, log, lock_line)
-        rc = 1 if apply_failed else 0
+        rc = 1 if _apply_phase(slug, store, rows, modules, accts, now, log, lock_line) else 0
         for row in rows:
             mkey, mode = row["module_key"], row["mode"]
             if not is_due(mkey, store.last_run_started(slug, mkey, DONE_STATUSES),
@@ -241,7 +286,6 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                     summary["unverified"] = by_login
                 summary.update(findings=len(out.findings), inserted=len(rec.insert),
                                resolved=len(rec.resolve), expired=len(rec.expire))
-                summary.update(stats.get(mkey, {}))
                 if lock_line and mode in WRITE_MODES:
                     summary["agent_lock"] = lock_line
                 elif mode == "auto":

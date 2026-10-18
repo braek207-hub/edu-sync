@@ -44,16 +44,20 @@ class FakeStore:
         self.calls.append(("lock", slug))
         yield self.lock
 
-    def load_project_modules(self, slug):
+    def load_project_modules(self, slug, include_off=False):
         self.calls.append(("load", slug))
-        return self.rows
+        return [r for r in self.rows if include_off or r["mode"] != "off"]
+
+    def fail_stale_runs(self, slug, older_than):
+        self.calls.append(("fail_stale", older_than))
+        return 0
 
     def last_run_started(self, slug, mkey, statuses=None):
         return (self.last_ok if statuses else self.last_started).get(mkey)
 
-    def start_run(self, slug, mkey, mode):
+    def start_run(self, slug, mkey, mode, phase=None):
         rid = len(self.runs) + 1
-        self.runs[rid] = {"key": mkey, "mode": mode}
+        self.runs[rid] = {"key": mkey, "mode": mode, "phase": phase}
         self.calls.append(("start_run", mkey))
         return rid
 
@@ -427,3 +431,104 @@ def test_unverified_reaches_reconcile_and_summary(monkeypatch):
     _go(st, {"audit": m})
     assert seen == [[("login1", "ads_rejected")]]
     assert st.runs[1]["summary"]["unverified"] == {"login1": ["ads_rejected"]}
+
+
+# --- фаза применения пишет свою строку module_runs (I2) ---
+
+def _apply_rows(st):
+    return [r for r in st.runs.values() if r["phase"] == "apply"]
+
+
+def test_apply_recorded_even_when_scan_not_due():
+    m = FakeModule("queries")
+    st = FakeStore([_row("queries")], pending=[_stored(1, "approved", key="queries")])
+    st.last_started["queries"] = st.last_ok["queries"] = NOW - timedelta(hours=1)
+    assert _go(st, {"queries": m}) == 0
+    assert m.trace == [("apply", "queries")]  # скан не due, применение было
+    (row,) = st.runs.values()
+    assert row["phase"] == "apply" and row["status"] == "ok"
+    assert row["summary"] == {"phase": "apply", "apply": {"applied": 1}}
+
+
+def test_apply_errors_do_not_clobber_module_errors():
+    class ErrScan(BadApply):
+        def run(self, ctx):
+            return RunOutput(findings=[], summary={"errors": ["login2: Директ лёг"]})
+
+    st = FakeStore([_row()], pending=[_stored(1, "approved")])
+    assert _go(st, {"placements": ErrScan("placements")}) == 1
+    (apply_row,) = _apply_rows(st)
+    assert apply_row["status"] == "error" and "direct 500" in apply_row["error"]
+    assert apply_row["summary"]["apply"] == {"apply_errors": 1, "failed": 1}
+    scan = next(r for r in st.runs.values() if r["phase"] is None)
+    assert scan["summary"]["errors"] == ["login2: Директ лёг"]
+    assert "applied" not in scan["summary"] and "failed" not in scan["summary"]
+
+
+def test_no_work_no_apply_row():
+    st = FakeStore([_row(mode="report")], pending=[_stored(1, "approved")])
+    _go(st, {"placements": FakeModule("placements")})
+    assert _apply_rows(st) == []
+
+
+def test_skipped_changed_counted_in_apply_row():
+    st = FakeStore([_row()], pending=[_stored(2, "rollback_requested")])
+    st.outcome_ok = False
+    _go(st, {"placements": FakeModule("placements")})
+    (row,) = _apply_rows(st)
+    assert row["summary"]["apply"] == {"skipped_changed": 1}
+
+
+# --- откат в report выполняется, одобренное — нет; off не трогается (I3) ---
+
+def test_rollback_processed_in_report_but_approved_not_applied():
+    m = FakeModule("placements")
+    st = FakeStore([_row(mode="report")],
+                   pending=[_stored(1, "approved"), _stored(2, "rollback_requested", obj="b.ru")])
+    _go(st, {"placements": m})
+    assert m.rolled == [2] and m.applied == []
+    assert st.outcomes == [(2, "rolled_back", True)]
+    (row,) = _apply_rows(st)
+    assert row["mode"] == "report" and row["summary"]["apply"] == {"rolled_back": 1}
+
+
+def test_nothing_processed_in_off():
+    m = FakeModule("placements")
+    st = FakeStore([_row(mode="off")],
+                   pending=[_stored(1, "approved"), _stored(2, "rollback_requested", obj="b.ru")])
+    _go(st, {"placements": m})
+    assert m.trace == [] and st.outcomes == [] and st.runs == {}
+
+
+def test_rollback_in_report_still_respects_agent_lock():
+    m = FakeModule("placements")
+    st = FakeStore([_row(mode="report")], pending=[_stored(2, "rollback_requested")])
+    _go(st, {"placements": m}, agent_lock_fn=lambda slug: "агент EDU включён — запись у него")
+    assert m.rolled == [] and st.outcomes == []
+
+
+# --- убитый прогон закрывается при следующем старте проекта (M-e) ---
+
+def test_stale_runs_failed_under_lock_before_work():
+    st = FakeStore([_row()])
+    _go(st, {"placements": FakeModule("placements")})
+    assert st.calls[:2] == [("lock", "lime"), ("fail_stale", timedelta(minutes=80))]
+    st = FakeStore([_row()], lock=False)
+    _go(st, {"placements": FakeModule("placements")})
+    assert not any(c[0] == "fail_stale" for c in st.calls)
+
+
+# --- репетиция выключенного модуля берёт его сохранённые настройки (M-f) ---
+
+def test_dry_run_off_module_uses_saved_settings():
+    q = FakeModule("queries")
+    seen = []
+    orig = q.run
+    q.run = lambda ctx: (seen.append(ctx.settings["max_per_run"]), orig(ctx))[1]
+    st = FakeStore([_row("queries", mode="off", settings={"max_per_run": 17})])
+    rc, _logs = _dry(st, {"queries": q}, only="queries")
+    assert rc == 0 and seen == [17]
+    # без only выключенный модуль не гоняется
+    q2 = FakeModule("queries")
+    _dry(st, {"queries": q2})
+    assert q2.trace == []
