@@ -326,7 +326,11 @@ def test_unban_writes_only_with_apply(monkeypatch, capsys):
 
     assert placements_clean.main(["--unban", "A.ru", "--apply"]) == 0
     assert asked == [("edunetwork", "placements", ["a.ru"])]
-    assert "раннер не выполнит откат" in capsys.readouterr().out
+    # в report откат выполняется: предупреждать не о чем
+    assert "выключен" not in capsys.readouterr().out
+    monkeypatch.setattr(placements_clean.store, "load_project_modules", lambda slug: [])
+    assert placements_clean.main(["--unban", "A.ru", "--apply"]) == 0
+    assert "выключен — откат выполнится после включения" in capsys.readouterr().out
     assert calls == []
 
 
@@ -338,3 +342,14 @@ def test_unban_dry_run_db_failure_is_a_clear_line(monkeypatch, capsys):
     assert placements_clean.main(["--unban", "a.ru"]) == 1
     out = capsys.readouterr().out
     assert "база недоступна" in out and "нет соединения" in out
+
+
+def test_second_finding_same_site_same_campaign_is_a_named_duplicate(monkeypatch):
+    # одна площадка под двумя правилами в одной кампании: запись одна, вторая — дубль
+    fake = FakeDirect(monkeypatch, [_camp(1)])
+    second = dataclasses.replace(_stored(2, SITES[0]), rule="spam",
+                                 fingerprint="placements:spam:login1:1:%s" % SITES[0])
+    res = pm.apply(_ctx(), [_stored(1, SITES[0]), second])
+    assert res[1].ok
+    assert not res[2].ok and "дубль" in res[2].error
+    assert fake.writes == [(1, [SITES[0]])]

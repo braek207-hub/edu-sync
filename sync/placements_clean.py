@@ -22,7 +22,6 @@ from sync.placements.classify import normalize
 
 MODULE = "placements"
 DEFAULT_SLUG = "edunetwork"
-WRITE_MODES = ("approve", "auto")
 
 
 def _out(text: str = "") -> None:
@@ -49,10 +48,9 @@ def _warn_if_module_idle(slug: str) -> None:
     except Exception as err:
         _out("[%s] режим модуля не прочитан (%s)" % (slug, err))
         return
-    mode = (rows.get(MODULE) or {}).get("mode")
-    if mode not in WRITE_MODES:
-        _out("[%s] модуль %s в режиме %s: раннер не выполнит откат, пока модуль не "
-             "переведён в approve или auto" % (slug, MODULE, mode or "off"))
+    # откат раннер выполняет в report, approve и auto; не трогает только выключенный модуль
+    if MODULE not in rows:
+        _out("[%s] модуль %s выключен — откат выполнится после включения" % (slug, MODULE))
 
 
 def main(argv=None) -> int:

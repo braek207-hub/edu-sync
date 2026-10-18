@@ -260,7 +260,9 @@ def _apply_group(acc, cid, group) -> Dict[int, ApplyResult]:
             out[f.id] = ApplyResult(False, {"already_present": True, "site": site},
                                     "площадка уже запрещена в кампании — запрет не робота")
         elif site in to_add:
-            continue
+            # Вторая находка на ту же площадку: запись одна, засчитать её дважды нельзя
+            # (откат первой снял бы запрет, который «держит» и вторая).
+            out[f.id] = ApplyResult(False, {}, "дубль: та же площадка в этом применении")
         elif len(to_add) >= room:
             out[f.id] = ApplyResult(False, {}, "список запретов заполнен (%d из %d)"
                                     % (len(existing), limit))
