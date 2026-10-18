@@ -536,7 +536,7 @@ def test_running_job_fails_after_max_attempts(world):
     }
     w = world(src(1, status="backfilling", backfill=job), src(2, backfill=refresh_job()))
     assert queue(w) == 1
-    message = "История прервалась 3 раза подряд — запустите заново"
+    message = "Загрузка прервалась 3 раза подряд — запустите заново"
     assert w.sources[1].backfill["state"] == "failed" and w.sources[1].backfill["error"] == message
     assert w.events("error") == [("error", 1, message)]
     assert [e for e in w.fetches() if e[2] == "login1"] == []

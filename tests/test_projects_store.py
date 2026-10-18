@@ -149,7 +149,7 @@ def test_load_sources_maps_columns_and_filters():
     assert "JOIN yandex_accounts ya ON ya.id = ps.yandex_account_id" in q
     assert "ps.status IN ('ok','error','reconnect')" in q and "ya.status = 'ok'" in q
     assert "ps.last_synced_at IS NOT NULL" in q and "ps.dashboard_slug = %s" in q
-    assert q.endswith("ORDER BY ps.last_synced_at NULLS FIRST, ps.id") and args == ["acme"]
+    assert q.endswith("ORDER BY ps.updated_at, ps.id") and args == ["acme"]
     conn_all = Conn()
     S.load_daily_sources(conn_all)
     assert "ps.dashboard_slug = %s" not in conn_all.log[0][1] and conn_all.log[0][2] == []

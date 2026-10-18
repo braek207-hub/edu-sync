@@ -62,7 +62,8 @@ def load_daily_sources(conn, slug: str | None = None) -> list[Source]:
     Но только при ya.status = 'ok' — иначе каждую ночь впустую стучимся с мёртвым токеном.
     Источник без загруженной истории (last_synced_at IS NULL) ночью не трогаем: 7 дней
     без остальной истории и mark_ok оставили бы дыру, которую уже не видно по статусу.
-    Давно не грузившиеся идут первыми — при общем бюджете им достанется время.
+    Порядок — по последней попытке (updated_at двигают и mark_ok, и mark_error): упавший ночью
+    источник уходит в хвост и не отнимает бюджет у здоровых каждую ночь.
     """
     q = (
         "SELECT ps.id, ps.dashboard_slug AS slug, ps.kind, ps.external_id,"
@@ -75,7 +76,7 @@ def load_daily_sources(conn, slug: str | None = None) -> list[Source]:
     if slug is not None:
         q += " AND ps.dashboard_slug = %s"
         args.append(slug)
-    q += " ORDER BY ps.last_synced_at NULLS FIRST, ps.id"
+    q += " ORDER BY ps.updated_at, ps.id"
     with conn.cursor() as cur:
         cur.execute(q, args)
         return [Source(*r) for r in cur.fetchall()]

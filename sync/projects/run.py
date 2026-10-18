@@ -233,7 +233,7 @@ def _run_job(conn, source: Source, *, yesterday: date, key_b64: str) -> bool:
             # иначе задание, которое каждый раз роняет процесс, резюмировалось бы вечно.
             attempts = int(job.get("attempts", 0))
             if attempts >= MAX_JOB_ATTEMPTS:
-                message = f"История прервалась {MAX_JOB_ATTEMPTS} раза подряд — запустите заново"
+                message = f"Загрузка прервалась {MAX_JOB_ATTEMPTS} раза подряд — запустите заново"
                 log("queue", f"источник {source.id} ({source.slug}/{source.kind}): {message}")
                 job.update(state="failed", error=message, finished_at=_now_iso())
                 store.save_backfill(conn, source.id, job)
