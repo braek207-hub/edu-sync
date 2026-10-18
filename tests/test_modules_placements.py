@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Модуль placements: находки из плана, запись с чтением обратно, откат, старый CLI."""
 
+import dataclasses
 from datetime import datetime, timezone
 
 import pytest
@@ -309,16 +310,31 @@ def test_unban_writes_only_with_apply(monkeypatch, capsys):
     monkeypatch.setattr(placements_clean.store, "request_rollback",
                         lambda *a, **k: asked.append(a) or 2)
     monkeypatch.setattr(placements_clean.store, "existing_findings",
-                        lambda slug, mod: [_stored(1, "a.ru"), _stored(2, "b.ru")])
+                        lambda slug, mod: [
+                            dataclasses.replace(_stored(1, "a.ru"), status="applied"),
+                            dataclasses.replace(_stored(2, "b.ru"), status="applied"),
+                            _stored(3, "a.ru", cid=2)])  # approved: в список не попадает
     monkeypatch.setattr(placements_clean.store, "load_project_modules",
                         lambda slug: [{"module_key": "placements", "mode": "report"}])
     assert placements_clean.main(["--unban", "Com.Block/"]) == 0
     assert placements_clean.main(["--unban", "a.ru", "--dry-run"]) == 0
     assert asked == []
     shown = capsys.readouterr().out
-    assert "a.ru" in shown and "b.ru" not in shown
+    assert "login1 / кампания 1 / a.ru" in shown
+    assert "кампания 2" not in shown and "b.ru" not in shown.split("затронуло бы:")[1]
+    assert "итого: 1" in shown
 
     assert placements_clean.main(["--unban", "A.ru", "--apply"]) == 0
     assert asked == [("edunetwork", "placements", ["a.ru"])]
     assert "раннер не выполнит откат" in capsys.readouterr().out
     assert calls == []
+
+
+def test_unban_dry_run_db_failure_is_a_clear_line(monkeypatch, capsys):
+    def boom(slug, mod):
+        raise RuntimeError("нет соединения")
+
+    monkeypatch.setattr(placements_clean.store, "existing_findings", boom)
+    assert placements_clean.main(["--unban", "a.ru"]) == 1
+    out = capsys.readouterr().out
+    assert "база недоступна" in out and "нет соединения" in out

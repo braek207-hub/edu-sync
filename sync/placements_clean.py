@@ -92,7 +92,12 @@ def main(argv=None) -> int:
             # самим роботом: ручные запреты директолога в них не входят.
             if not write:
                 _out("[%s] репетиция, в базу ничего не пишу; затронуло бы:" % slug)
-                hits = [f for f in store.existing_findings(slug, MODULE)
+                try:
+                    found = store.existing_findings(slug, MODULE)
+                except Exception as err:
+                    _out("[%s] база недоступна, список не получен: %s" % (slug, err))
+                    return 1
+                hits = [f for f in found
                         if f.status == "applied" and f.object_id in sites]
                 for f in hits:
                     _out("    %s / кампания %s / %s" % (f.login, f.campaign_id, f.object_id))
