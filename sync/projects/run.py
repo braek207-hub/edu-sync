@@ -103,10 +103,13 @@ def _metrika_plan(source: Source):
 
 
 def sync_source(conn, source: Source, date_from: str, date_to: str, *, key_b64: str, deadline: float) -> int:
-    """Перезаливает окно источника; не коммитит. Сначала токен (он коммитит) и все запросы
-    к Яндексу, потом записи — транзакция не висит открытой на время сети."""
+    """Перезаливает окно источника; записи окна не коммитит. Сначала токен и коммит, затем все
+    запросы к Яндексу, потом записи — транзакция не висит открытой на время сети."""
     _check_deadline(deadline, source)
     token = accounts.access_token(conn, source.account_id, key_b64=key_b64)
+    # access_token без обновления только читает и не коммитит: закрыть транзакцию SELECT'ов
+    # (замок, перечитывание, токен), чтобы на время сети не висел idle in transaction.
+    conn.commit()
 
     if source.kind == "direct":
         _check_deadline(deadline, source)
@@ -159,6 +162,11 @@ def run_daily(conn, *, today_msk: date, key_b64: str, slug: str | None = None) -
             log("daily", f"источник {source.id} занят, пропуск")
             continue
         try:
+            # Под замком перечитать: задание могли поставить после чтения списка. Его окно
+            # отработает очередь (история перекрывает ночные 7 дней) — ночной прогон не пишет поверх.
+            if any(s.id == source.id for s in store.load_queued_sources(conn, source.slug)):
+                log("daily", f"источник {source.id}: есть задание в очереди, пропуск")
+                continue
             deadline = time.monotonic() + SOURCE_BUDGET_SEC
             try:
                 n = sync_source(conn, source, *window, key_b64=key_b64, deadline=deadline)
@@ -179,15 +187,25 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _job_kind(job: dict) -> str:
+    kind = job.get("kind")
+    if kind is None:
+        raise ValueError("задание без kind")
+    if kind not in _JOB_DAYS:
+        raise ValueError(f"Неизвестный вид задания: {kind}")
+    return kind
+
+
 def _job_chunks(job: dict) -> list[tuple[date, date]]:
+    kind = _job_kind(job)
+    if not job.get("from") or not job.get("to"):
+        raise ValueError("задание без границ from/to")
     date_from, date_to = date.fromisoformat(job["from"]), date.fromisoformat(job["to"])
-    return month_chunks(date_from, date_to) if job["kind"] == "history" else [(date_from, date_to)]
+    return month_chunks(date_from, date_to) if kind == "history" else [(date_from, date_to)]
 
 
 def _start_job(conn, source: Source, job: dict, yesterday: date) -> dict:
-    kind = job.get("kind")
-    if kind not in _JOB_DAYS:
-        raise ValueError(f"Неизвестный вид задания: {kind}")
+    kind = _job_kind(job)
     days = job.get("days", _JOB_DAYS[kind])
     if not isinstance(days, int) or isinstance(days, bool) or days < 1:
         raise ValueError(f"Некорректная глубина задания: {days}")

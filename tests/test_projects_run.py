@@ -287,6 +287,34 @@ def test_daily_skips_locked_source(world, capsys):
     assert "источник 2 занят" in capsys.readouterr().out
 
 
+def test_daily_skips_source_with_queued_job(world, monkeypatch, capsys):
+    w = world(src(1), src(2), src(3, backfill={"state": "running", "kind": "refresh", "days": 7}))
+    real_lock = w.try_lock_source
+
+    def lock_after_queue(conn, sid):
+        # задание поставили уже после того, как ночной прогон прочитал список источников
+        if sid == 2:
+            w.sources[2].backfill = refresh_job()
+        return real_lock(conn, sid)
+
+    monkeypatch.setattr(store, "try_lock_source", lock_after_queue)
+    assert daily(w) == 0
+    assert [e[2] for e in w.fetches()] == ["login1"]
+    assert [e[1] for e in w.events("unlock")] == [1, 2, 3]
+    assert not w.events("error")
+    out = capsys.readouterr().out
+    assert "источник 2" in out and "источник 3" in out and "задание" in out
+
+
+def test_commit_after_token_before_first_fetch(world):
+    w = world(src(1, kind="metrika"))
+    run.sync_source(w.conn, w.sources[1], "2026-10-12", "2026-10-18", key_b64="KEY", deadline=time.monotonic() + 60)
+    names = [e[0] for e in w.log]
+    token_at, fetch_at = names.index("token"), names.index("fetch")
+    # SELECT'ы замка и токена не должны держать транзакцию открытой на время сети
+    assert "commit" in names[token_at:fetch_at]
+
+
 def test_daily_only_ok_and_error_sources_and_slug(world):
     w = world(
         src(1),
@@ -553,6 +581,20 @@ def test_queue_midwrite_failure_rolls_back_before_failed_state(world):
     assert names.index("rollback") < w.log.index(failed_save) < names.index("error")
     assert failed_save[2]["error"] == "deadlock detected"
     assert w.log[names.index("error") + 1] == ("commit",)
+
+
+@pytest.mark.parametrize("kind", [None, "everything"])
+def test_resume_running_without_valid_kind_fails_readably(world, kind):
+    job = {"state": "running", "days": 90, "from": "2026-07-21", "to": "2026-10-18", "chunks_total": 4, "chunks_done": 1}
+    if kind is not None:
+        job["kind"] = kind
+    w = world(src(1, status="backfilling", backfill=job))
+    assert queue(w) == 1
+    assert not w.fetches()
+    error = w.sources[1].backfill["error"]
+    assert w.sources[1].backfill["state"] == "failed"
+    assert error == ("задание без kind" if kind is None else "Неизвестный вид задания: everything")
+    assert w.events("error") == [("error", 1, error)]
 
 
 def test_queue_bad_job_kind_fails(world):
