@@ -159,3 +159,17 @@ def build_rows(raw: List[Dict[str, Any]], *, goals: List[int], by: str, currency
     # Порядок детерминирован и полезен лимиту записи: дорогие первыми.
     rows.sort(key=lambda r: (-r.metrics["cost"], r.campaign_id, r.object))
     return rows, invisible
+
+
+def _r2(value: Any) -> Optional[float]:
+    return None if value is None else round(float(value), 2)
+
+
+def finding_metrics(metrics: Dict[str, Any], account: Dict[str, Any]) -> dict:
+    """metrics и account строки -> details.metrics находки.
+
+    Два знака, как в журнале; None — не определено (нет базы или лиды неизвестны), а не 0."""
+    return {"clicks": int(metrics.get("clicks") or 0), "cost": _r2(metrics.get("cost") or 0.0),
+            "impressions": int(metrics.get("impressions") or 0), "leads": metrics.get("leads"),
+            "cr": _r2(metrics.get("cr")), "cpl": _r2(metrics.get("cpl")),
+            "account_cr": _r2(account.get("cr")), "account_cpl": _r2(account.get("cpl"))}
