@@ -2,6 +2,7 @@
 """Общий клиент Директа для модулей: отчёты, постраничное чтение, списки кампании."""
 
 import hashlib
+import http.client
 import json
 import time
 import urllib.error
@@ -68,7 +69,8 @@ def report_rows(token: str, login: str, params: dict, *, prefix: str,
     while True:
         try:
             status, hdrs, text = post(REPORTS, body, headers)
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as err:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError,
+                ConnectionError) as err:
             # Сеть моргнула: повтор под тем же именем, как и при 500.
             status, hdrs, text = None, {}, ""
             last_error = "сеть: %s" % err
