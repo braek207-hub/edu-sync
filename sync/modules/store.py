@@ -166,6 +166,23 @@ def set_outcome(finding_id: int, status: str, result: ApplyResult,
         return cur.rowcount == 1
 
 
+def approve_auto(slug: str, module_key: str, ids: Sequence[int]) -> List[int]:
+    """Режим auto: открытые находки с действием сразу одобряются самим раннером.
+
+    decided_at/decided_by не пишем: это след решения человека; итог применения
+    запишет set_outcome в outcome_at.
+    """
+    if not ids:
+        return []
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE module_findings SET status = 'approved' "
+            "WHERE dashboard_slug = %s AND module_key = %s AND id = ANY(%s) "
+            "AND status = 'open' AND action IS NOT NULL RETURNING id",
+            (slug, module_key, list(ids)))
+        return [r[0] for r in cur.fetchall()]
+
+
 def request_rollback(slug: str, module_key: str, object_ids: Sequence[str],
                      login: Optional[str] = None) -> int:
     """Откат по списку объектов (путь --unban): применённые -> rollback_requested."""

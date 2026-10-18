@@ -180,3 +180,18 @@ def test_rolled_back_and_failed_are_loaded_for_suppression(live):
                  "outcome_at = now() - interval '2 days' WHERE id = %s", (b,))
     ex = store.existing_findings(SLUG, "placements")
     assert [e.status for e in ex] == ["rolled_back"]
+
+
+def test_approve_auto_only_open_with_action_and_no_decision_trace(live):
+    run = store.start_run(SLUG, "placements", "auto")
+    ids = store.apply_reconciled(SLUG, "placements", run, Reconciled(
+        insert=[_f("a.ru"), _f("b.ru", action=False)]))
+    assert store.approve_auto(SLUG, "placements", []) == []
+    assert store.approve_auto(SLUG, "placements", ids) == [ids[0]]
+    # повторно и по чужому модулю не проходит
+    assert store.approve_auto(SLUG, "placements", ids) == []
+    assert store.approve_auto(SLUG, "queries", ids) == []
+    live.execute("SELECT status, decided_at, decided_by FROM module_findings WHERE id = %s",
+                 (ids[0],))
+    assert live.fetchone() == ("approved", None, None)
+    assert store.set_outcome(ids[0], "applied", ApplyResult(ok=True, response={}))
