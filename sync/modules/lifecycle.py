@@ -53,6 +53,13 @@ def _suppressed(s: StoredFinding, now: datetime) -> bool:
     return False
 
 
+def _action_key(f: Finding):
+    """Тот же шаг над тем же объектом, под любым правилом; у находок без action ключа нет."""
+    if f.action is None:
+        return None
+    return (f.login, f.campaign_id, f.object_id, f.action.get("op"))
+
+
 def reconcile(module_key: str, existing: List[StoredFinding],
               seen: List[Finding], now: datetime,
               scanned_logins: Optional[Collection[str]] = None) -> Reconciled:
@@ -63,6 +70,14 @@ def reconcile(module_key: str, existing: List[StoredFinding],
     by_fp: Dict[str, List[StoredFinding]] = {}
     for s in existing:
         by_fp.setdefault(s.fingerprint, []).append(s)
+
+    # отказ человека относится к действию, а не к имени правила: stop_word после отката
+    # word_zero_conv имеет другой fingerprint, но то же действие
+    by_action: Dict[tuple, List[StoredFinding]] = {}
+    for s in existing:
+        key = _action_key(s)
+        if key is not None:
+            by_action.setdefault(key, []).append(s)
 
     out = Reconciled()
     seen_fps = set()
@@ -81,9 +96,11 @@ def reconcile(module_key: str, existing: List[StoredFinding],
             else:
                 out.seen_live.append(live[0].id)
             continue
-        if any(s.status == "dismissed" for s in rows):
+        akey = _action_key(f)
+        blockers = rows + (by_action.get(akey, []) if akey is not None else [])
+        if any(s.status == "dismissed" for s in blockers):
             continue
-        if any(_suppressed(s, now) for s in rows):
+        if any(_suppressed(s, now) for s in blockers):
             continue
         out.insert.append(f)
 

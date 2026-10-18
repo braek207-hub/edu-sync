@@ -180,3 +180,38 @@ def test_project_level_login_counts_as_scanned():
     assert reconcile(MK, ex, [], NOW, scanned_logins=["good"]).resolve == [1]
     assert reconcile(MK, ex, [], NOW, scanned_logins=[]).resolve == []
     assert reconcile(MK, ex, [], NOW).resolve == [1]
+
+
+def test_suppression_by_action_across_rules():
+    old = finding(action=ACT, rule="word_zero_conv")
+    new = finding(action=ACT, rule="stop_word")
+    # (a) отказ человека держит то же действие под другим правилом
+    ex = [stored(old, status="rejected", decided_ago=timedelta(days=1))]
+    assert reconcile(MK, ex, [new], NOW).insert == []
+    # (b) откат: 30 дней держит, 31 — нет
+    ex = [stored(old, status="rolled_back", outcome_ago=timedelta(days=29))]
+    assert reconcile(MK, ex, [new], NOW).insert == []
+    ex = [stored(old, status="rolled_back", outcome_ago=timedelta(days=31))]
+    assert reconcile(MK, ex, [new], NOW).insert == [new]
+    # dismissed — навсегда, failed — 24 часа
+    ex = [stored(old, status="dismissed", seen_ago=timedelta(days=90))]
+    assert reconcile(MK, ex, [new], NOW).insert == []
+    ex = [stored(old, status="failed", outcome_ago=timedelta(hours=30))]
+    assert reconcile(MK, ex, [new], NOW).insert == [new]
+
+
+def test_suppression_by_action_needs_same_identity():
+    old = stored(finding(action=ACT, rule="a"), status="rejected", decided_ago=timedelta(days=1))
+    # (c) другой op или другая кампания — не то же действие
+    other_op = finding(action={"op": "minus_phrase"}, rule="b")
+    other_camp = finding(action=ACT, rule="b", campaign_id=8)
+    assert reconcile(MK, [old], [other_op], NOW).insert == [other_op]
+    assert reconcile(MK, [old], [other_camp], NOW).insert == [other_camp]
+
+
+def test_findings_without_action_suppressed_by_fingerprint_only():
+    # (d) аудит: отказ по одному правилу не гасит другое правило того же объекта
+    old = stored(finding(rule="a"), status="rejected", decided_ago=timedelta(days=1))
+    other = finding(rule="b")
+    assert reconcile(MK, [old], [other], NOW).insert == [other]
+    assert reconcile(MK, [old], [finding(rule="a")], NOW).insert == []
