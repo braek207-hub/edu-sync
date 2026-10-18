@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Раннер модулей Директа: замок проекта -> применение одобренного -> due-модули -> сверка."""
+"""Раннер модулей Директа: замок проекта -> применение одобренного -> due-модули -> сверка.
+
+Пробные прогоны (module_previews) берутся в начале такта, между модулями и в конце, а при
+занятом замке — до выхода: превью только читает, замок ему не нужен.
+"""
 
 import dataclasses
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from sync.modules import accounts as _accounts
 from sync.modules import store as _store
 from sync.modules.defaults import settings_for
 from sync.modules.lifecycle import reconcile
+from sync.modules.placements import USER as USER_RULE
 from sync.modules.registry import MODULES
-from sync.modules.types import ApplyResult, Context, StoredFinding
+from sync.modules.types import ApplyResult, Context, Finding, RunOutput, StoredFinding
 
 # Москва без перехода на летнее время с 2014: фиксированное смещение не требует базы tz.
 MSK = timezone(timedelta(hours=3))
@@ -28,6 +33,12 @@ APPLY_PHASE = "apply"
 # systemd и уже не завершится.
 STALE_RUN_AFTER = timedelta(minutes=80)
 EDU_LOCK_LINE = "агент EDU включён — запись у него"
+# Пределы списков в jsonb (спека «Пробный прогон»): рядом всегда полный счёт, по нему
+# Panda пишет «Показаны первые N из M».
+PREVIEW_WOULD_MAX = 500
+PREVIEW_REFUSED_MAX = 300
+SUMMARY_REFUSED_MAX = 300
+RUB = "RUB"
 
 
 def _aware(dt: datetime) -> datetime:
@@ -73,10 +84,29 @@ def agent_lock(slug: str, read_autonomy: Callable[[], str] = _live_autonomy) -> 
         return EDU_LOCK_LINE
 
 
-def _ctx(slug, mkey, mode, raw_settings, accts, now, log) -> Context:
+def _ctx(slug, mkey, mode, raw_settings, accts, now, log, goals: Iterable[int] = (),
+         progress: Optional[Callable[[dict], None]] = None) -> Context:
+    extra = {"progress": progress} if progress is not None else {}
     return Context(slug=slug, module_key=mkey, mode=mode,
                    settings=settings_for(mkey, raw_settings),
-                   accounts=accts, now=now, log=log)
+                   accounts=accts, now=now, log=log, project_goals=list(goals), **extra)
+
+
+def _currencies(accts) -> Dict[str, str]:
+    # как money_known модулей: валюта не указана — рубли
+    return {a.login: (a.currency or RUB).upper() for a in accts}
+
+
+def _unverified_by_login(items: Iterable[tuple], skip: Iterable[str] = ()) -> Dict[str, list]:
+    """Форма summary.unverified: {логин: [правило | [правило, кампания]]} — пара строкой,
+    тройка списком из двух; так её читает Panda (unverifiedOf)."""
+    off = set(skip)
+    out: Dict[str, list] = {}
+    for u in items:
+        if u[1] in off:
+            continue
+        out.setdefault(u[0], []).append(u[1] if len(u) == 2 else [u[1], u[2]])
+    return out
 
 
 def _safe_call(fn, ctx, items, log, what):
@@ -214,6 +244,11 @@ def _dry_run(slug, store, accts, modules, now, only, log) -> int:
         log("предупреждение: настройки проекта не прочитаны (%s: %s), беру умолчания"
             % (type(err).__name__, err))
         rows = [{"module_key": k, "settings": None} for k in modules if not only or k == only]
+    try:
+        goals = store.project_lead_goals(slug)
+    except Exception as err:
+        log("предупреждение: цели-лиды проекта не прочитаны (%s: %s)" % (type(err).__name__, err))
+        goals = []
     rc = 0
     for row in rows:
         mkey = row["module_key"]
@@ -222,7 +257,8 @@ def _dry_run(slug, store, accts, modules, now, only, log) -> int:
             log("[%s] модуль не реализован" % mkey)
             continue
         try:
-            out = module.run(_ctx(slug, mkey, "report", row.get("settings"), accts, now, log))
+            out = module.run(_ctx(slug, mkey, "report", row.get("settings"), accts, now, log,
+                                  goals))
         except Exception as err:
             log("[%s] ошибка: %s: %s" % (mkey, type(err).__name__, err))
             rc = 1
@@ -231,6 +267,168 @@ def _dry_run(slug, store, accts, modules, now, only, log) -> int:
         for f in out.findings:
             log("  %s | %s | %s | %s | %s" % (f.severity, f.login, f.object_id, f.rule, f.title))
     return rc
+
+
+def _scan_summary(out: RunOutput, accts, cur: Dict[str, str]) -> dict:
+    """summary строки module_runs из итога модуля: unverified по логинам, отказы с пределом."""
+    summary = dict(out.summary)
+    if out.unverified:
+        summary["unverified"] = _unverified_by_login(out.unverified)
+    refused = summary.get("refused")
+    if isinstance(refused, list):
+        # by_rule модуль посчитал по полному списку; урезаем только то, что ляжет в jsonb
+        summary["refused_total"] = len(refused)
+        summary["refused"] = refused[:SUMMARY_REFUSED_MAX]
+    # «кабинет N из M»: из errors M не вывести — проблемы прочитанного логина тоже там
+    summary["logins_total"] = len(accts)
+    other = {login: c for login, c in cur.items() if c != RUB}
+    if other:
+        summary["currency_by_login"] = other
+    return summary
+
+
+class _NotRun(Exception):
+    """Превью не начато по понятной причине: текст идёт человеку без имени исключения."""
+
+
+def _num(v) -> float:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+
+
+def _would_row(f: Finding, cur: str) -> dict:
+    d = f.details or {}
+    m = d.get("metrics")
+    # находки этапа 1 без снимка metrics несут клики и расход прямо в details
+    metrics = m if isinstance(m, dict) else {
+        k: d[k] for k in ("clicks", "cost", "conversions") if k in d}
+    return {"object": f.object_id, "campaign_id": f.campaign_id,
+            "campaign_name": f.campaign_name or None, "login": f.login, "rule": f.rule,
+            "currency": cur, "metrics": metrics, "action": f.action}
+
+
+def _preview_result(out: RunOutput, rule_id: Optional[str], accts) -> dict:
+    """result превью по контракту Panda (adm-module-rules.ts, previewView): would — те же
+    находки, что записал бы скан; тексты Panda рисует по снимку настроек сама."""
+    cur = _currencies(accts)
+    findings = out.findings
+    if rule_id:
+        key = rule_id if rule_id.startswith(USER_RULE) else USER_RULE + rule_id
+        findings = [f for f in findings if f.rule == key]
+    rows = [_would_row(f, cur.get(f.login, RUB)) for f in findings]
+    # дорогие первыми: усечение до 500 должно резать дешёвый хвост
+    rows.sort(key=lambda r: -_num(r["metrics"].get("cost")))
+    cost_other: Dict[str, float] = {}
+    rub = 0.0
+    for r in rows:
+        c = _num(r["metrics"].get("cost"))
+        if r["currency"] == RUB:
+            rub += c
+        else:
+            cost_other[r["currency"]] = cost_other.get(r["currency"], 0.0) + c
+    summary = out.summary or {}
+    refused = summary.get("refused") or []
+    # строки этапа 1 отдельно: Panda сопоставляет refused[i] со списком отказов с кодом
+    coded = [x for x in refused if isinstance(x, dict)]
+    lines = [x for x in refused if isinstance(x, str)]
+    totals: Dict[str, Any] = {"would": len(rows),
+                              "clicks": int(sum(_num(r["metrics"].get("clicks")) for r in rows)),
+                              "cost": round(rub, 2), "refused": len(coded)}
+    if cost_other:
+        totals["cost_other"] = {k: round(v, 2) for k, v in sorted(cost_other.items())}
+    disabled = list(summary.get("disabled") or [])
+    result: Dict[str, Any] = {
+        "would": rows[:PREVIEW_WOULD_MAX],
+        "refused": coded[:PREVIEW_REFUSED_MAX],
+        "by_rule": {k: {"would": v.get("found", 0), "refused": v.get("refused", 0),
+                        "over_cap": v.get("over_cap", 0)}
+                    for k, v in (summary.get("by_rule") or {}).items() if isinstance(v, dict)},
+        # выключенное настройкой не «не проверено»: оно в disabled, иначе превью пугало бы
+        # строками про спам, выключенный по умолчанию
+        "unverified": _unverified_by_login(out.unverified, skip=disabled),
+        "skipped": list(summary.get("skipped") or []),
+        "errors": ["кабинет %s" % e for e in summary.get("errors") or [] if isinstance(e, str)],
+        "totals": totals,
+        "logins_total": len(accts),
+    }
+    if disabled:
+        result["disabled"] = disabled
+    if lines:
+        result["refused_lines"] = lines[:PREVIEW_REFUSED_MAX]
+    return result
+
+
+def _memo(fn: Callable[[], Any]) -> Callable[[], Any]:
+    box: list = []
+
+    def get():
+        if not box:
+            box.append(fn())
+        return box[0]
+    return get
+
+
+def _one_preview(slug, store, row, get_accounts, get_goals, modules, now, log) -> bool:
+    """Один пробный прогон: тот же module.run, что у скана, но в report и без записи —
+    ни apply_reconciled, ни set_outcome, ни Директа. True — done."""
+    pid, mkey = row["id"], row["module_key"]
+
+    def progress(p: dict) -> None:
+        try:
+            store.preview_progress(pid, p)
+        except Exception as err:
+            # ход — подсказка человеку; из-за него превью не роняем
+            log("превью %s: ход не записан (%s: %s)" % (pid, type(err).__name__, err))
+
+    try:
+        module = modules.get(mkey)
+        if module is None:
+            raise _NotRun("модуль %s не реализован" % mkey)
+        accts, why = get_accounts()
+        if not accts:
+            raise _NotRun("нет кабинетов: " + "; ".join(why or ["не найдены"]))
+        ctx = _ctx(slug, mkey, "report", row.get("settings"), accts, now, log,
+                   get_goals(), progress)
+        result = _preview_result(module.run(ctx), row.get("rule_id"), accts)
+        status, error = "done", None
+    except Exception as err:
+        status, result = "error", None
+        error = str(err) if isinstance(err, _NotRun) else "%s: %s" % (type(err).__name__, err)
+        log("[превью %s %s] ошибка: %s" % (pid, mkey, error))
+    if not store.finish_preview(pid, status, result, error=error):
+        log("превью %s закрыто как прерванное раньше, итог не записан" % pid)
+    return status == "done"
+
+
+def _run_previews(slug, store, accts: Callable[[], Tuple[list, list]], modules, now,
+                  log) -> None:
+    """Вся очередь превью проекта. accts — функция () -> (кабинеты, почему нет): при занятом
+    замке кабинеты читаются, только когда превью взято (у EDU это запрос в Директ).
+    Сбой базы здесь не роняет такт: превью останется running и закроется как прерванное."""
+    try:
+        store.cleanup_previews(slug)
+    except Exception as err:
+        log("превью: старые не удалены (%s: %s)" % (type(err).__name__, err))
+    goals = _memo(lambda: store.project_lead_goals(slug))
+    try:
+        while True:
+            row = store.claim_preview(slug)
+            if row is None:
+                return
+            _one_preview(slug, store, row, accts, goals, modules, now, log)
+    except Exception as err:
+        log("превью: очередь прервана (%s: %s)" % (type(err).__name__, err))
+
+
+def run_preview(slug: str, preview_id: int, *, store=_store, accounts=_accounts.accounts_for,
+                modules=MODULES, now: datetime, log=print) -> int:
+    """Ручной прогон одного превью (modules_run --preview-id), без скана и замка."""
+    row = store.claim_preview(slug, preview_id=preview_id)
+    if row is None:
+        log("превью %s проекта %s не найдено или уже идёт" % (preview_id, slug))
+        return 1
+    ok = _one_preview(slug, store, row, _memo(lambda: accounts(slug)),
+                      _memo(lambda: store.project_lead_goals(slug)), modules, now, log)
+    return 0 if ok else 1
 
 
 def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, modules=MODULES,
@@ -242,6 +440,9 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
         return _dry_run(slug, store, accts, modules, now, only, log)
     with store.hold_project_lock(slug) as got:
         if not got:
+            # превью только читает: идущий прогон проекта ему не помеха, а ждать его конца
+            # человеку незачем
+            _run_previews(slug, store, _memo(lambda: accounts(slug)), modules, now, log)
             log("проект %s: уже идёт" % slug)
             return 0
         # убитый прогон (OOM, таймаут юнита) так и остался бы «идёт» навсегда
@@ -253,14 +454,24 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 if not only or r["module_key"] == only]
         if only and not rows:
             log("модуль %s выключен" % only)
+        goals = store.project_lead_goals(slug)
+
+        def previews() -> None:
+            _run_previews(slug, store, lambda: (accts, why), modules, now, log)
+        previews()
         lock_line = agent_lock_fn(slug)
         rc = 1 if _apply_phase(slug, store, rows, modules, accts, now, log, lock_line) else 0
+        scanned_any = False
         for row in rows:
             mkey, mode = row["module_key"], row["mode"]
             if not is_due(mkey, store.last_run_started(slug, mkey, DONE_STATUSES),
                           store.last_run_started(slug, mkey),
                           row.get("run_requested_at"), now):
                 continue
+            # заявка, поданная во время скана, не ждёт следующего такта
+            if scanned_any:
+                previews()
+            scanned_any = True
             run_id = store.start_run(slug, mkey, mode)
             module = modules.get(mkey)
             if module is None:
@@ -272,20 +483,20 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 continue
             summary: dict = {}
             try:
-                ctx = _ctx(slug, mkey, mode, row.get("settings"), accts, now, log)
+                ctx = _ctx(slug, mkey, mode, row.get("settings"), accts, now, log, goals)
                 out = module.run(ctx)
+                cur = _currencies(accts)
+                for f in out.findings:
+                    # журнал рисует расход находки: тенге без пометки читались бы рублями
+                    if cur.get(f.login, RUB) != RUB:
+                        f.details["currency"] = cur[f.login]
                 # свой список модуля, иначе кабинеты ctx: туда попали только разрешённые логины
                 scanned = out.scanned_logins if out.scanned_logins is not None \
                     else [a.login for a in accts]
                 rec = reconcile(mkey, store.existing_findings(slug, mkey), out.findings,
                                 now, scanned, unverified=out.unverified)
                 inserted = store.apply_reconciled(slug, mkey, run_id, rec)
-                summary = dict(out.summary)
-                if out.unverified:
-                    by_login: Dict[str, List[str]] = {}
-                    for login, rule in out.unverified:
-                        by_login.setdefault(login, []).append(rule)
-                    summary["unverified"] = by_login
+                summary = _scan_summary(out, accts, cur)
                 summary.update(findings=len(out.findings), inserted=len(rec.insert),
                                resolved=len(rec.resolve), expired=len(rec.expire))
                 if lock_line and mode in WRITE_MODES:
@@ -303,4 +514,6 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 text = "%s: %s" % (type(err).__name__, err)
                 log("[%s] ошибка: %s" % (mkey, text))
                 store.finish_run(run_id, "error", summary, error=text)
+        if scanned_any:
+            previews()
         return rc

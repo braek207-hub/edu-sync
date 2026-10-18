@@ -29,7 +29,7 @@ def _stored(fid, status, key="placements", obj="old.ru") -> StoredFinding:
 
 
 class FakeStore:
-    def __init__(self, rows, pending=(), lock=True, existing=None):
+    def __init__(self, rows, pending=(), lock=True, existing=None, previews=(), goals=()):
         self.rows, self._pending, self.lock = rows, list(pending), lock
         self.existing = existing or {}
         self.calls: List[tuple] = []
@@ -38,6 +38,35 @@ class FakeStore:
         self.last_started: Dict[str, Optional[datetime]] = {}
         self.last_ok: Dict[str, Optional[datetime]] = {}
         self.outcome_ok = True
+        self.previews: List[dict] = [dict(p) for p in previews]
+        self.goals = list(goals)
+        self.inserted: Dict[str, List[Finding]] = {}
+
+    def project_lead_goals(self, slug):
+        return list(self.goals)
+
+    def claim_preview(self, slug, preview_id=None):
+        self.calls.append(("claim_preview",))
+        for p in self.previews:
+            if p["status"] == "queued" and preview_id in (None, p["id"]):
+                p["status"] = "running"
+                return {k: v for k, v in p.items() if k != "status"}
+        return None
+
+    def _preview(self, pid):
+        return next(p for p in self.previews if p["id"] == pid)
+
+    def preview_progress(self, pid, progress):
+        self._preview(pid).setdefault("progress", []).append(progress)
+
+    def finish_preview(self, pid, status, result, error=None):
+        self._preview(pid).update(status=status, result=result, error=error)
+        self.calls.append(("finish_preview", pid, status))
+        return True
+
+    def cleanup_previews(self, slug, older_than=timedelta(days=7)):
+        self.calls.append(("cleanup_previews",))
+        return 0
 
     @contextmanager
     def hold_project_lock(self, slug):
@@ -70,15 +99,19 @@ class FakeStore:
 
     def apply_reconciled(self, slug, mkey, run_id, rec):
         self.calls.append(("apply_reconciled", mkey))
+        self.inserted.setdefault(mkey, []).extend(rec.insert)
         ids = list(range(100, 100 + len(rec.insert)))
         self.existing[mkey] = list(self.existing.get(mkey, [])) + [
-            dataclasses.replace(_stored(i, "open", mkey, f.object_id), action=f.action)
+            dataclasses.replace(_stored(i, "open", mkey, f.object_id), action=f.action,
+                                details=f.details)
             for i, f in zip(ids, rec.insert)]
         return ids
 
     def approve_auto(self, slug, mkey, ids):
+        # как store.approve_auto: предложение правила авторежим не одобряет
         self.calls.append(("approve_auto", mkey))
-        return list(ids)
+        by_id = {f.id: f for f in self.existing.get(mkey, [])}
+        return [i for i in ids if not (i in by_id and by_id[i].details.get("propose"))]
 
     def pending(self, slug):
         return list(self._pending)
@@ -532,3 +565,317 @@ def test_dry_run_off_module_uses_saved_settings():
     q2 = FakeModule("queries")
     _dry(st, {"queries": q2})
     assert q2.trace == []
+
+
+# --- пробный прогон (превью) ---
+
+def _preview(pid=1, mkey="placements", settings=None, rule_id=None):
+    return {"id": pid, "dashboard_slug": "lime", "module_key": mkey,
+            "settings": settings if settings is not None else {}, "rule_id": rule_id,
+            "status": "queued"}
+
+
+def _uf(obj, rule="u:aaa111", login="login1", cid=1, clicks=1, cost=10.0, **details):
+    return Finding(rule=rule, severity="info", title="t", login=login, campaign_id=cid,
+                   campaign_name="К%d" % cid, object_type="site", object_id=obj,
+                   details={"clicks": clicks, "cost": cost,
+                            "metrics": {"clicks": clicks, "cost": cost, "leads": 0},
+                            **details},
+                   action={"op": "exclude_site", "campaign_id": cid, "site": obj})
+
+
+class OutModule(FakeModule):
+    """Модуль, отдающий готовый RunOutput: и скану, и превью — одно и то же."""
+
+    def __init__(self, mkey, out, **kw):
+        super().__init__(mkey, **kw)
+        self.out = out
+        self.modes: List[str] = []
+
+    def run(self, ctx):
+        self.trace.append(("run", ctx.module_key))
+        self.modes.append(ctx.mode)
+        ctx.progress({"step": "login1", "logins_done": 1, "logins_total": 1})
+        return self.out
+
+
+def _done(st, pid=1):
+    p = st._preview(pid)
+    assert p["status"] == "done", p
+    return p["result"]
+
+
+def test_preview_equals_scan_on_same_fixtures(monkeypatch):
+    # общий тест «превью = скан»: настоящий модуль площадок на одних и тех же отчётах
+    from sync.modules import placements as pm
+    from sync.placements import direct
+    monkeypatch.delenv(pm.LLM_ENV, raising=False)
+    camps = [{"Id": c, "Name": "К%d" % c, "Type": "TEXT_CAMPAIGN", "State": "ON",
+              "ExcludedSites": {"Items": []}} for c in (1, 2)]
+    rows = [{"campaign_id": str(c), "placement": s, "clicks": 10 + i, "cost": 5.0 + i,
+             "impressions": 100}
+            for c in (1, 2) for i, s in enumerate(["com.aaa.bbb", "plain.example.ru"])]
+    monkeypatch.setattr(direct, "campaigns", lambda t, l: camps)
+    monkeypatch.setattr(direct, "placements_today", lambda t, l: rows)
+    monkeypatch.setattr(direct, "campaign_goals", lambda t, l: {})
+    monkeypatch.setattr(direct, "placements_with_goals", lambda t, l, g: [])
+    monkeypatch.setattr(direct, "placements_window", lambda t, l, d, g: [])
+    settings = {"rules": [{"id": "aaa111", "name": "Клики", "enabled": True, "action": "block",
+                           "window": 0, "where": "seen",
+                           "campaigns": {"only": [], "except": []},
+                           "conditions": [{"field": "clicks", "op": "gte", "value": 1}]}]}
+    st = FakeStore([_row(mode="report", settings=settings)],
+                   previews=[_preview(settings=settings)])
+    assert _go(st, {"placements": pm}) == 0
+    res = _done(st)
+    scan = sorted((f.login, f.campaign_id, f.object_id, f.rule)
+                  for f in st.inserted["placements"])
+    would = sorted((w["login"], w["campaign_id"], w["object"], w["rule"]) for w in res["would"])
+    assert scan and would == scan
+    assert {x[3] for x in scan} == {"app", "u:aaa111"}
+    assert res["totals"]["would"] == len(scan)
+    assert st._preview(1)["progress"][-1] == {"step": "login1", "logins_done": 1,
+                                              "logins_total": 1}
+
+
+def test_preview_runs_in_report_and_writes_nothing():
+    m = OutModule("placements", RunOutput(findings=[_uf("a.ru")]))
+    st = FakeStore([], previews=[_preview()])
+    assert _go(st, {"placements": m}) == 0
+    res = _done(st)
+    assert m.modes == ["report"] and m.applied == [] and st.outcomes == []
+    banned = {"apply_reconciled", "set_outcome", "approve_auto", "start_run"}
+    assert not [c for c in st.calls if c[0] in banned]
+    assert res["would"] == [{"object": "a.ru", "campaign_id": 1, "campaign_name": "К1",
+                             "login": "login1", "rule": "u:aaa111", "currency": "RUB",
+                             "metrics": {"clicks": 1, "cost": 10.0, "leads": 0},
+                             "action": {"op": "exclude_site", "campaign_id": 1,
+                                        "site": "a.ru"}}]
+    assert res["totals"] == {"would": 1, "clicks": 1, "cost": 10.0, "refused": 0}
+    assert ("cleanup_previews",) in st.calls
+
+
+def test_preview_taken_when_lock_busy():
+    m = OutModule("placements", RunOutput(findings=[_uf("a.ru")]))
+    logs = []
+    st = FakeStore([_row()], lock=False, previews=[_preview()])
+    rc = runner.run_project("lime", store=st, accounts=lambda s: (ACC, []),
+                            modules={"placements": m}, now=NOW, log=logs.append,
+                            agent_lock_fn=lambda s: None)
+    assert rc == 0 and any("уже идёт" in line for line in logs)
+    assert _done(st)["totals"]["would"] == 1
+    assert not any(c[0] in ("load", "start_run", "fail_stale") for c in st.calls)
+
+
+def test_lock_busy_without_previews_does_not_read_accounts():
+    asked = []
+    st = FakeStore([_row()], lock=False)
+    runner.run_project("lime", store=st, accounts=lambda s: asked.append(s) or (ACC, []),
+                       modules={}, now=NOW, log=lambda m: None, agent_lock_fn=lambda s: None)
+    # кабинеты EDU читаются через Директ: без заявки на превью дёргать их незачем
+    assert asked == []
+
+
+def test_preview_taken_between_modules_and_at_end():
+    st = FakeStore([_row("placements"), _row("queries")])
+
+    class Enqueue(OutModule):
+        def __init__(self, mkey, out, pid, target):
+            super().__init__(mkey, out)
+            self.pid, self.target = pid, target
+
+        def run(self, ctx):
+            if ctx.mode != "report":
+                st.previews.append(_preview(self.pid, self.target))
+            return super().run(ctx)
+
+    p = Enqueue("placements", RunOutput(findings=[]), 1, "queries")
+    q = Enqueue("queries", RunOutput(findings=[_uf("слово", rule="phrase_waste")]), 2,
+                "placements")
+    assert _go(st, {"placements": p, "queries": q}) == 0
+    order = [c for c in st.calls if c[0] in ("finish_run", "finish_preview")]
+    assert order == [("finish_run", "placements", "ok"), ("finish_preview", 1, "done"),
+                     ("finish_run", "queries", "ok"), ("finish_preview", 2, "done")]
+    assert [w["object"] for w in _done(st, 1)["would"]] == ["слово"]
+
+
+def test_preview_rule_id_filters_would_only():
+    out = RunOutput(findings=[_uf("a.ru"), _uf("b.ru", rule="app"), _uf("c.ru", rule="u:bbb222")],
+                    summary={"by_rule": {"u:aaa111": {"found": 1, "refused": 2, "over_cap": 3},
+                                         "app": {"found": 1, "refused": 0, "over_cap": 0}},
+                             "refused": [{"code": "list_full", "rule": "u:bbb222"}]})
+    st = FakeStore([], previews=[_preview(rule_id="aaa111")])
+    _go(st, {"placements": OutModule("placements", out)})
+    res = _done(st)
+    assert [w["object"] for w in res["would"]] == ["a.ru"]
+    assert res["totals"]["would"] == 1
+    assert res["by_rule"]["u:aaa111"] == {"would": 1, "refused": 2, "over_cap": 3}
+    assert res["by_rule"]["app"] == {"would": 1, "refused": 0, "over_cap": 0}
+    assert res["refused"] == [{"code": "list_full", "rule": "u:bbb222"}]
+
+
+def test_preview_truncates_with_full_totals_and_currency():
+    kz = DirectAccount("kz1", "tok", "KZT", "X")
+    findings = [_uf("s%03d.ru" % i, clicks=1, cost=1.0) for i in range(550)]
+    findings += [_uf("kz%d.ru" % i, login="kz1", clicks=2, cost=100.0) for i in range(3)]
+    refused = [{"code": "list_full", "rule": "u:aaa111", "object": str(i)} for i in range(350)]
+    out = RunOutput(findings=findings, summary={"refused": ["строка этапа 1"] + refused})
+    st = FakeStore([], previews=[_preview()])
+    runner.run_project("lime", store=st, accounts=lambda s: (ACC + [kz], []),
+                       modules={"placements": OutModule("placements", out)}, now=NOW,
+                       log=lambda m: None, agent_lock_fn=lambda s: None)
+    res = _done(st)
+    assert len(res["would"]) == 500 and len(res["refused"]) == 300
+    assert res["totals"] == {"would": 553, "clicks": 556, "cost": 550.0, "refused": 350,
+                             "cost_other": {"KZT": 300.0}}
+    # дорогие строки первыми: усечение режет дешёвый хвост
+    assert [w["currency"] for w in res["would"][:3]] == ["KZT"] * 3
+    assert all(isinstance(r, dict) for r in res["refused"])
+    assert res["refused_lines"] == ["строка этапа 1"]
+    assert res["logins_total"] == 2
+
+
+def test_preview_unverified_errors_skipped_shape():
+    out = RunOutput(findings=[], unverified=[("login1", "u:aaa111"), ("login1", "u:bbb222", 5),
+                                              ("login1", "spam")],
+                    summary={"errors": ["login1: отчёт не готов"], "skipped": ["login1: off"],
+                             "disabled": ["spam"]})
+    st = FakeStore([], previews=[_preview()])
+    _go(st, {"placements": OutModule("placements", out)})
+    res = _done(st)
+    # выключенное настройкой — не «не проверено»: оно лежит в disabled
+    assert res["unverified"] == {"login1": ["u:aaa111", ["u:bbb222", 5]]}
+    assert res["disabled"] == ["spam"]
+    assert res["errors"] == ["кабинет login1: отчёт не готов"]
+    assert res["skipped"] == ["login1: off"]
+    assert res["totals"] == {"would": 0, "clicks": 0, "cost": 0.0, "refused": 0}
+
+
+def test_preview_crash_is_error_and_next_preview_runs():
+    st = FakeStore([], previews=[_preview(1), _preview(2, "queries")])
+    good = OutModule("queries", RunOutput(findings=[]))
+    _go(st, {"placements": FakeModule("placements", crash=True), "queries": good})
+    p1 = st._preview(1)
+    assert p1["status"] == "error" and "boom" in p1["error"] and p1["result"] is None
+    assert st._preview(2)["status"] == "done"
+
+
+def test_preview_without_accounts_or_module_is_error():
+    st = FakeStore([], previews=[_preview(1), _preview(2, "queries")])
+    runner.run_project("lime", store=st, accounts=lambda s: ([], ["нет токена"]),
+                       modules={"placements": FakeModule("placements")}, now=NOW,
+                       log=lambda m: None, agent_lock_fn=lambda s: None)
+    assert "нет токена" in st._preview(1)["error"]
+    assert "не реализован" in st._preview(2)["error"]
+
+
+def test_preview_cleanup_failure_not_fatal():
+    st = FakeStore([], previews=[_preview()])
+
+    def boom(slug, older_than=None):
+        raise RuntimeError("db down")
+    st.cleanup_previews = boom
+    logs = []
+    runner.run_project("lime", store=st, accounts=lambda s: (ACC, []),
+                       modules={"placements": OutModule("placements", RunOutput(findings=[]))},
+                       now=NOW, log=logs.append, agent_lock_fn=lambda s: None)
+    assert st._preview(1)["status"] == "done"
+    assert any("db down" in line for line in logs)
+
+
+def test_preview_gets_project_goals_and_preview_settings():
+    seen = []
+    m = OutModule("placements", RunOutput(findings=[]))
+    orig = m.run
+    m.run = lambda ctx: (seen.append((ctx.project_goals, ctx.settings["max_per_run"])),
+                         orig(ctx))[1]
+    st = FakeStore([], previews=[_preview(settings={"max_per_run": 7})], goals=[30, 40])
+    _go(st, {"placements": m})
+    assert seen == [([30, 40], 7)]
+
+
+def test_run_preview_by_id_runs_only_that_preview():
+    m = OutModule("placements", RunOutput(findings=[_uf("a.ru")]))
+    st = FakeStore([_row()], previews=[_preview(1), _preview(2)])
+    rc = runner.run_preview("lime", 2, store=st, accounts=lambda s: (ACC, []),
+                            modules={"placements": m}, now=NOW, log=lambda x: None)
+    assert rc == 0 and st._preview(2)["status"] == "done"
+    assert st._preview(1)["status"] == "queued" and st.runs == {}
+    assert runner.run_preview("lime", 9, store=st, accounts=lambda s: (ACC, []),
+                              modules={"placements": m}, now=NOW, log=lambda x: None) == 1
+
+
+# --- сводка скана: тройки, предел отказов, кабинеты, валюта ---
+
+def test_scan_summary_triples_refused_cap_logins_currency():
+    kz = DirectAccount("kz1", "tok", "KZT", "X")
+    refused = [{"code": "list_full", "rule": "u:aaa111"}] * 350
+    out = RunOutput(findings=[_uf("a.ru"), _uf("k.ru", login="kz1")],
+                    summary={"refused": refused},
+                    unverified=[("login1", "u:aaa111"), ("login1", "u:bbb222", 5),
+                                ("kz1", "u:bbb222", 6)])
+    st = FakeStore([_row(mode="report")])
+    rc = runner.run_project("lime", store=st, accounts=lambda s: (ACC + [kz], []),
+                            modules={"placements": OutModule("placements", out)}, now=NOW,
+                            log=lambda m: None, agent_lock_fn=lambda s: None)
+    assert rc == 0 and st.runs[1]["status"] == "ok"
+    s = st.runs[1]["summary"]
+    assert s["unverified"] == {"login1": ["u:aaa111", ["u:bbb222", 5]], "kz1": [["u:bbb222", 6]]}
+    assert len(s["refused"]) == 300 and s["refused_total"] == 350
+    assert s["logins_total"] == 2
+    assert s["currency_by_login"] == {"kz1": "KZT"}
+    by_obj = {f.object_id: f for f in st.inserted["placements"]}
+    assert by_obj["k.ru"].details["currency"] == "KZT"
+    assert "currency" not in by_obj["a.ru"].details
+
+
+def test_scan_all_rub_has_no_currency_map():
+    st = FakeStore([_row(mode="report")])
+    _go(st, {"placements": OutModule("placements", RunOutput(findings=[_uf("a.ru")]))})
+    s = st.runs[1]["summary"]
+    assert "currency_by_login" not in s and s["logins_total"] == 1
+
+
+def test_scan_triple_holds_only_its_campaign_finding():
+    old = NOW - timedelta(hours=100)
+    mine = dataclasses.replace(_stored(7, "open", obj="a.ru"), rule="u:aaa111",
+                               fingerprint="placements:u:aaa111:login1:1:a.ru", last_seen_at=old)
+    other = dataclasses.replace(_stored(8, "open", obj="b.ru"), rule="u:aaa111", campaign_id=2,
+                                fingerprint="placements:u:aaa111:login1:2:b.ru", last_seen_at=old)
+    out = RunOutput(findings=[], unverified=[("login1", "u:aaa111", 1)])
+    expired = []
+    st = FakeStore([_row(mode="report")], existing={"placements": [mine, other]})
+    orig = st.apply_reconciled
+    st.apply_reconciled = lambda *a: (expired.extend(a[3].expire), orig(*a))[1]
+    _go(st, {"placements": OutModule("placements", out)})
+    assert expired == [8]
+    assert st.runs[1]["summary"]["expired"] == 1
+
+
+def test_auto_holds_propose_findings():
+    m = OutModule("placements", RunOutput(findings=[_uf("a.ru"), _uf("p.ru", propose=True)]))
+    st = FakeStore([_row(mode="auto")])
+    assert _go(st, {"placements": m}) == 0
+    assert m.applied == [100]
+    assert st.runs[1]["summary"]["auto_held"] == 1
+
+
+def test_scan_ctx_gets_project_goals():
+    seen = []
+    m = OutModule("placements", RunOutput(findings=[]))
+    orig = m.run
+    m.run = lambda ctx: (seen.append(ctx.project_goals), orig(ctx))[1]
+    _go(FakeStore([_row()], goals=[30]), {"placements": m})
+    assert seen == [[30]]
+
+
+def test_cli_preview_id_runs_preview_not_scan(monkeypatch):
+    from sync import modules_run
+    calls = []
+    monkeypatch.setattr(modules_run, "run_preview",
+                        lambda slug, pid, **kw: calls.append(("preview", slug, pid)) or 0)
+    monkeypatch.setattr(modules_run, "run_project",
+                        lambda slug, **kw: calls.append(("scan", slug)) or 0)
+    assert modules_run.main(["--project", "lime", "--preview-id", "12"]) == 0
+    assert modules_run.main(["--project", "lime"]) == 0
+    assert calls == [("preview", "lime", 12), ("scan", "lime")]

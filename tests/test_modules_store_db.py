@@ -6,6 +6,7 @@ DATABASE_URL здесь не годится: в развёрнутых окру�
 """
 
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 
 import psycopg2
@@ -25,8 +26,13 @@ pytestmark = pytest.mark.skipif(
     reason="нужны MODULES_TEST_DATABASE_URL и MODULES_DDL_PATH")
 
 
+# module_previews ведёт миграция этапа 2 из той же папки; обе DDL повторяемы (IF NOT EXISTS,
+# перенос goal_ids после первого наката — no-op), поэтому накатываются на каждый тест.
+DDL_STAGE2 = "20261018213700_direct_modules_rules.sql"
+
+
 def _cleanup(cur):
-    for t in ("module_findings", "module_runs", "project_modules"):
+    for t in ("module_previews", "module_findings", "module_runs", "project_modules"):
         cur.execute(f"DELETE FROM {t} WHERE dashboard_slug = %s", (SLUG,))
     cur.execute("DELETE FROM dashboards WHERE slug = %s", (SLUG,))
 
@@ -39,8 +45,9 @@ def live(monkeypatch):
     conn = psycopg2.connect(TEST_URL)
     conn.autocommit = True
     cur = conn.cursor()
-    with open(DDL_PATH, encoding="utf-8") as fh:
-        cur.execute(fh.read())
+    for path in (DDL_PATH, os.path.join(os.path.dirname(DDL_PATH), DDL_STAGE2)):
+        with open(path, encoding="utf-8") as fh:
+            cur.execute(fh.read())
     _cleanup(cur)
     cur.execute("INSERT INTO dashboards (id, slug, name) VALUES (%s, %s, %s)",
                 (SLUG, SLUG, "test"))
@@ -351,3 +358,159 @@ def test_project_lead_goals_quality_only_when_no_lead(sources):
     sources("metrika", "100", '{"goals": [{"id": 20, "name": "Качественный лид", "role": "quality_lead"},'
                               ' {"id": 10, "name": "Корзина", "role": "step"}]}')
     assert store.project_lead_goals(SLUG) == [20]
+
+
+# --- превью (module_previews) ---
+
+def _queue(cur, module="placements", ago=0, status="queued", started_ago=None,
+           progress="{}", rule_id=None):
+    cur.execute(
+        "INSERT INTO module_previews (dashboard_slug, module_key, settings, rule_id, status, "
+        "progress, created_at, started_at) VALUES (%s, %s, %s::jsonb, %s, %s, %s::jsonb, "
+        "now() - make_interval(secs => %s), "
+        "CASE WHEN %s::float8 IS NULL THEN NULL ELSE now() - make_interval(secs => %s) END) "
+        "RETURNING id",
+        (SLUG, module, '{"top_n": 5, "имя": "черновик"}', rule_id, status, progress, ago,
+         started_ago, started_ago or 0))
+    return cur.fetchone()[0]
+
+
+def _preview_row(cur, pid):
+    cur.execute("SELECT status, error, result, progress, started_at, finished_at "
+                "FROM module_previews WHERE id = %s", (pid,))
+    return cur.fetchone()
+
+
+def test_claim_preview_full_cycle(live):
+    assert store.claim_preview(SLUG) is None
+    pid = _queue(live, rule_id="aaa111")
+    row = store.claim_preview(SLUG)
+    assert row["id"] == pid and row["module_key"] == "placements" and row["rule_id"] == "aaa111"
+    assert row["settings"] == {"top_n": 5, "имя": "черновик"} and row["started_at"] is not None
+    assert _preview_row(live, pid)[0] == "running"
+    # идёт — второй раз не выдаётся
+    assert store.claim_preview(SLUG) is None
+
+    store.preview_progress(pid, {"step": "логин", "logins_done": 1, "logins_total": 3})
+    progress = _preview_row(live, pid)[3]
+    assert progress["step"] == "логин" and progress["logins_total"] == 3 and progress["at"]
+
+    result = {"would": [{"object": "сайт.рф"}], "totals": {"would": 1}}
+    assert store.finish_preview(pid, "done", result) is True
+    status, error, saved, _p, _s, finished = _preview_row(live, pid)
+    assert (status, error, saved) == ("done", None, result) and finished is not None
+    # закрытое не переписывается
+    assert store.finish_preview(pid, "error", None, error="поздно") is False
+    assert _preview_row(live, pid)[0] == "done"
+
+
+def test_finish_preview_error_without_result(live):
+    pid = _queue(live)
+    store.claim_preview(SLUG)
+    assert store.finish_preview(pid, "error", None, error="RuntimeError: boom")
+    assert _preview_row(live, pid)[:3] == ("error", "RuntimeError: boom", None)
+
+
+def test_claim_replaces_older_queued_of_same_module(live):
+    old = _queue(live, "placements", ago=60)
+    q = _queue(live, "queries", ago=30)
+    new = _queue(live, "placements", ago=10)
+    # из оставшихся старейшее — queries; старое placements заменено новым
+    assert store.claim_preview(SLUG)["id"] == q
+    status, error = _preview_row(live, old)[:2]
+    assert status == "error" and store.PREVIEW_REPLACED in error and "заменено новым" in error
+    assert store.claim_preview(SLUG)["id"] == new
+    assert store.claim_preview(SLUG) is None
+
+
+def test_running_preview_blocks_its_module_until_stale(live):
+    running = _queue(live, "placements", ago=600, status="running", started_ago=300)
+    queued = _queue(live, "placements", ago=10)
+    other = _queue(live, "queries", ago=5)
+    # running дожидается: свежее превью того же модуля ждёт, соседний модуль — нет
+    assert store.claim_preview(SLUG)["id"] == other
+    assert store.claim_preview(SLUG) is None
+    assert _preview_row(live, running)[0] == "running"
+
+    # 25 минут без хода — прерван, очередь модуля освобождается
+    live.execute("UPDATE module_previews SET started_at = now() - interval '25 minutes' "
+                 "WHERE id = %s", (running,))
+    assert store.claim_preview(SLUG)["id"] == queued
+    status, error = _preview_row(live, running)[:2]
+    assert status == "error" and "прерван" in error
+
+
+def test_running_preview_with_fresh_progress_is_not_stale(live):
+    # старт давно, но ход был минуту назад: большой проект честно идёт дольше 20 минут
+    pid = _queue(live, "placements", ago=3600, status="running", started_ago=1800)
+    live.execute("UPDATE module_previews SET progress = jsonb_build_object('logins_done', 3, "
+                 "'at', now() - interval '1 minute') WHERE id = %s", (pid,))
+    _queue(live, "placements", ago=10)
+    assert store.claim_preview(SLUG) is None
+    assert _preview_row(live, pid)[0] == "running"
+
+
+def test_claim_preview_atomic_across_connections(live):
+    pid = _queue(live)
+    gate = threading.Barrier(4)
+    got = []
+
+    def claim():
+        gate.wait()
+        got.append(store.claim_preview(SLUG))
+
+    threads = [threading.Thread(target=claim) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert [r["id"] for r in got if r] == [pid] and len(got) == 4
+
+
+def test_claim_preview_skips_row_locked_by_other_connection(live):
+    pid = _queue(live)
+    other = psycopg2.connect(TEST_URL)
+    try:
+        with other.cursor() as cur:
+            cur.execute("SELECT id FROM module_previews WHERE id = %s FOR UPDATE", (pid,))
+            # строку держит другой раннер: не ждём его, а уходим ни с чем
+            assert store.claim_preview(SLUG) is None
+        other.rollback()
+        assert store.claim_preview(SLUG)["id"] == pid
+    finally:
+        other.close()
+
+
+def test_claim_preview_by_id(live):
+    done = _queue(live, status="done")
+    live.execute("UPDATE module_previews SET result = '{\"would\": []}', error = 'x' "
+                 "WHERE id = %s", (done,))
+    row = store.claim_preview(SLUG, preview_id=done)
+    assert row["id"] == done
+    status, error, result = _preview_row(live, done)[:3]
+    assert (status, error, result) == ("running", None, None)
+    # идущее и чужое по id не берутся
+    assert store.claim_preview(SLUG, preview_id=done) is None
+    assert store.claim_preview("__other_slug__", preview_id=done) is None
+
+
+def test_cleanup_previews_keeps_fresh_and_running(live):
+    old = _queue(live, ago=8 * 86400, status="done")
+    old_running = _queue(live, ago=8 * 86400, status="running", started_ago=60)
+    fresh = _queue(live, ago=3600, status="error")
+    assert store.cleanup_previews(SLUG) == 1
+    live.execute("SELECT id FROM module_previews WHERE dashboard_slug = %s ORDER BY id", (SLUG,))
+    assert [r[0] for r in live.fetchall()] == [old_running, fresh]
+    assert old not in (old_running, fresh)
+    assert store.cleanup_previews(SLUG, older_than=timedelta(minutes=30)) == 1
+
+
+def test_approve_auto_skips_propose(live):
+    run = store.start_run(SLUG, "placements", "auto")
+    plain = _f("plain.ru")
+    propose = _f("propose.ru")
+    propose.details = dict(propose.details, propose=True)
+    ids = store.apply_reconciled(SLUG, "placements", run, Reconciled(insert=[plain, propose]))
+    assert store.approve_auto(SLUG, "placements", ids) == [ids[0]]
+    live.execute("SELECT status FROM module_findings WHERE id = %s", (ids[1],))
+    assert live.fetchone()[0] == "open"

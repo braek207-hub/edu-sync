@@ -259,3 +259,26 @@ def test_unverified_pair_keeps_open_finding():
     # другой кабинет с тем же правилом не держит
     r = reconcile(MK, [audit], [], NOW, ["acc"], unverified=[("other", "ads_rejected")])
     assert r.resolve == [1]
+
+
+def test_unverified_triple_keeps_only_its_campaign():
+    old = timedelta(hours=EXPIRE_HOURS + 1)
+    mine = stored(finding("a.ru", action=ACT, rule="u:aaa111", campaign_id=7), id=1, seen_ago=old)
+    other_cid = stored(finding("b.ru", action=ACT, rule="u:aaa111", campaign_id=8), id=2,
+                       seen_ago=old)
+    other_rule = stored(finding("c.ru", action=ACT, rule="junk", campaign_id=7), id=3,
+                        seen_ago=old)
+    report = stored(finding("d.ru", rule="u:aaa111", campaign_id=7), id=4)
+    whole = stored(finding("e.ru", action=ACT, rule="u:aaa111", campaign_id=None), id=5,
+                   seen_ago=old)
+    r = reconcile(MK, [mine, other_cid, other_rule, report, whole], [], NOW, ["acc"],
+                  unverified=[("acc", "u:aaa111", 7)])
+    # тройка держит только находки своей кампании; соседняя кампания и правило — как обычно
+    assert sorted(r.expire) == [2, 3, 5] and r.resolve == []
+    # чужой кабинет с той же кампанией не держит
+    r = reconcile(MK, [mine], [], NOW, ["acc"], unverified=[("other", "u:aaa111", 7)])
+    assert r.expire == [1]
+    # пара держит весь логин, и вперемешку с тройками тоже
+    r = reconcile(MK, [mine, other_cid], [], NOW, ["acc"],
+                  unverified=[("acc", "u:aaa111"), ("acc", "junk", 8)])
+    assert r.expire == []

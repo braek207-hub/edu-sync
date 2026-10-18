@@ -63,15 +63,17 @@ def _action_key(f: Finding):
 def reconcile(module_key: str, existing: List[StoredFinding],
               seen: List[Finding], now: datetime,
               scanned_logins: Optional[Collection[str]] = None,
-              unverified: Collection[Tuple[str, str]] = ()) -> Reconciled:
+              unverified: Collection[tuple] = ()) -> Reconciled:
     """scanned_logins: кабинеты, прочитанные в этом прогоне (None — все). Открытые находки
     непрочитанных кабинетов не закрываются; находки с login "" относятся к проекту целиком
     и считаются прочитанными, когда scanned_logins непуст.
 
-    unverified: пары (логин, правило), которые прогон не проверил (RunOutput.unverified).
-    Их открытые находки не закрываются и не истекают: статус и first_seen_at остаются.
+    unverified: пары (логин, правило) и тройки (логин, правило, кампания), которые прогон
+    не проверил (RunOutput.unverified). Их открытые находки не закрываются и не истекают:
+    статус и first_seen_at остаются. Тройка держит только находки своей кампании.
     """
-    skip_pairs = set(unverified)
+    skip_pairs = {tuple(u) for u in unverified if len(u) == 2}
+    skip_triples = {(u[0], u[1], int(u[2])) for u in unverified if len(u) == 3}
     by_fp: Dict[str, List[StoredFinding]] = {}
     for s in existing:
         by_fp.setdefault(s.fingerprint, []).append(s)
@@ -140,6 +142,9 @@ def reconcile(module_key: str, existing: List[StoredFinding],
             continue
         # правило в этом кабинете не отработало: «не нашли» здесь не значит «устранено»
         if (s.login, s.rule) in skip_pairs:
+            continue
+        # цель не видна одной кампании: молчание правила там не значит «устранено»
+        if s.campaign_id is not None and (s.login, s.rule, int(s.campaign_id)) in skip_triples:
             continue
         if s.action is None:
             out.resolve.append(s.id)

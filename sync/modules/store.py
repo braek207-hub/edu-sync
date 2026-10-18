@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Хранилище модулей Директа: project_modules, module_runs, module_findings;
+"""Хранилище модулей Директа: project_modules, module_runs, module_findings, module_previews;
 чтение целей-лидов из project_sources.
 
 Схему ведут миграции Panda-BI (supabase/migrations/20261018193100_direct_modules.sql,
-project_sources — 20261017153700_project_onboarding_core.sql); здесь таблицы не создаются.
+module_previews — 20261018213700_direct_modules_rules.sql, project_sources —
+20261017153700_project_onboarding_core.sql); здесь таблицы не создаются.
 """
 
 import json
@@ -240,6 +241,8 @@ def approve_auto(slug: str, module_key: str, ids: Sequence[int]) -> List[int]:
     Действие, которое человек хоть раз откатил (rolled_back в истории, за любой срок), сам
     раннер больше не одобряет: после окна подавления оно возвращается только предложением,
     и одобрить его может лишь человек. Тождество действия — как lifecycle._action_key.
+
+    Находку правила с действием «предложить» (details.propose) тоже одобряет только человек.
     """
     if not ids:
         return []
@@ -248,6 +251,7 @@ def approve_auto(slug: str, module_key: str, ids: Sequence[int]) -> List[int]:
             "UPDATE module_findings f SET status = 'approved' "
             "WHERE f.dashboard_slug = %s AND f.module_key = %s AND f.id = ANY(%s) "
             "AND f.status = 'open' AND f.action IS NOT NULL "
+            "AND f.details->>'propose' IS DISTINCT FROM 'true' "
             "AND NOT EXISTS (SELECT 1 FROM module_findings h "
             "  WHERE h.dashboard_slug = f.dashboard_slug AND h.module_key = f.module_key "
             "    AND h.status = 'rolled_back' "
@@ -271,6 +275,93 @@ def request_rollback(slug: str, module_key: str, object_ids: Sequence[str],
             "WHERE dashboard_slug = %s AND module_key = %s AND status = 'applied' "
             "AND object_id = ANY(%s) AND (%s::text IS NULL OR login = %s)",
             (slug, module_key, list(object_ids), login, login))
+        return cur.rowcount
+
+
+# Превью, которое столько не подавало хода (preview_progress), уже не идёт: процесс убит
+# (юнит ограничен 40 минутами, OOM). Без этого следующее превью того же модуля ждало бы
+# его вечно. Меряем от последнего хода, а не от старта: большой проект честно идёт дольше.
+PREVIEW_STALE_AFTER = timedelta(minutes=20)
+PREVIEW_RETENTION = timedelta(days=7)
+# Panda узнаёт замену по этим словам (adm-module-rules.ts, previewView).
+PREVIEW_REPLACED = "заменено новым"
+_PREVIEW_COLS = "id, dashboard_slug, module_key, settings, rule_id, created_at, started_at"
+
+
+def claim_preview(slug: str, preview_id: Optional[int] = None) -> Optional[dict]:
+    """Взять превью проекта в работу (queued -> running) или None, если брать нечего.
+
+    Одна транзакция: зависшие running закрываются как прерванные; из нескольких queued
+    одного модуля живо только последнее, старые — error «заменено новым»; берётся старейшее
+    из оставшихся у модулей, где ничего не идёт («running дожидается»). SKIP LOCKED: два
+    раннера проекта (под замком и без) одну строку не получат оба.
+
+    preview_id — ручной прогон одного превью (modules_run --preview-id): берётся в любом
+    статусе, кроме идущего, без замены соседей.
+    """
+    stale = PREVIEW_STALE_AFTER.total_seconds()
+    with db.get_connection() as conn, _dict_cursor(conn) as cur:
+        cur.execute(
+            "UPDATE module_previews SET status = 'error', finished_at = now(), "
+            "error = 'прерван: ' || %s || ' мин без хода' "
+            "WHERE dashboard_slug = %s AND status = 'running' "
+            "AND coalesce((progress->>'at')::timestamptz, started_at, created_at) "
+            "    < now() - make_interval(secs => %s)",
+            (int(stale // 60), slug, stale))
+        if preview_id is not None:
+            cur.execute(
+                "UPDATE module_previews SET status = 'running', started_at = now(), "
+                "finished_at = NULL, result = NULL, error = NULL, progress = '{}'::jsonb "
+                "WHERE id = %s AND dashboard_slug = %s AND status <> 'running' "
+                "RETURNING " + _PREVIEW_COLS, (preview_id, slug))
+        else:
+            cur.execute(
+                "UPDATE module_previews p SET status = 'error', finished_at = now(), "
+                "error = %s "
+                "WHERE p.dashboard_slug = %s AND p.status = 'queued' AND EXISTS ("
+                "  SELECT 1 FROM module_previews n WHERE n.dashboard_slug = p.dashboard_slug "
+                "    AND n.module_key = p.module_key AND n.status = 'queued' "
+                "    AND (n.created_at, n.id) > (p.created_at, p.id))",
+                (PREVIEW_REPLACED, slug))
+            cur.execute(
+                "UPDATE module_previews SET status = 'running', started_at = now() "
+                "WHERE status = 'queued' AND id = ("
+                "  SELECT q.id FROM module_previews q "
+                "  WHERE q.dashboard_slug = %s AND q.status = 'queued' "
+                "    AND NOT EXISTS (SELECT 1 FROM module_previews r "
+                "      WHERE r.dashboard_slug = q.dashboard_slug "
+                "        AND r.module_key = q.module_key AND r.status = 'running') "
+                "  ORDER BY q.created_at, q.id LIMIT 1 FOR UPDATE SKIP LOCKED) "
+                "RETURNING " + _PREVIEW_COLS, (slug,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def preview_progress(preview_id: int, progress: dict) -> None:
+    """Ход превью для человека; метка at — пульс, по нему claim_preview отличает живое."""
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE module_previews "
+                    "SET progress = %s::jsonb || jsonb_build_object('at', now()) "
+                    "WHERE id = %s AND status = 'running'", (_json(progress), preview_id))
+
+
+def finish_preview(preview_id: int, status: str, result: Optional[dict],
+                   error: Optional[str] = None) -> bool:
+    """Итог превью (done/error). False — строку уже закрыли как прерванную: итог не пишем,
+    чтобы не воскрешать превью, которое человек, возможно, уже перезапустил."""
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE module_previews SET status = %s, result = %s, error = %s, "
+                    "finished_at = now() WHERE id = %s AND status = 'running'",
+                    (status, _json(result) if result is not None else None, error, preview_id))
+        return cur.rowcount == 1
+
+
+def cleanup_previews(slug: str, older_than: timedelta = PREVIEW_RETENTION) -> int:
+    """Превью проекта старше older_than удалить; идущее не трогаем."""
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM module_previews WHERE dashboard_slug = %s "
+                    "AND status <> 'running' AND created_at < now() - make_interval(secs => %s)",
+                    (slug, older_than.total_seconds()))
         return cur.rowcount
 
 
