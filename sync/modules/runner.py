@@ -23,7 +23,9 @@ WRITE_MODES = ("approve", "auto")
 ROLLBACK_MODES = ("report", "approve", "auto")
 # Строка module_runs фазы применения: её не считают сканом ни расписание, ни ручной запуск.
 APPLY_PHASE = "apply"
-# Юнит модулей ограничен 40 минутами; «идёт» вдвое дольше — прогон убит и уже не завершится.
+# Юнит <slug>_modules ограничен 40 минутами: TimeoutStartSec из timeout="40min" в
+# infra/panda/sync/gen-units.py (репо Panda-BI). Строка «идёт» вдвое дольше — прогон убит
+# systemd и уже не завершится.
 STALE_RUN_AFTER = timedelta(minutes=80)
 EDU_LOCK_LINE = "агент EDU включён — запись у него"
 
