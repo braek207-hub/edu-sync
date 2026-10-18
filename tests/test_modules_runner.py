@@ -300,6 +300,14 @@ def test_auto_applies_open_findings_recorded_earlier():
     assert m.applied == [7] and st.outcomes == [(7, "applied", False)]
 
 
+def test_auto_does_not_apply_unconfirmed_open_finding():
+    stale = dataclasses.replace(_stored(7, "open", obj="stale.ru"))
+    m = FakeModule("placements", findings=[_finding("new.ru")])
+    st = FakeStore([_row(mode="auto")], existing={"placements": [stale]})
+    assert _go(st, {"placements": m}) == 0
+    assert m.applied == [100] and st.outcomes == [(100, "applied", False)]
+
+
 def test_only_off_module_logged_and_busy_message():
     logs = []
     st = FakeStore([])

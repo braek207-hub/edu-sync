@@ -137,12 +137,16 @@ def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line):
     return stats, failed
 
 
-def _auto_apply(slug, mkey, module, ctx, store, fresh, log):
-    """Все открытые находки с действием: и новые, и записанные раньше (например под замком агента)."""
+def _auto_apply(slug, mkey, module, ctx, store, fresh, confirmed, log):
+    """Только подтверждённое этим сканом: вставленное сейчас и открытое, увиденное снова.
+
+    Открытая находка без подтверждения живёт до 72 ч; банить по устаревшим данным нельзя.
+    """
     out: dict = {}
     if not hasattr(module, "apply"):
         return out, False
-    cand = [f.id for f in fresh if f.status == "open" and f.action is not None]
+    cand = [f.id for f in fresh if f.id in confirmed and f.status == "open"
+            and f.action is not None]
     ids = set(store.approve_auto(slug, mkey, cand)) if cand else set()
     items = [dataclasses.replace(f, status="approved") for f in fresh if f.id in ids]
     if not items:
@@ -228,7 +232,7 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                     else [a.login for a in accts]
                 rec = reconcile(mkey, store.existing_findings(slug, mkey), out.findings,
                                 now, scanned)
-                store.apply_reconciled(slug, mkey, run_id, rec)
+                inserted = store.apply_reconciled(slug, mkey, run_id, rec)
                 summary = dict(out.summary)
                 summary.update(findings=len(out.findings), inserted=len(rec.insert),
                                resolved=len(rec.resolve), expired=len(rec.expire))
@@ -237,7 +241,8 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                     summary["agent_lock"] = lock_line
                 elif mode == "auto":
                     auto, bad = _auto_apply(slug, mkey, module, ctx, store,
-                                            store.existing_findings(slug, mkey), log)
+                                            store.existing_findings(slug, mkey),
+                                            set(inserted) | {fid for fid, _ in rec.touch}, log)
                     summary.update({"auto_" + k: v for k, v in auto.items()})
                     if bad:
                         rc = 1
