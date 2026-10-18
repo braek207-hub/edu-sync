@@ -112,15 +112,10 @@ def replace_window(conn, table: str, source: Source, date_from: str, date_to: st
 
 
 def replace_purchases(conn, source: Source, date_from: str, date_to: str, rows: list[PurchaseRow]) -> int:
-    sets = [c for c in _columns(_PURCHASES) if c not in ("source_id", "order_id")]
-    # Заказ может прийти из двух месячных кусков истории с разными датами: побеждает более поздняя.
+    sets = [c for c in _columns(_PURCHASES) if c not in ("source_id", "order_id", "purchase_date")]
     upsert = _insert_sql(_PURCHASES) + sql.SQL(
-        " ON CONFLICT (source_id, order_id) DO UPDATE SET {s}, updated_at = now()"
-        " WHERE EXCLUDED.purchase_date >= {t}.purchase_date"
-    ).format(
-        s=sql.SQL(", ").join(sql.SQL("{c} = EXCLUDED.{c}").format(c=sql.Identifier(c)) for c in sets),
-        t=sql.Identifier(_PURCHASES),
-    )
+        " ON CONFLICT (source_id, order_id, purchase_date) DO UPDATE SET {s}, updated_at = now()"
+    ).format(s=sql.SQL(", ").join(sql.SQL("{c} = EXCLUDED.{c}").format(c=sql.Identifier(c)) for c in sets))
     with conn.cursor() as cur:
         _delete(cur, _PURCHASES, source, date_from, date_to)
         if rows:

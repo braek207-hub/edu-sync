@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from sync.bjorn.common import (
@@ -196,7 +196,9 @@ def parse_goals(data: list[dict[str, Any]], goal_ids: list[int]) -> list[GoalRow
 
 
 def parse_purchases(data: list[dict[str, Any]]) -> list[PurchaseRow]:
-    by_order: dict[str, PurchaseRow] = {}
+    # Покупка = (order_id, дата): тот же purchaseID в другой день — отдельная покупка, как в отчёте Метрики.
+    # Строки с одинаковым ключом суммируются, измерения источника берутся от первой.
+    merged: dict[tuple[str, str], PurchaseRow] = {}
     for rec in data:
         dims = rec["dimensions"]
         order_id = _name(dims[1])
@@ -204,11 +206,15 @@ def parse_purchases(data: list[dict[str, Any]]) -> list[PurchaseRow]:
             continue
         purchases, revenue = rec["metrics"][:2]
         row = PurchaseRow(order_id, _name(dims[0]), *_source_dims(dims[2:8]), _count(purchases), money(revenue))
-        prev = by_order.get(order_id)
-        # Дубль заказа: остаётся строка с поздней датой; при равенстве — первая (детерминированно)
-        if prev is None or row.purchase_date > prev.purchase_date:
-            by_order[order_id] = row
-    return list(by_order.values())
+        key = (order_id, row.purchase_date)
+        prev = merged.get(key)
+        if prev is None:
+            merged[key] = row
+        else:
+            merged[key] = replace(
+                prev, purchases=prev.purchases + row.purchases, revenue=money(prev.revenue + row.revenue)
+            )
+    return list(merged.values())
 
 
 def parse_products(data: list[dict[str, Any]]) -> list[ProductRow]:

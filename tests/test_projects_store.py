@@ -104,13 +104,14 @@ def test_purchases_upsert_on_order(batches):
     assert S.replace_purchases(conn, SRC, "2026-10-01", "2026-10-05", [r]) == 1
     assert '"purchase_date" BETWEEN' in conn.log[0][1]
     q = batches[0][0]
-    assert "ON CONFLICT (source_id, order_id) DO UPDATE SET" in q
-    assert 'WHERE EXCLUDED.purchase_date >= "project_metrika_purchases".purchase_date' in q
+    assert "ON CONFLICT (source_id, order_id, purchase_date) DO UPDATE SET" in q
+    assert "EXCLUDED.purchase_date >=" not in q
     assert "updated_at = now()" in q
     for f in dataclasses.fields(PurchaseRow):
-        if f.name != "order_id":
+        if f.name not in ("order_id", "purchase_date"):
             assert f'"{f.name}" = EXCLUDED."{f.name}"' in q
     assert '"source_id" = EXCLUDED' not in q and '"order_id" = EXCLUDED' not in q
+    assert '"purchase_date" = EXCLUDED' not in q
     assert batches[0][1][0][:3] == (7, "acme", "o1")
 
 

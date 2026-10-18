@@ -106,15 +106,15 @@ def _purchase(day, rev):
     return row([day, "A1", *EMPTY_SOURCE], [1.0, rev])
 
 
-def test_purchase_dedupe_keeps_latest_date():
-    rows = mf.parse_purchases([_purchase("2026-10-16", 100.0), _purchase("2026-10-17", 200.0), _purchase("2026-10-15", 50.0)])
-    assert len(rows) == 1
-    assert (rows[0].purchase_date, rows[0].revenue) == ("2026-10-17", 200.0)
+def test_purchase_same_order_other_day_is_separate():
+    rows = mf.parse_purchases([_purchase("2026-10-16", 100.0), _purchase("2026-10-17", 200.0)])
+    assert [(r.purchase_date, r.revenue) for r in rows] == [("2026-10-16", 100.0), ("2026-10-17", 200.0)]
 
 
-def test_purchase_dedupe_tie_keeps_first():
+def test_purchase_same_order_same_day_sums():
     rows = mf.parse_purchases([_purchase("2026-10-17", 100.0), _purchase("2026-10-17", 300.0)])
-    assert [r.revenue for r in rows] == [100.0]
+    assert len(rows) == 1
+    assert (rows[0].purchases, rows[0].revenue) == (2, 400.0)
 
 
 def test_products_skip_zero_and_none_literal():
