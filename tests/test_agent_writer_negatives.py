@@ -382,3 +382,19 @@ def test_evidence_is_absent_when_the_baseline_cpa_is_unknown():
                                 "campaign_type": "TEXT_CAMPAIGN"}},
         cut_cost=plan["cut_cost"], cut_conversions=plan["cut_conversions"])
     assert actions[0].get("evidence") is None
+
+
+def test_superscripts_and_fractions_refused():
+    # isalnum пропустил бы их как «цифры», а Директ таких не примет.
+    for phrase in ("площадь м²", "½ ставки", "курс №1"):
+        ok, reason = phrase_is_valid(phrase)
+        assert not ok and "робот пишет только" in reason, phrase
+    # Буквы любых алфавитов — буквы: казахские нужны LIME KZ.
+    assert phrase_is_valid("қазақ тілі курсы") == (True, "")
+
+
+def test_hyphen_parts_count_as_words():
+    # Директ делит по дефису: 6 слов через пробел, одно из них с дефисом, — это 7.
+    assert phrase_is_valid("вуз санкт-петербург очно заочно бюджет 2026") == (True, "")
+    ok, reason = phrase_is_valid("вуз санкт-петербург очно заочно бюджет 2026 мгу")
+    assert not ok and "8 слов" in reason

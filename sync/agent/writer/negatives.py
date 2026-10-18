@@ -90,17 +90,19 @@ def phrase_is_valid(phrase: str) -> Tuple[bool, str]:
     if OPERATOR_CHARS & set(normalized):
         return False, ("во фразе есть операторы языка запросов — "
                        "автоматический рычаг такие не ставит")
+    # isalpha/isdecimal, а не isalnum: тот пропускает «²» и «½», которых Директ не примет.
     odd = sorted({ch for ch in _INWORD_HYPHEN.sub("", normalized)
-                  if not ch.isalnum() and ch not in EXTRA_PHRASE_CHARS})
+                  if not (ch.isalpha() or ch.isdecimal()) and ch not in EXTRA_PHRASE_CHARS})
     if odd:
         return False, ("во фразе символы %s — робот пишет только буквы, цифры, "
                        "пробел, точку, апостроф и дефис внутри слова"
                        % " ".join("«%s»" % ch for ch in odd))
-    words = normalized.split(" ")
-    if len(words) > MAX_WORDS_PER_PHRASE:
-        return False, (f"во фразе {len(words)} слов при пределе "
-                       f"{MAX_WORDS_PER_PHRASE}")
-    for word in words:
+    # Директ делит слово по дефису: «санкт-петербург» в пределе 7 слов — два.
+    counted = len(_INWORD_HYPHEN.sub(" ", normalized).split(" "))
+    if counted > MAX_WORDS_PER_PHRASE:
+        return False, (f"во фразе {counted} слов при пределе "
+                       f"{MAX_WORDS_PER_PHRASE} (части через дефис — отдельные слова)")
+    for word in normalized.split(" "):
         if len(word) > MAX_WORD_CHARS:
             return False, (f"слово длиннее {MAX_WORD_CHARS} символов: "
                            f"{word[:40]}")

@@ -6,7 +6,8 @@
    «Не минусовать», затем покрытость минусом и ключи кампании;
 2. встроенные этапа 1: «Фраза не окупается», «Слово без конверсий» (выключаются
    настройкой builtin), стоп-слова;
-3. пользовательские правила по строке запрос × кампания (leads.build_rows).
+3. пользовательские правила: текст условий выбирает запрос × кампания (leads.build_rows),
+   метрики судятся на семье — всех запросах кампании, которые минус отрезал бы.
 
 Кандидатов встроенных считает конвейер агента (sync/agent_e0.py, блок минусации) на
 тех же функциях sync.agent.objects; правила не меняются, fingerprint тот же. Лимит
@@ -15,7 +16,7 @@ max_per_run и 10 на кампанию — общий, встроенные б�
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
@@ -307,7 +308,7 @@ class _Family:
                 "cost": round(sum(q["cost"] for q in hit), 2),
                 "impressions": sum(q.get("impressions") or 0 for q in hit),
                 "conversions": None if None in conv else sum(conv),
-                "queries_sample": [q["query"] for q in hit[:SAMPLE]]}
+                "queries_sample": [q["query"] for q in hit[:SAMPLE]], "queries": len(hit)}
 
 
 @dataclass
@@ -365,6 +366,26 @@ def _candidates(rows, settings, cpa_limit, own_words, own_phrases):
     return out
 
 
+# Метрики правила минус-действия считаются на семье — всех запросах кампании, которые
+# минус отрежет (слово или все слова фразы в любой форме), а не на строке, где сработал
+# текст: «0 лидов» у одного запроса ничего не говорит о слове, которое режет и запросы
+# с лидами (урок «высшее» 25.08), а «цена лида ≥ 5000» человек пишет про поток слова.
+# Текстовые условия (query, words) выбирают запрос-кандидат и судятся на нём.
+FAMILY_FIELDS = frozenset({"clicks", "cost", "impressions", "ctr", "leads", "cr", "cpl",
+                           "cr_x", "cpl_x"})
+
+
+def _family_row(row: R.Row, fam: Dict[str, Any]) -> R.Row:
+    """Строка правила с метриками семьи: текст — запроса-кандидата, база кабинета — та же."""
+    conv = fam["conversions"]
+    known = conv is not None
+    metrics = {"clicks": fam["clicks"], "cost": fam["cost"], "impressions": fam["impressions"],
+               "ctr": leads.pct(fam["clicks"], fam["impressions"]), "leads": conv,
+               "cr": leads.pct(conv, fam["clicks"]) if known else None,
+               "cpl": leads.div(fam["cost"], conv) if known else None}
+    return replace(row, metrics=metrics, leads_known=known)
+
+
 def _rule_phrase(rule: R.Rule, row: R.Row) -> str:
     # Слово — из первого условия «содержит слово» (compile_rules без него правило
     # отвергает), но в написании запроса: ё=е — только для сравнения, а пишется то,
@@ -392,6 +413,7 @@ class _Cand:
 
     Действует первое по списку правило, давшее эту фразу (его строка — самая дорогая
     из его совпадений); остальные, давшие ту же фразу, — «сработали также» в matched.
+    fam — поток семьи, которую минус отрежет; frow — строка правила с её метриками.
     """
     cid: str
     phrase: str
@@ -399,6 +421,7 @@ class _Cand:
     row: R.Row
     matched: List[dict]
     fam: Dict[str, Any] = field(default_factory=dict)
+    frow: Optional[R.Row] = None
 
 
 class _Login:
@@ -432,6 +455,12 @@ class _Login:
     def skip(self, cid: str, reason: str) -> None:
         self.out.skipped.append("%s %s (%s): %s" % (self.acc.login, cid,
                                                     self.live[cid].get("Name") or "", reason))
+
+    def skip_builtin(self, cid: str, reason: str) -> None:
+        # Встроенные кампанию не судили: их прошлые находки в ней reconcile не закрывает.
+        self.skip(cid, reason)
+        for key in self.builtin_keys():
+            self.unverified(key, cid)
 
     def refuse_line(self, rule: str, cid: str, phrase: str, reason: str) -> None:
         self.out.refused.append("%s %s «%s»: %s" % (self.acc.login, cid, phrase, reason))
@@ -502,13 +531,10 @@ class _Login:
         report_goals, dropped = _report_goals(goals_by_cid, self.lead if self.acting else [])
         for cid in dropped:
             # Цель, не попавшая в отчёт, дала бы кампании «ноль конверсий» там, где их не спросили.
-            self.skip(cid, "целей в кабинете больше %d, её цели не вошли в отчёт"
-                      % MAX_REPORT_GOALS)
+            self.skip_builtin(cid, "целей в кабинете больше %d, её цели не вошли в отчёт"
+                              % MAX_REPORT_GOALS)
             self.refuse(refusal("report_goals_over_cap", None, login=acc.login,
                                 campaign_id=int(cid)))
-            # Встроенные кампанию не судили: их прошлые находки в ней reconcile не закрывает.
-            for key in self.builtin_keys():
-                self.unverified(key, cid)
             del goals_by_cid[cid]
         # Правилам пользователя нужны все запущенные кампании, не только с целью стратегии:
         # условие без лидов судится и там, а лиды считаются по целям-лидам.
@@ -568,8 +594,8 @@ class _Login:
             if goals:
                 goals_by_cid[cid] = goals
             else:
-                self.skip(cid, "судить без конверсий нельзя: у стратегии нет цели, "
-                               "lead_goal_ids пуст")
+                self.skip_builtin(cid, "судить без конверсий нельзя: у стратегии нет цели, "
+                                       "lead_goal_ids пуст")
         return goals_by_cid
 
     def _builtin_rows(self, rows: List[Dict[str, Any]], goals_by_cid: Dict[str, List[int]]
@@ -583,8 +609,8 @@ class _Login:
             qs = by_cid[cid]
             if sum(q["cost"] for q in qs) > 0 and sum(q["conversions"] for q in qs) == 0:
                 # Ноль по цели во ВСЕЙ кампании — цель не привязана к её счётчику, а не мусор.
-                self.skip(cid, "цель не дала конверсий за окно — ноль конверсий здесь ничего "
-                               "не значит")
+                self.skip_builtin(cid, "цель не дала конверсий за окно — ноль конверсий "
+                                       "здесь ничего не значит")
                 del by_cid[cid]
         mine = [q for qs in by_cid.values() for q in qs]
         if not mine:
@@ -739,32 +765,48 @@ class _Login:
         self.spend = {cid: sum(q["cost"] or 0.0 for q in items) for cid, items in by.items()}
         self._login_wide()
         login = self.acc.login
-        cands: Dict[Tuple[str, str], _Cand] = {}
+        # Сначала текст: какие запросы-кандидаты и какую фразу дало бы каждое правило.
+        text_only = [replace(r, conditions=tuple(c for c in r.conditions
+                                                 if c.field not in FAMILY_FIELDS))
+                     for r in self.acting]
+        trig: Dict[Tuple[str, str], Dict[str, Tuple[R.Row, str]]] = {}
         for row in urows if self.acting else ():
-            m = R.evaluate(self.acting, row)
+            m = R.evaluate(text_only, row)
             if m is None:
                 continue
-            for rid in m.unverified:
-                code, whole = self.unknown(self.by_id[rid], row)
-                cid = None if whole else row.campaign_id
-                self.unverified(USER + rid, cid)
-                self.refuse(refusal(code, USER + rid, login=login, campaign_id=cid,
-                                    **self.gnv(code, cid)))
-            # Строки идут по убыванию расхода: первая строка правила — его самая дорогая.
             for hit in m.matched:
                 rule = self.by_id[hit["id"]]
                 phrase = negatives.normalize_phrase(_rule_phrase(rule, row))
-                entry = {"id": USER + rule.id, "name": rule.name, "conds": hit["conds"]}
                 key = (str(row.campaign_id), yo(phrase))
+                # Строки идут по убыванию расхода: первая строка правила — его самая дорогая.
+                trig.setdefault(key, {}).setdefault(rule.id, (row, phrase))
+        # Затем правило целиком — на семье, которую эта фраза отрезала бы в кампании.
+        cands: Dict[Tuple[str, str], _Cand] = {}
+        for key, per_rule in trig.items():
+            cid = key[0]
+            words = _words(next(iter(per_rule.values()))[1])
+            fam = self.families[cid].stats(words, stems=True)
+            for rid in sorted(per_rule, key=lambda i: self.rank[USER + i]):
+                rule = self.by_id[rid]
+                row, phrase = per_rule[rid]
+                frow = _family_row(row, fam)
+                m = R.evaluate([rule], frow)
+                if m is None:
+                    continue
+                if m.rule is None:
+                    code, whole = self.unknown(rule, frow)
+                    at = None if whole else row.campaign_id
+                    self.unverified(USER + rid, at)
+                    self.refuse(refusal(code, USER + rid, login=login, campaign_id=at,
+                                        **self.gnv(code, at)))
+                    continue
+                entry = {"id": USER + rid, "name": rule.name, "conds": m.matched[0]["conds"]}
                 c = cands.get(key)
                 if c is None:
-                    cands[key] = _Cand(cid=key[0], phrase=phrase, rule=rule, row=row,
-                                       matched=[entry])
-                elif all(x["id"] != entry["id"] for x in c.matched):
+                    cands[key] = _Cand(cid=cid, phrase=phrase, rule=rule, row=row,
+                                       matched=[entry], fam=fam, frow=frow)
+                else:
                     c.matched.append(entry)
-                    c.matched.sort(key=lambda x: self.rank[x["id"]])
-                    if self.rank[entry["id"]] < self.rank[USER + c.rule.id]:
-                        c.rule, c.row, c.phrase = rule, row, phrase
         return cands
 
     def _user_checks(self, cands, picked, keywords, never, covered) -> List[_Cand]:
@@ -807,20 +849,6 @@ class _Login:
             if _key_conflict(words, own_phrases.get(cid, ())):
                 no("conflicts_keyword")
                 continue
-            if c.rule.action == "minus_word":
-                # Условия правила — по одной строке, а минус-слово режет все запросы кампании
-                # с этим словом и его формами (урок «высшее» 25.08). Слово, которое где-то
-                # в кампании приносит лиды, не минусуем; лиды неизвестны — не проверено.
-                wide = self.families[cid].stats(words, stems=True)
-                if wide["conversions"] is None:
-                    code = self.lead_code or "goal_not_visible"
-                    self.unverified(rule_key, cid)
-                    no(code, **self.gnv(code, cid))
-                    continue
-                if wide["conversions"] > 0:
-                    no("family_pays_off", leads=wide["conversions"])
-                    continue
-            c.fam = self.families[cid].stats(words, stems=False)
             if c.fam["clicks"] <= 0:
                 continue
             ok.append(c)
@@ -888,8 +916,10 @@ class _Login:
         key = USER + c.rule.id
         details = self._base_details(c.fam)
         details.update(rule=dict(R.snapshot(c.rule), id=key), matched=c.matched,
-                       metrics=leads.finding_metrics(c.row.metrics, c.row.account),
-                       # Строка, на которой сработало правило: минус-слово — не сам запрос.
+                       metrics=leads.finding_metrics(c.frow.metrics, c.frow.account),
+                       # Метрики — по всем запросам, которые отрежет минус («по N запросам»).
+                       metrics_scope="family", family_queries=c.fam["queries"],
+                       # Запрос, на котором сработал текст правила: минус-слово — не сам запрос.
                        query=c.row.object)
         if c.rule.action in PROPOSE:
             # Авторежим такие не одобряет (store.approve_auto): решение за человеком.

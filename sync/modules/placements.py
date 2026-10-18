@@ -64,10 +64,6 @@ def _window(now: datetime, days: int) -> dict:
     return {"from": (to - timedelta(days=days - 1)).isoformat(), "to": to.isoformat()}
 
 
-def _r2(value) -> Optional[float]:
-    return None if value is None else round(float(value), 2)
-
-
 def _metrics(row: Optional[R.Row]) -> dict:
     # Строки площадки в окне встроенного может не быть: метрики тогда нулевые, а не пропуск.
     if row is None:
@@ -155,7 +151,7 @@ class _Frame:
         кампании cid, а для строки по логину (None) — кампаний с невидимой целью:
         лиды неизвестны из-за них, а не из-за всего логина."""
         cids = self.invisible if cid is None else (cid,)
-        return _r2(sum(self.cost_by_campaign.get(c, 0.0) for c in cids))
+        return leads.r2(sum(self.cost_by_campaign.get(c, 0.0) for c in cids))
 
 
 def _frame(raw: List[Dict[str, Any]], goals: List[int], currency: str,
@@ -326,7 +322,7 @@ class _Login:
             # она, нельзя. Сработавшая защита ниже по списку решает и без неё.
             if held is None:
                 code = self.unknown(rule, row)[0]
-                extra = ({"cost": _r2(row.metrics.get("cost") or 0.0)}
+                extra = ({"cost": leads.r2(row.metrics.get("cost") or 0.0)}
                          if code == "goal_not_visible" else {})
                 held = refusal(code, None, login=login, campaign_id=cid, obj=site,
                                by=USER + rule.id, held=True, **extra)
@@ -578,7 +574,7 @@ class _Login:
 def _user_finding(c: _Candidate, now: datetime) -> Finding:
     key = USER + c.rule.id
     snap = dict(R.snapshot(c.rule), id=key)
-    details = {"clicks": int(c.row.metrics.get("clicks") or 0), "cost": _r2(c.cost),
+    details = {"clicks": int(c.row.metrics.get("clicks") or 0), "cost": leads.r2(c.cost),
                "rule": snap, "matched": c.matched, "window": _window(now, c.rule.window),
                "metrics": _metrics(c.row),
                "list_fill": {"before": c.list_before, "limit": c.list_limit}}
