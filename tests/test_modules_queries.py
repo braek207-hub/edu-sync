@@ -453,7 +453,7 @@ def test_write_timeout_after_accept_is_applied(monkeypatch):
     monkeypatch.setattr(qm.direct_api, "update_campaign_list", real)
     monkeypatch.setattr(qm.direct_api, "read_campaign_list", lambda *a: None)
     res = qm.apply(_ctx(), [_stored(1, "мусор")])
-    assert not res[1].ok and res[1].error == "кампания не найдена при чтении обратно"
+    assert not res[1].ok and res[1].error == "кампания не найдена в Директе после записи"
 
 
 def test_account_skip_keeps_campaign_reasons(monkeypatch):

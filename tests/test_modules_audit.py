@@ -161,7 +161,7 @@ def test_rejected_shared_sets_field_falls_back(monkeypatch):
     assert len(camp_calls) == 2
     assert "NegativeKeywordSharedSetIds" not in camp_calls[1][3]
     assert "TrackingParams" in camp_calls[1][4]["UnifiedCampaignFieldNames"]
-    reason = "поле NegativeKeywordSharedSetIds не принято API"
+    reason = "Директ не отдал общие наборы минус-фраз"
     assert out.summary["skipped"]["no_negatives"] == {"count": 12, "reason": reason}
     assert "no_negatives" not in out.summary["by_rule"]
     assert "login1" in out.summary["unavailable"]
@@ -210,9 +210,9 @@ def test_summary_skipped_shape(monkeypatch):
     Fake(monkeypatch)
     out = audit_mod.run(_ctx())
     sk = out.summary["skipped"]
-    assert sk["banned_words"]["reason"] == "список banned_words пуст — правило выключено"
+    assert sk["banned_words"]["reason"] == "список запрещённых слов не заполнен в настройках"
     assert sk["strategy_goal_not_allowed"] == {
-        "count": 12, "reason": "список allowed_goal_ids пуст — правило выключено"}
+        "count": 12, "reason": "список допустимых целей не заполнен в настройках"}
 
 
 def test_rejected_request_failure_is_isolated(monkeypatch):
@@ -232,7 +232,7 @@ def test_start_date_is_optional_field(monkeypatch):
     # остальные необязательные поля при этом не потеряны
     assert "NegativeKeywordSharedSetIds" in camp_calls[1][3]
     assert out.summary["skipped"]["on_no_impressions"] == {
-        "count": 12, "reason": "поле StartDate не принято API"}
+        "count": 12, "reason": "Директ не отдал даты старта кампаний"}
     assert out.scanned_logins == ["login1"]
 
 

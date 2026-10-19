@@ -1087,7 +1087,7 @@ def _write(acc: DirectAccount, campaign_id: int, items: Optional[List[str]]) -> 
             "%s %s" % (e.get("Code"), e.get("Message")) for e in errors))
 
 
-NOT_FOUND_BACK = "кампания не найдена при чтении обратно"
+NOT_FOUND_BACK = "кампания не найдена в Директе после записи"
 
 
 def _write_and_read(acc: DirectAccount, cid: int, items: Optional[List[str]]):

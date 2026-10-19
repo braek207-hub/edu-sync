@@ -751,7 +751,7 @@ def _fail_all(group, error) -> Dict[int, ApplyResult]:
     return {f.id: ApplyResult(False, {}, error) for f in group}
 
 
-NOT_FOUND_BACK = "кампания не найдена при чтении обратно"
+NOT_FOUND_BACK = "кампания не найдена в Директе после записи"
 
 
 def _apply_group(acc, cid, group) -> Dict[int, ApplyResult]:

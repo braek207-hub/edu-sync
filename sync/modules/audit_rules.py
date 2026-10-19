@@ -171,7 +171,7 @@ def _epk_blind(snap: Snapshot, rule: str) -> bool:
         return False
     n = sum(1 for camp, _ in _ads(snap) if camp.get("Type") == "UNIFIED_CAMPAIGN")
     if n:
-        skip(snap, rule, "объявления ЕПК: v501 не ответил, вердикт зависел бы от версии API", n,
+        skip(snap, rule, "объявления ЕПК не прочитаны — Директ не отдал их полностью", n,
              whole=True)
     return True
 
@@ -228,7 +228,7 @@ def ads_rejected(snap: Snapshot, settings: dict) -> List[Finding]:
     cmap = _camp_map(snap)
     out = []
     if snap.rejected_ads is None:
-        skip(snap, "ads_rejected", "запрос отклонённых объявлений не удался", whole=True)
+        skip(snap, "ads_rejected", "Директ не отдал отклонённые объявления", whole=True)
         return out
     for ad in snap.rejected_ads:
         camp = cmap.get(int(ad.get("CampaignId") or 0))
@@ -249,7 +249,7 @@ def no_metrika_counter(snap: Snapshot, settings: dict) -> List[Finding]:
         # CounterIds запрашивается только у текстовых и ЕПК; у остальных типов
         # отсутствие поля в ответе ничего не значит.
         if c.get("Type") not in TYPE_BLOCKS:
-            skip(snap, "no_metrika_counter", "тип кампании без запроса счётчика")
+            skip(snap, "no_metrika_counter", "у этого типа кампании счётчик не проверяется")
             continue
         if _items(_block(c).get("CounterIds")):
             continue
@@ -279,12 +279,12 @@ def banned_words(snap: Snapshot, settings: dict) -> List[Finding]:
     words = [_norm(str(w).strip()) for w in settings.get("banned_words") or []
              if str(w).strip()]
     if not words:
-        skip(snap, "banned_words", "список banned_words пуст — правило выключено",
+        skip(snap, "banned_words", "список запрещённых слов не заполнен в настройках",
              sum(1 for _ in _ads(snap)), whole=True)
         return []
     unread = _count_unread_ads(snap) if snap.responsive_ads is None else 0
     if unread:
-        skip(snap, "banned_words", "объявления ЕПК: v501 не ответил, читать нечем", unread,
+        skip(snap, "banned_words", "объявления ЕПК не прочитаны — Директ не отдал их полностью", unread,
              whole=True)
     out = []
     for camp, ad in _ads(snap):
@@ -317,7 +317,7 @@ def on_no_impressions(snap: Snapshot, settings: dict) -> List[Finding]:
             continue
         # Стартовавшая внутри окна или позже не обязана была показываться все три дня.
         if START_DATE in snap.unavailable:
-            skip(snap, "on_no_impressions", "поле StartDate не принято API", whole=True)
+            skip(snap, "on_no_impressions", "Директ не отдал даты старта кампаний", whole=True)
             continue
         start = str(c.get("StartDate") or "")
         if start and snap.impressions_from and start > snap.impressions_from:
@@ -366,7 +366,7 @@ def no_negatives(snap: Snapshot, settings: dict) -> List[Finding]:
             continue
         if SHARED_SETS in snap.unavailable:
             # Без наборов общих минус-слов «пусто» может быть ложным: не судим.
-            skip(snap, "no_negatives", "поле %s не принято API" % SHARED_SETS, whole=True)
+            skip(snap, "no_negatives", "Директ не отдал общие наборы минус-фраз", whole=True)
             continue
         if _items(c.get("NegativeKeywords")) or _items(c.get(SHARED_SETS)):
             continue
@@ -385,7 +385,7 @@ def _has_utm(href: str) -> bool:
 def href_no_utm(snap: Snapshot, settings: dict) -> List[Finding]:
     groups = {int(g["Id"]): g for g in snap.groups}
     if not settings.get("require_utm", True):
-        skip(snap, "href_no_utm", "require_utm выключен — правило выключено",
+        skip(snap, "href_no_utm", "проверка меток выключена в настройках",
              sum(1 for _ in _ads(snap)), whole=True)
         return []
     blind = _epk_blind(snap, "href_no_utm")
@@ -399,10 +399,10 @@ def href_no_utm(snap: Snapshot, settings: dict) -> List[Finding]:
         block = _block(camp)
         ctype = camp.get("Type")
         if ctype not in TYPE_BLOCKS:
-            skip(snap, "href_no_utm", "тип кампании без чтения TrackingParams")
+            skip(snap, "href_no_utm", "у этого типа кампании метки ссылок не проверяются")
             continue
         if ctype == "UNIFIED_CAMPAIGN" and UNIFIED_TRACKING in snap.unavailable:
-            skip(snap, "href_no_utm", "поле TrackingParams не принято API (ЕПК)", whole=True)
+            skip(snap, "href_no_utm", "Директ не отдал метки ссылок ЕПК", whole=True)
             continue
         if str(block.get("TrackingParams") or "").strip():
             continue
@@ -415,7 +415,7 @@ def href_no_utm(snap: Snapshot, settings: dict) -> List[Finding]:
         out.append(_finding(
             snap, "href_no_utm", "warning", camp, "ad", ad["Id"],
             "Ссылка объявления %s без utm_source и utm_campaign" % ad["Id"],
-            "Добавьте разметку в ссылку или задайте TrackingParams на кампанию.",
+            "Добавьте разметку в ссылку или задайте метки ссылок в настройках кампании.",
             _ad_link(snap, camp, ad), {"href": href}))
     return out
 
@@ -429,7 +429,7 @@ def strategy_goal_not_allowed(snap: Snapshot, settings: dict) -> List[Finding]:
             continue
     if not allowed:
         skip(snap, "strategy_goal_not_allowed",
-             "список allowed_goal_ids пуст — правило выключено", len(snap.campaigns), whole=True)
+             "список допустимых целей не заполнен в настройках", len(snap.campaigns), whole=True)
         return []
     out = []
     for c in snap.campaigns:
@@ -468,7 +468,7 @@ def negatives_near_limit(snap: Snapshot, settings: dict) -> List[Finding]:
         out.append(_finding(
             snap, "negatives_near_limit", "warning", c, "campaign", c["Id"],
             "Минус-фразы занимают %d из %d символов" % (chars, NEGATIVES_LIMIT_CHARS),
-            "Сократите список: уберите дубли и фразы, которые уже покрыты общими минус-словами.",
+            "Сократите список: уберите дубли и фразы, которые уже покрыты общими минус-фразами.",
             url(snap.login, c["Id"]), {"chars": chars, "limit": NEGATIVES_LIMIT_CHARS}))
     return out
 
@@ -484,7 +484,7 @@ def no_sitelinks(snap: Snapshot, settings: dict) -> List[Finding]:
         if not isinstance(text, dict):
             # SitelinkSetId читается из TextAd; у комбинаторных его в запросе нет.
             if ad.get("ResponsiveAd") is not None:
-                skip(snap, "no_sitelinks", "объявление ЕПК: быстрые ссылки не читаются")
+                skip(snap, "no_sitelinks", "у объявлений ЕПК быстрые ссылки не проверяются")
             continue
         if text.get("SitelinkSetId"):
             continue
@@ -502,7 +502,7 @@ def title_underused(snap: Snapshot, settings: dict) -> List[Finding]:
         fill = 0.6
     unread = _count_unread_ads(snap) if snap.responsive_ads is None else 0
     if unread:
-        skip(snap, "title_underused", "объявления ЕПК: v501 не ответил, читать нечем", unread,
+        skip(snap, "title_underused", "объявления ЕПК не прочитаны — Директ не отдал их полностью", unread,
              whole=True)
     out = []
     for camp, ad in _ads(snap):
@@ -543,7 +543,7 @@ def duplicate_keywords(snap: Snapshot, settings: dict) -> List[Finding]:
         out.append(_finding(
             snap, "duplicate_keywords", "info", camp, "phrase", phrase,
             "Фраза «%s» повторяется в %d группах" % (phrase, len(groups)),
-            "Оставьте фразу в одной группе или разведите их минус-словами.",
+            "Оставьте фразу в одной группе или разведите их минус-фразами.",
             url(snap.login, cid), {"group_ids": sorted(groups)}))
     return out
 
@@ -552,7 +552,7 @@ def area_of_interest_on(snap: Snapshot, settings: dict) -> List[Finding]:
     out = []
     for c in snap.campaigns:
         if c.get("Type") not in TYPE_BLOCKS:
-            skip(snap, "area_of_interest_on", "тип кампании без чтения Settings")
+            skip(snap, "area_of_interest_on", "у этого типа кампании настройки не проверяются")
             continue
         on = any(isinstance(o, dict) and o.get("Option") == AREA_OF_INTEREST
                  and o.get("Value") == "YES" for o in _items(_block(c).get("Settings")))
@@ -561,7 +561,7 @@ def area_of_interest_on(snap: Snapshot, settings: dict) -> List[Finding]:
         out.append(_finding(
             snap, "area_of_interest_on", "info", c, "campaign", c["Id"],
             "Включён расширенный геотаргетинг",
-            "Выключите вручную в настройках кампании: API это не меняет.",
+            "Выключите вручную в настройках кампании: робот этого не меняет.",
             url(snap.login, c["Id"])))
     return out
 

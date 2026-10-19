@@ -121,7 +121,7 @@ def fail_stale_runs(slug: str, older_than: timedelta) -> int:
         cur.execute(
             "UPDATE module_runs SET status = 'error', finished_at = now(), "
             "summary = summary || jsonb_build_object('reason', 'прерван'), "
-            "error = coalesce(error, 'прогон прерван: не завершился за ' || %s || ' мин') "
+            "error = coalesce(error, 'запуск прерван: не завершился за ' || %s || ' мин') "
             "WHERE dashboard_slug = %s AND status = 'running' "
             "AND started_at < now() - make_interval(secs => %s)",
             (int(older_than.total_seconds() // 60), slug, older_than.total_seconds()))

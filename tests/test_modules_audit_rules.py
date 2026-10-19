@@ -161,7 +161,7 @@ def test_href_silent_when_tracking_params_not_read():
     snap = _snap([_camp(ctype="UNIFIED_CAMPAIGN")], ads=[_ad(href="https://x.ru/")],
                  unavailable={UNIFIED_TRACKING: "4000"})
     assert _run("href_no_utm", snap) == []
-    assert snap.skipped["href_no_utm"] == {"поле TrackingParams не принято API (ЕПК)": 1}
+    assert snap.skipped["href_no_utm"] == {"Директ не отдал метки ссылок ЕПК": 1}
     # поле принято и пусто — это «разметки нет», правило судит
     ok = _snap([_camp(ctype="UNIFIED_CAMPAIGN")], ads=[_ad(href="https://x.ru/")])
     assert len(_run("href_no_utm", ok)) == 1
@@ -283,20 +283,20 @@ def test_skipped_counts_silent_rules():
     for _rule, _s, chk in RULES:
         chk(snap, settings_for("audit", {}))
     sk = snap.skipped
-    assert sk["no_metrika_counter"] == {"тип кампании без запроса счётчика": 1}
-    assert sk["banned_words"] == {"список banned_words пуст — правило выключено": 2}
+    assert sk["no_metrika_counter"] == {"у этого типа кампании счётчик не проверяется": 1}
+    assert sk["banned_words"] == {"список запрещённых слов не заполнен в настройках": 2}
     assert sk["strategy_goal_not_allowed"] == {
-        "список allowed_goal_ids пуст — правило выключено": 2}
+        "список допустимых целей не заполнен в настройках": 2}
     assert sk["group_no_targeting"] == {"группа не текстовая (таргет не по фразам)": 1,
                                         "группа в черновике": 1}
-    assert sk["area_of_interest_on"] == {"тип кампании без чтения Settings": 1}
+    assert sk["area_of_interest_on"] == {"у этого типа кампании настройки не проверяются": 1}
     assert sk["no_negatives"] == {"не поисковая кампания или тип без минус-фраз": 1}
 
 
 def test_href_rule_off_is_reported():
     snap = _snap(ads=[_ad()])
     _run("href_no_utm", snap, require_utm=False)
-    assert snap.skipped["href_no_utm"] == {"require_utm выключен — правило выключено": 1}
+    assert snap.skipped["href_no_utm"] == {"проверка меток выключена в настройках": 1}
 
 
 def test_on_no_impressions_skips_campaign_started_in_window():
@@ -317,7 +317,7 @@ def test_shared_negative_set_counts_as_negatives():
 def test_no_negatives_skipped_when_shared_sets_field_rejected():
     snap = _snap([_camp(negatives=())], unavailable={SHARED_SETS: "8000"})
     assert _run("no_negatives", snap) == []
-    assert snap.skipped["no_negatives"] == {"поле %s не принято API" % SHARED_SETS: 1}
+    assert snap.skipped["no_negatives"] == {"Директ не отдал общие наборы минус-фраз": 1}
 
 
 def test_group_tracking_params_close_href_rule():
@@ -352,7 +352,7 @@ def test_responsive_unread_reported_when_v501_failed():
     snap = _snap(ads=[ep, _ad()], responsive=None)
     _run("banned_words", snap, banned_words=["кредит"])
     _run("title_underused", snap)
-    reason = "объявления ЕПК: v501 не ответил, читать нечем"
+    reason = "объявления ЕПК не прочитаны — Директ не отдал их полностью"
     assert snap.skipped["banned_words"] == {reason: 1}
     assert snap.skipped["title_underused"] == {reason: 1}
 
@@ -367,7 +367,7 @@ def test_rejected_archived_ad_is_not_a_finding():
 def test_rejected_request_failed_reported_in_skipped():
     snap = _snap(rejected=None)
     assert _run("ads_rejected", snap) == []
-    assert snap.skipped["ads_rejected"] == {"запрос отклонённых объявлений не удался": 1}
+    assert snap.skipped["ads_rejected"] == {"Директ не отдал отклонённые объявления": 1}
 
 
 def test_same_ad_from_v5_and_v501_judged_once():
@@ -383,7 +383,7 @@ def test_same_ad_from_v5_and_v501_judged_once():
 def test_start_date_unavailable_skips_rule():
     snap = _snap(imp={}, unavailable={"StartDate": "4000"})
     assert _run("on_no_impressions", snap) == []
-    assert snap.skipped["on_no_impressions"] == {"поле StartDate не принято API": 1}
+    assert snap.skipped["on_no_impressions"] == {"Директ не отдал даты старта кампаний": 1}
 
 
 def _open_ad(rule, obj, cid=1):

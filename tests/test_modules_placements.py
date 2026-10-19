@@ -282,7 +282,7 @@ def test_readback_none_has_own_reason(monkeypatch):
 
     Gone(monkeypatch, [_camp(1)])
     res = pm.apply(_ctx(), [_stored(1, SITES[0])])
-    assert res[1].error == "кампания не найдена при чтении обратно"
+    assert res[1].error == "кампания не найдена в Директе после записи"
 
 
 def test_failed_spam_report_keeps_login_out_of_scanned(api, monkeypatch):
