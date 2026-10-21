@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from sync.modules import direct_api, leads
 from sync.modules import rules as R
 from sync.modules.accounts import DirectAccount
-from sync.modules.reasons import by_rule, refusal
+from sync.modules.reasons import by_rule, intercept, merge_intercepted, refusal
 from sync.modules.queries import MSK
 from sync.modules.types import ApplyResult, Context, Finding, RunOutput, StoredFinding
 from sync.placements import classify, direct, journal, llm, spam
@@ -202,6 +202,8 @@ class _LoginScan:
     unverified: List[tuple] = field(default_factory=list)
     problems: List[str] = field(default_factory=list)
     room: Dict[Tuple[str, int], int] = field(default_factory=dict)
+    # {правило: {taken, protected}} — улов правила, где действует не оно (reasons.intercept)
+    intercepted: Dict[str, Dict[str, int]] = field(default_factory=dict)
     campaigns: int = 0
     objects: int = 0
 
@@ -543,6 +545,7 @@ class _Login:
             if builtin is not None:
                 # Встроенное раньше по порядку: действие одно, совпавшие — «сработали также».
                 builtin.details["matched"].extend(entry["matched"])
+                intercept(self.out.intercepted, [h["id"] for h in entry["matched"]], "taken")
                 continue
             rule, row = entry["first"]
             key = USER + rule.id
@@ -561,10 +564,14 @@ class _Login:
             if not ok:
                 self.log("  [%s] %s в кампании %s не пишется: %s" % (login, site, cid, why))
                 continue
+            # Правила ниже поймали ту же площадку: защита у всех одна, действие — у первого.
+            lower = [h["id"] for h in entry["matched"][1:]]
             held = self.guard(site, cid, key, True)
             if held is not None:
                 self.guarded(held)
+                intercept(self.out.intercepted, [key] + lower, "protected")
                 continue
+            intercept(self.out.intercepted, lower, "taken")
             self.out.candidates.append(_Candidate(
                 login=login, campaign=campaign, site=site, rule=rule, row=row,
                 matched=entry["matched"], list_before=len(existing),
@@ -654,7 +661,8 @@ def run(ctx: Context) -> RunOutput:
                                   detail=n.get("detail")) for n in notes]
     unverified: List[tuple] = []
     room: Dict[Tuple[str, int], int] = {}
-    read = {"logins": 0, "campaigns": 0, "objects": 0}
+    intercepted: Dict[str, Dict[str, int]] = {}
+    read ={"logins": 0, "campaigns": 0, "objects": 0}
     scanned: List[str] = []
     errors: List[str] = []
     total = len(ctx.accounts)
@@ -672,6 +680,7 @@ def run(ctx: Context) -> RunOutput:
             candidates += scan.candidates
             refused += scan.refused
             room.update(scan.room)
+            merge_intercepted(intercepted, scan.intercepted)
             unverified += scan.unverified + [(acc.login, k) for k in silent]
             if scan.problems:
                 # Улики неполные: не закрываем и не гасим его находки по устаревшим данным.
@@ -688,6 +697,8 @@ def run(ctx: Context) -> RunOutput:
                                "by_rule": by_rule([USER + r.id for r in rules], findings, refused, over),
                                # Число, как в queries: по правилам счёт — в by_rule.
                                "over_cap": sum(over.values())}
+    if intercepted:
+        summary["intercepted"] = intercepted
     if silent:
         # Те же ключи лежат в unverified каждого логина: по этому списку UI отличает
         # «выключено настройкой» от «не проверено» (спам выключен по умолчанию).
@@ -754,7 +765,37 @@ def _fail_all(group, error) -> Dict[int, ApplyResult]:
 NOT_FOUND_BACK = "кампания не найдена в Директе после записи"
 
 
-def _apply_group(acc, cid, group) -> Dict[int, ApplyResult]:
+GUARD_TEXT = {
+    "user_protect": "площадку защищает правило «%s» — запрет не ставим",
+    "in_never_list": "площадка в списке «Никогда не закрывать» — запрет не ставим",
+    "system_allowlist": "площадка в системном белом списке — запрет не ставим",
+}
+
+
+def _apply_guard(f: StoredFinding, site: str, cid: int, protect: List[R.Rule],
+                 extra: Set[str], money_known: bool) -> Optional[ApplyResult]:
+    """Защиты на применении одобренного: между сканом и записью человек мог добавить
+    защиту или площадку в «Никогда не закрывать», а снять одобрение нельзя. Порядок —
+    как у скана (_Login._guard); «Всегда закрывать» сильнее системного белого списка."""
+    by = R.protected_by(protect, [R.finding_row(site, cid, classify.classify(site)[0],
+                                                f.details, money_known)])
+    if by is not None:
+        return ApplyResult(False, {"code": "user_protect", "by": USER + by.id,
+                                   "campaign_id": cid, "site": site},
+                           GUARD_TEXT["user_protect"] % by.name)
+    code = ("in_never_list" if site in extra
+            else "system_allowlist" if f.rule != "forced" and _system_allowed(site) else None)
+    if code is None:
+        return None
+    return ApplyResult(False, {"code": code, "campaign_id": cid, "site": site}, GUARD_TEXT[code])
+
+
+def _apply_group(acc, cid, group, settings: Optional[dict] = None) -> Dict[int, ApplyResult]:
+    settings = settings or {}
+    protect = [r for r in R.compile_rules(KEY, settings.get("rules") or [])[0]
+               if r.action == R.PROTECT]
+    extra = {_site(s) for s in settings.get("extra_allow") or [] if _site(s)}
+    money_known = (acc.currency or "RUB").upper() == "RUB"
     fresh = _fresh(acc, cid)
     if fresh is None:
         return _fail_all(group, "кампания не видна API (Мастер кампаний)")
@@ -769,7 +810,10 @@ def _apply_group(acc, cid, group) -> Dict[int, ApplyResult]:
     to_add: List[str] = []
     for f in group:
         site = _site(f.action["site"])
-        if site in have:
+        guard = _apply_guard(f, site, int(cid), protect, extra, money_known)
+        if guard is not None:
+            out[f.id] = guard
+        elif site in have:
             # Это не наш запрет: помечать applied нельзя, иначе откат снимет чужое.
             out[f.id] = ApplyResult(False, {"already_present": True, "site": site},
                                     "площадка уже запрещена в кампании — запрет не робота")
@@ -807,7 +851,7 @@ def _apply_group(acc, cid, group) -> Dict[int, ApplyResult]:
     return out
 
 
-def _rollback_group(acc, cid, group) -> Dict[int, ApplyResult]:
+def _rollback_group(acc, cid, group, _settings: Optional[dict] = None) -> Dict[int, ApplyResult]:
     fresh = _fresh(acc, cid)
     if fresh is None:
         return _fail_all(group, "кампания не видна API (Мастер кампаний)")
@@ -815,10 +859,12 @@ def _rollback_group(acc, cid, group) -> Dict[int, ApplyResult]:
     out: Dict[int, ApplyResult] = {}
     drop = set()
     for f in group:
-        site = f.action["site"]
+        # Запись шла нормализованной формой (_apply_group): ищем её, а не сырое action.site —
+        # регистр или «www.» в находке иначе давали бы промах отката.
+        site = _site(f.action["site"])
         if any(s.strip() == site for s in existing):
             drop.add(site)
-        elif any(_site(s) == _site(site) for s in existing):
+        elif any(_site(s) == site for s in existing):
             # Робот писал нормализованную форму; вариант в другом регистре поставил человек.
             out[f.id] = ApplyResult(False, {"campaign_id": cid, "site": site},
                                     "в списке вариант в другом регистре — запрет не робота")
@@ -837,7 +883,7 @@ def _rollback_group(acc, cid, group) -> Dict[int, ApplyResult]:
     for f in group:
         if f.id in out:
             continue
-        site = f.action["site"]
+        site = _site(f.action["site"])
         if site not in present:
             out[f.id] = ApplyResult(True, {"campaign_id": cid, "site": site})
         elif werr is not None:
@@ -858,7 +904,7 @@ def _run_groups(ctx: Context, items: List[StoredFinding], handler) -> Dict[int, 
             out.update(_fail_all(group, "кабинет %s недоступен" % login))
             continue
         try:
-            out.update(handler(acc, cid, group))
+            out.update(handler(acc, cid, group, ctx.settings))
         except Exception as err:  # одна кампания не должна ронять остальные
             out.update(_fail_all(group, "%s: %s" % (type(err).__name__, err)))
     return out

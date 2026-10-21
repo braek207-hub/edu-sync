@@ -536,6 +536,7 @@ def test_user_finding_details(api):
     assert d["propose"] is True
     assert d["rule"] == {"id": "u:" + RID, "name": "Правило " + RID, "action": "propose",
                          "window": 7, "where": "seen",
+                         "campaigns": {"only": [], "except": []},
                          "conditions": [{"field": "clicks", "op": "gte", "value": 10}]}
     assert d["matched"] == [{"id": "u:" + RID, "name": "Правило " + RID,
                              "conds": [{"field": "clicks", "op": "gte", "value": 10,
@@ -747,3 +748,77 @@ def test_spam_constants_match_settings_defaults():
     d = settings_for("placements", None)["spam"]
     assert (pm.spam.MIN_LEADS, pm.spam.MIN_CR, pm.spam.CR_RATIO) == (
         d["min_leads"], d["min_cr"], d["ratio"])
+
+
+# --- полный улов правила для превью (final-review I-2 п.3) ---------------------------
+
+def test_rule_below_counts_rows_taken_by_rule_above_and_by_protect(api):
+    api["campaigns"] = [_camp(1)]
+    api["rows"] = [_day(1, "alpha.ru", 50, 9.0), _day(1, "beta.ru", 30, 8.0),
+                   _day(1, "gamma.ru", 5, 7.0)]
+    above = _rule([("clicks", "gte", 40)], rid="abv111", action="propose")
+    block = _rule([("clicks", "gte", 1)])
+    protect = _rule([("name", "equals", "beta.ru")], rid="ppp111", action="protect")
+    out = pm.run(_ctx({"rules": [above, block, protect]}))
+    assert sorted((f.rule, f.object_id) for f in out.findings) == [
+        ("u:" + RID, "gamma.ru"), ("u:abv111", "alpha.ru")]
+    # alpha.ru правило ловит, но действует propose выше; beta.ru держит защита
+    assert out.summary["intercepted"]["u:" + RID] == {"taken": 1, "protected": 1}
+    assert "u:abv111" not in out.summary["intercepted"]
+
+
+def test_rule_counts_rows_taken_by_builtin(api):
+    api["rows"] = [_day(1, "games.example.ru", 12, 30.0)]
+    out = pm.run(_ctx({"rules": [_rule([("category", "is", "game")])]}))
+    assert [f.rule for f in out.findings] == ["game"]
+    assert out.summary["intercepted"]["u:" + RID] == {"taken": 1, "protected": 0}
+
+
+# --- применение одобренного перепроверяет защиты (final-review Minor 4) ------------
+
+def _approved(site, rule="u:" + RID, cid=1, metrics=None):
+    f = _stored(1, site, cid=cid)
+    return dataclasses.replace(
+        f, rule=rule, fingerprint="placements:%s:login1:%d:%s" % (rule, cid, site),
+        details={"metrics": metrics or {"clicks": 5, "cost": 10.0, "impressions": 50}})
+
+
+def test_apply_skips_site_protected_after_approval(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1)])
+    protect = _rule([("name", "equals", "beta.ru")], rid="ppp111", action="protect")
+    res = pm.apply(_ctx({"rules": [protect]}), [_approved("Beta.ru")])
+    assert not res[1].ok
+    assert res[1].response["code"] == "user_protect" and res[1].response["by"] == "u:ppp111"
+    assert "«Правило ppp111»" in res[1].error
+    assert fake.writes == []
+
+
+def test_apply_protect_by_stats_judged_on_finding_numbers(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1)])
+    protect = _rule([("clicks", "gte", 40)], rid="ppp111", action="protect")
+    busy = pm.apply(_ctx({"rules": [protect]}), [_approved("beta.ru", metrics={"clicks": 50})])
+    assert busy[1].response["code"] == "user_protect" and fake.writes == []
+    calm = pm.apply(_ctx({"rules": [protect]}), [_approved("beta.ru", metrics={"clicks": 5})])
+    assert calm[1].ok and fake.writes == [(1, ["beta.ru"])]
+
+
+def test_apply_skips_never_list_and_system_allowlist(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1)])
+    never = pm.apply(_ctx({"extra_allow": ["WWW.Beta.ru"]}), [_approved("www.beta.ru")])
+    assert never[1].response["code"] == "in_never_list"
+    system = pm.apply(_ctx(), [_approved("avito.ru", rule="app")])
+    assert system[1].response["code"] == "system_allowlist"
+    assert fake.writes == []
+    # «Всегда закрывать» — явное решение человека: сильнее системного белого списка
+    forced = pm.apply(_ctx(), [_approved("avito.ru", rule="forced")])
+    assert forced[1].ok and fake.writes == [(1, ["avito.ru"])]
+
+
+# --- откат нормализует домен так же, как запись (final-review Minor 9) ---------------
+
+def test_rollback_finds_robot_form_of_raw_site(monkeypatch):
+    # находка помнит «WWW.Beta.ru», робот записал нормализованное «www.beta.ru»
+    fake = FakeDirect(monkeypatch, [_camp(1, items=["www.beta.ru", "Ручной.ru"])])
+    res = pm.rollback(_ctx(), [_stored(1, "WWW.Beta.ru")])
+    assert res[1].ok and not res[1].response.get("already_absent")
+    assert fake.writes == [(1, ["Ручной.ru"])]

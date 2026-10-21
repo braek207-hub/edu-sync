@@ -34,6 +34,24 @@ def refusal(code: str, rule: Optional[str], *, login: Optional[str] = None,
     return out
 
 
+INTERCEPT_KINDS: Tuple[str, ...] = ("taken", "protected")
+
+
+def intercept(acc: Dict[str, Dict[str, int]], keys: Iterable[str], kind: str) -> None:
+    """Правило поймало строку, но действие не его: taken — раньше сработало правило выше
+    или встроенное, protected — строку держит защита. Превью одного правила показывает
+    полный улов: без этого счёта «делать само» подтверждали бы по заниженным цифрам."""
+    for key in keys:
+        acc.setdefault(key, {k: 0 for k in INTERCEPT_KINDS})[kind] += 1
+
+
+def merge_intercepted(dst: Dict[str, Dict[str, int]], src: Dict[str, Dict[str, int]]) -> None:
+    for key, counts in src.items():
+        slot = dst.setdefault(key, {k: 0 for k in INTERCEPT_KINDS})
+        for kind in INTERCEPT_KINDS:
+            slot[kind] += int(counts.get(kind) or 0)
+
+
 def by_rule(user_keys: Iterable[str], findings: Iterable[Any], refused: List[Any],
             over: Dict[str, int], lines: Optional[Dict[str, int]] = None
             ) -> Dict[str, Dict[str, int]]:

@@ -374,9 +374,42 @@ def evaluate(rules: List[Rule], row: Row) -> Optional[Match]:
                  unverified=unverified, held_by=held_by)
 
 
+def finding_row(obj: str, campaign_id: int, category: Optional[str], details: Any,
+                money_known: bool) -> Row:
+    """Строка для защит при применении одобренного: объект находки и её цифры.
+
+    Скан к этому моменту мог быть сутки назад, а окно защиты — другим, чем у находки:
+    статистика здесь — последняя известная, из details.metrics (этап 1 — clicks и cost
+    прямо в details). Ошибиться она может только в сторону лишнего отказа."""
+    d = details if isinstance(details, dict) else {}
+    m = d.get("metrics") if isinstance(d.get("metrics"), dict) else {
+        k: d.get(k) for k in ("clicks", "cost")}
+    clicks, shows = m.get("clicks") or 0, m.get("impressions") or 0
+    metrics = {"clicks": m.get("clicks"), "cost": m.get("cost"), "impressions": m.get("impressions"),
+               "leads": m.get("leads"), "cr": m.get("cr"), "cpl": m.get("cpl"),
+               "ctr": round(clicks * 100.0 / shows, 2) if shows else None}
+    return Row(object=obj, campaign_id=int(campaign_id), category=category, metrics=metrics,
+               account={"cr": m.get("account_cr"), "cpl": m.get("account_cpl")},
+               leads_known=m.get("leads") is not None, money_known=money_known,
+               scope="campaign")
+
+
+def protected_by(rules: List[Rule], rows: List[Row]) -> Optional[Rule]:
+    """Защита, сработавшая хоть на одной строке, или None. Непроверяемая защита здесь не
+    держит: её удержание — дело скана, на применении действует только сработавшая."""
+    guards = [r for r in rules if r.action == PROTECT]
+    for row in rows if guards else ():
+        m = evaluate(guards, row)
+        if m is not None and m.rule is not None:
+            return m.rule
+    return None
+
+
 def snapshot(rule: Rule) -> dict:
     """Снимок правила для details.rule: по нему Panda рисует, почему и что сделано."""
     return {"id": rule.id, "name": rule.name, "action": rule.action,
             "window": rule.window, "where": rule.where,
+            # сужение по кампаниям: без него «почему» и история не видят, где правило судит
+            "campaigns": {"only": sorted(rule.only), "except": sorted(rule.except_)},
             "conditions": [{"field": c.field, "op": c.op, "value": c.value}
                            for c in rule.conditions]}

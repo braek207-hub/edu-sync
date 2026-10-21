@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Модуль queries: окно и цели отчёта, пропуски, конвейер агента, запись и откат."""
 
+import dataclasses
 from datetime import datetime, timezone
 
 import pytest
@@ -611,6 +612,7 @@ def test_user_minus_word_finding(monkeypatch):
     d = f.details
     assert d["rule"] == {"id": "u:free01", "name": "Правило free01", "action": "minus_word",
                          "window": None, "where": None,
+                         "campaigns": {"only": [], "except": []},
                          "conditions": [{"field": "query", "op": "has_word",
                                          "value": "бесплатно"},
                                         {"field": "clicks", "op": "gte", "value": 3},
@@ -1163,3 +1165,64 @@ def test_word_covers_phrase_only_in_its_campaign(monkeypatch):
     assert {(f.rule, f.campaign_id, f.object_id) for f in out.findings} == {
         ("u:free01", 1, "бесплатно"), ("u:cour01", 2, "курсы бесплатно")}
     assert [(r["code"], r["campaign_id"]) for r in _codes(out)] == [("covered_by_minus", 1)]
+
+
+# --- полный улов правила для превью (final-review I-2 п.3) ---------------------------
+
+def test_rule_below_counts_phrase_taken_by_rule_above(monkeypatch):
+    FakeDirect(monkeypatch, [_camp(1)], _small(), keywords={"1": []})
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [
+        _rule("first1", "propose_word", FREE, ("clicks", "gte", 3)),
+        _rule("secnd1", "minus_word", FREE, ("clicks", "gte", 2))]}))
+    assert [f.rule for f in out.findings] == ["u:first1"]
+    assert out.summary["intercepted"] == {"u:secnd1": {"taken": 1, "protected": 0}}
+
+
+def test_protect_counts_for_every_rule_that_caught_the_phrase(monkeypatch):
+    FakeDirect(monkeypatch, [_camp(1)], _small(), keywords={"1": []})
+    out = qm.run(_ctx({"lead_goal_ids": [GOAL], "rules": [
+        _rule("first1", "minus_word", FREE, ("clicks", "gte", 3)),
+        _rule("secnd1", "minus_word", FREE, ("clicks", "gte", 2)),
+        _rule("prot01", "protect", ("query", "has_word", "курсы"))]}))
+    assert out.findings == []
+    assert out.summary["intercepted"] == {"u:first1": {"taken": 0, "protected": 1},
+                                          "u:secnd1": {"taken": 0, "protected": 1}}
+
+
+def test_rule_counts_phrase_taken_by_builtin(monkeypatch):
+    FakeDirect(monkeypatch, [_camp(1)], _base(), keywords={"1": []})
+    out = qm.run(_ctx({"rules": [_rule("free01", "minus_word", FREE, CLICKS3)]}))
+    assert out.summary["intercepted"]["u:free01"] == {"taken": 1, "protected": 0}
+
+
+# --- применение одобренного перепроверяет защиту пользователя (Minor 4) -------------
+
+def _approved(phrase, **details):
+    f = _stored(1, phrase, rule="u:free01")
+    return dataclasses.replace(f, details=details)
+
+
+def test_apply_skips_phrase_protected_after_approval(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1)], keywords={"1": []})
+    prot = _rule("prot01", "protect", ("query", "has_word", "курсы"))
+    res = qm.apply(_ctx({"rules": [prot]}),
+                   [_approved("бесплатно", query="курсы бесплатно",
+                              queries_sample=["курсы бесплатно", "бесплатно онлайн"])])
+    assert not res[1].ok
+    assert res[1].response["code"] == "user_protect" and res[1].response["by"] == "u:prot01"
+    assert "«Правило prot01»" in res[1].error
+    assert fake.writes == []
+    # защита по слову самой фразы: всё, что фраза отрежет, это слово содержит
+    word = _rule("prot02", "protect", ("query", "has_word", "бесплатно"))
+    res = qm.apply(_ctx({"rules": [word]}), [_approved("бесплатно")])
+    assert res[1].response["by"] == "u:prot02" and fake.writes == []
+    # чужая защита не мешает
+    other = _rule("prot03", "protect", ("query", "has_word", "диплом"))
+    res = qm.apply(_ctx({"rules": [other]}), [_approved("бесплатно", query="курсы бесплатно")])
+    assert res[1].ok and fake.writes == [(1, ["бесплатно"])]
+
+
+def test_apply_never_minus_carries_code(monkeypatch):
+    FakeDirect(monkeypatch, [_camp(1)], keywords={"1": []})
+    res = qm.apply(_ctx({"never_minus": ["бесплатно"]}), [_stored(1, "бесплатно")])
+    assert res[1].response["code"] == "in_never_minus"

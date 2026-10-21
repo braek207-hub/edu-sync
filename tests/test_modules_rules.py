@@ -423,12 +423,29 @@ def test_queries_window_not_stored_and_minus_word_ok():
     assert r.window is None and r.where is None
 
 
+def test_auto_off_mark_does_not_break_rule():
+    """Panda кладёт в снятое правило auto_off {why, at}: раннер его не судит и не отбрасывает."""
+    raw = _rule(conds=[("clicks", "gte", 10)])
+    raw["action"] = "propose"
+    raw["auto_off"] = {"why": "Делать само выключено: изменились правила выше", "at": "2026-10-18T09:00:00Z"}
+    (r,) = _one("placements", raw)
+    assert r.action == "propose"
+
+
+def test_snapshot_keeps_campaign_narrowing():
+    """Сужение по кампаниям — в снимке: история и «почему» без него его не видят (Minor 8)."""
+    raw = _rule(conds=[("clicks", "gte", 10)])
+    raw["campaigns"] = {"only": [7, 3], "except": [9]}
+    (r,) = _one("placements", raw)
+    assert R.snapshot(r)["campaigns"] == {"only": [3, 7], "except": [9]}
+
+
 def test_snapshot():
     (r,) = _one("placements", _rule(conds=[("name", "contains", "Game"), ("clicks", "gte", 10),
                                            ("leads", "eq", 0)]))
     assert R.snapshot(r) == {
         "id": "aaaaaa", "name": "Правило aaaaaa", "action": "block", "window": 7,
-        "where": "seen",
+        "where": "seen", "campaigns": {"only": [], "except": []},
         "conditions": [{"field": "name", "op": "contains", "value": "game"},
                        {"field": "clicks", "op": "gte", "value": 10},
                        {"field": "leads", "op": "eq", "value": 0}]}

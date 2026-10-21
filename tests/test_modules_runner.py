@@ -699,19 +699,49 @@ def test_preview_taken_between_modules_and_at_end():
     assert [w["object"] for w in _done(st, 1)["would"]] == ["слово"]
 
 
-def test_preview_rule_id_filters_would_only():
+def test_preview_rule_id_counts_only_that_rule():
+    """Превью одного правила — его цифры: отказы, «не проверено», сверх лимита и улов,
+    который забрали правила выше и защиты (final-review Minor 1, I-2 п.3)."""
     out = RunOutput(findings=[_uf("a.ru"), _uf("b.ru", rule="app"), _uf("c.ru", rule="u:bbb222")],
                     summary={"by_rule": {"u:aaa111": {"found": 1, "refused": 2, "over_cap": 3},
+                                         "u:bbb222": {"found": 1, "refused": 1, "over_cap": 9},
                                          "app": {"found": 1, "refused": 0, "over_cap": 0}},
-                             "refused": [{"code": "list_full", "rule": "u:bbb222"}]})
+                             "intercepted": {"u:aaa111": {"taken": 4, "protected": 2},
+                                             "u:bbb222": {"taken": 7, "protected": 0}},
+                             "refused": [{"code": "list_full", "rule": "u:bbb222"},
+                                         {"code": "campaign_stopped", "rule": "u:aaa111"},
+                                         "строка встроенного"]},
+                    unverified=[("login1", "u:aaa111", 5), ("login1", "u:bbb222"),
+                                ("login1", "spam")])
     st = FakeStore([], previews=[_preview(rule_id="aaa111")])
     _go(st, {"placements": OutModule("placements", out)})
     res = _done(st)
     assert [w["object"] for w in res["would"]] == ["a.ru"]
-    assert res["totals"]["would"] == 1
-    assert res["by_rule"]["u:aaa111"] == {"would": 1, "refused": 2, "over_cap": 3}
-    assert res["by_rule"]["app"] == {"would": 1, "refused": 0, "over_cap": 0}
-    assert res["refused"] == [{"code": "list_full", "rule": "u:bbb222"}]
+    assert res["by_rule"] == {"u:aaa111": {"would": 1, "refused": 2, "over_cap": 3,
+                                           "taken": 4, "protected": 2}}
+    assert res["refused"] == [{"code": "campaign_stopped", "rule": "u:aaa111"}]
+    assert res["refused_by_code"] == {"campaign_stopped": 1}
+    assert "refused_lines" not in res
+    assert res["unverified"] == {"login1": [["u:aaa111", 5]]}
+    t = res["totals"]
+    assert (t["would"], t["refused"], t["over_cap"], t["taken"], t["protected"]) == (1, 1, 3, 4, 2)
+    # полный улов правила: закрыло бы, не влезло в лимит, забрали другие, держат защиты
+    assert t["caught"] == 1 + 3 + 4 + 2
+
+
+def test_preview_all_rules_keeps_module_totals_and_records_lead_goals():
+    out = RunOutput(findings=[_uf("a.ru"), _uf("b.ru", rule="app")],
+                    summary={"by_rule": {"u:aaa111": {"found": 1, "refused": 0, "over_cap": 0}},
+                             "intercepted": {"u:aaa111": {"taken": 1, "protected": 0}},
+                             "refused": [{"code": "list_full", "rule": "u:bbb222"}]})
+    st = FakeStore([], previews=[_preview()], goals=[77, 55])
+    _go(st, {"placements": OutModule("placements", out)})
+    res = _done(st)
+    assert res["totals"]["would"] == 2 and res["totals"]["refused"] == 1
+    assert "caught" not in res["totals"]
+    assert res["by_rule"]["u:aaa111"]["taken"] == 1
+    # цели, по которым шёл прогон: Panda сверяет с ними «делать само» (I-2 п.1, Minor 7)
+    assert res["lead_goals"] == [55, 77]
 
 
 HELD = {"code": "goal_not_visible", "object": None, "campaign_id": None, "rule": None,

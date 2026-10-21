@@ -26,7 +26,7 @@ from sync.agent.writer.goal import PLACEHOLDER_GOAL_ID, read_goal_ids
 from sync.modules import direct_api, leads
 from sync.modules import rules as R
 from sync.modules.accounts import DirectAccount
-from sync.modules.reasons import by_rule, refusal
+from sync.modules.reasons import by_rule, intercept, merge_intercepted, refusal
 from sync.modules.text import word_list, yo
 from sync.modules.types import ApplyResult, Context, Finding, RunOutput, StoredFinding
 from sync.placements.direct import MAX_REPORT_GOALS, DirectError
@@ -322,6 +322,8 @@ class _Scan:
     # Отказы-строки встроенных по правилу: кода у них нет, а by_rule их считает.
     lines: Dict[str, int] = field(default_factory=dict)
     unverified: List[tuple] = field(default_factory=list)
+    # {правило: {taken, protected}} — улов правила, где действует не оно (reasons.intercept)
+    intercepted: Dict[str, Dict[str, int]] = field(default_factory=dict)
     campaigns: int = 0
     objects: int = 0
     # False — кабинет целиком не судили: его открытые находки не закрываем
@@ -331,6 +333,7 @@ class _Scan:
         # Причины по кампаниям, собранные до пропуска кабинета, остаются в отчёте.
         self.skipped.append("%s: %s" % (login, reason))
         self.findings = []
+        self.intercepted = {}
         self.judged = False
         return self
 
@@ -829,8 +832,11 @@ class _Login:
             if key in builtin:
                 # Встроенное раньше по порядку: действие одно, совпавшие — «сработали также».
                 self.attach.setdefault(builtin[key], []).extend(c.matched)
+                intercept(self.out.intercepted, [m["id"] for m in c.matched], "taken")
                 continue
             rule_key, cid, phrase = USER + c.rule.id, c.cid, c.phrase
+            # Правила ниже дали ту же фразу: защиты у неё одни, действие — у первого.
+            lower = [m["id"] for m in c.matched[1:]]
 
             def no(code, **extra):
                 self.refuse(refusal(code, rule_key, login=login, campaign_id=int(cid),
@@ -845,12 +851,15 @@ class _Login:
             guard = self._guard(cid, phrase, words, rule_key)
             if guard is not None and guard["code"] == "user_protect":
                 self.guarded(guard)
+                intercept(self.out.intercepted, [rule_key] + lower, "protected")
                 continue
             if _never_hit(words, never) is not None:
                 no("in_never_minus")
+                intercept(self.out.intercepted, [rule_key] + lower, "protected")
                 continue
             if guard is not None:
                 self.guarded(guard)
+                intercept(self.out.intercepted, [rule_key] + lower, "protected")
                 continue
             if any(_covers(w, words) for w in covered[cid]):
                 no("covered_by_minus")
@@ -860,6 +869,7 @@ class _Login:
                 continue
             if c.fam["clicks"] <= 0:
                 continue
+            intercept(self.out.intercepted, lower, "taken")
             ok.append(c)
         return ok
 
@@ -1026,6 +1036,7 @@ def run(ctx: Context) -> RunOutput:
     over_cap = 0
     over: Dict[str, int] = {}
     lines: Dict[str, int] = {}
+    intercepted: Dict[str, Dict[str, int]] = {}
     read = {"logins": 0, "campaigns": 0, "objects": 0}
     total = len(ctx.accounts)
     for i, acc in enumerate(ctx.accounts, 1):
@@ -1044,6 +1055,7 @@ def run(ctx: Context) -> RunOutput:
             for src, dst in ((scan.over, over), (scan.lines, lines)):
                 for key, n in src.items():
                     dst[key] = dst.get(key, 0) + n
+            merge_intercepted(intercepted, scan.intercepted)
             unverified += scan.unverified + [(acc.login, k) for k in silent]
             if scan.judged:
                 findings += scan.findings
@@ -1056,6 +1068,8 @@ def run(ctx: Context) -> RunOutput:
                                "over_cap": over_cap, "read": read,
                                "by_rule": by_rule([USER + r.id for r in rules], findings, refused,
                                                   over, lines)}
+    if intercepted:
+        summary["intercepted"] = intercepted
     if silent:
         # Те же ключи лежат в unverified каждого логина: по этому списку UI отличает
         # «выключено настройкой» от «не проверено».
@@ -1132,7 +1146,22 @@ def _phrase(f: StoredFinding) -> str:
     return negatives.normalize_phrase(f.action["phrase"])
 
 
+def _apply_protect(f: StoredFinding, phrase: str, cid: int, protect: List[R.Rule],
+                   money_known: bool) -> Optional[R.Rule]:
+    """Защита пользователя на применении одобренного: человек мог добавить её после скана,
+    а снять одобрение нельзя. Запросов семьи на применении нет — судим тексты, которые
+    находка помнит (сама фраза, запрос правила, образцы семьи), на цифрах находки."""
+    d = f.details if isinstance(f.details, dict) else {}
+    texts = [phrase, d.get("query")] + list(d.get("queries_sample") or [])
+    rows = [R.finding_row(t, cid, None, d, money_known)
+            for t in dict.fromkeys(t for t in texts if isinstance(t, str) and t.strip())]
+    return R.protected_by(protect, rows)
+
+
 def _apply_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
+    protect = [r for r in R.compile_rules(KEY, settings.get("rules") or [])[0]
+               if r.action == R.PROTECT]
+    money_known = (acc.currency or "RUB").upper() == "RUB"
     fresh = _fresh(acc, cid)
     if fresh is None:
         return _fail_all(group, "кампания не видна API (Мастер кампаний)")
@@ -1154,11 +1183,18 @@ def _apply_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
         words = _words(phrase)
         ok, why = negatives.phrase_is_valid(phrase)
         hit = _never_hit(words, never)
+        by = _apply_protect(f, phrase, int(cid), protect, money_known) if ok else None
         if not ok:
             out[f.id] = ApplyResult(False, {}, why)
+        elif by is not None:
+            out[f.id] = ApplyResult(False, {"code": "user_protect", "by": USER + by.id,
+                                            "campaign_id": int(cid), "phrase": phrase},
+                                    "запрос защищает правило «%s» — минус-фразу не ставим"
+                                    % by.name)
         elif hit is not None:
-            out[f.id] = ApplyResult(False, {}, "фраза задевает never_minus «%s»"
-                                    % " ".join(sorted(hit)))
+            out[f.id] = ApplyResult(False, {"code": "in_never_minus", "campaign_id": int(cid),
+                                            "phrase": phrase},
+                                    "фраза задевает never_minus «%s»" % " ".join(sorted(hit)))
         elif _key_conflict(words, keys):
             out[f.id] = ApplyResult(False, {}, "конфликт с ключом кампании")
         elif yo(phrase) in have:

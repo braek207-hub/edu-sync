@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from sync.modules import accounts as _accounts
+from sync.modules import leads as _leads
 from sync.modules import store as _store
 from sync.modules.defaults import settings_for
 from sync.modules.lifecycle import reconcile
@@ -336,14 +337,33 @@ def _would_row(f: Finding, cur: str) -> dict:
     return row
 
 
-def _preview_result(out: RunOutput, rule_id: Optional[str], accts) -> dict:
+def _preview_result(out: RunOutput, rule_id: Optional[str], accts,
+                    lead_goals: Optional[List[int]] = None) -> dict:
     """result превью по контракту Panda (adm-module-rules.ts, previewView): would — те же
-    находки, что записал бы скан; тексты Panda рисует по снимку настроек сама."""
+    находки, что записал бы скан; тексты Panda рисует по снимку настроек сама.
+
+    Превью одного правила — только его цифры: отказы, «не проверено», сверх лимита и
+    улов, который сейчас забирают правила выше и защиты (by_rule.taken/protected).
+    lead_goals — цели-лиды, по которым шёл прогон: Panda сверяет с ними «делать само»."""
     cur = _currencies(accts)
     findings = out.findings
+    summary = out.summary or {}
+    refused = summary.get("refused") or []
+    # строки этапа 1 отдельно: Panda сопоставляет refused[i] со списком отказов с кодом
+    coded = [x for x in refused if isinstance(x, dict)]
+    lines = [x for x in refused if isinstance(x, str)]
+    by_rule = {k: v for k, v in (summary.get("by_rule") or {}).items() if isinstance(v, dict)}
+    caught = summary.get("intercepted") or {}
+    unverified = list(out.unverified)
+    key = None
     if rule_id:
         key = rule_id if rule_id.startswith(USER_RULE) else USER_RULE + rule_id
         findings = [f for f in findings if f.rule == key]
+        coded = [x for x in coded if x.get("rule") == key]
+        # отказы-строки — встроенных, у правила пользователя их нет
+        lines = []
+        by_rule = {key: by_rule.get(key) or {}}
+        unverified = [u for u in unverified if u[1] == key]
     rows = [_would_row(f, cur.get(f.login, RUB)) for f in findings]
     # дорогие первыми: усечение до 500 должно резать дешёвый хвост. Курса в раннере нет,
     # тенге численно в разы больше рублей — поэтому сначала рубли, затем прочие валюты
@@ -356,14 +376,23 @@ def _preview_result(out: RunOutput, rule_id: Optional[str], accts) -> dict:
             rub += c
         else:
             cost_other[r["currency"]] = cost_other.get(r["currency"], 0.0) + c
-    summary = out.summary or {}
-    refused = summary.get("refused") or []
-    # строки этапа 1 отдельно: Panda сопоставляет refused[i] со списком отказов с кодом
-    coded = [x for x in refused if isinstance(x, dict)]
-    lines = [x for x in refused if isinstance(x, str)]
+    rules_out: Dict[str, Dict[str, int]] = {}
+    for k, v in by_rule.items():
+        got = caught.get(k) or {}
+        rules_out[k] = {"would": v.get("found", 0), "refused": v.get("refused", 0),
+                        "over_cap": v.get("over_cap", 0),
+                        "taken": int(got.get("taken") or 0),
+                        "protected": int(got.get("protected") or 0)}
     totals: Dict[str, Any] = {"would": len(rows),
                               "clicks": int(sum(_num(r["metrics"].get("clicks")) for r in rows)),
                               "cost": round(rub, 2), "refused": len(coded)}
+    if key is not None:
+        mine = rules_out[key]
+        # полный улов: что закрыло бы сейчас, что не влезло в лимит и что забрали другие
+        totals.update(over_cap=mine["over_cap"], taken=mine["taken"],
+                      protected=mine["protected"],
+                      caught=mine["would"] + mine["over_cap"] + mine["taken"]
+                      + mine["protected"])
     if cost_other:
         totals["cost_other"] = {k: round(v, 2) for k, v in sorted(cost_other.items())}
     disabled = list(summary.get("disabled") or [])
@@ -371,18 +400,18 @@ def _preview_result(out: RunOutput, rule_id: Optional[str], accts) -> dict:
         "would": rows[:PREVIEW_WOULD_MAX],
         "refused": _held_first(coded)[:PREVIEW_REFUSED_MAX],
         "refused_by_code": _by_code(coded),
-        "by_rule": {k: {"would": v.get("found", 0), "refused": v.get("refused", 0),
-                        "over_cap": v.get("over_cap", 0)}
-                    for k, v in (summary.get("by_rule") or {}).items() if isinstance(v, dict)},
+        "by_rule": rules_out,
         # выключенное настройкой не «не проверено»: оно в disabled, иначе превью пугало бы
         # строками про спам, выключенный по умолчанию
-        "unverified": _unverified_by_login(out.unverified, skip=disabled),
+        "unverified": _unverified_by_login(unverified, skip=disabled),
         "skipped": list(summary.get("skipped") or []),
         # та же форма «логин: текст», что summary.errors скана (Panda: errorLogins)
         "errors": [e for e in summary.get("errors") or [] if isinstance(e, str)],
         "totals": totals,
         "logins_total": len(accts),
     }
+    if lead_goals is not None:
+        result["lead_goals"] = list(lead_goals)
     if disabled:
         result["disabled"] = disabled
     # без валюты логина Panda рисует «₽» у отказа в тенговом кабинете
@@ -425,7 +454,8 @@ def _one_preview(slug, store, row, get_accounts, get_goals, modules, now, log) -
             raise _NotRun("нет кабинетов: " + "; ".join(why or ["не найдены"]))
         ctx = _ctx(slug, mkey, "report", row.get("settings"), accts, now, log,
                    get_goals(), progress)
-        result = _preview_result(module.run(ctx), row.get("rule_id"), accts)
+        result = _preview_result(module.run(ctx), row.get("rule_id"), accts,
+                                 _leads.lead_goals(ctx.settings, ctx.project_goals)[0])
         status, error = "done", None
     except Exception as err:
         status, result = "error", None
