@@ -6,7 +6,7 @@ Logs API асинхронный: первый запрос ставит подг
 """
 import os
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 
@@ -29,17 +29,60 @@ INSTALL_FIELDS = (
 EVENT_FIELDS = "appmetrica_device_id,event_name,event_datetime,event_json"
 
 
+# Запрос старше этого в очереди — мёртвый: живой месячный файл готовится минуты.
+# 10.10.2026 три запроса встали на total_progress 0.99 и висели 12 дней; очередь
+# обрабатывается строго по одному, лимит — 3 на приложение, так что все синки
+# установок (appmetrica, install-source, sections) падали по таймауту ежедневно.
+STUCK_QUERY_HOURS = float(os.environ.get("APPMETRICA_STUCK_HOURS") or "6")
+_MSK = timezone(timedelta(hours=3))  # create_time в get_active_queries — московское
+
+
+def cancel_stuck_queries(app_id: str, token: str, now: datetime | None = None) -> list[str]:
+    """Отменить запросы очереди приложения старше STUCK_QUERY_HOURS. Сами они не истекают,
+    а очередь стоит за ними целиком. Ошибка очистки не роняет синк: это лишь попытка."""
+    headers = {"Authorization": f"OAuth {token}"}
+    now = now or datetime.now(_MSK)
+    try:
+        r = requests.get(f"{BASE}/get_active_queries", params={"application_id": app_id},
+                         headers=headers, timeout=60)
+        r.raise_for_status()
+        queries = r.json()
+    except (requests.RequestException, ValueError) as e:
+        print(f"  Logs API: очередь не прочитана ({e}) — без очистки", flush=True)
+        return []
+    cancelled = []
+    for q in queries:
+        born = datetime.strptime(q["create_time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=_MSK)
+        if (now - born).total_seconds() < STUCK_QUERY_HOURS * 3600:
+            continue
+        rid = str(q["request_id"])
+        try:
+            requests.post(f"{BASE}/{rid}/cancel", params={"application_id": app_id},
+                          headers=headers, timeout=60).raise_for_status()
+        except requests.RequestException as e:
+            print(f"  Logs API: запрос {rid} не отменён ({e})", flush=True)
+            continue
+        cancelled.append(rid)
+        print(f"  Logs API: отменён зависший запрос {rid} от {q['create_time']}, "
+              f"прогресс {q.get('total_progress')}", flush=True)
+    return cancelled
+
+
 def _export(endpoint: str, params: dict, token: str) -> list[dict]:
     url = f"{BASE}/{endpoint}.json"
     headers = {"Authorization": f"OAuth {token}"}
+    cleaned = False
     for _ in range(POLL_MAX_ATTEMPTS):
         r = requests.get(url, params=params, headers=headers, timeout=120)
         if r.status_code == 200:
             return r.json().get("data", [])
         # 429 «There are already 3 enqueued queries for given application_id»: в очереди
         # приложения ещё готовятся файлы соседних синков (GCC, install-source) или брошенные
-        # упавшим прогоном. Они дозревают сами — ждём, как 202. 01–06.10.2026 синк падал на
-        # этом сразу, и каждый упавший прогон оставлял в очереди ещё один запрос.
+        # упавшим прогоном. Живые дозревают сами — ждём, как 202; мёртвые (старше
+        # STUCK_QUERY_HOURS) отменяем один раз за выгрузку.
+        if r.status_code == 429 and not cleaned:
+            cancel_stuck_queries(params["application_id"], token)
+            cleaned = True
         if r.status_code in (202, 429):
             time.sleep(POLL_INTERVAL_SEC)
             continue
