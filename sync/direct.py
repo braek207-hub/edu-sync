@@ -3,7 +3,7 @@ import json
 import os
 import time
 from datetime import date, timedelta
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Tuple
 
 import requests
 
@@ -40,10 +40,52 @@ EDU_CONVERSION_GOALS: Dict[str, List[str]] = {
     "provuz": ["330389387"],
 }
 
+INTERNATIONAL_MARKERS = ("дубай", "дубае", "за границ", "зарубеж", "international", "оаэ")
+
+
+def is_international_campaign(campaign_name: str) -> bool:
+    s = str(campaign_name or "").lower()
+    return any(m in s for m in INTERNATIONAL_MARKERS)
+
+
+# Внутри кабинета vuz живут ленды со своей целью обучения (выбор Павла 22.10.2026):
+# онлайн-школа учится на «Отправка формы тильда» (счётчик school.edunetwork.ru),
+# обучение за границей — на «Спасибо контекст (international)» (счётчик edunetwork.ru).
+# Цель кабинета для таких кампаний — ноль: ленд другой, и цель там не стреляет.
+EDU_CAMPAIGN_GOALS: Dict[str, List[Tuple[Callable[[str], bool], List[str]]]] = {
+    "vuz": [
+        (lambda name: detect_project(name) == "eduschool", ["596548027"]),
+        (is_international_campaign, ["670497292"]),
+    ],
+}
+
+
+def cabinet_goals(project: str | None, fallback: List[str] | None = None) -> List[str]:
+    """Все цели, которые нужны кабинету в отчёте: своя + цели лендов внутри него."""
+    base = EDU_CONVERSION_GOALS.get(project or "") or list(fallback or [])
+    extra = [g for _, goals in EDU_CAMPAIGN_GOALS.get(project or "", []) for g in goals]
+    return list(dict.fromkeys(base + extra))
+
+
+def campaign_goals(
+    project: str | None, campaign_name: str, fallback: List[str] | None = None
+) -> List[str]:
+    """Цели, конверсии которых засчитываются кампании."""
+    for match, goals in EDU_CAMPAIGN_GOALS.get(project or "", []):
+        if match(campaign_name):
+            return goals
+    return EDU_CONVERSION_GOALS.get(project or "") or list(fallback or [])
+
 
 def _report_fields(goals: List[str]) -> List[str]:
-    """Поля отчёта: базовые + Conversions (это МЕТРИКА, не измерение → строки не множит)."""
+    """Поля отчёта: базовые + Conversions (это МЕТРИКА, не измерение → строки не множит).
+    В ответе Conversions разворачивается в колонку на цель: Conversions_<цель>_LSCCD."""
     return FIELD_NAMES + (["Conversions"] if goals else [])
+
+
+def _goal_of_column(column: str) -> str | None:
+    parts = column.split("_")
+    return parts[1] if len(parts) >= 3 and parts[0] == "Conversions" else None
 
 
 def _direct_clients() -> List[dict]:
@@ -86,23 +128,27 @@ def _report_headers(login: str) -> dict:
         "processingMode": "auto",
         "returnMoneyInMicros": "false",
         "skipReportHeader": "true",
-        "skipColumnHeader": "true",
+        # Заголовок нужен: колонки конверсий называются по целям, и разбор по позиции
+        # зависел бы от порядка, в котором Директ их развернёт.
+        "skipColumnHeader": "false",
         "skipReportSummary": "true",
     }
 
 
-def _parse_report_tsv(text: str, fields: List[str] = FIELD_NAMES) -> List[Dict[str, Any]]:
+def _parse_report_tsv(
+    text: str, project: str | None = None, fallback_goals: List[str] | None = None
+) -> List[Dict[str, Any]]:
+    """TSV \u0441 \u0437\u0430\u0433\u043e\u043b\u043e\u0432\u043a\u043e\u043c. \u041a\u043e\u043d\u0432\u0435\u0440\u0441\u0438\u0438 \u043a\u0430\u043c\u043f\u0430\u043d\u0438\u0438 \u2014 \u0441\u0443\u043c\u043c\u0430 \u043a\u043e\u043b\u043e\u043d\u043e\u043a \u0435\u0451 \u0446\u0435\u043b\u0435\u0439 (campaign_goals)."""
     rows: List[Dict[str, Any]] = []
     lines = [ln for ln in text.lstrip("\ufeff").splitlines() if ln.strip()]
     if not lines:
         return rows
 
     reader = csv.reader(lines, delimiter="\t")
+    header = next(reader)
+    goal_columns = {c: _goal_of_column(c) for c in header if c.startswith("Conversions")}
     for parts in reader:
-        if len(parts) < 6:
-            continue
-        padded = parts + [""] * (len(fields) - len(parts))
-        row = dict(zip(fields, padded[: len(fields)]))
+        row = dict(zip(header, parts))
         campaign_id = str(row.get("CampaignId", "")).strip()
         if not campaign_id or campaign_id == "--":
             continue
@@ -111,15 +157,18 @@ def _parse_report_tsv(text: str, fields: List[str] = FIELD_NAMES) -> List[Dict[s
         clicks = int(float(row.get("Clicks", 0) or 0))
         cost = float(row.get("Cost", 0) or 0)
 
-        w_bid = w_traffic = w_impr = w_click = 0.0
-        if len(parts) > 6 and clicks > 0:
-            w_bid = to_num_gas(parts[6]) * clicks
-        if len(parts) > 7 and impressions > 0:
-            w_traffic = to_num_gas(parts[7]) * impressions
-        if len(parts) > 8 and impressions > 0:
-            w_impr = to_num_gas(parts[8]) * impressions
-        if len(parts) > 9 and clicks > 0:
-            w_click = to_num_gas(parts[9]) * clicks
+        w_bid = to_num_gas(row.get("AvgEffectiveBid")) * clicks
+        w_traffic = to_num_gas(row.get("AvgTrafficVolume")) * impressions
+        w_impr = to_num_gas(row.get("AvgImpressionPosition")) * impressions
+        w_click = to_num_gas(row.get("AvgClickPosition")) * clicks
+
+        # \u041a\u043e\u043b\u043e\u043d\u043a\u0430 \u0431\u0435\u0437 \u0446\u0435\u043b\u0438 \u0432 \u0438\u043c\u0435\u043d\u0438 (\u00abConversions\u00bb) \u2014 \u043e\u0442\u0447\u0451\u0442 \u043f\u043e \u043e\u0434\u043d\u043e\u0439 \u0446\u0435\u043b\u0438, \u043e\u043d\u0430 \u0438 \u0437\u0430\u0441\u0447\u0438\u0442\u044b\u0432\u0430\u0435\u0442\u0441\u044f.
+        own = set(campaign_goals(project, campaign_name, fallback_goals))
+        conversions = sum(
+            int(to_num_gas(row.get(col)))
+            for col, goal in goal_columns.items()
+            if goal is None or goal in own
+        )
 
         rows.append(
             {
@@ -136,8 +185,8 @@ def _parse_report_tsv(text: str, fields: List[str] = FIELD_NAMES) -> List[Dict[s
                 "w_avg_impr_pos": w_impr,
                 "w_avg_click_pos": w_click,
                 "w_auction_win_share": 0.0,
-                # Conversions по цели-конверсии проекта (LSC). Метрика отчёта; 0 если целей нет.
-                "conversions": int(to_num_gas(row.get("Conversions", 0))) if "Conversions" in fields else 0,
+                # LSC по целям кампании; 0, если целей нет.
+                "conversions": conversions,
             }
         )
     return rows
@@ -160,7 +209,9 @@ def _report_body(login: str, date_from: str, date_to: str, goals: List[str]) -> 
     return {"params": params}
 
 
-def _fetch_report(login: str, date_from: str, date_to: str, goals: List[str]) -> List[Dict[str, Any]]:
+def _fetch_report(
+    login: str, date_from: str, date_to: str, goals: List[str], project: str | None = None
+) -> List[Dict[str, Any]]:
     headers = _report_headers(login)
     body = _report_body(login, date_from, date_to, goals)
 
@@ -197,7 +248,7 @@ def _fetch_report(login: str, date_from: str, date_to: str, goals: List[str]) ->
     else:
         raise RuntimeError(f"Директ API [{login}]: превышено число попыток")
 
-    return _parse_report_tsv(resp.text, _report_fields(goals))
+    return _parse_report_tsv(resp.text, project, goals)
 
 
 def sync_direct_api_range(
@@ -212,8 +263,9 @@ def sync_direct_api_range(
     for client in clients:
         login = client["login"]
         try:
-            goals = EDU_CONVERSION_GOALS.get(client.get("project") or "") or client.get("goal_ids") or []
-            chunk = _fetch_report(login, date_from, date_to, goals)
+            project = client.get("project")
+            goals = cabinet_goals(project, client.get("goal_ids"))
+            chunk = _fetch_report(login, date_from, date_to, goals, project)
             print(f"  [{login}] получено {len(chunk)} строк")
             all_rows.extend(chunk)
         except Exception as e:
