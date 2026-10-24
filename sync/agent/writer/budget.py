@@ -25,8 +25,9 @@ WeeklySpendLimit внутри блока BiddingStrategy кампании; у р
 Единицы. Целевой бюджет Э3.2 (budget_target.value) — расход за 28 дней
 С НДС, как все факты EDU (Reports API запрашивается с IncludeVAT=YES,
 sync/agent/segments.py:265). Лимиты кабинета Директ хранит БЕЗ НДС в
-микрорублях. Конверсия — здесь и только здесь: value / 4 недель / VAT → в
-микрорубли с округлением до рубля.
+микрорублях. Конверсия — здесь и только здесь: value / 4 недель / НДС окна
+(sync/vat.py: ставка по датам дней, 1,22 с 01.01.2026) → в микрорубли с
+округлением до рубля.
 
 previous_state несёт ВЕСЬ прочитанный блок BiddingStrategy (или DailyBudget),
 а не только старый лимит: откат обязан вернуть кампанию ровно туда, откуда
@@ -39,10 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sync.agent.confidence import assess
 from sync.agent.writer import exposure
-
-# Факты расхода с НДС, лимиты кабинета без. Ставка НДС РФ; менялась в 2019 —
-# если изменится снова, конверсия обязана поехать за ней.
-VAT = 1.2
+from sync.vat import facts_vat_rate
 
 # Недель в окне целевого бюджета: budget_target считан на 28 зрелых днях.
 WEEKS_IN_WINDOW = 4.0
@@ -135,14 +133,18 @@ def _idempotency_key(campaign_id: str, kind: str, micros: int) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
-def desired_weekly_micros(target_28d_with_vat: float) -> int:
+def desired_weekly_micros(target_28d_with_vat: float,
+                          vat: Optional[float] = None) -> int:
     """Целевой расход 28 дней с НДС → недельный лимит кабинета в микрорублях.
+
+    vat — ставка НДС окна фактов; по умолчанию facts_vat_rate() (sync/vat.py).
 
     Округление до целого РУБЛЯ, а не микрорубля: лимит — управляющая ручка,
     и хвост в микрорублях делал бы ключ идемпотентности чувствительным к
     шуму плавающей точки.
     """
-    rub = float(target_28d_with_vat) / WEEKS_IN_WINDOW / VAT
+    rate = facts_vat_rate() if vat is None else float(vat)
+    rub = float(target_28d_with_vat) / WEEKS_IN_WINDOW / rate
     return int(round(rub)) * MICROS
 
 

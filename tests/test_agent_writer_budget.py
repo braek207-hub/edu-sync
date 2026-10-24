@@ -6,6 +6,9 @@ tests/test_agent_writer_budget.py — тесты рычага бюджетов (
 
 import copy
 
+import pytest
+
+from sync.agent.writer import budget as budget_mod
 from sync.agent.writer.apply import to_api_call
 from sync.agent.writer.budget import (
     apply_cooldown,
@@ -24,6 +27,12 @@ from sync.agent.writer.rollback import rollback_payload
 from sync.agent_e1_watchdog import rollback_guard_form
 
 M = 1_000_000
+
+
+@pytest.fixture
+def vat_20(monkeypatch):
+    # Числа этих тестов посчитаны при НДС 20%; ставка по дате — в tests/test_vat.py.
+    monkeypatch.setattr(budget_mod, "facts_vat_rate", lambda: 1.2)
 
 
 def _target_row(target, current, rel_error=0.1):
@@ -55,8 +64,16 @@ def _strategy(weekly_micros, channel="Search"):
 
 
 def test_weekly_micros_strips_vat_and_weeks():
-    # 480 000 ₽ с НДС за 28 дней → 120 000/нед с НДС → 100 000/нед без НДС.
-    assert desired_weekly_micros(480_000.0) == 100_000 * M
+    # 480 000 ₽ с НДС 20% за 28 дней → 120 000/нед с НДС → 100 000/нед без НДС.
+    assert desired_weekly_micros(480_000.0, vat=1.2) == 100_000 * M
+    # С 01.01.2026 НДС 22%: 488 000 → 122 000/нед с НДС → 100 000/нед без НДС.
+    assert desired_weekly_micros(488_000.0, vat=1.22) == 100_000 * M
+
+
+def test_weekly_micros_default_vat_follows_the_window(monkeypatch):
+    # Без явной ставки — ставка окна фактов (sync/vat.facts_vat_rate).
+    monkeypatch.setattr(budget_mod, "facts_vat_rate", lambda: 1.22)
+    assert desired_weekly_micros(488_000.0) == 100_000 * M
 
 
 def test_weekly_micros_rounds_to_whole_rubles():
@@ -480,7 +497,7 @@ def test_plan_without_write_step_row_keeps_the_default():
     assert "write_step" not in plan["desired"]["1"]
 
 
-def test_double_step_reaches_the_account():
+def test_double_step_reaches_the_account(vat_20):
     # Без параметризации кап записи ±20 % убивал адресный шаг ×2 на последнем
     # метре: солвер назначал 200 000 ₽/нед, а в кабинет уезжало 120 000.
     # Тесты этого не ловили — они не доходили до писателя.
@@ -501,7 +518,7 @@ def test_without_the_addressed_step_the_default_still_clamps():
     assert actions[0]["payload"]["WeeklySpendLimit"] == 120_000 * M
 
 
-def test_daily_branch_honours_the_addressed_step():
+def test_daily_branch_honours_the_addressed_step(vat_20):
     # Ручная стратегия: тот же кап, но от дневного расхода.
     actions, _ = diff_budget(
         {"1": _move(960_000, 480_000, write_step=1.0)},

@@ -110,6 +110,7 @@ from sync.agent.writer.risk import (
 from sync.agent import blackbox, conflicts, experiments, learning_loop, notify, rejects
 from sync.agent.writer.rollback import red_line_for
 from sync.agent.writer.units import api_to_delta
+from sync.vat import facts_vat_rate
 
 CAMPAIGN_PAGE_LIMIT = 1000
 
@@ -2015,8 +2016,9 @@ def run_account(
     # попыток, закрытые ключи, лимит действий, красная линия, риск-бюджет.
     budget_state = (budget.fetch_budget_state(client, sorted(budget_desired))
                     if budget_desired else {})
+    budget_vat = facts_vat_rate()
     budget_spend_no_vat = {
-        cid: m["cost_28d"] / budget.WEEKS_IN_WINDOW / budget.VAT
+        cid: m["cost_28d"] / budget.WEEKS_IN_WINDOW / budget_vat
         for cid, m in budget_desired.items()
     }
     budget_actions, budget_refused = budget.diff_budget(
