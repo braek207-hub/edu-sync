@@ -1,5 +1,8 @@
 # Секреты для edu-sync
 
+> ⚠️ С 17.10.2026 синки идут на сервере Panda-BI, секреты — `/opt/panda/sync*.env` (карта — EduDash
+> `docs/ENV-MAP.md`). Секреты GitHub ниже нужны только оставшимся workflow записи в Метрику (README).
+
 Значения **не хранятся в git**. Большая часть уже есть в репозитории **`braek207-hub/BJ_auto_metrica`** (workflow `run_direct_daily_multi_edu.yml`).
 
 ## Карта: откуда брать
