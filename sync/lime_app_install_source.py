@@ -22,11 +22,13 @@ APP_KEEP_REATTR (1) / APP_KEEP_REINSTALL (0) — как у основного с
 """
 import os
 from collections import defaultdict
+from contextlib import closing
 from datetime import date, datetime, timedelta
 
 import psycopg2
 import psycopg2.extras
 
+from sync import appmetrica_raw as raw
 from sync.appmetrica_logs import app_country, fetch_installations, fetch_purchase_events, fetch_sessions, only_country
 from sync.lime_appmetrica import (
     _truthy, first_install_attribution, load_vk_entity_map, parse_dt, purchase_facts,
@@ -73,23 +75,30 @@ def _attr(first: dict[str, tuple], dev: str, day: date) -> tuple[str, str]:
     return info[1] or "unknown", info[3] or ""
 
 
-def build_source_daily(first: dict[str, tuple], sessions: list[dict],
+def aggregate_sessions(raw_sessions: list[dict]) -> list[tuple]:
+    """Сырые старты Logs API (appmetrica_device_id, session_start_datetime) → [(device, date, n)] —
+    та же свёртка, что лежит в appm_sessions_day."""
+    acc: dict[tuple[str, date], int] = defaultdict(int)
+    for s in raw_sessions:
+        dev = s.get("appmetrica_device_id")
+        if dev:
+            acc[(dev, parse_dt(s["session_start_datetime"]).date())] += 1
+    return [(dev, d, n) for (dev, d), n in acc.items()]
+
+
+def build_source_daily(first: dict[str, tuple], sessions: list[tuple],
                        purchases: list[tuple]) -> list[tuple]:
     """Строки COLUMNS за даты, встретившиеся в sessions/purchases.
 
-    sessions — сырые старты (appmetrica_device_id, session_start_datetime);
+    sessions — старты, свёрнутые по (device, date, n): aggregate_sessions или appm_sessions_day;
     purchases — факты purchase_facts (device, dt, txn, amount).
     """
     acc: dict[tuple[date, str, str], dict] = defaultdict(
         lambda: {"sessions": 0, "devices": set(), "orders": 0, "revenue": 0.0})
-    for s in sessions:
-        dev = s.get("appmetrica_device_id")
-        if not dev:
-            continue
-        d = parse_dt(s["session_start_datetime"]).date()
+    for dev, d, n in sessions:
         pub, cid = _attr(first, dev, d)
         a = acc[(d, pub, cid)]
-        a["sessions"] += 1
+        a["sessions"] += n
         a["devices"].add(dev)
     for dev, dt, _txn, amount in purchases:
         pub, cid = _attr(first, dev, dt.date())
@@ -104,10 +113,11 @@ def build_source_daily(first: dict[str, tuple], sessions: list[dict],
 
 def _write(conn, since: str, until: str, rows: list[tuple]) -> None:
     with conn.cursor() as cur:
-        cur.execute(f"DELETE FROM {TABLE} WHERE date >= %s AND date <= %s", (since, until))
+        table = raw.target_table(cur, TABLE)
+        cur.execute(f"DELETE FROM {table} WHERE date >= %s AND date <= %s", (since, until))
         if rows:
             psycopg2.extras.execute_values(
-                cur, f"INSERT INTO {TABLE} ({', '.join(COLUMNS)}) VALUES %s", rows, page_size=1000)
+                cur, f"INSERT INTO {table} ({', '.join(COLUMNS)}) VALUES %s", rows, page_size=1000)
     conn.commit()
 
 
@@ -121,8 +131,10 @@ def _window(today: date) -> tuple[str, str]:
 
 
 def sync_lime_app_install_source() -> int:
+    # С Y1 сырьё — из appm_* (sync.appmetrica_raw); APPM_SOURCE=api — откат на Logs API.
+    use_db = raw.source() == "db"
     token = os.environ.get("APPMETRICA_TOKEN")
-    if not token:
+    if not use_db and not token:
         print("[lime-app-source] APPMETRICA_TOKEN не задан — пропуск")
         return 0
     app_id = os.environ.get("APPMETRICA_APP_ID") or "4415407"
@@ -131,15 +143,21 @@ def sync_lime_app_install_source() -> int:
     keep_reinstall = _truthy(os.environ.get("APP_KEEP_REINSTALL") or "0")
     install_months = int(os.environ.get("APP_SOURCE_INSTALL_MONTHS") or "12")
 
-    today = date.today()
+    today = raw.today() if use_db else date.today()
     since, until = _window(today)
     inst_since, inst_until = sync_window(install_months, today)
+    if use_db:
+        inst_until = (today - timedelta(days=1)).isoformat()
     country = app_country()
     print(f"[lime-app-source] окно {since}..{until}, установки {inst_since}..{inst_until}, "
           f"app={app_id}, страна покупок={country or 'все'}")
 
     entity_map = load_vk_entity_map()
-    installs_raw = fetch_installations(app_id, token, inst_since, inst_until)
+    if use_db:
+        with closing(raw.connect()) as c:
+            installs_raw = raw.read_installations(c, inst_since, inst_until)
+    else:
+        installs_raw = fetch_installations(app_id, token, inst_since, inst_until)
     vk_total, vk_with_c, vk_resolved = vk_resolve_stats(installs_raw, entity_map)
     print(f"[lime-app-source] установок {len(installs_raw)}; VK {vk_total}, с `c` {vk_with_c}, "
           f"резолвнулось {vk_resolved}")
@@ -158,12 +176,19 @@ def sync_lime_app_install_source() -> int:
                 cur.execute(ddl)
         conn.commit()
         for c_since, c_until in day_chunks(since, until):
-            sessions = fetch_sessions(app_id, token, c_since, c_until)
             # Покупки по времени СОБЫТИЯ (не приёма): строки витрины — по дате покупки, чанк
             # переписывает ровно свои даты. Поздние события подхватит ежедневное окно 10 дней.
-            purchases = purchase_facts(only_country(fetch_purchase_events(
-                app_id, token, c_since, c_until, event_name, date_dimension="default",
-                country=bool(country))))
+            # Из сырья: событие дня могло прийти позже — read_purchase_events требует покрытие
+            # по дате приёма до вчера, иначе RawNotReady и витрина не пишет ничего.
+            if use_db:
+                sessions = raw.read_sessions_day(conn, c_since, c_until)
+                events = raw.read_purchase_events(conn, c_since, c_until, "default")
+            else:
+                sessions = aggregate_sessions(fetch_sessions(app_id, token, c_since, c_until))
+                events = fetch_purchase_events(app_id, token, c_since, c_until, event_name,
+                                               date_dimension="default", country=bool(country))
+            purchases = purchase_facts(only_country(events))
+            del events
             rows = build_source_daily(first, sessions, purchases)
             outside = [r for r in rows if not (c_since <= r[0].isoformat() <= c_until)]
             if outside:
@@ -174,7 +199,7 @@ def sync_lime_app_install_source() -> int:
                                    f"пустой ответ Logs API, день не переписываем")
             _write(conn, c_since, c_until, rows)
             attributed = sum(r[3] for r in rows if r[1] != "unknown")
-            print(f"[lime-app-source] {c_since}..{c_until}: сессий={len(sessions)}, "
+            print(f"[lime-app-source] {c_since}..{c_until}: сессий={sum(r[3] for r in rows)}, "
                   f"атрибутировано={attributed}, покупок={len(purchases)}, строк={len(rows)}", flush=True)
             total += len(rows)
             del sessions, purchases

@@ -4,7 +4,7 @@
 Окно и поведение — через env (см. sync/lime_appmetrica.py):
   APP_COHORT_MONTHS (7), APP_MAX_LIFE (6), APPMETRICA_EVENT_NAME (purchase),
   APPMETRICA_APP_ID (4415407), APP_KEEP_REATTR / APP_KEEP_REINSTALL (выкл).
-Пропуск, если нет APPMETRICA_TOKEN. Запуск: python sync_lime_appmetrica.py
+Сырьё — appm_* (sync.appmetrica_raw); APPM_SOURCE=api — старый путь через Logs API. Запуск: python sync_lime_appmetrica.py
 """
 import os
 import sys
@@ -18,7 +18,8 @@ def main() -> None:
     if not os.environ.get("DATABASE_URL"):
         print("ОШИБКА: нет DATABASE_URL")
         sys.exit(1)
-    if not os.environ.get("APPMETRICA_TOKEN"):
+    # Токен нужен только старому пути (APPM_SOURCE=api): с Y1 витрина читает сырьё из базы.
+    if (os.environ.get("APPM_SOURCE") or "db").strip().lower() == "api" and not os.environ.get("APPMETRICA_TOKEN"):
         print("lime-appmetrica: пропуск (нет APPMETRICA_TOKEN)")
         return
 

@@ -16,6 +16,8 @@ import psycopg2.extras
 # month_chunks — чтобы не тянуть события с event_json за всё окно одним запросом.
 from sync.appmetrica_logs import (app_country, fetch_installations, fetch_purchase_events,
                                   month_chunks, only_country)
+from sync import appmetrica_raw as raw
+from sync.appmetrica_raw import target_table
 
 
 def parse_dt(s: str) -> datetime:
@@ -572,42 +574,45 @@ def _write(installs_rows: list[tuple], cohort_rows: list[tuple],
         with conn.cursor() as cur:
             for stmt in _CYCLE_DDL:
                 cur.execute(stmt)
-            cur.execute("DELETE FROM lime_app_installs")
+            T = {t: target_table(cur, t) for t in (
+                "lime_app_installs", "lime_app_cohorts", "lime_app_cycle_daily", "lime_app_cycle_cohort",
+                "lime_app_install_purchase_daily")}
+            cur.execute(f"DELETE FROM {T['lime_app_installs']}")
             psycopg2.extras.execute_values(
                 cur,
-                "INSERT INTO lime_app_installs "
+                f"INSERT INTO {T['lime_app_installs']} "
                 "(date, publisher, detail, campaign_id, installs, cohort_orders, cohort_revenue) "
                 "VALUES %s",
                 installs_rows, page_size=500,
             )
-            cur.execute("DELETE FROM lime_app_cohorts")
+            cur.execute(f"DELETE FROM {T['lime_app_cohorts']}")
             psycopg2.extras.execute_values(
                 cur,
-                "INSERT INTO lime_app_cohorts "
+                f"INSERT INTO {T['lime_app_cohorts']} "
                 "(cohort_month, publisher, life_month, cohort_size, buyers, orders, revenue) "
                 "VALUES %s",
                 cohort_rows, page_size=500,
             )
-            cur.execute("DELETE FROM lime_app_cycle_daily")
+            cur.execute(f"DELETE FROM {T['lime_app_cycle_daily']}")
             psycopg2.extras.execute_values(
                 cur,
-                "INSERT INTO lime_app_cycle_daily "
+                f"INSERT INTO {T['lime_app_cycle_daily']} "
                 "(cohort_date, publisher, detail, campaign_id, step, days, devices) "
                 "VALUES %s",
                 cycle_rows, page_size=2000,
             )
-            cur.execute("DELETE FROM lime_app_cycle_cohort")
+            cur.execute(f"DELETE FROM {T['lime_app_cycle_cohort']}")
             psycopg2.extras.execute_values(
                 cur,
-                "INSERT INTO lime_app_cycle_cohort "
+                f"INSERT INTO {T['lime_app_cycle_cohort']} "
                 "(cohort_date, publisher, detail, campaign_id, devices, buyers1, buyers2, buyers3) "
                 "VALUES %s",
                 cycle_cohort_rows, page_size=2000,
             )
-            cur.execute("DELETE FROM lime_app_install_purchase_daily")
+            cur.execute(f"DELETE FROM {T['lime_app_install_purchase_daily']}")
             psycopg2.extras.execute_values(
                 cur,
-                "INSERT INTO lime_app_install_purchase_daily "
+                f"INSERT INTO {T['lime_app_install_purchase_daily']} "
                 "(install_date, purchase_date, publisher, detail, campaign_id, orders, revenue) "
                 "VALUES %s",
                 install_purchase_rows, page_size=2000,
@@ -621,8 +626,11 @@ def _write(installs_rows: list[tuple], cohort_rows: list[tuple],
 
 
 def sync_lime_appmetrica() -> None:
+    # С Y1 (24.10) сырьё — из appm_* (грузит sync.appmetrica_raw), в Logs API витрина не ходит:
+    # своих ~10 заказов в сутки она клала в общую очередь на 3 места. APPM_SOURCE=api — откат.
+    use_db = raw.source() == "db"
     token = os.environ.get("APPMETRICA_TOKEN")
-    if not token:
+    if not use_db and not token:
         print("[lime-appmetrica] APPMETRICA_TOKEN не задан — пропуск")
         return
     app_id = os.environ.get("APPMETRICA_APP_ID") or "4415407"
@@ -636,22 +644,35 @@ def sync_lime_appmetrica() -> None:
     keep_reattr = _truthy(os.environ.get("APP_KEEP_REATTR") or "1")
     keep_reinstall = _truthy(os.environ.get("APP_KEEP_REINSTALL") or "0")
 
-    since, until = sync_window(months, date.today())
+    today = raw.today() if use_db else date.today()
+    since, until = sync_window(months, today)
+    if use_db:
+        # В сырье только закрытые дни: сегодняшние покупки из API приходили неполными и
+        # всё равно переписывались завтрашним прогоном.
+        until = (today - timedelta(days=1)).isoformat()
     country = app_country()
     print(f"[lime-appmetrica] окно {since}..{until}, app={app_id}, event={event_name}, "
-          f"страна покупок={country or 'все'}")
+          f"страна покупок={country or 'все'}, источник={'appm_*' if use_db else 'Logs API'}")
 
-    installs_raw = fetch_installations(app_id, token, since, until)
-    # События тянем ПОМЕСЯЧНО и сразу сворачиваем в факты: с event_json (там корзина)
-    # всё окно одним куском — сотни мегабайт в памяти.
-    purchases_raw: list[tuple] = []
-    for chunk_since, chunk_until in month_chunks(since, until):
-        chunk = only_country(fetch_purchase_events(app_id, token, chunk_since, chunk_until, event_name,
-                                                   country=bool(country)))
-        purchases_raw.extend(purchase_facts(chunk))
-        print(f"[lime-appmetrica] покупки {chunk_since}..{chunk_until}: "
-              f"событий={len(chunk)}, фактов накоплено={len(purchases_raw)}", flush=True)
-        del chunk
+    conn = raw.connect() if use_db else None
+    try:
+        installs_raw = (raw.read_installations(conn, since, until) if use_db
+                        else fetch_installations(app_id, token, since, until))
+        # События ПОМЕСЯЧНО и сразу в факты: с event_json (там корзина) всё окно одним куском —
+        # сотни мегабайт в памяти. Дедуп transaction_id — внутри месяца, как было с API.
+        purchases_raw: list[tuple] = []
+        for chunk_since, chunk_until in month_chunks(since, until):
+            chunk = only_country(
+                raw.read_purchase_events(conn, chunk_since, chunk_until, "receive") if use_db
+                else fetch_purchase_events(app_id, token, chunk_since, chunk_until, event_name,
+                                           country=bool(country)))
+            purchases_raw.extend(purchase_facts(chunk))
+            print(f"[lime-appmetrica] покупки {chunk_since}..{chunk_until}: "
+                  f"событий={len(chunk)}, фактов накоплено={len(purchases_raw)}", flush=True)
+            del chunk
+    finally:
+        if conn is not None:
+            conn.close()
     print(f"[lime-appmetrica] сырьё: installs={len(installs_raw)}, purchases={len(purchases_raw)}")
     if not purchases_raw:
         print("[lime-appmetrica] WARNING: purchases_raw пуст — покупки не найдены за окно")
