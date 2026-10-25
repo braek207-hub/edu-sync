@@ -1,9 +1,6 @@
 name: Sync Mesh-n-Flesh Metrika → Supabase
 
 on:
-  schedule:
-    # 05:10 UTC = 08:10 Moscow — вчерашний день Метрики готов утром
-    - cron: "10 5 * * *"
   workflow_dispatch:
     inputs:
       sync_days:

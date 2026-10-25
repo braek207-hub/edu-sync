@@ -1,9 +1,6 @@
 name: Sync Mesh-n-Flesh Direct Campaign Settings
 
 on:
-  schedule:
-    # каждые 3 часа — тот же ритм, что чистильщик площадок РСЯ (placement-cleaner.yml)
-    - cron: "35 */3 * * *"
   workflow_dispatch:
 
 concurrency:

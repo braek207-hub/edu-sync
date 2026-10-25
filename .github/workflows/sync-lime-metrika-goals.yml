@@ -8,8 +8,6 @@
 name: Sync LIME Metrika Goals
 
 on:
-  schedule:
-    - cron: "10 1 * * *"   # 04:10 МСК ежедневно, после RU-среза (03:50)
   workflow_dispatch:
     inputs:
       date_from:

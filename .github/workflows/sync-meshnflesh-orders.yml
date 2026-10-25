@@ -1,9 +1,6 @@
 name: Sync Mesh-n-Flesh Orders → Panda-BI
 
 on:
-  schedule:
-    # 01:00 UTC = 04:00 Moscow — дневное окно «изменённые за 7 дней» добирает поздние оплаты
-    - cron: "0 1 * * *"
   workflow_dispatch:
     inputs:
       sync_days:

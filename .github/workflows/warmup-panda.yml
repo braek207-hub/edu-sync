@@ -9,8 +9,6 @@ name: Прогрев кэша Panda-BI
 # Ответ без секрета не содержит цифр (см. app/api/warmup/route.ts в EduDash),
 # печатать его в публичный лог безопасно.
 on:
-  schedule:
-    - cron: "45 5 * * *" # 08:45 МСК — после основной волны ночных синков и сторожа
   workflow_dispatch:
 
 concurrency:

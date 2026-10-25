@@ -1,11 +1,6 @@
 name: LIME Roistat → Google Sheet (визиты + продажи)
 
 on:
-  schedule:
-    # 23:44 UTC = 02:44 Moscow (UTC+3). Раньше нужного 5:00, чтобы компенсировать
-    # задержку планировщика GitHub (best-effort, бывает на часы). Окно считается по
-    # московской дате в коде, поэтому запуск до полуночи UTC пишет верный «вчера».
-    - cron: "44 23 * * *"
   workflow_dispatch:
     inputs:
       mode:

@@ -4,8 +4,6 @@ name: Sync LIME app install-source daily
 # После sync-lime-vk (справочник групп) и sync-lime-appmetrica (04:10 MSK, до 90 мин).
 
 on:
-  schedule:
-    - cron: "0 3 * * *"   # 06:00 MSK
   workflow_dispatch:
     inputs:
       date_from:
