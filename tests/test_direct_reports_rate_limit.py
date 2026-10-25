@@ -69,7 +69,7 @@ def test_edu_direct_other_400_still_fails(monkeypatch, sleeps):
 
 def test_lime_direct_retries_after_56(monkeypatch, sleeps):
     monkeypatch.setattr(lime_direct, "_report_headers", lambda: {})
-    monkeypatch.setattr(lime_direct.requests, "post", scripted([
+    monkeypatch.setattr(lime_direct._HTTP, "post", scripted([
         Resp(201, headers={"retryIn": "1"}), Resp(400, LIMIT_56), Resp(200, "CampaignId\tDate\n"),
     ]))
     assert lime_direct._fetch_report_chunk("2026-10-10", "2026-10-16", [], {}) == []
