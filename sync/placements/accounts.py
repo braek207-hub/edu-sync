@@ -18,6 +18,10 @@ class Account(NamedTuple):
     token_env: str      # переменная окружения с OAuth-токеном
     login: Optional[str] = None       # Client-Login; None — прямой кабинет
     logins_env: Optional[str] = None  # JSON со списком клиентов агентства
+    # JSON [{login, token}] — у кабинета несколько логинов, и токен у каждого
+    # свой (BJORN: тот же секрет, что читают sync/bjorn и настройки кампаний).
+    # Токен строки пуст — берётся token_env.
+    clients_env: Optional[str] = None
     agency: bool = False              # спросить список клиентов у Директа
     # Площадки, которые в этом кабинете запрещаются всегда: не по вердикту
     # словаря и не по кликам, а решением человека. Список кабинетный —
@@ -51,8 +55,11 @@ ACCOUNTS: List[Account] = [
             spam_rule=True),
     Account("lime", "LIME", "LIME_DIRECT_TOKEN",
             login=os.environ.get("LIME_DIRECT_CLIENT_LOGIN") or None),
+    # BJORN с 26.10.2026 по просьбе Павла. E-com: цель — покупка, спам-заявок
+    # нет, поэтому spam_rule выключен; always_block не задан — кабинетного
+    # решения о почте и Дзене у BJORN не было.
     Account("bjorn", "BJORN", "BJORN_DIRECT_TOKEN",
-            login=os.environ.get("BJORN_DIRECT_CLIENT_LOGIN") or None),
+            clients_env="BJORN_DIRECT_CLIENTS_JSON"),
     Account("polinarepik", "Polinarepik", "POLINA_DIRECT_TOKEN",
             login=os.environ.get("POLINA_DIRECT_CLIENT_LOGIN") or None),
     Account("meshnflesh", "mesh-n-flesh", "MNF_DIRECT_TOKEN",
@@ -86,16 +93,41 @@ def agency_logins(account: Account) -> List[str]:
         offset += len(chunk)
 
 
-def logins_of(account: Account) -> List[str]:
-    """Клиентские логины кабинета.
+def _clients_json(account: Account) -> List[Tuple[str, str]]:
+    raw = os.environ.get(account.clients_env or "", "").strip()
+    if not raw:
+        return []
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    out = []
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict):
+            login = str(item.get("login") or item.get("client_login") or "").strip()
+            token = str(item.get("token") or "").strip() or account.token()
+        else:
+            login, token = str(item).strip(), account.token()
+        if login and token:
+            out.append((login, token))
+    return out
+
+
+def logins_of(account: Account) -> List[Tuple[str, str]]:
+    """Клиентские логины кабинета с токеном, которым каждый открывается.
 
     У агентского кабинета их несколько (EDU: ВУЗ, СПО, ПроВУЗ…), и чистить
     надо каждый: запрет площадок живёт на кампании, а кампании — у клиента.
     """
+    if account.clients_env:
+        return _clients_json(account)
+    token = account.token()
+    if not token:
+        return []
     if account.agency:
         logins = agency_logins(account)
         if logins:
-            return logins
+            return [(login, token) for login in logins]
     if account.logins_env:
         raw = os.environ.get(account.logins_env, "").strip()
         if not raw:
@@ -108,9 +140,9 @@ def logins_of(account: Account) -> List[str]:
         for item in items:
             login = str(item.get("login", "")).strip() if isinstance(item, dict) else str(item).strip()
             if login:
-                out.append(login)
+                out.append((login, token))
         return out
-    return [account.login] if account.login else []
+    return [(account.login, token)] if account.login else []
 
 
 def available(keys: Optional[List[str]] = None):
@@ -119,12 +151,16 @@ def available(keys: Optional[List[str]] = None):
     for account in ACCOUNTS:
         if keys and account.key not in keys:
             continue
-        if not account.token():
+        if account.clients_env:
+            if not os.environ.get(account.clients_env, "").strip():
+                skipped.append((account, "нет клиентов в %s" % account.clients_env))
+                continue
+        elif not account.token():
             skipped.append((account, "нет токена в %s" % account.token_env))
             continue
         logins = logins_of(account)
         if not logins:
-            skipped.append((account, "не задан Client-Login"))
+            skipped.append((account, "не задан Client-Login или токен"))
             continue
         ready.append((account, logins))
     return ready, skipped

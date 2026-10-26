@@ -90,7 +90,9 @@ ALLOW_EXACT = frozenset({
     "ru.zen.android",
     "ru.mail.mailapp", "ru.mail.mail", "ru.mail.cloud",
     "ru.mail.search.electroscope",
-    "ru.avito.android", "ru.auto.ara", "ru.drom.app",
+    # ru.avito.app — iOS-сборка Авито: репетиция BJORN 26.10.2026 резала её
+    # как мобильное приложение, хотя андроидные имена здесь давно.
+    "ru.avito.android", "ru.avito.app", "ru.auto.ara", "ru.drom.app",
     "com.farpost.dromfilter", "ru.rutube.app",
     "ru.wildberries.wbclient", "com.wildberries.ru",
     "ru.ozon.app.android", "ru.beru.android", "ru.megamarket.android",

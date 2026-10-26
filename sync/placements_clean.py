@@ -85,9 +85,8 @@ def spam_sites(account, token: str, login: str) -> dict:
         return {}
 
 
-def run_login(account, login: str, apply: bool, top_n: int,
+def run_login(account, login: str, token: str, apply: bool, top_n: int,
               use_db: bool, ask=None) -> dict:
-    token = account.token()
     _out("\n[%s / %s] отчёт площадок за сегодня…" % (account.key, login))
     # Кампании сначала: у агентского кабинета половина клиентов пустая или
     # выключена, и заказывать по ним отчёт — минуты прогона впустую.
@@ -184,7 +183,8 @@ def run_login(account, login: str, apply: bool, top_n: int,
             "ok": applied_ok, "failed": applied_bad}
 
 
-def unban(account, login: str, sites, apply: bool, mine=None) -> int:
+def unban(account, login: str, token: str, sites, apply: bool,
+          mine=None) -> int:
     """Снять указанные площадки из всех кампаний кабинета.
 
     Обратный ход нужен ровно потому, что словарь ошибается: allowlist узнал
@@ -195,7 +195,6 @@ def unban(account, login: str, sites, apply: bool, mine=None) -> int:
     com.avito.android директолог мог запретить руками, и стирать его решение
     заодно со своей ошибкой недопустимо.
     """
-    token = account.token()
     hits = 0
     for campaign in direct.campaigns(token, login):
         items = (campaign.get("ExcludedSites") or {}).get("Items") or []
@@ -276,10 +275,10 @@ def main(argv=None) -> int:
                 _out("  [%s] журнала нет — снимать небезопасно, пропуск"
                      % account.key)
                 continue
-            for login in logins:
+            for login, token in logins:
                 _out("\n[%s / %s]" % (account.key, login))
                 try:
-                    touched += unban(account, login, sites, apply, mine)
+                    touched += unban(account, login, token, sites, apply, mine)
                 except Exception as err:
                     _out("  ОШИБКА: %s" % err)
         _out("\nитого затронуто кампаний: %d" % touched)
@@ -292,9 +291,9 @@ def main(argv=None) -> int:
     failures = 0
     totals = {"sites": 0, "campaigns": 0, "ok": 0, "failed": 0}
     for account, logins in ready:
-        for login in logins:
+        for login, token in logins:
             try:
-                res = run_login(account, login, apply, args.top_n,
+                res = run_login(account, login, token, apply, args.top_n,
                                 use_db, ask=ask)
                 for key in totals:
                     totals[key] += res[key]
