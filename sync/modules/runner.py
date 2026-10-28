@@ -491,6 +491,10 @@ def _run_previews(slug, store, accts: Callable[[], Tuple[list, list]], modules, 
             store.cleanup_previews(slug)
         except Exception as err:
             log("превью: старые не удалены (%s: %s)" % (type(err).__name__, err))
+        try:
+            store.cleanup_runs(slug)
+        except Exception as err:
+            log("журнал: старые прогоны не удалены (%s: %s)" % (type(err).__name__, err))
     goals = _memo(lambda: store.project_lead_goals(slug))
     try:
         while True:

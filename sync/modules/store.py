@@ -371,6 +371,34 @@ def cleanup_previews(slug: str, older_than: timedelta = PREVIEW_RETENTION) -> in
         return cur.rowcount
 
 
+# Журнал прогонов нужен человеку за последний квартал; дальше строки только растят таблицу
+# (такт раз в 20 минут — тысячи строк в месяц на проект). Находки на прогон ссылаются
+# ON DELETE SET NULL и не пропадают.
+RUN_RETENTION = timedelta(days=90)
+
+
+def cleanup_runs(slug: str, older_than: timedelta = RUN_RETENTION) -> int:
+    """Прогоны проекта старше older_than удалить. Не трогаем идущие и последний скан
+    каждого модуля — и вообще, и среди завершённых (DONE в runner; строки фазы применения
+    не сканы, как в last_run_started): по ним расписание решает, пора ли сканировать,
+    и редкий модуль без них просканировал бы внеочередно."""
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM module_runs WHERE dashboard_slug = %s AND status <> 'running' "
+            "AND started_at < now() - make_interval(secs => %s) "
+            "AND id NOT IN ("
+            " SELECT DISTINCT ON (module_key) id FROM module_runs"
+            " WHERE dashboard_slug = %s AND summary->>'phase' IS DISTINCT FROM 'apply'"
+            " ORDER BY module_key, started_at DESC) "
+            "AND id NOT IN ("
+            " SELECT DISTINCT ON (module_key) id FROM module_runs"
+            " WHERE dashboard_slug = %s AND status IN ('ok', 'skipped')"
+            " AND summary->>'phase' IS DISTINCT FROM 'apply'"
+            " ORDER BY module_key, started_at DESC)",
+            (slug, older_than.total_seconds(), slug, slug))
+        return cur.rowcount
+
+
 @contextmanager
 def hold_project_lock(slug: str) -> Iterator[bool]:
     """Advisory-замок проекта на всё время прогона; False — замок держит другой прогон.

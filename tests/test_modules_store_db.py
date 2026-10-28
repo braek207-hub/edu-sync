@@ -531,6 +531,39 @@ def test_cleanup_previews_keeps_fresh_and_running(live):
     assert store.cleanup_previews(SLUG, older_than=timedelta(minutes=30)) == 1
 
 
+def _run_at(cur, module_key, status, days_ago):
+    cur.execute("INSERT INTO module_runs (dashboard_slug, module_key, mode, status, started_at) "
+                "VALUES (%s, %s, 'report', %s, now() - make_interval(days => %s)) RETURNING id",
+                (SLUG, module_key, status, days_ago))
+    return cur.fetchone()[0]
+
+
+def test_cleanup_runs_keeps_recent_running_and_last_per_module(live):
+    old_ok = _run_at(live, "placements", "ok", 200)
+    old_err = _run_at(live, "placements", "error", 150)
+    last_ok = _run_at(live, "placements", "ok", 120)       # последний завершённый — живёт
+    last_any = _run_at(live, "placements", "error", 100)   # последний вообще — живёт
+    old_running = _run_at(live, "queries", "running", 120)
+    fresh = _run_at(live, "queries", "ok", 10)
+    rare = _run_at(live, "audit", "ok", 300)               # единственный у модуля — живёт
+    apply_row = _run_at(live, "audit", "ok", 200)          # применение не скан: удаляется
+    live.execute("UPDATE module_runs SET summary = '{\"phase\": \"apply\"}' WHERE id = %s",
+                 (apply_row,))
+    assert store.cleanup_runs(SLUG) == 3
+    live.execute("SELECT id FROM module_runs WHERE dashboard_slug = %s ORDER BY id", (SLUG,))
+    assert [r[0] for r in live.fetchall()] == [last_ok, last_any, old_running, fresh, rare]
+    assert {old_ok, old_err, apply_row}.isdisjoint({last_ok, last_any, old_running, fresh, rare})
+
+
+def test_cleanup_runs_keeps_findings(live):
+    run = _run_at(live, "placements", "ok", 200)
+    _run_at(live, "placements", "ok", 1)
+    store.apply_reconciled(SLUG, "placements", run, Reconciled(insert=[_f("x")]))
+    assert store.cleanup_runs(SLUG) == 1
+    live.execute("SELECT run_id FROM module_findings WHERE dashboard_slug = %s", (SLUG,))
+    assert [r[0] for r in live.fetchall()] == [None]
+
+
 def test_approve_auto_skips_propose(live):
     run = store.start_run(SLUG, "placements", "auto")
     plain = _f("plain.ru")

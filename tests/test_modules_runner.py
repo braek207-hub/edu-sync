@@ -68,6 +68,10 @@ class FakeStore:
         self.calls.append(("cleanup_previews",))
         return 0
 
+    def cleanup_runs(self, slug, older_than=timedelta(days=90)):
+        self.calls.append(("cleanup_runs",))
+        return 0
+
     @contextmanager
     def hold_project_lock(self, slug):
         self.calls.append(("lock", slug))
@@ -828,6 +832,27 @@ def test_preview_without_accounts_or_module_is_error():
                        log=lambda m: None, agent_lock_fn=lambda s: None)
     assert "нет токена" in st._preview(1)["error"]
     assert "не реализован" in st._preview(2)["error"]
+
+
+def test_cleanup_runs_once_per_tick_and_not_fatal():
+    st = FakeStore([_row("placements"), _row("queries")])
+    _go(st, {"placements": OutModule("placements", RunOutput(findings=[])),
+             "queries": OutModule("queries", RunOutput(findings=[]))})
+    assert st.calls.count(("cleanup_runs",)) == 1
+
+    st = FakeStore([_row()])
+
+    def boom(slug, older_than=None):
+        raise RuntimeError("runs db down")
+    st.cleanup_runs = boom
+    logs = []
+    rc = runner.run_project("lime", store=st, accounts=lambda s: (ACC, []),
+                            modules={"placements": OutModule("placements",
+                                                             RunOutput(findings=[]))},
+                            now=NOW, log=logs.append, agent_lock_fn=lambda s: None)
+    assert rc == 0
+    assert ("finish_run", "placements", "ok") in st.calls
+    assert any("runs db down" in line for line in logs)
 
 
 def test_preview_cleanup_failure_not_fatal():
