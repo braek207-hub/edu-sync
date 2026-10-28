@@ -17,6 +17,7 @@ from typing import Any, Dict, List
 
 import requests
 
+from sync import progress
 from sync.db import load_lead_client_ids, upsert_edu_visit_behavior
 from sync.metrika_offline import COUNTER_VUZ
 
@@ -184,10 +185,14 @@ def sync_edu_visits(days_back: int = 90, chunk_days: int = 30) -> int:
     # отказ, соседние 30 дней проходят. Поэтому окна по chunk_days, а отказное делится пополам.
     total = 0
     cur = start
+    days = (today - start).days + 1
     while cur <= today:
+        progress.report("metrika.days", (cur - start).days, days, "Метрика · дни")
         c_to = min(cur + timedelta(days=chunk_days - 1), today)
         total += _sync_window(cur, c_to, token, keep)
         cur = c_to + timedelta(days=1)
+    progress.report("metrika.days", days, days, "Метрика · дни")
+    progress.result(rows=total, days=days)
     return total
 
 

@@ -25,6 +25,7 @@ from typing import Any
 
 import requests
 
+from sync import progress
 from sync.panda_url import ingest_url
 
 INGEST_URL = ingest_url("meshnflesh", "MESHNFLESH_INGEST_URL")
@@ -205,6 +206,7 @@ def main() -> int:
         return 0
 
     since = datetime.now(timezone.utc) - timedelta(days=SYNC_DAYS)
+    progress.report("orders.fetch", label="Заказы · выгрузка")
     raw = fetch_orders(host, api_key, password, since)
     print(f"Fetched {len(raw)} orders (updated_since {since:%Y-%m-%d %H:%M} UTC, окно {SYNC_DAYS} дн.)")
 
@@ -221,6 +223,7 @@ def main() -> int:
     all_rejected: list[Any] = []
     all_failed: list[Any] = []
     for i in range(0, len(orders), BATCH_SIZE):
+        progress.report("orders.write", i, len(orders), "Заказы · запись")
         chunk = orders[i : i + BATCH_SIZE]
         res = post_batch(chunk, token)
         total_upserted += int(res.get("upserted") or 0)
@@ -228,6 +231,8 @@ def main() -> int:
         all_failed.extend(res.get("failed") or [])
         print(f"  batch {i // BATCH_SIZE + 1}: upserted={res.get('upserted')}")
 
+    progress.report("orders.write", len(orders), len(orders), "Заказы · запись")
+    progress.result(rows=total_upserted)
     print(f"Total upserted: {total_upserted}/{len(orders)}")
     if all_rejected:
         print(f"Rejected by schema: {json.dumps(all_rejected, ensure_ascii=False)}")

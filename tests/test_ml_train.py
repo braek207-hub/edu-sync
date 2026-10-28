@@ -11,7 +11,6 @@ def test_gate_beats_pilot():
 
 def test_time_split_maturity_window():
     from datetime import date
-    from sync.ml_train import time_split
     today = date(2026, 7, 23)
     rows = [
         {"created_date": date(2025, 6, 1), "client_id": "a"},   # age~418 → train
@@ -25,7 +24,6 @@ def test_time_split_maturity_window():
 
 def test_time_split_drops_test_clients_in_train():
     from datetime import date
-    from sync.ml_train import time_split
     today = date(2026, 7, 23)
     rows = [
         {"created_date": date(2025, 6, 1), "client_id": "dup"},   # train

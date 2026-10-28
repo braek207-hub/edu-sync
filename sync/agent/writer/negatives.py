@@ -62,7 +62,15 @@ MAX_PHRASES_PER_TICK = 10
 # запросов, их быть не может — значит это чужая правка или битые данные.
 OPERATOR_CHARS = set('"!+[]<>|')
 
+# Кроме букв и цифр робот пишет только пробел, точку, апостроф и дефис внутри слова.
+# Список намеренно узкий: «-» на краю слова Директ читает как минус-оператор, «?» и
+# прочая пунктуация из запроса дают отказ записи. Дефис между буквами («санкт-петербург»)
+# — часть слова, без него робот отказывал бы самым частым городским запросам. Отказ на
+# расчёте лучше упавшей записи: его видно сразу и с причиной.
+EXTRA_PHRASE_CHARS = frozenset(" .'")
+
 _SPACES = re.compile(r"\s+")
+_INWORD_HYPHEN = re.compile(r"(?<=\w)-(?=\w)")
 
 DISPLAY_CAMPAIGN_REASON = (
     "минус-фразы недоступны для этого типа кампании (не текстовая)"
@@ -82,11 +90,19 @@ def phrase_is_valid(phrase: str) -> Tuple[bool, str]:
     if OPERATOR_CHARS & set(normalized):
         return False, ("во фразе есть операторы языка запросов — "
                        "автоматический рычаг такие не ставит")
-    words = normalized.split(" ")
-    if len(words) > MAX_WORDS_PER_PHRASE:
-        return False, (f"во фразе {len(words)} слов при пределе "
-                       f"{MAX_WORDS_PER_PHRASE}")
-    for word in words:
+    # isalpha/isdecimal, а не isalnum: тот пропускает «²» и «½», которых Директ не примет.
+    odd = sorted({ch for ch in _INWORD_HYPHEN.sub("", normalized)
+                  if not (ch.isalpha() or ch.isdecimal()) and ch not in EXTRA_PHRASE_CHARS})
+    if odd:
+        return False, ("во фразе символы %s — робот пишет только буквы, цифры, "
+                       "пробел, точку, апостроф и дефис внутри слова"
+                       % " ".join("«%s»" % ch for ch in odd))
+    # Директ делит слово по дефису: «санкт-петербург» в пределе 7 слов — два.
+    counted = len(_INWORD_HYPHEN.sub(" ", normalized).split(" "))
+    if counted > MAX_WORDS_PER_PHRASE:
+        return False, (f"во фразе {counted} слов при пределе "
+                       f"{MAX_WORDS_PER_PHRASE} (части через дефис — отдельные слова)")
+    for word in normalized.split(" "):
         if len(word) > MAX_WORD_CHARS:
             return False, (f"слово длиннее {MAX_WORD_CHARS} символов: "
                            f"{word[:40]}")

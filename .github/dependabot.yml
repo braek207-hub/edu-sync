@@ -1,0 +1,10 @@
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    # Тот же гейт свежести, что exclude-newer = "7 days" у uv: атаки через пакеты ловят за 1–3 дня.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5

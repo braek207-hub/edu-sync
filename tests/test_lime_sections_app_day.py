@@ -7,7 +7,6 @@ NameError в app-ветке (camps/camp) доехал до CI, потому чт
 форм строк с lime_sections_db.TABLES.
 """
 import json
-from datetime import datetime
 from unittest.mock import patch
 
 from sync import lime_sections_app as A

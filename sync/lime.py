@@ -12,6 +12,8 @@ import psycopg2
 import psycopg2.extras
 import pymysql
 
+from sync import progress
+
 SYNC_DAYS = int(os.environ.get("LIME_SYNC_DAYS") or "7")
 SYNC_FROM = (os.environ.get("LIME_SYNC_FROM") or "").strip() or None
 SYNC_TO = (os.environ.get("LIME_SYNC_TO") or "").strip() or None
@@ -320,7 +322,8 @@ def sync_lime() -> None:
     try:
         total_raw = 0
         total_agg = 0
-        for day in date_chunks(date_from, date_to):
+        days = list(date_chunks(date_from, date_to))
+        for day in progress.track(days, "procontext.days", "Procontext · дни"):
             conn_my.ping(reconnect=True)
             raw, agg_n = sync_chunk(conn_my, day, day, vk_groups)
             total_raw += raw
@@ -328,6 +331,7 @@ def sync_lime() -> None:
             print(f"[lime-sync] {day}: raw={raw} -> aggregated={agg_n}")
 
         print(f"[lime-sync] done. total raw={total_raw}, total aggregated={total_agg}")
+        progress.result(rows=total_agg, days=len(days))
     finally:
         conn_my.close()
 

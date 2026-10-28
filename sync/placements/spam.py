@@ -12,15 +12,16 @@
 кампаниях 131 клик и 18 достижений, ни одной оплаты.
 """
 
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List
 
 from sync.placements.classify import ALLOW_EXACT, ALLOW_PREFIX, normalize
 from sync.placements.llm import is_protected
 
 # Меньше — шум: три заявки с двух кликов дают CR 150 % на пустом месте.
-MIN_CONVERSIONS = 5
-# Абсолютный порог: ниже него «высокой» конверсия не бывает ни у кого.
-MIN_CR = 0.08
+# Умолчания совпадают с settings.spam модуля (defaults.py): настройка их только сдвигает.
+MIN_LEADS = 5
+# Абсолютный порог в процентах: ниже него «высокой» конверсия не бывает ни у кого.
+MIN_CR = 8.0
 # И относительный: площадка обязана быть в разы лучше своего кабинета —
 # честная площадка от кабинета отличается процентами, спамовая — кратно.
 CR_RATIO = 2.5
@@ -40,14 +41,18 @@ def _own_conversions(row: Dict[str, Any], goals: Dict[str, int]) -> int:
 
 
 def suspicious_sites(rows: Iterable[Dict[str, Any]],
-                     goals: Dict[str, int],
-                     min_conversions: int = MIN_CONVERSIONS,
+                     goals: Dict[str, int], *,
+                     min_leads: int = MIN_LEADS,
                      min_cr: float = MIN_CR,
-                     cr_ratio: float = CR_RATIO) -> Dict[str, str]:
+                     ratio: float = CR_RATIO) -> Dict[str, str]:
     """Строки недельного отчёта → площадка → причина запрета.
 
     Считается по площадке целиком, поверх всех кампаний логина: спам-сайт
     спамит везде, и по одной кампании его иногда не видно.
+
+    min_leads — достижений не меньше; min_cr — CR площадки не ниже, в процентах;
+    ratio — и во столько раз выше CR кабинета. goals пустой — у каждой строки
+    берётся самая массовая цель отчёта (так считаются цели-лиды, goals:"leads").
 
     Известные приложения и крупные порталы правило не трогает: ВК за неделю
     даёт шесть заявок с 55 кликов, и решать, спам это или нет, — человеку.
@@ -68,14 +73,16 @@ def suspicious_sites(rows: Iterable[Dict[str, Any]],
         slot[1] += conv
     if total_clicks <= 0:
         return {}
-    account_cr = total_conv / float(total_clicks)
-    threshold = max(min_cr, account_cr * cr_ratio)
+    # Проценты, а не доли: в тех же единицах порог стоит в настройке, и 8 % из
+    # настройки сравнивается с 8 % площадки без пересчёта.
+    account_cr = total_conv * 100.0 / total_clicks
+    threshold = max(float(min_cr), account_cr * float(ratio))
 
     out: Dict[str, str] = {}
     for site, (clicks, conv) in per_site.items():
-        if conv < min_conversions or clicks <= 0:
+        if conv < min_leads or clicks <= 0:
             continue
-        cr = conv / float(clicks)
+        cr = conv * 100.0 / clicks
         if cr < threshold:
             continue
         if site in ALLOW_EXACT or is_protected(site) \
@@ -83,5 +90,5 @@ def suspicious_sites(rows: Iterable[Dict[str, Any]],
             continue
         out[site] = ("спам-площадка: %d достижений с %d кликов, CR %.1f%% "
                      "при %.1f%% по кабинету"
-                     % (conv, clicks, 100 * cr, 100 * account_cr))
+                     % (conv, clicks, cr, account_cr))
     return out

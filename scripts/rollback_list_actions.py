@@ -25,7 +25,7 @@ ENV: DATABASE_URL, DIRECT_TOKEN (боевой — только в Actions).
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

@@ -10,7 +10,7 @@ from datetime import date, timedelta
 
 import requests
 
-from sync.gcc_ga4 import GA4_CODES, GA4_PROPERTY, HOST_COUNTRY, fetch_ga4_traffic, run_report
+from sync.gcc_ga4 import GA4_PROPERTY, HOST_COUNTRY, fetch_ga4_traffic, run_report
 from sync.gcc_metrika import domain_country_gcc5
 
 M_URL = "https://api-metrika.yandex.net/stat/v1/data"
@@ -48,7 +48,6 @@ def audit():
     # ── 1. ДНЕВНАЯ ДИНАМИКА: Метрика users vs GA4 totalUsers/activeUsers/sessions (5 стран GCC)
     ga_tot = fetch_ga4_traffic(GA4_PROPERTY, dates, "totalUsers")
     ga_act = fetch_ga4_traffic(GA4_PROPERTY, dates, "activeUsers")
-    ga_ses = fetch_ga4_traffic(GA4_PROPERTY, dates, "sessions")
     # Метрика по дням: users по (дата, домен) → фильтр GCC5, сумма
     m_rows = _m(["ym:s:date", "ym:s:startURLDomain"], ["ym:s:users", "ym:s:visits"], frm_s, to_s)
     m_day = {}
@@ -101,7 +100,6 @@ def audit():
     for dev, u in sorted(magg.items(), key=lambda x: -x[1]):
         print(f"MDEV {dev} | {u}")
     print("\n### DEVICE GA4 (totalUsers, GCC-хосты, всё окно):")
-    hosts = list(HOST_COUNTRY.keys())
     gdev = run_report(GA4_PROPERTY, frm_s, to_s, ["deviceCategory", "hostName"], ("totalUsers",))
     gagg = {}
     for r in gdev:
@@ -595,7 +593,7 @@ def ru_direct_check():
         brk = cur.fetchall()
     conn.close()
     print(f"### RU платные подканалы Метрики: {brk}")
-    print(f"### RU date | direct_clicks | metrika_visits | metrika_DAU | visits/clicks% | DAU/clicks%")
+    print("### RU date | direct_clicks | metrika_visits | metrika_DAU | visits/clicks% | DAU/clicks%")
     tc = tv = tu = 0
     d = frm
     while d <= to:

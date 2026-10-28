@@ -34,6 +34,8 @@ from typing import Any, Dict, Optional, Tuple
 import psycopg2
 import psycopg2.extras
 
+from sync import progress
+
 BASE = "https://ads.vk.com/api/v2"
 TOKEN_URL = f"{BASE}/oauth2/token.json"
 STAT_BATCH = 20
@@ -102,11 +104,11 @@ def build_rows(base_map, goals_map, campaigns_meta, cabinet: str = "") -> list:
     """Слить базу + конверсии + мету кампании в строки upsert. Ведёт база (только где есть статистика).
     cabinet — метка кабинета (login), различает несколько VK-аккаунтов в одной таблице."""
     rows = []
-    for (date, cid), base in base_map.items():
+    for (day, cid), base in base_map.items():
         meta = campaigns_meta.get(cid, {})
-        conv = goals_map.get((date, cid), {})
+        conv = goals_map.get((day, cid), {})
         rows.append({
-            "date": date,
+            "date": day,
             "region": "ru",
             "cabinet": cabinet,
             "campaign_id": cid,
@@ -490,7 +492,7 @@ def sync_lime_vk_ads(days_back: int = 14) -> int:
     all_rows: list = []
     entity_rows: list = []
     failed: list = []
-    for client_id, secret in cabinets:
+    for client_id, secret in progress.track(cabinets, "vk.cabinets", "VK · кабинеты"):
         # Токен одного кабинета не должен ронять остальные: лимит активных токенов
         # считается на КАЖДУЮ пару client_id+пользователь отдельно, поэтому упёршийся
         # кабинет — это не «VK недоступен». Раньше падение на первом же оставляло без
@@ -517,8 +519,10 @@ def sync_lime_vk_ads(days_back: int = 14) -> int:
                   f"пропускаю, расход кабинета не затронут")
 
     # ad_plan_id глобально уникальны между кабинетами (0 пересечений) → PK (date,campaign_id) без cabinet.
+    progress.report("vk.write", label="VK · запись в базу")
     n = _upsert(all_rows, df, dt)
     e = _upsert_entities(entity_rows)
+    progress.result(rows=n, days=days_back + 1)
     print(f"[lime_vk_ads] {n} строк из {len(cabinets) - len(failed)} кабинетов "
           f"({df}..{dt}); справочник lime_vk_entities: {e} строк")
     if failed:

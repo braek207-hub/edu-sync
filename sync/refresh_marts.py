@@ -19,6 +19,8 @@ import sys
 
 import psycopg2
 
+from sync import progress
+
 MARTS = ["mart_lime_cabinet_daily"]
 
 
@@ -32,7 +34,7 @@ def refresh_marts(marts: list[str] | None = None) -> int:
     done = 0
     conn = psycopg2.connect(url.split("?")[0], connect_timeout=30)
     try:
-        for name in names:
+        for name in progress.track(names, "marts.refresh", "Витрины · пересчёт"):
             try:
                 with conn.cursor() as cur:
                     cur.execute("SELECT refresh_mart(%s)", (name,))

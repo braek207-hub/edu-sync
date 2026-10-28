@@ -7,7 +7,7 @@ from sync.lime_gcc_report import (
 
 
 def _empty_traffic(dates):
-    from sync.lime_gcc_report import _SCOPES, _empty_day
+    from sync.lime_gcc_report import _empty_day
     return {d: _empty_day() for d in dates}
 
 

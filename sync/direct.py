@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import requests
 
+from sync import progress
 from sync.classify import detect_direction, detect_project, project_from_client
 from sync.direct_reports_limit import MIN_POLL_SECONDS, is_rate_limited, poll_delay
 from sync.utils import to_num_gas
@@ -260,7 +261,7 @@ def sync_direct_api_range(
 
     all_rows: List[Dict[str, Any]] = []
     errors: List[str] = []
-    for client in clients:
+    for client in progress.track(clients, "direct.cabinets", "Директ · кабинеты"):
         login = client["login"]
         try:
             project = client.get("project")
@@ -293,7 +294,9 @@ def sync_direct_api_range(
         if replace_from:
             deleted = delete_direct_stats_from(date_from)
             print(f"Директ API: удалено {deleted} строк с {date_from}")
+        progress.report("direct.write", label="Директ · запись в базу")
         written = upsert_direct_stats(all_rows)
+    progress.result(rows=written, days=(date.fromisoformat(date_to) - date.fromisoformat(date_from)).days + 1)
 
     # Частичный сбой: загрузившиеся кабинеты записаны (upsert чужие строки не задевает), но
     # прогон красный. WARN в логе зелёного прогона не читает никто, а сторож свежести кабинет

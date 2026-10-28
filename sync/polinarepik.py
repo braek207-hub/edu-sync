@@ -16,6 +16,7 @@ from typing import Any
 
 import requests
 
+from sync import progress
 from sync.db import (
     delete_polinarepik_metrica_from,
     delete_polinarepik_metrica_purchases_from,
@@ -547,35 +548,26 @@ def main() -> int:
         return 1
     sources = sources or {"direct", "metrica"}
 
+    steps = []
     if "direct" in sources:
-        try:
-            n = sync_direct(days)
-            print(f"Direct upserted: {n}")
-        except Exception as e:
-            print(f"ERROR direct: {e}")
-            errors.append(f"direct: {e}")
-
+        steps.append(("direct", "Direct upserted", sync_direct))
     if "metrica" in sources:
+        steps += [
+            ("metrica visits", "Metrica visits upserted", sync_metrica),
+            ("metrica sources", "Metrica sources upserted", sync_metrica_sources),
+            ("metrica purchases", "Metrica purchases upserted", sync_metrica_purchases),
+        ]
+    label = "Директ · отчёт" if sources == {"direct"} else "Метрика · отчёты" if sources == {"metrica"} else "Отчёты"
+    written = 0
+    for name, done_msg, step in progress.track(steps, "polinarepik.reports", label):
         try:
-            n = sync_metrica(days)
-            print(f"Metrica visits upserted: {n}")
+            n = step(days)
+            written += n or 0
+            print(f"{done_msg}: {n}")
         except Exception as e:
-            print(f"ERROR metrica visits: {e}")
-            errors.append(f"metrica visits: {e}")
-
-        try:
-            n = sync_metrica_sources(days)
-            print(f"Metrica sources upserted: {n}")
-        except Exception as e:
-            print(f"ERROR metrica sources: {e}")
-            errors.append(f"metrica sources: {e}")
-
-        try:
-            n = sync_metrica_purchases(days)
-            print(f"Metrica purchases upserted: {n}")
-        except Exception as e:
-            print(f"ERROR metrica purchases: {e}")
-            errors.append(f"metrica purchases: {e}")
+            print(f"ERROR {name}: {e}")
+            errors.append(f"{name}: {e}")
+    progress.result(rows=written, days=days + 1)
 
     print("=== Polinarepik Sync DONE ===")
 

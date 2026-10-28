@@ -8,7 +8,6 @@ API дальше дописывает свежие недели (перетир�
 """
 import csv
 import datetime as dt
-import os
 
 COLMAP = {"week_start": "week_start", "demand": "demand", "seo_clicks": "seo_clicks"}
 

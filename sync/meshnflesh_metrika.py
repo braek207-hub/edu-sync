@@ -31,6 +31,7 @@ from typing import Any, Dict, List
 import psycopg2.extras
 import requests
 
+from sync import progress
 from sync.db import get_connection
 
 METRICA_COUNTER_ID = "82116769"
@@ -466,6 +467,12 @@ def main() -> int:
         print(f"ERROR: MESHNFLESH_SOURCES: неизвестные {sorted(unknown)} (есть direct, metrica)")
         return 1
     sources = sources or {"direct", "metrica"}
+    # Шаги для плашки «Обновить»: Директ — один отчёт, Метрика — источники и покупки.
+    label = "Директ · отчёт" if sources == {"direct"} else "Метрика · отчёты" if sources == {"metrica"} else "Отчёты"
+    steps = ("direct" in sources) + 2 * ("metrica" in sources)
+    step = 0
+    written = 0
+    progress.report("mnf.reports", 0, steps, label)
 
     if "direct" in sources:
         direct_token = _env("MESHNFLESH_DIRECT_TOKEN")
@@ -477,10 +484,14 @@ def main() -> int:
                 rows = fetch_direct_report(direct_token, date_from, date_to)
                 print(f"  rows: {len(rows)}")
                 if rows:
-                    print(f"  upserted: {upsert_direct(rows)}")
+                    n = upsert_direct(rows)
+                    written += n
+                    print(f"  upserted: {n}")
             except Exception as e:
                 print(f"ERROR direct: {e}")
                 errors.append(f"direct: {e}")
+        step += 1
+        progress.report("mnf.reports", step, steps, label)
 
     if "metrica" in sources:
         try:
@@ -490,10 +501,14 @@ def main() -> int:
             if rows:
                 deleted = delete_sources_from(date_from)
                 print(f"  deleted from {date_from}: {deleted}")
-                print(f"  upserted: {upsert_sources(rows)}")
+                n = upsert_sources(rows)
+                written += n
+                print(f"  upserted: {n}")
         except Exception as e:
             print(f"ERROR metrica sources: {e}")
             errors.append(f"sources: {e}")
+        step += 1
+        progress.report("mnf.reports", step, steps, label)
 
         try:
             print(f"Metrica purchases: {date_from} — {date_to}")
@@ -511,10 +526,16 @@ def main() -> int:
             if rows:
                 deleted = delete_purchases_from(date_from)
                 print(f"  deleted from {date_from}: {deleted}")
-                print(f"  upserted: {upsert_purchases(rows)}")
+                n = upsert_purchases(rows)
+                written += n
+                print(f"  upserted: {n}")
         except Exception as e:
             print(f"ERROR metrica purchases: {e}")
             errors.append(f"purchases: {e}")
+        step += 1
+        progress.report("mnf.reports", step, steps, label)
+
+    progress.result(rows=written, days=days + 1)
 
     print("=== Mesh-n-Flesh Metrika Sync DONE ===")
     if errors:
