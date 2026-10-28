@@ -8,7 +8,11 @@ import pytest
 
 from sync.projects import revalidate as rv
 from sync.projects import run
-from tests.test_projects_run import daily, history_job, queue, src, world  # noqa: F401 — фикстура world
+from tests import test_projects_run as prun
+from tests.test_projects_run import daily, history_job, queue, src
+
+# Фикстура из соседнего модуля: присваивание, а не import — иначе ruff F811 на каждом параметре world.
+world = prun.world
 
 
 class FakeResp:
