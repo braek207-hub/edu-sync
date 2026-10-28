@@ -20,6 +20,7 @@ import traceback
 from datetime import date, timedelta
 
 from sync.lime_media_session import yandex_page
+from sync.vat import vat_rate
 
 COMPANY_ID = os.environ.get("LIME_GEO_COMPANY_ID", "93296554")
 ORIGIN = f"https://yandex.ru/geoadv/statistics?company_id={COMPANY_ID}"
@@ -28,7 +29,12 @@ ORIGIN = f"https://yandex.ru/geoadv/statistics?company_id={COMPANY_ID}"
 # IncludeVAT=NO. В отчёт медийки расход идёт в колонку «Расход (c НДС)» рядом с
 # Директом (там IncludeVAT=YES, уже с налогом), поэтому домножаем при записи, на
 # сервере, а не в витрине — тот же инвариант, что у Директа KZ (LIME_DIRECT_VAT_MULT).
-VAT_MULT = float(os.environ.get("LIME_GEO_VAT_MULT", "1.2"))
+# Ставка — НДС РФ по дате дня (sync/vat.py: 1,22 с 01.01.2026); переменная — ручная подмена.
+_VAT_OVERRIDE = os.environ.get("LIME_GEO_VAT_MULT", "").strip()
+
+
+def vat_mult(d: date) -> float:
+    return float(_VAT_OVERRIDE) if _VAT_OVERRIDE else vat_rate(d)
 
 
 def _day_url(day: str) -> str:
@@ -84,7 +90,7 @@ def build_rows(page, date_from: date, date_to: date) -> tuple[list, int]:
             det = c.get("details") or {}
             shows = int(_num(det.get("shows")))
             clicks = int(_num(det.get("clicks")))
-            spent = round(_num(det.get("spent")) * VAT_MULT, 2)
+            spent = round(_num(det.get("spent")) * vat_mult(d), 2)
             if shows == 0 and clicks == 0 and spent == 0:
                 continue  # день без открутки по кампании — не засоряем
             name = str(c.get("campaignName", "")).strip() or "geo.media"

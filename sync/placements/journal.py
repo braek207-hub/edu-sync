@@ -1,18 +1,65 @@
 # -*- coding: utf-8 -*-
-"""Кэш вердиктов модели для чистильщика площадок.
+"""Кэш вердиктов модели и журнал старого движка чистильщика площадок.
 
-Журнал запретов переехал в module_findings (sync.modules); здесь остался только
-вечный кэш ответов модели: домен не меняет природу, платить за повторный
-вопрос о нём не за что.
+Журнал запретов кабинетов проектов Panda-BI переехал в module_findings
+(sync.modules). Здесь остались вечный кэш ответов модели (домен не меняет
+природу, платить за повторный вопрос о нём не за что) и журнал кабинетов вне
+проектов (accounts.legacy_accounts): без него обратный ход не отличит свой
+запрет от ручного.
 """
 
-from typing import List
+import json
+from typing import Any, Dict, List
 
 import psycopg2.extras
 
 from sync.db import enable_rls_for_ddl, get_connection
 
 DDL: List[str] = [
+    """
+    CREATE TABLE IF NOT EXISTS placement_cleaner_runs (
+      run_id        BIGSERIAL PRIMARY KEY,
+      started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+      account       TEXT NOT NULL,
+      login         TEXT NOT NULL,
+      dry_run       BOOLEAN NOT NULL DEFAULT FALSE,
+      day_sites     INTEGER NOT NULL DEFAULT 0,
+      day_clicks    INTEGER NOT NULL DEFAULT 0,
+      day_cost      DOUBLE PRECISION NOT NULL DEFAULT 0,
+      campaigns_hit INTEGER NOT NULL DEFAULT 0,
+      sites_cut     INTEGER NOT NULL DEFAULT 0,
+      cut_clicks    INTEGER NOT NULL DEFAULT 0,
+      cut_cost      DOUBLE PRECISION NOT NULL DEFAULT 0,
+      summary       JSONB,
+      refused       JSONB,
+      error         TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS placement_cleaner_cuts (
+      run_id        BIGINT NOT NULL,
+      cut_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      account       TEXT NOT NULL,
+      login         TEXT NOT NULL,
+      campaign_id   TEXT NOT NULL,
+      campaign_name TEXT,
+      placement     TEXT NOT NULL,
+      verdict       TEXT NOT NULL,
+      reason        TEXT,
+      clicks        INTEGER NOT NULL DEFAULT 0,
+      cost          DOUBLE PRECISION NOT NULL DEFAULT 0,
+      fill_after    INTEGER NOT NULL DEFAULT 0,
+      applied       BOOLEAN NOT NULL DEFAULT FALSE
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS placement_cleaner_cuts_run_idx
+      ON placement_cleaner_cuts (run_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS placement_cleaner_cuts_site_idx
+      ON placement_cleaner_cuts (placement)
+    """,
     """
     CREATE TABLE IF NOT EXISTS placement_llm_verdicts (
       placement   TEXT PRIMARY KEY,
@@ -32,6 +79,74 @@ def ensure_tables() -> None:
                 cur.execute(statement)
             enable_rls_for_ddl(cur, DDL)
         conn.commit()
+
+
+def start_run(account: str, login: str, dry_run: bool,
+              plan: Dict[str, Any]) -> int:
+    actions = plan.get("actions") or []
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO placement_cleaner_runs
+                  (account, login, dry_run, day_sites, day_clicks, day_cost,
+                   campaigns_hit, sites_cut, cut_clicks, cut_cost,
+                   summary, refused)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING run_id
+                """,
+                (account, login, dry_run,
+                 plan.get("day_sites", 0), plan.get("day_clicks", 0),
+                 plan.get("day_cost", 0.0),
+                 len(actions),
+                 sum(len(a["added"]) for a in actions),
+                 sum(a["cut_clicks"] for a in actions),
+                 sum(a["cut_cost"] for a in actions),
+                 json.dumps(plan.get("summary") or {}, ensure_ascii=False),
+                 json.dumps(plan.get("refused") or [], ensure_ascii=False)))
+            run_id = cur.fetchone()[0]
+        conn.commit()
+    return run_id
+
+
+def record_cuts(run_id: int, account: str, login: str,
+                action: Dict[str, Any], applied: bool) -> None:
+    rows = [(run_id, account, login, action["campaign_id"],
+             action.get("campaign_name"), a["placement"], a["verdict"],
+             a["reason"], a["clicks"], a["cost"], action["fill_after"], applied)
+            for a in action["added"]]
+    if not rows:
+        return
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO placement_cleaner_cuts
+                  (run_id, account, login, campaign_id, campaign_name,
+                   placement, verdict, reason, clicks, cost, fill_after,
+                   applied)
+                VALUES %s
+                """, rows)
+        conn.commit()
+
+
+def robot_cuts(account: str):
+    """Что робот запрещал сам: кампания → множество площадок.
+
+    Снимать всё подряд по имени нельзя: то же имя директолог мог запретить
+    руками, и стирать его решение — не право робота.
+    """
+    out = {}
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT campaign_id, placement "
+                        "FROM placement_cleaner_cuts "
+                        "WHERE account = %s AND applied", (account,))
+            for campaign_id, placement in cur.fetchall():
+                out.setdefault(str(campaign_id), set()).add(
+                    (placement or "").strip().lower())
+    return out
 
 
 def load_llm_verdicts(sites):

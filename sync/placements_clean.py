@@ -8,16 +8,24 @@
 Расчёт, запись и откат делает раннер (sync.modules.runner, модуль placements);
 режим модуля (report/approve/auto) и настройки живут в project_modules, а не
 в флагах. Без --apply прогон идёт репетицией: ничего не пишется в базу и Директ.
+
+Кабинет вне проектов Panda-BI (accounts.legacy_accounts, сейчас ОШ Синергия)
+модулю недоступен и чистится прежним движком (sync.placements.legacy) — только
+когда назван в --accounts явно:
+
+    python -m sync.placements_clean --apply --accounts synergy_school
 """
 
 import argparse
 import os
 import sys
+import traceback
 from datetime import datetime, timezone
 
 from sync.modules import store
 from sync.modules.runner import run_project
 from sync.placements import accounts as reg
+from sync.placements import journal, legacy
 from sync.placements.classify import normalize
 
 MODULE = "placements"
@@ -37,9 +45,55 @@ def _slugs(keys) -> list:
         account = reg.BY_KEY.get(key)
         if account is None:
             _out("неизвестный кабинет: %s" % key)
-        elif account.slug not in seen:
+        elif account.slug and account.slug not in seen:
             seen.append(account.slug)
     return seen
+
+
+def _legacy_db() -> bool:
+    if not os.environ.get("DATABASE_URL"):
+        return False
+    try:
+        journal.ensure_tables()
+        return True
+    except Exception as err:
+        _out("журнал недоступен (%s) — прогон идёт без него" % err)
+        return False
+
+
+def _legacy_unban(accounts, sites, write: bool) -> int:
+    use_db = _legacy_db()
+    for account in accounts:
+        mine = {}
+        if use_db:
+            try:
+                mine = journal.robot_cuts(account.key)
+            except Exception as err:
+                _out("  журнал недоступен: %s" % err)
+        if not mine:
+            # Без журнала свой запрет неотличим от человеческого.
+            _out("[%s] журнала нет — снимать небезопасно, пропуск" % account.key)
+            continue
+        _out("[%s] снятие (%s)" % (account.key, "БОЕВОЕ" if write else "репетиция"))
+        try:
+            legacy.unban(account, set(sites), write, _out, mine)
+        except Exception as err:
+            _out("  ОШИБКА: %s" % err)
+            return 1
+    return 0
+
+
+def _legacy_run(accounts, apply: bool) -> int:
+    use_db = _legacy_db()
+    failures = 0
+    for account in accounts:
+        try:
+            legacy.run_account(account, apply, use_db, _out)
+        except Exception as err:  # кабинет не должен ронять остальные
+            failures += 1
+            _out("  ОШИБКА [%s]: %s" % (account.key, err))
+            traceback.print_exc()
+    return 1 if failures else 0
 
 
 def _warn_if_module_idle(slug: str) -> None:
@@ -74,8 +128,9 @@ def main(argv=None) -> int:
 
     dry_run = args.dry_run or not args.apply
     keys = [k.strip() for k in args.accounts.split(",") if k.strip()]
+    old = reg.legacy_accounts(keys) if keys else []
     slugs = _slugs(keys)
-    if not slugs:
+    if not slugs and not old:
         return 1
     for flag, used in (("--top-n", args.top_n is not None), ("--no-db", args.no_db)):
         if used:
@@ -104,11 +159,11 @@ def main(argv=None) -> int:
             n = store.request_rollback(slug, MODULE, sites)
             _out("[%s] поставлено на откат находок: %d" % (slug, n))
             _warn_if_module_idle(slug)
-        return 0
+        return _legacy_unban(old, sites, write) if old else 0
 
     if args.llm:
         os.environ["PLACEMENTS_LLM"] = "1"
-    rc = 0
+    rc = _legacy_run(old, not dry_run) if old else 0
     for slug in slugs:
         rc |= run_project(slug, only=MODULE, now=datetime.now(timezone.utc),
                           dry_run=dry_run, log=_out)

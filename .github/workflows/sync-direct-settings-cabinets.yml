@@ -8,10 +8,6 @@ name: Sync Direct Campaign Settings (BJORN, Polina)
 # настроек BJORN/Polina обработчики дашбордов пока не читают.
 
 on:
-  schedule:
-    # 02:15 UTC = 05:15 МСК — рядом со снимком EDU (05:00): дни журнала у всех
-    # дашбордов режутся по одному и тому же утру.
-    - cron: "15 2 * * *"
   workflow_dispatch:
 
 concurrency:

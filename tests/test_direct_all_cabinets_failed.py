@@ -28,7 +28,7 @@ def db(monkeypatch):
 
 
 def _reports(monkeypatch, failing):
-    def fetch(login, date_from, date_to, goals):
+    def fetch(login, date_from, date_to, goals, project=None):
         if login in failing:
             raise RuntimeError(f"Директ API [{login}]: превышено число попыток")
         return [{"date": date_from, "campaign_id": login, "cost": 1}]

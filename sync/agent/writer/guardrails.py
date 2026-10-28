@@ -20,6 +20,7 @@ sync/agent/writer/guardrails.py — рельсы движка записи (сл
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sync.agent.writer.units import API_MAX, API_MIN, API_NEUTRAL
+from sync.vat import facts_vat_rate
 
 # Рельса работает по ДЕЛЬТЕ, а не по 100-базному коэффициенту Директа: в
 # payload действия (diff.py) лежит внутренняя единица движка, перевод в шкалу
@@ -373,8 +374,8 @@ def _check_suspend(action: Dict[str, Any]) -> Tuple[bool, str]:
 
 # Конверсии рельсы бюджета — СВОИ, не импорт из writer/budget.py: рельса,
 # считающая формулой построителя, пропустит любую его ошибку. Тот же довод,
-# что у границ расписания выше.
-_BUDGET_VAT = 1.2
+# что у границ расписания выше. Ставка НДС — общая таблица фактов (sync/vat.py),
+# а не формула построителя: она одна для всех, и своя копия разошлась бы с ней.
 _BUDGET_WEEKS = 4.0
 _BUDGET_MICROS = 1_000_000
 
@@ -433,7 +434,7 @@ def _check_budget(action: Dict[str, Any],
                            f"разошлись, решение считать не по чему")
         cost_v = mart_v
 
-    implied_28d = micros_v / _BUDGET_MICROS * per_window * _BUDGET_VAT
+    implied_28d = micros_v / _BUDGET_MICROS * per_window * facts_vat_rate()
     ratio = implied_28d / cost_v
     if not (BUDGET_RATIO_MIN <= ratio <= BUDGET_RATIO_MAX):
         return False, (f"целевой бюджет ×{ratio:.2f} от прежнего расхода — вне "
@@ -620,7 +621,7 @@ def _check_strategy(action: Dict[str, Any],
 
     mart_cost = (cost_28d_by_campaign or {}).get(str(action.get("object_id")))
     if mart_cost is not None and float(mart_cost) > 0:
-        implied_28d = limit_v / _BUDGET_MICROS * _BUDGET_WEEKS * _BUDGET_VAT
+        implied_28d = limit_v / _BUDGET_MICROS * _BUDGET_WEEKS * facts_vat_rate()
         ratio = implied_28d / float(mart_cost)
         if not (BUDGET_RATIO_MIN <= ratio <= BUDGET_RATIO_MAX):
             return False, (f"лимит новой стратегии ×{ratio:.2f} от прежнего "

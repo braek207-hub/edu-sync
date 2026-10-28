@@ -32,13 +32,23 @@ sync/agent/tcpa.py — Э3.5: экономически допустимая це
 рычага после аудита 2026-08-23 (C2): числитель p_sign и его ошибка обязаны
 описывать одну величину.
 
-Модуль чистый: ни БД, ни дат — только счётчики, которые собрал вызывающий.
+Единицы. Расход витрины — С НДС (Reports API, IncludeVAT=YES), цель CPA
+кабинета (targetCpa) — БЕЗ НДС, и в кабинет уходит тоже без. Недодержание —
+отношение факта к цели, поэтому факт перед делением приводится к единицам
+кабинета ставкой НДС окна (sync/vat.py): иначе в него въезжает ×1,22, и
+кампания, держащая цель ровно, выглядит недодержавшей на 22 %, а зажим
+SLIPPAGE_MIN срабатывает не там.
+
+Модуль чистый: ни БД, ни дат — только счётчики, которые собрал вызывающий;
+ставку НДС окна считает build_inputs по датам фактов.
 """
 
 import math
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 from sync.agent.confidence import assess
+from sync.vat import facts_vat_rate, vat_rate
 
 # Требуемая окупаемость предельного рубля. По умолчанию 1.0 — безубыточность:
 # план освоения задаёт человек, а механизм обязан лишь не уходить в минус.
@@ -70,8 +80,9 @@ def tcpa_target(campaign: Dict[str, Any],
                 target_romi: float = DEFAULT_TARGET_ROMI) -> Dict[str, Any]:
     """Экономически допустимая цель CPA одной кампании.
 
-    campaign: cost, conversions, revenue (зрелая когорта), beta,
-    value_rel_error, tcpa_current.
+    campaign: cost (с НДС), conversions, revenue (зрелая когорта), beta,
+    value_rel_error, tcpa_current (без НДС), vat — ставка НДС окна фактов
+    (build_inputs; без неё — facts_vat_rate()).
     """
     out: Dict[str, Any] = {
         "campaign_id": str(campaign.get("campaign_id")),
@@ -96,12 +107,14 @@ def tcpa_target(campaign: Dict[str, Any],
         return out
 
     beta = float(campaign.get("beta") or 1.0)
+    vat = float(campaign.get("vat") or facts_vat_rate())
     cpa_fact = cost / conversions
     value_per_conversion = revenue / conversions
     allowed_marginal = value_per_conversion * beta / float(target_romi)
     # Недодержание считается по самой кампании и зажимается: см. границы выше.
-    slippage = min(max(cpa_fact / current, SLIPPAGE_MIN), SLIPPAGE_MAX)
-    target = allowed_marginal / slippage
+    # Факт и допустимый CPA — в единицах кабинета (без НДС), как и сама цель.
+    slippage = min(max(cpa_fact / vat / current, SLIPPAGE_MIN), SLIPPAGE_MAX)
+    target = allowed_marginal / vat / slippage
 
     # Ошибка решения: ценность (лестница) и счёт конверсий — независимые
     # источники. β входит множителем, его ошибку вызывающий передаёт в
@@ -183,8 +196,12 @@ def build_inputs(
         if not (window_from <= day <= window_to):
             continue
         slot = totals.setdefault(str(row["campaign_id"]),
-                                 {"cost": 0.0, "conversions": 0.0, "revenue": 0.0})
-        slot["cost"] += float(row.get("cost") or 0.0)
+                                 {"cost": 0.0, "cost_no_vat": 0.0,
+                                  "conversions": 0.0, "revenue": 0.0})
+        cost = float(row.get("cost") or 0.0)
+        slot["cost"] += cost
+        # Ставка — по дню расхода: окно через 01.01.2026 смешивает 1,2 и 1,22.
+        slot["cost_no_vat"] += cost / vat_rate(date.fromisoformat(day))
         slot["conversions"] += float(row.get("conversions") or 0.0)
         slot["revenue"] += float(row.get("revenue") or 0.0)
 
@@ -204,6 +221,8 @@ def build_inputs(
             # входит множителем β в допустимый CPA.
             "value_rel_error": float(curve.get("marginal_rel_error") or 0.0),
             "tcpa_current": float(search.get("targetCpa") or 0.0),
+            "vat": (slot["cost"] / slot["cost_no_vat"]
+                    if slot["cost_no_vat"] > 0 else None),
         })
     return out
 

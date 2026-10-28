@@ -186,7 +186,7 @@ def test_sync_refuses_to_wipe_when_installs_raw_is_empty():
     # окно дат) — это НЕ ошибка на уровне HTTP, просто [] (fetch_installations.json()
     # .get("data", [])). Если это молча проходит в _write — DELETE отработает,
     # INSERT вставит 0 строк, витрина обнулится до следующего успешного запуска.
-    with patch.dict(os.environ, {"APPMETRICA_TOKEN": "test-token"}, clear=False), \
+    with patch.dict(os.environ, {"APPMETRICA_TOKEN": "test-token", "APPM_SOURCE": "api"}, clear=False), \
          patch("sync.lime_appmetrica.fetch_installations", return_value=[]), \
          patch("sync.lime_appmetrica.fetch_purchase_events", return_value=[]), \
          patch("sync.lime_appmetrica._write") as mock_write:
@@ -440,7 +440,7 @@ def test_sync_refuses_to_wipe_when_vk_entity_map_unusable():
          "publisher_name": VK_PUB, "click_url_parameters": "c=140704359",
          "is_reinstallation": "0", "is_reattribution": "0"},
     ]
-    with patch.dict(os.environ, {"APPMETRICA_TOKEN": "test-token"}, clear=False), \
+    with patch.dict(os.environ, {"APPMETRICA_TOKEN": "test-token", "APPM_SOURCE": "api"}, clear=False), \
          patch("sync.lime_appmetrica.fetch_installations", return_value=installs), \
          patch("sync.lime_appmetrica.fetch_purchase_events", return_value=[]), \
          patch("sync.lime_appmetrica.load_vk_entity_map", return_value={}), \
@@ -457,13 +457,40 @@ def test_sync_proceeds_when_no_vk_installs_have_macro_c():
         {"appmetrica_device_id": "d1", "install_datetime": "2026-07-06 10:00:00",
          "publisher_name": "Organic", "is_reinstallation": "0", "is_reattribution": "0"},
     ]
-    with patch.dict(os.environ, {"APPMETRICA_TOKEN": "test-token"}, clear=False), \
+    with patch.dict(os.environ, {"APPMETRICA_TOKEN": "test-token", "APPM_SOURCE": "api"}, clear=False), \
          patch("sync.lime_appmetrica.fetch_installations", return_value=installs), \
          patch("sync.lime_appmetrica.fetch_purchase_events", return_value=[]), \
          patch("sync.lime_appmetrica.load_vk_entity_map", return_value={}), \
          patch("sync.lime_appmetrica._write") as mock_write:
         m.sync_lime_appmetrica()
     mock_write.assert_called_once()
+
+
+def test_sync_db_source_reads_raw_not_api_and_stops_at_yesterday():
+    """Y1: по умолчанию витрина читает appm_* и в Logs API не ходит; окно — до вчера."""
+    installs = [
+        {"appmetrica_device_id": "d1", "install_datetime": "2026-07-06 10:00:00",
+         "publisher_name": "Organic", "is_reinstallation": "false", "is_reattribution": "false"},
+    ]
+    windows = []
+
+    def fake_purchases(_conn, a, b, _dim):
+        windows.append((a, b))
+        return []
+
+    env = {"APPM_SOURCE": "db", "APPM_TODAY": "2026-10-25"}
+    with patch.dict(os.environ, env, clear=False), \
+         patch("sync.appmetrica_raw.connect"), \
+         patch("sync.appmetrica_raw.read_installations", return_value=installs) as ri, \
+         patch("sync.appmetrica_raw.read_purchase_events", side_effect=fake_purchases), \
+         patch("sync.lime_appmetrica.fetch_installations", side_effect=AssertionError("API")), \
+         patch("sync.lime_appmetrica.fetch_purchase_events", side_effect=AssertionError("API")), \
+         patch("sync.lime_appmetrica.load_vk_entity_map", return_value={}), \
+         patch("sync.lime_appmetrica._write") as mock_write:
+        m.sync_lime_appmetrica()
+    mock_write.assert_called_once()
+    assert ri.call_args[0][1:] == ("2026-04-01", "2026-10-24")
+    assert windows[-1][1] == "2026-10-24"
 
 
 def test_warn_if_vk_entities_stale():

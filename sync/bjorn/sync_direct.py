@@ -66,7 +66,9 @@ def direct_headers(token: str, login: str, include_column_header: bool = False) 
     }
 
 
-def fetch_report(login: str, date_from: str, date_to: str, fields: list[str], *, token: str = "") -> str:
+def fetch_report(
+    login: str, date_from: str, date_to: str, fields: list[str], *, token: str = "", max_wait_sec: float | None = None
+) -> str:
     if not token:
         token = env_required("DIRECT_TOKEN")
     signature = hashlib.md5("|".join(fields + [login, date_from, date_to]).encode("utf-8")).hexdigest()[:10]
@@ -86,6 +88,16 @@ def fetch_report(login: str, date_from: str, date_to: str, fields: list[str], *,
     backoff = 10
     server_error_attempts = 0
     rate_limited_attempts = 0
+    waited = 0.0
+
+    def wait_report(seconds: float) -> None:
+        # Бюджет всех пауз (201/202, лимит 56, 5xx); время самих HTTP-запросов не считается —
+        # у оркестратора свой бюджет на источник. None — без предела, как раньше.
+        nonlocal waited
+        if max_wait_sec is not None and waited + seconds > max_wait_sec:
+            raise TimeoutError(f"Отчёт Директа {login} не готов за {max_wait_sec} с")
+        waited += seconds
+        time.sleep(seconds)
 
     while True:
         response = requests.post(
@@ -98,16 +110,16 @@ def fetch_report(login: str, date_from: str, date_to: str, fields: list[str], *,
         if response.status_code == 200:
             return response.text
         if response.status_code == 201:
-            time.sleep(60)
+            wait_report(60)
             continue
         if response.status_code == 202:
-            time.sleep(poll_delay(response.headers.get("retryIn"), 60))
+            wait_report(poll_delay(response.headers.get("retryIn"), 60))
             continue
         if is_rate_limited(response.status_code, response.text):
             rate_limited_attempts += 1
             if rate_limited_attempts >= 10:
                 break
-            time.sleep(MIN_POLL_SECONDS)
+            wait_report(MIN_POLL_SECONDS)
             continue
         # 204 с пустым телом и без RequestId в списке кодов Reports API нет: так отвечает
         # балансер Яндекса, когда сам API лежит (11.10.2026 — на любой метод, любой кабинет,
@@ -117,7 +129,7 @@ def fetch_report(login: str, date_from: str, date_to: str, fields: list[str], *,
             server_error_attempts += 1
             if server_error_attempts >= 5:
                 break
-            time.sleep(backoff)
+            wait_report(backoff)
             backoff = min(backoff * 2, 120)
             continue
         raise RuntimeError(f"Direct API error for {login}: {response.status_code}: {response.text[:500]}")

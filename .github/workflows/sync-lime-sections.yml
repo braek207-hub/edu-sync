@@ -8,8 +8,6 @@
 name: Sync LIME sections
 
 on:
-  schedule:
-    - cron: "0 4 * * *"   # 07:00 МСК — логи за вчера уже готовы
   workflow_dispatch:
     inputs:
       date_from:

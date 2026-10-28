@@ -89,6 +89,7 @@ def test_spam_wrapper_is_week_window_and_caps_goals(report):
 class _Resp:
     def __init__(self, status, text=""):
         self.status, self._text = status, text
+        self.headers = {}  # как у HTTPResponse: очередь отчётов читает retryIn
 
     def read(self):
         return self._text.encode("utf-8")

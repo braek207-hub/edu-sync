@@ -57,6 +57,61 @@ def test_allowlist_is_exact_not_substring():
     assert classify("vk.baraholka.russia")[0] == "app"
 
 
+def test_avito_kept_on_both_platforms():
+    for site in ("ru.avito.android", "com.avito.android", "ru.avito.app"):
+        assert classify(site)[0] == "keep", site
+
+
+def test_clients_json_gives_each_login_its_token():
+    """BJORN: [{login, token}] — у каждого логина свой токен, пустой берёт BJORN_DIRECT_TOKEN."""
+    from sync.modules.accounts import accounts_for
+
+    raw = json.dumps([{"login": "a", "token": "ta"}, {"client_login": "b"}, "c", {"token": "t"}])
+    found, _ = accounts_for("bjorn", {"BJORN_DIRECT_CLIENTS_JSON": raw,
+                                      "BJORN_DIRECT_TOKEN": "common"})
+    assert [(a.login, a.token) for a in found] == [("a", "ta"), ("b", "common"), ("c", "common")]
+
+    found, why = accounts_for("bjorn", {"BJORN_DIRECT_CLIENTS_JSON": raw})
+    assert [(a.login, a.token) for a in found] == [("a", "ta")]
+    assert why
+
+
+def test_bjorn_and_synergy_stay_in_cleaner_registry():
+    """BJORN — проект модулей; Синергия без проекта Panda-BI — старый движок, свои кампании."""
+    from sync.placements import accounts as reg
+
+    assert reg.BY_KEY["bjorn"].slug == "bjorn"
+    old = reg.legacy_accounts()
+    assert [a.key for a in old] == ["synergy_school"]
+    assert old[0].campaign_ids == (715539609, 715543179)
+    assert old[0].token_env == "APPROVE_AGENCY_TOKEN"
+
+
+def test_legacy_account_cleans_only_own_campaigns(monkeypatch):
+    """Общий кабинет: campaigns.get сужен Ids, строки отчёта чужих кампаний отброшены."""
+    from sync.placements import accounts as reg
+    from sync.placements import direct, legacy
+
+    acc = reg.Account("x", "X", None, token_env="X_TOKEN", login="l", campaign_ids=(1,))
+    monkeypatch.setenv("X_TOKEN", "t")
+    asked = {}
+
+    def campaigns(token, login, ids=()):
+        asked["ids"] = tuple(ids)
+        return [_campaign(1)]
+
+    rows = [_row(1, "com.junk.app", 50), _row(2, "com.other.app", 50)]
+    monkeypatch.setattr(direct, "campaigns", campaigns)
+    monkeypatch.setattr(direct, "placements_today", lambda token, login: rows)
+    written = []
+    monkeypatch.setattr(legacy, "set_excluded_sites",
+                        lambda t, l, cid, sites: written.append((cid, list(sites))) or (True, ""))
+    res = legacy.run_account(acc, apply=True, use_db=False, log=lambda s: None)
+    assert asked["ids"] == (1,)
+    assert written == [("1", ["com.junk.app"])]
+    assert res["failed"] == 0
+
+
 def test_publisher_prefix_allowed():
     assert classify("ru.yandex.mail")[0] == "keep"
     assert classify("ru.yandex.mobile.weather")[0] == "keep"
@@ -384,3 +439,76 @@ def test_override_turns_site_into_cut():
                         overrides={"doorway.ru": ("llm", "модель: дорвей")})
     added = plan["actions"][0]["added"][0]
     assert added["placement"] == "doorway.ru" and added["verdict"] == "llm"
+
+
+# --- вызов API ----------------------------------------------------------
+
+class _Resp:
+    status = 200
+
+    def __init__(self, body):
+        self._body = json.dumps(body).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def test_call_retries_temporary_direct_error(monkeypatch):
+    """1000 «Сервис временно недоступен» — повтор, а не потеря кабинета.
+
+    Замер vpo-goroda 28.10.2026: 5 из 12 одинаковых campaigns.get подряд
+    вернули 1000, остальные прошли.
+    """
+    from sync.placements import direct
+
+    answers = [{"error": {"error_code": 1000, "error_string": "Сервис временно недоступен"}},
+               {"result": {"Campaigns": [{"Id": 1}]}}]
+    monkeypatch.setattr(direct.urllib.request, "urlopen",
+                        lambda req, timeout: _Resp(answers.pop(0)))
+    monkeypatch.setattr(direct.time, "sleep", lambda s: None)
+    assert direct.call("t", "l", "campaigns", {}) == {"Campaigns": [{"Id": 1}]}
+
+
+def test_call_does_not_retry_real_error(monkeypatch):
+    """Ошибка запроса (8800 и прочие) повтором не лечится — сразу наверх."""
+    import pytest
+    from sync.placements import direct
+
+    calls = []
+
+    def urlopen(req, timeout):
+        calls.append(1)
+        return _Resp({"error": {"error_code": 8800, "error_string": "Объект не найден"}})
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(direct.time, "sleep", lambda s: None)
+    with pytest.raises(direct.DirectError):
+        direct.call("t", "l", "campaigns", {})
+    assert len(calls) == 1
+
+
+def test_cli_routes_project_and_legacy_accounts(monkeypatch):
+    """--accounts bjorn → раннер модулей; synergy_school → старый движок, не раннер."""
+    from sync import placements_clean as cli
+
+    projects, old = [], []
+    monkeypatch.setattr(cli, "run_project", lambda slug, **kw: projects.append(slug) or 0)
+    monkeypatch.setattr(cli.legacy, "run_account",
+                        lambda acc, apply, use_db, log: old.append((acc.key, apply)))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert cli.main(["--apply", "--accounts", "bjorn,synergy_school"]) == 0
+    assert projects == ["bjorn"] and old == [("synergy_school", True)]
+
+    projects.clear(), old.clear()
+    assert cli.main(["--apply", "--accounts", "synergy_school"]) == 0
+    assert projects == [] and old == [("synergy_school", True)]
+
+    projects.clear(), old.clear()
+    assert cli.main(["--apply"]) == 0
+    assert projects == ["edunetwork"] and old == []
