@@ -11,6 +11,7 @@ from typing import Any
 
 import requests
 
+from .. import progress
 from ..direct_reports_limit import MIN_POLL_SECONDS, is_rate_limited, poll_delay
 from .common import (
     SupabaseRest,
@@ -161,7 +162,7 @@ def fetch_rows(date_from: str, date_to: str) -> list[dict[str, Any]]:
         }
     )
 
-    for client in load_client_logins():
+    for client in progress.track(load_client_logins(), "direct.cabinets", "Директ · кабинеты"):
         text = fetch_report(client["login"], date_from, date_to, fields, token=client["token"])
         reader = csv.DictReader(io.StringIO(text), delimiter="\t")
         for row in reader:

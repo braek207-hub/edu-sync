@@ -22,7 +22,6 @@ tests/test_agent_ideas_registry.py), такт записи вызывается 
 функцией.
 """
 
-import pytest
 
 from sync.agent import ladder
 from sync.agent.ideas import proven, registry

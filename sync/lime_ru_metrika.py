@@ -24,6 +24,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync import progress
 from sync.lime import load_vk_group_map
 from sync.lime_ru_metrika_api import fetch_ru_traffic
 from sync.lime_ru_metrika_keys import campaign_key, ru_channel
@@ -117,7 +118,9 @@ def _sync_range(frm: date, to: date, conn) -> int:
     total = 0
     vk_groups = _vk_groups()
     day = frm
+    days = (to - frm).days + 1
     while day <= to:
+        progress.report("metrika.days", (day - frm).days, days, "Метрика · дни")
         day_s = day.isoformat()
         metrika = fetch_ru_traffic(COUNTER_ID, token, day_s, day_s)
         rows = build_rows(metrika, day_s, vk_groups)
@@ -136,6 +139,9 @@ def _sync_range(frm: date, to: date, conn) -> int:
 
         total += len(rows)
         day += timedelta(days=1)
+    progress.report("metrika.days", days, days, "Метрика · дни")
+    if conn is not None:
+        progress.result(rows=total, days=days)
     return total
 
 

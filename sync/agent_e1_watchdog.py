@@ -44,7 +44,6 @@ ENV: DATABASE_URL, DIRECT_TOKEN
 import hashlib
 import json
 import math
-from statistics import median
 import sys
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -73,7 +72,7 @@ from sync.agent.writer.client import WriteClient, journal_allowed
 from sync.agent.writer.budget import BUDGET_DAILY_KIND, BUDGET_KIND
 from sync.agent.writer.guardrails import check_rollback
 from sync.agent.writer.tcpa import TCPA_KIND
-from sync.agent.writer.rollback import (rollback_payload, is_breached,
+from sync.agent.writer.rollback import (MIN_LEADS_FOR_VERDICT, rollback_payload, is_breached,
                                         is_spend_collapsed, outcome_verdict)
 
 # Чтение корректировок кампании берётся у прогона применения, а не пишется

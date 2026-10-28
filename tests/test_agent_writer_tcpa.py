@@ -8,7 +8,6 @@
 самой цели.
 """
 
-import pytest
 
 from sync.agent.writer.tcpa import (
     MAX_TCPA_STEP,

@@ -11,7 +11,6 @@ previous_state — прежний список для отката.
 (20 000 символов) считается независимо от построителя.
 """
 
-import pytest
 
 from sync.agent.writer.negatives import (
     MAX_PHRASES_PER_TICK,

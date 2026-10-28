@@ -45,7 +45,7 @@ SLIPPAGE_MIN срабатывает не там.
 
 import math
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from sync.agent.confidence import assess
 from sync.vat import facts_vat_rate, vat_rate
