@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -11,6 +12,8 @@ from typing import Any, Iterable
 from urllib.parse import urlencode
 
 import requests
+
+from .. import progress
 
 # "<логин кабинета>_yd_...|<номер>|11:<id> → <id>
 _EPROMO_CAMPAIGN_RE = re.compile(r'\|\d+:(\d+)$')
@@ -67,7 +70,31 @@ def resolve_date_range(args: argparse.Namespace) -> tuple[str, str]:
 
     if start > end:
         raise RuntimeError(f"Invalid date range: {start} > {end}")
+    _report_step((end - start).days + 1)
     return start.isoformat(), end.isoformat()
+
+
+# Шаги юнитов bjorn_direct / bjorn_metrika (infra/panda/sync/units/*.conf) словами для плашки
+# «Обновить» в Panda-BI. Каждый модуль — свой процесс; общий для всех вход — resolve_date_range.
+_STEP_LABELS = {
+    "sync.bjorn.sync_direct": "Директ · расходы",
+    "sync.bjorn.build_fact": "Сборка витрины",
+    "sync.bjorn.verify_fact": "Проверка витрины",
+    "sync.bjorn.sync_purchase_fact": "Метрика · покупки по заказам",
+    "sync.bjorn.sync_ads": "Директ · объявления",
+    "sync.bjorn.sync_metrica": "Метрика · визиты",
+    "sync.bjorn.sync_metrica_ecommerce": "Метрика · e-commerce",
+    "sync.bjorn.sync_purchases": "Метрика · покупки",
+    "sync.bjorn.sync_products": "Метрика · товары",
+    "sync.bjorn.sync_card_views": "Метрика · просмотры карточек",
+}
+
+
+def _report_step(days: int) -> None:
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    name = getattr(spec, "name", "") or ""
+    progress.report(name or "bjorn", label=_STEP_LABELS.get(name))
+    progress.result(days=days)
 
 
 def clean_text(value: Any) -> str:
@@ -453,7 +480,8 @@ class SupabaseRest:
         if not rows:
             print(f"{table}: no rows to upsert")
             return
-        for part in chunked(rows, chunk_size):
+        parts = list(chunked(rows, chunk_size))
+        for part in progress.track(parts, "db.write", "Запись в базу"):
             self.request(
                 "POST",
                 table,
@@ -462,6 +490,7 @@ class SupabaseRest:
                 headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
             )
         print(f"{table}: upserted {len(rows)} rows")
+        progress.result(rows=len(rows))
 
     def select_date_range(self, table: str, date_from: str, date_to: str, select: str = "*") -> list[dict[str, Any]]:
         order = ",".join(f"{col}.asc" for col in PAGINATION_KEYS[table])
