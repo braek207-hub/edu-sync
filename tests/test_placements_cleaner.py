@@ -403,3 +403,55 @@ def test_override_turns_site_into_cut():
                         overrides={"doorway.ru": ("llm", "модель: дорвей")})
     added = plan["actions"][0]["added"][0]
     assert added["placement"] == "doorway.ru" and added["verdict"] == "llm"
+
+
+# --- вызов API ----------------------------------------------------------
+
+class _Resp:
+    status = 200
+
+    def __init__(self, body):
+        self._body = json.dumps(body).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def test_call_retries_temporary_direct_error(monkeypatch):
+    """1000 «Сервис временно недоступен» — повтор, а не потеря кабинета.
+
+    Замер vpo-goroda 28.10.2026: 5 из 12 одинаковых campaigns.get подряд
+    вернули 1000, остальные прошли.
+    """
+    from sync.placements import direct
+
+    answers = [{"error": {"error_code": 1000, "error_string": "Сервис временно недоступен"}},
+               {"result": {"Campaigns": [{"Id": 1}]}}]
+    monkeypatch.setattr(direct.urllib.request, "urlopen",
+                        lambda req, timeout: _Resp(answers.pop(0)))
+    monkeypatch.setattr(direct.time, "sleep", lambda s: None)
+    assert direct.call("t", "l", "campaigns", {}) == {"Campaigns": [{"Id": 1}]}
+
+
+def test_call_does_not_retry_real_error(monkeypatch):
+    """Ошибка запроса (8800 и прочие) повтором не лечится — сразу наверх."""
+    import pytest
+    from sync.placements import direct
+
+    calls = []
+
+    def urlopen(req, timeout):
+        calls.append(1)
+        return _Resp({"error": {"error_code": 8800, "error_string": "Объект не найден"}})
+
+    monkeypatch.setattr(direct.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(direct.time, "sleep", lambda s: None)
+    with pytest.raises(direct.DirectError):
+        direct.call("t", "l", "campaigns", {})
+    assert len(calls) == 1

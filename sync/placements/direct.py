@@ -11,7 +11,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 API = "https://api.direct.yandex.com/json/v5/"
 REPORTS = "https://api.direct.yandex.com/json/v5/reports"
@@ -59,6 +59,16 @@ def sites_limit(campaign_type: str) -> int:
 CLEANABLE_STATES = frozenset({"ON"})
 
 
+# Временные отказы Директа (ref-v5/errors: 52 — сервер авторизации, 1000 и
+# 1001 — сервис временно недоступен). У кабинета vpo-goroda 1000 приходит на
+# каждый третий-второй вызов (замер 28.10.2026: 5 из 12), и без повтора
+# кабинет выпадал из такта целиком. В отличие от 204 (ниже, без повтора) тут
+# Директ сам говорит «временно», и полминуты пауз на кабинет дешевле такта.
+TEMPORARY_CODES = frozenset({52, 1000, 1001})
+CALL_ATTEMPTS = 5
+CALL_BACKOFF = 3
+
+
 class DirectError(RuntimeError):
     pass
 
@@ -74,39 +84,49 @@ def _headers(token: str, login: str) -> Dict[str, str]:
 
 def call(token: str, login: str, service: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(API + service, data=data,
-                                 headers=_headers(token, login))
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        status, raw = resp.status, resp.read()
-    # 204 с пустым телом — json.loads падал «Expecting value: line 1 column 1», и по логу
-    # нельзя было понять, что не ответил Директ (12–16.10.2026 так стояли четыре кабинета EDU
-    # каждый такт). Без повтора внутри: повтор — сам цикл тактов через PASS_GAP, а пауза на
-    # каждый из двадцати логинов съела бы бюджет такта.
-    if status == 204 or not raw.strip():
-        raise DirectError("%s: Директ API %s (недоступен) — пустой ответ" % (service, status))
-    body = json.loads(raw.decode("utf-8"))
-    if "error" in body:
+    for attempt in range(1, CALL_ATTEMPTS + 1):
+        req = urllib.request.Request(API + service, data=data,
+                                     headers=_headers(token, login))
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            status, raw = resp.status, resp.read()
+        # 204 с пустым телом — json.loads падал «Expecting value: line 1 column 1», и по логу
+        # нельзя было понять, что не ответил Директ (12–16.10.2026 так стояли четыре кабинета EDU
+        # каждый такт). Без повтора внутри: повтор — сам цикл тактов через PASS_GAP, а пауза на
+        # каждый из двадцати логинов съела бы бюджет такта.
+        if status == 204 or not raw.strip():
+            raise DirectError("%s: Директ API %s (недоступен) — пустой ответ" % (service, status))
+        body = json.loads(raw.decode("utf-8"))
+        if "error" not in body:
+            return body.get("result", {})
         err = body["error"]
+        if err.get("error_code") in TEMPORARY_CODES and attempt < CALL_ATTEMPTS:
+            time.sleep(CALL_BACKOFF * attempt)
+            continue
         raise DirectError("%s [%s] %s: %s" % (
             service, err.get("error_code"), err.get("error_string"),
             err.get("error_detail")))
-    return body.get("result", {})
+    return {}
 
 
-def campaigns(token: str, login: str) -> List[Dict[str, Any]]:
+def campaigns(token: str, login: str,
+              ids: Sequence[int] = ()) -> List[Dict[str, Any]]:
     """Кампании кабинета с типом, состоянием и текущими запретами.
 
     ExcludedSites читается тем же вызовом, что и всё остальное: список в API
     заменяется ЦЕЛИКОМ, поэтому писать его можно только поверх свежего
     чтения — иначе запись затрёт запреты, поставленные человеком.
+
+    ids сужает выборку на стороне Директа: в общем кабинете чужие кампании
+    не читаются вовсе, а не отбрасываются после.
     """
+    criteria: Dict[str, Any] = {"Ids": [int(i) for i in ids]} if ids else {}
     out: List[Dict[str, Any]] = []
     offset = 0
     while True:
         res = call(token, login, "campaigns", {
             "method": "get",
             "params": {
-                "SelectionCriteria": {},
+                "SelectionCriteria": criteria,
                 "FieldNames": ["Id", "Name", "Type", "State", "Status",
                                "ExcludedSites"],
                 "Page": {"Limit": 1000, "Offset": offset},

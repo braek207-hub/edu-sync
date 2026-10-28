@@ -90,7 +90,8 @@ def run_login(account, login: str, token: str, apply: bool, top_n: int,
     _out("\n[%s / %s] отчёт площадок за сегодня…" % (account.key, login))
     # Кампании сначала: у агентского кабинета половина клиентов пустая или
     # выключена, и заказывать по ним отчёт — минуты прогона впустую.
-    campaigns = direct.campaigns(token, login)
+    campaigns = direct.campaigns(token, login, account.campaign_ids)
+    mine = {str(x) for x in account.campaign_ids}
     live = [c for c in campaigns
             if c.get("Type") in direct.CLEANABLE_TYPES
             and c.get("State") in direct.CLEANABLE_STATES]
@@ -98,6 +99,8 @@ def run_login(account, login: str, token: str, apply: bool, top_n: int,
         _out("  нечего чистить: ни одной запущенной кампании с рычагом")
         return {"sites": 0, "campaigns": 0, "ok": 0, "failed": 0}
     rows = direct.placements_today(token, login)
+    if mine:
+        rows = [r for r in rows if str(r.get("campaign_id") or "") in mine]
     forced = account.always_block
     suspicious = spam_sites(account, token, login) if account.spam_rule else {}
     plan = planner.plan_account(rows, campaigns, top_n=top_n,
@@ -196,7 +199,7 @@ def unban(account, login: str, token: str, sites, apply: bool,
     заодно со своей ошибкой недопустимо.
     """
     hits = 0
-    for campaign in direct.campaigns(token, login):
+    for campaign in direct.campaigns(token, login, account.campaign_ids):
         items = (campaign.get("ExcludedSites") or {}).get("Items") or []
         own = (mine or {}).get(str(campaign["Id"]), set())
         keep = [s for s in items

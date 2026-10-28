@@ -32,6 +32,9 @@ class Account(NamedTuple):
     # спам-заявки выглядят для Директа успехом; у e-com цель — оплата, и
     # накрутить её площадка не может.
     spam_rule: bool = False
+    # Чистить только эти кампании. Нужно там, где кабинет общий: в чужие
+    # кампании клиента чистильщик не ходит, даже если они запущены.
+    campaign_ids: Tuple[int, ...] = ()
 
     def token(self) -> str:
         return os.environ.get(self.token_env, "").strip()
@@ -64,6 +67,13 @@ ACCOUNTS: List[Account] = [
             login=os.environ.get("POLINA_DIRECT_CLIENT_LOGIN") or None),
     Account("meshnflesh", "mesh-n-flesh", "MNF_DIRECT_TOKEN",
             login=os.environ.get("MNF_DIRECT_CLIENT_LOGIN") or None),
+    # Онлайн-школа Синергия в кабинете vpo-goroda (доступ через approve.agency,
+    # 28.10.2026). Кабинет общий — чистим только две наши РСЯ-кампании.
+    # spam_rule не нужен: цель стратегии — CRM-статус (317516886), площадка
+    # его не накрутит.
+    Account("synergy_school", "ОШ Синергия (vpo-goroda)", "APPROVE_AGENCY_TOKEN",
+            login="vpo-goroda-316088-c0ts",
+            campaign_ids=(715539609, 715543179)),
 ]
 
 BY_KEY: Dict[str, Account] = {a.key: a for a in ACCOUNTS}
