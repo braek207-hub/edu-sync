@@ -180,9 +180,9 @@ google-api-python-client==2.111.0 \
     --hash=sha256:3a45a53c031478d1c82c7162dd25c9a965247bca6bd438af0838a9d9b8219405 \
     --hash=sha256:b605adee2d09a843b97a59925757802904679e44e5599708cedb8939900dfbc7
     # via edu-sync
-google-auth==2.27.0 \
-    --hash=sha256:8e4bad367015430ff253fe49d500fdc3396c1a434db5740828c728e45bcce245 \
-    --hash=sha256:e863a56ccc2d8efa83df7a80272601e43487fa9a728a376205c86c26aaefa821
+google-auth==2.62.0 \
+    --hash=sha256:0bef0ce54bdf9ce226c5d66e4264413bd918141c31bbe49fb52eac882f513d69 \
+    --hash=sha256:4ff4319aeb4ad128409759d397a9fcafad126d0031d241cc0dd6b9a00b43e3f3
     # via
     #   edu-sync
     #   google-api-core

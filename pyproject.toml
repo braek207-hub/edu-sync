@@ -11,7 +11,7 @@ dependencies = [
     "python-dotenv==1.0.0",
     "pymysql==1.1.1",
     "google-api-python-client==2.111.0",
-    "google-auth==2.27.0",
+    "google-auth==2.62.0",
     "google-auth-httplib2==0.4.2",
     "httplib2==0.32.0",  # decode_limit_* появились в 0.32 — см. sync/sheets.py
     "catboost==1.2.5",
