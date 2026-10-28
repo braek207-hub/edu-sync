@@ -10,6 +10,7 @@ from sync.modules import queries as qm
 from sync.modules.accounts import DirectAccount
 from sync.modules.defaults import settings_for
 from sync.modules.types import Context, StoredFinding, fingerprint
+from sync.placements.direct import DirectError
 
 NOW = datetime(2026, 10, 18, 9, 0, tzinfo=timezone.utc)
 ACC = DirectAccount("login1", "tok", "RUB", "X")
@@ -1226,3 +1227,51 @@ def test_apply_never_minus_carries_code(monkeypatch):
     FakeDirect(monkeypatch, [_camp(1)], keywords={"1": []})
     res = qm.apply(_ctx({"never_minus": ["бесплатно"]}), [_stored(1, "бесплатно")])
     assert res[1].response["code"] == "in_never_minus"
+
+
+def _v501_error(as_result):
+    """Два вида отказа ЕПК в v5: ошибка запроса и ошибка в UpdateResults."""
+    def update(token, login, cid, field, items):
+        if as_result:
+            return {"Id": cid, "Errors": [{"Code": 5005, "Message": "Используйте версию API v501"}]}
+        raise DirectError("campaigns [5005] Поле задано неверно: Используйте версию API v501")
+    return update
+
+
+@pytest.mark.parametrize("as_result", [True, False])
+def test_apply_epk_5005_fails_with_code_not_crash(monkeypatch, as_result):
+    """ЕПК, которую v5 не даёт менять (5005 «используйте v501»): находка failed с кодом
+    epk_needs_v501, соседняя кампания применяется, прогон не падает."""
+    fake = FakeDirect(monkeypatch, [_camp(1, ctype="UNIFIED_CAMPAIGN"), _camp(2)])
+    real = fake.update_campaign_list
+
+    def update(token, login, cid, field, items):
+        if cid == 1:
+            return _v501_error(as_result)(token, login, cid, field, items)
+        return real(token, login, cid, field, items)
+
+    monkeypatch.setattr(qm.direct_api, "update_campaign_list", update)
+    res = qm.apply(_ctx(), [_stored(1, "бесплатно"), _stored(2, "мусор", cid=2)])
+    assert not res[1].ok and res[1].error == "epk_needs_v501"
+    assert res[1].response.get("direct") and "5005" in res[1].response["direct"]
+    assert res[2].ok
+
+
+def test_rollback_epk_5005_fails_with_code(monkeypatch):
+    fake = FakeDirect(monkeypatch, [_camp(1, ctype="UNIFIED_CAMPAIGN", negatives=["бесплатно"])])
+    monkeypatch.setattr(qm.direct_api, "update_campaign_list", _v501_error(False))
+    res = qm.rollback(_ctx(), [_stored(1, "бесплатно")])
+    assert not res[1].ok and res[1].error == "epk_needs_v501"
+    assert fake.writes == []
+
+
+def test_5005_elsewhere_in_group_is_coded(monkeypatch):
+    """5005 на чтении ключей (keywords.get по ЕПК) — тот же код, а не сырой текст."""
+    FakeDirect(monkeypatch, [_camp(1, ctype="UNIFIED_CAMPAIGN")])
+
+    def kw(*a, **k):
+        raise DirectError("keywords [5005] Используйте версию API v501")
+
+    monkeypatch.setattr(qm.direct_api, "keywords_by_campaign", kw)
+    res = qm.apply(_ctx(), [_stored(1, "бесплатно")])
+    assert res[1].error == "epk_needs_v501"

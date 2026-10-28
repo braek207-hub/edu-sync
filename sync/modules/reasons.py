@@ -19,6 +19,8 @@ REASON_CODES: Tuple[str, ...] = (
     "direct_rejected", "too_many_goals", "rule_invalid",
     # Добавлены после этапа 2: порядок сохраняет прежние позиции.
     "phrase_invalid", "report_goals_over_cap",
+    # После выкладки: ЕПК, которую v5 не даёт менять (ошибка Директа 5005).
+    "epk_needs_v501",
 )
 
 

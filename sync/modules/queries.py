@@ -1103,6 +1103,23 @@ def _write(acc: DirectAccount, campaign_id: int, items: Optional[List[str]]) -> 
 
 NOT_FOUND_BACK = "кампания не найдена в Директе после записи"
 
+# Часть ЕПК v5 менять не даёт: ошибка 5005 «используйте версию API v501» — и в ответе
+# campaigns.update, и на чтении ключей. Повтор её не лечит, а сырой текст Директа человеку
+# ничего не говорит: находка уходит в failed с кодом (текст и совет — lib/modules/reasons.ts),
+# исходная ошибка — в ответе для поддержки.
+V501_CODE = "epk_needs_v501"
+_V501_RE = re.compile(r"(?<!\d)5005(?!\d)")
+
+
+def _needs_v501(err: Optional[Exception]) -> bool:
+    return err is not None and bool(_V501_RE.search(str(err)))
+
+
+def _failed(resp: dict, werr: Optional[Exception], fallback: str) -> ApplyResult:
+    if _needs_v501(werr):
+        return ApplyResult(False, dict(resp, direct=str(werr)), V501_CODE)
+    return ApplyResult(False, resp, _write_error(werr) or fallback)
+
 
 def _write_and_read(acc: DirectAccount, cid: int, items: Optional[List[str]]):
     """Запись и чтение обратно: (что в списке сейчас, ошибка записи или None).
@@ -1227,8 +1244,8 @@ def _apply_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
             out[f.id] = ApplyResult(True, {"campaign_id": cid, "phrase": phrase,
                                            "chars_after": _chars(back)})
         else:
-            out[f.id] = ApplyResult(False, {"campaign_id": cid, "phrase": phrase},
-                                    _write_error(werr) or "Директ принял, но не применил")
+            out[f.id] = _failed({"campaign_id": cid, "phrase": phrase}, werr,
+                                "Директ принял, но не применил")
     return out
 
 
@@ -1278,9 +1295,8 @@ def _rollback_group(acc, cid, group, settings) -> Dict[int, ApplyResult]:
                 resp["already_absent"] = True
             out[f.id] = ApplyResult(True, resp)
         else:
-            out[f.id] = ApplyResult(False, {"campaign_id": cid, "phrase": phrase},
-                                    _write_error(werr)
-                                    or "минус-фраза осталась в списке после снятия")
+            out[f.id] = _failed({"campaign_id": cid, "phrase": phrase}, werr,
+                                "минус-фраза осталась в списке после снятия")
     return out
 
 
@@ -1295,7 +1311,11 @@ def _run_groups(ctx: Context, items: List[StoredFinding], handler) -> Dict[int, 
         try:
             out.update(handler(acc, cid, group, ctx.settings))
         except Exception as err:  # одна кампания не должна ронять остальные
-            out.update(_fail_all(group, "%s: %s" % (type(err).__name__, err)))
+            if _needs_v501(err):
+                out.update({f.id: ApplyResult(False, {"campaign_id": cid, "direct": str(err)},
+                                              V501_CODE) for f in group})
+            else:
+                out.update(_fail_all(group, "%s: %s" % (type(err).__name__, err)))
     return out
 
 
