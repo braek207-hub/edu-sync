@@ -35,7 +35,7 @@ uv run python main.py
 ```
 
 Новая или обновлённая зависимость: правка `pyproject.toml` → `uv lock` →
-`uv export --format requirements-txt --no-dev --extra agent --no-emit-project --no-header -o requirements.txt`.
+`uv export --format requirements-txt --no-dev --no-emit-project --no-header -o requirements.txt`.
 Пакеты моложе 7 дней uv не берёт (`exclude-newer` в uv.toml), Dependabot ждёт столько же.
 
 ## Тесты
