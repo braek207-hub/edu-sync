@@ -164,3 +164,31 @@ def test_locks():
     S.unlock_source(conn, 7)
     assert "pg_try_advisory_lock" in conn.log[0][1] and conn.log[0][2] == (7311, 7)
     assert "pg_advisory_unlock" in conn.log[1][1] and conn.log[1][2] == (7311, 7)
+
+
+class _NoFunction(Cur):
+    def execute(self, q, args=None):
+        super().execute(q, args)
+        if "sync_gate(" in render(q):
+            raise S.psycopg2.errors.UndefinedFunction("function public.sync_gate does not exist")
+
+
+def test_sync_gate_asks_with_slug_unit_source():
+    conn = Conn(rows=[("disabled",)])
+    assert S.sync_gate(conn, SRC, "projects_daily") == "disabled"
+    assert conn.log == [
+        ("execute", "SAVEPOINT sync_gate", None),
+        ("execute", "SELECT public.sync_gate(%s, %s, %s)", ("acme", "projects_daily", 7)),
+        ("execute", "RELEASE SAVEPOINT sync_gate", None),
+    ]
+
+
+def test_sync_gate_open_returns_none():
+    assert S.sync_gate(Conn(rows=[(None,)]), SRC, "projects_queue") is None
+
+
+def test_sync_gate_without_migration_lets_sync_run():
+    conn = Conn()
+    conn.cursor = lambda: _NoFunction(conn.log)
+    assert S.sync_gate(conn, SRC, "projects_daily") is None
+    assert conn.log[-1] == ("execute", "ROLLBACK TO SAVEPOINT sync_gate", None)

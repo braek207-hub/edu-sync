@@ -53,6 +53,7 @@ class World:
         self.fetch_errors: dict[tuple, Exception] = {}  # (fn, external_id, date_from) или (fn, external_id)
         self.write_errors: dict[str, Exception] = {}
         self.on_backfill = None  # хук (world, sid, backfill)
+        self.gate: dict[int, str] = {}  # sid -> ответ sync_gate ('paused' | 'disabled')
         self.conn = Conn(self)
 
     # --- store ---
@@ -82,6 +83,11 @@ class World:
         assert sid in self.held, f"unlock без lock: {sid}"
         self.held.discard(sid)
         self.log.append(("unlock", sid))
+
+    def sync_gate(self, conn, source, unit):
+        assert source.id in self.held, "ворота спрашивают под замком источника"
+        self.log.append(("gate", source.id, unit))
+        return self.gate.get(source.id)
 
     def replace_window(self, conn, table, source, date_from, date_to, rows):
         if table in self.write_errors:
@@ -191,6 +197,7 @@ def world(monkeypatch):
             "mark_ok",
             "mark_error",
             "save_backfill",
+            "sync_gate",
         ):
             monkeypatch.setattr(store, name, getattr(w, name))
         monkeypatch.setattr(accounts, "access_token", w.access_token)
@@ -312,6 +319,31 @@ def test_daily_skips_source_with_queued_job(world, monkeypatch, capsys):
     assert not w.events("error")
     out = capsys.readouterr().out
     assert "источник 2" in out and "источник 3" in out and "задание" in out
+
+
+def test_daily_skips_disabled_and_paused_sources(world, capsys):
+    w = world(src(1), src(2), src(3, slug="other"))
+    w.gate = {1: "disabled", 3: "paused"}
+    assert daily(w) == 0
+    assert [e[2] for e in w.fetches()] == ["login2"]
+    assert w.events("gate") == [("gate", 1, "projects_daily"), ("gate", 2, "projects_daily"), ("gate", 3, "projects_daily")]
+    # пропуск — не сбой: статус и история источника не трогаются, замок снят
+    assert not w.events("error") and w.events("ok") == [("ok", 2)]
+    assert [e[1] for e in w.events("unlock")] == [1, 2, 3]
+    out = capsys.readouterr().out
+    assert "источник 1 (acme/direct): отключён" in out and "источник 3 (other/direct): синки проекта на паузе" in out
+
+
+def test_queue_gated_job_stays_queued(world):
+    w = world(src(1, backfill=refresh_job()), src(2, backfill=refresh_job()))
+    w.gate = {1: "paused"}
+    assert queue(w) == 0
+    assert w.sources[1].backfill["state"] == "queued"
+    assert not [e for e in w.events("backfill") if e[1] == 1]
+    assert [e[2] for e in w.fetches()] == ["login2"]
+    assert ("gate", 1, "projects_queue") in w.events("gate")
+    # закрытое задание не перебирается по кругу в том же прогоне
+    assert w.events("gate").count(("gate", 1, "projects_queue")) == 1
 
 
 def test_commit_after_token_before_first_fetch(world):

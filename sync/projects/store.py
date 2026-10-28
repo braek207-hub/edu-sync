@@ -5,6 +5,7 @@
 """
 from dataclasses import dataclass, fields
 
+import psycopg2.errors
 from psycopg2 import sql
 from psycopg2.extras import Json, execute_batch
 
@@ -95,6 +96,27 @@ def try_lock_source(conn, source_id: int) -> bool:
 def unlock_source(conn, source_id: int) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT pg_advisory_unlock(%s, %s)", (LOCK_CLASS, source_id))
+
+
+def sync_gate(conn, source: Source, unit: str) -> str | None:
+    """Ответ public.sync_gate (миграция Panda-BI 20261018211913_sync_gate): 'paused' — проект
+    на паузе, 'disabled' — источник отключён в «Источниках», None — можно синкать.
+
+    Для projects_* серверные ворота (infra/panda/sync/gate.sh) пропускают юнит целиком — слага у
+    общего синка нет, поэтому источник спрашивает сам, под своим замком перед записью.
+    Функции нет (миграция ещё не накатана) — синкаем, как gate.sh при молчащей базе: сломанные
+    ворота не должны гасить синк. Точка сохранения — чтобы ошибка не отравила транзакцию.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SAVEPOINT sync_gate")
+        try:
+            cur.execute("SELECT public.sync_gate(%s, %s, %s)", (source.slug, unit, source.id))
+            verdict = cur.fetchone()[0]
+        except psycopg2.errors.UndefinedFunction:
+            cur.execute("ROLLBACK TO SAVEPOINT sync_gate")
+            return None
+        cur.execute("RELEASE SAVEPOINT sync_gate")
+    return verdict
 
 
 def _columns(table: str) -> list[str]:

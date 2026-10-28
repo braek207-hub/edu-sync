@@ -31,6 +31,10 @@ BACKFILL_DAYS = 90
 SOURCE_BUDGET_SEC = 1200
 MAX_JOB_ATTEMPTS = 3  # прерванное (процесс убит на середине) задание резюмируется не больше стольких раз
 
+# Имена юнитов panda-sync@ — их ждёт sync_gate (Panda-BI lib/project/unit-timers.ts).
+UNIT_DAILY = "projects_daily"
+UNIT_QUEUE = "projects_queue"
+
 MSK = timezone(timedelta(hours=3))
 METRIKA_401 = "Metrica API error 401"  # префикс RuntimeError из sync/bjorn/common.py _metrica_stat_page
 ERROR_MAX = 500
@@ -156,6 +160,17 @@ def _record_failure(conn, mode: str, source: Source, exc: Exception) -> None:
         conn.commit()
 
 
+def _gated(conn, mode: str, source: Source, unit: str) -> bool:
+    """Источник отключён или проект на паузе — не синкаем; это пропуск, а не сбой."""
+    verdict = store.sync_gate(conn, source, unit)
+    conn.commit()
+    if verdict is None:
+        return False
+    why = "отключён в настройках проекта" if verdict == "disabled" else "синки проекта на паузе"
+    log(mode, f"источник {source.id} ({source.slug}/{source.kind}): {why}, пропуск")
+    return True
+
+
 def run_daily(conn, *, today_msk: date, key_b64: str, slug: str | None = None) -> int:
     date_to = today_msk - timedelta(days=1)
     date_from = date_to - timedelta(days=DAILY_DAYS - 1)
@@ -172,6 +187,8 @@ def run_daily(conn, *, today_msk: date, key_b64: str, slug: str | None = None) -
                 # отработает очередь (история перекрывает ночные 7 дней) — ночной прогон не пишет поверх.
                 if any(s.id == source.id for s in store.load_queued_sources(conn, source.slug)):
                     log("daily", f"источник {source.id}: есть задание в очереди, пропуск")
+                    continue
+                if _gated(conn, "daily", source, UNIT_DAILY):
                     continue
                 deadline = time.monotonic() + SOURCE_BUDGET_SEC
                 try:
@@ -279,12 +296,14 @@ def run_queue(conn, *, today_msk: date, key_b64: str, slug: str | None = None) -
     yesterday = today_msk - timedelta(days=1)
     failed_ids: set[int] = set()
     busy_ids: set[int] = set()
+    gated_ids: set[int] = set()
     synced_slugs: set[str] = set()
     try:
         while True:
             # Очередь перечитывается после каждого источника: задания, пришедшие во время прогона,
             # тоже отработают. Упавшие и занятые в этом прогоне не берутся — цикл конечен.
-            pending = [s for s in store.load_queued_sources(conn, slug) if s.id not in failed_ids | busy_ids]
+            skip = failed_ids | busy_ids | gated_ids
+            pending = [s for s in store.load_queued_sources(conn, slug) if s.id not in skip]
             if not pending:
                 break
             source_id = pending[0].id
@@ -295,7 +314,10 @@ def run_queue(conn, *, today_msk: date, key_b64: str, slug: str | None = None) -
             try:
                 # Под замком перечитать: задание могло уйти (другой исполнитель) или смениться.
                 source = next((s for s in store.load_queued_sources(conn, slug) if s.id == source_id), None)
-                if source is not None:
+                if source is not None and _gated(conn, "queue", source, UNIT_QUEUE):
+                    # Задание остаётся в очереди: отработает после снятия паузы или включения.
+                    gated_ids.add(source_id)
+                elif source is not None:
                     if _run_job(conn, source, yesterday=yesterday, key_b64=key_b64):
                         synced_slugs.add(source.slug)
                     else:
