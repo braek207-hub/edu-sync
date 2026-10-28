@@ -25,6 +25,10 @@ METRICA_API_URL = "https://api-metrika.yandex.net/stat/v1/data"
 ATTRIBUTION = "lastsign"
 
 
+class QueryTooComplex(RuntimeError):
+    """400 query_error «Запрос слишком сложный»: окно дат несёт слишком много строк."""
+
+
 def _token() -> str:
     return os.environ.get("YM_TOKEN", "").strip()
 
@@ -42,6 +46,8 @@ def _metrica_get(params: Dict[str, Any], token: str) -> Dict[str, Any]:
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
             continue
+        if resp.status_code == 400 and "query_error" in resp.text:
+            raise QueryTooComplex(resp.text[:400])
         raise RuntimeError(f"Metrica API {resp.status_code}: {resp.text[:400]}")
     raise RuntimeError("Metrica API: max retries")
 
@@ -173,19 +179,30 @@ def sync_edu_visits(days_back: int = 90, chunk_days: int = 30) -> int:
     start = today - timedelta(days=days_back)
     print(f"EDU visits (vuz {COUNTER_VUZ}): {start} — {today}, лидов-client_id={len(keep)}, чанк={chunk_days}д")
 
-    # Reporting API с 7 dimensions за большой период отвечает 400 «Запрос слишком сложный»
-    # (недетерминированно). Тянем окнами по chunk_days — каждый запрос проще и стабилен.
+    # Reporting API с 7 dimensions за большой период отвечает 400 «Запрос слишком сложный».
+    # Порог зависит от трафика, а не от длины окна: 20.10 30 дней пика приёмной (21.08–19.09)
+    # отказ, соседние 30 дней проходят. Поэтому окна по chunk_days, а отказное делится пополам.
     total = 0
     cur = start
     while cur <= today:
-        c_from = cur
         c_to = min(cur + timedelta(days=chunk_days - 1), today)
-        rows = fetch_edu_client_visits(COUNTER_VUZ, c_from.isoformat(), c_to.isoformat(), token, keep)
-        n = upsert_edu_visit_behavior(rows) if rows else 0
-        print(f"  {c_from} — {c_to}: {n} строк")
-        total += n
+        total += _sync_window(cur, c_to, token, keep)
         cur = c_to + timedelta(days=1)
     return total
+
+
+def _sync_window(c_from: date, c_to: date, token: str, keep: set) -> int:
+    try:
+        rows = fetch_edu_client_visits(COUNTER_VUZ, c_from.isoformat(), c_to.isoformat(), token, keep)
+    except QueryTooComplex:
+        if c_from == c_to:
+            raise
+        mid = c_from + timedelta(days=(c_to - c_from).days // 2)
+        print(f"  {c_from} — {c_to}: слишком сложно для Метрики, делю пополам")
+        return _sync_window(c_from, mid, token, keep) + _sync_window(mid + timedelta(days=1), c_to, token, keep)
+    n = upsert_edu_visit_behavior(rows) if rows else 0
+    print(f"  {c_from} — {c_to}: {n} строк")
+    return n
 
 
 if __name__ == "__main__":

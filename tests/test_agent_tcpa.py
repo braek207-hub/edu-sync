@@ -17,12 +17,14 @@ from sync.agent.tcpa import (
 def _campaign(**over):
     base = {
         "campaign_id": "111",
-        "cost": 300_000.0,
-        "conversions": 200.0,      # факт по цели 1500 ₽
-        "revenue": 900_000.0,      # 4500 ₽ ценности на конверсию
+        # Расход витрины с НДС, цель кабинета без: 366 000 / 1,22 = 300 000.
+        "cost": 366_000.0,
+        "conversions": 200.0,      # факт по цели 1500 ₽ без НДС (1830 с НДС)
+        "revenue": 1_098_000.0,    # 5490 ₽ ценности на конверсию
         "beta": 0.8,
         "value_rel_error": 0.15,
         "tcpa_current": 1000.0,    # цель 1000, факт 1500 — недодержание ×1.5
+        "vat": 1.22,
     }
     base.update(over)
     return base
@@ -30,11 +32,12 @@ def _campaign(**over):
 
 def test_target_is_marginal_value_corrected_for_slippage():
     # Допустимый ПРЕДЕЛЬНЫЙ CPA = ценность конверсии × β / требуемая
-    # окупаемость: 4500 × 0.8 / 2 = 1800. Факт стоит в 1.5 раза выше цели,
-    # поэтому цель ставится ниже допустимого факта: 1800 / 1.5 = 1200.
+    # окупаемость: 5490 × 0.8 / 2 = 2196 в рублях расхода (с НДС), 1800 —
+    # в рублях кабинета. Факт стоит в 1.5 раза выше цели, поэтому цель
+    # ставится ниже допустимого факта: 1800 / 1.5 = 1200.
     out = tcpa_target(_campaign(), target_romi=2.0)
-    assert abs(out["value_per_conversion"] - 4500.0) < 1e-6
-    assert abs(out["allowed_marginal_cpa"] - 1800.0) < 1e-6
+    assert abs(out["value_per_conversion"] - 5490.0) < 1e-6
+    assert abs(out["allowed_marginal_cpa"] - 2196.0) < 1e-6
     assert abs(out["slippage"] - 1.5) < 1e-6
     assert abs(out["target"] - 1200.0) < 1e-6
     assert out["move"] == "up"
@@ -87,6 +90,32 @@ def test_section_splits_confident_moves_and_reasons():
     assert section["moves_up"] >= 1
 
 
+def test_slippage_is_measured_in_cabinet_units():
+    # Кампания держит цель ровно: 1000 ₽ без НДС = 1220 ₽ с НДС в витрине.
+    # Сравни факт с НДС с целью без — вышло бы недодержание ×1,22 и цель,
+    # заниженная на те же 22 %.
+    out = tcpa_target(_campaign(cost=244_000.0), target_romi=2.0)
+    assert abs(out["slippage"] - 1.0) < 1e-9
+    assert abs(out["target"] - 1800.0) < 1e-6
+
+
+def test_clamped_slippage_still_yields_cabinet_units():
+    # Факт ниже цели — недодержание зажато в 1.0. Цель обязана уйти в
+    # кабинет без НДС (1800), а не допустимым CPA с НДС (2196).
+    out = tcpa_target(_campaign(cost=200_000.0), target_romi=2.0)
+    assert out["slippage"] == 1.0
+    assert abs(out["target"] - 1800.0) < 1e-6
+
+
+def test_unclamped_target_does_not_depend_on_vat_rate():
+    # Без зажима ставка сокращается: факт и допустимый CPA делятся на неё оба.
+    at_20 = tcpa_target(_campaign(cost=360_000.0, revenue=1_080_000.0, vat=1.2),
+                        target_romi=2.0)
+    at_22 = tcpa_target(_campaign(), target_romi=2.0)
+    assert abs(at_20["target"] - at_22["target"]) < 1e-6
+    assert abs(at_20["slippage"] - 1.5) < 1e-9
+
+
 # ------------------- сборка входа из витрины и настроек кабинета
 
 
@@ -111,6 +140,21 @@ def test_inputs_join_mart_curve_and_cabinet_target():
     assert row["revenue"] == 900_000.0
     assert row["beta"] == 0.8
     assert row["tcpa_current"] == 1000.0
+    assert abs(row["vat"] - 1.22) < 1e-12
+
+
+def test_inputs_vat_follows_fact_dates_across_new_year():
+    from sync.agent.tcpa import build_inputs
+    facts = [
+        {"fact_date": "2025-12-31", "campaign_id": "111", "cost": 120_000.0,
+         "conversions": 50, "revenue": 1.0},       # 100 000 без НДС по 20 %
+        {"fact_date": "2026-01-01", "campaign_id": "111", "cost": 122_000.0,
+         "conversions": 50, "revenue": 1.0},       # 100 000 без НДС по 22 %
+    ]
+    settings = {"111": {"strategy": {"search": {"biddingStrategyType": "AVERAGE_CPA",
+                                                "targetCpa": 1000.0}}}}
+    row = build_inputs(facts, {}, settings, "2025-12-31", "2026-01-01")[0]
+    assert abs(row["vat"] - 242_000.0 / 200_000.0) < 1e-12
 
 
 def test_inputs_skip_campaigns_on_other_strategies():

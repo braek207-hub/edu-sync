@@ -1,8 +1,6 @@
 name: E-com Demand Sync
 
 on:
-  schedule:
-    - cron: "20 2 * * *"   # 05:20 Moscow, после основного синка
   workflow_dispatch:
     inputs:
       wordstat_from:

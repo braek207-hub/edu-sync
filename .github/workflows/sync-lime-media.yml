@@ -2,9 +2,6 @@ name: Sync LIME Media → Supabase
 
 # Медийка LIME (Ф4): Urban Ads (публичный API). Гео/Медиаметрика (headless) добавятся шагами сюда.
 on:
-  schedule:
-    # 01:00 UTC = 04:00 Moscow (после основного lime-direct в 03:10 МСК)
-    - cron: "0 1 * * *"
   workflow_dispatch:
     inputs:
       days_back:

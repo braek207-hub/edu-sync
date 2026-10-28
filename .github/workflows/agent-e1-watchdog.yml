@@ -1,10 +1,5 @@
 name: agent-e1-watchdog
 on:
-  schedule:
-    # 07:30 UTC = 10:30 МСК: после расчёта agent-e0 (09:30 МСК) и сторожа
-    # свежести данных (10:00 МСК). По крону — боевой откат с тревогами:
-    # --prod --apply --fail-on-alarm (см. шаг Run ниже).
-    - cron: "30 7 * * *"
   workflow_dispatch:
     inputs:
       prod:

@@ -13,9 +13,6 @@ on:
         required: false
         type: boolean
         default: false
-  schedule:
-    # каждые 20 минут с 08:00 до 23:40 МСК (UTC+3)
-    - cron: "*/20 5-20 * * *"
 jobs:
   run:
     runs-on: ubuntu-latest

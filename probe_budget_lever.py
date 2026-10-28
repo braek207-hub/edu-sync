@@ -22,8 +22,11 @@ import json
 import psycopg2.extras
 
 from sync.db import get_connection
+from sync.vat import facts_vat_rate
 
-VAT = 1.2          # факты расхода с НДС, лимиты кабинета без НДС
+# Факты расхода с НДС, лимиты кабинета без — ставка окна фактов, как у писателя
+# (sync/vat.py: 1,22 с 01.01.2026).
+VAT = facts_vat_rate()
 BINDING_SHARE = 0.9
 
 

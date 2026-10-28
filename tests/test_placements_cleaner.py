@@ -57,6 +57,25 @@ def test_allowlist_is_exact_not_substring():
     assert classify("vk.baraholka.russia")[0] == "app"
 
 
+def test_avito_kept_on_both_platforms():
+    for site in ("ru.avito.android", "com.avito.android", "ru.avito.app"):
+        assert classify(site)[0] == "keep", site
+
+
+def test_clients_json_gives_each_login_its_token(monkeypatch):
+    """BJORN: [{login, token}] — у каждого логина свой токен, пустой берёт token_env."""
+    from sync.placements import accounts as reg
+
+    acc = reg.Account("x", "X", "X_TOKEN", clients_env="X_CLIENTS_JSON")
+    monkeypatch.setenv("X_TOKEN", "common")
+    monkeypatch.setenv("X_CLIENTS_JSON", json.dumps(
+        [{"login": "a", "token": "ta"}, {"client_login": "b"}, "c", {"token": "t"}]))
+    assert reg.logins_of(acc) == [("a", "ta"), ("b", "common"), ("c", "common")]
+
+    monkeypatch.delenv("X_TOKEN")
+    assert reg.logins_of(acc) == [("a", "ta")]
+
+
 def test_publisher_prefix_allowed():
     assert classify("ru.yandex.mail")[0] == "keep"
     assert classify("ru.yandex.mobile.weather")[0] == "keep"

@@ -1,8 +1,6 @@
 name: Sync EDU Market Demand
 
 on:
-  schedule:
-    - cron: "25 2 * * *"   # ежедневно 05:25 MSK; гард в синке пропускает, если прошлая неделя уже залита
   workflow_dispatch:
     inputs:
       wordstat_from:

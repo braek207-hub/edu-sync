@@ -1,7 +1,7 @@
 """Сессии/покупки приложения по дате × кампания установки (sync/lime_app_install_source)."""
 from datetime import datetime
 
-from sync.lime_app_install_source import COLUMNS, build_source_daily, day_chunks
+from sync.lime_app_install_source import COLUMNS, aggregate_sessions, build_source_daily, day_chunks
 
 FIRST = {
     # device → (install_dt, publisher, detail, campaign_id) — форма first_install_attribution
@@ -23,7 +23,7 @@ def test_sessions_grouped_by_event_date_and_install_campaign():
         {"appmetrica_device_id": "d2", "session_start_datetime": "2026-09-01 12:00:00"},
         {"appmetrica_device_id": "d3", "session_start_datetime": "2026-09-02 12:00:00"},
     ]
-    rows = _by_key(build_source_daily(FIRST, sessions, []))
+    rows = _by_key(build_source_daily(FIRST, aggregate_sessions(sessions), []))
     vk = rows[("2026-09-01", "VK Ads (ex. myTarget)", "2780001")]
     assert vk["sessions"] == 3 and vk["devices"] == 2
     assert rows[("2026-09-02", "Yandex.Direct", "117845740")]["sessions"] == 1
@@ -40,7 +40,7 @@ def test_purchases_land_on_purchase_date_not_install_date():
 def test_device_without_install_in_window_is_unknown_remainder():
     sessions = [{"appmetrica_device_id": "old", "session_start_datetime": "2026-09-01 10:00:00"},
                 {"appmetrica_device_id": "d4", "session_start_datetime": "2026-09-01 10:00:00"}]
-    rows = _by_key(build_source_daily(FIRST, sessions, []))
+    rows = _by_key(build_source_daily(FIRST, aggregate_sessions(sessions), []))
     assert rows[("2026-09-01", "unknown", "")]["sessions"] == 2
 
 
@@ -55,6 +55,6 @@ def test_event_before_install_day_is_unknown_remainder():
     sessions = [{"appmetrica_device_id": "d3", "session_start_datetime": "2026-07-20 10:00:00"},
                 {"appmetrica_device_id": "d3", "session_start_datetime": "2026-08-01 09:00:00"}]
     purchases = [("d3", datetime(2026, 7, 20, 12, 0), "t0", 9000.0)]
-    rows = _by_key(build_source_daily(FIRST, sessions, purchases))
+    rows = _by_key(build_source_daily(FIRST, aggregate_sessions(sessions), purchases))
     assert rows[("2026-07-20", "unknown", "")] == {"sessions": 1, "devices": 1, "orders": 1, "revenue": 9000.0}
     assert rows[("2026-08-01", "Yandex.Direct", "117845740")]["sessions"] == 1

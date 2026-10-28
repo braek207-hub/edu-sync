@@ -40,8 +40,9 @@ from sync.agent.tcpa import DEFAULT_TARGET_ROMI
 # у него быть не должно: разойдись они — расчёт поднимал бы вес кампании,
 # которой писатель всё равно откажет. Поэтому и порог, и единицы берутся
 # оттуда, а не переписываются здесь.
-from sync.agent.writer.budget import (BINDING_SHARE, MAX_WRITE_STEP, VAT,
+from sync.agent.writer.budget import (BINDING_SHARE, MAX_WRITE_STEP,
                                       WEEKS_IN_WINDOW)
+from sync.vat import facts_vat_rate
 from sync.agent.writer.learning import BUDGET_SAFE_DELTA
 
 # Кап шага за такт. Симметричный в лог-смысле он не обязан быть: ×1.5 вверх
@@ -314,7 +315,7 @@ def binding_limit(settings: Optional[Dict[str, Any]], cost_28d: float) -> bool:
 
     Единицы: cost_28d — расход за 28 дней С НДС (все факты EDU), лимиты
     витрины — рубли БЕЗ НДС (edu_direct_settings переводит микрорубли).
-    Конверсия та же, что у писателя: cost / 4 недель / VAT.
+    Конверсия та же, что у писателя: cost / 4 недель / НДС окна (sync/vat.py).
     """
     strategy = ((settings or {}).get("strategy") or {})
     if not isinstance(strategy, dict) or strategy.get("package"):
@@ -322,7 +323,7 @@ def binding_limit(settings: Optional[Dict[str, Any]], cost_28d: float) -> bool:
     if ((settings or {}).get("meta") or {}).get("campaignType") != "TEXT_CAMPAIGN":
         return False
 
-    weekly_spend = float(cost_28d or 0.0) / WEEKS_IN_WINDOW / VAT
+    weekly_spend = float(cost_28d or 0.0) / WEEKS_IN_WINDOW / facts_vat_rate()
     if weekly_spend <= 0:
         return False
 

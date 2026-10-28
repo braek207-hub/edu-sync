@@ -33,6 +33,8 @@ from datetime import date, datetime, timedelta
 
 import requests
 
+from sync import appmetrica_raw as raw
+from sync.appmetrica_logs import cancel_stuck_queries
 from sync.lime_sections_common import (
     APPMETRICA_APP, DEEPLINK_LOOKBACK_DAYS, SECTIONS_V2, TABMAP, app_campaign_channel,
     app_campaign_of, app_channel_of_publisher, bucket, pub_norm,
@@ -58,11 +60,15 @@ def _export_json(endpoint: str, params: dict, token: str) -> list:
     Очередь экспорта AppMetrica под нагрузкой держит месячный запрос установок
     дольше 40 минут — ждём до ~2 часов (240×30с), прогресс в лог каждые 10 минут."""
     attempts = int(os.environ.get("APPMETRICA_EXPORT_ATTEMPTS", "240"))
+    cleaned = False
     for attempt in range(attempts):
         r = requests.get(f"{BASE}/{endpoint}.json", params=params,
                          headers={"Authorization": f"OAuth {token}"}, timeout=900)
         if r.status_code == 200:
             return r.json().get("data", [])
+        if r.status_code == 429 and not cleaned:
+            cancel_stuck_queries(params["application_id"], token)
+            cleaned = True
         if r.status_code not in (202, 429):
             raise RuntimeError(f"{endpoint} HTTP {r.status_code}: {r.text[:200]}")
         r.close()
@@ -87,8 +93,24 @@ class Attribution:
     def __init__(self, token: str, date_from, date_to):
         self.inst = {}
         dl = defaultdict(list)
+        # С Y1 установки и диплинки — из appm_* (sync.appmetrica_raw), по месяцам как раньше.
+        # Сырьё упорядочено по времени установки: последняя установка устройства перезаписывает
+        # прежние детерминированно (в ответе API порядок не гарантирован).
+        db = raw.connect() if raw.source() == "db" else None
+        try:
+            self._load(token, date_from, date_to, dl, db)
+        finally:
+            if db is not None:
+                db.close()
+        for v in dl.values():
+            v.sort()
+        self.dl = dict(dl)
+        self.dl_keys = {d: [t for t, *_ in v] for d, v in self.dl.items()}
+        print(f"  атрибуция готова: установок {len(self.inst):,}, устройств с диплинком {len(self.dl):,}")
+
+    def _load(self, token, date_from, date_to, dl, db):
         for a, b in _months(INSTALL_HISTORY_START, date_to):
-            data = _export_json("installations", {
+            data = raw.read_installations(db, a, b) if db is not None else _export_json("installations", {
                 "application_id": APPMETRICA_APP,
                 "date_since": f"{a} 00:00:00", "date_until": f"{b} 23:59:59",
                 "date_dimension": "default",
@@ -103,7 +125,7 @@ class Attribution:
                     )
             print(f"  установки {a:%Y-%m}: +{len(data):,}")
         for a, b in _months(date_from - timedelta(days=DEEPLINK_LOOKBACK_DAYS), date_to):
-            data2 = _export_json("deeplinks", {
+            data2 = raw.read_deeplinks(db, a, b) if db is not None else _export_json("deeplinks", {
                 "application_id": APPMETRICA_APP,
                 "date_since": f"{a} 00:00:00", "date_until": f"{b} 23:59:59",
                 "date_dimension": "default",
@@ -120,11 +142,6 @@ class Attribution:
                         app_campaign_of(r.get("publisher_name"), r.get("tracker_name")),
                     ))
             print(f"  диплинки {a:%Y-%m}: +{len(data2):,}")
-        for v in dl.values():
-            v.sort()
-        self.dl = dict(dl)
-        self.dl_keys = {d: [t for t, *_ in v] for d, v in self.dl.items()}
-        print(f"  атрибуция готова: установок {len(self.inst):,}, устройств с диплинком {len(self.dl):,}")
 
     def _last_touch(self, dev: str, when: datetime):
         v = self.dl.get(dev)
@@ -158,6 +175,7 @@ def _stream_event(day: str, event: str, token: str):
               "date_dimension": "receive", "event_name": event,
               "fields": "appmetrica_device_id,event_datetime,event_json"}
     r = None
+    cleaned = False
     for _ in range(120):
         try:
             r = requests.get(f"{BASE}/events.csv", params=params,
@@ -168,6 +186,9 @@ def _stream_event(day: str, event: str, token: str):
             continue
         if r.status_code == 200:
             break
+        if r.status_code == 429 and not cleaned:
+            cancel_stuck_queries(APPMETRICA_APP, token)
+            cleaned = True
         if r.status_code not in (202, 429):
             raise RuntimeError(f"{day}/{event}: HTTP {r.status_code} {r.text[:150]}")
         r.close()

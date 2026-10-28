@@ -13,8 +13,6 @@ name: placement-cleaner
 # теперь только будильник раз в три часа, а частоту держит цикл внутри
 # самого прогона: один раннер делает PASSES тактов с шагом PASS_GAP.
 on:
-  schedule:
-    - cron: "23 */3 * * *"
   workflow_dispatch:
     inputs:
       apply:

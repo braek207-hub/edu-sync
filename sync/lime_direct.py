@@ -37,17 +37,19 @@ import traceback
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
 import psycopg2
 import psycopg2.extras
 
 from sync.direct_reports_limit import MIN_POLL_SECONDS, is_rate_limited, poll_delay
 from sync.fx import to_rub as fx_to_rub
+from sync.http_retry import read_only_session
 from sync.strategy_snapshots import msk_today, write_snapshot
 
 REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports"
 # Опрос не чаще раза в 11 с: 30 попыток — до ~6 мин на офлайн-отчёт.
 REPORT_POLL_ATTEMPTS = 30
+# Синк только читает (Reports и method=get) — повтор на 5xx/обрыве безопасен.
+_HTTP = read_only_session()
 CAMPAIGNS_URL = "https://api.direct.yandex.com/json/v5/campaigns"
 CAMPAIGNS_V501_URL = "https://api.direct.yandex.com/json/v501/campaigns"
 STRATEGIES_URL = "https://api.direct.yandex.com/json/v5/strategies"
@@ -446,7 +448,7 @@ def _fetch_report_chunk(
     payload = json.dumps(body).encode("utf-8")
 
     for _ in range(REPORT_POLL_ATTEMPTS):
-        r = requests.post(REPORTS_URL, data=payload, headers=_report_headers())
+        r = _HTTP.post(REPORTS_URL, data=payload, headers=_report_headers())
         r.encoding = "utf-8"
         if r.status_code == 200:
             break
@@ -517,7 +519,7 @@ def _fetch_video_report(date_from: str, date_to: str) -> Dict[tuple, Dict[str, i
     try:
         r = None
         for _ in range(REPORT_POLL_ATTEMPTS):
-            r = requests.post(REPORTS_URL, data=payload, headers=_report_headers())
+            r = _HTTP.post(REPORTS_URL, data=payload, headers=_report_headers())
             r.encoding = "utf-8"
             if r.status_code == 200:
                 break
@@ -575,7 +577,7 @@ def _fetch_package_strategies(strategy_ids: List[int]) -> Dict[int, Dict[str, Op
             },
         }
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        r = requests.post(STRATEGIES_URL, data=data, headers=_json_headers())
+        r = _HTTP.post(STRATEGIES_URL, data=data, headers=_json_headers())
         r.encoding = "utf-8"
         if r.status_code != 200:
             raise RuntimeError(f"Strategies API {r.status_code}: {r.text[:300]}")
@@ -627,7 +629,7 @@ def _fetch_campaigns(campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
             },
         }
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        r = requests.post(CAMPAIGNS_URL, data=data, headers=_json_headers())
+        r = _HTTP.post(CAMPAIGNS_URL, data=data, headers=_json_headers())
         r.encoding = "utf-8"
         if r.status_code != 200:
             raise RuntimeError(f"Campaigns API {r.status_code}: {r.text[:300]}")
@@ -688,7 +690,7 @@ def _fetch_campaigns(campaign_ids: List[str]) -> Dict[str, Dict[str, Any]]:
 
 def _direct_post(url: str, body: Dict[str, Any]) -> Dict[str, Any]:
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    r = requests.post(url, data=data, headers=_json_headers())
+    r = _HTTP.post(url, data=data, headers=_json_headers())
     r.encoding = "utf-8"
     if r.status_code != 200:
         raise RuntimeError(f"Direct API {url} {r.status_code}: {r.text[:300]}")

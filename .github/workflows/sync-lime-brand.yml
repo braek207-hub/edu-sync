@@ -1,8 +1,6 @@
 name: Sync LIME Brand Traffic
 
 on:
-  schedule:
-    - cron: "15 2 * * *"   # ежедневно 05:15 MSK; гард в синке пропускает wordstat, если прошлая неделя уже залита
   workflow_dispatch:
     inputs:
       wordstat_from:

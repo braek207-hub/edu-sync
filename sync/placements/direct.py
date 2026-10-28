@@ -16,9 +16,13 @@ from typing import Any, Dict, List, Tuple
 API = "https://api.direct.yandex.com/json/v5/"
 REPORTS = "https://api.direct.yandex.com/json/v5/reports"
 
-# Отчёт формируется в очереди: HTTP 201/202 значит «ещё не готов».
-MAX_POLL = 12
-POLL_SLEEP = 10
+# Отчёт формируется в очереди: HTTP 201/202 значит «ещё не готов». Опрос — не
+# чаще раза в 10 с (иначе ошибка 56), бюджет ~5 мин: в часы пик 2 минут не хватало.
+MAX_POLL = 30
+POLL_SLEEP = 11
+# Лимит Reports на кабинет общий для всех наших синков: чужой запрос за последние
+# 10 с даёт 56 и нам. Это «подожди», а не отказ кабинета.
+RATE_LIMIT_CODE = "56"
 
 # Ограничения Директа на список запрещённых площадок (ref-v5/campaigns).
 MAX_EXCLUDED_SITES = 1000
@@ -116,6 +120,21 @@ def campaigns(token: str, login: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _retry_in(value: Any) -> int:
+    """Заголовок retryIn очереди отчётов → пауза, но не короче лимита опроса."""
+    try:
+        return max(POLL_SLEEP, int(value))
+    except (TypeError, ValueError):
+        return POLL_SLEEP
+
+
+def _error_code(detail: str) -> str:
+    try:
+        return str(json.loads(detail)["error"]["error_code"])
+    except (ValueError, KeyError, TypeError):
+        return ""
+
+
 def _report_lines(token: str, login: str, body: Dict[str, Any]) -> List[str]:
     """Отчёт из очереди Reports API → непустые строки TSV (первая — шапка)."""
     headers = dict(_headers(token, login))
@@ -126,15 +145,20 @@ def _report_lines(token: str, login: str, body: Dict[str, Any]) -> List[str]:
     text = None
     for attempt in range(1, MAX_POLL + 1):
         req = urllib.request.Request(REPORTS, data=data, headers=headers)
+        wait = POLL_SLEEP
         try:
             with urllib.request.urlopen(req, timeout=180) as resp:
                 if resp.status == 200:
                     text = resp.read().decode("utf-8")
                     break
+                wait = _retry_in(resp.headers.get("retryIn"))
         except urllib.error.HTTPError as err:
-            raise DirectError("reports HTTP %s: %s"
-                              % (err.code, err.read().decode("utf-8")[:400]))
-        time.sleep(POLL_SLEEP)
+            detail = err.read().decode("utf-8")[:400]
+            if err.code == 400 and _error_code(detail) == RATE_LIMIT_CODE:
+                time.sleep(POLL_SLEEP)
+                continue
+            raise DirectError("reports HTTP %s: %s" % (err.code, detail))
+        time.sleep(wait)
     if text is None:
         raise DirectError("отчёт не сформировался за %d попыток" % MAX_POLL)
     return [ln for ln in text.splitlines() if ln.strip()]

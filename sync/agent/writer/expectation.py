@@ -82,7 +82,8 @@ budget.set_daily получали его готовым от солвера по
 from typing import Any, Dict, Optional
 
 from sync.agent.writer import schedule
-from sync.agent.writer.budget import BUDGET_DAILY_KIND, BUDGET_KIND, VAT
+from sync.agent.writer.budget import BUDGET_DAILY_KIND, BUDGET_KIND
+from sync.vat import facts_vat_rate
 
 MICROS = 1_000_000
 
@@ -369,8 +370,8 @@ def _budget(action: Dict[str, Any], days: int) -> Optional[Dict[str, Any]]:
     if target_day is None:
         return None
     # Факты расхода с НДС, лимиты кабинета без — сравнивать их можно только
-    # в одних единицах (budget.VAT).
-    cost_day = cost_28d_vat / WINDOW_DAYS / VAT
+    # в одних единицах (НДС окна, sync/vat.py).
+    cost_day = cost_28d_vat / WINDOW_DAYS / facts_vat_rate()
     return {
         "leads_delta": _round(leads),
         "rub_delta": _round((target_day - cost_day) * days),

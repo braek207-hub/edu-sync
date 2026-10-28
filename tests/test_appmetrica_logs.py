@@ -43,6 +43,29 @@ def test_export_waits_on_429_queue_full():
     assert g.call_count == 3
 
 
+def test_cancel_stuck_queries_only_old():
+    now = al.datetime(2026, 10, 22, 12, 0, tzinfo=al._MSK)
+    active = _resp(200)
+    active.json.return_value = [
+        {"request_id": 1, "create_time": "2026-10-10 13:40:42", "total_progress": 0.99},
+        {"request_id": 2, "create_time": "2026-10-22 10:30:00", "total_progress": 0.4},
+    ]
+    with patch.object(al.requests, "get", return_value=active), \
+         patch.object(al.requests, "post", return_value=_resp(200)) as post:
+        assert al.cancel_stuck_queries("4415407", "tok", now) == ["1"]
+    assert post.call_args.args[0].endswith("/1/cancel")
+    assert post.call_args.kwargs["params"] == {"application_id": "4415407"}
+
+
+def test_export_cleans_queue_once_on_429():
+    seq = [_resp(429), _resp(429), _resp(200, {"data": []})]
+    with patch.object(al.requests, "get", side_effect=seq), \
+         patch.object(al.time, "sleep"), \
+         patch.object(al, "cancel_stuck_queries") as cancel:
+        al._export("installations", {"application_id": "1"}, "tok")
+    cancel.assert_called_once_with("1", "tok")
+
+
 def test_fetch_installations_one_file_per_month():
     with patch.object(al, "_export", side_effect=[[{"d": 1}], [{"d": 2}], [{"d": 3}]]) as ex:
         rows = al.fetch_installations("4415407", "tok", "2026-08-15", "2026-10-06")
