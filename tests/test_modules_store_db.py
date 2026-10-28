@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(
 
 # module_previews ведёт миграция этапа 2 из той же папки; обе DDL повторяемы (IF NOT EXISTS,
 # перенос goal_ids после первого наката — no-op), поэтому накатываются на каждый тест.
-DDL_STAGE2 = "20261018213700_direct_modules_rules.sql"
+DDL_STAGE2 = "20261028231419_direct_modules_rules.sql"
 
 
 def _cleanup(cur):

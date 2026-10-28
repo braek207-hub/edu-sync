@@ -2,8 +2,8 @@
 """Хранилище модулей Директа: project_modules, module_runs, module_findings, module_previews;
 чтение целей-лидов из project_sources.
 
-Схему ведут миграции Panda-BI (supabase/migrations/20261018193100_direct_modules.sql,
-module_previews — 20261018213700_direct_modules_rules.sql, project_sources —
+Схему ведут миграции Panda-BI (supabase/migrations/20261028231347_direct_modules.sql,
+module_previews — 20261028231419_direct_modules_rules.sql, project_sources —
 20261017153700_project_onboarding_core.sql); здесь таблицы не создаются.
 """
 
