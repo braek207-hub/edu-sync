@@ -14,7 +14,7 @@ dependencies = [
     "google-auth==2.27.0",
     "google-auth-httplib2==0.4.2",
     "httplib2==0.32.0",  # decode_limit_* появились в 0.32 — см. sync/sheets.py
-    "catboost==1.2.5",
+    "catboost==1.2.10",
     "scikit-learn==1.4.2",
     "pandas==2.2.2",
     "numpy==1.26.4",
