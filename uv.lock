@@ -2,10 +2,6 @@ version = 1
 revision = 5
 requires-python = "==3.11.*"
 
-[options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
-exclude-newer-span = "P7D"
-
 [[package]]
 name = "annotated-types"
 version = "0.8.0"
@@ -57,7 +53,7 @@ wheels = [
 
 [[package]]
 name = "catboost"
-version = "1.2.5"
+version = "1.2.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "graphviz" },
@@ -68,12 +64,12 @@ dependencies = [
     { name = "scipy" },
     { name = "six" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/99/be/363db90d07afe3d6fc9927e892885469dd851347e56e03d08977e716f076/catboost-1.2.5.tar.gz", hash = "sha256:12c31650fa55944e9ab5863d4eef194533914920c358b52a7a7d7b0b855cba9f", size = 69597354, upload-time = "2024-04-18T18:28:13.445Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e9/0e/09e8fa0858570fda88090bc3f441b69c18ea3d6f4a02fd41aa5426c157bf/catboost-1.2.10.tar.gz", hash = "sha256:26ae6d423acaf0e9d8160f2477a990431057ed04522d993c2f42dac62743b4f7", size = 39925863, upload-time = "2026-02-18T16:13:29.092Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/03/9f/5da788602cb9a2ce70abd9b3f9650dc53e6ec834e746b8dd053cb4314ca3/catboost-1.2.5-cp311-cp311-macosx_11_0_universal2.whl", hash = "sha256:68dc17e6850f1ad8256fbbfbfac2c26b7be291c78b0961b135adf3aa6ed503bf", size = 26216428, upload-time = "2024-04-18T18:25:08.506Z" },
-    { url = "https://files.pythonhosted.org/packages/d0/77/5166aa701241f33164c029b845942efbe34045b8417a24d9867083c8446d/catboost-1.2.5-cp311-cp311-manylinux2014_aarch64.whl", hash = "sha256:b6e1617b57deca52c8880ec2439d0fb514d7e9f78479bae8dbfbd2f95bb3b28e", size = 97691103, upload-time = "2024-04-18T18:25:16.509Z" },
-    { url = "https://files.pythonhosted.org/packages/c1/97/def10dcc5e5a8bb4f1d4b0a53124d9bf6630bdb001c39116b2c8d16356c1/catboost-1.2.5-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:9e0aac17d1a25e0f67770ba7362c6275db611ebb5dc6179daed84f55c3db976c", size = 98157496, upload-time = "2024-04-18T18:25:27.028Z" },
-    { url = "https://files.pythonhosted.org/packages/35/7e/35fa1a7cf6925ff438e849cca50c88b8d28e02d9c3486442f2f85b86184a/catboost-1.2.5-cp311-cp311-win_amd64.whl", hash = "sha256:901bf56e43334ce42f45b5c62fab1d8a14d54160b6da0645c798b7b7ad415da1", size = 101123916, upload-time = "2024-04-18T18:25:37.908Z" },
+    { url = "https://files.pythonhosted.org/packages/90/52/b961328a61a31a474c61fdcc1a19a086f7e672fd1becc0f70697a0ccccdb/catboost-1.2.10-cp311-cp311-macosx_11_0_universal2.whl", hash = "sha256:ab2e84237308d62bae236b1ecba2e3867697f96bdbaf0ca68dafc2c886946406", size = 28850304, upload-time = "2026-02-18T16:11:49.153Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/5e/4cb6a2f896b34aaa4afe70491c595f77bef7f9b948d719eda99678847d3d/catboost-1.2.10-cp311-cp311-manylinux2014_aarch64.whl", hash = "sha256:5ffe85f53092219cf65c73c2946426a289ef6f62c119c2bfda52815250d9bcef", size = 96708112, upload-time = "2026-02-18T16:11:53.607Z" },
+    { url = "https://files.pythonhosted.org/packages/7c/62/5839abf95f9ee4bc2beb1be4a45f1a912859362477a4eb0f4c9d81298f53/catboost-1.2.10-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:5819a880af6b314f4980e6c26ad0f7552eafcf247d521bc884fe726347fdd87d", size = 97159502, upload-time = "2026-02-18T16:11:59.55Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/af/36048fdd08eca7876716176c30acf0e7ff1dfb1f53d0b93a021537e26601/catboost-1.2.10-cp311-cp311-win_amd64.whl", hash = "sha256:41bbe16cab0695978c325a20fa300f92831ed78e9cc8c5fe8047538b4055e98e", size = 100244500, upload-time = "2026-02-18T16:12:04.065Z" },
 ]
 
 [[package]]
@@ -306,7 +302,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", marker = "extra == 'agent'", specifier = "==1.2.0" },
-    { name = "catboost", specifier = "==1.2.5" },
+    { name = "catboost", specifier = "==1.2.10" },
     { name = "cryptography", specifier = "==50.0.2" },
     { name = "google-api-python-client", specifier = "==2.111.0" },
     { name = "google-auth", specifier = "==2.27.0" },
