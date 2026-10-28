@@ -62,18 +62,54 @@ def test_avito_kept_on_both_platforms():
         assert classify(site)[0] == "keep", site
 
 
-def test_clients_json_gives_each_login_its_token(monkeypatch):
-    """BJORN: [{login, token}] — у каждого логина свой токен, пустой берёт token_env."""
+def test_clients_json_gives_each_login_its_token():
+    """BJORN: [{login, token}] — у каждого логина свой токен, пустой берёт BJORN_DIRECT_TOKEN."""
+    from sync.modules.accounts import accounts_for
+
+    raw = json.dumps([{"login": "a", "token": "ta"}, {"client_login": "b"}, "c", {"token": "t"}])
+    found, _ = accounts_for("bjorn", {"BJORN_DIRECT_CLIENTS_JSON": raw,
+                                      "BJORN_DIRECT_TOKEN": "common"})
+    assert [(a.login, a.token) for a in found] == [("a", "ta"), ("b", "common"), ("c", "common")]
+
+    found, why = accounts_for("bjorn", {"BJORN_DIRECT_CLIENTS_JSON": raw})
+    assert [(a.login, a.token) for a in found] == [("a", "ta")]
+    assert why
+
+
+def test_bjorn_and_synergy_stay_in_cleaner_registry():
+    """BJORN — проект модулей; Синергия без проекта Panda-BI — старый движок, свои кампании."""
     from sync.placements import accounts as reg
 
-    acc = reg.Account("x", "X", "X_TOKEN", clients_env="X_CLIENTS_JSON")
-    monkeypatch.setenv("X_TOKEN", "common")
-    monkeypatch.setenv("X_CLIENTS_JSON", json.dumps(
-        [{"login": "a", "token": "ta"}, {"client_login": "b"}, "c", {"token": "t"}]))
-    assert reg.logins_of(acc) == [("a", "ta"), ("b", "common"), ("c", "common")]
+    assert reg.BY_KEY["bjorn"].slug == "bjorn"
+    old = reg.legacy_accounts()
+    assert [a.key for a in old] == ["synergy_school"]
+    assert old[0].campaign_ids == (715539609, 715543179)
+    assert old[0].token_env == "APPROVE_AGENCY_TOKEN"
 
-    monkeypatch.delenv("X_TOKEN")
-    assert reg.logins_of(acc) == [("a", "ta")]
+
+def test_legacy_account_cleans_only_own_campaigns(monkeypatch):
+    """Общий кабинет: campaigns.get сужен Ids, строки отчёта чужих кампаний отброшены."""
+    from sync.placements import accounts as reg
+    from sync.placements import direct, legacy
+
+    acc = reg.Account("x", "X", None, token_env="X_TOKEN", login="l", campaign_ids=(1,))
+    monkeypatch.setenv("X_TOKEN", "t")
+    asked = {}
+
+    def campaigns(token, login, ids=()):
+        asked["ids"] = tuple(ids)
+        return [_campaign(1)]
+
+    rows = [_row(1, "com.junk.app", 50), _row(2, "com.other.app", 50)]
+    monkeypatch.setattr(direct, "campaigns", campaigns)
+    monkeypatch.setattr(direct, "placements_today", lambda token, login: rows)
+    written = []
+    monkeypatch.setattr(legacy, "set_excluded_sites",
+                        lambda t, l, cid, sites: written.append((cid, list(sites))) or (True, ""))
+    res = legacy.run_account(acc, apply=True, use_db=False, log=lambda s: None)
+    assert asked["ids"] == (1,)
+    assert written == [("1", ["com.junk.app"])]
+    assert res["failed"] == 0
 
 
 def test_publisher_prefix_allowed():
@@ -455,3 +491,24 @@ def test_call_does_not_retry_real_error(monkeypatch):
     with pytest.raises(direct.DirectError):
         direct.call("t", "l", "campaigns", {})
     assert len(calls) == 1
+
+
+def test_cli_routes_project_and_legacy_accounts(monkeypatch):
+    """--accounts bjorn → раннер модулей; synergy_school → старый движок, не раннер."""
+    from sync import placements_clean as cli
+
+    projects, old = [], []
+    monkeypatch.setattr(cli, "run_project", lambda slug, **kw: projects.append(slug) or 0)
+    monkeypatch.setattr(cli.legacy, "run_account",
+                        lambda acc, apply, use_db, log: old.append((acc.key, apply)))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert cli.main(["--apply", "--accounts", "bjorn,synergy_school"]) == 0
+    assert projects == ["bjorn"] and old == [("synergy_school", True)]
+
+    projects.clear(), old.clear()
+    assert cli.main(["--apply", "--accounts", "synergy_school"]) == 0
+    assert projects == [] and old == [("synergy_school", True)]
+
+    projects.clear(), old.clear()
+    assert cli.main(["--apply"]) == 0
+    assert projects == ["edunetwork"] and old == []

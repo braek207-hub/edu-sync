@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Реестр кабинетов Директа для чистильщика площадок.
+"""Реестр кабинетов Директа для старого входа чистильщика площадок.
 
-Кабинет описывается декларативно: где взять токен, какой Client-Login
-подставить. Кабинет без доступа не роняет прогон — он пропускается с
-внятной строкой, потому что чистильщик ходит по пяти клиентам, и потеря
-одного не повод оставить остальных грязными.
+Кабинет проекта Panda-BI описывается ключом и проектом: CLI
+(sync.placements_clean) переводит ключи в проекты, а токены, логины и пропуск
+кабинета без доступа — у раннера модулей (sync.modules.accounts).
+
+Кабинет вне проектов Panda-BI (slug=None) модули вести не могут — у них нет
+строки в dashboards. Такой кабинет чистит прежний движок старого входа, и для
+него здесь остаются токен, логин и список своих кампаний.
 """
 
-import json
 import os
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -15,29 +17,19 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 class Account(NamedTuple):
     key: str            # короткое имя кабинета в журнале и логах
     label: str          # человекочитаемое
-    token_env: str      # переменная окружения с OAuth-токеном
-    login: Optional[str] = None       # Client-Login; None — прямой кабинет
-    logins_env: Optional[str] = None  # JSON со списком клиентов агентства
-    # JSON [{login, token}] — у кабинета несколько логинов, и токен у каждого
-    # свой (BJORN: тот же секрет, что читают sync/bjorn и настройки кампаний).
-    # Токен строки пуст — берётся token_env.
-    clients_env: Optional[str] = None
-    agency: bool = False              # спросить список клиентов у Директа
-    # Площадки, которые в этом кабинете запрещаются всегда: не по вердикту
-    # словаря и не по кликам, а решением человека. Список кабинетный —
-    # почта и Дзен у одного клиента сливают бюджет, у другого приносят лиды.
-    always_block: Tuple[str, ...] = ()
-    # Резать площадки, которые «достигают» цель автостратегии кратно чаще
-    # кабинета (spam.py). Нужно там, где стратегия учится на лид-форме и
-    # спам-заявки выглядят для Директа успехом; у e-com цель — оплата, и
-    # накрутить её площадка не может.
-    spam_rule: bool = False
+    # Проект Panda-BI в реестре sync.modules.accounts; None — кабинет вне проектов.
+    # always_block и spam_rule кабинетов проектов переехали в настройки модуля
+    # (project_modules.settings): источник правды теперь они.
+    slug: Optional[str]
+    # Дальше — только для кабинета вне проектов.
+    token_env: str = ""               # переменная окружения с OAuth-токеном
+    login: Optional[str] = None       # Client-Login
     # Чистить только эти кампании. Нужно там, где кабинет общий: в чужие
     # кампании клиента чистильщик не ходит, даже если они запущены.
     campaign_ids: Tuple[int, ...] = ()
 
     def token(self) -> str:
-        return os.environ.get(self.token_env, "").strip()
+        return os.environ.get(self.token_env, "").strip() if self.token_env else ""
 
 
 # Russever (Групп Орсо, orso-groupmedia) снят 06.10.2026: работа с клиентом
@@ -48,129 +40,27 @@ class Account(NamedTuple):
 # «images.yandex.ru», «mail.rambler.ru», «m.games.yandex.ru»).
 ACCOUNTS: List[Account] = [
     # EDU — агентский кабинет: клиентов два десятка, и список живёт у самого
-    # Директа. Секрет DIRECT_CLIENTS_JSON перечисляет только тех, у кого
-    # проставлены цели, — чистить надо всех, включая новых, о которых секрет
-    # ещё не знает.
-    Account("edu", "EDUNETWORK", "DIRECT_TOKEN",
-            logins_env="DIRECT_CLIENTS_JSON", agency=True,
-            # Решение Павла 14.09.2026: площадки с аномально частым
-            # «Спасибо» выключать — это спам-заявки, а не студенты.
-            spam_rule=True),
-    Account("lime", "LIME", "LIME_DIRECT_TOKEN",
-            login=os.environ.get("LIME_DIRECT_CLIENT_LOGIN") or None),
-    # BJORN с 26.10.2026 по просьбе Павла. E-com: цель — покупка, спам-заявок
-    # нет, поэтому spam_rule выключен; always_block не задан — кабинетного
-    # решения о почте и Дзене у BJORN не было.
-    Account("bjorn", "BJORN", "BJORN_DIRECT_TOKEN",
-            clients_env="BJORN_DIRECT_CLIENTS_JSON"),
-    Account("polinarepik", "Polinarepik", "POLINA_DIRECT_TOKEN",
-            login=os.environ.get("POLINA_DIRECT_CLIENT_LOGIN") or None),
-    Account("meshnflesh", "mesh-n-flesh", "MNF_DIRECT_TOKEN",
-            login=os.environ.get("MNF_DIRECT_CLIENT_LOGIN") or None),
+    # Директа. Решение Павла 14.09.2026: площадки с аномально частым «Спасибо»
+    # выключать (спам-заявки, не студенты) — теперь spam_rule=true в настройках EDU.
+    Account("edu", "EDUNETWORK", "edunetwork"),
+    Account("lime", "LIME", "lime"),
+    # BJORN с 26.10.2026: логины и токены — из BJORN_DIRECT_CLIENTS_JSON
+    # (sync.modules.accounts, как у sync/bjorn и настроек кампаний).
+    Account("bjorn", "BJORN", "bjorn"),
+    Account("polinarepik", "Polinarepik", "polinarepik"),
+    Account("meshnflesh", "mesh-n-flesh", "meshnflesh"),
     # Онлайн-школа Синергия в кабинете vpo-goroda (доступ через approve.agency,
-    # 28.10.2026). Кабинет общий — чистим только две наши РСЯ-кампании.
-    # spam_rule не нужен: цель стратегии — CRM-статус (317516886), площадка
-    # его не накрутит.
-    Account("synergy_school", "ОШ Синергия (vpo-goroda)", "APPROVE_AGENCY_TOKEN",
-            login="vpo-goroda-316088-c0ts",
+    # 28.10.2026). Проекта в Panda-BI у неё нет — чистит старый движок. Кабинет
+    # общий — только две наши РСЯ-кампании. spam_rule не нужен: цель стратегии —
+    # CRM-статус (317516886), площадка его не накрутит.
+    Account("synergy_school", "ОШ Синергия (vpo-goroda)", None,
+            token_env="APPROVE_AGENCY_TOKEN", login="vpo-goroda-316088-c0ts",
             campaign_ids=(715539609, 715543179)),
 ]
 
 BY_KEY: Dict[str, Account] = {a.key: a for a in ACCOUNTS}
 
 
-def agency_logins(account: Account) -> List[str]:
-    """Клиенты агентства прямо из Директа. Пустой список — не повод падать."""
-    from sync.placements.direct import DirectError, call
-
-    out: List[str] = []
-    offset = 0
-    while True:
-        try:
-            res = call(account.token(), "", "agencyclients", {
-                "method": "get",
-                "params": {"SelectionCriteria": {},
-                           "FieldNames": ["Login"],
-                           "Page": {"Limit": 1000, "Offset": offset}},
-            })
-        except (DirectError, Exception):
-            return out
-        chunk = res.get("Clients", [])
-        out.extend(str(c.get("Login", "")).strip() for c in chunk
-                   if str(c.get("Login", "")).strip())
-        if len(chunk) < 1000:
-            return out
-        offset += len(chunk)
-
-
-def _clients_json(account: Account) -> List[Tuple[str, str]]:
-    raw = os.environ.get(account.clients_env or "", "").strip()
-    if not raw:
-        return []
-    try:
-        items = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    out = []
-    for item in items if isinstance(items, list) else []:
-        if isinstance(item, dict):
-            login = str(item.get("login") or item.get("client_login") or "").strip()
-            token = str(item.get("token") or "").strip() or account.token()
-        else:
-            login, token = str(item).strip(), account.token()
-        if login and token:
-            out.append((login, token))
-    return out
-
-
-def logins_of(account: Account) -> List[Tuple[str, str]]:
-    """Клиентские логины кабинета с токеном, которым каждый открывается.
-
-    У агентского кабинета их несколько (EDU: ВУЗ, СПО, ПроВУЗ…), и чистить
-    надо каждый: запрет площадок живёт на кампании, а кампании — у клиента.
-    """
-    if account.clients_env:
-        return _clients_json(account)
-    token = account.token()
-    if not token:
-        return []
-    if account.agency:
-        logins = agency_logins(account)
-        if logins:
-            return [(login, token) for login in logins]
-    if account.logins_env:
-        raw = os.environ.get(account.logins_env, "").strip()
-        if not raw:
-            return []
-        try:
-            items = json.loads(raw)
-        except json.JSONDecodeError:
-            return []
-        out = []
-        for item in items:
-            login = str(item.get("login", "")).strip() if isinstance(item, dict) else str(item).strip()
-            if login:
-                out.append((login, token))
-        return out
-    return [(account.login, token)] if account.login else []
-
-
-def available(keys: Optional[List[str]] = None):
-    """Кабинеты, до которых есть доступ, и причины отказа по остальным."""
-    ready, skipped = [], []
-    for account in ACCOUNTS:
-        if keys and account.key not in keys:
-            continue
-        if account.clients_env:
-            if not os.environ.get(account.clients_env, "").strip():
-                skipped.append((account, "нет клиентов в %s" % account.clients_env))
-                continue
-        elif not account.token():
-            skipped.append((account, "нет токена в %s" % account.token_env))
-            continue
-        logins = logins_of(account)
-        if not logins:
-            skipped.append((account, "не задан Client-Login или токен"))
-            continue
-        ready.append((account, logins))
-    return ready, skipped
+def legacy_accounts(keys: Optional[List[str]] = None) -> List[Account]:
+    """Кабинеты вне проектов Panda-BI (их чистит старый движок)."""
+    return [a for a in ACCOUNTS if a.slug is None and (not keys or a.key in keys)]

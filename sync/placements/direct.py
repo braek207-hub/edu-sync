@@ -11,7 +11,8 @@ import re
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Sequence, Tuple
+import zlib
+from typing import Any, Dict, List, Sequence
 
 API = "https://api.direct.yandex.com/json/v5/"
 REPORTS = "https://api.direct.yandex.com/json/v5/reports"
@@ -270,28 +271,50 @@ def campaign_goals(token: str, login: str) -> Dict[str, int]:
     return out
 
 
-def placements_with_goals(token: str, login: str, goals: List[int],
-                          date_range: str = "LAST_7_DAYS") -> List[Dict[str, Any]]:
-    """Площадки сети за период с достижениями целей: для спам-правила.
+# Окно отчёта с целями → DateRangeType Директа. Других окон у правил нет (rules.WINDOWS,
+# 0 — дневной отчёт без целей, placements_today).
+WINDOW_RANGES = {7: "LAST_7_DAYS", 30: "LAST_30_DAYS"}
+# Потолок Reports API на число целей в одном отчёте.
+MAX_REPORT_GOALS = 10
 
-    Окно шире суточного: спам-площадка даёт по 1–3 заявки в день, и за
-    сутки её не отличить от честной. Конверсии приходят по колонке на цель
-    (Conversions_<goal>_<модель>); строка несёт словарь goal → достижения.
+
+def placements_window(token: str, login: str, days: int,
+                      goals: List[int]) -> List[Dict[str, Any]]:
+    """Площадки сети за 7 или 30 дней с достижениями целей, один отчёт на вызов.
+
+    Конверсии приходят по колонке на цель (Conversions_<goal>_<модель>); строка несёт
+    словарь goal → достижения. Цели сверх потолка не урезаются молча, а отклоняются:
+    отрезанная цель дала бы кампании «ноль лидов» там, где их просто не спросили.
+
+    Без целей отчёт всё равно строится, только без конверсий (conversions = {}):
+    правилу «клики ≥ 10 за 30 дней» цели не нужны, и проекту без целей-лидов
+    оно обязано работать, а не молча не находить ничего.
     """
-    goals = sorted({int(g) for g in goals})[:10]  # потолок Reports API
-    if not goals:
-        return []
+    if days not in WINDOW_RANGES:
+        raise ValueError("окно %r не из %s" % (days, sorted(WINDOW_RANGES)))
+    goals = sorted({int(g) for g in goals})
+    if len(goals) > MAX_REPORT_GOALS:
+        raise ValueError("целей %d при потолке отчёта %d" % (len(goals), MAX_REPORT_GOALS))
+    # Окно и цели в имени: имя отчёта Директ связывает с параметрами, и два отчёта
+    # одного логина в одну секунду (спам по целям стратегий и правила по целям-лидам)
+    # с одним именем получили бы отказ «отчёт с таким именем уже есть».
+    tag = zlib.crc32(",".join(map(str, goals)).encode("ascii"))
+    fields = ["CampaignId", "Placement", "AdNetworkType", "Cost", "Clicks", "Impressions"]
+    with_goals = {}
+    if goals:
+        # Без своих целей колонка конверсий несла бы чужие (по умолчанию Директа),
+        # и лиды правил посчитались бы не по тем целям — поэтому только вместе с Goals.
+        fields.append("Conversions")
+        with_goals = {"Goals": [str(g) for g in goals], "AttributionModels": ["AUTO"]}
     body = {"params": {
         "SelectionCriteria": {"Filter": [{"Field": "Clicks",
                                           "Operator": "GREATER_THAN",
                                           "Values": ["0"]}]},
-        "Goals": [str(g) for g in goals],
-        "AttributionModels": ["AUTO"],
-        "FieldNames": ["CampaignId", "Placement", "AdNetworkType", "Cost",
-                       "Clicks", "Impressions", "Conversions"],
-        "ReportName": "placement-spam-%s-%d" % (login, int(time.time())),
+        **with_goals,
+        "FieldNames": fields,
+        "ReportName": "placement-goals-%s-%dd-%08x-%d" % (login, days, tag, int(time.time())),
         "ReportType": "CUSTOM_REPORT",
-        "DateRangeType": date_range,
+        "DateRangeType": WINDOW_RANGES[days],
         "Format": "TSV",
         "IncludeVAT": "YES",
         "IncludeDiscount": "NO",
@@ -312,7 +335,7 @@ def placements_with_goals(token: str, login: str, goals: List[int],
             continue
         if not cells[col["Placement"]]:
             continue
-        conv = {}
+        conv: Dict[int, int] = {}
         for i, goal in conv_cols:
             raw = cells[i]
             conv[goal] = int(float(raw)) if raw not in ("", "--") else 0
@@ -327,34 +350,12 @@ def placements_with_goals(token: str, login: str, goals: List[int],
     return rows
 
 
-def set_excluded_sites(token: str, login: str,
-                       campaign_id: str, sites: List[str]) -> Tuple[bool, str]:
-    """Записать полный список запрещённых площадок кампании.
+def placements_with_goals(token: str, login: str, goals: List[int]) -> List[Dict[str, Any]]:
+    """Площадки сети за неделю с достижениями целей стратегий: для спам-правила.
 
-    Возвращает (успех, сообщение). Ошибка одной кампании не должна ронять
-    прогон: у кабинета их десятки, и остальные вычистить всё равно надо.
+    Окно шире суточного: спам-площадка даёт по 1–3 заявки в день, и за
+    сутки её не отличить от честной. Цели сверх потолка отчёта отрезаются, как и в
+    этапе 1: спам-правилу недостающая цель даёт только «не спам», то есть отказ.
     """
-    try:
-        res = call(token, login, "campaigns", {
-            "method": "update",
-            "params": {"Campaigns": [{
-                "Id": int(campaign_id),
-                "ExcludedSites": {"Items": sites},
-            }]},
-        })
-    except DirectError as err:
-        return False, str(err)
-    except urllib.error.URLError as err:
-        return False, "сеть: %s" % err
-
-    results = res.get("UpdateResults") or []
-    if not results:
-        return False, "Директ не вернул результат обновления"
-    item = results[0]
-    errors = item.get("Errors") or []
-    if errors:
-        return False, "; ".join("%s %s" % (e.get("Code"), e.get("Message"))
-                                for e in errors)
-    warnings = item.get("Warnings") or []
-    note = "; ".join(w.get("Message", "") for w in warnings)
-    return True, note
+    capped = sorted({int(g) for g in goals})[:MAX_REPORT_GOALS]
+    return placements_window(token, login, 7, capped)
