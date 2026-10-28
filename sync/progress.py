@@ -55,7 +55,7 @@ update public.sync_runs
                            else coalesce(rows_written, 0) + %(rows)s::bigint end,
        progress = coalesce(progress, '{}'::jsonb) || jsonb_strip_nulls(jsonb_build_object(
          'days', greatest((progress->>'days')::int, %(days)s::int),
-         'updated_at', now()))
+         'updated_at', %(at)s::text))
  where id = %(id)s and status = 'running'
 """
 
@@ -72,6 +72,8 @@ def _default_connect():
 
     conn = _new_connection(connect_timeout=5)
     conn.autocommit = True
+    # Подписи этапов — кириллица; кодировку не оставляем на умолчание сервера.
+    conn.set_client_encoding("UTF8")
     with conn.cursor() as cur:
         # Запись хода не должна ждать блокировок дольше пары секунд: синк важнее плашки.
         cur.execute("set statement_timeout = 3000")
@@ -147,6 +149,7 @@ class Reporter:
             {
                 "rows": None if rows is None else int(rows),
                 "days": None if days is None else int(days),
+                "at": _now_iso(),
                 "id": None,
             },
         )

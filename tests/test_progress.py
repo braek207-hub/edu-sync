@@ -169,7 +169,8 @@ def test_result_uses_named_params(run_file):
     r.result(rows=1240, days=3)
     sql, args = conn.calls[-1]
     assert "jsonb_strip_nulls" in sql
-    assert args == {"rows": 1240, "days": 3, "id": 42}
+    assert args["rows"] == 1240 and args["days"] == 3 and args["id"] == 42
+    assert args["at"].endswith("Z")
 
 
 def test_errors_are_swallowed_and_disable(run_file, capsys):
