@@ -12,7 +12,7 @@
 кампаниях 131 клик и 18 достижений, ни одной оплаты.
 """
 
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List
 
 from sync.placements.classify import ALLOW_EXACT, ALLOW_PREFIX, normalize
 from sync.placements.llm import is_protected

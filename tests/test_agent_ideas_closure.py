@@ -79,7 +79,7 @@ def test_a_won_bet_closes_its_idea_as_done(store):
 def test_a_lost_bet_closes_its_idea_with_a_named_reason(store):
     # Снятая машиной идея без причины на разборе неотличима от отказа
     # человека, а лечатся они противоположным.
-    row = _running(store)
+    _running(store)
 
     closed = registry.settle_by_experiment(EXPERIMENT, experiments.STATUS_LOST,
                                            "наблюдение закрыто без вердикта")

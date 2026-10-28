@@ -104,11 +104,11 @@ def build_rows(base_map, goals_map, campaigns_meta, cabinet: str = "") -> list:
     """Слить базу + конверсии + мету кампании в строки upsert. Ведёт база (только где есть статистика).
     cabinet — метка кабинета (login), различает несколько VK-аккаунтов в одной таблице."""
     rows = []
-    for (date, cid), base in base_map.items():
+    for (day, cid), base in base_map.items():
         meta = campaigns_meta.get(cid, {})
-        conv = goals_map.get((date, cid), {})
+        conv = goals_map.get((day, cid), {})
         rows.append({
-            "date": date,
+            "date": day,
             "region": "ru",
             "cabinet": cabinet,
             "campaign_id": cid,
