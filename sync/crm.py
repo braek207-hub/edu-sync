@@ -10,6 +10,7 @@ from sync.classify import (
     normalize_city_ip_segment,
     resolve_row_project,
 )
+from sync import progress
 from sync.sheets import get_sheets_service, read_sheet
 from sync.product_parse import parse_product
 from sync.utils import (
@@ -905,6 +906,7 @@ def sync_crm_leads() -> int:
 
     # Признак оплаты лида берём из листа «Оплаты» (orders==1) и приписываем к дате
     # создания лида по leadId — в самом листе «Лиды» колонки оплаты нет.
+    progress.report("crm.payments_index", label="CRM · оплаты по лидам")
     paid_by_lead_id = _load_paid_by_lead_id(service, spreadsheet_id)
 
     lead_dims_by_id: Dict[str, Dims] = {}
@@ -913,7 +915,7 @@ def sync_crm_leads() -> int:
     # Один набор на все листы: лид, попавший и в «Лиды», и в «Лиды 2025», считается один раз.
     seen_lead_ids: set[str] = set()
 
-    for sheet_name in sheet_names:
+    for sheet_name in progress.track(sheet_names, "crm.leads_sheets", "CRM · листы лидов"):
         # Та же дисциплина, что у оплат: crm_leads пишется через replace
         # (полная замена), и «пропуск» упавшего листа в full-режиме молча
         # выкинул бы весь его год из витрины. Ошибка чтения — фатальна.
@@ -978,6 +980,7 @@ def sync_crm_leads() -> int:
     print(f"CRM Лиды: {len(rows)} сегментированных строк")
     from sync.db import replace_crm_leads
 
+    progress.report("crm.leads_write", label="CRM · запись лидов")
     n = replace_crm_leads(rows)
     print(f"CRM Лиды: записано {n} строк в crm_leads")
 
@@ -1001,6 +1004,7 @@ def sync_crm_leads() -> int:
     from sync.db import upsert_lead_details
 
     nd = upsert_lead_details(lead_details, delete_from=sheets_min_created)
+    progress.result(rows=n)
     paid_details = sum(1 for d in lead_details if d.get("is_paid"))
     print(
         f"CRM Детализация: {nd} лидов в crm_lead_details "
@@ -1062,7 +1066,7 @@ def sync_crm_payments() -> int:
     lead_dims_by_id = _load_all_lead_dims(service, spreadsheet_id)
     agg: Dict[str, Dict[str, Any]] = {}
 
-    for sheet_name in sheet_names:
+    for sheet_name in progress.track(sheet_names, "crm.payments_sheets", "CRM · листы оплат"):
         # Фатально: crm_payments пишется через replace, «пропуск» листа =
         # потеря его строк из витрины (см. _load_paid_by_lead_id).
         values = read_sheet(service, spreadsheet_id, sheet_name)
@@ -1101,7 +1105,9 @@ def sync_crm_payments() -> int:
     print(f"CRM Оплаты: {len(rows)} сегментированных строк")
     from sync.db import replace_crm_payments
 
+    progress.report("crm.payments_write", label="CRM · запись оплат")
     n = replace_crm_payments(rows)
+    progress.result(rows=n)
     print(f"CRM Оплаты: записано {n} строк в crm_payments")
     return n
 

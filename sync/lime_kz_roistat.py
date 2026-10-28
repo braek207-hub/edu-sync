@@ -29,6 +29,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync import progress
 from sync.fx import to_rub as fx_to_rub
 from sync.roistat_api import fetch_day, fetch_cohort
 from sync.roistat_channels import campaign_of, map_roistat_channel
@@ -254,11 +255,14 @@ def _sync_range(frm: date, to: date, conn) -> int:
     key = os.environ["ROISTAT_API_KEY"]
 
     # Когорта по дате визита за всё окно оплаты, чанками (одна выгрузка не проходит).
+    progress.report("roistat.cohort", label="Roistat · когорты")
     cohort_map = build_cohort_map(frm, to, key)
 
     total = 0
     day = frm
+    days = (to - frm).days + 1
     while day <= to:
+        progress.report("roistat.days", (day - frm).days, days, "Roistat · дни")
         day_s = day.isoformat()
         api_rows = fetch_day(day_s, PROJECT, key)
         fx_rate = fx_to_rub("KZT", day_s)
@@ -281,6 +285,9 @@ def _sync_range(frm: date, to: date, conn) -> int:
 
         total += len(rows)
         day += timedelta(days=1)
+    progress.report("roistat.days", days, days, "Roistat · дни")
+    if conn is not None:
+        progress.result(rows=total, days=days)
     return total
 
 

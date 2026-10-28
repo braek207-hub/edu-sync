@@ -36,6 +36,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync import progress
 from sync.fx import to_rub as fx_to_rub
 from sync.gcc_campaign_bridge import bridge_metrika_campaign, fetch_campaign_index
 from sync.gcc_ga4 import GA4_PROPERTY, fetch_ga4_dashboard_traffic
@@ -354,6 +355,7 @@ def _fetch_ga4_by_month(frm: date, to: date) -> dict[str, list[dict]]:
     by_day: dict[str, list[dict]] = {}
     spans = _month_spans(frm, to)
     for i, (span_from, span_to) in enumerate(spans, 1):
+        progress.report("gcc.ga4", i - 1, len(spans), "GA4 · месяцы")
         rows = fetch_ga4_dashboard_traffic(
             GA4_PROPERTY, span_from.isoformat(), span_to.isoformat()
         )
@@ -371,6 +373,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
     # Справочник кампаний строим ОДИН раз на весь прогон и с запасом назад: у дневного
     # синка в своём дне может не быть расхода по кампании, чей трафик уже идёт, и метка
     # осталась бы неопознанной.
+    progress.report("gcc.prepare", label="GCC · справочники и заказы")
     campaign_index = fetch_campaign_index(
         tw_key, shop, (frm - timedelta(days=90)).isoformat(), to.isoformat()
     )
@@ -398,7 +401,9 @@ def _sync_range(frm: date, to: date, conn) -> int:
 
     total = 0
     day = frm
+    days = (to - frm).days + 1
     while day <= to:
+        progress.report("gcc.days", (day - frm).days, days, "GCC · дни")
         day_s = day.isoformat()
         traffic = ga4_by_day.get(day_s, [])
         tw_orders_raw = fetch_tw_orders(tw_key, shop, day_s, day_s)
@@ -458,6 +463,9 @@ def _sync_range(frm: date, to: date, conn) -> int:
 
         total += len(rows)
         day += timedelta(days=1)
+    progress.report("gcc.days", days, days, "GCC · дни")
+    if conn is not None:
+        progress.result(rows=total, days=days)
     return total
 
 
