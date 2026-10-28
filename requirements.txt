@@ -172,9 +172,9 @@ fonttools==4.67.0 \
     --hash=sha256:621b3152b5d0412381b792bacfe410ac1f09c2c4f28a44bd19d26fe7160cfc96 \
     --hash=sha256:690ab72d338aa9bf8e5cd9aefb86e0d3c458d8b9de4df041fb7dc2ed4703144e
     # via matplotlib
-google-api-core==2.30.3 \
-    --hash=sha256:a85761ba72c444dad5d611c2220633480b2b6be2521eca69cca2dbb3ffd6bfe8 \
-    --hash=sha256:e601a37f148585319b26db36e219df68c5d07b6382cff2d580e83404e44d641b
+google-api-core==2.42.0 \
+    --hash=sha256:82cf5daa2ef1b456d4e29ff1de1a5c2995c7be3ccf4fc608184326e03390c1ee \
+    --hash=sha256:b1bdf4f72dc4f910736ce4ba49038352effbbc309579215107649b22973a1317
     # via google-api-python-client
 google-api-python-client==2.111.0 \
     --hash=sha256:3a45a53c031478d1c82c7162dd25c9a965247bca6bd438af0838a9d9b8219405 \
