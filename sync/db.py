@@ -9,6 +9,8 @@ from urllib.parse import unquote, urlparse
 import psycopg2
 import psycopg2.extras
 
+from sync import data_versions
+
 
 _CREATE_TABLE_RE = re.compile(
     r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)",
@@ -414,6 +416,7 @@ def replace_direct_stats(rows: List[Dict[str, Any]]) -> int:
         with conn.cursor() as cur:
             cur.execute("TRUNCATE direct_stats RESTART IDENTITY")
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_rows(cur, "edunetwork", "direct_stats", rows)
         conn.commit()
     return len(rows)
 
@@ -469,6 +472,7 @@ def upsert_direct_stats(rows: List[Dict[str, Any]]) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_rows(cur, "edunetwork", "direct_stats", rows)
         conn.commit()
     return len(rows)
 
@@ -744,6 +748,7 @@ def upsert_polinarepik_direct_stats(rows: List[Dict[str, Any]]) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_rows(cur, "polinarepik", "polinarepik_direct_stats", rows)
         conn.commit()
     return len(rows)
 
@@ -808,6 +813,7 @@ def upsert_polinarepik_metrica_sources(rows: List[Dict[str, Any]]) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_rows(cur, "polinarepik", "polinarepik_metrica_sources", rows)
         conn.commit()
     return len(rows)
 
@@ -837,6 +843,7 @@ def upsert_polinarepik_metrica_visits(rows: List[Dict[str, Any]]) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_rows(cur, "polinarepik", "polinarepik_metrica_visits", rows)
         conn.commit()
     return len(rows)
 
@@ -867,6 +874,7 @@ def upsert_polinarepik_metrica_purchases(rows: List[Dict[str, Any]]) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_rows(cur, "polinarepik", "polinarepik_metrica_purchases", rows, key="purchase_date")
         conn.commit()
     return len(rows)
 

@@ -12,6 +12,8 @@ import psycopg2
 import psycopg2.extras
 import pymysql
 
+from sync import data_versions
+
 SYNC_DAYS = int(os.environ.get("LIME_SYNC_DAYS") or "7")
 SYNC_FROM = (os.environ.get("LIME_SYNC_FROM") or "").strip() or None
 SYNC_TO = (os.environ.get("LIME_SYNC_TO") or "").strip() or None
@@ -284,6 +286,7 @@ def sync_chunk(conn_my, day_from: str, day_to: str, vk_groups=None):
         with conn_pg.cursor() as cur:
             cur.execute(DELETE_SQL, (day_from, day_to))
             psycopg2.extras.execute_values(cur, INSERT_SQL, data, page_size=500)
+            data_versions.bump(cur, "lime", "lime_stats", day_from, day_to, len(data))
         conn_pg.commit()
     except Exception:
         conn_pg.rollback()
@@ -328,6 +331,9 @@ def sync_lime() -> None:
             print(f"[lime-sync] {day}: raw={raw} -> aggregated={agg_n}")
 
         print(f"[lime-sync] done. total raw={total_raw}, total aggregated={total_agg}")
+        # Один раз после всех дней, а не на каждый день: витрины на lime_stats (P2) догоняются
+        # по версиям всех записанных месяцев разом.
+        data_versions.ready("lime", "lime_stats", _pg_url())
     finally:
         conn_my.close()
 

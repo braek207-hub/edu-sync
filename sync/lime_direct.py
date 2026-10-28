@@ -40,6 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg2
 import psycopg2.extras
 
+from sync import data_versions
 from sync.direct_reports_limit import MIN_POLL_SECONDS, is_rate_limited, poll_delay
 from sync.fx import to_rub as fx_to_rub
 from sync.http_retry import read_only_session
@@ -2057,7 +2058,9 @@ def _upsert(rows: List[Dict[str, Any]]) -> int:
     with psycopg2.connect(_pg_url()) as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, _UPSERT_SQL, rows, page_size=500)
+            data_versions.bump_rows(cur, "lime", "lime_direct_stats", rows)
         conn.commit()
+    data_versions.ready("lime", "lime_direct_stats", _pg_url())
     return len(rows)
 
 

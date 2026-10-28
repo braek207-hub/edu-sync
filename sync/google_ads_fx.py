@@ -15,6 +15,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync import data_versions
 from sync.fx import CBR_IDS, to_rub as fx_to_rub
 
 DAYS_BACK = int(os.environ.get("GOOGLE_ADS_FX_DAYS_BACK") or "30")
@@ -41,14 +42,18 @@ def build_pairs_query(backfill: bool, frm: str, to: str) -> tuple:
 
 UPDATE_SQL = """
 UPDATE lime_google_ads_stats
-SET cost_rub = ROUND((cost * %s)::numeric, 2)
-WHERE date = %s::date AND COALESCE(currency, 'USD') = %s
+SET cost_rub = ROUND((cost * %(rate)s)::numeric, 2)
+WHERE date = %(date)s::date AND COALESCE(currency, 'USD') = %(currency)s
+  -- Только изменившиеся рубли: прогон каждую ночь трогает 30 дней, и без условия каждая строка
+  -- переписывалась бы впустую, а версия входа витрины (data_versions) двигалась без новых данных.
+  AND cost_rub IS DISTINCT FROM ROUND((cost * %(rate)s)::numeric, 2)
 """
 
 UPDATE_RUB_SQL = """
 UPDATE lime_google_ads_stats
 SET cost_rub = ROUND(cost::numeric, 2)
-WHERE date = %s::date AND COALESCE(currency, 'USD') = %s
+WHERE date = %(date)s::date AND COALESCE(currency, 'USD') = %(currency)s
+  AND cost_rub IS DISTINCT FROM ROUND(cost::numeric, 2)
 """
 
 
@@ -68,11 +73,12 @@ def sync_google_ads_fx() -> int:
             pairs = cur.fetchall()
 
         failed = 0
+        changed = []
         with conn.cursor() as cur:
             for p in pairs:
                 cur_code = (p["currency"] or "").upper()
                 if cur_code in ("RUB", "RUR", ""):
-                    cur.execute(UPDATE_RUB_SQL, (p["date"], p["currency"]))
+                    cur.execute(UPDATE_RUB_SQL, {"date": p["date"], "currency": p["currency"]})
                 elif cur_code in CBR_IDS:
                     # Недоступность ЦБ на ОДНУ дату не должна ронять прогон: раньше
                     # ConnectTimeout здесь убивал весь workflow вместе с шагами после
@@ -84,12 +90,19 @@ def sync_google_ads_fx() -> int:
                         failed += 1
                         print(f"google_ads_fx: WARN курс {cur_code} на {p['date']} не получен: {e}")
                         continue
-                    cur.execute(UPDATE_SQL, (rate, p["date"], p["currency"]))
+                    cur.execute(UPDATE_SQL, {"rate": rate, "date": p["date"], "currency": p["currency"]})
                 else:
                     print(f"google_ads_fx: WARN валюта {cur_code!r} ({p['date']}) — cost_rub не заполнен")
                     continue
                 updated += cur.rowcount
+                if cur.rowcount:
+                    changed.append(p["date"])
+            if changed:
+                span = data_versions.date_span(changed)
+                data_versions.bump(cur, "lime", "lime_google_ads_stats", span[0], span[1], updated)
         conn.commit()
+        if updated:
+            data_versions.ready("lime", "lime_google_ads_stats")
         if failed:
             print(f"google_ads_fx: WARN {failed} дат без курса — подхватятся следующим прогоном")
     except Exception:

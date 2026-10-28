@@ -34,6 +34,8 @@ from typing import Any, Dict, Optional, Tuple
 import psycopg2
 import psycopg2.extras
 
+from sync import data_versions
+
 BASE = "https://ads.vk.com/api/v2"
 TOKEN_URL = f"{BASE}/oauth2/token.json"
 STAT_BATCH = 20
@@ -420,7 +422,10 @@ def _upsert(rows: list, frm: str, to: str) -> int:
             cur.execute(_DELETE_WINDOW_SQL, (frm, to))
             if rows:
                 psycopg2.extras.execute_batch(cur, _UPSERT_SQL, rows, page_size=500)
+            # Окно, а не даты строк: DELETE окна меняет и дни, где строк больше нет.
+            data_versions.bump(cur, "lime", "lime_vk_ads_stats", frm, to, len(rows))
         conn.commit()
+    data_versions.ready("lime", "lime_vk_ads_stats", _pg_url())
     return len(rows)
 
 
