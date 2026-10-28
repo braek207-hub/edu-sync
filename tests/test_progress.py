@@ -97,6 +97,17 @@ def test_run_id_from_run_file_and_payload(run_file):
     assert args[1] == 42
     assert body["stage"] == "direct.cabinets" and body["done"] == 1 and body["total"] == 4
     assert body["label"] == "Директ · кабинеты" and body["updated_at"].endswith("Z")
+    assert body["since"].endswith("Z")
+
+
+def test_since_kept_within_stage(run_file):
+    conn, clock = FakeConn(), Clock()
+    r = make(run_file, conn, clock)
+    r.report("days", 1, 30)
+    first = writes(conn)[0]["since"]
+    clock.t += 3
+    r.report("days", 2, 30)
+    assert writes(conn)[1]["since"] == first
 
 
 def test_foreign_invocation_falls_back_to_db(run_file):

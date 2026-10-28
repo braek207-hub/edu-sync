@@ -107,6 +107,7 @@ class Reporter:
         self._failures = 0
         self._last_write = float("-inf")
         self._stage: Optional[str] = None
+        self._since: Optional[str] = None
         self._pending: Optional[dict] = None
 
     @property
@@ -129,11 +130,14 @@ class Reporter:
             "total": None if total is None else int(total),
         }
         # Новый этап пишется сразу: иначе короткий этап (запись в базу) так и не показался бы.
-        if stage != self._stage or self._clock() - self._last_write >= MIN_INTERVAL_S:
-            self._stage = stage
-            self._write_progress(payload)
+        if stage != self._stage:
+            # since — начало этапа: Panda-BI считает остаток по скорости этапа, а не всего прогона.
+            self._stage, self._since = stage, _now_iso()
+            self._write_progress(dict(payload, since=self._since))
+        elif self._clock() - self._last_write >= MIN_INTERVAL_S:
+            self._write_progress(dict(payload, since=self._since))
         else:
-            self._pending = payload
+            self._pending = dict(payload, since=self._since)
 
     def flush(self) -> None:
         if self._pending is not None and self.enabled:
