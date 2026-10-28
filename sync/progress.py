@@ -1,7 +1,8 @@
 """Ход прогона синка → public.sync_runs.progress (миграция Panda-BI *_sync_run_progress.sql).
 
 Кнопка «Обновить сейчас» в Panda-BI показывает этап и «X из Y» («Директ · кабинеты 2 из 4»),
-а по окончании — что пришло («+30 дн., 1 240 строк»). Синк сообщает о себе сам:
+а по окончании — что пришло («30 дн., 1 240 строк»; строки — sync_runs.rows_written).
+Синк сообщает о себе сам:
 
     from sync import progress
     for client in progress.track(clients, "direct.cabinets", "Директ · кабинеты"):
@@ -46,12 +47,13 @@ update public.sync_runs
  where id = %s and status = 'running'
 """
 
-# rows копятся (юнит из нескольких модулей — bjorn_direct — пишет итог каждым), days — максимум.
+# Строки — в существующую колонку rows_written (её же суммирует биллинг Panda-BI) и копятся:
+# юнит из нескольких модулей (bjorn_direct) пишет итог каждым. Дни — в progress.days, максимум.
 _RESULT_SQL = """
 update public.sync_runs
-   set progress = coalesce(progress, '{}'::jsonb) || jsonb_strip_nulls(jsonb_build_object(
-         'rows', case when %(rows)s::bigint is null then null
-                      else coalesce((progress->>'rows')::bigint, 0) + %(rows)s::bigint end,
+   set rows_written = case when %(rows)s::bigint is null then rows_written
+                           else coalesce(rows_written, 0) + %(rows)s::bigint end,
+       progress = coalesce(progress, '{}'::jsonb) || jsonb_strip_nulls(jsonb_build_object(
          'days', greatest((progress->>'days')::int, %(days)s::int),
          'updated_at', now()))
  where id = %(id)s and status = 'running'
