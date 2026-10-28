@@ -17,7 +17,6 @@ POST https://api.triplewhale.com/api/v2/orcabase/api/sql
 ROAS; Google 76 481,39/1 982,48 = 38,58 = показанный). То есть `currency` описывает
 биллинг кабинета, а не единицу `spend`. Принять её за единицу = завысить Meta в 3.67 раза.
 """
-import os
 import re
 import time
 

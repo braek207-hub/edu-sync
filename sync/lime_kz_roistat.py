@@ -265,7 +265,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
         rows = build_rows(api_rows, fx_rate, _cabinet_cost(conn, day_s), day_s, cohort_map)
 
         if conn is None:
-            i_o, i_r = COLUMNS.index("purchases_count"), COLUMNS.index("purchases_revenue")
+            i_o = COLUMNS.index("purchases_count")
             i_c, i_co = COLUMNS.index("cost"), COLUMNS.index("cohort_orders")
             print(f"lime_kz_roistat: [DRY-RUN] {day_s} → {len(rows)} строк "
                   f"(заявки={sum(r[i_o] for r in rows)}, "

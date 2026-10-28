@@ -1,0 +1,14 @@
+#!/bin/sh
+# Гейт перед пушем: в main пушат сразу, сервер забирает код pull'ом — красное не должно уехать.
+# Включение (один раз на клон): git config core.hooksPath scripts/git-hooks
+set -e
+command -v uv >/dev/null || { echo "pre-push: нет uv — https://docs.astral.sh/uv/"; exit 1; }
+
+# requirements.txt ставит сервер (setup.sh в EduDash) и workflow GitHub — он обязан совпадать с uv.lock.
+uv lock --check -q
+uv export --format requirements-txt --no-dev --extra agent --no-emit-project --no-header -o - | diff -q --strip-trailing-cr - requirements.txt >/dev/null \
+  || { echo "pre-push: requirements.txt отстал от uv.lock — uv export --format requirements-txt --no-dev --extra agent --no-emit-project --no-header -o requirements.txt"; exit 1; }
+
+uv run -q ruff check .
+uv run -q pytest -q -p no:cacheprovider
+echo "pre-push: чисто"

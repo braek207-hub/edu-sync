@@ -24,18 +24,25 @@
 
 ## Локальный запуск
 
+Проект — uv: зависимости в `pyproject.toml`, точные версии в `uv.lock`. `requirements.txt`
+(с хэшами) генерируется из lock — его ставят сервер (`setup.sh` в EduDash) и workflow GitHub.
+
 ```bash
-python -m venv .venv
-.venv\Scripts\activate   # Windows
-pip install -r requirements.txt
+uv sync --all-extras                        # .venv со всеми пакетами, включая тесты и ruff
+git config core.hooksPath scripts/git-hooks # один раз: pre-push гоняет lock, ruff и тесты
 cp .env.example .env     # заполнить переменные; база — только через ssh-туннель к серверу
-python main.py
+uv run python main.py
 ```
+
+Новая или обновлённая зависимость: правка `pyproject.toml` → `uv lock` →
+`uv export --format requirements-txt --no-dev --extra agent --no-emit-project --no-header -o requirements.txt`.
+Пакеты моложе 7 дней uv не берёт (`exclude-newer` в uv.toml), Dependabot ждёт столько же.
 
 ## Тесты
 
 ```bash
-pytest -v
+uv run pytest -q
+uv run ruff check .
 ```
 
 ## Связанные проекты

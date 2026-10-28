@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional
 import pytest
 import requests
 
-import sync.agent.writer.apply as apply_mod
 import sync.agent.writer.db as writer_db
 from sync.agent.writer.apply import _element_errors, apply_actions, to_api_call
 from sync.agent.writer.client import DirectWriteError, is_outcome_unknown

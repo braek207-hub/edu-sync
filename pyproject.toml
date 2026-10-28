@@ -1,0 +1,51 @@
+[project]
+name = "edu-sync"
+version = "0"
+# Сервер (/opt/panda/edu-sync/.venv) — CPython 3.11, его ставит setup.sh в EduDash.
+requires-python = ">=3.11,<3.12"
+# Всё, что импортируют синки-юниты VPS. Версии точные: обновление — правкой здесь и `uv lock`,
+# сервер ставит ровно requirements.txt (uv export, с хэшами).
+dependencies = [
+    "requests==2.32.5",
+    "psycopg2-binary==2.9.9",
+    "python-dotenv==1.0.0",
+    "pymysql==1.1.1",
+    "google-api-python-client==2.111.0",
+    "google-auth==2.27.0",
+    "google-auth-httplib2==0.4.2",
+    "httplib2==0.32.0",  # decode_limit_* появились в 0.32 — см. sync/sheets.py
+    "catboost==1.2.5",
+    "scikit-learn==1.4.2",
+    "pandas==2.2.2",
+    "numpy==1.26.4",
+    "playwright==1.61.0",
+    "cryptography==50.0.2",
+    "sentry-sdk==2.72.0",  # ошибки синков в Bugsink — sitecustomize.py в EduDash
+]
+
+[project.optional-dependencies]
+# Агент EDU (sync/agent_analyst.py) остановлен и на сервер не переезжал.
+agent = ["anthropic==1.2.0"]
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.2",
+    "pyyaml==6.0.3",  # тесты читают workflow-файлы (test_agent_reprice_workflow_permissions)
+    "ruff==0.14.2",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py311"
+# Разовые пробы — архив исследований, не код синков.
+extend-exclude = ["probe_*.py", "scripts/probe_*.py", "output"]
+
+[tool.ruff.lint]
+# Только то, что ломает исполнение или прячет баг (F821 нашёл NameError в agent_e1_watchdog).
+# Стиль не трогаем — формат ruff format не включён, чтобы не переписать весь репозиторий разом.
+select = ["E9", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

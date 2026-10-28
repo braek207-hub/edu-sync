@@ -8,7 +8,7 @@ p_pay (class_weight="balanced"), калибровка чинит абсолют 
 p перетасовывает ранжирование), фолбэк на сырые p если артефакт старый
 (нет ключа "calibrator")."""
 
-from datetime import date, timedelta
+from datetime import date
 from typing import Any, Optional
 
 import numpy as np
