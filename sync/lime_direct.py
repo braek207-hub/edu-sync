@@ -41,6 +41,7 @@ import psycopg2
 import psycopg2.extras
 
 from sync import data_versions
+from sync import progress
 from sync.direct_reports_limit import MIN_POLL_SECONDS, is_rate_limited, poll_delay
 from sync.fx import to_rub as fx_to_rub
 from sync.http_retry import read_only_session
@@ -413,9 +414,10 @@ def _fetch_report(
     ступень install. Порционный запрос закрывает лимит без потери целей.
     """
     if len(goal_ids) > GOALS_PER_REPORT:
+        parts = list(_chunked(goal_ids, GOALS_PER_REPORT))
         chunks = [
             _fetch_report_chunk(date_from, date_to, part, id_to_key)
-            for part in _chunked(goal_ids, GOALS_PER_REPORT)
+            for part in progress.track(parts, "direct.report", "Директ · отчёт, порции целей")
         ]
         return _merge_report_chunks(chunks)
     return _fetch_report_chunk(date_from, date_to, goal_ids, id_to_key)
@@ -2139,12 +2141,14 @@ def sync_lime_direct(days_back: int = 7) -> int:
     print(f"[lime_direct] отчёт {date_from} — {date_to} ({client_login})")
     if goal_ids:
         print(f"[lime_direct] цели LSC: {', '.join(goal_ids)}")
+    progress.report("direct.report", label="Директ · отчёт")
     report_rows = _fetch_report(date_from, date_to, goal_ids, id_to_key)
     print(f"[lime_direct] получено {len(report_rows)} строк отчёта")
     if not report_rows:
         return 0
 
     # Видео-досмотры медийных кампаний (отдельный R&F-отчёт; см. _fetch_video_report).
+    progress.report("direct.video", label="Директ · видео-досмотры")
     video_map = _fetch_video_report(date_from, date_to)
     if video_map:
         vc_total = sum(v["video_complete"] for v in video_map.values())
@@ -2152,6 +2156,7 @@ def sync_lime_direct(days_back: int = 7) -> int:
 
     campaign_ids = sorted({r["campaign_id"] for r in report_rows})
     campaign_names = {r["campaign_id"]: r["campaign_name"] for r in report_rows}
+    progress.report("direct.campaigns", label="Директ · стратегии кампаний")
     campaigns = _fetch_campaigns(campaign_ids)
     print(f"[lime_direct] стратегии/бюджеты по {len(campaigns)} кампаниям")
 
@@ -2164,6 +2169,7 @@ def sync_lime_direct(days_back: int = 7) -> int:
         cabinet = {}
     settings_ids = sorted(set(campaign_ids) | set(cabinet))
     settings_names = {**cabinet, **campaign_names}
+    progress.report("direct.settings", label="Директ · настройки кампаний")
     try:
         _sync_campaign_settings(settings_ids, settings_names)
     except Exception as e:
@@ -2205,8 +2211,10 @@ def sync_lime_direct(days_back: int = 7) -> int:
     if (src_currency.strip().upper() not in ("", "RUB", "RUR")) or vat_mult != 1.0:
         print(f"[lime_direct] деньги → рубли: валюта={src_currency or 'RUB'}, НДС×{vat_mult}")
 
+    progress.report("direct.write", label="Директ · запись в базу")
     n = _upsert(merged)
     print(f"[lime_direct] upsert {n} строк в lime_direct_stats")
+    progress.result(rows=n, days=days_back + 1)
     return n
 
 

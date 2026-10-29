@@ -1,4 +1,4 @@
-import os, json, requests
+import os, requests
 MGMT = "https://api-metrika.yandex.net/management/v1"
 token = os.environ["METRICA_TOKEN"].strip()
 counter = os.environ["METRICA_COUNTER_ID"].strip()

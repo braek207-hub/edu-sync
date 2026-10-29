@@ -22,13 +22,9 @@ sys.path.insert(0, str(ROOT))
 
 from sync.metrika_offline import (  # noqa: E402
     COUNTER_VUZ,
-    GOAL_CONNECTION,
-    GOAL_DEAL,
-    GOAL_PAYMENT,
     _collect_conversions,
 )
 from sync.sheets import get_sheets_service  # noqa: E402
-from sync.utils import to_iso_date  # noqa: E402
 
 MSK = ZoneInfo("Europe/Moscow")
 

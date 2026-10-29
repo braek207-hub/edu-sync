@@ -21,7 +21,6 @@ tests/test_agent_ideas_market.py — генератор идей «спрос и
 БД не требуется: реестр подменяется двойником (фикстура store в conftest).
 """
 
-import pytest
 
 from sync.agent import demand
 from sync.agent.experiments import HORIZON_DAYS, METRIC

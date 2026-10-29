@@ -837,7 +837,7 @@ def _parse_history_csv(path: str) -> dict:
         except ValueError:
             return 0
 
-    org_t, paid_t, tot = col("ORG Total"), col("PAID Total"), col("Total")
+    org_t, paid_t = col("ORG Total"), col("PAID Total")
     out: dict[str, dict] = {}
     for r in rows[hi + 1:]:
         if not r:

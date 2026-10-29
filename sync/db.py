@@ -307,10 +307,11 @@ def ensure_schema() -> None:
         conn.commit()
     _schema_ready = True
 
-def _new_connection():
+def _new_connection(**extra: Any):
+    """extra — доп. параметры psycopg2.connect (connect_timeout у журнала хода, sync/progress.py)."""
     parsed = urlparse(_database_url())
     if not parsed.hostname:
-        return psycopg2.connect(_database_url())
+        return psycopg2.connect(_database_url(), **extra)
     return psycopg2.connect(
         host=parsed.hostname,
         port=parsed.port or 5432,
@@ -318,6 +319,7 @@ def _new_connection():
         password=unquote(parsed.password or ""),
         dbname=(parsed.path or "/postgres").lstrip("/") or "postgres",
         sslmode="require",
+        **extra,
     )
 
 

@@ -11,7 +11,6 @@ previous_state — прежний список для отката.
 (20 000 символов) считается независимо от построителя.
 """
 
-import pytest
 
 from sync.agent.writer.negatives import (
     MAX_PHRASES_PER_TICK,
@@ -54,6 +53,18 @@ def test_operators_are_refused():
     for phrase in ('"мгсу"', "!мгсу", "+мгсу", "[мгсу]"):
         ok, _ = phrase_is_valid(phrase)
         assert not ok, phrase
+
+
+def test_only_letters_digits_dot_apostrophe():
+    # «-» Директ читает как минус-оператор, «?» из запроса — отказ записи.
+    for phrase in ("курсы - бесплатно", "курсы -бесплатно", "мгу.рф отзывы?",
+                   "вуз, москва", "диплом_2", "вуз-"):
+        ok, reason = phrase_is_valid(phrase)
+        assert not ok and "робот пишет только" in reason, phrase
+    # дефис между буквами — часть слова, не минус-оператор
+    for phrase in ("мгу.рф отзывы", "o'reilly курс", "колледж 2026", "учёба онлайн",
+                   "санкт-петербург вуз"):
+        assert phrase_is_valid(phrase) == (True, ""), phrase
 
 
 # ------------------------------------------------------------------- план
@@ -370,3 +381,19 @@ def test_evidence_is_absent_when_the_baseline_cpa_is_unknown():
                                 "campaign_type": "TEXT_CAMPAIGN"}},
         cut_cost=plan["cut_cost"], cut_conversions=plan["cut_conversions"])
     assert actions[0].get("evidence") is None
+
+
+def test_superscripts_and_fractions_refused():
+    # isalnum пропустил бы их как «цифры», а Директ таких не примет.
+    for phrase in ("площадь м²", "½ ставки", "курс №1"):
+        ok, reason = phrase_is_valid(phrase)
+        assert not ok and "робот пишет только" in reason, phrase
+    # Буквы любых алфавитов — буквы: казахские нужны LIME KZ.
+    assert phrase_is_valid("қазақ тілі курсы") == (True, "")
+
+
+def test_hyphen_parts_count_as_words():
+    # Директ делит по дефису: 6 слов через пробел, одно из них с дефисом, — это 7.
+    assert phrase_is_valid("вуз санкт-петербург очно заочно бюджет 2026") == (True, "")
+    ok, reason = phrase_is_valid("вуз санкт-петербург очно заочно бюджет 2026 мгу")
+    assert not ok and "8 слов" in reason

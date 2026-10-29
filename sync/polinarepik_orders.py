@@ -18,6 +18,7 @@ from typing import Any
 
 import requests
 
+from sync import progress
 from sync.panda_url import ingest_url
 
 SOURCE_URL = os.environ.get(
@@ -101,6 +102,7 @@ def main() -> int:
     api_key = _require("POLINAREPIK_ORDERS_API_KEY")
     token = _require("POLINAREPIK_INGEST_TOKEN")
 
+    progress.report("orders.fetch", label="Заказы · выгрузка")
     orders = fetch_orders(api_key)
     print(f"Fetched {len(orders)} orders (изменённые за вчера)")
     if not orders:
@@ -112,6 +114,7 @@ def main() -> int:
     all_skipped: list[Any] = []
     all_failed: list[Any] = []
     for i in range(0, len(orders), BATCH_SIZE):
+        progress.report("orders.write", i, len(orders), "Заказы · запись")
         chunk = orders[i : i + BATCH_SIZE]
         res = post_batch(chunk, token)
         total_upserted += int(res.get("upserted") or 0)
@@ -119,6 +122,8 @@ def main() -> int:
         all_failed.extend(res.get("failed") or [])
         print(f"  batch {i // BATCH_SIZE + 1}: upserted={res.get('upserted')}")
 
+    progress.report("orders.write", len(orders), len(orders), "Заказы · запись")
+    progress.result(rows=total_upserted)
     print(f"Total upserted: {total_upserted}/{len(orders)}")
     if all_skipped:
         print(f"Skipped: {json.dumps(all_skipped, ensure_ascii=False)}")

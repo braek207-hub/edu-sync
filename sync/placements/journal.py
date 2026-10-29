@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Журнал чистильщика: что и почему было запрещено.
+"""Кэш вердиктов модели и журнал старого движка чистильщика площадок.
 
-Без журнала бот, ходящий по шести кабинетам каждый час, — чёрный ящик:
-через неделю нельзя ни объяснить срез, ни откатить его, ни увидеть, что
-правило начало резать живое. Пишем и запреты, и сводку такта, включая
-холостые: отсутствие строки должно означать «прогон не состоялся», а не
-«резать было нечего».
+Журнал запретов кабинетов проектов Panda-BI переехал в module_findings
+(sync.modules). Здесь остались вечный кэш ответов модели (домен не меняет
+природу, платить за повторный вопрос о нём не за что) и журнал кабинетов вне
+проектов (accounts.legacy_accounts): без него обратный ход не отличит свой
+запрет от ручного.
 """
 
 import json
@@ -53,6 +53,14 @@ DDL: List[str] = [
     )
     """,
     """
+    CREATE INDEX IF NOT EXISTS placement_cleaner_cuts_run_idx
+      ON placement_cleaner_cuts (run_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS placement_cleaner_cuts_site_idx
+      ON placement_cleaner_cuts (placement)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS placement_llm_verdicts (
       placement   TEXT PRIMARY KEY,
       verdict     TEXT NOT NULL,
@@ -60,14 +68,6 @@ DDL: List[str] = [
       model       TEXT,
       decided_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS placement_cleaner_cuts_run_idx
-      ON placement_cleaner_cuts (run_id)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS placement_cleaner_cuts_site_idx
-      ON placement_cleaner_cuts (placement)
     """,
 ]
 
@@ -83,6 +83,7 @@ def ensure_tables() -> None:
 
 def start_run(account: str, login: str, dry_run: bool,
               plan: Dict[str, Any]) -> int:
+    actions = plan.get("actions") or []
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -97,10 +98,10 @@ def start_run(account: str, login: str, dry_run: bool,
                 (account, login, dry_run,
                  plan.get("day_sites", 0), plan.get("day_clicks", 0),
                  plan.get("day_cost", 0.0),
-                 len(plan.get("actions") or []),
-                 sum(len(a["added"]) for a in plan.get("actions") or []),
-                 sum(a["cut_clicks"] for a in plan.get("actions") or []),
-                 sum(a["cut_cost"] for a in plan.get("actions") or []),
+                 len(actions),
+                 sum(len(a["added"]) for a in actions),
+                 sum(a["cut_clicks"] for a in actions),
+                 sum(a["cut_cost"] for a in actions),
                  json.dumps(plan.get("summary") or {}, ensure_ascii=False),
                  json.dumps(plan.get("refused") or [], ensure_ascii=False)))
             run_id = cur.fetchone()[0]
@@ -130,12 +131,22 @@ def record_cuts(run_id: int, account: str, login: str,
         conn.commit()
 
 
-def fail_run(run_id: int, error: str) -> None:
+def robot_cuts(account: str):
+    """Что робот запрещал сам: кампания → множество площадок.
+
+    Снимать всё подряд по имени нельзя: то же имя директолог мог запретить
+    руками, и стирать его решение — не право робота.
+    """
+    out = {}
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE placement_cleaner_runs SET error=%s "
-                        "WHERE run_id=%s", (error[:2000], run_id))
-        conn.commit()
+            cur.execute("SELECT campaign_id, placement "
+                        "FROM placement_cleaner_cuts "
+                        "WHERE account = %s AND applied", (account,))
+            for campaign_id, placement in cur.fetchall():
+                out.setdefault(str(campaign_id), set()).add(
+                    (placement or "").strip().lower())
+    return out
 
 
 def load_llm_verdicts(sites):
@@ -176,23 +187,3 @@ def save_llm_verdicts(verdicts, model: str) -> None:
                       decided_at = now()
                 """, rows)
         conn.commit()
-
-
-def robot_cuts(account: str):
-    """Что робот запрещал сам: кампания → множество площадок.
-
-    Нужно для обратного хода. Снимать всё подряд по имени нельзя: тот же
-    com.avito.android директолог мог запретить руками годом раньше, и стирать
-    его решение — не право робота. Репетиция снятия 08.09.2026 нашла такие
-    имена в 24 кампаниях Russever, и своих среди них была меньшая часть.
-    """
-    out = {}
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT campaign_id, placement "
-                        "FROM placement_cleaner_cuts "
-                        "WHERE account = %s AND applied", (account,))
-            for campaign_id, placement in cur.fetchall():
-                out.setdefault(str(campaign_id), set()).add(
-                    (placement or "").strip().lower())
-    return out

@@ -13,6 +13,7 @@ import psycopg2.extras
 import pymysql
 
 from sync import data_versions
+from sync import progress
 
 SYNC_DAYS = int(os.environ.get("LIME_SYNC_DAYS") or "7")
 SYNC_FROM = (os.environ.get("LIME_SYNC_FROM") or "").strip() or None
@@ -323,7 +324,8 @@ def sync_lime() -> None:
     try:
         total_raw = 0
         total_agg = 0
-        for day in date_chunks(date_from, date_to):
+        days = list(date_chunks(date_from, date_to))
+        for day in progress.track(days, "procontext.days", "Procontext · дни"):
             conn_my.ping(reconnect=True)
             raw, agg_n = sync_chunk(conn_my, day, day, vk_groups)
             total_raw += raw
@@ -334,6 +336,7 @@ def sync_lime() -> None:
         # Один раз после всех дней, а не на каждый день: витрины на lime_stats (P2) догоняются
         # по версиям всех записанных месяцев разом.
         data_versions.ready("lime", "lime_stats", _pg_url())
+        progress.result(rows=total_agg, days=len(days))
     finally:
         conn_my.close()
 

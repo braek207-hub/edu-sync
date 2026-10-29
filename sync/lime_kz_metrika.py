@@ -22,6 +22,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync import progress
 from sync.ecommerce_health import detect_ecommerce_drop
 from sync.fx import to_rub as fx_to_rub
 from sync.lime_kz_campaigns import (
@@ -232,7 +233,9 @@ def _sync_range(frm: date, to: date, conn) -> int:
 
     total = 0
     day = frm
+    days = (to - frm).days + 1
     while day <= to:
+        progress.report("metrika.days", (day - frm).days, days, "Метрика · дни")
         day_s = day.isoformat()
         metrika = fetch_kz_traffic(COUNTER_ID, token, day_s, day_s)
         fx_rate = fx_to_rub("KZT", day_s)
@@ -260,6 +263,9 @@ def _sync_range(frm: date, to: date, conn) -> int:
 
         total += len(rows)
         day += timedelta(days=1)
+    progress.report("metrika.days", days, days, "Метрика · дни")
+    if conn is not None:
+        progress.result(rows=total, days=days)
     return total
 
 

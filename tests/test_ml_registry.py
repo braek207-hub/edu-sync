@@ -1,4 +1,4 @@
-from sync.ml.registry import REGISTRY, select_features, feature_key, FeatureSpec
+from sync.ml.registry import REGISTRY, select_features, feature_key
 
 def test_registry_has_no_duplicate_names():
     names = [f.name for f in REGISTRY]
