@@ -166,7 +166,12 @@ def inventory(accts: Sequence[DirectAccount], log: Callable[[str], None],
     кампаний» по сбою. У кабинета без доступа кампании не читались — их список не трогаем."""
     out: List[dict] = []
     camps: Dict[str, List[dict]] = {}
+    seen = set()
     for acc in accts:
+        # дубль логина в конфиге проекта: второй upsert той же строки в одном запросе падает
+        if acc.login in seen:
+            continue
+        seen.add(acc.login)
         row = {"login": acc.login, "currency": (acc.currency or "RUB").upper()}
         try:
             found = read_campaigns(acc, call_fn)

@@ -414,3 +414,11 @@ def test_refresh_missing_table_is_logged_not_raised():
 def test_refresh_without_accounts_does_nothing():
     st = InvStore(fail=AssertionError("не должен читать базу"))
     assert cabinets.refresh("lime", [], st, NOW, lambda x: None) is None
+
+
+def test_inventory_skips_duplicate_login():
+    # дубль логина в конфиге проекта (BJORN_DIRECT_CLIENTS_JSON) ронял upsert: «cannot affect
+    # row a second time» — кабинет читается и пишется один раз
+    rows, camps = cabinets.inventory([A, A, B], [].append, _caller({"login-a": 3, "Login-B": 1}))
+    assert [r["login"] for r in rows] == ["login-a", "Login-B"]
+    assert sorted(camps) == ["Login-B", "login-a"]
