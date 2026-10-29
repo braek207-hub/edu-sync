@@ -62,6 +62,16 @@ class TestAdsSpendRows:
     def test_zero_spend_skipped(self):
         assert ads_spend_rows([self._row(spend=0)]) == []
 
+    def test_impressions_and_clicks_carried(self):
+        row = {**self._row(), "impressions": 48032, "clicks": 2380}
+        got = ads_spend_rows([row])[0]
+        assert (got["impressions"], got["clicks"]) == (48032, 2380)
+
+    def test_zero_spend_with_impressions_kept(self):
+        """Показы без расхода (кредит площадки, бонусы) — тоже факт, строку не выбрасываем."""
+        got = ads_spend_rows([{**self._row(spend=0), "impressions": 10, "clicks": 1}])
+        assert len(got) == 1 and got[0]["cost"] == 0
+
     def test_currency_column_is_ignored(self):
         """`currency` = валюта биллинга кабинета, а НЕ единица spend (spend уже в AED).
         Если модуль начнёт её учитывать, Meta вырастет в 3.67 раза."""

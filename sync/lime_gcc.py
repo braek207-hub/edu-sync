@@ -100,6 +100,8 @@ def merge_rows(ga4_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
                 "revenue": 0.0,
                 "cost": 0.0,
                 "cost_rub": 0.0,
+                "clicks": 0,
+                "impressions": 0,
                 "new_users": 0,
                 # Взвешенные на визиты — иначе среднее от средних соврёт при склейке строк.
                 "bounce_w": 0.0,
@@ -141,6 +143,10 @@ def merge_rows(ga4_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
         row = _bucket(sp.get("country"), sp.get("campaign_id"), sp["channel"],
                       sp["subchannel"], sp.get("traffic_type"))
         row["cost"] += float(sp["cost"] or 0)
+        # Показы/клики есть только у строк ads_table (Meta и прочие); Google их получает
+        # в дашборде из кабинета (enrichGccCabinetImpressions), сюда не пишем.
+        row["clicks"] += int(sp.get("clicks") or 0)
+        row["impressions"] += int(sp.get("impressions") or 0)
         if sp.get("campaign_name") and not row["campaign_name"]:
             row["campaign_name"] = sp["campaign_name"]
 
@@ -162,7 +168,8 @@ def merge_rows(ga4_rows, tw_order_rows, tw_spend_rows, fx_rate, date_s,
         out.append((
             date_s, "web", "gcc", country, channel, subchannel, row["traffic_type"],
             campaign, row["campaign_name"],                    # campaign_id, campaign_name
-            cost_rub, 0, 0, row["sessions"], row["users"], 0,   # cost, clicks, impressions, sessions, users, clients
+            cost_rub, row["clicks"], row["impressions"],      # cost, clicks, impressions
+            row["sessions"], row["users"], 0,                   # sessions, users, clients
             round(float(row["orders"]), 6), revenue_rub, 0,     # purchases_count, purchases_revenue, customers
             row["new_users"], 0, 0.0,                           # new_users, new_customers, new_customers_revenue
             # Средневзвешенные по визитам; проценты и «страниц за визит» — конвенция

@@ -313,3 +313,11 @@ def test_app_order_rows_keep_fractions():
     assert sum(r["purchases_count"] for r in rows) == pytest.approx(1, abs=1e-9)
     got = {r["subchannel"]: r["purchases_count"] for r in rows}
     assert got["Google.Adwords"] == 0.7 and got["SEO Google"] == 0.3
+
+
+def test_merge_carries_meta_impressions_and_clicks():
+    spend = [{"date": "2026-10-27", "country": None, "campaign_id": "120", "campaign_name": "CPO_X",
+              "channel": "SMM paid", "subchannel": "Meta Ads", "traffic_type": "Платный",
+              "cost": 10.0, "impressions": 1000, "clicks": 50}]
+    r = dict(zip(COLS, merge_rows([], [], spend, 20.0, "2026-10-27")[0]))
+    assert (r["impressions"], r["clicks"], r["cost"]) == (1000, 50, 200.0)

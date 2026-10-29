@@ -47,7 +47,8 @@ CAMPAIGN_COUNTRY_SUFFIX = {
 }
 
 SPEND_SQL = (
-    "SELECT event_date, channel, campaign_id, campaign_name, SUM(spend) AS spend "
+    "SELECT event_date, channel, campaign_id, campaign_name, SUM(spend) AS spend, "
+    "SUM(impressions) AS impressions, SUM(clicks) AS clicks "
     "FROM ads_table "
     "WHERE event_date BETWEEN @startDate AND @endDate "
     "GROUP BY event_date, channel, campaign_id, campaign_name"
@@ -101,7 +102,8 @@ def ads_spend_rows(db_rows: list[dict]) -> list[dict]:
     не возникает, потому что здесь google-ads не появляется никогда.
 
     Returns:
-        [{date, country, campaign_id, campaign_name, channel, subchannel, traffic_type, cost}]
+        [{date, country, campaign_id, campaign_name, channel, subchannel, traffic_type, cost,
+          impressions, clicks}] — показы и клики площадки: у Meta их больше взять негде.
     """
     out: list[dict] = []
     for row in db_rows:
@@ -110,7 +112,9 @@ def ads_spend_rows(db_rows: list[dict]) -> list[dict]:
         if not mapped:
             continue
         cost = float(row.get("spend") or 0)
-        if not cost:
+        impressions = int(row.get("impressions") or 0)
+        clicks = int(row.get("clicks") or 0)
+        if not (cost or impressions or clicks):
             continue
         channel, subchannel = mapped
         name = (row.get("campaign_name") or "").strip()
@@ -123,6 +127,8 @@ def ads_spend_rows(db_rows: list[dict]) -> list[dict]:
             "subchannel": subchannel,
             "traffic_type": "Платный",
             "cost": cost,
+            "impressions": impressions,
+            "clicks": clicks,
         })
     return out
 
