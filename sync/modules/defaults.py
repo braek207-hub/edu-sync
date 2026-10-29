@@ -16,8 +16,9 @@ ALLOWED_MODES: Dict[str, Tuple[str, ...]] = {
     "audit": ("off", "report"),
 }
 
+# logins — кабинеты, которые обходит модуль; пусто — все кабинеты проекта (accounts_for).
 DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "placements": {"top_n": 30, "always_block": [], "extra_allow": [],
+    "placements": {"logins": [], "top_n": 30, "always_block": [], "extra_allow": [],
                    "spam_rule": False, "lead_goal_ids": [], "rules": [],
                    "max_per_run": 100,
                    # Пустой список категорий — словарь выключен; отдельного enabled нет.
@@ -26,11 +27,11 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
                    # 7.5 молча заменялся бы на 8. Panda хранит то же число 8.
                    "spam": {"min_leads": 5, "min_cr": 8.0, "ratio": 2.5,
                             "goals": "strategy"}},
-    "queries": {"window_days": 30, "cpa_limit": None, "multiplier": 2.0,
+    "queries": {"logins": [], "window_days": 30, "cpa_limit": None, "multiplier": 2.0,
                 "lead_goal_ids": [], "stop_words": [], "never_minus": [],
                 "max_per_run": 20, "rules": [],
                 "builtin": {"phrase_waste": True, "word_zero_conv": True}},
-    "audit": {"banned_words": [], "allowed_goal_ids": [], "require_utm": True,
+    "audit": {"logins": [], "banned_words": [], "allowed_goal_ids": [], "require_utm": True,
               "title_fill_min": 0.6},
 }
 

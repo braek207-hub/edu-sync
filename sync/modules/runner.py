@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from sync.modules import accounts as _accounts
+from sync.modules import cabinets as _cabinets
 from sync.modules import leads as _leads
 from sync.modules import store as _store
 from sync.modules.defaults import settings_for
@@ -97,6 +98,13 @@ def _ctx(slug, mkey, mode, raw_settings, accts, now, log, goals: Iterable[int] =
     return Context(slug=slug, module_key=mkey, mode=mode,
                    settings=settings_for(mkey, raw_settings),
                    accounts=accts, now=now, log=log, project_goals=list(goals), **extra)
+
+
+def _module_accounts(mkey: str, raw_settings, accts) -> Tuple[list, List[str]]:
+    """Кабинеты, которые обходит скан модуля (settings.logins; пусто — все), и строки
+    «почему пропущен» для логинов настройки, которых нет у проекта. Применение одобренного
+    идёт по всем кабинетам: человек одобрил действие, когда кабинет ещё был выбран."""
+    return _cabinets.select_accounts(accts, settings_for(mkey, raw_settings).get("logins"))
 
 
 def _currencies(accts) -> Dict[str, str]:
@@ -263,8 +271,11 @@ def _dry_run(slug, store, accts, modules, now, only, log) -> int:
         if module is None:
             log("[%s] модуль не реализован" % mkey)
             continue
+        mod_accts, skipped = _module_accounts(mkey, row.get("settings"), accts)
+        for line in skipped:
+            log("[%s] %s" % (mkey, line))
         try:
-            out = module.run(_ctx(slug, mkey, "report", row.get("settings"), accts, now, log,
+            out = module.run(_ctx(slug, mkey, "report", row.get("settings"), mod_accts, now, log,
                                   goals))
         except Exception as err:
             log("[%s] ошибка: %s: %s" % (mkey, type(err).__name__, err))
@@ -452,10 +463,15 @@ def _one_preview(slug, store, row, get_accounts, get_goals, modules, now, log) -
         accts, why = get_accounts()
         if not accts:
             raise _NotRun("нет кабинетов: " + "; ".join(why or ["не найдены"]))
+        accts, skipped = _module_accounts(mkey, row.get("settings"), accts)
+        if not accts:
+            raise _NotRun("нет выбранных кабинетов: " + "; ".join(skipped))
         ctx = _ctx(slug, mkey, "report", row.get("settings"), accts, now, log,
                    get_goals(), progress)
         result = _preview_result(module.run(ctx), row.get("rule_id"), accts,
                                  _leads.lead_goals(ctx.settings, ctx.project_goals)[0])
+        if skipped:
+            result["skipped_logins"] = skipped
         status, error = "done", None
     except Exception as err:
         status, result = "error", None
@@ -524,7 +540,8 @@ def run_preview(slug: str, preview_id: int, *, store=_store, accounts=_accounts.
 def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, modules=MODULES,
                 now: datetime, only: Optional[str] = None, dry_run: bool = False,
                 log=print, agent_lock_fn=agent_lock,
-                clock: Callable[[], float] = time.monotonic) -> int:
+                clock: Callable[[], float] = time.monotonic,
+                cabinets: Callable[..., Any] = _cabinets.refresh) -> int:
     """Код 1, если упал хоть один модуль; занятый замок — не ошибка."""
     if dry_run:
         accts, _why = accounts(slug)
@@ -547,6 +564,8 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
         if only and not rows:
             log("модуль %s выключен" % only)
         goals = store.project_lead_goals(slug)
+        # инвентарь — по всем кабинетам проекта, а не по выбранным: из него и выбирают
+        cabinets(slug, accts, store, now, log)
 
         cleaned = False
 
@@ -580,22 +599,32 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 store.finish_run(run_id, "skipped", {
                     "reason": "нет кабинетов: " + "; ".join(why or ["не найдены"])})
                 continue
+            mod_accts, skipped = _module_accounts(mkey, row.get("settings"), accts)
+            for line in skipped:
+                log("[%s] %s" % (mkey, line))
+            if not mod_accts:
+                store.finish_run(run_id, "skipped", {
+                    "reason": "нет выбранных кабинетов: " + "; ".join(skipped),
+                    "skipped_logins": skipped})
+                continue
             summary: dict = {}
             try:
-                ctx = _ctx(slug, mkey, mode, row.get("settings"), accts, now, log, goals)
+                ctx = _ctx(slug, mkey, mode, row.get("settings"), mod_accts, now, log, goals)
                 out = module.run(ctx)
-                cur = _currencies(accts)
+                cur = _currencies(mod_accts)
                 for f in out.findings:
                     # журнал рисует расход находки: тенге без пометки читались бы рублями
                     if cur.get(f.login, RUB) != RUB:
                         f.details["currency"] = cur[f.login]
                 # свой список модуля, иначе кабинеты ctx: туда попали только разрешённые логины
                 scanned = out.scanned_logins if out.scanned_logins is not None \
-                    else [a.login for a in accts]
+                    else [a.login for a in mod_accts]
                 rec = reconcile(mkey, store.existing_findings(slug, mkey), out.findings,
                                 now, scanned, unverified=out.unverified)
                 inserted = store.apply_reconciled(slug, mkey, run_id, rec)
-                summary = _scan_summary(out, accts, cur)
+                summary = _scan_summary(out, mod_accts, cur)
+                if skipped:
+                    summary["skipped_logins"] = skipped
                 summary.update(findings=len(out.findings), inserted=len(rec.insert),
                                resolved=len(rec.resolve), expired=len(rec.expire))
                 if lock_line and mode in WRITE_MODES:

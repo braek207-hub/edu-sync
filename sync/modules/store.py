@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Хранилище модулей Директа: project_modules, module_runs, module_findings, module_previews;
-чтение целей-лидов из project_sources.
+"""Хранилище модулей Директа: project_modules, module_runs, module_findings, module_previews,
+module_cabinets; чтение целей-лидов из project_sources.
 
 Схему ведут миграции Panda-BI (supabase/migrations/20261028231347_direct_modules.sql,
-module_previews — 20261028231419_direct_modules_rules.sql, project_sources —
+module_previews — 20261028231419_direct_modules_rules.sql, module_cabinets —
+20261029162317_module_cabinets.sql, project_sources —
 20261017153700_project_onboarding_core.sql); здесь таблицы не создаются.
 """
 
@@ -423,3 +424,26 @@ def hold_project_lock(slug: str) -> Iterator[bool]:
                     cur.execute("SELECT pg_advisory_unlock(hashtext('modules:' || %s))", (slug,))
         finally:
             conn.close()
+
+
+def cabinets_checked_at(slug: str) -> Optional[datetime]:
+    """Когда инвентарь кабинетов проекта обновлялся последний раз; None — ни разу."""
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT max(checked_at) FROM module_cabinets WHERE dashboard_slug = %s",
+                    (slug,))
+        return cur.fetchone()[0]
+
+
+def upsert_cabinets(slug: str, rows: Sequence[dict]) -> None:
+    """Инвентарь кабинетов (таблица Panda, миграция 20261029162317_module_cabinets.sql).
+    Строки кабинетов, которых нет в rows, не трогаем: временно не прочитанный кабинет
+    сохраняет последнее известное состояние."""
+    with db.get_connection() as conn, conn.cursor() as cur:
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO module_cabinets (dashboard_slug, login, currency, campaigns, access, "
+            "checked_at) VALUES %s ON CONFLICT (dashboard_slug, login) DO UPDATE SET "
+            "currency = EXCLUDED.currency, campaigns = EXCLUDED.campaigns, "
+            "access = EXCLUDED.access, checked_at = EXCLUDED.checked_at",
+            [(slug, r["login"], r["currency"], r["campaigns"], r["access"]) for r in rows],
+            template="(%s, %s, %s, %s, %s, now())")
