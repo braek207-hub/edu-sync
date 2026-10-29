@@ -303,6 +303,9 @@ def store(conn, stream: Stream, job_id: int, since: date, until: date, table_row
         per_day[row[0]] += 1
     days = [since + timedelta(days=i) for i in range((until - since).days + 1)]
     with conn.cursor() as cur:
+        # Пишут двое (Logs API и Data Stream API): без замка две транзакции на один день удаляют
+        # каждая своё и вставляют обе — день задваивается.
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"appm:{stream.name}",))
         cur.execute(f"DELETE FROM {table} WHERE {day_col} BETWEEN %s AND %s", (since, until))
         if table_rows:
             psycopg2.extras.execute_values(cur, f"INSERT INTO {table} ({cols}) VALUES %s",
