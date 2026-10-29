@@ -9,7 +9,7 @@
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
-from sync.modules import direct_api
+from sync.modules import cabinets, direct_api
 from sync.modules.accounts import DirectAccount
 from sync.modules.audit_rules import RULES, SHARED_SETS, START_DATE, UNIFIED_TRACKING, Snapshot
 from sync.modules.queries import window
@@ -66,7 +66,8 @@ def _campaigns(acc: DirectAccount, unavailable: Dict[str, str]) -> List[dict]:
                                    else [])
         try:
             rows = direct_api.get_all(
-                acc.token, acc.login, "campaigns", {"States": ["ON"]}, fields,
+                acc.token, acc.login, "campaigns", cabinets.with_ids(acc, {"States": ["ON"]}),
+                fields,
                 extra={"TextCampaignFieldNames": TEXT_BLOCK,
                        "UnifiedCampaignFieldNames": unified})
             return [c for c in rows if c.get("State") == "ON"]
@@ -152,6 +153,7 @@ def run(ctx: Context) -> RunOutput:
     skipped: Dict[str, Dict[str, int]] = {}
     unavailable: Dict[str, Dict[str, str]] = {}
     unverified: List[Tuple[str, str]] = []
+    skipped_campaigns: List[str] = []
     for acc in ctx.accounts:
         try:
             snap = fetch_snapshot(acc, win)
@@ -164,6 +166,7 @@ def run(ctx: Context) -> RunOutput:
         # scanned_logins, и его открытые находки не закрываются как исправленные.
         findings += found
         scanned.append(acc.login)
+        skipped_campaigns += cabinets.unmatched_lines(acc, (c["Id"] for c in snap.campaigns))
         unverified += [(acc.login, rule) for rule in sorted(snap.unverified)]
         for rule, by in snap.skipped.items():
             slot = skipped.setdefault(rule, {})
@@ -184,4 +187,4 @@ def run(ctx: Context) -> RunOutput:
     if errors:
         summary["errors"] = errors
     return RunOutput(findings=findings, summary=summary, scanned_logins=scanned,
-                     unverified=unverified)
+                     unverified=unverified, skipped_campaigns=skipped_campaigns)

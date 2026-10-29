@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Collection, Dict, List, Optional, Tuple
+from typing import Collection, Dict, List, Mapping, Optional, Tuple
 
 from sync.modules.types import Finding, StoredFinding, fingerprint
 
@@ -63,7 +63,8 @@ def _action_key(f: Finding):
 def reconcile(module_key: str, existing: List[StoredFinding],
               seen: List[Finding], now: datetime,
               scanned_logins: Optional[Collection[str]] = None,
-              unverified: Collection[tuple] = ()) -> Reconciled:
+              unverified: Collection[tuple] = (),
+              scanned_campaigns: Optional[Mapping[str, Collection[int]]] = None) -> Reconciled:
     """scanned_logins: кабинеты, прочитанные в этом прогоне (None — все). Открытые находки
     непрочитанных кабинетов не закрываются; находки с login "" относятся к проекту целиком
     и считаются прочитанными, когда scanned_logins непуст.
@@ -71,6 +72,11 @@ def reconcile(module_key: str, existing: List[StoredFinding],
     unverified: пары (логин, правило) и тройки (логин, правило, кампания), которые прогон
     не проверил (RunOutput.unverified). Их открытые находки не закрываются и не истекают:
     статус и first_seen_at остаются. Тройка держит только находки своей кампании.
+
+    scanned_campaigns: {логин: кампании} — кабинеты, где модуль обходил только выбранные
+    кампании (settings.campaigns). Открытые находки остальных кампаний такого кабинета не
+    закрываются и не истекают — их не читали, как и непрочитанный кабинет. Находка без кампании
+    (уровня кабинета) считается прочитанной.
     """
     skip_pairs = {tuple(u) for u in unverified if len(u) == 2}
     skip_triples = {(u[0], u[1], int(u[2])) for u in unverified if len(u) == 3}
@@ -139,6 +145,10 @@ def reconcile(module_key: str, existing: List[StoredFinding],
         # login "" — находка уровня проекта: прочитана, если прочитан хоть один кабинет
         if (scanned_logins is not None and s.login not in scanned_logins
                 and not (s.login == "" and scanned_logins)):
+            continue
+        # кампанию не выбрали в настройке: её не читали, молчание — не «устранено»
+        chosen = (scanned_campaigns or {}).get(s.login)
+        if chosen is not None and s.campaign_id is not None and int(s.campaign_id) not in chosen:
             continue
         # правило в этом кабинете не отработало: «не нашли» здесь не значит «устранено»
         if (s.login, s.rule) in skip_pairs:

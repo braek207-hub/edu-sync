@@ -166,7 +166,7 @@ def test_findings_shape_and_fingerprint(monkeypatch):
                                                       "курсы бесплатно"]
     # Ключи этапа 1 на месте; этап 2 дописывает снимок правила, окно и метрики.
     assert set(word.details) == {"clicks", "cost", "conversions", "window_from", "window_to",
-                                 "queries_sample", "rule", "matched", "window", "metrics"}
+                                 "queries_sample", "rule", "matched", "window", "metrics", "list_fill"}
     assert word.details["rule"] == {"id": "word_zero_conv", "name": "Слово без конверсий",
                                     "builtin": True,
                                     "params": {"cpa_limit": 3400.0, "cpa_auto": True,
@@ -1275,3 +1275,15 @@ def test_5005_elsewhere_in_group_is_coded(monkeypatch):
     monkeypatch.setattr(qm.direct_api, "keywords_by_campaign", kw)
     res = qm.apply(_ctx(), [_stored(1, "бесплатно")])
     assert res[1].error == "epk_needs_v501"
+
+
+def test_findings_carry_negative_list_fill(monkeypatch):
+    # UI рисует полоску заполненности списка минус-фраз: символы как у записи, лимит Директа
+    FakeDirect(monkeypatch, [_camp(1, negatives=["ручная фраза", " ещё "])], _base())
+    out = qm.run(_ctx())
+    assert out.findings
+    for f in out.findings:
+        assert f.details["list_fill"] == {"used": 15, "max": 20000}
+    FakeDirect(monkeypatch, [_camp(1)], _base())
+    assert {str(f.details["list_fill"]) for f in qm.run(_ctx()).findings} == {
+        str({"used": 0, "max": 20000})}

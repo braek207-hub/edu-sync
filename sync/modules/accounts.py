@@ -19,6 +19,9 @@ class DirectAccount:
     token: str
     currency: str = "RUB"
     label: str = ""
+    # Кампании, которые обходит модуль (settings.campaigns); None — все подходящие кабинета.
+    # Ставит раннер (cabinets.select_accounts), accounts_for его не заполняет.
+    campaign_ids: Optional[Tuple[int, ...]] = None
 
 
 def agency_logins_by_token(token: str) -> List[str]:

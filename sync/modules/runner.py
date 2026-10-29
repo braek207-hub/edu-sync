@@ -101,10 +101,12 @@ def _ctx(slug, mkey, mode, raw_settings, accts, now, log, goals: Iterable[int] =
 
 
 def _module_accounts(mkey: str, raw_settings, accts) -> Tuple[list, List[str]]:
-    """Кабинеты, которые обходит скан модуля (settings.logins; пусто — все), и строки
-    «почему пропущен» для логинов настройки, которых нет у проекта. Применение одобренного
-    идёт по всем кабинетам: человек одобрил действие, когда кабинет ещё был выбран."""
-    return _cabinets.select_accounts(accts, settings_for(mkey, raw_settings).get("logins"))
+    """Кабинеты, которые обходит скан модуля (settings.logins; пусто — все), с выбранными
+    кампаниями (settings.campaigns → campaign_ids), и строки «почему пропущен». Применение
+    одобренного идёт по всем кабинетам и кампаниям: человек одобрил действие, когда они ещё
+    были выбраны."""
+    s = settings_for(mkey, raw_settings)
+    return _cabinets.select_accounts(accts, s.get("logins"), s.get("campaigns"))
 
 
 def _currencies(accts) -> Dict[str, str]:
@@ -468,10 +470,13 @@ def _one_preview(slug, store, row, get_accounts, get_goals, modules, now, log) -
             raise _NotRun("нет выбранных кабинетов: " + "; ".join(skipped))
         ctx = _ctx(slug, mkey, "report", row.get("settings"), accts, now, log,
                    get_goals(), progress)
-        result = _preview_result(module.run(ctx), row.get("rule_id"), accts,
+        out = module.run(ctx)
+        result = _preview_result(out, row.get("rule_id"), accts,
                                  _leads.lead_goals(ctx.settings, ctx.project_goals)[0])
         if skipped:
             result["skipped_logins"] = skipped
+        if out.skipped_campaigns:
+            result["skipped_campaigns"] = out.skipped_campaigns
         status, error = "done", None
     except Exception as err:
         status, result = "error", None
@@ -620,11 +625,14 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 scanned = out.scanned_logins if out.scanned_logins is not None \
                     else [a.login for a in mod_accts]
                 rec = reconcile(mkey, store.existing_findings(slug, mkey), out.findings,
-                                now, scanned, unverified=out.unverified)
+                                now, scanned, unverified=out.unverified,
+                                scanned_campaigns=_cabinets.scanned_campaigns(mod_accts))
                 inserted = store.apply_reconciled(slug, mkey, run_id, rec)
                 summary = _scan_summary(out, mod_accts, cur)
                 if skipped:
                     summary["skipped_logins"] = skipped
+                if out.skipped_campaigns:
+                    summary["skipped_campaigns"] = out.skipped_campaigns
                 summary.update(findings=len(out.findings), inserted=len(rec.insert),
                                resolved=len(rec.resolve), expired=len(rec.expire))
                 if lock_line and mode in WRITE_MODES:

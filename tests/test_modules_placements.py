@@ -822,3 +822,21 @@ def test_rollback_finds_robot_form_of_raw_site(monkeypatch):
     res = pm.rollback(_ctx(), [_stored(1, "WWW.Beta.ru")])
     assert res[1].ok and not res[1].response.get("already_absent")
     assert fake.writes == [(1, ["Ручной.ru"])]
+
+
+def test_selected_campaigns_asked_by_ids_and_rows_narrowed(api, monkeypatch):
+    # settings.campaigns: Директ отдаёт только выбранные, строки отчётов чужих кампаний
+    # кабинета до планировщика не доходят, выбранная без рычага — строка «почему пропущена»
+    asked = []
+
+    def campaigns(t, l, ids=()):
+        asked.append(tuple(ids))
+        return [_camp(1)]
+
+    monkeypatch.setattr(direct, "campaigns", campaigns)
+    acc = dataclasses.replace(ACC, campaign_ids=(1, 5))
+    out = pm.run(_ctx(accounts=[acc]))
+    assert asked == [(1, 5)]
+    assert {f.campaign_id for f in out.findings} == {1}
+    assert out.skipped_campaigns == [
+        "login1: кампания 5 не найдена или не подходит модулю — пропущена"]

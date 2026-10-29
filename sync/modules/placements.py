@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from sync.modules import direct_api, leads
+from sync.modules import cabinets, direct_api, leads
 from sync.modules import rules as R
 from sync.modules.accounts import DirectAccount
 from sync.modules.reasons import by_rule, intercept, merge_intercepted, refusal
@@ -206,6 +206,7 @@ class _LoginScan:
     intercepted: Dict[str, Dict[str, int]] = field(default_factory=dict)
     campaigns: int = 0
     objects: int = 0
+    skipped_campaigns: List[str] = field(default_factory=list)
 
 
 class _Login:
@@ -246,8 +247,8 @@ class _Login:
         # целями — один заказ в Директе, а не два.
         key = (days, tuple(sorted(goals)))
         if key not in self._reports:
-            self._reports[key] = direct.placements_window(self.acc.token, self.acc.login,
-                                                          days, list(key[1]))
+            self._reports[key] = cabinets.keep_rows(self.acc, direct.placements_window(
+                self.acc.token, self.acc.login, days, list(key[1])))
         return self._reports[key]
 
     def existing(self, campaign: dict) -> Set[str]:
@@ -346,10 +347,13 @@ class _Login:
 
     def scan(self, ask, use_db: bool) -> _LoginScan:
         acc, out = self.acc, self.out
-        campaigns = direct.campaigns(acc.token, acc.login)
+        # Выбранные кампании (settings.campaigns) Директ отдаёт сам по Ids; без выбора — все.
+        campaigns = (direct.campaigns(acc.token, acc.login, ids=acc.campaign_ids)
+                     if acc.campaign_ids is not None else direct.campaigns(acc.token, acc.login))
         live = [c for c in campaigns
                 if c.get("Type") in direct.CLEANABLE_TYPES
                 and c.get("State") in direct.CLEANABLE_STATES]
+        out.skipped_campaigns = cabinets.unmatched_lines(acc, (c["Id"] for c in live))
         if not live:
             # У агентского кабинета половина клиентов пустая или выключена:
             # заказывать по ним отчёт — минуты прогона впустую.
@@ -358,7 +362,7 @@ class _Login:
         out.campaigns = len(live)
         self.by_id = {int(c["Id"]): c for c in campaigns}
 
-        rows = direct.placements_today(acc.token, acc.login)
+        rows = cabinets.keep_rows(acc, direct.placements_today(acc.token, acc.login))
         self.frames[0] = _frame(rows, [], acc.currency, self.category)
         self._read_windows()
         objects = {_site(r.get("placement")) for r in rows}
@@ -665,6 +669,7 @@ def run(ctx: Context) -> RunOutput:
     read ={"logins": 0, "campaigns": 0, "objects": 0}
     scanned: List[str] = []
     errors: List[str] = []
+    skipped_campaigns: List[str] = []
     total = len(ctx.accounts)
     for i, acc in enumerate(ctx.accounts, 1):
         try:
@@ -676,6 +681,7 @@ def run(ctx: Context) -> RunOutput:
             read["logins"] += 1
             read["campaigns"] += scan.campaigns
             read["objects"] += scan.objects
+            skipped_campaigns += scan.skipped_campaigns
             findings += scan.findings
             candidates += scan.candidates
             refused += scan.refused
@@ -707,7 +713,7 @@ def run(ctx: Context) -> RunOutput:
         summary["errors"] = errors
     # Упавший логин не сканировали: его открытые находки не закрываем.
     return RunOutput(findings=findings, summary=summary, scanned_logins=scanned,
-                     unverified=unverified)
+                     unverified=unverified, skipped_campaigns=skipped_campaigns)
 
 
 def _fresh(acc: DirectAccount, campaign_id: int):

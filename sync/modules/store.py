@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Хранилище модулей Директа: project_modules, module_runs, module_findings, module_previews,
-module_cabinets; чтение целей-лидов из project_sources.
+module_cabinets, module_campaigns; чтение целей-лидов из project_sources.
 
 Схему ведут миграции Panda-BI (supabase/migrations/20261028231347_direct_modules.sql,
-module_previews — 20261028231419_direct_modules_rules.sql, module_cabinets —
+module_previews — 20261028231419_direct_modules_rules.sql, module_cabinets и module_campaigns —
 20261029162317_module_cabinets.sql, project_sources —
 20261017153700_project_onboarding_core.sql); здесь таблицы не создаются.
 """
@@ -447,3 +447,28 @@ def upsert_cabinets(slug: str, rows: Sequence[dict]) -> None:
             "access = EXCLUDED.access, checked_at = EXCLUDED.checked_at",
             [(slug, r["login"], r["currency"], r["campaigns"], r["access"]) for r in rows],
             template="(%s, %s, %s, %s, %s, now())")
+
+
+def replace_campaigns(slug: str, by_login: dict) -> None:
+    """Кампании прочитанных кабинетов (module_campaigns, та же миграция): по каждому логину
+    строки заменяются целиком — пропавшая или ушедшая в архив кампания уходит из списка.
+    Кабинеты, которых нет в by_login (сбой чтения, нет доступа), не трогаем. Одна транзакция:
+    Panda не увидит кабинет посреди замены."""
+    with db.get_connection() as conn, conn.cursor() as cur:
+        for login, rows in by_login.items():
+            ids = [int(r["id"]) for r in rows]
+            cur.execute("DELETE FROM module_campaigns WHERE dashboard_slug = %s AND login = %s "
+                        "AND NOT (campaign_id = ANY(%s::bigint[]))", (slug, login, ids))
+            if not rows:
+                continue
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO module_campaigns (dashboard_slug, login, campaign_id, name, type, "
+                "search, network, state, checked_at) VALUES %s "
+                "ON CONFLICT (dashboard_slug, login, campaign_id) DO UPDATE SET "
+                "name = EXCLUDED.name, type = EXCLUDED.type, search = EXCLUDED.search, "
+                "network = EXCLUDED.network, state = EXCLUDED.state, "
+                "checked_at = EXCLUDED.checked_at",
+                [(slug, login, r["id"], r["name"], r["type"], r["search"], r["network"],
+                  r["state"]) for r in rows],
+                template="(%s, %s, %s, %s, %s, %s, %s, %s, now())")

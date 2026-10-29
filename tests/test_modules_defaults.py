@@ -5,17 +5,17 @@ from sync.modules.defaults import ALLOWED_MODES, DEFAULTS, MODULE_KEYS, settings
 def test_defaults_pinned():
     assert MODULE_KEYS == ("placements", "queries", "audit")
     assert DEFAULTS == {
-        "placements": {"logins": [], "top_n": 30, "always_block": [], "extra_allow": [],
+        "placements": {"logins": [], "campaigns": {}, "top_n": 30, "always_block": [], "extra_allow": [],
                        "spam_rule": False, "lead_goal_ids": [], "rules": [],
                        "max_per_run": 100,
                        "dictionary": {"categories": ["app", "dsp", "game", "junk"]},
                        "spam": {"min_leads": 5, "min_cr": 8, "ratio": 2.5,
                                 "goals": "strategy"}},
-        "queries": {"logins": [], "window_days": 30, "cpa_limit": None, "multiplier": 2.0,
+        "queries": {"logins": [], "campaigns": {}, "window_days": 30, "cpa_limit": None, "multiplier": 2.0,
                     "lead_goal_ids": [], "stop_words": [], "never_minus": [],
                     "max_per_run": 20, "rules": [],
                     "builtin": {"phrase_waste": True, "word_zero_conv": True}},
-        "audit": {"logins": [], "banned_words": [], "allowed_goal_ids": [],
+        "audit": {"logins": [], "campaigns": {}, "banned_words": [], "allowed_goal_ids": [],
                   "require_utm": True, "title_fill_min": 0.6},
     }
 
@@ -87,3 +87,12 @@ def test_logins_list_kept_and_bad_type_falls_back():
     assert settings_for("placements", {"logins": ["a", "b"]})["logins"] == ["a", "b"]
     assert settings_for("audit", {"logins": "a"})["logins"] == []
     assert settings_for("queries", None)["logins"] == []
+
+
+def test_campaigns_map_kept_ids_normalized():
+    s = settings_for("queries", {"campaigns": {" vuz ": ["123", 45, "x", 0, True, 45],
+                                               "empty": [], "bad": "1", 5: [1]}})
+    assert s["campaigns"] == {"vuz": [123, 45]}
+    for bad in (None, [], "x", 5):
+        assert settings_for("audit", {"campaigns": bad})["campaigns"] == {}
+    assert settings_for("placements", None)["campaigns"] == {}

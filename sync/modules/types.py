@@ -72,3 +72,6 @@ class RunOutput:
     # правила не прочитан, правило выключено настройкой или цель не видна кампании (тройка).
     # Их живые находки reconcile не трогает: молчание — не «исправлено».
     unverified: List[Union[Tuple[str, str], Tuple[str, str, int]]] = field(default_factory=list)
+    # Строки «почему пропущена» по выбранным кампаниям (settings.campaigns), которых у кабинета
+    # нет или которые модулю не подходят: cabinets.unmatched_lines.
+    skipped_campaigns: List[str] = field(default_factory=list)

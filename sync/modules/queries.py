@@ -23,7 +23,7 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 from sync.agent import objects
 from sync.agent.writer import negatives
 from sync.agent.writer.goal import PLACEHOLDER_GOAL_ID, read_goal_ids
-from sync.modules import direct_api, leads
+from sync.modules import cabinets, direct_api, leads
 from sync.modules import rules as R
 from sync.modules.accounts import DirectAccount
 from sync.modules.reasons import by_rule, intercept, merge_intercepted, refusal
@@ -116,7 +116,8 @@ def _campaigns(acc: DirectAccount) -> List[dict]:
     # Стратегии одним вызовом с типом и состоянием: placements.direct.campaign_goals
     # читает только TextCampaign, и ЕПК без goal_ids уходили бы в пропуск молча.
     blocks = ["BiddingStrategy", "PriorityGoals"]
-    return direct_api.get_all(acc.token, acc.login, "campaigns", {},
+    # Выбранные кампании (settings.campaigns) — по Ids: невыбранные Директ не отдаёт.
+    return direct_api.get_all(acc.token, acc.login, "campaigns", cabinets.with_ids(acc),
                               ["Id", "Name", "Type", "State", FIELD],
                               extra={"TextCampaignFieldNames": blocks,
                                      "UnifiedCampaignFieldNames": blocks})
@@ -326,6 +327,7 @@ class _Scan:
     intercepted: Dict[str, Dict[str, int]] = field(default_factory=dict)
     campaigns: int = 0
     objects: int = 0
+    skipped_campaigns: List[str] = field(default_factory=list)
     # False — кабинет целиком не судили: его открытые находки не закрываем
     judged: bool = True
 
@@ -528,6 +530,7 @@ class _Login:
         self.live = {cid: c for cid, c in every.items()
                      if c.get("Type") in TYPES and c.get("State") in STATES}
         self._named_unfit(every)
+        out.skipped_campaigns = cabinets.unmatched_lines(acc, self.live)
         if not self.live:
             self.log("[%s] нечего чистить: ни одной запущенной текстовой кампании или ЕПК"
                      % acc.login)
@@ -923,6 +926,11 @@ class _Login:
 
     def _finding(self, rule: str, cid: str, phrase: str, details: dict) -> Finding:
         what = "Минус-слово" if len(_words(phrase)) == 1 else "Минус-фраза"
+        # Заполненность списка минус-фраз кампании в символах — тем же счётом и с тем же
+        # лимитом Директа (20 000, ref-v5/campaigns), что проверяет запись (_apply_campaign).
+        items = (self.live[cid].get(FIELD) or {}).get("Items") or []
+        details = dict(details, list_fill={"used": _chars(items),
+                                           "max": negatives.MAX_TOTAL_CHARS})
         return Finding(
             rule=rule, severity="info",
             title="%s «%s» в кампании %s" % (what, phrase, cid),
@@ -1033,6 +1041,7 @@ def run(ctx: Context) -> RunOutput:
     unverified: List[tuple] = []
     scanned: List[str] = []
     errors: List[str] = []
+    skipped_campaigns: List[str] = []
     over_cap = 0
     over: Dict[str, int] = {}
     lines: Dict[str, int] = {}
@@ -1050,6 +1059,7 @@ def run(ctx: Context) -> RunOutput:
             read["campaigns"] += scan.campaigns
             read["objects"] += scan.objects
             skipped += scan.skipped
+            skipped_campaigns += scan.skipped_campaigns
             refused += scan.refused
             over_cap += scan.over_cap
             for src, dst in ((scan.over, over), (scan.lines, lines)):
@@ -1080,7 +1090,7 @@ def run(ctx: Context) -> RunOutput:
         summary["settings_notes"] = notes
     # Упавший и пропущенный целиком логин не судили: его открытые находки не закрываем.
     return RunOutput(findings=findings, summary=summary, scanned_logins=scanned,
-                     unverified=unverified)
+                     unverified=unverified, skipped_campaigns=skipped_campaigns)
 
 
 def _fresh(acc: DirectAccount, campaign_id: int):
