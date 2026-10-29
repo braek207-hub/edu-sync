@@ -20,6 +20,7 @@ from datetime import date, timedelta
 
 import psycopg2.extras
 
+from sync import data_versions
 from sync.db import get_connection
 
 COHORT_WINDOW_DAYS = 30
@@ -119,11 +120,19 @@ def sync_cohort_web(day: str, cohort_input: dict) -> None:
                     (day, [str(c) for c in sorted(first_buy)]),
                 )
 
-            # 3. Витрина: перезапись дня покупки.
+            # 3. Витрина: перезапись дня покупки. Удаляемые строки несут свои click_day —
+            # их края снимаем до DELETE, чтобы версия покрыла и месяцы ушедших кликов.
+            cur.execute(
+                "select min(click_day) from lime_section_cohort_daily "
+                "where platform = 'web' and purchase_day = %s",
+                (day,),
+            )
+            old_click = cur.fetchone()
             cur.execute(
                 "delete from lime_section_cohort_daily where platform = 'web' and purchase_day = %s",
                 (day,),
             )
+            rows = []
             if cells:
                 rows = [
                     (cd, day, camp, ch, sec, b, o, round(it, 2), round(rev, 2))
@@ -134,6 +143,8 @@ def sync_cohort_web(day: str, cohort_input: dict) -> None:
                       (click_day, purchase_day, platform, campaign, channel, section, buyers, orders, items, revenue)
                     values (%s, %s, 'web', %s, %s, %s, %s, %s, %s, %s)
                 """, rows, page_size=500)
+            data_versions.bump_dates(cur, "lime", "lime_section_cohort_daily",
+                                     [day, *(old_click or ())] + [r[0] for r in rows], len(rows))
 
             # 4. Клики дня (знаменатель CR): перезапись дня клика.
             cur.execute(

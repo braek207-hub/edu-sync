@@ -17,6 +17,7 @@ import psycopg2.extras
 from sync.appmetrica_logs import (app_country, fetch_installations, fetch_purchase_events,
                                   month_chunks, only_country)
 from sync import appmetrica_raw as raw
+from sync import data_versions
 from sync.appmetrica_raw import target_table
 
 
@@ -566,6 +567,28 @@ _CYCLE_DDL = (
 )
 
 
+# Полностью перезаписываемые таблицы-входы приложения → колонки дат. Версия — только месяцам,
+# чьё содержимое изменилось: перезапись целиком иначе двигала бы версию всей истории каждую ночь.
+_VERSIONED_DATES = {
+    "lime_app_installs": ("date",),
+    "lime_app_cycle_daily": ("cohort_date",),
+    "lime_app_install_purchase_daily": ("install_date", "purchase_date"),
+}
+
+
+def _rewrite(cur, name: str, table: str, columns: tuple, rows: list[tuple], page_size: int) -> None:
+    dates = _VERSIONED_DATES.get(name)
+    # Теневая копия (APPM_TABLE_SUFFIX) — только сверка, витрины её не читают.
+    versioned = dates is not None and table == name
+    before = data_versions.month_fingerprints(cur, table, dates, columns) if versioned else {}
+    cur.execute(f"DELETE FROM {table}")
+    psycopg2.extras.execute_values(
+        cur, f"INSERT INTO {table} ({', '.join(columns)}) VALUES %s", rows, page_size=page_size)
+    if versioned:
+        after = data_versions.month_fingerprints(cur, table, dates, columns)
+        data_versions.bump_changed_months(cur, "lime", name, before, after, len(rows))
+
+
 def _write(installs_rows: list[tuple], cohort_rows: list[tuple],
            cycle_rows: list[tuple], cycle_cohort_rows: list[tuple],
            install_purchase_rows: list[tuple]) -> None:
@@ -577,46 +600,21 @@ def _write(installs_rows: list[tuple], cohort_rows: list[tuple],
             T = {t: target_table(cur, t) for t in (
                 "lime_app_installs", "lime_app_cohorts", "lime_app_cycle_daily", "lime_app_cycle_cohort",
                 "lime_app_install_purchase_daily")}
-            cur.execute(f"DELETE FROM {T['lime_app_installs']}")
-            psycopg2.extras.execute_values(
-                cur,
-                f"INSERT INTO {T['lime_app_installs']} "
-                "(date, publisher, detail, campaign_id, installs, cohort_orders, cohort_revenue) "
-                "VALUES %s",
-                installs_rows, page_size=500,
-            )
-            cur.execute(f"DELETE FROM {T['lime_app_cohorts']}")
-            psycopg2.extras.execute_values(
-                cur,
-                f"INSERT INTO {T['lime_app_cohorts']} "
-                "(cohort_month, publisher, life_month, cohort_size, buyers, orders, revenue) "
-                "VALUES %s",
-                cohort_rows, page_size=500,
-            )
-            cur.execute(f"DELETE FROM {T['lime_app_cycle_daily']}")
-            psycopg2.extras.execute_values(
-                cur,
-                f"INSERT INTO {T['lime_app_cycle_daily']} "
-                "(cohort_date, publisher, detail, campaign_id, step, days, devices) "
-                "VALUES %s",
-                cycle_rows, page_size=2000,
-            )
-            cur.execute(f"DELETE FROM {T['lime_app_cycle_cohort']}")
-            psycopg2.extras.execute_values(
-                cur,
-                f"INSERT INTO {T['lime_app_cycle_cohort']} "
-                "(cohort_date, publisher, detail, campaign_id, devices, buyers1, buyers2, buyers3) "
-                "VALUES %s",
-                cycle_cohort_rows, page_size=2000,
-            )
-            cur.execute(f"DELETE FROM {T['lime_app_install_purchase_daily']}")
-            psycopg2.extras.execute_values(
-                cur,
-                f"INSERT INTO {T['lime_app_install_purchase_daily']} "
-                "(install_date, purchase_date, publisher, detail, campaign_id, orders, revenue) "
-                "VALUES %s",
-                install_purchase_rows, page_size=2000,
-            )
+            _rewrite(cur, "lime_app_installs", T["lime_app_installs"],
+                     ("date", "publisher", "detail", "campaign_id", "installs", "cohort_orders", "cohort_revenue"),
+                     installs_rows, 500)
+            _rewrite(cur, "lime_app_cohorts", T["lime_app_cohorts"],
+                     ("cohort_month", "publisher", "life_month", "cohort_size", "buyers", "orders", "revenue"),
+                     cohort_rows, 500)
+            _rewrite(cur, "lime_app_cycle_daily", T["lime_app_cycle_daily"],
+                     ("cohort_date", "publisher", "detail", "campaign_id", "step", "days", "devices"),
+                     cycle_rows, 2000)
+            _rewrite(cur, "lime_app_cycle_cohort", T["lime_app_cycle_cohort"],
+                     ("cohort_date", "publisher", "detail", "campaign_id", "devices", "buyers1", "buyers2", "buyers3"),
+                     cycle_cohort_rows, 2000)
+            _rewrite(cur, "lime_app_install_purchase_daily", T["lime_app_install_purchase_daily"],
+                     ("install_date", "purchase_date", "publisher", "detail", "campaign_id", "orders", "revenue"),
+                     install_purchase_rows, 2000)
         conn.commit()
     except Exception:
         conn.rollback()

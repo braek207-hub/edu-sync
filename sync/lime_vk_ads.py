@@ -403,6 +403,7 @@ def _upsert_entities(rows: list) -> int:
     with psycopg2.connect(_pg_url(), connect_timeout=30) as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, _ENTITY_UPSERT_SQL, rows, page_size=500)
+            data_versions.bump_dimension(cur, "lime", "lime_vk_entities", len(rows))
         conn.commit()
     return len(rows)
 

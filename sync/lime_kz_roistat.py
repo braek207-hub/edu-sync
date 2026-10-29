@@ -29,7 +29,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
-from sync import progress
+from sync import data_versions, progress
 from sync.fx import to_rub as fx_to_rub
 from sync.roistat_api import fetch_day, fetch_cohort
 from sync.roistat_channels import campaign_of, map_roistat_channel
@@ -280,6 +280,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
                 cur.execute(DELETE_SQL, (day_s, day_s))
                 if rows:
                     psycopg2.extras.execute_values(cur, INSERT_SQL, rows, page_size=500)
+                data_versions.bump(cur, "lime", "lime_stats", day_s, day_s, len(rows))
             conn.commit()
             print(f"lime_kz_roistat: {day_s} → {len(rows)} строк")
 

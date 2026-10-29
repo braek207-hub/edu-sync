@@ -36,7 +36,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
-from sync import progress
+from sync import data_versions, progress
 from sync.fx import to_rub as fx_to_rub
 from sync.gcc_campaign_bridge import bridge_metrika_campaign, fetch_campaign_index
 from sync.gcc_ga4 import GA4_PROPERTY, fetch_ga4_dashboard_traffic
@@ -312,6 +312,7 @@ def _write_day(conn, day_s: str, rows: list[tuple]) -> None:
                 cur.execute(DELETE_SQL, (day_s, day_s))
                 if rows:
                     psycopg2.extras.execute_values(cur, INSERT_SQL, rows, page_size=500)
+                data_versions.bump(cur, "lime", "lime_stats", day_s, day_s, len(rows))
             conn.commit()
             return
         except (psycopg2.errors.DeadlockDetected,

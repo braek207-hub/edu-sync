@@ -1858,6 +1858,7 @@ def _upsert_campaign_settings(rows: List[Dict[str, Any]]) -> int:
                         "settings": json.dumps(row["settings"], ensure_ascii=False),
                     },
                 )
+            data_versions.bump_dimension(cur, "lime", "lime_campaign_settings", len(rows))
         conn.commit()
     return len(rows)
 

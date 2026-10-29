@@ -18,6 +18,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync import data_versions
 from sync.fx import CBR_IDS, to_rub as fx_to_rub
 
 DAYS_BACK = int(os.environ.get("LIME_KZ_CABINET_DAYS_BACK") or "30")
@@ -90,6 +91,8 @@ def sync_lime_kz_cabinet() -> int:
             cur.execute(DELETE_SQL, (frm_s, to_s))
             if rows:
                 psycopg2.extras.execute_values(cur, INSERT_SQL, rows, page_size=500)
+            # Окно, а не даты строк: DELETE окна меняет и дни, где строк больше нет.
+            data_versions.bump(cur, "lime", "lime_stats", frm_s, to_s, len(rows))
         conn.commit()
     except Exception:
         conn.rollback()

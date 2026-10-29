@@ -27,6 +27,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync import data_versions
 from sync.db import _database_url
 from sync.gcc_channels import map_ga4_channel
 from sync.gcc_ga4 import GA4_PROPERTY, run_report
@@ -134,6 +135,9 @@ def run() -> None:
                 cur.execute(f.read())
             cur.execute(DELETE_SQL, (frm, to))
             psycopg2.extras.execute_values(cur, INSERT_SQL, rows, page_size=500)
+            # Окно вместе с датами строк: DELETE окна меняет и дни, где строк больше нет.
+            data_versions.bump_dates(cur, "lime", "lime_gcc_counter_daily",
+                                     [frm, to] + [r[0] for r in rows], len(rows))
         print(f"записано {len(rows)} строк")
     finally:
         conn.close()

@@ -26,6 +26,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extras
 
+from sync import data_versions
 from sync.lime import load_vk_group_map
 from sync.lime_metrika_goals_api import fetch_goal_catalog, fetch_goal_reaches
 from sync.lime_ru_metrika_keys import campaign_key, ru_channel
@@ -195,6 +196,7 @@ def _sync_range(frm: date, to: date, conn) -> int:
                 cur.execute(DELETE_SQL, (day_s, day_s))
                 if rows:
                     psycopg2.extras.execute_values(cur, INSERT_SQL, rows, page_size=1000)
+                data_versions.bump(cur, "lime", "lime_metrika_goal_daily", day_s, day_s, len(rows))
             conn.commit()
             print(f"lime_metrika_goals: {day_s} → {len(rows)} строк")
 

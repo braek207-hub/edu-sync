@@ -34,6 +34,7 @@ from typing import Any, Dict, List
 import requests
 import psycopg2.extras
 
+from sync import data_versions
 from sync.db import get_connection
 
 BASE_URL = "https://api.urbanads.yandex.ru"
@@ -269,6 +270,7 @@ def upsert_media(rows: List[Dict[str, Any]]) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_rows(cur, "lime", "lime_media_stats", rows)
         conn.commit()
     return len(rows)
 

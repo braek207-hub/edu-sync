@@ -172,3 +172,49 @@ def test_direct_upsert_bumps_rows_and_runs_ready(monkeypatch):
     bump = [p for s, p in cur.sql if "bump_data_version" in s]
     assert bump == [("lime", "lime_direct_stats", "2026-10-26", "2026-10-27", 2)]
     assert readies == [("lime", "lime_direct_stats")]
+
+
+def test_bump_dimension_marks_epoch_month():
+    cur = FakeCursor()
+    assert dv.bump_dimension(cur, "lime", "lime_vk_entities", 7) == 42
+    assert cur.sql[1][1] == ("lime", "lime_vk_entities", dv.DIMENSION_DAY, dv.DIMENSION_DAY, 7)
+    assert dv.DIMENSION_DAY == "1970-01-01"
+
+
+def test_rewrite_bumps_only_months_whose_content_changed(monkeypatch):
+    """Полная перезапись: версия — только месяцам, где содержимое изменилось (новый, ушедший,
+    поменявшийся); не тронутые месяцы версию не получают. Теневая копия версию не трогает."""
+    import sync.lime_appmetrica as am
+
+    class Cur(FakeCursor):
+        def __init__(self, snapshots):
+            super().__init__()
+            self.snapshots = list(snapshots)
+
+        def fetchall(self):
+            return self.snapshots.pop(0)
+
+    # до: install_date — март, апрель; purchase_date — апрель. После: апрель тот же, март ушёл,
+    # май появился, purchase_date апреля поменялся.
+    cur = Cur([
+        [("2026-03-01", "a"), ("2026-04-01", "b")],
+        [("2026-04-01", "p")],
+        [("2026-04-01", "b"), ("2026-05-01", "c")],
+        [("2026-04-01", "p2")],
+    ])
+    monkeypatch.setattr(am.psycopg2.extras, "execute_values", lambda *a, **k: None)
+    am._rewrite(cur, "lime_app_install_purchase_daily", "lime_app_install_purchase_daily",
+                ("install_date", "purchase_date", "orders"), [(date(2026, 5, 1), date(2026, 5, 2), 1)], 10)
+    am._rewrite(cur, "lime_app_installs", "lime_app_installs_shadow", ("date",), [], 10)
+    bumps = [p for s, p in cur.sql if "bump_data_version" in s]
+    assert [b[2] for b in bumps] == ["2026-03-01", "2026-04-01", "2026-05-01"]
+    fingerprint = cur.sql[0][0]
+    assert "row(install_date, purchase_date, orders)::text" in fingerprint
+    assert "updated_at" not in fingerprint
+
+
+def test_unchanged_rewrite_bumps_nothing():
+    before = {("date", "2026-09-01"): "x", ("date", "2026-10-01"): "y"}
+    cur = FakeCursor()
+    assert dv.bump_changed_months(cur, "lime", "lime_app_installs", before, dict(before)) == []
+    assert cur.sql == []

@@ -29,6 +29,7 @@ import psycopg2
 import psycopg2.extras
 
 from sync import appmetrica_raw as raw
+from sync import data_versions
 from sync.appmetrica_logs import app_country, fetch_installations, fetch_purchase_events, fetch_sessions, only_country
 from sync.lime_appmetrica import (
     _truthy, first_install_attribution, load_vk_entity_map, parse_dt, purchase_facts,
@@ -118,6 +119,9 @@ def _write(conn, since: str, until: str, rows: list[tuple]) -> None:
         if rows:
             psycopg2.extras.execute_values(
                 cur, f"INSERT INTO {table} ({', '.join(COLUMNS)}) VALUES %s", rows, page_size=1000)
+        # Теневая копия (APPM_TABLE_SUFFIX) — только сверка, витрины её не читают.
+        if table == TABLE:
+            data_versions.bump_dates(cur, "lime", TABLE, [since, until] + [r[0] for r in rows], len(rows))
     conn.commit()
 
 
