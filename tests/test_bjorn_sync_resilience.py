@@ -166,3 +166,14 @@ def test_logs_wait_stops_at_the_step_deadline(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="статус created"):
         sync_card_views.logs_wait("1", {}, 7, deadline=0.0)
+
+
+def test_visits_of_both_models_come_from_one_request():
+    fields = sync_card_views.visit_fields().split(",")
+    assert fields[0] == "ym:s:visitID"
+    assert "ym:s:firstTrafficSource" in fields and "ym:s:lastSignDirectClickBanner" in fields
+    head = "\t".join(fields)
+    row = "\t".join(["42", "organic", "", "", "", "ad", "715000001", "", "M-170000000001"])
+    visits = sync_card_views.parse_visits(f"{head}\n{row}\n")
+    assert visits["first"]["42"] == ("Переходы из поисковых систем", "", "")
+    assert visits["lastsign"]["42"] == ("Переходы по рекламе", "715000001", "170000000001")

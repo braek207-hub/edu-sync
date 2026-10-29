@@ -87,13 +87,19 @@ def norm_product(name: str) -> str:
     return re.sub(r"\s+", " ", BUY_TAIL.split(name)[0].replace("ё", "е").lower()).strip()
 
 
-def visit_fields(prefix: str) -> str:
-    # Кампания и объявление берутся теми же полями, из которых их выводит товарная витрина
-    # (sync_products): UTMCampaign и баннер без «M-». Иначе строки двух витрин не встанут
-    # в один узел дерева на дашборде, даже если id совпадают по смыслу.
-    return (
-        f"ym:s:visitID,ym:s:{prefix}TrafficSource,"
-        f"ym:s:{prefix}UTMCampaign,ym:s:{prefix}DirectClickOrder,ym:s:{prefix}DirectClickBanner"
+# Поля визита на одну модель. Кампания и объявление берутся теми же полями, из которых их
+# выводит товарная витрина (sync_products): UTMCampaign и баннер без «M-». Иначе строки двух
+# витрин не встанут в один узел дерева на дашборде, даже если id совпадают по смыслу.
+VISIT_SUFFIXES = ("TrafficSource", "UTMCampaign", "DirectClickOrder", "DirectClickBanner")
+
+
+def visit_fields() -> str:
+    # Обе модели одним запросом: раньше было по запросу на модель, а каждый запрос — ещё одно
+    # место в очереди Logs API. 29.10.2026 второй из трёх запросов простоял в «created»
+    # 26 минут и уронил шаг по потолку ожидания.
+    return ",".join(
+        ["ym:s:visitID"]
+        + [f"ym:s:{p}{s}" for p in ATTRIBUTION_PREFIX.values() for s in VISIT_SUFFIXES]
     )
 
 
@@ -111,8 +117,8 @@ def logs_create(counter: str, headers: dict[str, str], source: str, fields: str,
 
 def logs_wait(counter: str, headers: dict[str, str], request_id: int, deadline: float) -> dict[str, Any]:
     # Замер пробы 10: день готовится за 33 секунды, но это без очереди. В прогонах 7-дневное
-    # окно (три запроса) занимало от 3,5 до 11 минут, а 04.10.2026 один запрос не успел
-    # за прежний потолок в 20 минут. Поэтому потолок общий на шаг, а не на запрос.
+    # окно (тогда три запроса, теперь два) занимало от 3,5 до 11 минут, а 04.10.2026 один
+    # запрос не успел за прежний потолок в 20 минут. Поэтому потолок общий на шаг.
     status = ""
     while True:
         resp = requests.get(
@@ -180,21 +186,24 @@ def strip_banner(value: str) -> str:
     return text[2:] if text.startswith("M-") else text
 
 
-def parse_visits(text: str) -> dict[str, tuple[str, str, str]]:
-    """visitID → (фраза источника, id кампании, id объявления) в терминах товарной витрины."""
-    out: dict[str, tuple[str, str, str]] = {}
+def parse_visits(text: str) -> dict[str, dict[str, tuple[str, str, str]]]:
+    """Модель → visitID → (фраза источника, id кампании, id объявления) в терминах товарной
+    витрины. Колонки — в порядке visit_fields: visitID, затем по четыре поля на модель."""
+    out: dict[str, dict[str, tuple[str, str, str]]] = {a: {} for a in ATTRIBUTION_PREFIX}
+    step = len(VISIT_SUFFIXES)
     for index, line in enumerate(text.splitlines()):
         if index == 0:
             continue
         parts = line.split("\t")
-        if len(parts) < 5:
+        if len(parts) < 1 + step * len(ATTRIBUTION_PREFIX):
             continue
-        code = parts[1].strip().lower()
-        source = SOURCE_LABELS.get(code, "Не определено")
-        # UTMCampaign первым — им кампанию называет товарная витрина; DirectClickOrder
-        # подхватывает визиты, где метка не раскрылась.
-        campaign = normalize_campaign_id(parts[2]) or strip_banner(parts[3])
-        out[parts[0]] = (source, campaign, strip_banner(parts[4]))
+        for n, attribution in enumerate(ATTRIBUTION_PREFIX):
+            code, utm, order, banner = parts[1 + n * step : 1 + (n + 1) * step]
+            source = SOURCE_LABELS.get(code.strip().lower(), "Не определено")
+            # UTMCampaign первым — им кампанию называет товарная витрина; DirectClickOrder
+            # подхватывает визиты, где метка не раскрылась.
+            campaign = normalize_campaign_id(utm) or strip_banner(order)
+            out[attribution][parts[0]] = (source, campaign, strip_banner(banner))
     return out
 
 
@@ -293,19 +302,16 @@ def main() -> None:
     counter = env_required("METRICA_COUNTER_ID")
     headers = {"Authorization": f"OAuth {env_required('METRICA_TOKEN')}"}
 
-    # 35 минут на три запроса: остальные шаги прогона занимают около 10 минут, задача
-    # ограничена 60 (timeout-minutes в sync-bjorn.yml).
-    deadline = time.monotonic() + 60 * float(env_optional("CARD_VIEWS_WAIT_MINUTES", "35"))
+    # 50 минут на оба запроса: на сервере шаг — свой юнит bjorn_card_views с потолком 60 минут
+    # (infra/panda/sync/gen-units.py в репо Panda-BI).
+    deadline = time.monotonic() + 60 * float(env_optional("CARD_VIEWS_WAIT_MINUTES", "50"))
     hits = fetch(counter, headers, "hits", HIT_FIELDS, date_from, date_to, deadline)
     views = parse_card_views(hits)
     print(f"[bjorn/card_views] просмотров карточек: {len(views)}")
 
-    visits_by_attribution = {
-        attribution: parse_visits(
-            fetch(counter, headers, "visits", visit_fields(prefix), date_from, date_to, deadline)
-        )
-        for attribution, prefix in ATTRIBUTION_PREFIX.items()
-    }
+    visits_by_attribution = parse_visits(
+        fetch(counter, headers, "visits", visit_fields(), date_from, date_to, deadline)
+    )
 
     supabase = SupabaseRest()
     products = load_products(supabase, date_from, date_to)
