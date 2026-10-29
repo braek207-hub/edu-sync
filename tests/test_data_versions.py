@@ -204,8 +204,8 @@ def test_rewrite_bumps_only_months_whose_content_changed(monkeypatch):
     ])
     monkeypatch.setattr(am.psycopg2.extras, "execute_values", lambda *a, **k: None)
     am._rewrite(cur, "lime_app_install_purchase_daily", "lime_app_install_purchase_daily",
-                ("install_date", "purchase_date", "orders"), [(date(2026, 5, 1), date(2026, 5, 2), 1)], 10)
-    am._rewrite(cur, "lime_app_installs", "lime_app_installs_shadow", ("date",), [], 10)
+                ("install_date", "purchase_date", "orders"), [(date(2026, 5, 1), date(2026, 5, 2), 1)], 10, date.min)
+    am._rewrite(cur, "lime_app_installs", "lime_app_installs_shadow", ("date",), [], 10, date.min)
     bumps = [p for s, p in cur.sql if "bump_data_version" in s]
     assert [b[2] for b in bumps] == ["2026-03-01", "2026-04-01", "2026-05-01"]
     fingerprint = cur.sql[0][0]

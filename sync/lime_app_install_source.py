@@ -152,6 +152,11 @@ def sync_lime_app_install_source() -> int:
     inst_since, inst_until = sync_window(install_months, today)
     if use_db:
         inst_until = (today - timedelta(days=1)).isoformat()
+        # Дни до RAW_START не переписываем: сырья под них нет, в витрине — посчитанное до DSA.
+        since = max(since, raw.RAW_START.isoformat())
+        if since > until:
+            print(f"[lime-app-source] окно {since}..{until} целиком до сырья — пропуск")
+            return 0
     country = app_country()
     print(f"[lime-app-source] окно {since}..{until}, установки {inst_since}..{inst_until}, "
           f"app={app_id}, страна покупок={country or 'все'}")

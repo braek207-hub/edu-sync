@@ -38,7 +38,8 @@ def test_plan_tail_first_then_backfill_newest_first_without_tail_days():
     back = [j for j in jobs if j["stream"] == "installs" and j["kind"] == "backfill"]
     assert back[0]["date_until"] == D("2026-10-10")          # граница хвоста установок 14 дн.
     assert back[0]["date_since"] > back[-1]["date_since"]    # новые окна первыми
-    assert back[-1]["date_since"] == D("2024-08-01")
+    # Бэкфилл не глубже срока хранения: дальше prune_db удалил бы загруженное.
+    assert back[-1]["date_since"] == D("2026-10-25") - timedelta(days=400)
     assert all(j["priority"] == 1 for j in back)
     p = next(j for j in jobs if j["stream"] == "purchases")["params"]
     assert p["event_name"] == "purchase" and p["date_dimension"] == "receive"

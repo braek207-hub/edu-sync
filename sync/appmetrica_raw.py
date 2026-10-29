@@ -57,6 +57,7 @@ class Stream:
     tail_days: int
     backfill_from: str          # первый день, который должен быть в покрытии
     chunk: str                  # month | week — нарезка бэкфилла
+    keep_days: int              # сколько дней сырья держать в базе (prune_db); ≥ окна читающих витрин
     fmt: str = "json"           # csv — стримом (сессии: сотни тысяч строк в день)
     event_name: str | None = None
 
@@ -69,22 +70,32 @@ STREAMS: dict[str, Stream] = {s.name: s for s in (
            "tracker_name,click_url_parameters,is_reattribution,is_reinstallation,city,country_iso_code",
            "default", tail_days=14,
            # С запуска приложения: last-touch разделов падает на установку любой давности.
-           backfill_from=os.environ.get("APPM_INSTALLS_FROM") or "2024-08-01", chunk="month"),
+           backfill_from=os.environ.get("APPM_INSTALLS_FROM") or "2024-08-01", chunk="month",
+           # Атрибуция lime_app_install_source — 12 календарных месяцев (до 396 дн.).
+           keep_days=400),
     Stream("deeplinks", "deeplinks",
            "appmetrica_device_id,event_datetime,publisher_name,tracker_name",
            "default", tail_days=7,
-           backfill_from=os.environ.get("APPM_DEEPLINKS_FROM") or "2026-06-01", chunk="month"),
+           backfill_from=os.environ.get("APPM_DEEPLINKS_FROM") or "2026-06-01", chunk="month",
+           # Last-touch разделов: диплинк не старше 90 дн. от пересобираемого дня.
+           keep_days=100),
     Stream("purchases", "events",
            "appmetrica_device_id,event_datetime,event_receive_datetime,event_json,city,country_iso_code",
            "receive", tail_days=7,
            # Окно когорт lime_appmetrica (7 мес.) с запасом на сверку с витринами от 30.09.
            backfill_from=os.environ.get("APPM_PURCHASES_FROM") or "2026-03-01", chunk="month",
-           event_name="purchase"),
+           # Окно когорт — 7 календарных месяцев (до 217 дн.).
+           keep_days=220, event_name="purchase"),
     Stream("sessions", "sessions_starts",
            "appmetrica_device_id,session_start_datetime",
            "default", tail_days=7,
-           backfill_from=os.environ.get("APPM_SESSIONS_FROM") or "2026-09-15", chunk="week", fmt="csv"),
+           backfill_from=os.environ.get("APPM_SESSIONS_FROM") or "2026-09-15", chunk="week",
+           # lime_app_install_source пересобирает последние 10 дн.; сессии — 90% объёма сырья.
+           keep_days=14, fmt="csv"),
 )}
+# Первый день сырья в базе (DSA с 23.10; Logs API встал 28.10, истории по устройствам нет).
+# Витрины не переписывают даты раньше него — там остаются агрегаты, посчитанные до переезда.
+RAW_START = date.fromisoformat(os.environ.get("APPM_RAW_START") or "2026-10-23")
 # Порядок заказа хвоста: установки первыми — без них не считается ни одна витрина.
 STREAM_ORDER = ("installs", "purchases", "sessions", "deeplinks")
 
@@ -162,7 +173,9 @@ def plan(today: date, covered: dict[str, set[date]]) -> list[dict]:
     for name in STREAM_ORDER:
         s = STREAMS[name]
         b_until = today - timedelta(days=s.tail_days + 1)
-        for a, b in reversed(missing_ranges(covered.get(name, set()), _d(s.backfill_from), b_until, s.chunk)):
+        # Дальше срока хранения не заказываем: prune_db удалил бы загруженное, и план повторялся бы.
+        b_since = max(_d(s.backfill_from), kept_since(name, today))
+        for a, b in reversed(missing_ranges(covered.get(name, set()), b_since, b_until, s.chunk)):
             jobs.append(dict(stream=name, kind="backfill", priority=1, date_since=a, date_until=b,
                              params=export_params(s, a, b)))
     return jobs
@@ -275,9 +288,24 @@ def to_table_rows(stream: Stream, rows, job_id: int, since: date, until: date):
                         r.get("publisher_name"), r.get("tracker_name"), job_id))
         elif stream.name == "purchases":
             out.append((day_ok(r["event_receive_datetime"]), dev, _ts(r["event_datetime"]),
-                        _ts(r.get("event_receive_datetime")), r.get("event_json"),
+                        _ts(r.get("event_receive_datetime")), purchase_json(r.get("event_json")),
                         r.get("country_iso_code"), r.get("city"), job_id))
     return out
+
+
+# Из payload покупки витрины читают только это (lime_appmetrica.purchase_facts). Корзина — 9/10
+# объёма строки; разделы берут её из спула окон, а не из базы.
+PURCHASE_KEYS = ("transaction_id", "value", "currency")
+
+
+def purchase_json(raw_json: str | None) -> str | None:
+    try:
+        p = json.loads(raw_json or "")
+    except (ValueError, TypeError):
+        return raw_json
+    if not isinstance(p, dict):
+        return raw_json
+    return json.dumps({k: p[k] for k in PURCHASE_KEYS if k in p}, ensure_ascii=False)
 
 
 TABLES = {
@@ -408,6 +436,26 @@ def retry_or_fail(conn, job: dict, error: str) -> None:
     conn.commit()
 
 
+def kept_since(stream: str, today: date) -> date:
+    """Первый день потока, который ещё лежит в базе по сроку хранения."""
+    return today - timedelta(days=STREAMS[stream].keep_days)
+
+
+def prune_db(conn, today: date) -> dict[str, int]:
+    """Сырьё старше срока хранения — вон вместе с покрытием. → {поток: удалено строк}."""
+    out = {}
+    with conn.cursor() as cur:
+        for name in STREAM_ORDER:
+            table, day_col, _ = TABLES[name]
+            edge = kept_since(name, today)
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"appm:{name}",))
+            cur.execute(f"DELETE FROM {table} WHERE {day_col} < %s", (edge,))
+            out[name] = cur.rowcount
+            cur.execute("DELETE FROM appm_coverage WHERE stream = %s AND day < %s", (name, edge))
+    conn.commit()
+    return out
+
+
 def tails_loaded(conn, today: date) -> bool:
     """Покрыт ли вчерашний день всеми потоками — тогда витрины можно считать."""
     yesterday = today - timedelta(days=1)
@@ -521,6 +569,12 @@ def require_coverage(conn, stream: str, since: date, until: date) -> None:
                           f"загрузчик lime_appmetrica_raw ещё не дотянул окно")
 
 
+def read_from(stream: str, since: date) -> date:
+    """Начало окна чтения: раньше RAW_START сырья нет, раньше срока хранения — удалено. Витрины
+    просят окна в месяцы, а лежит меньше; даты до RAW_START они не переписывают."""
+    return max(since, RAW_START, kept_since(stream, today()))
+
+
 def _fmt(v):
     return v.strftime("%Y-%m-%d %H:%M:%S") if isinstance(v, datetime) else v
 
@@ -532,7 +586,9 @@ def cutoff() -> str | None:
 
 
 def read_installations(conn, since, until) -> list[dict]:
-    since, until = _d(since), _d(until)
+    since, until = read_from("installs", _d(since)), _d(until)
+    if since > until:
+        return []
     require_coverage(conn, "installs", since, until)
     cut = cutoff()
     sql = ("SELECT device_id, install_datetime, install_receive_datetime, publisher_name, tracker_name, "
@@ -559,7 +615,9 @@ def read_purchase_events(conn, since, until, date_dimension: str = "receive") ->
 
     default: события окна могли прийти позже — покрытие нужно по дате приёма от since до
     вчера (или до конца окна при сверке с отсечкой)."""
-    since, until = _d(since), _d(until)
+    since, until = read_from("purchases", _d(since)), _d(until)
+    if since > until:
+        return []
     cut = cutoff()
     if date_dimension == "receive":
         require_coverage(conn, "purchases", since, until)
@@ -589,7 +647,9 @@ def read_purchase_events(conn, since, until, date_dimension: str = "receive") ->
 
 def read_sessions_day(conn, since, until) -> list[tuple]:
     """→ [(device, date, sessions)] — форма sync.lime_app_install_source.aggregate_sessions."""
-    since, until = _d(since), _d(until)
+    since, until = read_from("sessions", _d(since)), _d(until)
+    if since > until:
+        return []
     require_coverage(conn, "sessions", since, until)
     with conn.cursor() as cur:
         cur.execute("SELECT device_id, date, sessions FROM appm_sessions_day WHERE date BETWEEN %s AND %s",
@@ -598,7 +658,9 @@ def read_sessions_day(conn, since, until) -> list[tuple]:
 
 
 def read_deeplinks(conn, since, until) -> list[dict]:
-    since, until = _d(since), _d(until)
+    since, until = read_from("deeplinks", _d(since)), _d(until)
+    if since > until:
+        return []
     require_coverage(conn, "deeplinks", since, until)
     keys = ("appmetrica_device_id", "event_datetime", "publisher_name", "tracker_name")
     with conn.cursor() as cur:

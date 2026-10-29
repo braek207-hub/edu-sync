@@ -2,7 +2,9 @@
 
 installs → недельные установки по партнёру (уникальные устройства, первая установка).
 cohorts  → устройства-покупатели по когорте (месяц × партнёр) накопительно по месяцам жизни.
-Сырьё не хранится — только агрегаты. Границы недели/месяца — по времени установки/события.
+Границы недели/месяца — по времени установки/события. Сырьё — appm_* со сроком хранения
+(appmetrica_raw.STREAMS.keep_days); даты раньше appmetrica_raw.RAW_START не переписываются:
+там агрегаты, посчитанные до переезда на DSA, — сырья под них нет.
 """
 import json
 import os
@@ -576,12 +578,19 @@ _VERSIONED_DATES = {
 }
 
 
-def _rewrite(cur, name: str, table: str, columns: tuple, rows: list[tuple], page_size: int) -> None:
+def _rewrite(cur, name: str, table: str, columns: tuple, rows: list[tuple], page_size: int,
+             edge: date) -> None:
+    """Переписывает строки с первой колонкой (дата/месяц когорты) ≥ edge. Раньше edge — агрегаты,
+    посчитанные до переезда на DSA: сырья под них нет (appmetrica_raw.RAW_START)."""
+    early = [r for r in rows if r[0] < edge]
+    if early:
+        raise RuntimeError(f"[lime-appmetrica] {name}: {len(early)} строк раньше {edge} "
+                           f"(первая {early[0][:3]}) — затёрли бы замороженную историю")
     dates = _VERSIONED_DATES.get(name)
     # Теневая копия (APPM_TABLE_SUFFIX) — только сверка, витрины её не читают.
     versioned = dates is not None and table == name
     before = data_versions.month_fingerprints(cur, table, dates, columns) if versioned else {}
-    cur.execute(f"DELETE FROM {table}")
+    cur.execute(f"DELETE FROM {table} WHERE {columns[0]} >= %s", (edge,))
     psycopg2.extras.execute_values(
         cur, f"INSERT INTO {table} ({', '.join(columns)}) VALUES %s", rows, page_size=page_size)
     if versioned:
@@ -591,7 +600,7 @@ def _rewrite(cur, name: str, table: str, columns: tuple, rows: list[tuple], page
 
 def _write(installs_rows: list[tuple], cohort_rows: list[tuple],
            cycle_rows: list[tuple], cycle_cohort_rows: list[tuple],
-           install_purchase_rows: list[tuple]) -> None:
+           install_purchase_rows: list[tuple], edge: date) -> None:
     conn = psycopg2.connect(_pg_url(), connect_timeout=30)
     try:
         with conn.cursor() as cur:
@@ -600,21 +609,23 @@ def _write(installs_rows: list[tuple], cohort_rows: list[tuple],
             T = {t: target_table(cur, t) for t in (
                 "lime_app_installs", "lime_app_cohorts", "lime_app_cycle_daily", "lime_app_cycle_cohort",
                 "lime_app_install_purchase_daily")}
+            # Когорта месяца RAW_START неполная: устройства месяца до RAW_START в сырьё не попали.
+            month_edge = date(edge.year, edge.month, 1)
             _rewrite(cur, "lime_app_installs", T["lime_app_installs"],
                      ("date", "publisher", "detail", "campaign_id", "installs", "cohort_orders", "cohort_revenue"),
-                     installs_rows, 500)
+                     installs_rows, 500, edge)
             _rewrite(cur, "lime_app_cohorts", T["lime_app_cohorts"],
                      ("cohort_month", "publisher", "life_month", "cohort_size", "buyers", "orders", "revenue"),
-                     cohort_rows, 500)
+                     cohort_rows, 500, month_edge)
             _rewrite(cur, "lime_app_cycle_daily", T["lime_app_cycle_daily"],
                      ("cohort_date", "publisher", "detail", "campaign_id", "step", "days", "devices"),
-                     cycle_rows, 2000)
+                     cycle_rows, 2000, edge)
             _rewrite(cur, "lime_app_cycle_cohort", T["lime_app_cycle_cohort"],
                      ("cohort_date", "publisher", "detail", "campaign_id", "devices", "buyers1", "buyers2", "buyers3"),
-                     cycle_cohort_rows, 2000)
+                     cycle_cohort_rows, 2000, edge)
             _rewrite(cur, "lime_app_install_purchase_daily", T["lime_app_install_purchase_daily"],
                      ("install_date", "purchase_date", "publisher", "detail", "campaign_id", "orders", "revenue"),
-                     install_purchase_rows, 2000)
+                     install_purchase_rows, 2000, edge)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -707,7 +718,9 @@ def sync_lime_appmetrica() -> None:
             f"({since}..{until})."
         )
 
-    _write(installs_rows, cohort_rows, cycle_rows, cycle_cohort_rows, install_purchase_rows)
+    # Откат на Logs API (APPM_SOURCE=api) отдаёт всё окно — тогда витрина переписывается целиком.
+    _write(installs_rows, cohort_rows, cycle_rows, cycle_cohort_rows, install_purchase_rows,
+           raw.RAW_START if use_db else date.min)
     print(f"[lime-appmetrica] записано: install-строк={len(installs_rows)}, "
           f"cohort-строк={len(cohort_rows)}, cycle-строк={len(cycle_rows)}, "
           f"cycle-cohort-строк={len(cycle_cohort_rows)}, "

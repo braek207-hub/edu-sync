@@ -22,7 +22,9 @@ Logs API приложения встал (с 28.10 ни одна выгрузк�
 чтобы подобрать опоздавшие строки; новый закрывшийся день — в первый же прогон. Дни старше
 хвоста не трогаются: спул их уже не покрывает целиком.
 
-Запуск: python -m sync.appmetrica_dsa — скачать окна и собрать дни (юнит каждые 20 мин);
+В базе сырьё лежит сроком хранения потока (appmetrica_raw.prune_db после сборки).
+
+Запуск: python -m sync.appmetrica_dsa — скачать окна и собрать дни (юнит раз в 3 часа);
 python -m sync.appmetrica_dsa ready — выход 0, если вчера покрыто всеми потоками (ворота витрин).
 """
 from __future__ import annotations
@@ -334,6 +336,9 @@ def main(argv: list[str]) -> int:
         ranges = fetch(token, now, time.monotonic() + budget * 60)
         n = build(conn, ranges, today_msk())
         print(f"[appm-dsa] дней собрано {n}, удалено старых окон {prune(now)}", flush=True)
+        dropped = raw.prune_db(conn, today_msk())
+        if any(dropped.values()):
+            print(f"[appm-dsa] сырьё старше срока хранения удалено: {dropped}", flush=True)
         return 0
     finally:
         conn.close()
