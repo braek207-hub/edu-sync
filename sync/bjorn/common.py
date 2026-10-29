@@ -492,6 +492,31 @@ class SupabaseRest:
         print(f"{table}: upserted {len(rows)} rows")
         progress.result(rows=len(rows))
 
+    def bump_data_version(self, project: str, source: str, date_from: str, date_to: str,
+                          rows: int | None = None) -> None:
+        """Версия входа за месяцы окна (sync/data_versions.py) — через RPC PostgREST.
+
+        Транзакции с данными здесь нет: каждый запрос PostgREST коммитится сам. Поэтому
+        версия идёт ПОСЛЕ записи окна — она может отстать от данных (упал вызов — кэш
+        приложения покажет старое до следующего прогона), но не опередить их. Ошибка версии
+        прогон не валит: данные уже записаны."""
+        try:
+            self.request(
+                "POST",
+                "rpc/bump_data_version",
+                json_body={"p_project": project, "p_source": source,
+                           "p_from": date_from, "p_to": date_to, "p_rows": rows},
+            )
+        except RuntimeError as err:
+            print(f"data_versions: версия {project}/{source} не записана — {err}")
+
+    def replace_window(self, project: str, table: str, rows: list[dict[str, Any]], on_conflict: str,
+                       date_from: str, date_to: str) -> None:
+        """Окно [date_from; date_to] целиком заменяется строками и получает версию."""
+        self.delete_date_range(table, date_from, date_to)
+        self.upsert(table, rows, on_conflict)
+        self.bump_data_version(project, table, date_from, date_to, len(rows))
+
     def select_date_range(self, table: str, date_from: str, date_to: str, select: str = "*") -> list[dict[str, Any]]:
         order = ",".join(f"{col}.asc" for col in PAGINATION_KEYS[table])
         rows: list[dict[str, Any]] = []

@@ -206,8 +206,7 @@ def main() -> None:
 
     rows = fetch_rows(date_from, date_to)
     supabase = SupabaseRest()
-    supabase.delete_date_range("stg_direct_daily_campaign", date_from, date_to)
-    supabase.upsert("stg_direct_daily_campaign", rows, "date,campaign_id")
+    supabase.replace_window("bjorn", "stg_direct_daily_campaign", rows, "date,campaign_id", date_from, date_to)
 
 
 if __name__ == "__main__":

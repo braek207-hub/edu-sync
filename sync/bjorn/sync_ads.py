@@ -341,8 +341,7 @@ def main() -> None:
     entities = fetch_entities(client["login"], client["token"], {r["ad_id"] for r in rows})
 
     supabase = SupabaseRest()
-    supabase.delete_date_range(DAILY_TABLE, date_from, date_to)
-    supabase.upsert(DAILY_TABLE, rows, DAILY_ON_CONFLICT)
+    supabase.replace_window("bjorn", DAILY_TABLE, rows, DAILY_ON_CONFLICT, date_from, date_to)
     supabase.upsert(ENTITIES_TABLE, entities, ENTITIES_ON_CONFLICT)
 
     spend = sum(r["cost_vat"] for r in rows)

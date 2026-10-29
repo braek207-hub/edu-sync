@@ -233,8 +233,8 @@ def main() -> None:
     direct_rows = supabase.select_date_range("stg_direct_daily_campaign", date_from, date_to)
     fact_rows = build_fact_rows(metrica_rows, direct_rows)
 
-    supabase.delete_date_range("marketing_daily_fact", date_from, date_to)
-    supabase.upsert("marketing_daily_fact", fact_rows, "date,attribution,source,source_detail,campaign_id")
+    supabase.replace_window("bjorn", "marketing_daily_fact", fact_rows,
+                            "date,attribution,source,source_detail,campaign_id", date_from, date_to)
 
 
 if __name__ == "__main__":

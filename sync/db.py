@@ -516,7 +516,9 @@ def check_not_shrunk(
 
 
 def _guard_window_replace(cur, table: str, date_col: str, measure: str, rows: List[Dict[str, Any]],
-                          new_total: float, min_date: str) -> None:
+                          new_total: float, min_date: str) -> Optional[date]:
+    """Возвращает последнюю дату окна в базе ДО замены — правый край версии: окно открыто
+    справа, и удалённые дни позже новых строк тоже изменились."""
     cur.execute(
         f"SELECT COALESCE(SUM({measure}), 0), MAX({date_col}) FROM {table} WHERE {date_col} >= %s",
         (min_date,),
@@ -524,6 +526,7 @@ def _guard_window_replace(cur, table: str, date_col: str, measure: str, rows: Li
     old_total, old_max = cur.fetchone()
     new_max = max(date.fromisoformat(str(r[date_col])[:10]) for r in rows)
     check_not_shrunk(table, old_total=float(old_total), old_max=old_max, new_total=new_total, new_max=new_max)
+    return old_max
 
 
 def replace_crm_leads(rows: List[Dict[str, Any]]) -> int:
@@ -563,10 +566,12 @@ def replace_crm_leads(rows: List[Dict[str, Any]]) -> int:
     min_date = min(str(r["date"]) for r in rows)
     with get_connection() as conn:
         with conn.cursor() as cur:
-            _guard_window_replace(cur, "crm_leads", "date", "leads", rows,
-                                  sum(int(r["leads"]) for r in rows), min_date)
+            old_max = _guard_window_replace(cur, "crm_leads", "date", "leads", rows,
+                                            sum(int(r["leads"]) for r in rows), min_date)
             cur.execute("DELETE FROM crm_leads WHERE date >= %s", (min_date,))
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_dates(cur, "edunetwork", "crm_leads",
+                                     [min_date, old_max, *(r["date"] for r in rows)], len(rows))
         conn.commit()
     return len(rows)
 
@@ -684,8 +689,27 @@ def upsert_lead_details(rows: List[Dict[str, Any]], delete_from: str = "") -> in
     with get_connection() as conn:
         with conn.cursor() as cur:
             _guard_window_replace(cur, "crm_lead_details", "created_date", "1", rows, len(rows), min_date)
+            # Дашборд режет период по двум датам: лиды — created_date, оплаты — payment_date
+            # (handlers/edunetwork.ts). Меняются и удаляемые строки окна, и строки вне окна,
+            # которые upsert по lead_id перепишет (лид, достроенный по «Оплатам»), — версия
+            # нужна месяцам обеих дат у старых строк и у новых.
+            cur.execute(
+                """
+                SELECT MIN(LEAST(created_date, payment_date)), MAX(GREATEST(created_date, payment_date))
+                  FROM crm_lead_details
+                 WHERE created_date >= %s OR lead_id = ANY(%s)
+                """,
+                (min_date, [r["lead_id"] for r in rows]),
+            )
+            old_lo, old_hi = cur.fetchone()
             cur.execute("DELETE FROM crm_lead_details WHERE created_date >= %s", (min_date,))
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_dates(
+                cur, "edunetwork", "crm_lead_details",
+                [min_date, old_lo, old_hi,
+                 *(r["created_date"] for r in rows), *(r.get("payment_date") for r in rows)],
+                len(rows),
+            )
         conn.commit()
     return len(rows)
 
@@ -716,10 +740,12 @@ def replace_crm_payments(rows: List[Dict[str, Any]]) -> int:
     min_date = min(str(r["date"]) for r in rows)
     with get_connection() as conn:
         with conn.cursor() as cur:
-            _guard_window_replace(cur, "crm_payments", "date", "payments", rows,
-                                  sum(int(r["payments"]) for r in rows), min_date)
+            old_max = _guard_window_replace(cur, "crm_payments", "date", "payments", rows,
+                                            sum(int(r["payments"]) for r in rows), min_date)
             cur.execute("DELETE FROM crm_payments WHERE date >= %s", (min_date,))
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_dates(cur, "edunetwork", "crm_payments",
+                                     [min_date, old_max, *(r["date"] for r in rows)], len(rows))
         conn.commit()
     return len(rows)
 
@@ -755,40 +781,33 @@ def upsert_polinarepik_direct_stats(rows: List[Dict[str, Any]]) -> int:
     return len(rows)
 
 
-def delete_polinarepik_metrica_from(date_from: str) -> int:
+def delete_window_from(project: str, table: str, date_col: str, date_from: str) -> int:
+    """DELETE хвоста таблицы с date_from и версия удалённых дней — в той же транзакции.
+
+    Удаление и upsert идут разными транзакциями, а upsert отмечает только даты новых строк:
+    день, который из источника исчез целиком, без этой отметки остался бы в кэше приложения."""
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM polinarepik_metrica_visits WHERE date >= %s",
-                (date_from,),
-            )
+            cur.execute(f"SELECT MAX({date_col}) FROM {table} WHERE {date_col} >= %s", (date_from,))
+            old_max = cur.fetchone()[0]
+            cur.execute(f"DELETE FROM {table} WHERE {date_col} >= %s", (date_from,))
             deleted = cur.rowcount
+            if old_max:
+                data_versions.bump(cur, project, table, date_from, old_max, deleted)
         conn.commit()
     return deleted
+
+
+def delete_polinarepik_metrica_from(date_from: str) -> int:
+    return delete_window_from("polinarepik", "polinarepik_metrica_visits", "date", date_from)
 
 
 def delete_polinarepik_metrica_purchases_from(date_from: str) -> int:
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM polinarepik_metrica_purchases WHERE purchase_date >= %s",
-                (date_from,),
-            )
-            deleted = cur.rowcount
-        conn.commit()
-    return deleted
+    return delete_window_from("polinarepik", "polinarepik_metrica_purchases", "purchase_date", date_from)
 
 
 def delete_polinarepik_metrica_sources_from(date_from: str) -> int:
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM polinarepik_metrica_sources WHERE date >= %s",
-                (date_from,),
-            )
-            deleted = cur.rowcount
-        conn.commit()
-    return deleted
+    return delete_window_from("polinarepik", "polinarepik_metrica_sources", "date", date_from)
 
 
 def upsert_polinarepik_metrica_sources(rows: List[Dict[str, Any]]) -> int:
@@ -1304,6 +1323,7 @@ def upsert_edu_visit_behavior(rows: List[Dict[str, Any]]) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_rows(cur, "edunetwork", "edu_visit_behavior", rows, key="visit_date")
         conn.commit()
     return len(rows)
 

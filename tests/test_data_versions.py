@@ -218,3 +218,119 @@ def test_unchanged_rewrite_bumps_nothing():
     cur = FakeCursor()
     assert dv.bump_changed_months(cur, "lime", "lime_app_installs", before, dict(before)) == []
     assert cur.sql == []
+
+
+# ── P8: входы EDU, BJORN, mnf, Polina и справочник целей LIME ──
+
+
+class QueueCursor(FakeCursor):
+    """fetchone отдаёт заранее заданные ответы по очереди; версия — 42."""
+
+    def __init__(self, answers):
+        super().__init__()
+        self.answers = list(answers)
+
+    def fetchone(self):
+        if self.sql and "bump_data_version" in self.sql[-1][0]:
+            return (42,)
+        return self.answers.pop(0)
+
+    @property
+    def rowcount(self):
+        return 3
+
+
+def _db_with(monkeypatch, cur):
+    from contextlib import contextmanager
+
+    import sync.db as db
+
+    @contextmanager
+    def conn():
+        yield FakeConn(cur)
+
+    monkeypatch.setattr(db, "get_connection", conn)
+    monkeypatch.setattr(db, "ensure_schema", lambda: None)
+    monkeypatch.setattr(db.psycopg2.extras, "execute_batch", lambda *a, **k: None)
+    return db
+
+
+def _bumps(cur):
+    return [p for s, p in cur.sql if "bump_data_version" in s]
+
+
+def test_crm_window_replace_bumps_window_up_to_old_tail(monkeypatch):
+    """Окно открыто справа: удалённый хвост позже новых строк тоже отмечается."""
+    cur = QueueCursor([(10, date(2026, 10, 28))])
+    db = _db_with(monkeypatch, cur)
+    rows = [{"date": "2026-10-01", "leads": 6}, {"date": "2026-10-25", "leads": 5}]
+    db.replace_crm_leads(rows)
+    assert _bumps(cur) == [("edunetwork", "crm_leads", "2026-10-01", "2026-10-28", 2)]
+
+
+def test_lead_details_bump_covers_payment_dates_and_rewritten_old_rows(monkeypatch):
+    # guard → (строк, MAX created_date); затем крайние created/payment_date старых строк.
+    cur = QueueCursor([(1, date(2026, 10, 27)), (date(2026, 3, 2), date(2026, 10, 28))])
+    db = _db_with(monkeypatch, cur)
+    rows = [{"lead_id": "L1", "created_date": "2026-09-01", "payment_date": "2026-10-20"},
+            {"lead_id": "L2", "created_date": "2026-10-27", "payment_date": ""}]
+    db.upsert_lead_details(rows)
+    span_sql, span_params = cur.sql[1]
+    assert "lead_id = ANY" in span_sql and span_params == ("2026-09-01", ["L1", "L2"])
+    assert _bumps(cur) == [("edunetwork", "crm_lead_details", "2026-03-02", "2026-10-28", 2)]
+
+
+def test_delete_window_bumps_deleted_days_and_skips_empty_tail(monkeypatch):
+    cur = QueueCursor([(date(2026, 10, 27),), (None,)])
+    db = _db_with(monkeypatch, cur)
+    assert db.delete_window_from("meshnflesh", "meshnflesh_metrica_sources", "date", "2026-10-01") == 3
+    assert _bumps(cur) == [("meshnflesh", "meshnflesh_metrica_sources", "2026-10-01", "2026-10-27", 3)]
+    db.delete_window_from("polinarepik", "polinarepik_metrica_purchases", "purchase_date", "2026-10-28")
+    assert len(_bumps(cur)) == 1
+    assert "purchase_date >= %s" in cur.sql[-1][0]
+
+
+def test_goal_catalog_bumps_dimension_only_when_content_changed(monkeypatch):
+    import sync.lime_metrika_goals as g
+
+    monkeypatch.setattr(g.psycopg2.extras, "execute_values", lambda *a, **k: None)
+    catalog = [{"goal_id": "1", "name": "Корзина", "type": "action", "is_retargeting": False}]
+
+    same = QueueCursor([("abc",), ("abc",)])
+    g._write_catalog(FakeConn(same), catalog)
+    assert _bumps(same) == []
+    assert "synced_at" not in same.sql[0][0]
+
+    changed = QueueCursor([("abc",), ("def",)])
+    g._write_catalog(FakeConn(changed), catalog)
+    assert _bumps(changed) == [("lime", "lime_metrika_goals", dv.DIMENSION_DAY, dv.DIMENSION_DAY, 1)]
+
+
+def test_bjorn_replace_window_bumps_after_write_via_rpc(monkeypatch):
+    import sync.bjorn.common as common
+
+    monkeypatch.setenv("SUPABASE_URL", "https://x")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "k")
+    client = common.SupabaseRest()
+    calls = []
+    monkeypatch.setattr(client, "request", lambda method, path, **kw: calls.append((method, path, kw)))
+    client.replace_window("bjorn", "marketing_daily_fact", [{"date": "2026-10-27"}],
+                          "date,campaign_id", "2026-10-27", "2026-10-28")
+    assert [c[:2] for c in calls] == [("DELETE", "marketing_daily_fact")] * 2 + [
+        ("POST", "marketing_daily_fact"), ("POST", "rpc/bump_data_version")]
+    assert calls[-1][2]["json_body"] == {"p_project": "bjorn", "p_source": "marketing_daily_fact",
+                                         "p_from": "2026-10-27", "p_to": "2026-10-28", "p_rows": 1}
+
+
+def test_bjorn_version_failure_does_not_fail_sync(monkeypatch):
+    import sync.bjorn.common as common
+
+    monkeypatch.setenv("SUPABASE_URL", "https://x")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "k")
+    client = common.SupabaseRest()
+
+    def boom(*a, **k):
+        raise RuntimeError("PGRST202")
+
+    monkeypatch.setattr(client, "request", boom)
+    client.bump_data_version("bjorn", "bjorn_ad_daily", "2026-10-01", "2026-10-02")

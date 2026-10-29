@@ -31,8 +31,8 @@ from typing import Any, Dict, List
 import psycopg2.extras
 import requests
 
-from sync import progress
-from sync.db import get_connection
+from sync import data_versions, progress
+from sync.db import delete_window_from, get_connection
 
 METRICA_COUNTER_ID = "82116769"
 # «Автоматическая атрибуция» интерфейса = именно automatic (проверено 22.08 живым
@@ -167,6 +167,7 @@ def upsert_direct(rows: List[Dict[str, Any]]) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_rows(cur, "meshnflesh", "meshnflesh_direct_stats", rows)
         conn.commit()
     return len(rows)
 
@@ -366,12 +367,7 @@ def fetch_metrica_purchases(token: str, date_from: str, date_to: str) -> list[di
 
 
 def delete_sources_from(date_from: str) -> int:
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM meshnflesh_metrica_sources WHERE date >= %s", (date_from,))
-            deleted = cur.rowcount
-        conn.commit()
-    return deleted
+    return delete_window_from("meshnflesh", "meshnflesh_metrica_sources", "date", date_from)
 
 
 def upsert_sources(rows: List[Dict[str, Any]]) -> int:
@@ -398,19 +394,13 @@ def upsert_sources(rows: List[Dict[str, Any]]) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_rows(cur, "meshnflesh", "meshnflesh_metrica_sources", rows)
         conn.commit()
     return len(rows)
 
 
 def delete_purchases_from(date_from: str) -> int:
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM meshnflesh_metrica_purchases WHERE purchase_date >= %s", (date_from,)
-            )
-            deleted = cur.rowcount
-        conn.commit()
-    return deleted
+    return delete_window_from("meshnflesh", "meshnflesh_metrica_purchases", "purchase_date", date_from)
 
 
 def upsert_purchases(rows: List[Dict[str, Any]]) -> int:
@@ -439,6 +429,8 @@ def upsert_purchases(rows: List[Dict[str, Any]]) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+            data_versions.bump_rows(cur, "meshnflesh", "meshnflesh_metrica_purchases", rows,
+                                    key="purchase_date")
         conn.commit()
     return len(rows)
 

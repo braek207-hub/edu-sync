@@ -39,6 +39,9 @@ COLUMNS = ("date", "channel", "subchannel", "traffic_type", "campaign_id", "goal
 INSERT_SQL = f"INSERT INTO lime_metrika_goal_daily ({', '.join(COLUMNS)}) VALUES %s"
 DELETE_SQL = "DELETE FROM lime_metrika_goal_daily WHERE date >= %s AND date <= %s"
 
+# Без synced_at: он меняется каждым прогоном, и справочник «менялся» бы еженощно.
+CATALOG_COLUMNS = ("goal_id", "name", "type", "source", "is_retargeting")
+
 CATALOG_SQL = """
 INSERT INTO lime_metrika_goals (goal_id, name, type, source, is_retargeting, synced_at)
 VALUES %s
@@ -147,10 +150,13 @@ def _write_catalog(conn, catalog: list[dict]) -> None:
         for g in catalog
     ]
     with conn.cursor() as cur:
+        before = data_versions.table_fingerprint(cur, "lime_metrika_goals", CATALOG_COLUMNS)
         psycopg2.extras.execute_values(
             cur, CATALOG_SQL, rows, page_size=500,
             template="(%s, %s, %s, %s, %s, now())",
         )
+        data_versions.bump_dimension_if_changed(
+            cur, "lime", "lime_metrika_goals", before, CATALOG_COLUMNS, len(rows))
     conn.commit()
 
 

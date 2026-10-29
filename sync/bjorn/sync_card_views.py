@@ -318,8 +318,7 @@ def main() -> None:
     print(f"[bjorn/card_views] товаров в справочнике витрины: {len(products)}")
 
     rows = build_rows(views, visits_by_attribution, products)
-    supabase.delete_date_range(TABLE, date_from, date_to)
-    supabase.upsert(TABLE, rows, ON_CONFLICT)
+    supabase.replace_window("bjorn", TABLE, rows, ON_CONFLICT, date_from, date_to)
     print(f"[bjorn/card_views] {len(rows)} строк за {date_from}..{date_to}")
 
 

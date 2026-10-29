@@ -166,6 +166,7 @@ def main() -> None:
         supabase.upsert(TABLE, rows, ON_CONFLICT)
         total += len(rows)
         print(f"[bjorn/products] {attribution}: {len(rows)} строк")
+    supabase.bump_data_version("bjorn", TABLE, date_from, date_to, total)
     print(f"[bjorn/products] всего {total} строк за {date_from}..{date_to}")
 
 

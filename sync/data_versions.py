@@ -92,6 +92,14 @@ def month_fingerprints(cur, table: str, date_columns: Iterable[str],
     return out
 
 
+def table_fingerprint(cur, table: str, columns: Iterable[str]) -> Optional[str]:
+    """Отпечаток всего содержимого таблицы без дат (справочник) по записываемым колонкам."""
+    row = "row(" + ", ".join(columns) + ")::text"
+    cur.execute(f"SELECT md5(string_agg({row}, '|' ORDER BY {row})) FROM {table}")
+    found = cur.fetchone()
+    return found[0] if found else None
+
+
 def bump_changed_months(cur, project: str, source: str, before: dict, after: dict,
                         rows: Optional[int] = None) -> list:
     """Версия только месяцам, чьё содержимое изменилось (появилось, ушло, поменялось).
@@ -112,6 +120,17 @@ DIMENSION_DAY = "1970-01-01"
 def bump_dimension(cur, project: str, source: str, rows: Optional[int] = None) -> Optional[int]:
     """`bump` справочника без дат. Звать, только если что-то реально записано."""
     return bump(cur, project, source, DIMENSION_DAY, DIMENSION_DAY, rows)
+
+
+def bump_dimension_if_changed(cur, project: str, source: str, before: Optional[str],
+                              columns: Iterable[str], rows: Optional[int] = None) -> Optional[int]:
+    """`bump_dimension`, только если отпечаток справочника после записи отличается от `before`.
+
+    Справочник переписывается каждым прогоном целиком, а его версия примешана к ключу КАЖДОГО
+    месяца: безусловная отметка остужала бы весь кэш проекта при неизменном справочнике."""
+    if table_fingerprint(cur, source, columns) == before:
+        return None
+    return bump_dimension(cur, project, source, rows)
 
 
 def ready(project: str, source: str, url: Optional[str] = None) -> int:
