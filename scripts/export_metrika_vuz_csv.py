@@ -39,12 +39,9 @@ def _end_of_day_ts(d: date) -> int:
 
 
 def export_vuz_csv(*, days: int, out_path: Path) -> dict:
-    if not os.environ.get("GOOGLE_SHEETS_ID") and os.environ.get("SHEET_ID_EDU"):
-        os.environ["GOOGLE_SHEETS_ID"] = os.environ["SHEET_ID_EDU"]
-
     sid = os.environ.get("GOOGLE_SHEETS_ID", "").strip()
     if not sid:
-        raise SystemExit("GOOGLE_SHEETS_ID (или SHEET_ID_EDU) не задан")
+        raise SystemExit("GOOGLE_SHEETS_ID не задан")
 
     today = date.today()
     date_from = today - timedelta(days=days - 1)

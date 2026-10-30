@@ -25,8 +25,6 @@ def _cell(row, idx):
 
 
 def main() -> None:
-    if not os.environ.get("GOOGLE_SHEETS_ID") and os.environ.get("SHEET_ID_EDU"):
-        os.environ["GOOGLE_SHEETS_ID"] = os.environ["SHEET_ID_EDU"]
     sid = os.environ["GOOGLE_SHEETS_ID"]
     service = get_sheets_service()
 

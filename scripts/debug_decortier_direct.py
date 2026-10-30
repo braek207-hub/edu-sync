@@ -24,16 +24,8 @@ for name in (".env.local", ".env"):
         k, v = t.split("=", 1)
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-token = (
-    os.environ.get("DECORTIER_DIRECT_TOKEN", "")
-    or os.environ.get("DIRECT_DECORTIET_TOKEN", "")
-    or os.environ.get("DIRECT_DECORTIER_TOKEN", "")
-).strip()
-login = (
-    os.environ.get("DECORTIER_DIRECT_CLIENT_LOGIN", "")
-    or os.environ.get("DIRECT_CLIENT_DECORTIET_LOGIN", "")
-    or "walpapperdecor"
-).strip()
+token = os.environ.get("DECORTIER_DIRECT_TOKEN", "").strip()
+login = (os.environ.get("DECORTIER_DIRECT_CLIENT_LOGIN", "") or "walpapperdecor").strip()
 
 if not token:
     print("ERROR: no token", file=sys.stderr)

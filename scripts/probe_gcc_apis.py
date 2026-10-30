@@ -14,7 +14,7 @@ Discovery-скрипт (B1 плана LIME GCC). НЕ пишет в БД — т�
 Env:
     GCC_TRIPLEWHALE_API_KEY   — ключ TW (scopes Read)
     GCC_TW_SHOP_DOMAIN        — *.myshopify.com магазина GCC (для summary-page)
-    GCC_GA4_PROPERTY_ID       — id ресурса GA4 (default 417919368)
+    GCC_GA4_PROPERTY          — id ресурса GA4 (default 417919368)
     GOOGLE_SERVICE_ACCOUNT / GOOGLE_APPLICATION_CREDENTIALS — сервис-аккаунт (реюз GSC)
 """
 import json
@@ -78,7 +78,7 @@ def probe_tw():
 
 
 def probe_ga4():
-    pid = (os.environ.get("GCC_GA4_PROPERTY_ID") or GA4_PROPERTY_DEFAULT).strip()
+    pid = (os.environ.get("GCC_GA4_PROPERTY") or GA4_PROPERTY_DEFAULT).strip()
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
 

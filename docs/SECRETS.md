@@ -10,9 +10,12 @@
 | edu-sync (GitHub Secret) | Уже есть в BJ_auto_metrica | GAS / локально |
 |--------------------------|----------------------------|----------------|
 | `GCP_SA_KEY` | ✅ `GCP_SA_KEY` | — |
-| `SHEET_ID_EDU` или `GOOGLE_SHEETS_ID` | ✅ `SHEET_ID_EDU` | Script Property **`SPREADSHEET_ID`** (тот же ID книги) |
-| `DIRECT_TOKEN_EDU` или `DIRECT_TOKEN` | ✅ `DIRECT_TOKEN_EDU` | — |
-| `DIRECT_CLIENTS_JSON_EDU` | ✅ `DIRECT_CLIENTS_JSON_EDU` | JSON `[{login, goal_ids, sheet_name}, …]` |
+| `GOOGLE_SHEETS_ID` | ✅ `SHEET_ID_EDU` | Script Property **`SPREADSHEET_ID`** (тот же ID книги) |
+| `DIRECT_TOKEN` | ✅ `DIRECT_TOKEN_EDU` | — |
+| `DIRECT_CLIENTS_JSON` | ✅ `DIRECT_CLIENTS_JSON_EDU` | JSON `[{login, goal_ids, sheet_name}, …]` |
+
+Код читает только имена из первой колонки (с 30.10.2026 алиасы `SHEET_ID_EDU`, `DIRECT_TOKEN_EDU`,
+`DIRECT_CLIENTS_JSON_EDU` не читаются; правило имён — EduDash `docs/ENV-MAP.md` §6).
 | `DATABASE_URL` | ❌ только для v2 | Supabase **Connect → Prisma** → первая строка (**6543**, `aws-*-ap-south-1.pooler…`) |
 | `LIME_DB_HOST` | — | MySQL хост LIME |
 | `LIME_DB_SCHEMA` | — | Имя БД (schema) |
@@ -103,7 +106,7 @@ Workflow: `.github/workflows/sync-lime-gcc.yml` → таблица `lime_stats` 
 
 В Apps Script: **Project Settings → Script properties → `SPREADSHEET_ID`** — это ID Google-книги с листами `Лиды`, `Оплаты`, Direct.
 
-Совпадает с `SHEET_ID_EDU` в GitHub.
+Совпадает с `GOOGLE_SHEETS_ID` в GitHub.
 
 ### CRM
 
@@ -133,11 +136,11 @@ Workflow: `.github/workflows/sync-lime-gcc.yml` → таблица `lime_stats` 
 
 Минимум секретов в **edu-sync** (Settings → Secrets):
 
-1. Скопировать из **BJ_auto_metrica** (значения те же):
+1. Скопировать из **BJ_auto_metrica** (значения те же, имена — канонические):
    - `GCP_SA_KEY`
-   - `SHEET_ID_EDU`
-   - `DIRECT_TOKEN_EDU`
-   - `DIRECT_CLIENTS_JSON_EDU`
+   - `GOOGLE_SHEETS_ID` (там `SHEET_ID_EDU`)
+   - `DIRECT_TOKEN` (там `DIRECT_TOKEN_EDU`)
+   - `DIRECT_CLIENTS_JSON` (там `DIRECT_CLIENTS_JSON_EDU`)
 
 2. Добавить для Supabase:
    - `DATABASE_URL` — **transaction pooler** из Supabase Connect (порт **6543**, user `postgres.vkawfgoqjjdlcfvzihbx`, регион **ap-south-1** — не `eu-central-1`)
@@ -153,7 +156,7 @@ Workflow: `.github/workflows/sync-lime-gcc.yml` → таблица `lime_stats` 
    - `LIME_DIRECT_TOKEN` — OAuth Яндекс Директ (аккаунт LIME)
    - `LIME_DIRECT_CLIENT_LOGIN` — логин рекламируемого аккаунта LIME
 
-Опционально дублировать под «универсальными» именами: `GOOGLE_SERVICE_ACCOUNT` (= содержимое `GCP_SA_KEY`), `GOOGLE_SHEETS_ID` (= `SHEET_ID_EDU`).
+Опционально дублировать под «универсальным» именем: `GOOGLE_SERVICE_ACCOUNT` (= содержимое `GCP_SA_KEY`).
 
 ---
 

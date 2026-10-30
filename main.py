@@ -11,20 +11,8 @@ load_dotenv()
 
 
 def _resolve_env() -> None:
-    """Поддержка имён секретов из BJ_auto_metrica и edu-sync."""
-    if not os.environ.get("GOOGLE_SHEETS_ID") and os.environ.get("SHEET_ID_EDU"):
-        os.environ["GOOGLE_SHEETS_ID"] = os.environ["SHEET_ID_EDU"]
-    if not os.environ.get("GOOGLE_SHEETS_ID") and os.environ.get("SHEET_ID"):
-        os.environ["GOOGLE_SHEETS_ID"] = os.environ["SHEET_ID"]
-
-    if not os.environ.get("DIRECT_TOKEN") and os.environ.get("DIRECT_TOKEN_EDU"):
-        os.environ["DIRECT_TOKEN"] = os.environ["DIRECT_TOKEN_EDU"]
-
-    if not os.environ.get("DIRECT_CLIENTS_JSON") and os.environ.get(
-        "DIRECT_CLIENTS_JSON_EDU"
-    ):
-        os.environ["DIRECT_CLIENTS_JSON"] = os.environ["DIRECT_CLIENTS_JSON_EDU"]
-
+    """Адрес базы для Actions. Ключи читаются только под каноническими именами
+    (GOOGLE_SHEETS_ID, DIRECT_TOKEN, DIRECT_CLIENTS_JSON) — EduDash docs/ENV-MAP.md §6."""
     # GitHub Actions: pooler (IPv4). Локально можно DIRECT_URL (5432).
     if os.environ.get("GITHUB_ACTIONS"):
         pooler = os.environ.get("DATABASE_POOLER_URL") or os.environ.get(

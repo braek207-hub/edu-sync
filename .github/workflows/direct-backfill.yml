@@ -43,9 +43,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_URL: ${{ secrets.DIRECT_URL }}
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
-          DIRECT_TOKEN_EDU: ${{ secrets.DIRECT_TOKEN_EDU }}
           DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
-          DIRECT_CLIENTS_JSON_EDU: ${{ secrets.DIRECT_CLIENTS_JSON_EDU }}
           DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
           DIRECT_SOURCE: api
           DIRECT_SYNC_MODE: ${{ github.event.inputs.mode || 'monthly_upsert' }}

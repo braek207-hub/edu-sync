@@ -73,12 +73,9 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_URL: ${{ secrets.DIRECT_URL }}
           DIRECT_TOKEN: ${{ secrets.DIRECT_TOKEN }}
-          DIRECT_TOKEN_EDU: ${{ secrets.DIRECT_TOKEN_EDU }}
           DIRECT_CLIENTS_JSON: ${{ secrets.DIRECT_CLIENTS_JSON }}
-          DIRECT_CLIENTS_JSON_EDU: ${{ secrets.DIRECT_CLIENTS_JSON_EDU }}
           DIRECT_CLIENT_LOGIN: ${{ secrets.DIRECT_CLIENT_LOGIN }}
           GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
-          SHEET_ID_EDU: ${{ secrets.SHEET_ID_EDU }}
           # Офлайн-конверсии в Я.Метрику. Расписание/incremental — реальная загрузка;
           # ручной запуск по умолчанию dry-run (только посчитать).
           YM_TOKEN: ${{ secrets.YM_TOKEN }}
