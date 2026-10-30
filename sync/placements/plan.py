@@ -37,12 +37,47 @@ def site_is_valid(site: str):
     return True, ""
 
 
+def evictable(own, items, keep=()) -> List[str]:
+    """Свои запреты кампании, которые ротация вправе снять, в порядке снятия.
+
+    own — площадки, которые робот запрещал сам (его применённые находки), старейшие
+    первыми. Снимается только элемент, стоящий в списке ровно в той форме, в какой робот
+    его писал (нормализованной): вариант в другом регистре или с «/» ставил человек, —
+    то же правило, что у отката. keep — что снимать нельзя: обязательный список кабинета,
+    пришпиленное этим прогоном, площадки, которые сейчас же и пишутся.
+    """
+    exact = {str(x).strip() for x in (items or [])}
+    hold = {normalize(x) for x in keep or []}
+    out: List[str] = []
+    for site in own or []:
+        site = normalize(site)
+        if site and site in exact and site not in hold and site not in out:
+            out.append(site)
+    return out
+
+
+def free_slots(existing: int, ceiling: int, limit: int) -> int:
+    """Сколько новых встаёт без ротации: до max(потолок, текущая длина), но не выше лимита.
+
+    Список выше потолка заполнил человек: робот его не растит и не опускает чужими
+    руками — меняет свои 1:1 (rotation_need).
+    """
+    return max(min(max(ceiling, existing), limit) - existing, 0)
+
+
+def rotation_need(added: int, existing: int, ceiling: int, limit: int) -> int:
+    """Сколько своих снять под added новых: не больше added, ровно столько, чтобы итог не
+    превысил max(потолок, текущая длина) и лимит."""
+    return min(max(added - free_slots(existing, ceiling, limit), 0), added)
+
+
 def merge_sites(existing: List[str], added: List[str],
                 max_sites: int = MAX_EXCLUDED_SITES) -> List[str]:
     """Прежний список плюс новые площадки, в пределах лимита.
 
     Прежние запреты неприкосновенны: их ставил человек, и вытеснять их ради
-    своих — не право робота. Не поместившиеся ждут следующего такта.
+    своих — не право робота (свои старые снимает только ротация, plan_account(own=…)).
+    Не поместившиеся ждут следующего такта.
     """
     merged = [normalize(s) for s in (existing or []) if normalize(s)]
     seen = set(merged)
@@ -67,7 +102,8 @@ def plan_account(rows: List[Dict[str, Any]],
                  always_block=None,
                  spam: Optional[Dict[str, str]] = None,
                  cut_verdicts=CUT_VERDICTS,
-                 guard: Optional[Callable[[str, str, str], Optional[dict]]] = None
+                 guard: Optional[Callable[[str, str, str], Optional[dict]]] = None,
+                 own: Optional[Dict[str, List[str]]] = None
                  ) -> Dict[str, Any]:
     """Строки отчёта + кампании кабинета → план запретов по кампаниям.
 
@@ -78,6 +114,10 @@ def plan_account(rows: List[Dict[str, Any]],
     остаётся вердиктом, но не режется. guard(площадка, кампания, вердикт) —
     защита человека (правило protect, «Никогда не закрывать»): вернула отказ —
     площадка в этой кампании не пишется, отказ уходит в plan["guarded"].
+
+    own — {кампания: свои запреты робота, старейшие первыми}. Когда под потолком нет
+    места, план снимает старейшие из них (ротация, action["evict"]) ровно столько, сколько
+    нужно новым. Без own — прежний отказ «список запретов заполнен».
     """
     kwargs = {}
     if allow_exact is not None:
@@ -188,8 +228,8 @@ def plan_account(rows: List[Dict[str, Any]],
                                       "запрет не пишем" % campaign.get("State")})
             continue
 
-        existing = [normalize(s) for s in
-                    ((campaign.get("ExcludedSites") or {}).get("Items") or [])]
+        items = (campaign.get("ExcludedSites") or {}).get("Items") or []
+        existing = [normalize(s) for s in items]
         existing = [s for s in existing if s]
         known = set(existing)
 
@@ -248,7 +288,10 @@ def plan_account(rows: List[Dict[str, Any]],
 
         limit = sites_limit(campaign.get("Type"))
         ceiling = ceiling_for(limit, fill_ceiling)
-        room = ceiling - len(existing)
+        spare = evictable((own or {}).get(cid), items,
+                          list(pinned) + [a["placement"] for a in added])
+        # Ёмкость: свободное под потолком плюс свои запреты, которые можно снять (1:1).
+        room = free_slots(len(existing), ceiling, limit) + len(spare)
         if room <= 0:
             refused.append({
                 "campaign_id": cid, "name": campaign.get("Name"),
@@ -262,14 +305,17 @@ def plan_account(rows: List[Dict[str, Any]],
                           "площадок" % (ceiling, room, len(added) - room)})
             added = added[:room]
 
-        merged = merge_sites(existing, [a["placement"] for a in added],
-                             max_sites=limit)
+        evict = spare[:rotation_need(len(added), len(existing), ceiling, limit)]
+        gone = set(evict)
+        merged = merge_sites([x for x in items if str(x).strip() not in gone],
+                             [a["placement"] for a in added], max_sites=limit)
         actions.append({
             "campaign_id": cid,
             "campaign_name": campaign.get("Name"),
             "state": campaign.get("State"),
             "existing_count": len(existing),
             "added": added,
+            "evict": evict,
             "sites": merged,
             "fill_after": len(merged),
             "cut_clicks": sum(a["clicks"] for a in added),

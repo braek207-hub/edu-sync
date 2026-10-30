@@ -17,10 +17,11 @@ import psycopg2.extras
 
 from sync import db
 from sync.modules.lifecycle import (FAILED_RETRY_HOURS, LIVE_STATUSES, REJECT_SUPPRESS_DAYS,
-                                    Reconciled, can_transition)
+                                    ROTATED, Reconciled, can_transition)
 from sync.modules.types import ApplyResult, StoredFinding, fingerprint
 
-_FINDING_COLS = ("id, status, fingerprint, last_seen_at, decided_at, outcome_at, rule, severity, title, "
+_FINDING_COLS = ("id, status, fingerprint, last_seen_at, decided_at, outcome_at, applied_at, "
+                 "response, rule, severity, title, "
                  "login, campaign_id, campaign_name, object_type, object_id, details, action")
 
 
@@ -33,6 +34,7 @@ def _stored(row: dict) -> StoredFinding:
     return StoredFinding(
         id=row["id"], status=row["status"], fingerprint=row["fingerprint"],
         last_seen_at=row["last_seen_at"], decided_at=row["decided_at"], outcome_at=row["outcome_at"],
+        applied_at=row.get("applied_at"), response=row.get("response"),
         rule=row["rule"], severity=row["severity"], title=row["title"],
         login=row["login"] or "", campaign_id=row["campaign_id"],
         campaign_name=row["campaign_name"] or "", object_type=row["object_type"] or "",
@@ -256,13 +258,44 @@ def approve_auto(slug: str, module_key: str, ids: Sequence[int]) -> List[int]:
             "AND NOT EXISTS (SELECT 1 FROM module_findings h "
             "  WHERE h.dashboard_slug = f.dashboard_slug AND h.module_key = f.module_key "
             "    AND h.status = 'rolled_back' "
+            # снятое ротацией откатил робот, а не человек: запрета на возврат за ним нет
+            "    AND NOT coalesce(h.response ? %s, false) "
             "    AND coalesce(h.login, '') = coalesce(f.login, '') "
             "    AND h.campaign_id IS NOT DISTINCT FROM f.campaign_id "
             "    AND coalesce(h.object_id, '') = coalesce(f.object_id, '') "
             "    AND h.action->>'op' IS NOT DISTINCT FROM f.action->>'op') "
             "RETURNING f.id",
-            (slug, module_key, list(ids)))
+            (slug, module_key, list(ids), ROTATED))
         return [r[0] for r in cur.fetchall()]
+
+
+def applied_findings(slug: str, module_key: str, login: str) -> List[StoredFinding]:
+    """Свои применённые находки модуля в кабинете, старейшие первыми: что робот сам держит в
+    Директе. Перенесённая история старого журнала (placement_cleaner_cuts) лежит тут же —
+    миграция direct_modules перенесла её как applied с applied_at = cut_at."""
+    with db.get_connection() as conn, _dict_cursor(conn) as cur:
+        cur.execute(
+            f"SELECT {_FINDING_COLS} FROM module_findings "
+            "WHERE dashboard_slug = %s AND module_key = %s AND status = 'applied' AND login = %s "
+            "ORDER BY coalesce(applied_at, outcome_at, last_seen_at), id",
+            (slug, module_key, login))
+        return [_stored(r) for r in cur.fetchall()]
+
+
+def mark_displaced(finding_id: int, note: dict) -> bool:
+    """Свой запрет снят ротацией (applied -> rolled_back): место в списке ушло под новую
+    находку. Пометка response.rotated отличает его от отката человека (lifecycle.rotated):
+    такой не подавляет повторную находку и не мешает авторежиму. Ответ применения
+    сохраняем: по нему видно, что было запрещено."""
+    if not can_transition("applied", "rolled_back"):
+        return False
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE module_findings SET status = 'rolled_back', outcome_at = now(), "
+            "response = coalesce(response, '{}'::jsonb) || jsonb_build_object(%s::text, %s::jsonb) "
+            "WHERE id = %s AND status = 'applied'",
+            (ROTATED, json.dumps(note, ensure_ascii=False), finding_id))
+        return cur.rowcount == 1
 
 
 def request_rollback(slug: str, module_key: str, object_ids: Sequence[str],

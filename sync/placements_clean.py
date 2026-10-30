@@ -9,11 +9,13 @@
 режим модуля (report/approve/auto) и настройки живут в project_modules, а не
 в флагах. Без --apply прогон идёт репетицией: ничего не пишется в базу и Директ.
 
-Кабинет вне проектов Panda-BI (accounts.legacy_accounts, сейчас ОШ Синергия)
-модулю недоступен и чистится прежним движком (sync.placements.legacy) — только
-когда назван в --accounts явно:
+Кабинет вне проектов Panda-BI (accounts.legacy_accounts) модулю недоступен и
+чистится прежним движком (sync.placements.legacy) — только когда назван в
+--accounts явно. С 30.10.2026 таких нет: ОШ Синергия — проект synergy, и
 
     python -m sync.placements_clean --apply --accounts synergy_school
+
+идёт в раннер модулей этого проекта.
 """
 
 import argparse

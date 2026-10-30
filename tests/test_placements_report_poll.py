@@ -76,3 +76,22 @@ def test_other_api_error_still_raised(monkeypatch):
 def test_endless_queue_gives_up(monkeypatch):
     with pytest.raises(D.DirectError, match="не сформировался"):
         _run(monkeypatch, [_Resp(202) for _ in range(D.MAX_POLL)])
+
+
+def _temporary(code="1000"):
+    body = json.dumps({"error": {"error_code": code,
+                                 "error_string": "Сервис временно недоступен"}},
+                      ensure_ascii=False).encode("utf-8")
+    return urllib.error.HTTPError(D.REPORTS, 500, "Internal Server Error", {}, io.BytesIO(body))
+
+
+def test_temporary_1000_retried_with_backoff(monkeypatch):
+    """vpo-goroda (ОШ Синергия) отдаёт 1000 на каждый второй-третий вызов."""
+    lines, sleeps = _run(monkeypatch, [_temporary(), _temporary("52"), _Resp(200, b"A\n")])
+    assert lines == ["A"]
+    assert sleeps == [D.CALL_BACKOFF, 2 * D.CALL_BACKOFF]
+
+
+def test_temporary_error_gives_up_after_call_attempts(monkeypatch):
+    with pytest.raises(D.DirectError, match="1000"):
+        _run(monkeypatch, [_temporary() for _ in range(D.CALL_ATTEMPTS)])

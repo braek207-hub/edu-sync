@@ -18,7 +18,9 @@ LIVE_STATUSES = ("open", "approved", "applied", "rollback_requested")
 _TRANSITIONS = {
     "open": {"approved", "rejected", "dismissed", "resolved", "expired"},
     "approved": {"applied", "failed"},
-    "applied": {"rollback_requested"},
+    # rolled_back прямо из applied — только ротация (store.mark_displaced): робот сам снял
+    # свой старый запрет, чтобы освободить место под новый
+    "applied": {"rollback_requested", "rolled_back"},
     # applied при откате: Директ отказал в снятии, запрет остался в силе
     "rollback_requested": {"rolled_back", "applied"},
 }
@@ -26,6 +28,16 @@ _TRANSITIONS = {
 
 def can_transition(src: str, dst: str) -> bool:
     return dst in _TRANSITIONS.get(src, ())
+
+
+# Ключ пометки в module_findings.response у запрета, снятого ротацией (store.mark_displaced).
+ROTATED = "rotated"
+
+
+def rotated(s: StoredFinding) -> bool:
+    """Откат сделал сам робот ради места в списке, а не человек: решения «не возвращать»
+    за ним нет, и площадка, найденная снова, снова запрещается."""
+    return s.status == "rolled_back" and isinstance(s.response, dict) and ROTATED in s.response
 
 
 @dataclass
@@ -46,6 +58,8 @@ def _suppressed(s: StoredFinding, now: datetime) -> bool:
     # итоги раннера меряем от момента итога, а не решения человека (одобрить могли давно)
     ref = s.outcome_at or s.decided_at or s.last_seen_at
     if s.status == "rolled_back":
+        if rotated(s):
+            return False
         # человек снял запрет, auto-режим не должен вернуть его сразу
         return now - ref < timedelta(days=REJECT_SUPPRESS_DAYS)
     if s.status == "failed":

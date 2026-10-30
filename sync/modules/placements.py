@@ -11,6 +11,12 @@
 Пользовательские правила судят строки отчётов за свои окна (leads.build_rows) и идут
 под общий лимит max_per_run. Запись и откат — по правилу движка: свежее чтение ->
 слияние -> запись -> чтение обратно.
+
+Ротация: потолок списка (0,9 лимита) занят — робот снимает свои самые старые запреты
+кампании (его применённые находки, ctx.applied), ровно столько, сколько нужно новым.
+Ручные (их нет в журнале), «Всегда закрывать» и спам-площадки не снимаются никогда.
+Снятые раннер переводит в rolled_back с пометкой response.rotated (store.mark_displaced):
+в журнале они видны, а найденные снова — снова запрещаются.
 """
 
 import os
@@ -38,6 +44,9 @@ DICTIONARY = ("app", "dsp", "game", "junk")
 # Эти вердикты режутся всегда: второй судья, «Всегда закрывать», спам. Настройка
 # dictionary.categories включает и выключает только категории словаря.
 PINNED_VERDICTS = frozenset({"llm", "forced", "spam"})
+# Свои запреты этих правил ротация не снимает: «Всегда закрывать» — решение человека, а
+# спам-площадка дорога (накручивает заявки) и вернулась бы ближайшим тактом.
+NEVER_ROTATE = frozenset({"forced", "spam"})
 BUILTIN_NAMES = {"app": "Словарь мусора", "dsp": "Словарь мусора", "game": "Словарь мусора",
                  "junk": "Словарь мусора", "llm": "Второй судья", "forced": "Всегда закрывать",
                  "spam": "Спам-площадки"}
@@ -45,6 +54,68 @@ BUILTIN_NAMES = {"app": "Словарь мусора", "dsp": "Словарь м
 
 def _site(name) -> str:
     return classify.normalize(name)
+
+
+def own_site(f: StoredFinding) -> str:
+    """Площадка своего запрета; пусто — находка не запрет площадки в кампании. Перенесённая
+    история (details.migrated_from) может прийти без action — тогда по object_type/object_id."""
+    if f.campaign_id is None:
+        return ""
+    if f.action is not None:
+        if f.action.get("op") != "exclude_site":
+            return ""
+        return _site(f.action.get("site") or f.object_id)
+    return _site(f.object_id) if f.object_type == "site" else ""
+
+
+def _age(f: StoredFinding):
+    return (f.applied_at or f.outcome_at or f.last_seen_at, f.id)
+
+
+def own_by_campaign(applied: List[StoredFinding], always_block=()) -> Dict[int, List[StoredFinding]]:
+    """Свои применённые запреты логина, которые вправе снимать ротация: {кампания: находки},
+    старейшие первыми (по applied_at, как отдаёт store.applied_findings).
+
+    Своё — только то, что есть в журнале робота; ручной запрет директолога туда не попадает
+    и не снимается никогда. Не снимаются и правила NEVER_ROTATE, и площадки «Всегда
+    закрывать» из текущих настроек, под каким бы правилом их ни записали. Пришпиленное
+    прогоном (спам этой недели) отсекает keep у planner.evictable.
+    """
+    forced = {_site(x) for x in always_block or []}
+    out: Dict[int, List[StoredFinding]] = {}
+    for f in sorted(applied or [], key=_age):
+        if f.status != "applied" or f.rule in NEVER_ROTATE:
+            continue
+        site = own_site(f)
+        if site and site not in forced:
+            out.setdefault(int(f.campaign_id), []).append(f)
+    return out
+
+
+ABSENT_REASON = "запрета нет в кампании"
+
+
+def absent_own(applied: List[StoredFinding], campaigns: List[dict]) -> List[dict]:
+    """Свои applied-запреты прочитанных кампаний, которых в списке нет в той форме, в какой
+    робот их писал: сняли руками, или запись ротации прошла, а чтение обратно упало. Такие
+    раннер переводит в rolled_back с пометкой rotated (store.mark_displaced) — иначе живая
+    applied-находка глушила бы новую на ту же площадку. Только applied: идущий откат
+    (rollback_requested) сюда не попадает."""
+    lists = {int(c["Id"]): {str(x).strip() for x in (c.get(FIELD) or {}).get("Items") or []}
+             for c in campaigns}
+    out = []
+    for f in sorted(applied or [], key=_age):
+        site = own_site(f)
+        if f.status != "applied" or not site or int(f.campaign_id) not in lists:
+            continue
+        if site not in lists[int(f.campaign_id)]:
+            out.append({"id": f.id, "site": site, "campaign_id": int(f.campaign_id),
+                        "absent": True, "reason": ABSENT_REASON})
+    return out
+
+
+def _own_sites(own: Dict[int, List[StoredFinding]]) -> Dict[int, List[str]]:
+    return {cid: [own_site(f) for f in items] for cid, items in own.items()}
 
 
 def _system_allowed(site: str) -> bool:
@@ -183,6 +254,7 @@ class _Candidate:
     matched: List[dict]
     list_before: int
     list_limit: int
+    rotation: dict = field(default_factory=dict)
 
     @property
     def campaign_id(self) -> int:
@@ -207,14 +279,22 @@ class _LoginScan:
     campaigns: int = 0
     objects: int = 0
     skipped_campaigns: List[str] = field(default_factory=list)
+    # свои applied, которых нет в кампании (absent_own): раннер снимет с них applied
+    absent: List[dict] = field(default_factory=list)
 
 
 class _Login:
     """Скан одного логина: встроенные через план этапа 1, затем правила пользователя."""
 
     def __init__(self, acc: DirectAccount, settings: dict, rules: List[R.Rule],
-                 goals: List[int], goals_code: Optional[str], now: datetime, log):
+                 goals: List[int], goals_code: Optional[str], now: datetime, log,
+                 applied: Callable[[str], List[StoredFinding]] = lambda _l: []):
         self.acc = acc
+        self.applied = applied
+        # {кампания: свои запреты, старейшие первыми} — для ротации; читается в scan
+        self.own: Dict[int, List[str]] = {}
+        # пришпиленное этим прогоном («Всегда закрывать» и спам): ротация его не снимает
+        self.pinned: Set[str] = set()
         self.settings = settings
         self.rules = rules
         self.protect = [r for r in rules if r.action == R.PROTECT]
@@ -361,6 +441,16 @@ class _Login:
             return out
         out.campaigns = len(live)
         self.by_id = {int(c["Id"]): c for c in campaigns}
+        try:
+            applied = list(self.applied(acc.login))
+            out.absent = absent_own(applied, campaigns)
+            gone = {d["id"] for d in out.absent}
+            self.own = _own_sites(own_by_campaign([f for f in applied if f.id not in gone],
+                                                  self.settings["always_block"]))
+        except Exception as err:
+            # без журнала свой запрет неотличим от ручного: ротации нет, отказ «заполнен» как прежде
+            self.log("  [%s] свои запреты не прочитаны, ротации нет: %s" % (acc.login, err))
+            self.own = {}
 
         rows = cabinets.keep_rows(acc, direct.placements_today(acc.token, acc.login))
         self.frames[0] = _frame(rows, [], acc.currency, self.category)
@@ -424,8 +514,9 @@ class _Login:
                 goals = direct.campaign_goals(acc.token, acc.login)
                 if not goals:
                     return {}, None
-                week = direct.placements_with_goals(acc.token, acc.login,
-                                                    sorted(set(goals.values())))
+                # отчёт кабинетный: в общем кабинете статистика чужих кампаний не наша
+                week = cabinets.keep_rows(acc, direct.placements_with_goals(
+                    acc.token, acc.login, sorted(set(goals.values()))))
             return spam.suspicious_sites(week, goals, min_leads=params["min_leads"],
                                          min_cr=params["min_cr"], ratio=params["ratio"]), None
         except Exception as err:
@@ -440,7 +531,9 @@ class _Login:
             suspicious, bad = self._spam()
             if bad:
                 self.out.problems.append(bad)
+        self.pinned = set(forced) | {_site(x) for x in suspicious}
         kwargs: Dict[str, Any] = {
+            "own": {str(cid): sites for cid, sites in self.own.items()},
             "top_n": s["top_n"], "always_block": forced, "spam": suspicious,
             "cut_verdicts": frozenset(s["dictionary"]["categories"]) | PINNED_VERDICTS,
             "guard": lambda site, cid, verdict: self.guard(site, int(cid), verdict, False)}
@@ -492,16 +585,41 @@ class _Login:
                              "metrics": _metrics(self.frames[0].seen.get((cid, site))),
                              "list_fill": {"before": action["existing_count"], "limit": limit}},
                     action={"op": "exclude_site", "campaign_id": cid, "site": site})
+                rot = self.rotation(cid, action.get("evict"))
+                if rot:
+                    # Под эту запись план снимает свои старые запреты кампании: человек в
+                    # режиме «одобрять» видит это до решения. Что снять, решает применение
+                    # по свежему чтению тем же правилом (те же hold) — список могли поменять.
+                    f.details["rotation"] = rot
                 out.findings.append(f)
                 self.builtin[(cid, site)] = f
                 added[cid] = added.get(cid, 0) + 1
         # Слоты, оставшиеся правилам пользователя: тот же потолок 0,9 от лимита, что у
-        # встроенных и у записи, минус то, что встроенные заняли в этом прогоне.
+        # встроенных и у записи, минус то, что встроенные заняли в этом прогоне, плюс свои
+        # запреты, которые ротация ещё вправе снять.
+        taken = {(int(a["campaign_id"]), x["placement"]) for a in plan["actions"]
+                 for x in a["added"]}
         for c in live:
             cid = int(c["Id"])
-            ceiling = planner.ceiling_for(direct.sites_limit(c.get("Type")))
-            used = len(self.existing(c)) + added.get(cid, 0)
-            out.room[(login, cid)] = max(ceiling - used, 0)
+            limit = direct.sites_limit(c.get("Type"))
+            have = len(self.existing(c))
+            spare = planner.evictable(self.own.get(cid), (c.get(FIELD) or {}).get("Items"),
+                                      list(self.pinned) + [s for k, s in taken if k == cid])
+            # та же ёмкость, что у плана: свободное до max(потолок, длина) плюс свои 1:1,
+            # минус занятое встроенными
+            free = planner.free_slots(have, planner.ceiling_for(limit), limit)
+            out.room[(login, cid)] = max(free + len(spare) - added.get(cid, 0), 0)
+
+    def rotation(self, cid: int, evict=None) -> dict:
+        """details.rotation находки: что план снимет (evict) и какие свои запреты
+        пришпилены этим прогоном (hold) — применение их тоже не снимет."""
+        out: dict = {}
+        if evict:
+            out["evict"] = list(evict)
+        hold = sorted(set(self.own.get(cid) or []) & self.pinned)
+        if hold:
+            out["hold"] = hold
+        return out
 
     def _user(self, live: List[dict]) -> None:
         login = self.acc.login
@@ -579,7 +697,8 @@ class _Login:
             self.out.candidates.append(_Candidate(
                 login=login, campaign=campaign, site=site, rule=rule, row=row,
                 matched=entry["matched"], list_before=len(existing),
-                list_limit=direct.sites_limit(campaign.get("Type"))))
+                list_limit=direct.sites_limit(campaign.get("Type")),
+                rotation=self.rotation(cid)))
 
 
 def _user_finding(c: _Candidate, now: datetime) -> Finding:
@@ -589,6 +708,8 @@ def _user_finding(c: _Candidate, now: datetime) -> Finding:
                "rule": snap, "matched": c.matched, "window": _window(now, c.rule.window),
                "metrics": _metrics(c.row),
                "list_fill": {"before": c.list_before, "limit": c.list_limit}}
+    if c.rotation:
+        details["rotation"] = dict(c.rotation)
     if c.rule.action == "propose":
         # Авторежим такие не одобряет (store.approve_auto): решение за человеком.
         details["propose"] = True
@@ -670,10 +791,12 @@ def run(ctx: Context) -> RunOutput:
     scanned: List[str] = []
     errors: List[str] = []
     skipped_campaigns: List[str] = []
+    absent: List[dict] = []
     total = len(ctx.accounts)
     for i, acc in enumerate(ctx.accounts, 1):
         try:
-            scan = _Login(acc, settings, rules, goals, goals_code, ctx.now, ctx.log).scan(ask, use_db)
+            scan = _Login(acc, settings, rules, goals, goals_code, ctx.now, ctx.log,
+                          ctx.applied).scan(ask, use_db)
         except Exception as err:  # кабинет не должен ронять остальные
             errors.append("%s: %s" % (acc.login, err))
             ctx.log("[%s] ошибка: %s" % (acc.login, err))
@@ -682,6 +805,7 @@ def run(ctx: Context) -> RunOutput:
             read["campaigns"] += scan.campaigns
             read["objects"] += scan.objects
             skipped_campaigns += scan.skipped_campaigns
+            absent += scan.absent
             findings += scan.findings
             candidates += scan.candidates
             refused += scan.refused
@@ -713,7 +837,8 @@ def run(ctx: Context) -> RunOutput:
         summary["errors"] = errors
     # Упавший логин не сканировали: его открытые находки не закрываем.
     return RunOutput(findings=findings, summary=summary, scanned_logins=scanned,
-                     unverified=unverified, skipped_campaigns=skipped_campaigns)
+                     unverified=unverified, skipped_campaigns=skipped_campaigns,
+                     displaced=absent)
 
 
 def _fresh(acc: DirectAccount, campaign_id: int):
@@ -796,7 +921,14 @@ def _apply_guard(f: StoredFinding, site: str, cid: int, protect: List[R.Rule],
     return ApplyResult(False, {"code": code, "campaign_id": cid, "site": site}, GUARD_TEXT[code])
 
 
-def _apply_group(acc, cid, group, settings: Optional[dict] = None) -> Dict[int, ApplyResult]:
+def _apply_group(acc, cid, group, settings: Optional[dict] = None,
+                 own: Optional[List[StoredFinding]] = None) -> Dict[int, ApplyResult]:
+    """Записать одобренные площадки кампании поверх свежего чтения.
+
+    Места под потолком нет — ротация: снимаются свои запреты робота (own — его применённые
+    находки этого логина), старейшие первыми, ровно столько, сколько нужно новым. Ручные
+    (их нет в журнале) не снимаются никогда; снятые уходят в ApplyResult.displaced той
+    находки, под которую освободили место."""
     settings = settings or {}
     protect = [r for r in R.compile_rules(KEY, settings.get("rules") or [])[0]
                if r.action == R.PROTECT]
@@ -811,9 +943,9 @@ def _apply_group(acc, cid, group, settings: Optional[dict] = None) -> Dict[int, 
     have = {_site(s) for s in existing}
     limit = direct.sites_limit(ctype)
     ceiling = planner.ceiling_for(limit)
-    room = max(ceiling - len(existing), 0)
+    free = planner.free_slots(len(existing), ceiling, limit)
     out: Dict[int, ApplyResult] = {}
-    to_add: List[str] = []
+    wanted: List[Tuple[StoredFinding, str]] = []
     for f in group:
         site = _site(f.action["site"])
         guard = _apply_guard(f, site, int(cid), protect, extra, money_known)
@@ -823,41 +955,72 @@ def _apply_group(acc, cid, group, settings: Optional[dict] = None) -> Dict[int, 
             # Это не наш запрет: помечать applied нельзя, иначе откат снимет чужое.
             out[f.id] = ApplyResult(False, {"already_present": True, "site": site},
                                     "площадка уже запрещена в кампании — запрет не робота")
-        elif site in to_add:
+        elif any(site == w for _, w in wanted):
             # Вторая находка на ту же площадку: запись одна, засчитать её дважды нельзя
             # (откат первой снял бы запрет, который «держит» и вторая).
             out[f.id] = ApplyResult(False, {}, "дубль: та же площадка в этом применении")
-        elif len(to_add) >= room:
-            out[f.id] = ApplyResult(False, {}, "список запретов заполнен (%d из %d)"
-                                    % (len(existing), limit))
         else:
-            to_add.append(site)
-    if not to_add:
+            wanted.append((f, site))
+
+    mine = own_by_campaign(own or [], settings.get("always_block")).get(int(cid), [])
+    by_site: Dict[str, List[StoredFinding]] = {}
+    for f in mine:
+        by_site.setdefault(_site((f.action or {}).get("site") or f.object_id), []).append(f)
+    # Пришпиленное сканом (hold: спам этой недели, «Всегда закрывать») — тот же набор, что
+    # скан исключил из ротации: иначе спам-площадка ушла бы и вернулась ближайшим тактом.
+    hold = {_site(x) for f, _ in wanted
+            for x in ((f.details or {}).get("rotation") or {}).get("hold") or []}
+    spare = planner.evictable(list(by_site), existing, [w for _, w in wanted] + sorted(hold))
+    fits = free + len(spare)
+    for f, _site_name in wanted[fits:]:
+        out[f.id] = ApplyResult(False, {}, "список запретов заполнен (%d из %d)"
+                                % (len(existing), limit))
+    wanted = wanted[:fits]
+    if not wanted:
         return out
+    evict = spare[:planner.rotation_need(len(wanted), len(existing), ceiling, limit)]
+    gone = set(evict)
+    to_add = [w for _, w in wanted]
     # Прежние элементы остаются как есть и первыми: в списке есть и ручные запреты.
-    back, werr = _write_and_read(acc, cid, existing + to_add)
+    # Снимается только своя форма записи (нормализованная) — как при откате.
+    back, werr = _write_and_read(acc, cid,
+                                 [x for x in existing if x.strip() not in gone] + to_add)
     if back is None:
         out.update({f.id: ApplyResult(False, {}, NOT_FOUND_BACK)
                     for f in group if f.id not in out})
         return out
     present = {_site(s) for s in back}
-    for f in group:
-        if f.id in out:
+    still = {s.strip() for s in back}
+    # Снятое (его больше нет в списке) — к той новой площадке, под которую место и
+    # освобождали: первые free новых вставали без ротации, дальше 1:1.
+    displaced: Dict[int, List[dict]] = {}
+    rotated_for: Dict[int, List[str]] = {}
+    for i, site in enumerate(evict):
+        if site in still:
             continue
-        site = _site(f.action["site"])
+        f, target = wanted[min(i + free, len(wanted) - 1)]
+        rotated_for.setdefault(f.id, []).append(site)
+        displaced.setdefault(f.id, []).extend(
+            {"id": old.id, "site": site, "for_site": target, "campaign_id": int(cid)}
+            for old in by_site[site])
+    for f, site in wanted:
+        extra_resp = {"rotated_out": rotated_for[f.id]} if f.id in rotated_for else {}
+        moved = displaced.get(f.id, [])
         if site in present:
-            out[f.id] = ApplyResult(True, {"campaign_id": cid, "site": site,
-                                           "fill_after": len(back)})
+            out[f.id] = ApplyResult(True, dict({"campaign_id": cid, "site": site,
+                                                "fill_after": len(back)}, **extra_resp),
+                                    displaced=moved)
         elif werr is not None:
-            out[f.id] = ApplyResult(False, {"campaign_id": cid, "site": site},
-                                    "%s: %s" % (type(werr).__name__, werr))
+            out[f.id] = ApplyResult(False, dict({"campaign_id": cid, "site": site}, **extra_resp),
+                                    "%s: %s" % (type(werr).__name__, werr), displaced=moved)
         else:
-            out[f.id] = ApplyResult(False, {"campaign_id": cid, "site": site},
-                                    "Директ принял, но не применил")
+            out[f.id] = ApplyResult(False, dict({"campaign_id": cid, "site": site}, **extra_resp),
+                                    "Директ принял, но не применил", displaced=moved)
     return out
 
 
-def _rollback_group(acc, cid, group, _settings: Optional[dict] = None) -> Dict[int, ApplyResult]:
+def _rollback_group(acc, cid, group, _settings: Optional[dict] = None,
+                    _own: Optional[List[StoredFinding]] = None) -> Dict[int, ApplyResult]:
     fresh = _fresh(acc, cid)
     if fresh is None:
         return _fail_all(group, "кампания не видна API (Мастер кампаний)")
@@ -901,6 +1064,15 @@ def _rollback_group(acc, cid, group, _settings: Optional[dict] = None) -> Dict[i
     return out
 
 
+def _applied(ctx: Context, login: str) -> List[StoredFinding]:
+    try:
+        return list(ctx.applied(login))
+    except Exception as err:
+        # без журнала свой запрет неотличим от ручного: снимать нечего, место — как прежде
+        ctx.log("[%s] свои запреты не прочитаны, ротации нет: %s" % (login, err))
+        return []
+
+
 def _run_groups(ctx: Context, items: List[StoredFinding], handler) -> Dict[int, ApplyResult]:
     by_login = {a.login: a for a in ctx.accounts}
     out: Dict[int, ApplyResult] = {}
@@ -910,7 +1082,7 @@ def _run_groups(ctx: Context, items: List[StoredFinding], handler) -> Dict[int, 
             out.update(_fail_all(group, "кабинет %s недоступен" % login))
             continue
         try:
-            out.update(handler(acc, cid, group, ctx.settings))
+            out.update(handler(acc, cid, group, ctx.settings, _applied(ctx, login)))
         except Exception as err:  # одна кампания не должна ронять остальные
             out.update(_fail_all(group, "%s: %s" % (type(err).__name__, err)))
     return out

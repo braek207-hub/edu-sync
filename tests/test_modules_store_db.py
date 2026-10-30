@@ -573,3 +573,27 @@ def test_approve_auto_skips_propose(live):
     assert store.approve_auto(SLUG, "placements", ids) == [ids[0]]
     live.execute("SELECT status FROM module_findings WHERE id = %s", (ids[1],))
     assert live.fetchone()[0] == "open"
+
+
+def test_rotation_marks_own_rolled_back_and_does_not_suppress(live):
+    """Ротация: applied -> rolled_back с response.rotated; такая площадка, найденная снова,
+    вставляется и одобряется авторежимом (в отличие от отката человека)."""
+    run = store.start_run(SLUG, "placements", "auto")
+    old = _insert_applied(run, _f("a.ru"))
+    young = _insert_applied(run, _f("b.ru"))
+    live.execute("UPDATE module_findings SET status = 'applied', applied_at = now() - "
+                 "interval '9 days' WHERE id = %s", (old,))
+    live.execute("UPDATE module_findings SET status = 'applied', applied_at = now() "
+                 "WHERE id = %s", (young,))
+    assert [f.id for f in store.applied_findings(SLUG, "placements", "acc")] == [old, young]
+    assert store.applied_findings(SLUG, "placements", "other") == []
+    assert store.mark_displaced(old, {"for_site": "c.ru", "reason": "снят ротацией"})
+    assert not store.mark_displaced(old, {"for_site": "c.ru"})  # уже не applied
+    live.execute("SELECT status, response->'rotated'->>'for_site' FROM module_findings "
+                 "WHERE id = %s", (old,))
+    assert live.fetchone() == ("rolled_back", "c.ru")
+    existing = store.existing_findings(SLUG, "placements")
+    rec = reconcile("placements", existing, [_f("a.ru")], datetime.now(timezone.utc))
+    assert len(rec.insert) == 1
+    again = store.apply_reconciled(SLUG, "placements", run, rec)
+    assert store.approve_auto(SLUG, "placements", again) == again

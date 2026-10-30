@@ -6,6 +6,9 @@
 {логин: [Id]}; логина в нём нет — все подходящие модулю кампании кабинета. Выбранные кампании
 едут в DirectAccount.campaign_ids, и модуль сужает по ним чтение кампаний (with_ids) и строки
 отчётов (keep_rows) — одни и те же функции во всех трёх модулях.
+Ограждение (DirectAccount.fence, общий кабинет synergy): выбор его только сужает, без
+выбора — само ограждение, а не все кампании; инвентарь читает и кладёт только его кампании;
+применение за ним раннер отклоняет (runner._fence).
 Инвентарь: по каждому кабинету проекта кампании и доступ; по нему Panda показывает, из чего
 выбирать. Обновляется не чаще INVENTORY_EVERY: такт модулей идёт каждые полчаса, а состав
 кабинетов и кампаний меняется редко.
@@ -69,10 +72,37 @@ def select_accounts(accts: Sequence[DirectAccount], logins: Iterable,
         if ids and _norm(login) not in walked:
             why.append("%s: кампании выбраны, но кабинет %s — пропущены" % (
                 login, "не из проекта" if _norm(login) not in known else "не выбран"))
-    out = [dataclasses.replace(a, campaign_ids=tuple(sorted({int(i) for i in
-                                                             chosen[_norm(a.login)]})))
-           if _norm(a.login) in chosen else a for a in picked]
+    out: List[DirectAccount] = []
+    for a in picked:
+        ids = chosen.get(_norm(a.login))
+        if not ids:
+            # без выбора — все кампании кабинета, а у огороженного — его ограждение
+            out.append(dataclasses.replace(a, campaign_ids=a.fence) if a.fence is not None
+                       else a)
+            continue
+        ids = sorted({int(i) for i in ids})
+        if a.fence is not None:
+            # настройка ограждение только сужает: чужие кампании общего кабинета не берём
+            outside = [i for i in ids if i not in a.fence]
+            why += ["%s: кампания %d вне кампаний проекта в общем кабинете — пропущена"
+                    % (a.login, i) for i in outside]
+            ids = [i for i in ids if i in a.fence]
+            if not ids:
+                why.append("%s: ни одной выбранной кампании проекта — кабинет пропущен"
+                           % a.login)
+                continue
+        out.append(dataclasses.replace(a, campaign_ids=tuple(ids)))
     return out, why
+
+
+def outside_fence(acc: DirectAccount, campaign_id: Optional[int]) -> bool:
+    """Действие за ограждением общего кабинета: чужая кампания или уровень всего кабинета."""
+    if acc.fence is None:
+        return False
+    try:
+        return campaign_id is None or int(campaign_id) not in acc.fence
+    except (TypeError, ValueError):
+        return True
 
 
 def scanned_campaigns(accts: Sequence[DirectAccount]) -> Dict[str, Collection[int]]:
@@ -147,7 +177,10 @@ def read_campaigns(acc: DirectAccount, call_fn=call) -> List[dict]:
     (4000/8000), не роняет инвентарь: кампании остаются, поиск и сеть — неизвестны."""
     blocks = {v + "FieldNames": ["BiddingStrategy"] for v in STRATEGY_BLOCKS.values()}
     fields = ["Id", "Name", "Type", "State"]
-    crit = {"States": LIVE_STATES}
+    crit: Dict[str, Any] = {"States": LIVE_STATES}
+    if acc.fence is not None:
+        # общий кабинет: чужие кампании не читаем и в module_campaigns не кладём
+        crit["Ids"] = list(acc.fence)
     try:
         rows = direct_api.get_all(acc.token, acc.login, "campaigns", crit, fields,
                                   extra=blocks, call_fn=call_fn)
@@ -156,7 +189,9 @@ def read_campaigns(acc: DirectAccount, call_fn=call) -> List[dict]:
             raise
         rows = direct_api.get_all(acc.token, acc.login, "campaigns", crit, fields,
                                   call_fn=call_fn)
-    return [campaign_row(c) for c in rows if c.get("State") != "ARCHIVED"]
+    fence = set(acc.fence) if acc.fence is not None else None
+    return [campaign_row(c) for c in rows if c.get("State") != "ARCHIVED"
+            and (fence is None or int(c["Id"]) in fence)]
 
 
 def inventory(accts: Sequence[DirectAccount], log: Callable[[str], None],

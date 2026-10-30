@@ -7,7 +7,9 @@
 
 Кабинет вне проектов Panda-BI (slug=None) модули вести не могут — у них нет
 строки в dashboards. Такой кабинет чистит прежний движок старого входа, и для
-него здесь остаются токен, логин и список своих кампаний.
+него здесь остаются токен, логин и список своих кампаний. С 30.10.2026 таких
+кабинетов нет (последний, ОШ Синергия, стал проектом synergy): механизм
+оставлен на случай нового кабинета без проекта.
 """
 
 import os
@@ -49,13 +51,11 @@ ACCOUNTS: List[Account] = [
     Account("bjorn", "BJORN", "bjorn"),
     Account("polinarepik", "Polinarepik", "polinarepik"),
     Account("meshnflesh", "mesh-n-flesh", "meshnflesh"),
-    # Онлайн-школа Синергия в кабинете vpo-goroda (доступ через approve.agency,
-    # 28.10.2026). Проекта в Panda-BI у неё нет — чистит старый движок. Кабинет
-    # общий — только две наши РСЯ-кампании. spam_rule не нужен: цель стратегии —
-    # CRM-статус (317516886), площадка его не накрутит.
-    Account("synergy_school", "ОШ Синергия (vpo-goroda)", None,
-            token_env="APPROVE_AGENCY_TOKEN", login="vpo-goroda-316088-c0ts",
-            campaign_ids=(715539609, 715543179)),
+    # ОШ Синергия с 30.10.2026 — проект synergy: кабинет, токен и ограждение двух
+    # своих кампаний общего кабинета — в sync.modules.accounts (SYNERGY_SCHOOL_*). До того
+    # её чистил старый движок; ключ оставлен, чтобы прежний вызов CLI
+    # (--accounts synergy_school) шёл в раннер модулей, а не во второй писатель.
+    Account("synergy_school", "ОШ Синергия (vpo-goroda)", "synergy"),
 ]
 
 BY_KEY: Dict[str, Account] = {a.key: a for a in ACCOUNTS}

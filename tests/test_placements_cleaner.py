@@ -76,15 +76,14 @@ def test_clients_json_gives_each_login_its_token():
     assert why
 
 
-def test_bjorn_and_synergy_stay_in_cleaner_registry():
-    """BJORN — проект модулей; Синергия без проекта Panda-BI — старый движок, свои кампании."""
+def test_synergy_moved_from_legacy_engine_to_project():
+    """С 30.10.2026 ОШ Синергия — проект synergy: кабинетов старого движка нет,
+    ключ synergy_school ведёт в раннер модулей (второго писателя нет)."""
     from sync.placements import accounts as reg
 
     assert reg.BY_KEY["bjorn"].slug == "bjorn"
-    old = reg.legacy_accounts()
-    assert [a.key for a in old] == ["synergy_school"]
-    assert old[0].campaign_ids == (715539609, 715543179)
-    assert old[0].token_env == "APPROVE_AGENCY_TOKEN"
+    assert reg.legacy_accounts() == []
+    assert reg.BY_KEY["synergy_school"].slug == "synergy"
 
 
 def test_legacy_account_cleans_only_own_campaigns(monkeypatch):
@@ -494,8 +493,10 @@ def test_call_does_not_retry_real_error(monkeypatch):
 
 
 def test_cli_routes_project_and_legacy_accounts(monkeypatch):
-    """--accounts bjorn → раннер модулей; synergy_school → старый движок, не раннер."""
+    """--accounts bjorn → раннер модулей; synergy_school теперь тоже раннер (проект
+    synergy), старый движок не зовётся; кабинет вне проектов — старый движок."""
     from sync import placements_clean as cli
+    from sync.placements import accounts as reg
 
     projects, old = [], []
     monkeypatch.setattr(cli, "run_project", lambda slug, **kw: projects.append(slug) or 0)
@@ -503,12 +504,20 @@ def test_cli_routes_project_and_legacy_accounts(monkeypatch):
                         lambda acc, apply, use_db, log: old.append((acc.key, apply)))
     monkeypatch.delenv("DATABASE_URL", raising=False)
     assert cli.main(["--apply", "--accounts", "bjorn,synergy_school"]) == 0
-    assert projects == ["bjorn"] and old == [("synergy_school", True)]
+    assert projects == ["bjorn", "synergy"] and old == []
 
     projects.clear(), old.clear()
     assert cli.main(["--apply", "--accounts", "synergy_school"]) == 0
-    assert projects == [] and old == [("synergy_school", True)]
+    assert projects == ["synergy"] and old == []
 
     projects.clear(), old.clear()
     assert cli.main(["--apply"]) == 0
     assert projects == ["edunetwork"] and old == []
+
+    # механизм кабинета без проекта жив: такой кабинет идёт в старый движок
+    extra = reg.Account("solo", "Solo", None, token_env="X", login="l", campaign_ids=(1,))
+    monkeypatch.setattr(reg, "ACCOUNTS", reg.ACCOUNTS + [extra])
+    monkeypatch.setitem(reg.BY_KEY, "solo", extra)
+    projects.clear(), old.clear()
+    assert cli.main(["--apply", "--accounts", "solo"]) == 0
+    assert projects == [] and old == [("solo", True)]

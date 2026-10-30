@@ -37,6 +37,9 @@ class StoredFinding(Finding):
     decided_at: Optional[datetime] = None
     # время итога раннера (применил/упал/откатил); decided_at пишет только человек
     outcome_at: Optional[datetime] = None
+    applied_at: Optional[datetime] = None
+    # ответ применения/отката; по нему видно, что запрет снят ротацией (lifecycle.rotated)
+    response: Optional[dict] = None
 
 
 @dataclass
@@ -44,6 +47,10 @@ class ApplyResult:
     ok: bool
     response: dict
     error: Optional[str] = None
+    # Свои применённые находки, которые эта запись сняла из Директа, чтобы освободить место
+    # (ротация списка): [{"id", "site", "for_site", "campaign_id"}]. Раннер переводит их в
+    # rolled_back с пометкой response.rotated независимо от ok: снятие уже случилось.
+    displaced: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -60,6 +67,10 @@ class Context:
     # Ход прогона {"step", "logins_done", "logins_total"} после каждого логина: пробный
     # прогон показывает его человеку, обычный скан — никому.
     progress: Callable[[dict], None] = lambda _p: None
+    # Свои применённые находки модуля по логину, старейшие первыми (store.applied_findings):
+    # из них ротация выбирает, что снять, когда список кампании полон. Раннер читает их
+    # один раз на логин; по умолчанию — ничего, и ротации нет.
+    applied: Callable[[str], List["StoredFinding"]] = lambda _login: []
 
 
 @dataclass
@@ -75,3 +86,7 @@ class RunOutput:
     # Строки «почему пропущена» по выбранным кампаниям (settings.campaigns), которых у кабинета
     # нет или которые модулю не подходят: cabinets.unmatched_lines.
     skipped_campaigns: List[str] = field(default_factory=list)
+    # Свои применённые находки, запрета которых в Директе уже нет (placements.absent_own):
+    # [{"id", "site", "campaign_id", "absent", "reason"}]. Раннер переводит их в rolled_back
+    # с пометкой response.rotated до сверки, чтобы площадку можно было найти снова.
+    displaced: List[dict] = field(default_factory=list)

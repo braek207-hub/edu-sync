@@ -92,9 +92,25 @@ def agent_lock(slug: str, read_autonomy: Callable[[], str] = _live_autonomy) -> 
         return EDU_LOCK_LINE
 
 
+def _applied_reader(slug, mkey, store) -> Callable[[str], List[StoredFinding]]:
+    """Свои применённые находки модуля по логину, одно чтение на логин за контекст."""
+    read = getattr(store, "applied_findings", None)
+    memo: Dict[str, List[StoredFinding]] = {}
+
+    def get(login: str) -> List[StoredFinding]:
+        if read is None:
+            return []
+        if login not in memo:
+            memo[login] = list(read(slug, mkey, login))
+        return memo[login]
+    return get
+
+
 def _ctx(slug, mkey, mode, raw_settings, accts, now, log, goals: Iterable[int] = (),
-         progress: Optional[Callable[[dict], None]] = None) -> Context:
-    extra = {"progress": progress} if progress is not None else {}
+         progress: Optional[Callable[[dict], None]] = None, store=None) -> Context:
+    extra: Dict[str, Any] = {"progress": progress} if progress is not None else {}
+    if store is not None:
+        extra["applied"] = _applied_reader(slug, mkey, store)
     return Context(slug=slug, module_key=mkey, mode=mode,
                    settings=settings_for(mkey, raw_settings),
                    accounts=accts, now=now, log=log, project_goals=list(goals), **extra)
@@ -153,6 +169,54 @@ def _record(store, f, res, rollback, st, log) -> None:
         log("находка %s: статус изменился во время применения" % f.id)
 
 
+def _mark_displaced(store, d: dict, note: dict, st: dict, key: str, log) -> None:
+    if store.mark_displaced(d["id"], note):
+        st[key] = st.get(key, 0) + 1
+    else:
+        log("находка %s: запрета нет в Директе, но статус уже не applied" % d["id"])
+
+
+def _record_displaced(store, results: Dict[int, ApplyResult], st, log) -> None:
+    """Свои запреты, снятые ротацией: applied -> rolled_back с пометкой response.rotated.
+    Пишется при любом исходе новой находки: снятие в Директе уже случилось."""
+    for fid, res in results.items():
+        for d in getattr(res, "displaced", None) or []:
+            note = {"for_finding_id": fid, "for_site": d.get("for_site"),
+                    "site": d.get("site"), "campaign_id": d.get("campaign_id"),
+                    "reason": "снят ротацией: освободил место под %s" % d.get("for_site")}
+            _mark_displaced(store, d, note, st, "rotated_out", log)
+
+
+def _record_absent(store, items: List[dict], st, log) -> None:
+    """Свои applied, запрета которых в кампании нет (скан, placements.absent_own): тоже
+    rolled_back с пометкой rotated — так площадку можно найти снова. Самовосстановление
+    после записи ротации, у которой упало чтение обратно."""
+    for d in items or []:
+        note = {"site": d.get("site"), "campaign_id": d.get("campaign_id"), "absent": True,
+                "reason": d.get("reason")}
+        _mark_displaced(store, d, note, st, "absent_closed", log)
+
+
+FENCE_TEXT = "кампания вне кампаний проекта в общем кабинете — робот её не трогает"
+
+
+def _fence(items: List[StoredFinding], accts) -> Tuple[List[StoredFinding], Dict[int, ApplyResult]]:
+    """Находки за ограждением общего кабинета (DirectAccount.fence) — отказ до модуля: ни
+    настройка, ни одобрение человека не выводят запись за кампании проекта."""
+    by_login = {a.login: a for a in accts}
+    keep: List[StoredFinding] = []
+    refused: Dict[int, ApplyResult] = {}
+    for f in items:
+        acc = by_login.get(f.login)
+        cid = (f.action or {}).get("campaign_id", f.campaign_id)
+        if acc is not None and _cabinets.outside_fence(acc, cid):
+            refused[f.id] = ApplyResult(False, {"code": "outside_fence", "campaign_id": cid},
+                                        FENCE_TEXT)
+        else:
+            keep.append(f)
+    return keep, refused
+
+
 def _wanted(f: StoredFinding, mode: str) -> bool:
     """Откат — явная отмена человека и всегда в безопасную сторону (снимает нашу же запись),
     поэтому идёт и в report; одобренное пишется в Директ только в approve/auto."""
@@ -195,14 +259,19 @@ def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line) -> bool
         if not parts:
             continue
         row = by_key[mkey]
-        ctx = _ctx(slug, mkey, row["mode"], row.get("settings"), accts, now, log)
+        ctx = _ctx(slug, mkey, row["mode"], row.get("settings"), accts, now, log, store=store)
         run_id = store.start_run(slug, mkey, row["mode"], phase=APPLY_PHASE)
         st: dict = {}
         errors: List[str] = []
         try:
             for rollback, fn, part in parts:
-                results, err = _safe_call(fn, ctx, part, log,
+                inside, results = _fence(part, accts)
+                if inside:
+                    got, err = _safe_call(fn, ctx, inside, log,
                                           "%s.%s" % (mkey, "rollback" if rollback else "apply"))
+                    results.update(got)
+                else:
+                    err = None
                 if err is not None:
                     # не "errors": это имя у модулей занято списком строк по кабинетам
                     st["apply_errors"] = st.get("apply_errors", 0) + 1
@@ -210,6 +279,7 @@ def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line) -> bool
                 for f in part:
                     res = results.get(f.id) or ApplyResult(False, {}, "модуль не вернул результат")
                     _record(store, f, res, rollback, st, log)
+                _record_displaced(store, results, st, log)
         except Exception as exc:
             errors.append("%s: %s" % (type(exc).__name__, exc))
             store.finish_run(run_id, "error", {"phase": APPLY_PHASE, "apply": st},
@@ -239,10 +309,15 @@ def _auto_apply(slug, mkey, module, ctx, store, fresh, confirmed, log):
     items = [dataclasses.replace(f, status="approved") for f in fresh if f.id in ids]
     if not items:
         return out, False
-    results, err = _safe_call(module.apply, ctx, items, log, "%s.apply" % mkey)
+    inside, results = _fence(items, ctx.accounts)
+    err = None
+    if inside:
+        got, err = _safe_call(module.apply, ctx, inside, log, "%s.apply" % mkey)
+        results.update(got)
     for f in items:
         res = results.get(f.id) or ApplyResult(False, {}, "модуль не вернул результат")
         _record(store, f, res, False, out, log)
+    _record_displaced(store, results, out, log)
     return out, err is not None
 
 
@@ -278,7 +353,7 @@ def _dry_run(slug, store, accts, modules, now, only, log) -> int:
             log("[%s] %s" % (mkey, line))
         try:
             out = module.run(_ctx(slug, mkey, "report", row.get("settings"), mod_accts, now, log,
-                                  goals))
+                                  goals, store=store))
         except Exception as err:
             log("[%s] ошибка: %s: %s" % (mkey, type(err).__name__, err))
             rc = 1
@@ -469,7 +544,7 @@ def _one_preview(slug, store, row, get_accounts, get_goals, modules, now, log) -
         if not accts:
             raise _NotRun("нет выбранных кабинетов: " + "; ".join(skipped))
         ctx = _ctx(slug, mkey, "report", row.get("settings"), accts, now, log,
-                   get_goals(), progress)
+                   get_goals(), progress, store=store)
         out = module.run(ctx)
         result = _preview_result(out, row.get("rule_id"), accts,
                                  _leads.lead_goals(ctx.settings, ctx.project_goals)[0])
@@ -614,8 +689,12 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 continue
             summary: dict = {}
             try:
-                ctx = _ctx(slug, mkey, mode, row.get("settings"), mod_accts, now, log, goals)
+                ctx = _ctx(slug, mkey, mode, row.get("settings"), mod_accts, now, log, goals,
+                           store=store)
                 out = module.run(ctx)
+                healed: dict = {}
+                # до сверки: закрытая applied больше не глушит новую находку на ту же площадку
+                _record_absent(store, out.displaced, healed, log)
                 cur = _currencies(mod_accts)
                 for f in out.findings:
                     # журнал рисует расход находки: тенге без пометки читались бы рублями
@@ -635,6 +714,7 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                     summary["skipped_campaigns"] = out.skipped_campaigns
                 summary.update(findings=len(out.findings), inserted=len(rec.insert),
                                resolved=len(rec.resolve), expired=len(rec.expire))
+                summary.update(healed)
                 if lock_line and mode in WRITE_MODES:
                     summary["agent_lock"] = lock_line
                 elif mode == "auto":

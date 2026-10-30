@@ -164,6 +164,7 @@ def _report_lines(token: str, login: str, body: Dict[str, Any]) -> List[str]:
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
 
     text = None
+    temporary = 0
     for attempt in range(1, MAX_POLL + 1):
         req = urllib.request.Request(REPORTS, data=data, headers=headers)
         wait = POLL_SLEEP
@@ -175,8 +176,15 @@ def _report_lines(token: str, login: str, body: Dict[str, Any]) -> List[str]:
                 wait = _retry_in(resp.headers.get("retryIn"))
         except urllib.error.HTTPError as err:
             detail = err.read().decode("utf-8")[:400]
-            if err.code == 400 and _error_code(detail) == RATE_LIMIT_CODE:
+            code = _error_code(detail)
+            if err.code == 400 and code == RATE_LIMIT_CODE:
                 time.sleep(POLL_SLEEP)
+                continue
+            # «временно недоступен» очередь отчётов отдаёт так же, как call (TEMPORARY_CODES):
+            # у vpo-goroda без повтора отчёт ронял бы кабинет из такта
+            if code in {str(c) for c in TEMPORARY_CODES} and temporary < CALL_ATTEMPTS - 1:
+                temporary += 1
+                time.sleep(CALL_BACKOFF * temporary)
                 continue
             raise DirectError("reports HTTP %s: %s" % (err.code, detail))
         time.sleep(wait)
