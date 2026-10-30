@@ -256,7 +256,7 @@ def test_queries_and_audit_ask_direct_by_ids(monkeypatch):
 
 
 def test_audit_run_reports_unmatched_campaign(monkeypatch):
-    monkeypatch.setattr(audit, "fetch_snapshot", lambda acc, win: audit.Snapshot(
+    monkeypatch.setattr(audit, "fetch_snapshot", lambda acc, win, step=None: audit.Snapshot(
         login=acc.login, campaigns=[{"Id": 11}], groups=[], ads=[], keywords=[],
         audiences_by_group={}, impressions_3d={}, unavailable={}, impressions_from=win[0]))
     monkeypatch.setattr(audit, "judge", lambda snap, settings: [])

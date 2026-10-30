@@ -7,7 +7,7 @@
 """
 
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sync.modules import cabinets, direct_api
 from sync.modules.accounts import DirectAccount
@@ -38,6 +38,10 @@ AD_FIELDS = ["Id", "CampaignId", "AdGroupId", "State", "Status", "Type"]
 TEXT_AD_FIELDS = ["Title", "Title2", "Text", "Href", "SitelinkSetId"]
 KEYWORD_FIELDS = ["Id", "CampaignId", "AdGroupId", "Keyword", "State", "Status"]
 AUDIENCE_FIELDS = ["Id", "AdGroupId", "CampaignId", "State"]
+# Подшаги снимка кабинета по порядку fetch_snapshot — ход «Аудит · кабинет 2 из 5 · объявления»:
+# у проекта с одним-двумя кабинетами без них полоса стояла бы на нуле весь прогон.
+PARTS = ("кампании", "группы", "объявления", "отклонённые", "объявления ЕПК", "фразы",
+         "аудитории", "показы")
 
 
 def _report(acc: DirectAccount, win: Tuple[str, str], ids: List[int]) -> List[Dict[str, str]]:
@@ -97,8 +101,11 @@ def _responsive_ads(acc: DirectAccount, ids: List[int], unavailable: Dict[str, s
     return [a for a in rows if a.get("Type") == "RESPONSIVE_AD"]
 
 
-def fetch_snapshot(acc: DirectAccount, win: Tuple[str, str]) -> Snapshot:
+def fetch_snapshot(acc: DirectAccount, win: Tuple[str, str],
+                   step: Callable[[str], None] = lambda _part: None) -> Snapshot:
+    """step(подшаг из PARTS) — перед каждым запросом в Директ."""
     unavailable: Dict[str, str] = {}
+    step(PARTS[0])
     campaigns = _campaigns(acc, unavailable)
     snap = Snapshot(login=acc.login, campaigns=campaigns, groups=[], ads=[], keywords=[],
                     audiences_by_group={}, impressions_3d={}, unavailable=unavailable,
@@ -111,11 +118,14 @@ def fetch_snapshot(acc: DirectAccount, win: Tuple[str, str]) -> Snapshot:
         return direct_api.get_all(acc.token, acc.login, service, criteria, fields,
                                   chunk_key="CampaignIds", ids=ids, **kw)
 
+    step(PARTS[1])
     snap.groups = chunked("adgroups", {}, GROUP_FIELDS)
+    step(PARTS[2])
     snap.ads = chunked("ads", {"States": ["ON"]}, AD_FIELDS,
                        extra={"TextAdFieldNames": TEXT_AD_FIELDS})
     # Отклонённые — отдельным запросом по Statuses: у отклонённого объявления State бывает
     # и OFF, и SUSPENDED, фильтр ON их терял бы. Архивные — не находка, их исключаем.
+    step(PARTS[3])
     try:
         snap.rejected_ads = chunked(
             "ads", {"Statuses": ["REJECTED"], "States": LIVE_AD_STATES}, AD_FIELDS,
@@ -123,12 +133,16 @@ def fetch_snapshot(acc: DirectAccount, win: Tuple[str, str]) -> Snapshot:
     except Exception as err:  # доп. запрос: его сбой не роняет остальные правила
         snap.rejected_ads = None
         unavailable["RejectedAds"] = str(err)[:300]
+    step(PARTS[4])
     snap.responsive_ads = _responsive_ads(acc, ids, unavailable)
+    step(PARTS[5])
     snap.keywords = chunked("keywords", {"States": ["ON"]}, KEYWORD_FIELDS)
+    step(PARTS[6])
     for t in chunked("audiencetargets", {}, AUDIENCE_FIELDS, result_key="AudienceTargets"):
         if t.get("State") == "ON":
             gid = int(t.get("AdGroupId") or 0)
             snap.audiences_by_group[gid] = snap.audiences_by_group.get(gid, 0) + 1
+    step(PARTS[7])
     for rec in _report(acc, win, ids):
         try:
             cid, shown = int(rec.get("CampaignId") or 0), int(float(rec.get("Impressions") or 0))
@@ -154,14 +168,21 @@ def run(ctx: Context) -> RunOutput:
     unavailable: Dict[str, Dict[str, str]] = {}
     unverified: List[Tuple[str, str]] = []
     skipped_campaigns: List[str] = []
-    for acc in ctx.accounts:
+    total = len(ctx.accounts)
+    for i, acc in enumerate(ctx.accounts):
+        def step(part: str, i=i, acc=acc) -> None:
+            ctx.progress({"step": acc.login, "logins_done": i, "logins_total": total,
+                          "part": part, "part_done": PARTS.index(part),
+                          "part_total": len(PARTS)})
         try:
-            snap = fetch_snapshot(acc, win)
+            snap = fetch_snapshot(acc, win, step)
             found = judge(snap, ctx.settings)
         except Exception as err:  # кабинет не должен ронять остальные
             errors.append("%s: %s" % (acc.login, err))
             ctx.log("[%s] ошибка: %s" % (acc.login, err))
             continue
+        finally:
+            ctx.progress({"step": acc.login, "logins_done": i + 1, "logins_total": total})
         # Находки кабинета берём только целиком: недочитанный кабинет не попадает в
         # scanned_logins, и его открытые находки не закрываются как исправленные.
         findings += found

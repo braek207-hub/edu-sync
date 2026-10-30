@@ -3,6 +3,9 @@
 
 Пробные прогоны (module_previews) берутся в начале такта, между модулями и в конце, а при
 занятом замке — до выхода: превью только читает, замок ему не нужен.
+
+Ход прогона (модуль k из M, кабинет i из N) идёт в sync_runs.progress — run_progress.py;
+«Остановить» (SIGTERM) — cancel.py: скан обрывается сразу, применение — после итога.
 """
 
 import dataclasses
@@ -12,12 +15,14 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from sync.modules import accounts as _accounts
 from sync.modules import cabinets as _cabinets
+from sync.modules import cancel as _cancel
 from sync.modules import leads as _leads
 from sync.modules import store as _store
 from sync.modules.defaults import settings_for
 from sync.modules.lifecycle import reconcile
 from sync.modules.placements import USER as USER_RULE
 from sync.modules.registry import MODULES
+from sync.modules.run_progress import RunProgress
 from sync.modules.types import ApplyResult, Context, Finding, RunOutput, StoredFinding
 
 # Москва без перехода на летнее время с 2014: фиксированное смещение не требует базы tz.
@@ -225,12 +230,17 @@ def _wanted(f: StoredFinding, mode: str) -> bool:
     return mode in WRITE_MODES
 
 
-def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line) -> bool:
+def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
+                 cancel: Optional[_cancel.Switch] = None,
+                 prog: Optional[RunProgress] = None) -> bool:
     """Одобренное применяем, запрошенный откат снимаем; True — были сбои.
 
     Каждый модуль, у которого была работа, получает свою строку module_runs с
     summary.phase = "apply": queries и audit сканируются раз в сутки, и без неё итог
     применения не попал бы ни в один прогон.
+
+    Остановка (cancel) проверяется перед модулем, а не внутри: запрос в Директ без записи
+    итога оставил бы находку approved, и следующий такт применил бы её второй раз.
     """
     failed = False
     # rows — только включённые модули: в off находки остаются как есть
@@ -244,7 +254,11 @@ def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line) -> bool
     if pend and lock_line:
         log("запись заблокирована: %s" % lock_line)
         return failed
-    for mkey, items in pend.items():
+    for i, (mkey, items) in enumerate(pend.items()):
+        if cancel is not None:
+            cancel.check()
+        if prog is not None:
+            prog.phase("apply", "применение решений", i, len(pend))
         module = modules.get(mkey)
         if module is None or not accts:
             log("[%s] ждёт применения %d находок, но %s" % (
@@ -521,9 +535,13 @@ def _memo(fn: Callable[[], Any]) -> Callable[[], Any]:
     return get
 
 
-def _one_preview(slug, store, row, get_accounts, get_goals, modules, now, log) -> bool:
+def _one_preview(slug, store, row, get_accounts, get_goals, modules, now, log,
+                 cancel: _cancel.Switch = _cancel.SWITCH) -> bool:
     """Один пробный прогон: тот же module.run, что у скана, но в report и без записи —
-    ни apply_reconciled, ни set_outcome, ни Директа. True — done."""
+    ни apply_reconciled, ни set_outcome, ни Директа. True — done.
+
+    Только чтение — остановка прерывает его сразу; превью закрывается ошибкой «остановлен»,
+    а не висит «идёт» до уборки через 20 минут."""
     pid, mkey = row["id"], row["module_key"]
 
     def progress(p: dict) -> None:
@@ -545,7 +563,8 @@ def _one_preview(slug, store, row, get_accounts, get_goals, modules, now, log) -
             raise _NotRun("нет выбранных кабинетов: " + "; ".join(skipped))
         ctx = _ctx(slug, mkey, "report", row.get("settings"), accts, now, log,
                    get_goals(), progress, store=store)
-        out = module.run(ctx)
+        with cancel.interruptible():
+            out = module.run(ctx)
         result = _preview_result(out, row.get("rule_id"), accts,
                                  _leads.lead_goals(ctx.settings, ctx.project_goals)[0])
         if skipped:
@@ -553,6 +572,13 @@ def _one_preview(slug, store, row, get_accounts, get_goals, modules, now, log) -
         if out.skipped_campaigns:
             result["skipped_campaigns"] = out.skipped_campaigns
         status, error = "done", None
+    except _cancel.Cancelled:
+        try:
+            store.finish_preview(pid, "error", None,
+                                 error="прогон модулей %s" % _cancel.TEXT)
+        except Exception as err:
+            log("превью %s: итог остановки не записан (%s: %s)" % (pid, type(err).__name__, err))
+        raise
     except Exception as err:
         status, result = "error", None
         error = str(err) if isinstance(err, _NotRun) else "%s: %s" % (type(err).__name__, err)
@@ -577,11 +603,14 @@ def _one_preview(slug, store, row, get_accounts, get_goals, modules, now, log) -
 
 def _run_previews(slug, store, accts: Callable[[], Tuple[list, list]], modules, now,
                   log, *, cleanup: bool = True,
-                  keep_going: Optional[Callable[[], bool]] = None) -> None:
+                  keep_going: Optional[Callable[[], bool]] = None,
+                  cancel: _cancel.Switch = _cancel.SWITCH,
+                  on_claim: Optional[Callable[[], None]] = None) -> None:
     """Вся очередь превью проекта. accts — функция () -> (кабинеты, почему нет): при занятом
     замке кабинеты читаются, только когда превью взято (у EDU это запрос в Директ).
     keep_going проверяется перед каждым превью: бюджет такта (PREVIEW_TICK_BUDGET).
-    Сбой базы здесь не роняет такт: превью останется running и закроется как прерванное."""
+    Сбой базы здесь не роняет такт: превью останется running и закроется как прерванное.
+    Остановка (Cancelled — не Exception) уходит наверх. on_claim — превью взято (ход прогона)."""
     if cleanup:
         try:
             store.cleanup_previews(slug)
@@ -597,23 +626,32 @@ def _run_previews(slug, store, accts: Callable[[], Tuple[list, list]], modules, 
             if keep_going is not None and not keep_going():
                 log("превью: бюджет такта исчерпан, очередь возьмёт конец такта")
                 return
+            cancel.check()
             row = store.claim_preview(slug)
             if row is None:
                 return
-            _one_preview(slug, store, row, accts, goals, modules, now, log)
+            if on_claim is not None:
+                on_claim()
+            _one_preview(slug, store, row, accts, goals, modules, now, log, cancel)
     except Exception as err:
         log("превью: очередь прервана (%s: %s)" % (type(err).__name__, err))
 
 
 def run_preview(slug: str, preview_id: int, *, store=_store, accounts=_accounts.accounts_for,
-                modules=MODULES, now: datetime, log=print) -> int:
+                modules=MODULES, now: datetime, log=print,
+                cancel: _cancel.Switch = _cancel.SWITCH) -> int:
     """Ручной прогон одного превью (modules_run --preview-id), без скана и замка."""
     row = store.claim_preview(slug, preview_id=preview_id)
     if row is None:
         log("превью %s проекта %s не найдено или уже идёт" % (preview_id, slug))
         return 1
-    ok = _one_preview(slug, store, row, _memo(lambda: accounts(slug)),
-                      _memo(lambda: store.project_lead_goals(slug)), modules, now, log)
+    try:
+        ok = _one_preview(slug, store, row, _memo(lambda: accounts(slug)),
+                          _memo(lambda: store.project_lead_goals(slug)), modules, now, log,
+                          cancel)
+    except _cancel.Cancelled:
+        log("превью %s: %s" % (preview_id, _cancel.TEXT))
+        return _cancel.EXIT_CODE
     return 0 if ok else 1
 
 
@@ -621,19 +659,35 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 now: datetime, only: Optional[str] = None, dry_run: bool = False,
                 log=print, agent_lock_fn=agent_lock,
                 clock: Callable[[], float] = time.monotonic,
-                cabinets: Callable[..., Any] = _cabinets.refresh) -> int:
-    """Код 1, если упал хоть один модуль; занятый замок — не ошибка."""
+                cabinets: Callable[..., Any] = _cabinets.refresh,
+                cancel: _cancel.Switch = _cancel.SWITCH,
+                progress: Optional[RunProgress] = None) -> int:
+    """Код 1, если упал хоть один модуль; занятый замок — не ошибка; остановка — 143."""
     if dry_run:
         accts, _why = accounts(slug)
         return _dry_run(slug, store, accts, modules, now, only, log)
+    prog = progress if progress is not None else RunProgress()
+    try:
+        return _tick(slug, store, accounts, modules, now, only, log, agent_lock_fn, clock,
+                     cabinets, cancel, prog)
+    except _cancel.Cancelled:
+        # замок снят выходом из hold_project_lock, строку скана закрыл _scan
+        log("проект %s: %s" % (slug, _cancel.TEXT))
+        return _cancel.EXIT_CODE
+
+
+def _tick(slug, store, accounts, modules, now, only, log, agent_lock_fn, clock, cabinets,
+          cancel: _cancel.Switch, prog: RunProgress) -> int:
     started = clock()
     with store.hold_project_lock(slug) as got:
         if not got:
             # превью только читает: идущий прогон проекта ему не помеха, а ждать его конца
             # человеку незачем. Бюджета нет: применения и сканов в этом процессе не будет
-            _run_previews(slug, store, _memo(lambda: accounts(slug)), modules, now, log)
+            _run_previews(slug, store, _memo(lambda: accounts(slug)), modules, now, log,
+                          cancel=cancel)
             log("проект %s: уже идёт" % slug)
             return 0
+        prog.phase("prepare", "подготовка")
         # убитый прогон (OOM, таймаут юнита) так и остался бы «идёт» навсегда
         stale = store.fail_stale_runs(slug, STALE_RUN_AFTER)
         if stale:
@@ -643,6 +697,15 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 if not only or r["module_key"] == only]
         if only and not rows:
             log("модуль %s выключен" % only)
+        # Очередь сканов — до применения: страница модуля видит «модуль k из M» с начала
+        # прогона. Фаза применения пишет строки phase=apply, их last_run_started не считает,
+        # поэтому ответ is_due до неё и после один и тот же.
+        due = [r for r in rows
+               if is_due(r["module_key"],
+                         store.last_run_started(slug, r["module_key"], DONE_STATUSES),
+                         store.last_run_started(slug, r["module_key"]),
+                         r.get("run_requested_at"), now)]
+        prog.plan([r["module_key"] for r in due])
         goals = store.project_lead_goals(slug)
         # инвентарь — по всем кабинетам проекта, а не по выбранным: из него и выбирают
         cabinets(slug, accts, store, now, log)
@@ -654,82 +717,98 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
             within = (lambda: clock() - started < PREVIEW_TICK_BUDGET.total_seconds()) \
                 if budget else None
             _run_previews(slug, store, lambda: (accts, why), modules, now, log,
-                          cleanup=not cleaned, keep_going=within)
+                          cleanup=not cleaned, keep_going=within, cancel=cancel,
+                          on_claim=lambda: prog.phase("preview", "пробный прогон"))
             cleaned = True
         previews(budget=True)
+        cancel.check()
         lock_line = agent_lock_fn(slug)
-        rc = 1 if _apply_phase(slug, store, rows, modules, accts, now, log, lock_line) else 0
-        scanned_any = False
-        for row in rows:
-            mkey, mode = row["module_key"], row["mode"]
-            if not is_due(mkey, store.last_run_started(slug, mkey, DONE_STATUSES),
-                          store.last_run_started(slug, mkey),
-                          row.get("run_requested_at"), now):
-                continue
+        rc = 1 if _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
+                               cancel, prog) else 0
+        for i, row in enumerate(due):
             # заявка, поданная во время скана, не ждёт следующего такта
-            if scanned_any:
+            if i:
                 previews(budget=True)
-            scanned_any = True
-            run_id = store.start_run(slug, mkey, mode)
-            module = modules.get(mkey)
-            if module is None:
-                store.finish_run(run_id, "skipped", {"reason": "модуль %s не реализован" % mkey})
-                continue
-            if not accts:
-                store.finish_run(run_id, "skipped", {
-                    "reason": "нет кабинетов: " + "; ".join(why or ["не найдены"])})
-                continue
-            mod_accts, skipped = _module_accounts(mkey, row.get("settings"), accts)
-            for line in skipped:
-                log("[%s] %s" % (mkey, line))
-            if not mod_accts:
-                store.finish_run(run_id, "skipped", {
-                    "reason": "нет выбранных кабинетов: " + "; ".join(skipped),
-                    "skipped_logins": skipped})
-                continue
-            summary: dict = {}
-            try:
-                ctx = _ctx(slug, mkey, mode, row.get("settings"), mod_accts, now, log, goals,
-                           store=store)
-                out = module.run(ctx)
-                healed: dict = {}
-                # до сверки: закрытая applied больше не глушит новую находку на ту же площадку
-                _record_absent(store, out.displaced, healed, log)
-                cur = _currencies(mod_accts)
-                for f in out.findings:
-                    # журнал рисует расход находки: тенге без пометки читались бы рублями
-                    if cur.get(f.login, RUB) != RUB:
-                        f.details["currency"] = cur[f.login]
-                # свой список модуля, иначе кабинеты ctx: туда попали только разрешённые логины
-                scanned = out.scanned_logins if out.scanned_logins is not None \
-                    else [a.login for a in mod_accts]
-                rec = reconcile(mkey, store.existing_findings(slug, mkey), out.findings,
-                                now, scanned, unverified=out.unverified,
-                                scanned_campaigns=_cabinets.scanned_campaigns(mod_accts))
-                inserted = store.apply_reconciled(slug, mkey, run_id, rec)
-                summary = _scan_summary(out, mod_accts, cur)
-                if skipped:
-                    summary["skipped_logins"] = skipped
-                if out.skipped_campaigns:
-                    summary["skipped_campaigns"] = out.skipped_campaigns
-                summary.update(findings=len(out.findings), inserted=len(rec.insert),
-                               resolved=len(rec.resolve), expired=len(rec.expire))
-                summary.update(healed)
-                if lock_line and mode in WRITE_MODES:
-                    summary["agent_lock"] = lock_line
-                elif mode == "auto":
-                    auto, bad = _auto_apply(slug, mkey, module, ctx, store,
-                                            store.existing_findings(slug, mkey),
-                                            set(inserted) | {fid for fid, _ in rec.touch}, log)
-                    summary.update({"auto_" + k: v for k, v in auto.items()})
-                    if bad:
-                        rc = 1
-                store.finish_run(run_id, "ok", summary)
-            except Exception as err:
+            cancel.check()
+            if _scan(slug, store, row, modules, accts, why, goals, now, log, lock_line,
+                     cancel, prog):
                 rc = 1
-                text = "%s: %s" % (type(err).__name__, err)
-                log("[%s] ошибка: %s" % (mkey, text))
-                store.finish_run(run_id, "error", summary, error=text)
+            prog.module_done()
         # и без сканов: заявка, поданная во время применения, иначе ждала бы следующего такта
         previews(budget=False)
         return rc
+
+
+def _scan(slug, store, row, modules, accts, why, goals, now, log, lock_line,
+          cancel: _cancel.Switch, prog: RunProgress) -> bool:
+    """Скан одного модуля со строкой module_runs; True — сбой (код 1).
+
+    module.run только читает (находки раннер пишет после него) — остановка обрывает его
+    сразу: строка закрывается статусом cancelled, находки модуля не трогаются."""
+    mkey, mode = row["module_key"], row["mode"]
+    run_id = store.start_run(slug, mkey, mode)
+    module = modules.get(mkey)
+    if module is None:
+        store.finish_run(run_id, "skipped", {"reason": "модуль %s не реализован" % mkey})
+        return False
+    if not accts:
+        store.finish_run(run_id, "skipped", {
+            "reason": "нет кабинетов: " + "; ".join(why or ["не найдены"])})
+        return False
+    mod_accts, skipped = _module_accounts(mkey, row.get("settings"), accts)
+    for line in skipped:
+        log("[%s] %s" % (mkey, line))
+    if not mod_accts:
+        store.finish_run(run_id, "skipped", {
+            "reason": "нет выбранных кабинетов: " + "; ".join(skipped),
+            "skipped_logins": skipped})
+        return False
+    summary: dict = {}
+    failed = False
+    try:
+        ctx = _ctx(slug, mkey, mode, row.get("settings"), mod_accts, now, log, goals,
+                   prog.module(mkey, mod_accts), store=store)
+        with cancel.interruptible():
+            out = module.run(ctx)
+        healed: dict = {}
+        # до сверки: закрытая applied больше не глушит новую находку на ту же площадку
+        _record_absent(store, out.displaced, healed, log)
+        cur = _currencies(mod_accts)
+        for f in out.findings:
+            # журнал рисует расход находки: тенге без пометки читались бы рублями
+            if cur.get(f.login, RUB) != RUB:
+                f.details["currency"] = cur[f.login]
+        # свой список модуля, иначе кабинеты ctx: туда попали только разрешённые логины
+        scanned = out.scanned_logins if out.scanned_logins is not None \
+            else [a.login for a in mod_accts]
+        rec = reconcile(mkey, store.existing_findings(slug, mkey), out.findings,
+                        now, scanned, unverified=out.unverified,
+                        scanned_campaigns=_cabinets.scanned_campaigns(mod_accts))
+        inserted = store.apply_reconciled(slug, mkey, run_id, rec)
+        summary = _scan_summary(out, mod_accts, cur)
+        if skipped:
+            summary["skipped_logins"] = skipped
+        if out.skipped_campaigns:
+            summary["skipped_campaigns"] = out.skipped_campaigns
+        summary.update(findings=len(out.findings), inserted=len(rec.insert),
+                       resolved=len(rec.resolve), expired=len(rec.expire))
+        summary.update(healed)
+        if lock_line and mode in WRITE_MODES:
+            summary["agent_lock"] = lock_line
+        elif mode == "auto":
+            auto, bad = _auto_apply(slug, mkey, module, ctx, store,
+                                    store.existing_findings(slug, mkey),
+                                    set(inserted) | {fid for fid, _ in rec.touch}, log)
+            summary.update({"auto_" + k: v for k, v in auto.items()})
+            failed = bad
+        store.finish_run(run_id, "ok", summary)
+    except _cancel.Cancelled:
+        log("[%s] %s" % (mkey, _cancel.TEXT))
+        store.cancel_run(run_id, {"reason": _cancel.TEXT, "logins_total": len(mod_accts)})
+        raise
+    except Exception as err:
+        failed = True
+        text = "%s: %s" % (type(err).__name__, err)
+        log("[%s] ошибка: %s" % (mkey, text))
+        store.finish_run(run_id, "error", summary, error=text)
+    return failed

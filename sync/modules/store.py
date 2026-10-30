@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Iterator, List, Optional, Sequence
 
+import psycopg2.errors
 import psycopg2.extras
 
 from sync import db
@@ -135,6 +136,20 @@ def finish_run(run_id: int, status: str, summary: dict, error: Optional[str] = N
     with db.get_connection() as conn, conn.cursor() as cur:
         cur.execute("UPDATE module_runs SET finished_at = now(), status = %s, summary = %s, "
                     "error = %s WHERE id = %s", (status, _json(summary), error, run_id))
+
+
+def cancel_run(run_id: int, summary: dict) -> None:
+    """Скан остановлен «Остановить» (sync/modules/cancel.py): статус cancelled, summary.cancelled.
+
+    cancelled в CHECK module_runs добавляет миграция Panda-BI 20261030114217_module_runs_cancelled.
+    edu-sync выкладывается сам (git pull в юните), миграция — по апрову: пока её нет, строка
+    закрывается error с тем же summary.cancelled, иначе висела бы «идёт» до fail_stale_runs.
+    """
+    summary = dict(summary, cancelled=True)
+    try:
+        finish_run(run_id, "cancelled", summary)
+    except psycopg2.errors.CheckViolation:
+        finish_run(run_id, "error", summary, error="остановлен вручную")
 
 
 def existing_findings(slug: str, module_key: str) -> List[StoredFinding]:

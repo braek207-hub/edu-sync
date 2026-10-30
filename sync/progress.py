@@ -120,10 +120,14 @@ class Reporter:
         done: Optional[int] = None,
         total: Optional[int] = None,
         label: Optional[str] = None,
+        extra: Optional[dict] = None,
     ) -> None:
+        """extra — свои поля этапа рядом с общими (ход модулей Директа: модуль k из M, кабинет).
+        Колонка сливается через ||: поле, которое этап сбрасывает, передаётся явным None."""
         if not self.enabled:
             return
         payload = {
+            **(extra or {}),
             "stage": stage,
             "label": label,
             "done": None if done is None else int(done),
@@ -258,8 +262,8 @@ def _get() -> Reporter:
 
 
 def report(stage: str, done: Optional[int] = None, total: Optional[int] = None,
-           label: Optional[str] = None) -> None:
-    _get().report(stage, done, total, label)
+           label: Optional[str] = None, extra: Optional[dict] = None) -> None:
+    _get().report(stage, done, total, label, extra)
 
 
 def result(rows: Optional[int] = None, days: Optional[int] = None) -> None:

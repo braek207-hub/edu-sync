@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """CLI модулей Директа: python -m sync.modules_run --project <slug> [--module <key>] [--dry-run]
-[--preview-id <id>]."""
+[--preview-id <id>]. Код 143 — остановлен SIGTERM (sync/modules/cancel.py)."""
 
 import argparse
 import sys
 from datetime import datetime, timezone
 
+from sync.modules import cancel
 from sync.modules.runner import run_preview, run_project
 
 
@@ -21,6 +22,8 @@ def main(argv=None) -> int:
     p.add_argument("--preview-id", type=int,
                    help="прогнать только это превью (module_previews.id), без скана")
     a = p.parse_args(argv)
+    # «Остановить» в Panda-BI → systemctl stop → SIGTERM: чистый выход с кодом 143.
+    cancel.install()
     now = datetime.now(timezone.utc)
     if a.preview_id is not None:
         return run_preview(a.project, a.preview_id, now=now, log=_log)
