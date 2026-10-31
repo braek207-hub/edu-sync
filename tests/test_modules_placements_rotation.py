@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Ротация своих запретов в полном списке кампании и ограждение общего кабинета (synergy)."""
+"""Ротация своих запретов в полном списке кампании и кабинет проекта synergy."""
 
 from datetime import timedelta
 
@@ -7,7 +7,7 @@ import pytest
 
 from sync.modules import cabinets, runner
 from sync.modules import placements as pm
-from sync.modules.accounts import (SYNERGY_SCHOOL_CAMPAIGNS, SYNERGY_SCHOOL_LOGIN, DirectAccount,
+from sync.modules.accounts import (SYNERGY_SCHOOL_LOGIN, DirectAccount,
                                    accounts_for)
 from sync.modules.lifecycle import reconcile, rotated
 from sync.modules.types import ApplyResult, StoredFinding, fingerprint
@@ -333,66 +333,37 @@ def test_human_rollback_still_suppresses():
     assert reconcile("placements", [old], [new], NOW).insert == []
 
 
-# --- synergy: ограждение общего кабинета ---------------------------------------------
+# --- synergy: весь кабинет проекта, кампании — галочками настроек ---------------------
 
-def test_accounts_for_synergy_school_is_fenced():
+def test_accounts_for_synergy_school_is_whole_cabinet():
     (acc,), why = accounts_for("synergy", {"APPROVE_AGENCY_TOKEN": "t"})
     assert why == []
     assert (acc.login, acc.token, acc.currency) == (SYNERGY_SCHOOL_LOGIN, "t", "RUB")
-    assert acc.fence == acc.campaign_ids == (715539609, 715543179) == SYNERGY_SCHOOL_CAMPAIGNS
+    assert acc.campaign_ids is None
+    got, _ = cabinets.select_accounts([acc], [], {SYNERGY_SCHOOL_LOGIN: [715539609, 7]})
+    assert got[0].campaign_ids == (7, 715539609)
     acc2, why = accounts_for("synergy", {})
     assert acc2 == [] and "APPROVE_AGENCY_TOKEN" in why[0]
 
 
-SYN = DirectAccount(SYNERGY_SCHOOL_LOGIN, "t", "RUB", "ОШ", campaign_ids=(1, 2), fence=(1, 2))
-
-
-def test_settings_only_narrow_the_fence():
-    got, why = cabinets.select_accounts([SYN], [], {})
-    assert got[0].campaign_ids == (1, 2) and why == []
-    got, why = cabinets.select_accounts([SYN], [], {SYNERGY_SCHOOL_LOGIN: [2, 99]})
-    assert got[0].campaign_ids == (2,) and "99" in why[0]
-    got, why = cabinets.select_accounts([SYN], [], {SYNERGY_SCHOOL_LOGIN: [99]})
-    assert got == [] and any("пропущен" in w for w in why)
-    # без fence выбор работает как раньше
-    free = DirectAccount("x", "t")
-    got, _ = cabinets.select_accounts([free], [], {"x": [5]})
-    assert got[0].campaign_ids == (5,) and got[0].fence is None
-    got, _ = cabinets.select_accounts([free], [], {})
-    assert got[0].campaign_ids is None
-
-
-def test_inventory_reads_only_fenced_campaigns():
+def test_inventory_reads_whole_synergy_cabinet():
     params = []
 
     def call_fn(token, login, service, payload):
         params.append(payload["params"]["SelectionCriteria"])
         return {"Campaigns": [{"Id": 1, "Name": "a", "Type": "TEXT_CAMPAIGN", "State": "ON"},
-                              {"Id": 7, "Name": "чужая", "Type": "TEXT_CAMPAIGN",
+                              {"Id": 7, "Name": "новая", "Type": "TEXT_CAMPAIGN",
                                "State": "ON"}]}
-    got = cabinets.read_campaigns(SYN, call_fn)
-    assert params[0]["Ids"] == [1, 2]
-    assert [c["id"] for c in got] == [1]
+    acc = DirectAccount(SYNERGY_SCHOOL_LOGIN, "t", "RUB", "ОШ")
+    got = cabinets.read_campaigns(acc, call_fn)
+    assert "Ids" not in params[0]
+    assert [c["id"] for c in got] == [1, 7]
 
 
-def test_runner_refuses_findings_outside_fence():
-    inside = _own(1, "a.ru", cid=1, status="approved")
-    outside = _own(2, "b.ru", cid=7, status="approved")
-    level = _own(3, "c.ru", cid=1, status="approved")
-    level.campaign_id = None
-    level.action = {"op": "exclude_site", "site": "c.ru"}
-    for f in (inside, outside, level):
-        f.login = SYNERGY_SCHOOL_LOGIN
-    keep, refused = runner._fence([inside, outside, level], [SYN])
-    assert keep == [inside]
-    assert set(refused) == {2, 3}
-    assert refused[2].response["code"] == "outside_fence"
-    # кабинет без ограждения — без изменений
-    keep, refused = runner._fence([_own(4, "d.ru", cid=7)], [ACC])
-    assert len(keep) == 1 and refused == {}
+SYN = DirectAccount(SYNERGY_SCHOOL_LOGIN, "t", "RUB", "ОШ", campaign_ids=(1, 2))
 
 
-def test_scan_of_fenced_cabinet_reads_only_its_campaigns(monkeypatch):
+def test_scan_of_selected_campaigns_reads_only_them(monkeypatch):
     asked = {}
 
     def campaigns(t, l, ids=()):

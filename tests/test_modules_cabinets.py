@@ -422,3 +422,81 @@ def test_inventory_skips_duplicate_login():
     rows, camps = cabinets.inventory([A, A, B], [].append, _caller({"login-a": 3, "Login-B": 1}))
     assert [r["login"] for r in rows] == ["login-a", "Login-B"]
     assert sorted(camps) == ["Login-B", "login-a"]
+
+
+# --- modules_run --inventory: юнит <slug>_cabinets по кнопке «Обновить» -----------------
+
+def _inv(st, accts=(A, B), why=(), call=None, log=None, tracked=None):
+    def track(items, stage, label=None, total=None):
+        if tracked is not None:
+            tracked.append((stage, label, [a.login for a in items]))
+        return items
+    return runner.run_inventory(
+        "lime", store=st, accounts=lambda s: (list(accts), list(why)),
+        log=(log if log is not None else (lambda x: None)),
+        call_fn=call or _caller({"login-a": 2, "Login-B": 1}), track=track)
+
+
+def test_inventory_run_writes_now_even_if_fresh_and_exits_zero():
+    # свежий checked_at (10 минут) такт пропустил бы; ручной прогон пишет сразу
+    st = InvStore(last=NOW - timedelta(minutes=10))
+    tracked = []
+    assert _inv(st, tracked=tracked) == 0
+    assert [r["login"] for _, rows in st.saved for r in rows] == ["login-a", "Login-B"]
+    assert [sorted(b) for _, b in st.camps] == [["Login-B", "login-a"]]
+    assert tracked == [("modules.inventory", "Кабинеты · кампании", ["login-a", "Login-B"])]
+
+
+def test_inventory_run_partial_read_is_success():
+    st = InvStore()
+    log = []
+    assert _inv(st, log=log.append, call=_caller(
+        {"login-a": 2, "Login-B": DirectError("campaigns [1000] Сервис недоступен")})) == 0
+    assert [r["login"] for _, rows in st.saved for r in rows] == ["login-a"]
+    assert log[-1] == "кабинеты: инвентарь обновлён, кабинетов 1 из 2"
+
+
+def test_inventory_run_nothing_read_is_failure():
+    st = InvStore()
+    err = DirectError("campaigns [1000] Сервис недоступен")
+    assert _inv(st, call=_caller({"login-a": err, "Login-B": err})) == 1
+    assert st.saved == [] and st.camps == []
+
+
+def test_inventory_run_write_failure_is_exit_1():
+    class Boom(InvStore):
+        def upsert_cabinets(self, slug, rows):
+            raise RuntimeError("connection reset")
+    log = []
+    assert _inv(Boom(), log=log.append) == 1
+    assert log == ["кабинеты: инвентарь не записан (RuntimeError: connection reset)"]
+
+
+def test_inventory_run_without_cabinets_is_failure_with_reason():
+    log = []
+
+    def no_call(*a):
+        raise AssertionError("без кабинетов в Директ не ходим")
+    assert _inv(InvStore(), accts=(), why=["нет токена в DIRECT_TOKEN"], call=no_call,
+                log=log.append) == 1
+    assert log == ["кабинеты: нет токена в DIRECT_TOKEN",
+                   "кабинеты: у проекта lime нет кабинетов Директа"]
+
+
+def test_cli_inventory_runs_only_inventory(monkeypatch):
+    from sync import modules_run
+    calls = []
+    monkeypatch.setattr(modules_run, "run_inventory",
+                        lambda slug, log: calls.append(("inv", slug)) or 0)
+    monkeypatch.setattr(modules_run, "run_project",
+                        lambda *a, **k: calls.append(("project",)) or 0)
+    monkeypatch.setattr(modules_run.cancel, "install", lambda: calls.append(("cancel",)))
+    assert modules_run.main(["--project", "synergy", "--inventory"]) == 0
+    assert calls == [("inv", "synergy")]
+    for bad in (["--module", "audit"], ["--dry-run"], ["--preview-id", "3"]):
+        try:
+            modules_run.main(["--project", "lime", "--inventory"] + bad)
+        except SystemExit as e:
+            assert e.code == 2
+        else:
+            raise AssertionError(bad)

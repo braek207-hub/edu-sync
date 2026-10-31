@@ -6,12 +6,10 @@
 {логин: [Id]}; логина в нём нет — все подходящие модулю кампании кабинета. Выбранные кампании
 едут в DirectAccount.campaign_ids, и модуль сужает по ним чтение кампаний (with_ids) и строки
 отчётов (keep_rows) — одни и те же функции во всех трёх модулях.
-Ограждение (DirectAccount.fence, общий кабинет synergy): выбор его только сужает, без
-выбора — само ограждение, а не все кампании; инвентарь читает и кладёт только его кампании;
-применение за ним раннер отклоняет (runner._fence).
 Инвентарь: по каждому кабинету проекта кампании и доступ; по нему Panda показывает, из чего
-выбирать. Обновляется не чаще INVENTORY_EVERY: такт модулей идёт каждые полчаса, а состав
-кабинетов и кампаний меняется редко.
+выбирать. В такте модулей обновляется не чаще INVENTORY_EVERY: такт идёт каждые полчаса, а состав
+кабинетов и кампаний меняется редко. Кнопка «Обновить» в модалке подключения модуля зовёт
+юнит <slug>_cabinets (modules_run --inventory): write_inventory сразу, без порога.
 """
 
 import dataclasses
@@ -75,34 +73,9 @@ def select_accounts(accts: Sequence[DirectAccount], logins: Iterable,
     out: List[DirectAccount] = []
     for a in picked:
         ids = chosen.get(_norm(a.login))
-        if not ids:
-            # без выбора — все кампании кабинета, а у огороженного — его ограждение
-            out.append(dataclasses.replace(a, campaign_ids=a.fence) if a.fence is not None
-                       else a)
-            continue
-        ids = sorted({int(i) for i in ids})
-        if a.fence is not None:
-            # настройка ограждение только сужает: чужие кампании общего кабинета не берём
-            outside = [i for i in ids if i not in a.fence]
-            why += ["%s: кампания %d вне кампаний проекта в общем кабинете — пропущена"
-                    % (a.login, i) for i in outside]
-            ids = [i for i in ids if i in a.fence]
-            if not ids:
-                why.append("%s: ни одной выбранной кампании проекта — кабинет пропущен"
-                           % a.login)
-                continue
-        out.append(dataclasses.replace(a, campaign_ids=tuple(ids)))
+        out.append(dataclasses.replace(a, campaign_ids=tuple(sorted({int(i) for i in ids})))
+                   if ids else a)
     return out, why
-
-
-def outside_fence(acc: DirectAccount, campaign_id: Optional[int]) -> bool:
-    """Действие за ограждением общего кабинета: чужая кампания или уровень всего кабинета."""
-    if acc.fence is None:
-        return False
-    try:
-        return campaign_id is None or int(campaign_id) not in acc.fence
-    except (TypeError, ValueError):
-        return True
 
 
 def scanned_campaigns(accts: Sequence[DirectAccount]) -> Dict[str, Collection[int]]:
@@ -178,9 +151,6 @@ def read_campaigns(acc: DirectAccount, call_fn=call) -> List[dict]:
     blocks = {v + "FieldNames": ["BiddingStrategy"] for v in STRATEGY_BLOCKS.values()}
     fields = ["Id", "Name", "Type", "State"]
     crit: Dict[str, Any] = {"States": LIVE_STATES}
-    if acc.fence is not None:
-        # общий кабинет: чужие кампании не читаем и в module_campaigns не кладём
-        crit["Ids"] = list(acc.fence)
     try:
         rows = direct_api.get_all(acc.token, acc.login, "campaigns", crit, fields,
                                   extra=blocks, call_fn=call_fn)
@@ -189,12 +159,10 @@ def read_campaigns(acc: DirectAccount, call_fn=call) -> List[dict]:
             raise
         rows = direct_api.get_all(acc.token, acc.login, "campaigns", crit, fields,
                                   call_fn=call_fn)
-    fence = set(acc.fence) if acc.fence is not None else None
-    return [campaign_row(c) for c in rows if c.get("State") != "ARCHIVED"
-            and (fence is None or int(c["Id"]) in fence)]
+    return [campaign_row(c) for c in rows if c.get("State") != "ARCHIVED"]
 
 
-def inventory(accts: Sequence[DirectAccount], log: Callable[[str], None],
+def inventory(accts: Iterable[DirectAccount], log: Callable[[str], None],
               call_fn=call) -> Tuple[List[dict], Dict[str, List[dict]]]:
     """Строки module_cabinets и кампании прочитанных кабинетов {логин: [кампания]}. Временный
     сбой (сеть, 1000, 204) строки не даёт: последнее известное состояние лучше, чем «0
@@ -225,6 +193,18 @@ def inventory(accts: Sequence[DirectAccount], log: Callable[[str], None],
     return out, camps
 
 
+def write_inventory(slug: str, accts: Iterable[DirectAccount], store,
+                    log: Callable[[str], None], call_fn=call) -> int:
+    """Прочитать кабинеты и записать инвентарь сейчас. Сбой записи — исключение вызывающему.
+    Возвращает число записанных кабинетов (0 — ни один не прочитан, база не тронута)."""
+    rows, camps = inventory(accts, log, call_fn)
+    if rows:
+        store.upsert_cabinets(slug, rows)
+    if camps:
+        store.replace_campaigns(slug, camps)
+    return len(rows)
+
+
 def refresh(slug: str, accts: Sequence[DirectAccount], store, now: datetime,
             log: Callable[[str], None], call_fn=call,
             every: timedelta = INVENTORY_EVERY) -> Optional[int]:
@@ -237,15 +217,14 @@ def refresh(slug: str, accts: Sequence[DirectAccount], store, now: datetime,
         last = store.cabinets_checked_at(slug)
         if last is not None and now - last < every:
             return None
-        rows, camps = inventory(accts, log, call_fn)
-        if rows:
-            store.upsert_cabinets(slug, rows)
-        if camps:
-            store.replace_campaigns(slug, camps)
-        return len(rows)
+        return write_inventory(slug, accts, store, log, call_fn)
     except Exception as err:
-        missing = type(err).__name__ == "UndefinedTable"
-        log("кабинеты: инвентарь не записан (%s)" % (
-            "нет таблицы module_cabinets или module_campaigns — миграция Panda не накатана"
-            if missing else "%s: %s" % (type(err).__name__, err)))
+        log(failure_line(err))
         return None
+
+
+def failure_line(err: Exception) -> str:
+    missing = type(err).__name__ == "UndefinedTable"
+    return "кабинеты: инвентарь не записан (%s)" % (
+        "нет таблицы module_cabinets или module_campaigns — миграция Panda не накатана"
+        if missing else "%s: %s" % (type(err).__name__, err))

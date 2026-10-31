@@ -51,8 +51,8 @@ ACCOUNTS: List[Account] = [
     Account("bjorn", "BJORN", "bjorn"),
     Account("polinarepik", "Polinarepik", "polinarepik"),
     Account("meshnflesh", "mesh-n-flesh", "meshnflesh"),
-    # ОШ Синергия с 30.10.2026 — проект synergy: кабинет, токен и ограждение двух
-    # своих кампаний общего кабинета — в sync.modules.accounts (SYNERGY_SCHOOL_*). До того
+    # ОШ Синергия с 30.10.2026 — проект synergy: кабинет и токен — в sync.modules.accounts
+    # (SYNERGY_SCHOOL_LOGIN), кампании выбирают настройки модуля. До того
     # её чистил старый движок; ключ оставлен, чтобы прежний вызов CLI
     # (--accounts synergy_school) шёл в раннер модулей, а не во второй писатель.
     Account("synergy_school", "ОШ Синергия (vpo-goroda)", "synergy"),

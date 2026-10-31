@@ -6,7 +6,6 @@
 Окружение читается только внутри вызова: тесты подают словарь.
 """
 
-import dataclasses
 import os
 from dataclasses import dataclass
 from typing import Callable, List, Mapping, Optional, Tuple
@@ -21,12 +20,8 @@ class DirectAccount:
     currency: str = "RUB"
     label: str = ""
     # Кампании, которые обходит модуль (settings.campaigns); None — все подходящие кабинета.
-    # Ставит раннер (cabinets.select_accounts); accounts_for — только у кабинета с fence.
+    # Ставит раннер (cabinets.select_accounts); accounts_for оставляет None.
     campaign_ids: Optional[Tuple[int, ...]] = None
-    # Ограждение общего кабинета: кампании, которых робот вправе касаться вообще. Задаётся
-    # здесь, в коде, а не настройкой: settings.campaigns его только сужает (select_accounts),
-    # применение и инвентарь за него не выходят. None — ограждения нет.
-    fence: Optional[Tuple[int, ...]] = None
 
 
 def agency_logins_by_token(token: str) -> List[str]:
@@ -103,16 +98,11 @@ def _single(env, token_names, login_names, default_login, label, currency, why):
     return [DirectAccount(login, token, currency, label)]
 
 
-# ОШ Синергия (проект synergy): кабинет vpo-goroda общий с другими клиентами агентства
-# (доступ через approve.agency, 28.10.2026), наши в нём — только эти две РСЯ-кампании. Цель
-# их стратегии — CRM-статус 317516886: площадка его не накрутит, спам-правило не нужно.
+# ОШ Синергия (проект synergy): кабинет vpo-goroda через approve.agency (28.10.2026). Решение
+# владельца 31.10.2026: весь кабинет наш — кампании модулю выбирают галочками в настройках
+# (settings.campaigns), а не списком в коде. Цель стратегии РСЯ-кампаний — CRM-статус
+# 317516886: площадка его не накрутит, спам-правило не нужно.
 SYNERGY_SCHOOL_LOGIN = "vpo-goroda-316088-c0ts"
-SYNERGY_SCHOOL_CAMPAIGNS: Tuple[int, ...] = (715539609, 715543179)
-
-
-def _fenced(found: List[DirectAccount], fence: Tuple[int, ...]) -> List[DirectAccount]:
-    ids = tuple(sorted({int(i) for i in fence}))
-    return [dataclasses.replace(a, campaign_ids=ids, fence=ids) for a in found]
 
 
 def accounts_for(slug: str, env: Mapping[str, str] = os.environ,
@@ -149,8 +139,8 @@ def accounts_for(slug: str, env: Mapping[str, str] = os.environ,
         found = _single(env, ["MESHNFLESH_DIRECT_TOKEN"], [], "meshnflesh",
                         "mesh-n-flesh", "RUB", why)
     elif slug == "synergy":
-        found = _fenced(_single(env, ["APPROVE_AGENCY_TOKEN"], [], SYNERGY_SCHOOL_LOGIN,
-                                "ОШ Синергия", "RUB", why), SYNERGY_SCHOOL_CAMPAIGNS)
+        found = _single(env, ["APPROVE_AGENCY_TOKEN"], [], SYNERGY_SCHOOL_LOGIN,
+                        "ОШ Синергия", "RUB", why)
     else:
         return [], ["нет кабинетов Директа у проекта %s" % slug]
     return found, why

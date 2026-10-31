@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from sync import progress as _progress
 from sync.modules import accounts as _accounts
 from sync.modules import cabinets as _cabinets
 from sync.modules import cancel as _cancel
@@ -202,26 +203,6 @@ def _record_absent(store, items: List[dict], st, log) -> None:
         _mark_displaced(store, d, note, st, "absent_closed", log)
 
 
-FENCE_TEXT = "кампания вне кампаний проекта в общем кабинете — робот её не трогает"
-
-
-def _fence(items: List[StoredFinding], accts) -> Tuple[List[StoredFinding], Dict[int, ApplyResult]]:
-    """Находки за ограждением общего кабинета (DirectAccount.fence) — отказ до модуля: ни
-    настройка, ни одобрение человека не выводят запись за кампании проекта."""
-    by_login = {a.login: a for a in accts}
-    keep: List[StoredFinding] = []
-    refused: Dict[int, ApplyResult] = {}
-    for f in items:
-        acc = by_login.get(f.login)
-        cid = (f.action or {}).get("campaign_id", f.campaign_id)
-        if acc is not None and _cabinets.outside_fence(acc, cid):
-            refused[f.id] = ApplyResult(False, {"code": "outside_fence", "campaign_id": cid},
-                                        FENCE_TEXT)
-        else:
-            keep.append(f)
-    return keep, refused
-
-
 def _wanted(f: StoredFinding, mode: str) -> bool:
     """Откат — явная отмена человека и всегда в безопасную сторону (снимает нашу же запись),
     поэтому идёт и в report; одобренное пишется в Директ только в approve/auto."""
@@ -279,13 +260,8 @@ def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
         errors: List[str] = []
         try:
             for rollback, fn, part in parts:
-                inside, results = _fence(part, accts)
-                if inside:
-                    got, err = _safe_call(fn, ctx, inside, log,
+                results, err = _safe_call(fn, ctx, part, log,
                                           "%s.%s" % (mkey, "rollback" if rollback else "apply"))
-                    results.update(got)
-                else:
-                    err = None
                 if err is not None:
                     # не "errors": это имя у модулей занято списком строк по кабинетам
                     st["apply_errors"] = st.get("apply_errors", 0) + 1
@@ -323,11 +299,7 @@ def _auto_apply(slug, mkey, module, ctx, store, fresh, confirmed, log):
     items = [dataclasses.replace(f, status="approved") for f in fresh if f.id in ids]
     if not items:
         return out, False
-    inside, results = _fence(items, ctx.accounts)
-    err = None
-    if inside:
-        got, err = _safe_call(module.apply, ctx, inside, log, "%s.apply" % mkey)
-        results.update(got)
+    results, err = _safe_call(module.apply, ctx, items, log, "%s.apply" % mkey)
     for f in items:
         res = results.get(f.id) or ApplyResult(False, {}, "модуль не вернул результат")
         _record(store, f, res, False, out, log)
@@ -653,6 +625,33 @@ def run_preview(slug: str, preview_id: int, *, store=_store, accounts=_accounts.
         log("превью %s: %s" % (preview_id, _cancel.TEXT))
         return _cancel.EXIT_CODE
     return 0 if ok else 1
+
+
+def run_inventory(slug: str, *, store=_store, accounts=_accounts.accounts_for, log=print,
+                  call_fn=_cabinets.call,
+                  track: Callable[..., Iterable[Any]] = _progress.track) -> int:
+    """Только инвентарь кабинетов и кампаний, сейчас (modules_run --inventory, юнит
+    <slug>_cabinets по кнопке «Обновить» модалки подключения). Без замка проекта: модули не
+    гоняются, а запись инвентаря — upsert, второй писатель (такт модулей) ей не мешает.
+    Код 1 — нет кабинетов, ни один не прочитан или запись упала: заявка Panda ждёт новый
+    checked_at, и тихий ноль оставил бы её висеть до таймаута без причины в журнале."""
+    accts, why = accounts(slug)
+    for line in why:
+        log("кабинеты: %s" % line)
+    if not accts:
+        log("кабинеты: у проекта %s нет кабинетов Директа" % slug)
+        return 1
+    try:
+        n = _cabinets.write_inventory(slug, track(accts, "modules.inventory",
+                                                  "Кабинеты · кампании"), store, log, call_fn)
+    except Exception as err:
+        log(_cabinets.failure_line(err))
+        return 1
+    if not n:
+        log("кабинеты: ни один из %d не прочитан — инвентарь не обновлён" % len(accts))
+        return 1
+    log("кабинеты: инвентарь обновлён, кабинетов %d из %d" % (n, len(accts)))
+    return 0
 
 
 def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, modules=MODULES,
