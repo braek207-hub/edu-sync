@@ -875,14 +875,15 @@ def upsert_polinarepik_metrica_purchases(rows: List[Dict[str, Any]]) -> int:
     sql = """
         INSERT INTO polinarepik_metrica_purchases (
             order_id, purchase_date, client_id, traffic_source, utm_source,
-            utm_medium, utm_campaign, purchases, revenue, updated_at
+            utm_medium, utm_campaign, adv_engine, purchases, revenue, updated_at
         )
         VALUES (
             %(order_id)s, %(purchase_date)s, %(client_id)s, %(traffic_source)s, %(utm_source)s,
-            %(utm_medium)s, %(utm_campaign)s, %(purchases)s, %(revenue)s, NOW()
+            %(utm_medium)s, %(utm_campaign)s, %(adv_engine)s, %(purchases)s, %(revenue)s, NOW()
         )
         ON CONFLICT (order_id) DO UPDATE SET
             purchase_date  = EXCLUDED.purchase_date,
+            adv_engine     = EXCLUDED.adv_engine,
             client_id      = COALESCE(NULLIF(EXCLUDED.client_id, ''), polinarepik_metrica_purchases.client_id),
             traffic_source = EXCLUDED.traffic_source,
             utm_source     = EXCLUDED.utm_source,

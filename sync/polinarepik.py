@@ -12,7 +12,7 @@ import re
 import sys
 import time
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 
@@ -31,6 +31,7 @@ from sync.db import (
 DIRECT_CLIENT_LOGIN = "polinarepik-wear"
 METRICA_COUNTER_ID = "100764399"
 METRICA_ATTRIBUTION = "lastsign"
+PURCHASES_ATTRIBUTION = "automatic"
 DEFAULT_SYNC_DAYS = 60
 
 # Цели Метрики воронки (счётчик 100764399)
@@ -67,6 +68,13 @@ def metrica_counter_id() -> str:
 
 def metrica_attribution() -> str:
     return _env("POLINAREPIK_METRICA_ATTRIBUTION", METRICA_ATTRIBUTION)
+
+
+def purchases_attribution() -> str:
+    """Покупки — своя модель: дашборд привязывает по ним заказы Битрикса к рекламе, и
+    automatic отдаёт Директу заказы, где lastsign видит поиск или возврат (Павел 05.11).
+    Визиты и source-level остаются на metrica_attribution()."""
+    return _env("POLINAREPIK_PURCHASES_ATTRIBUTION", PURCHASES_ATTRIBUTION)
 
 
 def campaign_platform(name: str) -> str:
@@ -432,86 +440,93 @@ def _metrica_text(value: str) -> str:
     return text
 
 
-def fetch_metrica_purchases(date_from: str, date_to: str) -> list[dict[str, Any]]:
-    token = yandex_token()
-    counter_id = metrica_counter_id()
-    if not counter_id:
-        raise RuntimeError("Metrika counter ID missing")
-    attribution = metrica_attribution()
-
-    dimensions = ",".join(
-        [
-            "ym:s:date",
-            "ym:s:purchaseID",
-            "ym:s:clientID",
-            "ym:s:lastSignTrafficSource",
-            "ym:s:lastSignUTMSource",
-            "ym:s:lastSignUTMMedium",
-            "ym:s:lastSignUTMCampaign",
-        ]
-    )
-
-    by_order: dict[str, dict[str, Any]] = {}
+def _metrica_purchase_records(
+    dimensions: list[str], date_from: str, date_to: str, token: str
+) -> Iterator[tuple[list[str], list[Any]]]:
     limit = 100000
     offset = 1
-
     while True:
         params = {
-            "ids": counter_id,
+            "ids": metrica_counter_id(),
             "metrics": "ym:s:ecommercePurchases,ym:s:ecommerceRevenue",
-            "dimensions": dimensions,
+            "dimensions": ",".join(dimensions),
             "date1": date_from,
             "date2": date_to,
             "accuracy": "full",
             "proposed_accuracy": "false",
-            "attribution": attribution,
+            "attribution": purchases_attribution(),
             "lang": "ru",
             "limit": limit,
             "offset": offset,
             "filters": "ym:s:ecommercePurchases>0",
         }
-        payload = _metrica_get(params, token)
-        data = payload.get("data", [])
-        if not data:
-            break
-
+        data = _metrica_get(params, token).get("data", [])
         for record in data:
-            dims = [str(d.get("name", "")).strip() for d in record.get("dimensions", [])]
-            if len(dims) < 2:
-                continue
-            row_date, order_id = dims[0], dims[1]
-            if not row_date or not order_id or order_id in {"(not set)", "0", "--"}:
-                continue
-            client_id = _metrica_text(dims[2] if len(dims) > 2 else "")
-            traffic_source = _metrica_text(dims[3] if len(dims) > 3 else "")
-            utm_source = _metrica_text(dims[4] if len(dims) > 4 else "")
-            utm_medium = _metrica_text(dims[5] if len(dims) > 5 else "")
-            utm_campaign = normalize_campaign_id(_metrica_text(dims[6] if len(dims) > 6 else "")) or ""
-            metrics = record.get("metrics") or [0, 0]
-            purchases = int(float(metrics[0] or 0))
-            revenue = float(metrics[1] or 0)
-            if purchases <= 0:
-                continue
-
-            prev = by_order.get(order_id)
-            if prev and prev["purchase_date"] > row_date:
-                continue
-
-            by_order[order_id] = {
-                "order_id": order_id,
-                "purchase_date": row_date,
-                "client_id": client_id,
-                "traffic_source": traffic_source,
-                "utm_source": utm_source,
-                "utm_medium": utm_medium,
-                "utm_campaign": utm_campaign,
-                "purchases": purchases,
-                "revenue": revenue,
-            }
-
+            dims = [str(d.get("name", "") or "").strip() for d in record.get("dimensions", [])]
+            yield dims, record.get("metrics") or [0, 0]
         if len(data) < limit:
             break
         offset += limit
+
+
+def fetch_metrica_purchases(date_from: str, date_to: str) -> list[dict[str, Any]]:
+    token = yandex_token()
+    if not metrica_counter_id():
+        raise RuntimeError("Metrika counter ID missing")
+
+    by_order: dict[str, dict[str, Any]] = {}
+    for dims, metrics in _metrica_purchase_records(
+        [
+            "ym:s:date",
+            "ym:s:purchaseID",
+            "ym:s:clientID",
+            "ym:s:<attribution>TrafficSource",
+            "ym:s:<attribution>UTMSource",
+            "ym:s:<attribution>UTMMedium",
+            "ym:s:<attribution>UTMCampaign",
+        ],
+        date_from,
+        date_to,
+        token,
+    ):
+        if len(dims) < 2:
+            continue
+        row_date, order_id = dims[0], dims[1]
+        if not row_date or not order_id or order_id in {"(not set)", "0", "--"}:
+            continue
+        purchases = int(float(metrics[0] or 0))
+        revenue = float(metrics[1] or 0)
+        if purchases <= 0:
+            continue
+
+        prev = by_order.get(order_id)
+        if prev and prev["purchase_date"] > row_date:
+            continue
+
+        by_order[order_id] = {
+            "order_id": order_id,
+            "purchase_date": row_date,
+            "client_id": _metrica_text(dims[2] if len(dims) > 2 else ""),
+            "traffic_source": _metrica_text(dims[3] if len(dims) > 3 else ""),
+            "utm_source": _metrica_text(dims[4] if len(dims) > 4 else ""),
+            "utm_medium": _metrica_text(dims[5] if len(dims) > 5 else ""),
+            "utm_campaign": normalize_campaign_id(_metrica_text(dims[6] if len(dims) > 6 else "")) or "",
+            "adv_engine": "",
+            "purchases": purchases,
+            "revenue": revenue,
+        }
+
+    # Рекламная система — отдельным запросом: с clientID она вырождает выдачу в ноль строк
+    # (замер 05.11). Без неё клик Директа без utm (Метрика: «Яндекс Директ: Не определено»)
+    # неотличим от прочей рекламы и уходит в органику.
+    for dims, _ in _metrica_purchase_records(
+        ["ym:s:date", "ym:s:purchaseID", "ym:s:<attribution>AdvEngine"], date_from, date_to, token
+    ):
+        if len(dims) < 3:
+            continue
+        row = by_order.get(dims[1])
+        if row and row["purchase_date"] == dims[0]:
+            row["adv_engine"] = _metrica_text(dims[2])
 
     return list(by_order.values())
 
