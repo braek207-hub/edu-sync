@@ -146,6 +146,15 @@ def test_unsupported_campaigns(monkeypatch):
     assert fake.updates == []
 
 
+def test_two_channel_limit_unsupported(monkeypatch):
+    s = _strategy()
+    s["Network"] = {"BiddingStrategyType": "AVERAGE_CPA",
+                    "AverageCpa": {"AverageCpa": 1500 * M, "WeeklySpendLimit": 5000 * M}}
+    fake = FakeDirect(monkeypatch, {101: {"strategy": s}})
+    res = bm.apply(_ctx(), [_finding()])
+    assert (res[1].ok, res[1].error) == (False, "unsupported") and fake.updates == []
+
+
 def test_direct_accepted_but_not_applied(monkeypatch):
     FakeDirect(monkeypatch, {101: {"strategy": _strategy()}}, accept=False)
     res = bm.apply(_ctx(), [_finding()])
@@ -202,9 +211,12 @@ def test_never_due():
 # --- раннер: окно отмены и замок -------------------------------------------------------------
 
 class FakeStore:
-    def __init__(self, rows, pending, after_wait=None):
-        self.rows, self._pending = rows, list(pending)
+    """pending_with_now отдаёт очередь и «now() базы» — часы clock, а не процесса."""
+
+    def __init__(self, rows, pending, clock, after_wait=None, outcome_ok=True):
+        self.rows, self._pending, self.clock = rows, list(pending), clock
         self.after_wait = after_wait
+        self.outcome_ok = outcome_ok
         self.outcomes: List[tuple] = []
         self.runs: Dict[int, dict] = {}
         self.reads = 0
@@ -245,15 +257,22 @@ class FakeStore:
     def existing_findings(self, slug, mkey):
         return []
 
-    def pending(self, slug):
+    def pending_with_now(self, slug):
         self.reads += 1
         if self.reads > 1 and self.after_wait is not None:
-            return list(self.after_wait)
-        return list(self._pending)
+            return list(self.after_wait), self.clock.t
+        return list(self._pending), self.clock.t
+
+    def pending(self, slug):
+        return self.pending_with_now(slug)[0]
 
     def set_outcome(self, fid, status, result, rollback=False):
         self.outcomes.append((fid, status, rollback, result.error))
-        return True
+        return self.outcome_ok
+
+
+BEFORE = {"weekly_budget": 20000, "target_cpa": 1500}
+AFTER = {"weekly_budget": 26000, "target_cpa": 1800}
 
 
 class SpyModule:
@@ -267,75 +286,127 @@ class SpyModule:
 
     def apply(self, ctx, items):
         self.applied += [f.id for f in items]
-        return {f.id: ApplyResult(True, {"before": {}, "after": {}}) for f in items}
+        return {f.id: ApplyResult(True, {"before": BEFORE, "after": AFTER}) for f in items}
 
     def rollback(self, ctx, items):
         return {f.id: ApplyResult(True, {}) for f in items}
 
 
 class Clock:
-    def __init__(self, t, advance=True):
-        self.t, self.advance, self.slept = t, advance, []
+    """Часы базы; процессные часы тесту не нужны — раннер их для окна не читает."""
 
-    def __call__(self):
-        return self.t
+    def __init__(self, t, advance=True, on_sleep=None):
+        self.t, self.advance, self.slept, self.on_sleep = t, advance, [], on_sleep
 
     def sleep(self, s):
         self.slept.append(s)
+        if self.on_sleep is not None:
+            self.on_sleep()
         if self.advance:
             self.t += timedelta(seconds=s)
 
 
-def _go(store, mod, clock, lock=None):
+def _go(store, mod, clock, lock=None, logs=None, cancel=None):
+    kw = {"cancel": cancel} if cancel is not None else {}
     return runner.run_project("edunetwork", store=store, accounts=lambda s: (ACC, []),
-                              modules={"budget": mod}, now=NOW, log=lambda m: None,
+                              modules={"budget": mod}, now=NOW,
+                              log=(logs.append if logs is not None else lambda m: None),
                               agent_lock_fn=lambda s: lock, cabinets=lambda *a: None,
-                              wall=clock, sleep=clock.sleep)
+                              sleep=clock.sleep, **kw)
 
 
 ROW = {"module_key": "budget", "mode": "approve", "settings": {}, "run_requested_at": None}
+# Часы базы уходят от метки такта (NOW): окно меряется только ими.
+DB_NOW = NOW + timedelta(minutes=5)
 
 
 def test_skips_recent_decisions():
     # часы не идут: через ожидание находке всё ещё 3 с — в этом проходе не пишется
-    clock = Clock(NOW, advance=False)
-    young = _finding(1, decided_at=NOW - timedelta(seconds=3))
-    old = _finding(2, cid=102, decided_at=NOW - timedelta(seconds=30))
-    st, mod = FakeStore([ROW], [young, old]), SpyModule()
+    clock = Clock(DB_NOW, advance=False)
+    young = _finding(1, decided_at=DB_NOW - timedelta(seconds=3))
+    old = _finding(2, cid=102, decided_at=DB_NOW - timedelta(seconds=30))
+    st, mod = FakeStore([ROW], [young, old], clock), SpyModule()
     _go(st, mod, clock)
     assert mod.applied == [2]
     assert [o[0] for o in st.outcomes] == [2]
     assert clock.slept and 0 < max(clock.slept) <= 20
 
 
-def test_waits_out_undo_window_then_applies():
-    clock = Clock(NOW)
-    young = _finding(1, decided_at=NOW - timedelta(seconds=3))
-    st, mod = FakeStore([ROW], [young]), SpyModule()
+def test_ripe_threshold_12s_by_db_now():
+    # 11 с по часам базы — ещё не зрело (окно Panda 10 с + 2 с запаса), ждём ровно 1 с;
+    # по метке такта NOW находка «из будущего» — раннер её не читает
+    clock = Clock(DB_NOW, advance=False)
+    almost = _finding(1, decided_at=DB_NOW - timedelta(seconds=11))
+    ripe = _finding(2, cid=102, decided_at=DB_NOW - timedelta(seconds=12, milliseconds=1))
+    st, mod = FakeStore([ROW], [almost, ripe], clock), SpyModule()
     _go(st, mod, clock)
-    assert clock.slept == [pytest.approx(7.0)]
+    assert clock.slept == [pytest.approx(1.0)]
+    assert mod.applied == [2]
+
+
+def test_waits_out_undo_window_then_applies():
+    clock = Clock(DB_NOW)
+    young = _finding(1, decided_at=DB_NOW - timedelta(seconds=3))
+    st, mod = FakeStore([ROW], [young], clock), SpyModule()
+    _go(st, mod, clock)
+    assert clock.slept == [pytest.approx(9.0)]
     assert mod.applied == [1] and st.reads == 2
 
 
+def test_wait_capped_at_20s():
+    clock = Clock(DB_NOW)
+    future = _finding(1, decided_at=DB_NOW + timedelta(minutes=3))  # сдвиг часов
+    st, mod = FakeStore([ROW], [future], clock), SpyModule()
+    _go(st, mod, clock)
+    assert clock.slept == [pytest.approx(20.0)] and mod.applied == []
+
+
 def test_undo_during_wait_writes_nothing():
-    clock = Clock(NOW)
-    young = _finding(1, decided_at=NOW - timedelta(seconds=3))
-    st, mod = FakeStore([ROW], [young], after_wait=[]), SpyModule()
+    clock = Clock(DB_NOW)
+    young = _finding(1, decided_at=DB_NOW - timedelta(seconds=3))
+    st, mod = FakeStore([ROW], [young], clock, after_wait=[]), SpyModule()
     _go(st, mod, clock)
     assert mod.applied == [] and st.outcomes == []
 
 
+def test_stop_ends_the_wait():
+    switch = runner._cancel.Switch()
+    clock = Clock(DB_NOW, on_sleep=switch.request)
+    young = _finding(1, decided_at=DB_NOW - timedelta(seconds=3))
+    st, mod = FakeStore([ROW], [young], clock), SpyModule()
+    assert _go(st, mod, clock, cancel=switch) == runner._cancel.EXIT_CODE
+    assert mod.applied == [] and st.outcomes == [] and st.reads == 1
+
+
 def test_no_wait_for_old_decisions_or_other_modules():
-    clock = Clock(NOW)
-    st, mod = FakeStore([ROW], [_finding(1)]), SpyModule()
+    clock = Clock(DB_NOW)
+    st = FakeStore([ROW], [_finding(1, decided_at=DB_NOW - timedelta(minutes=1))], clock)
+    mod = SpyModule()
     _go(st, mod, clock)
     assert clock.slept == [] and mod.applied == [1]
 
 
+def test_outcome_lost_after_write_is_recorded():
+    # Директ записан, а находку за это время вернули в open: итог не лёг — след в module_runs
+    clock = Clock(DB_NOW)
+    logs: List[str] = []
+    st = FakeStore([ROW], [_finding(1, decided_at=DB_NOW - timedelta(minutes=1))], clock,
+                   outcome_ok=False)
+    mod = SpyModule()
+    _go(st, mod, clock, logs=logs)
+    assert mod.applied == [1]
+    run = next(r for r in st.runs.values() if r["phase"] == runner.APPLY_PHASE)
+    lost = run["summary"]["apply"]["outcome_lost"]
+    assert lost == [{"id": 1, "campaign_id": 101, "rollback": False,
+                     "before": BEFORE, "after": AFTER}]
+    assert any(m.startswith("ОШИБКА: находка 1") for m in logs)
+
+
 def test_agent_lock_marks_failed():
-    clock = Clock(NOW)
+    clock = Clock(DB_NOW)
     line = runner.EDU_LOCK_LINE
-    st, mod = FakeStore([ROW], [_finding(1)]), SpyModule()
+    st = FakeStore([ROW], [_finding(1, decided_at=DB_NOW - timedelta(minutes=1))], clock)
+    mod = SpyModule()
     _go(st, mod, clock, lock=line)
     assert mod.applied == []
     assert st.outcomes == [(1, "failed", False, line)]

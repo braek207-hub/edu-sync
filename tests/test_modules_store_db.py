@@ -98,6 +98,8 @@ def test_full_cycle(live):
     live.execute("UPDATE module_findings SET status = 'approved' WHERE id = %s", (ids[0],))
     pend = store.pending(SLUG)
     assert [p.id for p in pend] == [ids[0]] and pend[0].action["site"] == "a.ru"
+    pend_at, db_now = store.pending_with_now(SLUG)
+    assert [p.id for p in pend_at] == [ids[0]] and db_now.tzinfo is not None
     assert store.set_outcome(ids[0], "applied", ApplyResult(ok=True, response={"ok": "да"}))
     assert store.pending(SLUG) == []
     assert not store.set_outcome(ids[0], "approved", ApplyResult(ok=True, response={}))

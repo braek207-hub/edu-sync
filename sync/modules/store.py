@@ -11,7 +11,7 @@ module_previews — 20261028231419_direct_modules_rules.sql, module_cabinets и 
 import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Iterator, List, Optional, Sequence
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 import psycopg2.errors
 import psycopg2.extras
@@ -211,11 +211,19 @@ def apply_reconciled(slug: str, module_key: str, run_id: int, r: Reconciled) -> 
 
 def pending(slug: str) -> List[StoredFinding]:
     """Что раннер обязан сделать: одобренное применить, запрошенный откат снять."""
+    return pending_with_now(slug)[0]
+
+
+def pending_with_now(slug: str) -> Tuple[List[StoredFinding], datetime]:
+    """pending и now() базы одним соединением: окно отмены (runner._ripe) меряется теми же
+    часами, которыми Panda атомарно разрешает отмену (decided_at > now() - 10 s)."""
     with db.get_connection() as conn, _dict_cursor(conn) as cur:
+        cur.execute("SELECT now() AS now")
+        now = cur.fetchone()["now"]
         cur.execute(
             f"SELECT {_FINDING_COLS} FROM module_findings WHERE dashboard_slug = %s "
             "AND status IN ('approved', 'rollback_requested') ORDER BY id", (slug,))
-        return [_stored(r) for r in cur.fetchall()]
+        return [_stored(r) for r in cur.fetchall()], now
 
 
 def set_outcome(finding_id: int, status: str, result: ApplyResult,

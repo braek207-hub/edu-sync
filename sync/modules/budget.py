@@ -18,7 +18,7 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from sync.agent.writer.budget import (fetch_budget_state, read_weekly_limit,
+from sync.agent.writer.budget import (NO_LIMIT_REASON, fetch_budget_state, read_weekly_limit,
                                       strategy_with_limit)
 from sync.agent.writer.tcpa import read_target_cpa, strategy_with_target
 from sync.modules.types import ApplyResult, Context, RunOutput, StoredFinding
@@ -96,7 +96,10 @@ class _State:
 
     def __init__(self, strategy: dict):
         self.strategy = strategy
-        self.channel, limit, _why = read_weekly_limit(strategy)
+        self.channel, limit, why = read_weekly_limit(strategy)
+        # Лимит в обоих каналах (или нечитаемый) — рычаг неприменим, как у diff_budget. Иначе
+        # None читался бы «лимит сняли», и Panda вечно предлагала бы «пересчитать».
+        self.unsupported = bool(why) and why != NO_LIMIT_REASON
         self.values = {"weekly_budget": _rub(limit), "target_cpa": _rub(read_target_cpa(strategy))}
 
 
@@ -143,7 +146,7 @@ def _write(acc, cid: int, strategy: dict) -> None:
 def _set(acc, cid: int, expect: dict, to: dict) -> ApplyResult:
     """Общий шаг применения и отката: проверить expect, записать to, прочитать обратно."""
     state = _read(acc, cid)
-    if state is None:
+    if state is None or state.unsupported:
         return ApplyResult(False, {}, UNSUPPORTED)
     before = {k: state.values[k] for k in LEVERS}
     if not all(_same(state.values[k], v) for k, v in expect.items()):
