@@ -1,19 +1,26 @@
 """Polina Repik: заказы Битрикса → Panda-BI ingest.
 
-Их эндпоинт отдаёт заказы, ИЗМЕНЁННЫЕ за вчерашний день (по DATE_UPDATE), без
-лимита, в формате 1-в-1 с нашим ingest-роутом. Тянем pull-моделью (раннер за
-рубежом — обходит фильтрацию РКН к AWS) и POST-им в /api/ingest/polinarepik,
-который делает идемпотентный upsert по order_id + замену items.
+Их эндпоинт отдаёт заказы, ИЗМЕНЁННЫЕ за период (по DATE_UPDATE, не по дате заказа),
+без лимита, в формате 1-в-1 с нашим ingest-роутом. Период — GET date_from/date_to
+(ГГГГ-ММ-ДД, с 06.11.2026); без них — изменённые за вчера, date_to по умолчанию вчера.
+POST-им в /api/ingest/polinarepik: идемпотентный upsert по order_id + замена items.
 
-GitHub Actions: .github/workflows/sync-polinarepik-orders.yml
-Local: python -m sync.polinarepik_orders
+Окно — последние POLINAREPIK_ORDERS_DAYS дней, а не «вчера»: при окне в один день
+упавший прогон терял изменения навсегда — к 06.11 у 27 заказов устарел статус, у 19 сумма,
+539 заказов не доехали вовсе. Повторная выгрузка безвредна (upsert).
+
+Сервер: юнит panda-sync@polinarepik_orders (infra/panda/sync/gen-units.py в Panda-BI).
+Local: python -m sync.polinarepik_orders [--from ГГГГ-ММ-ДД] [--to ГГГГ-ММ-ДД]
+Вся история: --from 2020-01-01 (заказы с 11.09.2024, ~1700 шт., доли секунды).
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
 import time
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -30,6 +37,8 @@ BATCH_SIZE = int(os.environ.get("POLINAREPIK_ORDERS_BATCH", "200"))
 # «Read timed out (15)» на этапе connect. Из РФ отвечает за 3 с. Длинные ретраи с большим
 # connect-таймаутом пробивают флапающую фильтрацию; полный блок не лечат.
 MAX_RETRIES = 8
+WINDOW_DAYS = int(os.environ.get("POLINAREPIK_ORDERS_DAYS", "14"))
+MSK = timezone(timedelta(hours=3))
 
 
 def _require(name: str) -> str:
@@ -39,7 +48,17 @@ def _require(name: str) -> str:
     return value
 
 
-def fetch_orders(api_key: str) -> list[dict[str, Any]]:
+def window_params(date_from: str | None, date_to: str | None, today: date) -> dict[str, str]:
+    """Период выгрузки. Явный --from/--to главнее окна; date_to не шлём — их дефолт «вчера»."""
+    params = {"date_from": date_from or (today - timedelta(days=WINDOW_DAYS)).isoformat()}
+    if date_to:
+        params["date_to"] = date_to
+    for v in params.values():
+        date.fromisoformat(v)  # кривую дату ловим до запроса: их API на неё молча отдаст «вчера»
+    return params
+
+
+def fetch_orders(api_key: str, params: dict[str, str]) -> list[dict[str, Any]]:
     """GET заказов с их эндпоинта. Ретрай при таймауте/5xx (их сайт подвисает)."""
     backoff = 3
     last_err: Exception | None = None
@@ -47,6 +66,7 @@ def fetch_orders(api_key: str) -> list[dict[str, Any]]:
         try:
             resp = requests.get(
                 SOURCE_URL,
+                params=params,
                 headers={"X-API-Key": api_key, "Accept": "application/json"},
                 timeout=(60, 90),
             )
@@ -97,14 +117,20 @@ def post_batch(orders: list[dict[str, Any]], token: str) -> dict[str, Any]:
     raise RuntimeError("Ingest: max retries")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Заказы Polina Repik → Panda-BI")
+    ap.add_argument("--from", dest="date_from", help="ГГГГ-ММ-ДД, по дате изменения заказа")
+    ap.add_argument("--to", dest="date_to", help="ГГГГ-ММ-ДД, по умолчанию вчера")
+    args = ap.parse_args(argv)
+
     print("=== Polinarepik Orders Sync START ===")
     api_key = _require("POLINAREPIK_ORDERS_API_KEY")
     token = _require("POLINAREPIK_INGEST_TOKEN")
+    params = window_params(args.date_from, args.date_to, datetime.now(MSK).date())
 
     progress.report("orders.fetch", label="Заказы · выгрузка")
-    orders = fetch_orders(api_key)
-    print(f"Fetched {len(orders)} orders (изменённые за вчера)")
+    orders = fetch_orders(api_key, params)
+    print(f"Fetched {len(orders)} orders (изменённые {params})")
     if not orders:
         print("Nothing to sync.")
         print("=== Polinarepik Orders Sync DONE ===")
