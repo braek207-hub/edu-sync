@@ -53,6 +53,17 @@ RUB = "RUB"
 # иначе systemd убьёт процесс посреди скана. Конец такта бюджета не имеет: работы после
 # него нет, а заявка иначе ждала бы следующего такта.
 PREVIEW_TICK_BUDGET = timedelta(minutes=20)
+# Модули, находки которых создаёт Panda, а не скан: по расписанию их не гоняем.
+NO_SCAN_MODULES = ("budget",)
+# Окно отмены: Panda будит раннер сразу после «Применить», а человек ещё 10 с может нажать
+# «Отменить». Одобренное моложе окна не пишется; раннер ждёт его до конца окна, но не дольше
+# UNDO_WAIT_MAX, перечитывает очередь (отменённое из неё уже ушло) и только тогда пишет.
+UNDO_MODULES = ("budget",)
+UNDO_WINDOW = timedelta(seconds=10)
+UNDO_WAIT_MAX = 20.0
+# Замок агента EDU: находки этих модулей не ждут молча, а получают отказ с его строкой —
+# иначе в Panda они вечно висели бы «Пишу в Директ». Остальные модули ждут, как прежде.
+LOCK_FAILS_MODULES = ("budget",)
 
 
 def _aware(dt: datetime) -> datetime:
@@ -62,6 +73,8 @@ def _aware(dt: datetime) -> datetime:
 def is_due(module_key: str, last_ok: Optional[datetime], last_attempt: Optional[datetime],
            run_requested_at: Optional[datetime], now: datetime) -> bool:
     """last_ok — старт последнего прогона ok/skipped, last_attempt — последнего любого."""
+    if module_key in NO_SCAN_MODULES:
+        return False
     now = _aware(now)
     if run_requested_at is not None and (
             last_attempt is None or _aware(run_requested_at) > _aware(last_attempt)):
@@ -211,9 +224,71 @@ def _wanted(f: StoredFinding, mode: str) -> bool:
     return mode in WRITE_MODES
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _undo_left(f: StoredFinding, at: datetime) -> float:
+    """Сколько секунд у человека ещё есть на отмену одобрения; 0 — окно прошло."""
+    if f.status != "approved" or f.decided_at is None:
+        return 0.0
+    return max(0.0, (UNDO_WINDOW - (_aware(at) - _aware(f.decided_at))).total_seconds())
+
+
+def _collect(slug, store, by_key) -> Dict[str, List[StoredFinding]]:
+    pend: Dict[str, List[StoredFinding]] = {}
+    for f in store.pending(slug):
+        mkey = f.fingerprint.split(":", 1)[0]
+        row = by_key.get(mkey)
+        if row is not None and _wanted(f, row["mode"]):
+            pend.setdefault(mkey, []).append(f)
+    return pend
+
+
+def _ripe(slug, store, by_key, log, wall, sleep) -> Dict[str, List[StoredFinding]]:
+    """Очередь применения без одобренного, у которого ещё не истекло окно отмены."""
+    pend = _collect(slug, store, by_key)
+
+    def young(at):
+        return [f for k in UNDO_MODULES for f in pend.get(k, []) if _undo_left(f, at) > 0]
+    waiting = young(wall())
+    if waiting:
+        wait = min(max(_undo_left(f, wall()) for f in waiting), UNDO_WAIT_MAX)
+        log("жду окно отмены: %d находок, %.1f с" % (len(waiting), wait))
+        sleep(wait)
+        pend = _collect(slug, store, by_key)
+    at = wall()
+    held = {f.id for f in young(at)}
+    if held:
+        log("окно отмены не истекло: %d находок — следующим тактом" % len(held))
+    out: Dict[str, List[StoredFinding]] = {}
+    for mkey, items in pend.items():
+        keep = [f for f in items if f.id not in held]
+        if keep:
+            out[mkey] = keep
+    return out
+
+
+def _fail_locked(slug, store, pend, by_key, lock_line, log) -> None:
+    """Под замком агента EDU находки LOCK_FAILS_MODULES закрываются отказом с его строкой."""
+    for mkey in LOCK_FAILS_MODULES:
+        items = pend.get(mkey)
+        if not items:
+            continue
+        run_id = store.start_run(slug, mkey, by_key[mkey]["mode"], phase=APPLY_PHASE)
+        st: dict = {}
+        for f in items:
+            _record(store, f, ApplyResult(False, {"agent_lock": True}, lock_line),
+                    f.status == "rollback_requested", st, log)
+        store.finish_run(run_id, "ok", {"phase": APPLY_PHASE, "apply": st,
+                                        "agent_lock": lock_line})
+
+
 def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
                  cancel: Optional[_cancel.Switch] = None,
-                 prog: Optional[RunProgress] = None) -> bool:
+                 prog: Optional[RunProgress] = None,
+                 wall: Callable[[], datetime] = _utcnow,
+                 sleep: Callable[[float], None] = time.sleep) -> bool:
     """Одобренное применяем, запрошенный откат снимаем; True — были сбои.
 
     Каждый модуль, у которого была работа, получает свою строку module_runs с
@@ -226,14 +301,10 @@ def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
     failed = False
     # rows — только включённые модули: в off находки остаются как есть
     by_key = {r["module_key"]: r for r in rows}
-    pend: Dict[str, List[StoredFinding]] = {}
-    for f in store.pending(slug):
-        mkey = f.fingerprint.split(":", 1)[0]
-        row = by_key.get(mkey)
-        if row is not None and _wanted(f, row["mode"]):
-            pend.setdefault(mkey, []).append(f)
+    pend = _ripe(slug, store, by_key, log, wall, sleep)
     if pend and lock_line:
         log("запись заблокирована: %s" % lock_line)
+        _fail_locked(slug, store, pend, by_key, lock_line, log)
         return failed
     for i, (mkey, items) in enumerate(pend.items()):
         if cancel is not None:
@@ -660,15 +731,20 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
                 clock: Callable[[], float] = time.monotonic,
                 cabinets: Callable[..., Any] = _cabinets.refresh,
                 cancel: _cancel.Switch = _cancel.SWITCH,
-                progress: Optional[RunProgress] = None) -> int:
-    """Код 1, если упал хоть один модуль; занятый замок — не ошибка; остановка — 143."""
+                progress: Optional[RunProgress] = None,
+                wall: Callable[[], datetime] = _utcnow,
+                sleep: Callable[[float], None] = time.sleep) -> int:
+    """Код 1, если упал хоть один модуль; занятый замок — не ошибка; остановка — 143.
+
+    wall и sleep — стенные часы и пауза окна отмены (_ripe); now — метка такта, она для
+    окна не годится: превью до применения идут минутами."""
     if dry_run:
         accts, _why = accounts(slug)
         return _dry_run(slug, store, accts, modules, now, only, log)
     prog = progress if progress is not None else RunProgress()
     try:
         return _tick(slug, store, accounts, modules, now, only, log, agent_lock_fn, clock,
-                     cabinets, cancel, prog)
+                     cabinets, cancel, prog, wall, sleep)
     except _cancel.Cancelled:
         # замок снят выходом из hold_project_lock, строку скана закрыл _scan
         log("проект %s: %s" % (slug, _cancel.TEXT))
@@ -676,7 +752,7 @@ def run_project(slug: str, *, store=_store, accounts=_accounts.accounts_for, mod
 
 
 def _tick(slug, store, accounts, modules, now, only, log, agent_lock_fn, clock, cabinets,
-          cancel: _cancel.Switch, prog: RunProgress) -> int:
+          cancel: _cancel.Switch, prog: RunProgress, wall=_utcnow, sleep=time.sleep) -> int:
     started = clock()
     with store.hold_project_lock(slug) as got:
         if not got:
@@ -723,7 +799,7 @@ def _tick(slug, store, accounts, modules, now, only, log, agent_lock_fn, clock, 
         cancel.check()
         lock_line = agent_lock_fn(slug)
         rc = 1 if _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
-                               cancel, prog) else 0
+                               cancel, prog, wall, sleep) else 0
         for i, row in enumerate(due):
             # заявка, поданная во время скана, не ждёт следующего такта
             if i:

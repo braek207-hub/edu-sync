@@ -11,9 +11,11 @@ MODULES: Dict[str, Any] = {}
 
 # Импорт внизу: модуль не знает о реестре, цикла нет.
 from sync.modules import audit as _audit  # noqa: E402
+from sync.modules import budget as _budget  # noqa: E402
 from sync.modules import placements as _placements  # noqa: E402
 from sync.modules import queries as _queries  # noqa: E402
 
 MODULES["placements"] = _placements
 MODULES["queries"] = _queries
 MODULES["audit"] = _audit
+MODULES["budget"] = _budget

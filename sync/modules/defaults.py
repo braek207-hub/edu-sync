@@ -7,13 +7,15 @@
 
 from typing import Any, Dict, Optional, Tuple
 
-MODULE_KEYS: Tuple[str, ...] = ("placements", "queries", "audit")
+MODULE_KEYS: Tuple[str, ...] = ("placements", "queries", "audit", "budget")
 
 # audit только сообщает: записи в Директ у него нет, поэтому approve/auto ему закрыты.
 ALLOWED_MODES: Dict[str, Tuple[str, ...]] = {
     "placements": ("off", "report", "approve", "auto"),
     "queries": ("off", "report", "approve", "auto"),
     "audit": ("off", "report"),
+    # budget: каждая правка бюджета в Директе проходит через человека — auto нет.
+    "budget": ("off", "report", "approve"),
 }
 
 # logins — кабинеты, которые обходит модуль; пусто — все кабинеты проекта (accounts_for).
@@ -34,6 +36,12 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
                 "builtin": {"phrase_waste": True, "word_zero_conv": True}},
     "audit": {"logins": [], "campaigns": {}, "banned_words": [], "allowed_goal_ids": [], "require_utm": True,
               "title_fill_min": 0.6},
+    # Правила распределения: считает их Panda (находки создаёт она), движок только хранит
+    # и применяет одобренное. Значения — как в каталоге Panda (lib/modules/catalog.ts).
+    # plan None — плана месяца вручную нет, берётся план проекта.
+    "budget": {"pause": 7, "learn": 14, "add": 65, "cut": 35, "newWeeks": 6, "minLeads": 10,
+               "keepPlan": False, "lineGrad": 9500, "lineConn": 40, "minCpa": 1000,
+               "stepLim": 50, "stepCpa": 20, "minWeek": 3000, "plan": None},
 }
 
 # Допустимые значения внутри вложенных настроек: тип проверяет _fits, а смысл —

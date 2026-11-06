@@ -3,7 +3,7 @@ from sync.modules.defaults import ALLOWED_MODES, DEFAULTS, MODULE_KEYS, settings
 
 
 def test_defaults_pinned():
-    assert MODULE_KEYS == ("placements", "queries", "audit")
+    assert MODULE_KEYS == ("placements", "queries", "audit", "budget")
     assert DEFAULTS == {
         "placements": {"logins": [], "campaigns": {}, "top_n": 30, "always_block": [], "extra_allow": [],
                        "spam_rule": False, "lead_goal_ids": [], "rules": [],
@@ -17,6 +17,9 @@ def test_defaults_pinned():
                     "builtin": {"phrase_waste": True, "word_zero_conv": True}},
         "audit": {"logins": [], "campaigns": {}, "banned_words": [], "allowed_goal_ids": [],
                   "require_utm": True, "title_fill_min": 0.6},
+        "budget": {"pause": 7, "learn": 14, "add": 65, "cut": 35, "newWeeks": 6, "minLeads": 10,
+                   "keepPlan": False, "lineGrad": 9500, "lineConn": 40, "minCpa": 1000,
+                   "stepLim": 50, "stepCpa": 20, "minWeek": 3000, "plan": None},
     }
 
 
@@ -37,6 +40,7 @@ def test_settings_for_does_not_share_lists():
 def test_allowed_modes():
     assert ALLOWED_MODES["audit"] == ("off", "report")
     assert ALLOWED_MODES["queries"] == ("off", "report", "approve", "auto")
+    assert ALLOWED_MODES["budget"] == ("off", "report", "approve")
 
 
 def test_goal_ids_key_gone():
