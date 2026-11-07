@@ -14,7 +14,18 @@ def test_defaults_pinned():
         "queries": {"logins": [], "campaigns": {}, "window_days": 30, "cpa_limit": None, "multiplier": 2.0,
                     "lead_goal_ids": [], "stop_words": [], "never_minus": [],
                     "max_per_run": 20, "rules": [],
-                    "builtin": {"phrase_waste": True, "word_zero_conv": True}},
+                    "builtin": {"phrase_waste": True, "word_zero_conv": True},
+                    "sets": [
+                        {"id": "brand", "name": "Брендовые", "on": True,
+                         "clean": ["nonbrand", "comp", "trash"], "include": "бренд",
+                         "exclude": "без бренда", "campaigns": []},
+                        {"id": "nonbrand", "name": "Небрендовые", "on": True,
+                         "clean": ["brand", "comp", "trash", "rules"], "include": "без бренда",
+                         "exclude": "", "campaigns": []},
+                    ],
+                    "dict": {"brand": [], "comp": [], "trash": [], "never": [], "notBrand": []},
+                    "thresholds": {"noConvCost": 1000.0, "maxCpa": None},
+                    "manual": {}},
         "audit": {"logins": [], "campaigns": {}, "banned_words": [], "allowed_goal_ids": [],
                   "require_utm": True, "title_fill_min": 0.6},
         "budget": {"pause": 7, "learn": 14, "add": 65, "cut": 35, "newWeeks": 6, "minLeads": 10,
@@ -100,3 +111,13 @@ def test_campaigns_map_kept_ids_normalized():
     for bad in (None, [], "x", 5):
         assert settings_for("audit", {"campaigns": bad})["campaigns"] == {}
     assert settings_for("placements", None)["campaigns"] == {}
+
+
+def test_queries_manual_keeps_only_campaign_ids():
+    got = settings_for("queries", {"manual": {"12": "a", "x": "b", "13": "", "14": 5}})
+    assert got["manual"] == {"12": "a"}
+
+
+def test_queries_thresholds_merge_per_key():
+    got = settings_for("queries", {"thresholds": {"noConvCost": 500}})
+    assert got["thresholds"] == {"noConvCost": 500, "maxCpa": None}

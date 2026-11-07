@@ -33,7 +33,20 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
     "queries": {"logins": [], "campaigns": {}, "window_days": 30, "cpa_limit": None, "multiplier": 2.0,
                 "lead_goal_ids": [], "stop_words": [], "never_minus": [],
                 "max_per_run": 20, "rules": [],
-                "builtin": {"phrase_waste": True, "word_zero_conv": True}},
+                "builtin": {"phrase_waste": True, "word_zero_conv": True},
+                # Чистильщик запросов (Panda lib/queries, робот query_class): наборы кампаний,
+                # словари, пороги «По правилам» (maxCpa None — порог выключен), ручные наборы.
+                "sets": [
+                    {"id": "brand", "name": "Брендовые", "on": True,
+                     "clean": ["nonbrand", "comp", "trash"], "include": "бренд",
+                     "exclude": "без бренда", "campaigns": []},
+                    {"id": "nonbrand", "name": "Небрендовые", "on": True,
+                     "clean": ["brand", "comp", "trash", "rules"], "include": "без бренда",
+                     "exclude": "", "campaigns": []},
+                ],
+                "dict": {"brand": [], "comp": [], "trash": [], "never": [], "notBrand": []},
+                "thresholds": {"noConvCost": 1000.0, "maxCpa": None},
+                "manual": {}},
     "audit": {"logins": [], "campaigns": {}, "banned_words": [], "allowed_goal_ids": [], "require_utm": True,
               "title_fill_min": 0.6},
     # Правила распределения: считает их Panda (находки создаёт она), движок только хранит
@@ -122,9 +135,22 @@ def _coerce(path: Tuple[str, ...], default: Any, value: Any) -> Any:
     return value
 
 
+def _manual_map(value: Any) -> Dict[str, str]:
+    """{Id кампании: id набора | "none"} — ручной набор кампании чистильщика запросов."""
+    if not isinstance(value, dict):
+        return {}
+    return {k: v for k, v in value.items()
+            if isinstance(k, str) and k.isdigit() and isinstance(v, str) and v}
+
+
 def settings_for(module_key: str, raw: Optional[dict]) -> dict:
     """Настройки модуля: умолчания + то, что подошло по типу. Чужие ключи отбрасываются."""
     raw = raw if isinstance(raw, dict) else {}
-    return {key: (_campaign_map(raw.get(key)) if key in FREE_MAPS
-                  else _coerce((module_key, key), default, raw.get(key, default)))
-            for key, default in DEFAULTS[module_key].items()}
+
+    def one(key: str, default: Any) -> Any:
+        if key in FREE_MAPS:
+            return _campaign_map(raw.get(key))
+        if key == "manual":
+            return _manual_map(raw.get(key))
+        return _coerce((module_key, key), default, raw.get(key, default))
+    return {key: one(key, default) for key, default in DEFAULTS[module_key].items()}
