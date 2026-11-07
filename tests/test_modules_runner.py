@@ -958,6 +958,17 @@ def test_scan_ctx_gets_project_goals():
     assert seen == [[30]]
 
 
+def test_scan_calls_prepare_before_run_and_keeps_its_summary():
+    trace = []
+    m = FakeModule("placements", trace=trace)
+    m.prepare = lambda ctx, store: trace.append(("prepare", ctx.slug)) or {"logins": {}}
+    st = FakeStore([_row()])
+    assert _go(st, {"placements": m}) == 0
+    assert trace == [("prepare", "lime"), ("run", "placements")]
+    scan = [r for r in st.runs.values() if r.get("phase") is None]
+    assert scan[0]["summary"]["prepare"] == {"logins": {}}
+
+
 def test_cli_preview_id_runs_preview_not_scan(monkeypatch):
     from sync import modules_run
     calls = []

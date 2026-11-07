@@ -887,6 +887,13 @@ def _scan(slug, store, row, modules, accts, why, goals, now, log, lock_line,
     try:
         ctx = _ctx(slug, mkey, mode, row.get("settings"), mod_accts, now, log, goals,
                    prog.module(mkey, mod_accts), store=store)
+        # Шаг модуля до скана, только в настоящем прогоне (не в превью): queries грузит
+        # статистику запросов по дням для страницы Panda. Свои сбои он пишет в итог сам.
+        prepare = getattr(module, "prepare", None)
+        prepared = None
+        if prepare is not None:
+            with cancel.interruptible():
+                prepared = prepare(ctx, store)
         with cancel.interruptible():
             out = module.run(ctx)
         healed: dict = {}
@@ -912,6 +919,8 @@ def _scan(slug, store, row, modules, accts, why, goals, now, log, lock_line,
         summary.update(findings=len(out.findings), inserted=len(rec.insert),
                        resolved=len(rec.resolve), expired=len(rec.expire))
         summary.update(healed)
+        if prepared is not None:
+            summary["prepare"] = prepared
         if lock_line and mode in WRITE_MODES:
             summary["agent_lock"] = lock_line
         elif mode == "auto":

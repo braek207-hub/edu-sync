@@ -1023,6 +1023,13 @@ def _silent_keys(settings: dict, rules: List[R.Rule]) -> List[str]:
     return keys
 
 
+def prepare(ctx: Context, store) -> dict:
+    """Перед сканом: статистика запросов по дням для страницы Panda (query_stats)."""
+    # Импорт здесь: query_stats берёт отчёт, окно и цели из этого модуля — цикл импорта.
+    from sync.modules import query_stats
+    return query_stats.prepare(ctx, store)
+
+
 def run(ctx: Context) -> RunOutput:
     settings, notes = checked_settings(ctx.settings)
     win = window(ctx.now, settings["window_days"])

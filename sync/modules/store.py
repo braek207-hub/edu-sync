@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """Хранилище модулей Директа: project_modules, module_runs, module_findings, module_previews,
-module_cabinets, module_campaigns; чтение целей-лидов из project_sources.
+module_cabinets, module_campaigns, module_query_texts/stats; чтение целей-лидов из project_sources.
 
 Схему ведут миграции Panda-BI (supabase/migrations/20261028231347_direct_modules.sql,
 module_previews — 20261028231419_direct_modules_rules.sql, module_cabinets и module_campaigns —
-20261029162317_module_cabinets.sql, project_sources —
+20261029162317_module_cabinets.sql, статистика запросов — 20261107221317_module_query_stats.sql,
+project_sources —
 20261017153700_project_onboarding_core.sql); здесь таблицы не создаются.
 """
 
@@ -528,3 +529,55 @@ def replace_campaigns(slug: str, by_login: dict) -> None:
                 [(slug, login, r["id"], r["name"], r["type"], r["search"], r["network"],
                   r["state"]) for r in rows],
                 template="(%s, %s, %s, %s, %s, %s, %s, %s, now())")
+
+
+def query_stats_last_day(slug: str, login: str):
+    """Последний загруженный день статистики запросов кабинета (module_query_stats,
+    миграция Panda 20261107221317_module_query_stats.sql); None — кабинет не грузился."""
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT max(day) FROM module_query_stats "
+                    "WHERE dashboard_slug = %s AND login = %s", (slug, login))
+        return cur.fetchone()[0]
+
+
+def replace_query_stats(slug: str, login: str, start, end, rows) -> None:
+    """Дни start..end кабинета заменяются целиком, одной транзакцией: страница не увидит
+    день посреди перезаливки. rows — (день, кампания, запрос, показы, клики, расход,
+    конверсии или None). Тексты — в словарь проекта; id перечитываются SELECT-ом:
+    ON CONFLICT DO NOTHING RETURNING не отдаёт id уже существующих."""
+    texts = sorted({r[2] for r in rows})
+    with db.get_connection() as conn, conn.cursor() as cur:
+        ids = {}
+        if texts:
+            psycopg2.extras.execute_values(
+                cur, "INSERT INTO module_query_texts (dashboard_slug, query) VALUES %s "
+                     "ON CONFLICT (dashboard_slug, query) DO NOTHING",
+                [(slug, q) for q in texts], page_size=1000)
+            cur.execute("SELECT query, id FROM module_query_texts "
+                        "WHERE dashboard_slug = %s AND query = ANY(%s)", (slug, texts))
+            ids = dict(cur.fetchall())
+        cur.execute("DELETE FROM module_query_stats WHERE dashboard_slug = %s AND login = %s "
+                    "AND day BETWEEN %s AND %s", (slug, login, start, end))
+        if rows:
+            psycopg2.extras.execute_values(
+                cur, "INSERT INTO module_query_stats (dashboard_slug, day, campaign_id, "
+                     "query_id, login, impressions, clicks, cost, conversions) VALUES %s "
+                     "ON CONFLICT (dashboard_slug, day, campaign_id, query_id) DO UPDATE SET "
+                     "login = EXCLUDED.login, impressions = EXCLUDED.impressions, "
+                     "clicks = EXCLUDED.clicks, cost = EXCLUDED.cost, "
+                     "conversions = EXCLUDED.conversions",
+                [(slug, r[0], r[1], ids[r[2]], login, r[3], r[4], r[5], r[6]) for r in rows],
+                page_size=1000)
+
+
+def prune_query_stats(slug: str, keep_from) -> dict:
+    """Строки старше keep_from и тексты без строк. Идёт под замком проекта
+    (hold_project_lock): параллельной загрузки текстов того же проекта нет."""
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM module_query_stats WHERE dashboard_slug = %s AND day < %s",
+                    (slug, keep_from))
+        old = cur.rowcount
+        cur.execute("DELETE FROM module_query_texts t WHERE t.dashboard_slug = %s AND NOT EXISTS "
+                    "(SELECT 1 FROM module_query_stats s WHERE s.dashboard_slug = t.dashboard_slug "
+                    "AND s.query_id = t.id)", (slug,))
+        return {"rows": old, "texts": cur.rowcount}
