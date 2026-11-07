@@ -56,10 +56,6 @@ STUB_MARK = "CampaignStub"
 # Кампании не в зоне модуля — тот же текст, что EXCLUDED_NAME_SQL в Panda
 # (lib/budget/facts.sql.ts): rsv — чужие РК в своих кабинетах, Конкурент и Наш бренд — брендовые.
 EXCLUDED_NAME_RE = re.compile("rsv|Конкурент|Наш бренд", re.IGNORECASE)
-# Кампании «на рост» (Дубай, посадочные ПроВуза): только подъём, срез лимита или цены цели —
-# protected. Тот же текст, что у константы кампаний на рост в Panda (lib/budget): там такие
-# кампании не предлагаются к срезу, здесь — вторая линия на случай расхождения.
-GROWTH_NAME_RE = re.compile("Дубае?|Dubai|provuz / [^/]* LP /", re.IGNORECASE)
 RUB = "RUB"
 
 # Коды ошибок, по которым Panda пишет свою строку статуса (текст — на её стороне).
@@ -333,9 +329,6 @@ def _set(acc, cid: int, expect: dict, to: dict, guard: bool, done: list,
         return ApplyResult(False, {}, UNSUPPORTED)
     if guard and EXCLUDED_NAME_RE.search(state.name):
         return ApplyResult(False, {"name": state.name}, PROTECTED)
-    if guard and GROWTH_NAME_RE.search(state.name) and any(
-            expect.get(k) is not None and v < expect[k] for k, v in to.items()):
-        return ApplyResult(False, {"name": state.name, "growth": True}, PROTECTED)
     before = dict(state.values)
     if not all(_same(state.values[k], v) for k, v in expect.items()):
         if _reached(state.values, expect, to):

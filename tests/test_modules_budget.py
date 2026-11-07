@@ -925,43 +925,12 @@ def test_rollback_without_exploration_snapshot_as_before(monkeypatch):
                                            "IsMinimumExplorationBudgetCustom": "YES"}
 
 
-GROWTH = ["vuz / Обучение в Дубае / ВПО / Поиск / МСК (2026-10)",
-          "postupi_provuz / Юриспруденция LP / ВПО / Поиск / МСК (2026-10)"]
-NOT_GROWTH = ["postupi_provuz / Тех.Специальности - 2 / ВПО / Поиск / МСК (2026)",
-              "vsekolledzhi.ru/lp/postupi / Магистратура -Ирина"]
-
-
-def test_growth_pattern():
-    assert all(bm.GROWTH_NAME_RE.search(n) for n in GROWTH)
-    assert not any(bm.GROWTH_NAME_RE.search(n) for n in NOT_GROWTH)
-
-
-@pytest.mark.parametrize("name", GROWTH)
-@pytest.mark.parametrize("set_", [{"weekly_budget": 15000}, {"target_cpa": 1300},
-                                  {"weekly_budget": 26000, "target_cpa": 1300}])
-def test_growth_campaign_cut_protected(monkeypatch, name, set_):
+# Правило «Дубай и LP ПроВуза не срезать» снято владельцем 07.11.2026: срез решает модель Panda
+# по достатку данных, движок такие кампании отдельно не сторожит.
+@pytest.mark.parametrize("name", ["vuz / Обучение в Дубае / ВПО / Поиск / МСК (2026-10)",
+                                  "postupi_provuz / Юриспруденция LP / ВПО / Поиск / МСК (2026-10)"])
+def test_dubai_and_lp_cut_not_protected(monkeypatch, name):
     fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy(), "name": name}})
-    res = bm.apply(_ctx(), [_finding(set_=set_)])
-    assert (res[1].ok, res[1].error) == (False, "protected") and fake.updates == []
-
-
-@pytest.mark.parametrize("name", GROWTH)
-def test_growth_campaign_raise_passes(monkeypatch, name):
-    FakeDirect(monkeypatch, {101: {"strategy": _strategy(), "name": name}})
-    assert bm.apply(_ctx(), [_finding()])[1].ok
-
-
-@pytest.mark.parametrize("name", NOT_GROWTH)
-def test_other_campaign_cut_passes(monkeypatch, name):
-    FakeDirect(monkeypatch, {101: {"strategy": _strategy(), "name": name}})
     res = bm.apply(_ctx(), [_finding(set_={"weekly_budget": 15000, "target_cpa": 1300})])
     assert res[1].ok, res[1].error
-
-
-def test_growth_rollback_not_blocked(monkeypatch):
-    # откат снимает нашу же запись: подъём на кампании «на рост» откатывается и вниз
-    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy(26000, 1800), "name": GROWTH[0]}})
-    f = _finding(status="rollback_requested",
-                 response={"before": {"weekly_budget": 20000, "target_cpa": 1500},
-                           "after": {"weekly_budget": 26000, "target_cpa": 1800}})
-    assert bm.rollback(_ctx(), [f])[1].ok and len(fake.updates) == 1
+    assert len(fake.updates) == 1
