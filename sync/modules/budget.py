@@ -24,11 +24,12 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from sync import edu_direct_settings as _eds
+from sync import strategy_snapshots as _snap
 from sync.agent.writer.budget import read_weekly_limit, strategy_with_limit
 from sync.modules.defaults import settings_for
 from sync.modules.types import ApplyResult, Context, RunOutput, StoredFinding
 from sync.placements import direct
-from sync.strategy_snapshots import serving_channel, snapshot_row
+from sync.projects.revalidate import revalidate as _revalidate
 
 KEY = "budget"
 OP = "set_strategy"
@@ -144,10 +145,13 @@ def _within_step(expect: dict, to: dict, rules: dict) -> bool:
     return True
 
 
-def _snapshot_view(tc: dict, name: str) -> Tuple[dict, Optional[str]]:
-    """Рычаги так, как их пишет strategy_snapshots (из него Panda берёт expect), и канал,
-    который снимок читает. Разбор канала, цен целей и ДРР — функциями витрины настроек EDU
-    (edu_direct_settings._parse_campaign), строка — snapshot_row: своя копия разъехалась бы."""
+def _snapshot_view(item: dict) -> Tuple[dict, Optional[str], Optional[dict]]:
+    """Рычаги так, как их пишет strategy_snapshots (из него Panda берёт expect), канал,
+    который снимок читает, и сама строка снимка (None — у кампании нет состояния). Разбор
+    канала, цен целей и ДРР — функциями витрины настроек EDU (edu_direct_settings.
+    _parse_campaign), строка — snapshot_row: своя копия разъехалась бы."""
+    tc = item.get("TextCampaign") or {}
+    name = str(item.get("Name") or "")
     bs = tc.get("BiddingStrategy") or {}
     search = _eds._enrich_channel_crr(_eds._extract_strategy_channel_full(bs.get("Search")),
                                       bs.get("Search"))
@@ -158,15 +162,18 @@ def _snapshot_view(tc: dict, name: str) -> Tuple[dict, Optional[str]]:
     strategy = {"search": search or None, "network": network or None,
                 "priorityGoalsDetails": _eds._merge_priority_goals_details(
                     [tc], is_crr_strategy=kind == "drr")}
-    row = snapshot_row("", name, {"meta": {"state": "ON"}, "strategy": strategy})
-    shown = serving_channel(strategy)
+    meta = {"state": item.get("State"), "status": item.get("Status")}
+    row = _snap.snapshot_row(str(item.get("Id")), name, {"meta": meta, "strategy": strategy})
+    # без состояния снимок строку не пишет, а рычаги для сверки нужны всё равно
+    levers = row or _snap.snapshot_row("", name, {"meta": {"state": "-"}, "strategy": strategy})
+    shown = _snap.serving_channel(strategy)
     if strategy["search"] is not None and shown is strategy["search"]:
         channel = "Search"
     elif strategy["network"] is not None and shown is strategy["network"]:
         channel = "Network"
     else:
         channel = None
-    return {k: _whole(row[k]) for k in LEVERS}, channel
+    return {k: _whole(levers[k]) for k in LEVERS}, channel, row
 
 
 def _cpa_holder(block: Any) -> Optional[Tuple[str, str]]:
@@ -199,7 +206,7 @@ class _State:
         tc = item.get("TextCampaign") or {}
         self.name = str(item.get("Name") or "")
         self.strategy = tc["BiddingStrategy"]
-        self.values, serving = _snapshot_view(tc, self.name)
+        self.values, serving, self.snapshot = _snapshot_view(item)
         # Лимит в обоих каналах или нечитаемый — канал None, как у writer.diff_budget:
         # неприменим только лимит, правка одной цены цели идёт.
         channel, limit, _why = read_weekly_limit(self.strategy)
@@ -223,7 +230,7 @@ def _read(acc, cid: int) -> Optional[_State]:
     writer.fetch_budget_state: снимку нужны цены целей (PriorityGoals), сторожу — имя."""
     res = direct.call(acc.token, acc.login, "campaigns", {"method": "get", "params": {
         "SelectionCriteria": {"Ids": [int(cid)]},
-        "FieldNames": ["Id", "Name", "Type"],
+        "FieldNames": ["Id", "Name", "Type", "State", "Status"],
         "TextCampaignFieldNames": ["BiddingStrategy", "PackageBiddingStrategy", "PriorityGoals"],
     }})
     item = next((c for c in res.get("Campaigns") or [] if str(c.get("Id")) == str(cid)), None)
@@ -303,9 +310,10 @@ def _reached(values: dict, expect: dict, to: dict) -> bool:
             and all(_same(values[k], v) for k, v in expect.items() if k not in to))
 
 
-def _set(acc, cid: int, expect: dict, to: dict, guard: bool) -> ApplyResult:
+def _set(acc, cid: int, expect: dict, to: dict, guard: bool, done: list) -> ApplyResult:
     """Общий шаг применения и отката: проверить expect, записать to, прочитать обратно.
-    guard — сторож имён; у отката его нет: откат снимает нашу же запись."""
+    guard — сторож имён; у отката его нет: откат снимает нашу же запись. done — сюда строка
+    снимка дня по прочитанному из Директа, когда в нём стоит to."""
     state = _read(acc, cid)
     if state is None:
         return ApplyResult(False, {}, UNSUPPORTED)
@@ -314,6 +322,7 @@ def _set(acc, cid: int, expect: dict, to: dict, guard: bool) -> ApplyResult:
     before = dict(state.values)
     if not all(_same(state.values[k], v) for k, v in expect.items()):
         if _reached(state.values, expect, to):
+            _done(done, state)
             return ApplyResult(True, {"before": dict(expect), "after": before, "recovered": True})
         return ApplyResult(False, {"actual": before}, CHANGED)
     strategy = _with(state, to)
@@ -340,15 +349,43 @@ def _set(acc, cid: int, expect: dict, to: dict, guard: bool) -> ApplyResult:
     if warnings:
         resp["warnings"] = warnings
     if all(_same(after[k], v) for k, v in to.items()):
+        _done(done, back)
         return ApplyResult(True, resp)
     if werr is not None:
         return ApplyResult(False, resp, _err(werr))
     return ApplyResult(False, resp, NOT_APPLIED)
 
 
+def _done(done: list, state: _State) -> None:
+    if state.snapshot is not None:
+        done.append(state.snapshot)
+
+
+def _publish(ctx: Context, rows: List[dict]) -> None:
+    """Снимок дня по кампаниям, где запись встала: экран Panda читает strategy_snapshots, а
+    синк настроек перепишет его лишь следующим прогоном. Сбой — строка в лог: запись в
+    Директ уже случилась, и её итог важнее."""
+    if not rows:
+        return
+    try:
+        _snap.write_rows(_eds._pg_url(), ctx.slug, rows)
+    except Exception as err:
+        ctx.log("[budget] снимок стратегии не обновлён (%d кампаний): %s" % (len(rows), _err(err)))
+
+
+def after_apply(ctx: Context) -> None:
+    """Раннер зовёт раз за прогон, если что-то записано или откачено: сброс кэша Panda,
+    чтобы экран увидел новый снимок. Тот же вызов, что у синка проектов; сбой — строка в лог."""
+    try:
+        _revalidate([ctx.slug])
+    except Exception as err:
+        ctx.log("[budget] сброс кэша Panda не удался: %s" % _err(err))
+
+
 def _each(ctx: Context, items: List[StoredFinding], step) -> Dict[int, ApplyResult]:
     by_login = {a.login: a for a in ctx.accounts}
     out: Dict[int, ApplyResult] = {}
+    done: List[dict] = []
     # По одной находке со своим свежим чтением: вторая правка той же кампании сверяется
     # с тем, что оставила первая, а не со снимком до неё.
     for f in items:
@@ -368,23 +405,24 @@ def _each(ctx: Context, items: List[StoredFinding], step) -> Dict[int, ApplyResu
             out[f.id] = ApplyResult(False, {"currency": currency}, UNSUPPORTED)
             continue
         try:
-            out[f.id] = step(acc, f, *parsed)
+            out[f.id] = step(acc, f, *parsed, done)
         except Exception as err:  # одна кампания не роняет остальные
             out[f.id] = ApplyResult(False, {}, _err(err))
+    _publish(ctx, done)
     return out
 
 
 def apply(ctx: Context, items: List[StoredFinding]) -> Dict[int, ApplyResult]:
     rules = settings_for(KEY, ctx.settings)
 
-    def one(acc, f, cid, expect, to) -> ApplyResult:
+    def one(acc, f, cid, expect, to, done) -> ApplyResult:
         if not _within_step(expect, to, rules):
             return ApplyResult(False, {}, BAD_ACTION)
-        return _set(acc, cid, expect, to, guard=True)
+        return _set(acc, cid, expect, to, True, done)
     return _each(ctx, items, one)
 
 
-def _rollback_one(acc, f, cid, _expect, to) -> ApplyResult:
+def _rollback_one(acc, f, cid, _expect, to, done) -> ApplyResult:
     """Вернуть рычаги, которые меняла находка, к response.before; в Директе обязано стоять
     response.after — иначе их после нас правил человек, и откат затёр бы его правку."""
     resp = f.response if isinstance(f.response, dict) else {}
@@ -394,7 +432,7 @@ def _rollback_one(acc, f, cid, _expect, to) -> ApplyResult:
     back = {k: before.get(k) for k in to}
     if not all(_rub_value(v) for v in back.values()):
         return ApplyResult(False, {}, UNSUPPORTED)
-    return _set(acc, cid, {k: after.get(k) for k in to}, back, guard=False)
+    return _set(acc, cid, {k: after.get(k) for k in to}, back, False, done)
 
 
 def rollback(ctx: Context, items: List[StoredFinding]) -> Dict[int, ApplyResult]:

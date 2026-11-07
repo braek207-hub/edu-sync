@@ -336,3 +336,31 @@ def test_meshnflesh_entrypoint_is_the_generic_cabinet(monkeypatch):
     M.sync_meshnflesh_campaign_settings()
     assert seen == [("meshnflesh", "mt", "mnf_campaign_settings", [82116769])]
     assert snaps == ["meshnflesh"]
+
+
+def _row(cid="101"):
+    return {"campaign_id": cid, "campaign_name": "к", "weekly_budget": 26000.0,
+            "target_cpa": 1800.0, "target_crr": None, "state": "ON", "status": "ACCEPTED",
+            "strategy_type": "AVERAGE_CPA"}
+
+
+def test_write_rows_stamps_dashboard_and_today(monkeypatch):
+    cur, batches = _fake_pg(monkeypatch, columns=["dashboard"])
+    assert SS.write_rows("pg://x", "edunetwork", [_row()]) == 1
+    sql, rows = batches[0]
+    assert "ON CONFLICT (date, campaign_id)" in sql and "weekly_budget = EXCLUDED" in sql
+    assert rows[0]["dashboard"] == "edunetwork" and rows[0]["date"] == SS.msk_today()
+    assert rows[0]["target_cpa"] == 1800.0
+
+
+def test_write_rows_follows_dashboard_rule(monkeypatch, capsys):
+    _, batches = _fake_pg(monkeypatch, columns=[])
+    assert SS.write_rows("pg://x", "lime", [_row()]) == 0 and batches == []
+    assert "::warning::" in capsys.readouterr().out
+    assert SS.write_rows("pg://x", "edunetwork", [_row()]) == 1
+    assert "dashboard" not in batches[0][0]
+
+
+def test_write_rows_empty_does_not_connect(monkeypatch):
+    monkeypatch.setattr(SS.psycopg2, "connect", lambda url: pytest.fail("connect"))
+    assert SS.write_rows("pg://x", "edunetwork", []) == 0

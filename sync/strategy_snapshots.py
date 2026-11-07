@@ -197,19 +197,10 @@ def write_snapshot(
     по апруву владельца); до неё ДРР в снимок не попадает, остальное пишется как было."""
     if dashboard not in SETTINGS_TABLES:
         raise ValueError(f"неизвестный дашборд для снимка настроек: {dashboard}")
-    day = msk_today()
     with psycopg2.connect(pg_url) as conn:
         with conn.cursor() as cur:
-            cur.execute(_COLUMNS_SQL)
-            columns = {r[0] for r in cur.fetchall()}
-            has_dashboard = "dashboard" in columns
-            if not has_dashboard and dashboard != "edunetwork":
-                # ::warning:: — аннотация GitHub Actions: прогон зелёный (настройки
-                # записаны), но пропуск журнала виден в сводке, а не только в логе.
-                print(
-                    f"::warning::[strategy_snapshots] {dashboard}: колонки dashboard нет "
-                    "(миграция Panda-BI 20261007120000 не накачена) — снимок пропущен"
-                )
+            columns = _columns(cur, dashboard)
+            if columns is None:
                 return 0
             only_ids = campaign_ids is not None
             cur.execute(select_sql(dashboard, only_ids), {"ids": list(campaign_ids or [])})
@@ -220,12 +211,50 @@ def write_snapshot(
                 if row is None:
                     skipped += 1
                     continue
-                rows.append({**row, "dashboard": dashboard, "date": day})
-            if rows:
-                psycopg2.extras.execute_batch(
-                    cur, insert_sql(has_dashboard, "target_crr" in columns), rows, page_size=500
-                )
+                rows.append(row)
+            _upsert(cur, columns, dashboard, rows)
         conn.commit()
     tail = f", без состояния пропущено {skipped}" if skipped else ""
     print(f"[strategy_snapshots] {dashboard}: снимок {len(rows)} строк{tail}")
+    return len(rows)
+
+
+def _columns(cur, dashboard: str) -> Optional[set]:
+    """Необязательные колонки снимка; None — писать нельзя (колонки dashboard нет, а
+    дашборд не EDU: его кампании легли бы в таблицу как EDU-шные)."""
+    cur.execute(_COLUMNS_SQL)
+    columns = {r[0] for r in cur.fetchall()}
+    if "dashboard" not in columns and dashboard != "edunetwork":
+        # ::warning:: — аннотация GitHub Actions: прогон зелёный (настройки
+        # записаны), но пропуск журнала виден в сводке, а не только в логе.
+        print(
+            f"::warning::[strategy_snapshots] {dashboard}: колонки dashboard нет "
+            "(миграция Panda-BI 20261007120000 не накачена) — снимок пропущен"
+        )
+        return None
+    return columns
+
+
+def _upsert(cur, columns: set, dashboard: str, rows: List[Dict[str, Any]]) -> None:
+    day = msk_today()
+    if rows:
+        psycopg2.extras.execute_batch(
+            cur, insert_sql("dashboard" in columns, "target_crr" in columns),
+            [{**r, "dashboard": dashboard, "date": day} for r in rows], page_size=500,
+        )
+
+
+def write_rows(pg_url: str, dashboard: str, rows: List[Dict[str, Any]]) -> int:
+    """Готовые строки snapshot_row — в снимок дня. Для тех, кто сам только что прочитал
+    кампанию из Директа (модуль budget после записи): витрина настроек обновится лишь
+    следующим синком, а экран Panda читает снимок."""
+    if not rows:
+        return 0
+    with psycopg2.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            columns = _columns(cur, dashboard)
+            if columns is None:
+                return 0
+            _upsert(cur, columns, dashboard, rows)
+        conn.commit()
     return len(rows)

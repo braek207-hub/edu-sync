@@ -357,6 +357,7 @@ def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
         run_id = store.start_run(slug, mkey, row["mode"], phase=APPLY_PHASE)
         st: dict = {}
         errors: List[str] = []
+        changed = False
         try:
             for rollback, fn, part in parts:
                 results, err = _safe_call(fn, ctx, part, log,
@@ -367,6 +368,7 @@ def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
                     errors.append(err)
                 for f in part:
                     res = results.get(f.id) or ApplyResult(False, {}, "модуль не вернул результат")
+                    changed = changed or res.ok
                     _record(store, f, res, rollback, st, log)
                 _record_displaced(store, results, st, log)
         except Exception as exc:
@@ -374,11 +376,24 @@ def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
             store.finish_run(run_id, "error", {"phase": APPLY_PHASE, "apply": st},
                              error="; ".join(errors))
             raise
+        _after_apply(module, ctx, changed, mkey, log)
         log("[%s] применение: %s" % (mkey, st))
         store.finish_run(run_id, "error" if errors else "ok", {"phase": APPLY_PHASE, "apply": st},
                          error="; ".join(errors) or None)
         failed = failed or bool(errors)
     return failed
+
+
+def _after_apply(module, ctx, changed: bool, mkey: str, log) -> None:
+    """Хук модуля после применения и отката — раз за прогон, если в Директе что-то
+    поменялось (сброс кэша Panda у budget). Сбой хука — строка в лог: запись уже случилась."""
+    hook = getattr(module, "after_apply", None)
+    if hook is None or not changed:
+        return
+    try:
+        hook(ctx)
+    except Exception as err:
+        log("[%s] после применения: %s: %s" % (mkey, type(err).__name__, err))
 
 
 def _auto_apply(slug, mkey, module, ctx, store, fresh, confirmed, log):

@@ -59,7 +59,8 @@ class FakeDirect:
                 if c is None:
                     continue  # мастер кампаний API не видит
                 item = {"Id": cid, "Name": c.get("name", "EDU | Поиск | ВУЗ"),
-                        "Type": c.get("type", "TEXT_CAMPAIGN"), "DailyBudget": None}
+                        "Type": c.get("type", "TEXT_CAMPAIGN"), "DailyBudget": None,
+                        "State": "ON", "Status": "ACCEPTED"}
                 if item["Type"] == "TEXT_CAMPAIGN":
                     tc = {"BiddingStrategy": copy.deepcopy(c["strategy"])}
                     if c.get("package"):
@@ -83,6 +84,13 @@ class FakeDirect:
         if self.warnings:
             res["Warnings"] = self.warnings
         return {"UpdateResults": [res]}
+
+
+@pytest.fixture(autouse=True)
+def _no_db(monkeypatch):
+    """Снимок дня пишется в базу: в тестах — никуда, кроме фикстуры snaps."""
+    monkeypatch.setattr(bm._eds, "_pg_url", lambda: "pg://test")
+    monkeypatch.setattr(bm._snap, "write_rows", lambda url, dash, rows: len(rows))
 
 
 def _finding(fid=1, cid=101, expect=None, set_=None, status="approved", decided_at=None,
@@ -746,3 +754,139 @@ def test_direct_error_carries_code(monkeypatch):
     with pytest.raises(bm.direct.DirectError) as e:
         bm.direct.call("t", "l", "campaigns", {})
     assert e.value.code == 5005
+
+
+# --- раунд 3: снимок дня и сброс кэша после записи -------------------------------------------
+
+@pytest.fixture
+def snaps(monkeypatch):
+    """Строки, ушедшие в strategy_snapshots; ссылка на базу — подставная."""
+    out: List[tuple] = []
+    monkeypatch.setattr(bm._eds, "_pg_url", lambda: "pg://x")
+    monkeypatch.setattr(bm._snap, "write_rows",
+                        lambda url, dash, rows: out.append((dash, list(rows))) or len(rows))
+    return out
+
+
+def test_applied_updates_today_snapshot(monkeypatch, snaps):
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy(), "name": "vuz / IT"}})
+    res = bm.apply(_ctx(), [_finding()])
+    assert res[1].ok
+    assert len(snaps) == 1
+    dash, rows = snaps[0]
+    assert dash == "edunetwork" and len(rows) == 1
+    r = rows[0]
+    assert (r["campaign_id"], r["campaign_name"], r["weekly_budget"], r["target_cpa"]) == (
+        "101", "vuz / IT", 26000.0, 1800.0)
+    assert (r["state"], r["status"], r["strategy_type"]) == ("ON", "ACCEPTED", "AVERAGE_CPA")
+
+
+def test_one_snapshot_write_per_call(monkeypatch, snaps):
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy()}, 102: {"strategy": _strategy()}})
+    res = bm.apply(_ctx(), [_finding(1), _finding(2, cid=102)])
+    assert res[1].ok and res[2].ok
+    assert len(snaps) == 1 and [r["campaign_id"] for r in snaps[0][1]] == ["101", "102"]
+
+
+def test_recovered_also_updates_snapshot(monkeypatch, snaps):
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy(26000, 1800)}})
+    assert bm.apply(_ctx(), [_finding()])[1].ok
+    assert snaps[0][1][0]["weekly_budget"] == 26000.0
+
+
+def test_failed_write_leaves_snapshot(monkeypatch, snaps):
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy()}}, accept=False)
+    assert not bm.apply(_ctx(), [_finding()])[1].ok
+    assert snaps == []
+
+
+def test_rollback_updates_snapshot(monkeypatch, snaps):
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy(26000, 1800)}})
+    f = _finding(status="rollback_requested",
+                 response={"before": {"weekly_budget": 20000, "target_cpa": 1500},
+                           "after": {"weekly_budget": 26000, "target_cpa": 1800}})
+    assert bm.rollback(_ctx(), [f])[1].ok
+    r = snaps[0][1][0]
+    assert (r["weekly_budget"], r["target_cpa"]) == (20000.0, 1500.0)
+
+
+def test_snapshot_failure_does_not_fail_write(monkeypatch):
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy()}})
+    monkeypatch.setattr(bm._eds, "_pg_url", lambda: "pg://x")
+
+    def boom(*a):
+        raise RuntimeError("база легла")
+    monkeypatch.setattr(bm._snap, "write_rows", boom)
+    logs: List[str] = []
+    ctx = _ctx()
+    ctx.log = logs.append
+    assert bm.apply(ctx, [_finding()])[1].ok
+    assert any("снимок" in m and "база легла" in m for m in logs)
+
+
+def test_after_apply_pings_revalidate(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bm, "_revalidate", lambda slugs: calls.append(list(slugs)))
+    bm.after_apply(_ctx())
+    assert calls == [["edunetwork"]]
+
+
+def test_after_apply_ping_failure_is_a_warning(monkeypatch):
+    def boom(slugs):
+        raise OSError("нет сети")
+    monkeypatch.setattr(bm, "_revalidate", boom)
+    logs: List[str] = []
+    ctx = _ctx()
+    ctx.log = logs.append
+    bm.after_apply(ctx)
+    assert any("кэш" in m and "нет сети" in m for m in logs)
+
+
+class HookModule(SpyModule):
+    def __init__(self, ok=True, boom=False):
+        super().__init__()
+        self.ok, self.boom, self.hooks = ok, boom, 0
+
+    def apply(self, ctx, items):
+        self.applied += [f.id for f in items]
+        return {f.id: ApplyResult(self.ok, {"before": BEFORE, "after": AFTER},
+                                  None if self.ok else "x") for f in items}
+
+    def rollback(self, ctx, items):
+        return {f.id: ApplyResult(self.ok, {}) for f in items}
+
+    def after_apply(self, ctx):
+        self.hooks += 1
+        if self.boom:
+            raise RuntimeError("хук упал")
+
+
+def _hook_run(mod):
+    clock = Clock(DB_NOW)
+    old = DB_NOW - timedelta(minutes=1)
+    back = _finding(2, cid=102, status="rollback_requested", decided_at=old,
+                    response={"before": BEFORE, "after": AFTER})
+    st = FakeStore([ROW], [_finding(1, decided_at=old), back], clock)
+    rc = _go(st, mod, clock)
+    return st, rc
+
+
+def test_runner_calls_after_apply_once_per_run():
+    mod = HookModule()
+    st, rc = _hook_run(mod)
+    assert mod.hooks == 1 and rc == 0
+    assert sorted(o[0] for o in st.outcomes) == [1, 2]
+
+
+def test_runner_skips_after_apply_without_changes():
+    mod = HookModule(ok=False)
+    _hook_run(mod)
+    assert mod.hooks == 0
+
+
+def test_runner_after_apply_failure_is_not_a_run_failure():
+    mod = HookModule(boom=True)
+    st, rc = _hook_run(mod)
+    assert mod.hooks == 1 and rc == 0
+    run = next(r for r in st.runs.values() if r["phase"] == runner.APPLY_PHASE)
+    assert run["status"] == "ok"
