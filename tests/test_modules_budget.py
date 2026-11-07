@@ -41,6 +41,7 @@ class FakeDirect:
         self.read_error_after_write = read_error_after_write
         self.warnings = warnings
         self.updates: List[dict] = []
+        self.item_errors: List[dict] = []
         self.gets = 0
         monkeypatch.setattr(bm.direct, "call", self.call)
 
@@ -77,6 +78,8 @@ class FakeDirect:
         if self.write_error is not None:
             raise self.write_error
         res = {"Id": row["Id"]}
+        if self.item_errors:
+            res["Errors"] = self.item_errors
         if self.warnings:
             res["Warnings"] = self.warnings
         return {"UpdateResults": [res]}
@@ -530,8 +533,8 @@ def test_protected_regex_matches_panda():
     ({"weekly_budget": 30000}, True),          # +50 % — ровно предел stepLim
     ({"weekly_budget": 30001}, True),          # допуск 1 ₽ на округление expect
     ({"weekly_budget": 31000}, False),
-    ({"weekly_budget": 10000}, True),          # −50 %
-    ({"weekly_budget": 9000}, False),
+    ({"weekly_budget": 12000}, True),          # −40 % — предел среза Panda (CUT_STEPS)
+    ({"weekly_budget": 11900}, False),
     ({"target_cpa": 1800}, True),              # +20 % — предел stepCpa
     ({"target_cpa": 1850}, False),
     ({"target_cpa": 1200}, True),
@@ -621,3 +624,125 @@ def test_agent_lock_rechecked_after_undo_wait():
                        agent_lock_fn=lock, cabinets=lambda *a: None, sleep=clock.sleep)
     assert clock.slept and mod.applied == []
     assert st.outcomes == [(1, "failed", False, runner.EDU_LOCK_LINE)]
+
+
+# --- раунд 2: нижние пределы, бюджет обучения, нередактируемые ЕПК ---------------------------
+
+@pytest.mark.parametrize("settings,set_,ok", [
+    # срез лимита — не больше 40 % при любом stepLim (limitDown Panda stepLim не читает)
+    ({"stepLim": 300}, {"weekly_budget": 11900}, False),
+    ({"stepLim": 20}, {"weekly_budget": 12000}, True),
+    # подъём цены цели ниже minCpa не ограничен — Panda поднимает и цену 600 ₽
+    ({"minCpa": 1000}, {"target_cpa": 1200}, True),
+    ({"minCpa": 1300}, {"target_cpa": 1250}, False),
+    ({"minCpa": 1300}, {"target_cpa": 1300}, True),
+])
+def test_lower_bounds(monkeypatch, settings, set_, ok):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy()}})
+    res = bm.apply(_ctx(settings=settings), [_finding(set_=set_)])
+    if ok:
+        assert res[1].ok, res[1].error
+    else:
+        assert (res[1].ok, res[1].error) == (False, "bad_action") and fake.gets == 0
+
+
+def test_limit_floor_3000(monkeypatch):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy(limit_rub=4000)}})
+    low = _finding(expect={"weekly_budget": 4000, "target_cpa": 1500},
+                   set_={"weekly_budget": 2900})
+    res = bm.apply(_ctx(), [low])
+    assert (res[1].ok, res[1].error) == (False, "bad_action") and fake.gets == 0
+
+
+def test_cpa_raise_below_min_cpa_allowed(monkeypatch):
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy(cpa_rub=600)}})
+    res = bm.apply(_ctx(), [_finding(expect={"weekly_budget": 20000, "target_cpa": 600},
+                                     set_={"target_cpa": 700})])
+    assert res[1].ok, res[1].error
+
+
+def test_step_settings_clamped():
+    s = settings_for("budget", {"stepLim": 1000, "stepCpa": 500, "minCpa": -5})
+    assert (s["stepLim"], s["stepCpa"], s["minCpa"]) == (300, 100, 0)
+    s = settings_for("budget", {"stepLim": 0, "stepCpa": -3})
+    assert (s["stepLim"], s["stepCpa"]) == (1, 1)
+
+
+def _with_exploration(min_rub, custom="YES"):
+    s = _strategy()
+    s["Search"]["AverageCpa"]["ExplorationBudget"] = {
+        "MinimumExplorationBudget": min_rub * M, "IsMinimumExplorationBudgetCustom": custom}
+    return s
+
+
+def test_lowering_limit_resets_exploration_budget(monkeypatch):
+    # ручной бюджет обучения больше нового лимита — Директ отбил бы 4000 (замер 08.09.2026)
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _with_exploration(15000)}})
+    res = bm.apply(_ctx(), [_finding(set_={"weekly_budget": 12000})])
+    assert res[1].ok, res[1].error
+    holder = fake.updates[0]["Campaigns"][0]["TextCampaign"]["BiddingStrategy"]["Search"][
+        "AverageCpa"]
+    assert holder["ExplorationBudget"] == {"MinimumExplorationBudget": 7560 * M,
+                                           "IsMinimumExplorationBudgetCustom": "NO"}
+    assert holder["WeeklySpendLimit"] == 12000 * M
+    assert holder["BidCeiling"] == 300 * M and holder["AverageCpa"] == 1500 * M
+
+
+def test_exploration_budget_kept_when_fits(monkeypatch):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _with_exploration(5000)}})
+    res = bm.apply(_ctx(), [_finding(set_={"weekly_budget": 12000})])
+    assert res[1].ok, res[1].error
+    holder = fake.updates[0]["Campaigns"][0]["TextCampaign"]["BiddingStrategy"]["Search"][
+        "AverageCpa"]
+    assert holder["ExplorationBudget"] == {"MinimumExplorationBudget": 5000 * M,
+                                           "IsMinimumExplorationBudgetCustom": "YES"}
+
+
+STUB = "Невалидное значение: CampaignStub{type=UNIFIED_CAMPAIGN, id=709413835}"
+
+
+def test_campaign_stub_item_error_not_editable(monkeypatch):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy()}}, accept=False)
+    fake.item_errors = [{"Code": 5005, "Message": "Неверное значение", "Details": STUB}]
+    res = bm.apply(_ctx(), [_finding()])
+    assert (res[1].ok, res[1].error) == (False, "not_editable")
+    assert res[1].response["before"] == {"weekly_budget": 20000, "target_cpa": 1500}
+    assert len(fake.updates) == 1
+
+
+def test_campaign_stub_request_error_not_editable(monkeypatch):
+    err = bm.direct.DirectError("campaigns [5005] Неверное значение: " + STUB, code=5005)
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy()}}, accept=False, write_error=err)
+    res = bm.apply(_ctx(), [_finding()])
+    assert (res[1].ok, res[1].error) == (False, "not_editable")
+
+
+def test_other_5005_is_plain_error(monkeypatch):
+    # 5005 без CampaignStub — ошибка нашего тела, а не «правка только руками»
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy()}}, accept=False)
+    fake.item_errors = [{"Code": 5005, "Message": "Неверное значение", "Details": "BidCeiling"}]
+    res = bm.apply(_ctx(), [_finding()])
+    assert not res[1].ok and res[1].error.startswith("DirectError") and "5005" in res[1].error
+
+
+def test_direct_error_carries_code(monkeypatch):
+    class Resp:
+        status = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        def read(self):
+            return self.body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    body = '{"error": {"error_code": 5005, "error_string": "x", "error_detail": "y"}}'
+    monkeypatch.setattr(bm.direct.urllib.request, "urlopen",
+                        lambda req, timeout=None: Resp(body.encode("utf-8")))
+    with pytest.raises(bm.direct.DirectError) as e:
+        bm.direct.call("t", "l", "campaigns", {})
+    assert e.value.code == 5005

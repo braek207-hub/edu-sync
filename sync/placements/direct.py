@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 API = "https://api.direct.yandex.com/json/v5/"
 REPORTS = "https://api.direct.yandex.com/json/v5/reports"
@@ -71,7 +71,12 @@ CALL_BACKOFF = 3
 
 
 class DirectError(RuntimeError):
-    pass
+    """code — error_code ответа Директа, если отказ пришёл от него (по коду решают, повторять
+    ли и какой статус показать человеку)."""
+
+    def __init__(self, message: str, code: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
 
 
 def _headers(token: str, login: str) -> Dict[str, str]:
@@ -105,7 +110,7 @@ def call(token: str, login: str, service: str, payload: Dict[str, Any]) -> Dict[
             continue
         raise DirectError("%s [%s] %s: %s" % (
             service, err.get("error_code"), err.get("error_string"),
-            err.get("error_detail")))
+            err.get("error_detail")), code=err.get("error_code"))
     return {}
 
 

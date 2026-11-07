@@ -39,6 +39,19 @@ TOLERANCE_RUB = 1.0
 # Предел шага правки — те же настройки модуля, по которым её считала Panda (lib/budget/model.ts:
 # limitUp/limitDown, cpaUp/cpaDown), в процентах от значения «до».
 STEP_SETTING = {"weekly_budget": "stepLim", "target_cpa": "stepCpa"}
+# Срез лимита за раз — самый большой шаг CUT_STEPS в lib/budget/model.ts (limitDown).
+LIMIT_CUT_MAX = 0.40
+# Лимит ниже этого Panda не срезает — MIN_LIMIT в lib/budget/model.ts (limitDown).
+MIN_LIMIT = 3000
+# Ручной бюджет обучения больше нового лимита — Директ отбивает снижение лимита ошибкой 4000
+# («MinimumExplorationBudget не может быть больше …»). Прошло так: бюджет обучения ≈63 %
+# нового лимита и IsMinimumExplorationBudgetCustom NO; без MinimumExplorationBudget — 8000.
+# Замер на кампаниях EDU 08.09.2026 (память direct-api-epk-write-traps).
+EXPLORATION_SHARE = 0.63
+# Часть ЕПК (v5 отдаёт их TEXT_CAMPAIGN) Директ через API не правит вовсе: любое тело update
+# получает 5005 «Невалидное значение: …CampaignStub» — и в v5, и в v501. Только руками.
+STUB_CODE = 5005
+STUB_MARK = "CampaignStub"
 # Кампании не в зоне модуля — тот же текст, что EXCLUDED_NAME_SQL в Panda
 # (lib/budget/facts.sql.ts): rsv — чужие РК в своих кабинетах, Конкурент и Наш бренд — брендовые.
 EXCLUDED_NAME_RE = re.compile("rsv|Конкурент|Наш бренд", re.IGNORECASE)
@@ -49,6 +62,7 @@ CHANGED = "changed_in_direct"
 UNSUPPORTED = "unsupported"
 BAD_ACTION = "bad_action"
 PROTECTED = "protected"
+NOT_EDITABLE = "not_editable"
 NOT_APPLIED = "Директ принял, но не применил"
 
 
@@ -104,14 +118,28 @@ def _parse(action: Any) -> Optional[Tuple[int, dict, dict]]:
 
 
 def _within_step(expect: dict, to: dict, rules: dict) -> bool:
-    """Правка не шире шага, с которым её считала Panda. Panda округляет в сторону меньшей
-    правки, так что предел не превышается; допуск в рубль — на округление expect до целых."""
+    """Правка в тех пределах, в которых её считает Panda (lib/budget/model.ts):
+      лимит вверх  ≤ wb·(1 + stepLim)                  — limitUp;
+      лимит вниз   ≤ LIMIT_CUT_MAX и не ниже MIN_LIMIT — limitDown (stepLim срез не читает);
+      цена вверх   ≤ cpa·(1 + stepCpa)                 — cpaUp;
+      цена вниз    ≤ cpa·(1 − stepCpa), не ниже minCpa — cpaDown.
+    Panda округляет в сторону меньшей правки, так что пределы не превышаются; рубль допуска —
+    на округление expect до целых. Подъём ниже порогов не ограничен: Panda поднимает и цену
+    ниже minCpa, и лимит ниже MIN_LIMIT."""
     for k, v in to.items():
         base = expect.get(k)
         if base is None:
             return False  # предел считается от значения «до»; без него правка ничем не ограничена
         step = rules[STEP_SETTING[k]] / 100.0
-        if not base * (1 - step) - TOLERANCE_RUB <= v <= base * (1 + step) + TOLERANCE_RUB:
+        if v > base * (1 + step) + TOLERANCE_RUB:
+            return False
+        if v >= base:
+            continue
+        if k == "weekly_budget":
+            floor = max(base * (1 - LIMIT_CUT_MAX), MIN_LIMIT)
+        else:
+            floor = max(base * (1 - step), rules["minCpa"])
+        if v < floor - TOLERANCE_RUB:
             return False
     return True
 
@@ -209,6 +237,22 @@ def _read(acc, cid: int) -> Optional[_State]:
     return _State(item)
 
 
+def _fit_exploration(strategy: dict, channel: str, limit_rub: float) -> dict:
+    """Бюджет обучения больше нового лимита — сбросить его на автоматический (EXPLORATION_SHARE).
+    Меняется только ExplorationBudget носителя лимита; остальной блок — как прочитан."""
+    for holder in (strategy.get(channel) or {}).values():
+        if not isinstance(holder, dict) or "WeeklySpendLimit" not in holder:
+            continue
+        eb = holder.get("ExplorationBudget")
+        current = _micros_rub(eb.get("MinimumExplorationBudget")) if isinstance(eb, dict) else None
+        if current is not None and current > limit_rub:
+            holder["ExplorationBudget"] = {
+                "MinimumExplorationBudget": int(round(limit_rub * EXPLORATION_SHARE)) * MICROS,
+                "IsMinimumExplorationBudgetCustom": "NO"}
+        break
+    return strategy
+
+
 def _with(state: _State, to: dict) -> Optional[dict]:
     """Блок BiddingStrategy с новыми значениями; None — у рычага нет носителя, который
     читает снимок."""
@@ -216,8 +260,9 @@ def _with(state: _State, to: dict) -> Optional[dict]:
     if "weekly_budget" in to:
         if state.limit_channel is None:
             return None
-        out = strategy_with_limit(out, state.limit_channel,
-                                  int(round(to["weekly_budget"] * MICROS)))
+        out = _fit_exploration(strategy_with_limit(out, state.limit_channel,
+                                                   int(round(to["weekly_budget"] * MICROS))),
+                               state.limit_channel, to["weekly_budget"])
     if "target_cpa" in to:
         if state.cpa_holder is None:
             return None
@@ -239,8 +284,16 @@ def _write(acc, cid: int, strategy: dict) -> list:
     errors = results[0].get("Errors") or []
     if errors:
         raise direct.DirectError("; ".join(
-            "%s %s %s" % (e.get("Code"), e.get("Message"), e.get("Details") or "") for e in errors))
+            "%s %s %s" % (e.get("Code"), e.get("Message"), e.get("Details") or "") for e in errors),
+            code=errors[0].get("Code"))
     return list(results[0].get("Warnings") or [])
+
+
+def _stub(err: Optional[BaseException]) -> bool:
+    """Отказ «кампанию через API не править» — 5005 с CampaignStub; 5005 без него — ошибка
+    нашего тела, и статус «только руками» соврал бы."""
+    return (isinstance(err, direct.DirectError) and err.code == STUB_CODE
+            and STUB_MARK in str(err))
 
 
 def _reached(values: dict, expect: dict, to: dict) -> bool:
@@ -273,6 +326,9 @@ def _set(acc, cid: int, expect: dict, to: dict, guard: bool) -> ApplyResult:
         warnings = _write(acc, cid, strategy)
     except Exception as err:
         werr = err
+    if _stub(werr):
+        # Директ отказал целиком — записи не было, повтор даст то же самое
+        return ApplyResult(False, {"before": before, "detail": str(werr)}, NOT_EDITABLE)
     try:
         back = _read(acc, cid)
     except Exception as rerr:

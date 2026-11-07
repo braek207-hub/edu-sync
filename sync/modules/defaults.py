@@ -52,6 +52,14 @@ CHOICES: Dict[Tuple[str, ...], Tuple[str, ...]] = {
     ("placements", "spam", "goals"): ("strategy", "leads"),
 }
 
+# Пределы чисел — как min/max поля в каталоге Panda (lib/modules/catalog.ts): stepLim 300 % —
+# потолок, с которым движок соглашается писать лимит; вне предела значение прижимается к нему.
+RANGES: Dict[Tuple[str, ...], Tuple[float, float]] = {
+    ("budget", "stepLim"): (1, 300),
+    ("budget", "stepCpa"): (1, 100),
+    ("budget", "minCpa"): (0, 1_000_000),
+}
+
 
 # Настройки-словари со свободными ключами (логинами): поключевое слияние с умолчанием, как у
 # spam, отбросило бы их все — у умолчания ключей нет.
@@ -108,6 +116,9 @@ def _coerce(path: Tuple[str, ...], default: Any, value: Any) -> Any:
         return [x for x in value if x in allowed] if allowed else list(value)
     if allowed and value not in allowed:
         return default
+    bounds = RANGES.get(path)
+    if bounds is not None:
+        return min(max(value, bounds[0]), bounds[1])
     return value
 
 
