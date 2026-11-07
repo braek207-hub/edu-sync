@@ -33,27 +33,38 @@ def _strategy(limit_rub=20000, cpa_rub=1500):
 class FakeDirect:
     """campaigns.get/update одной кабинетной базы; update пишет стратегию как есть."""
 
-    def __init__(self, monkeypatch, camps: Dict[int, dict], accept=True):
+    def __init__(self, monkeypatch, camps: Dict[int, dict], accept=True, write_error=None,
+                 read_error_after_write=None, warnings=None):
         self.camps = camps
         self.accept = accept
+        self.write_error = write_error
+        self.read_error_after_write = read_error_after_write
+        self.warnings = warnings
         self.updates: List[dict] = []
+        self.gets = 0
         monkeypatch.setattr(bm.direct, "call", self.call)
 
     def call(self, token, login, service, payload):
         assert service == "campaigns"
         params = payload["params"]
         if payload["method"] == "get":
+            self.gets += 1
+            if self.updates and self.read_error_after_write is not None:
+                raise self.read_error_after_write
             ids = params["SelectionCriteria"]["Ids"]
             out = []
             for cid in ids:
                 c = self.camps.get(int(cid))
                 if c is None:
                     continue  # мастер кампаний API не видит
-                item = {"Id": cid, "Type": c.get("type", "TEXT_CAMPAIGN"), "DailyBudget": None}
+                item = {"Id": cid, "Name": c.get("name", "EDU | Поиск | ВУЗ"),
+                        "Type": c.get("type", "TEXT_CAMPAIGN"), "DailyBudget": None}
                 if item["Type"] == "TEXT_CAMPAIGN":
                     tc = {"BiddingStrategy": copy.deepcopy(c["strategy"])}
                     if c.get("package"):
                         tc["PackageBiddingStrategy"] = {"StrategyId": c["package"]}
+                    if c.get("goals"):
+                        tc["PriorityGoals"] = {"Items": copy.deepcopy(c["goals"])}
                     item["TextCampaign"] = tc
                 out.append(item)
             return {"Campaigns": out}
@@ -63,7 +74,12 @@ class FakeDirect:
         if self.accept:
             self.camps[int(row["Id"])]["strategy"] = copy.deepcopy(
                 row["TextCampaign"]["BiddingStrategy"])
-        return {"UpdateResults": [{"Id": row["Id"]}]}
+        if self.write_error is not None:
+            raise self.write_error
+        res = {"Id": row["Id"]}
+        if self.warnings:
+            res["Warnings"] = self.warnings
+        return {"UpdateResults": [res]}
 
 
 def _finding(fid=1, cid=101, expect=None, set_=None, status="approved", decided_at=None,
@@ -79,9 +95,9 @@ def _finding(fid=1, cid=101, expect=None, set_=None, status="approved", decided_
                          decided_at=decided_at or NOW - timedelta(minutes=1), response=response)
 
 
-def _ctx() -> Context:
+def _ctx(settings=None, accounts=None) -> Context:
     return Context(slug="edunetwork", module_key="budget", mode="approve",
-                   settings=settings_for("budget", None), accounts=ACC, now=NOW,
+                   settings=settings_for("budget", settings), accounts=accounts or ACC, now=NOW,
                    log=lambda m: None)
 
 
@@ -140,9 +156,10 @@ def test_unsupported_campaigns(monkeypatch):
     items = [_finding(1, cid=101), _finding(2, cid=102), _finding(3, cid=103),
              _finding(4, cid=104, expect={"weekly_budget": None, "target_cpa": None})]
     res = bm.apply(_ctx(), items)
+    # 104: рычагов нет, и предела шага без значения «до» не посчитать — действие не той формы
     assert {i: (r.ok, r.error) for i, r in res.items()} == {
         1: (False, "unsupported"), 2: (False, "unsupported"),
-        3: (False, "unsupported"), 4: (False, "unsupported")}
+        3: (False, "unsupported"), 4: (False, "bad_action")}
     assert fake.updates == []
 
 
@@ -412,3 +429,195 @@ def test_agent_lock_marks_failed():
     assert st.outcomes == [(1, "failed", False, line)]
     run = next(r for r in st.runs.values() if r["phase"] == runner.APPLY_PHASE)
     assert run["summary"]["agent_lock"] == line
+
+
+# --- цель CPA как в снимке, отказы движка, восстановление -----------------------------------
+
+def _pay_for_conversion(limit_rub=20000, cpa_rub=1500):
+    return {"Search": {"BiddingStrategyType": "PAY_FOR_CONVERSION",
+                       "PayForConversion": {"Cpa": cpa_rub * M, "GoalId": 7,
+                                            "WeeklySpendLimit": limit_rub * M}},
+            "Network": {"BiddingStrategyType": "SERVING_OFF"}}
+
+
+def _multi_goal(limit_rub=20000):
+    return {"Search": {"BiddingStrategyType": "AVERAGE_CPA_MULTIPLE_GOALS",
+                       "AverageCpaMultipleGoals": {"WeeklySpendLimit": limit_rub * M}},
+            "Network": {"BiddingStrategyType": "SERVING_OFF"}}
+
+
+GOALS = [{"GoalId": 1, "Value": 900 * M}, {"GoalId": 2, "Value": 1500 * M}]
+
+
+def test_cpa_read_and_written_in_cpa_field(monkeypatch):
+    # PAY_FOR_CONVERSION держит цену в Cpa — снимок читает её (AverageCpa or Cpa), пишем туда же
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _pay_for_conversion()}})
+    res = bm.apply(_ctx(), [_finding(set_={"target_cpa": 1800})])
+    assert res[1].ok, res[1].error
+    holder = fake.camps[101]["strategy"]["Search"]["PayForConversion"]
+    assert holder["Cpa"] == 1800 * M and "AverageCpa" not in holder
+    assert res[1].response["after"] == {"weekly_budget": 20000, "target_cpa": 1800}
+
+
+def test_multi_goal_cpa_compared_like_snapshot(monkeypatch):
+    # у «нескольких целей» снимок берёт цену самой дорогой цели: expect сравнивается с ней
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _multi_goal(), "goals": GOALS}})
+    res = bm.apply(_ctx(), [_finding(set_={"weekly_budget": 26000})])
+    assert res[1].ok, res[1].error
+    assert res[1].response["before"] == {"weekly_budget": 20000, "target_cpa": 1500}
+    assert len(fake.updates) == 1
+
+
+def test_multi_goal_cpa_write_unsupported(monkeypatch):
+    # цена живёт в PriorityGoals, а не в стратегии — писать в другое поле нельзя
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _multi_goal(), "goals": GOALS}})
+    res = bm.apply(_ctx(), [_finding(set_={"target_cpa": 1800})])
+    assert (res[1].ok, res[1].error) == (False, "unsupported") and fake.updates == []
+
+
+def test_custom_period_limit_not_written(monkeypatch):
+    # снимок читает лимит периода (CustomPeriodBudget), а пишем только WeeklySpendLimit
+    s = {"Search": {"BiddingStrategyType": "AVERAGE_CPA",
+                    "AverageCpa": {"AverageCpa": 1500 * M,
+                                   "CustomPeriodBudget": {"SpendLimit": 20000 * M}}},
+         "Network": {"BiddingStrategyType": "SERVING_OFF"}}
+    fake = FakeDirect(monkeypatch, {101: {"strategy": s}})
+    res = bm.apply(_ctx(), [_finding(set_={"weekly_budget": 26000})])
+    assert (res[1].ok, res[1].error) == (False, "unsupported") and fake.updates == []
+
+
+def test_two_channel_limit_cpa_only_ok(monkeypatch):
+    s = _strategy()
+    s["Network"] = {"BiddingStrategyType": "AVERAGE_CPA",
+                    "AverageCpa": {"AverageCpa": 1500 * M, "WeeklySpendLimit": 5000 * M}}
+    fake = FakeDirect(monkeypatch, {101: {"strategy": s}})
+    res = bm.apply(_ctx(), [_finding(set_={"target_cpa": 1800})])
+    assert res[1].ok, res[1].error
+    st = fake.camps[101]["strategy"]
+    assert st["Search"]["AverageCpa"]["AverageCpa"] == 1800 * M
+    assert st["Network"]["AverageCpa"]["AverageCpa"] == 1500 * M
+
+
+@pytest.mark.parametrize("expect", [{"weekly_budget": 20000}, {"target_cpa": 1500}, {}])
+def test_expect_needs_both_levers(monkeypatch, expect):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy()}})
+    res = bm.apply(_ctx(), [_finding(expect=expect, set_={"weekly_budget": 26000})])
+    assert (res[1].ok, res[1].error) == (False, "bad_action") and fake.gets == 0
+
+
+def test_campaign_id_must_match_finding(monkeypatch):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy()}})
+    f = _finding()
+    f.campaign_id = 999
+    res = bm.apply(_ctx(), [f])
+    assert (res[1].ok, res[1].error) == (False, "bad_action") and fake.gets == 0
+
+
+@pytest.mark.parametrize("name", ["EDU | rsv | Поиск", "Наш бренд — Поиск", "КОНКУРЕНТ ВУЗы",
+                                  "Бренд RSV"])
+def test_protected_campaign_refused(monkeypatch, name):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy(), "name": name}})
+    res = bm.apply(_ctx(), [_finding()])
+    assert (res[1].ok, res[1].error) == (False, "protected") and fake.updates == []
+
+
+def test_protected_regex_matches_panda():
+    # тот же текст, что EXCLUDED_NAME_SQL в Panda (lib/budget/facts.sql.ts)
+    assert bm.EXCLUDED_NAME_RE.pattern == "rsv|Конкурент|Наш бренд"
+
+
+@pytest.mark.parametrize("set_,ok", [
+    ({"weekly_budget": 30000}, True),          # +50 % — ровно предел stepLim
+    ({"weekly_budget": 30001}, True),          # допуск 1 ₽ на округление expect
+    ({"weekly_budget": 31000}, False),
+    ({"weekly_budget": 10000}, True),          # −50 %
+    ({"weekly_budget": 9000}, False),
+    ({"target_cpa": 1800}, True),              # +20 % — предел stepCpa
+    ({"target_cpa": 1850}, False),
+    ({"target_cpa": 1200}, True),
+    ({"target_cpa": 1150}, False),
+])
+def test_step_cap(monkeypatch, set_, ok):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy()}})
+    res = bm.apply(_ctx(), [_finding(set_=set_)])
+    if ok:
+        assert res[1].ok, res[1].error
+    else:
+        assert (res[1].ok, res[1].error) == (False, "bad_action") and fake.gets == 0
+
+
+def test_step_cap_follows_settings(monkeypatch):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy()}})
+    res = bm.apply(_ctx(settings={"stepLim": 20}), [_finding(set_={"weekly_budget": 26000})])
+    assert (res[1].ok, res[1].error) == (False, "bad_action") and fake.updates == []
+
+
+def test_set_without_expect_value_is_bad_action(monkeypatch):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy()}})
+    res = bm.apply(_ctx(), [_finding(expect={"weekly_budget": None, "target_cpa": 1500},
+                                     set_={"weekly_budget": 20000})])
+    assert (res[1].ok, res[1].error) == (False, "bad_action") and fake.gets == 0
+
+
+def test_non_rub_account_unsupported(monkeypatch):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy()}})
+    kzt = [DirectAccount("edu-login", "tok", "KZT", "KZ")]
+    res = bm.apply(_ctx(accounts=kzt), [_finding()])
+    assert (res[1].ok, res[1].error) == (False, "unsupported") and fake.gets == 0
+
+
+def test_recovered_when_direct_already_has_set(monkeypatch):
+    # прошлый такт записал, но итог не лёг (процесс убит): повторно не пишем, а признаём
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy(26000, 1800)}})
+    res = bm.apply(_ctx(), [_finding()])
+    assert res[1].ok, res[1].error
+    assert fake.updates == []
+    assert res[1].response == {"before": {"weekly_budget": 20000, "target_cpa": 1500},
+                               "after": {"weekly_budget": 26000, "target_cpa": 1800},
+                               "recovered": True}
+
+
+def test_not_recovered_when_other_lever_moved(monkeypatch):
+    # set — только лимит, а цену цели после нас правили: это не наш след, а чужая правка
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy(26000, 1700)}})
+    res = bm.apply(_ctx(), [_finding(set_={"weekly_budget": 26000})])
+    assert (res[1].ok, res[1].error) == (False, "changed_in_direct") and fake.updates == []
+
+
+def test_rollback_recovered_when_already_back(monkeypatch):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy(20000, 1500)}})
+    f = _finding(status="rollback_requested",
+                 response={"before": {"weekly_budget": 20000, "target_cpa": 1500},
+                           "after": {"weekly_budget": 26000, "target_cpa": 1800}})
+    res = bm.rollback(_ctx(), [f])
+    assert res[1].ok and res[1].response["recovered"] is True and fake.updates == []
+
+
+def test_unknown_outcome_keeps_before(monkeypatch):
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy()}}, write_error=TimeoutError("write"),
+               read_error_after_write=TimeoutError("read"))
+    res = bm.apply(_ctx(), [_finding()])
+    assert not res[1].ok and "TimeoutError" in res[1].error
+    assert res[1].response["before"] == {"weekly_budget": 20000, "target_cpa": 1500}
+
+
+def test_update_warnings_kept(monkeypatch):
+    warn = [{"Code": 10000, "Message": "предупреждение"}]
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy()}}, warnings=warn)
+    res = bm.apply(_ctx(), [_finding()])
+    assert res[1].ok and res[1].response["warnings"] == warn
+
+
+def test_agent_lock_rechecked_after_undo_wait():
+    # агент EDU включили, пока раннер ждал окно отмены: писать уже нельзя
+    clock = Clock(DB_NOW)
+    young = _finding(1, decided_at=DB_NOW - timedelta(seconds=3))
+    st, mod = FakeStore([ROW], [young], clock), SpyModule()
+
+    def lock(slug):
+        return runner.EDU_LOCK_LINE if clock.slept else None
+    runner.run_project("edunetwork", store=st, accounts=lambda s: (ACC, []),
+                       modules={"budget": mod}, now=NOW, log=lambda m: None,
+                       agent_lock_fn=lock, cabinets=lambda *a: None, sleep=clock.sleep)
+    assert clock.slept and mod.applied == []
+    assert st.outcomes == [(1, "failed", False, runner.EDU_LOCK_LINE)]

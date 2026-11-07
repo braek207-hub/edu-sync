@@ -55,11 +55,11 @@ RUB = "RUB"
 PREVIEW_TICK_BUDGET = timedelta(minutes=20)
 # Модули, находки которых создаёт Panda, а не скан: по расписанию их не гоняем.
 NO_SCAN_MODULES = ("budget",)
-# Окно отмены: Panda будит раннер сразу после «Применить», а человек ещё 10 с может нажать
-# «Отменить» (Panda разрешает её атомарно: decided_at > now() - 10 s по часам базы).
-# Одобренное моложе UNDO_RIPE по тем же часам базы не пишется: 2 с запаса сверх окна Panda —
-# чтобы отмена в последний миг не совпала с запросом в Директ. Раннер ждёт до конца окна, но
-# не дольше UNDO_WAIT_MAX, перечитывает очередь (отменённое из неё уже ушло) и только тогда пишет.
+# Окно отмены — на стороне клиента Panda: после «Применить» браузер 10 с держит «Отменить»
+# и только потом шлёт решение; серверной отмены у движка нет. Раннер — запас сверх этого:
+# одобренное моложе UNDO_RIPE по часам базы (now(), не процесса) не пишется. Раннер ждёт до
+# конца окна, но не дольше UNDO_WAIT_MAX, перечитывает очередь (отменённое из неё уже ушло),
+# заново спрашивает замок агента EDU (за ожидание его могли включить) и только тогда пишет.
 UNDO_MODULES = ("budget",)
 UNDO_RIPE = timedelta(seconds=12)
 UNDO_WAIT_MAX = 20.0
@@ -312,7 +312,8 @@ def _fail_locked(slug, store, pend, by_key, lock_line, log) -> None:
 def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
                  cancel: Optional[_cancel.Switch] = None,
                  prog: Optional[RunProgress] = None,
-                 sleep: Callable[[float], None] = time.sleep) -> bool:
+                 sleep: Callable[[float], None] = time.sleep,
+                 relock: Optional[Callable[[], Optional[str]]] = None) -> bool:
     """Одобренное применяем, запрошенный откат снимаем; True — были сбои.
 
     Каждый модуль, у которого была работа, получает свою строку module_runs с
@@ -326,6 +327,9 @@ def _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
     # rows — только включённые модули: в off находки остаются как есть
     by_key = {r["module_key"]: r for r in rows}
     pend = _ripe(slug, store, by_key, log, sleep, cancel)
+    # Ожидание окна отмены длится до UNDO_WAIT_MAX: замок, прочитанный до него, мог устареть.
+    if pend and relock is not None:
+        lock_line = relock()
     if pend and lock_line:
         log("запись заблокирована: %s" % lock_line)
         _fail_locked(slug, store, pend, by_key, lock_line, log)
@@ -820,15 +824,17 @@ def _tick(slug, store, accounts, modules, now, only, log, agent_lock_fn, clock, 
             cleaned = True
         previews(budget=True)
         cancel.check()
-        lock_line = agent_lock_fn(slug)
-        rc = 1 if _apply_phase(slug, store, rows, modules, accts, now, log, lock_line,
-                               cancel, prog, sleep) else 0
+        def relock() -> Optional[str]:
+            return agent_lock_fn(slug)
+        rc = 1 if _apply_phase(slug, store, rows, modules, accts, now, log, relock(),
+                               cancel, prog, sleep, relock=relock) else 0
         for i, row in enumerate(due):
             # заявка, поданная во время скана, не ждёт следующего такта
             if i:
                 previews(budget=True)
             cancel.check()
-            if _scan(slug, store, row, modules, accts, why, goals, now, log, lock_line,
+            # такт идёт до 40 минут: замок агента EDU — на момент скана, а не начала такта
+            if _scan(slug, store, row, modules, accts, why, goals, now, log, relock(),
                      cancel, prog):
                 rc = 1
             prog.module_done()
