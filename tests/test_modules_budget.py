@@ -890,3 +890,78 @@ def test_runner_after_apply_failure_is_not_a_run_failure():
     assert mod.hooks == 1 and rc == 0
     run = next(r for r in st.runs.values() if r["phase"] == runner.APPLY_PHASE)
     assert run["status"] == "ok"
+
+
+# --- раунд 4: откат бюджета обучения, кампании «на рост» -------------------------------------
+
+def test_rollback_restores_manual_exploration_budget(monkeypatch):
+    manual = {"MinimumExplorationBudget": 15000 * M, "IsMinimumExplorationBudgetCustom": "YES"}
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _with_exploration(15000)}})
+    res = bm.apply(_ctx(), [_finding(set_={"weekly_budget": 12000})])
+    assert res[1].ok, res[1].error
+    holder = fake.camps[101]["strategy"]["Search"]["AverageCpa"]
+    assert holder["ExplorationBudget"] == {"MinimumExplorationBudget": 7560 * M,
+                                           "IsMinimumExplorationBudgetCustom": "NO"}
+    assert res[1].response["before"]["exploration_budget"] == manual
+
+    f = _finding(set_={"weekly_budget": 12000}, status="rollback_requested",
+                 response=res[1].response)
+    back = bm.rollback(_ctx(), [f])
+    assert back[1].ok, back[1].error
+    holder = fake.camps[101]["strategy"]["Search"]["AverageCpa"]
+    assert holder["WeeklySpendLimit"] == 20000 * M and holder["ExplorationBudget"] == manual
+    assert holder["BidCeiling"] == 300 * M and holder["AverageCpa"] == 1500 * M
+
+
+def test_rollback_without_exploration_snapshot_as_before(monkeypatch):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _with_exploration(5000)}})
+    f = _finding(set_={"weekly_budget": 12000}, status="rollback_requested",
+                 response={"before": {"weekly_budget": 20000, "target_cpa": 1500},
+                           "after": {"weekly_budget": 12000, "target_cpa": 1500}})
+    fake.camps[101]["strategy"]["Search"]["AverageCpa"]["WeeklySpendLimit"] = 12000 * M
+    assert bm.rollback(_ctx(), [f])[1].ok
+    holder = fake.camps[101]["strategy"]["Search"]["AverageCpa"]
+    assert holder["ExplorationBudget"] == {"MinimumExplorationBudget": 5000 * M,
+                                           "IsMinimumExplorationBudgetCustom": "YES"}
+
+
+GROWTH = ["vuz / Обучение в Дубае / ВПО / Поиск / МСК (2026-10)",
+          "postupi_provuz / Юриспруденция LP / ВПО / Поиск / МСК (2026-10)"]
+NOT_GROWTH = ["postupi_provuz / Тех.Специальности - 2 / ВПО / Поиск / МСК (2026)",
+              "vsekolledzhi.ru/lp/postupi / Магистратура -Ирина"]
+
+
+def test_growth_pattern():
+    assert all(bm.GROWTH_NAME_RE.search(n) for n in GROWTH)
+    assert not any(bm.GROWTH_NAME_RE.search(n) for n in NOT_GROWTH)
+
+
+@pytest.mark.parametrize("name", GROWTH)
+@pytest.mark.parametrize("set_", [{"weekly_budget": 15000}, {"target_cpa": 1300},
+                                  {"weekly_budget": 26000, "target_cpa": 1300}])
+def test_growth_campaign_cut_protected(monkeypatch, name, set_):
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy(), "name": name}})
+    res = bm.apply(_ctx(), [_finding(set_=set_)])
+    assert (res[1].ok, res[1].error) == (False, "protected") and fake.updates == []
+
+
+@pytest.mark.parametrize("name", GROWTH)
+def test_growth_campaign_raise_passes(monkeypatch, name):
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy(), "name": name}})
+    assert bm.apply(_ctx(), [_finding()])[1].ok
+
+
+@pytest.mark.parametrize("name", NOT_GROWTH)
+def test_other_campaign_cut_passes(monkeypatch, name):
+    FakeDirect(monkeypatch, {101: {"strategy": _strategy(), "name": name}})
+    res = bm.apply(_ctx(), [_finding(set_={"weekly_budget": 15000, "target_cpa": 1300})])
+    assert res[1].ok, res[1].error
+
+
+def test_growth_rollback_not_blocked(monkeypatch):
+    # откат снимает нашу же запись: подъём на кампании «на рост» откатывается и вниз
+    fake = FakeDirect(monkeypatch, {101: {"strategy": _strategy(26000, 1800), "name": GROWTH[0]}})
+    f = _finding(status="rollback_requested",
+                 response={"before": {"weekly_budget": 20000, "target_cpa": 1500},
+                           "after": {"weekly_budget": 26000, "target_cpa": 1800}})
+    assert bm.rollback(_ctx(), [f])[1].ok and len(fake.updates) == 1

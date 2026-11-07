@@ -56,6 +56,10 @@ STUB_MARK = "CampaignStub"
 # Кампании не в зоне модуля — тот же текст, что EXCLUDED_NAME_SQL в Panda
 # (lib/budget/facts.sql.ts): rsv — чужие РК в своих кабинетах, Конкурент и Наш бренд — брендовые.
 EXCLUDED_NAME_RE = re.compile("rsv|Конкурент|Наш бренд", re.IGNORECASE)
+# Кампании «на рост» (Дубай, посадочные ПроВуза): только подъём, срез лимита или цены цели —
+# protected. Тот же текст, что у константы кампаний на рост в Panda (lib/budget): там такие
+# кампании не предлагаются к срезу, здесь — вторая линия на случай расхождения.
+GROWTH_NAME_RE = re.compile("Дубае?|Dubai|provuz / [^/]* LP /", re.IGNORECASE)
 RUB = "RUB"
 
 # Коды ошибок, по которым Panda пишет свою строку статуса (текст — на её стороне).
@@ -244,39 +248,47 @@ def _read(acc, cid: int) -> Optional[_State]:
     return _State(item)
 
 
-def _fit_exploration(strategy: dict, channel: str, limit_rub: float) -> dict:
-    """Бюджет обучения больше нового лимита — сбросить его на автоматический (EXPLORATION_SHARE).
-    Меняется только ExplorationBudget носителя лимита; остальной блок — как прочитан."""
+def _fit_exploration(strategy: dict, channel: str, limit_rub: float,
+                     restore: Optional[dict]) -> Optional[dict]:
+    """Бюджет обучения носителя лимита под новый лимит; меняется только ExplorationBudget,
+    остальной блок — как прочитан. restore (откат) — вернуть блок, снятый применением, как
+    был. Иначе: ручной бюджет больше нового лимита — сброс на автоматический
+    (EXPLORATION_SHARE). Возвращает снятый ручной блок — его кладут в before для отката."""
     for holder in (strategy.get(channel) or {}).values():
         if not isinstance(holder, dict) or "WeeklySpendLimit" not in holder:
             continue
+        if restore is not None:
+            holder["ExplorationBudget"] = copy.deepcopy(restore)
+            return None
         eb = holder.get("ExplorationBudget")
         current = _micros_rub(eb.get("MinimumExplorationBudget")) if isinstance(eb, dict) else None
         if current is not None and current > limit_rub:
             holder["ExplorationBudget"] = {
                 "MinimumExplorationBudget": int(round(limit_rub * EXPLORATION_SHARE)) * MICROS,
                 "IsMinimumExplorationBudgetCustom": "NO"}
-        break
-    return strategy
+            return copy.deepcopy(eb)
+        return None
+    return None
 
 
-def _with(state: _State, to: dict) -> Optional[dict]:
-    """Блок BiddingStrategy с новыми значениями; None — у рычага нет носителя, который
-    читает снимок."""
-    out = state.strategy
+def _with(state: _State, to: dict,
+          restore: Optional[dict] = None) -> Tuple[Optional[dict], Optional[dict]]:
+    """(блок BiddingStrategy с новыми значениями, снятый ручной бюджет обучения); блок None —
+    у рычага нет носителя, который читает снимок."""
+    out, replaced = state.strategy, None
     if "weekly_budget" in to:
         if state.limit_channel is None:
-            return None
-        out = _fit_exploration(strategy_with_limit(out, state.limit_channel,
-                                                   int(round(to["weekly_budget"] * MICROS))),
-                               state.limit_channel, to["weekly_budget"])
+            return None, None
+        out = strategy_with_limit(out, state.limit_channel,
+                                  int(round(to["weekly_budget"] * MICROS)))
+        replaced = _fit_exploration(out, state.limit_channel, to["weekly_budget"], restore)
     if "target_cpa" in to:
         if state.cpa_holder is None:
-            return None
+            return None, None
         channel, sub, field = state.cpa_holder
         out = copy.deepcopy(out)
         out[channel][sub][field] = int(round(to["target_cpa"] * MICROS))
-    return out
+    return out, replaced
 
 
 def _write(acc, cid: int, strategy: dict) -> list:
@@ -310,24 +322,31 @@ def _reached(values: dict, expect: dict, to: dict) -> bool:
             and all(_same(values[k], v) for k, v in expect.items() if k not in to))
 
 
-def _set(acc, cid: int, expect: dict, to: dict, guard: bool, done: list) -> ApplyResult:
+def _set(acc, cid: int, expect: dict, to: dict, guard: bool, done: list,
+         restore: Optional[dict] = None) -> ApplyResult:
     """Общий шаг применения и отката: проверить expect, записать to, прочитать обратно.
     guard — сторож имён; у отката его нет: откат снимает нашу же запись. done — сюда строка
-    снимка дня по прочитанному из Директа, когда в нём стоит to."""
+    снимка дня по прочитанному из Директа, когда в нём стоит to. restore — ручной бюджет
+    обучения, который откат возвращает вместе с лимитом."""
     state = _read(acc, cid)
     if state is None:
         return ApplyResult(False, {}, UNSUPPORTED)
     if guard and EXCLUDED_NAME_RE.search(state.name):
         return ApplyResult(False, {"name": state.name}, PROTECTED)
+    if guard and GROWTH_NAME_RE.search(state.name) and any(
+            expect.get(k) is not None and v < expect[k] for k, v in to.items()):
+        return ApplyResult(False, {"name": state.name, "growth": True}, PROTECTED)
     before = dict(state.values)
     if not all(_same(state.values[k], v) for k, v in expect.items()):
         if _reached(state.values, expect, to):
             _done(done, state)
             return ApplyResult(True, {"before": dict(expect), "after": before, "recovered": True})
         return ApplyResult(False, {"actual": before}, CHANGED)
-    strategy = _with(state, to)
+    strategy, replaced = _with(state, to, restore)
     if strategy is None:
         return ApplyResult(False, {"actual": before}, UNSUPPORTED)
+    if replaced is not None:
+        before["exploration_budget"] = replaced
     # Таймаут мог прийти после того, как Директ запись принял: чтение идёт при любом исходе,
     # а before лежит в ответе при любом исходе — по нему откатывают и восстанавливают.
     werr, warnings = None, []
@@ -430,9 +449,11 @@ def _rollback_one(acc, f, cid, _expect, to, done) -> ApplyResult:
     if not isinstance(before, dict) or not isinstance(after, dict):
         return ApplyResult(False, {}, "нет снимка до применения — откатывать нечем")
     back = {k: before.get(k) for k in to}
+    eb = before.get("exploration_budget") if "weekly_budget" in to else None
     if not all(_rub_value(v) for v in back.values()):
         return ApplyResult(False, {}, UNSUPPORTED)
-    return _set(acc, cid, {k: after.get(k) for k in to}, back, False, done)
+    return _set(acc, cid, {k: after.get(k) for k in to}, back, False, done,
+                eb if isinstance(eb, dict) else None)
 
 
 def rollback(ctx: Context, items: List[StoredFinding]) -> Dict[int, ApplyResult]:
