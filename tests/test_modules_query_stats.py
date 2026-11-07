@@ -106,7 +106,7 @@ def test_prepare_loads_with_strategy_goals_and_prunes(monkeypatch):
     assert (start, end) == (date(2026, 8, 10), YDAY)
     assert rows == [("2026-11-07", 1, "лайм", 20, 2, 50.0, 1.0)]
     assert out["logins"]["lime1"]["rows"] == 1
-    assert store.pruned == date(2026, 5, 12)
+    assert store.pruned == date(2026, 8, 10)
 
 
 def test_prepare_lead_goals_win_over_strategy(monkeypatch):
