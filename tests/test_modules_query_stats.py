@@ -150,3 +150,28 @@ def test_prepare_skips_login_without_search_campaigns(monkeypatch):
     store = Store()
     out = qs.prepare(_ctx([acc]), store)
     assert out["logins"] == {} and store.saved == {}
+
+
+def test_batches_keep_every_campaign_goal_within_report_cap():
+    # 12 кампаний с разными целями: по возрастанию id в один отчёт влезли бы 10
+    camps = [_camp(i, goal=1000 + i) for i in range(1, 13)] + [_camp(99, goal=None)]
+    plan = qs.batches(camps, [])
+    assert len(plan) == 2
+    for ids, goals, by_cid in plan:
+        assert len(goals) <= 10
+        for cid in by_cid:
+            assert set(by_cid[cid]) <= set(goals)
+    every = [cid for ids, _g, _b in plan for cid in ids]
+    assert sorted(every, key=int) == [str(i) for i in range(1, 13)] + ["99"]
+    # без целей — едет в первом отчёте, конверсии «не знаем»
+    assert "99" in plan[0][0] and "99" not in plan[0][2]
+
+
+def test_batches_frequent_goal_set_first():
+    camps = [_camp(1, goal=5)] + [_camp(i, goal=7) for i in range(2, 5)]
+    assert qs.batches(camps, [])[0][1] == [5, 7]
+
+
+def test_batches_lead_goals_one_report():
+    plan = qs.batches([_camp(1), _camp(2, goal=None)], [222])
+    assert plan == [(["1", "2"], [222], {"1": [222], "2": [222]})]

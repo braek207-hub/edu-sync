@@ -21,6 +21,7 @@ from sync.modules import direct_api, leads
 from sync.modules import queries as Q
 from sync.modules.accounts import DirectAccount
 from sync.modules.types import Context
+from sync.placements.direct import MAX_REPORT_GOALS
 
 FIRST_DAYS = 90
 RELOAD_DAYS = 10
@@ -93,14 +94,43 @@ def rows(raw: List[Dict[str, str]], goals_by_cid: Dict[str, List[int]]) -> List[
     return [(d, c, q, s[0], s[1], round(s[2], 2), s[3]) for (d, c, q), s in agg.items()]
 
 
-def _goals(campaigns: List[dict], lead: List[int]) -> Tuple[Dict[str, List[int]], List[int]]:
-    """(цели по кампании, цели отчёта). Не вошедшим в потолок отчёта целей — пусто."""
-    by_cid = {str(c["Id"]): (list(lead) or Q.strategy_goals(c)) for c in campaigns}
-    by_cid = {cid: gs for cid, gs in by_cid.items() if gs}
-    chosen, dropped = Q._report_goals(by_cid, lead)
-    for cid in dropped:
-        del by_cid[cid]
-    return by_cid, chosen
+def batches(campaigns: List[dict], lead: List[int]
+            ) -> List[Tuple[List[str], List[int], Dict[str, List[int]]]]:
+    """Отчёты кабинета: (кампании, цели отчёта, цели по кампании).
+
+    В отчёт входит не больше MAX_REPORT_GOALS целей, а у кабинета на сотни кампаний целей
+    стратегий больше (LIME 07.11: 875 кампаний, первые 10 id по возрастанию отрезали цель
+    покупки у 675 из них). Поэтому кампании раскладываются по отчётам: наборы целей от самых
+    частых к редким, каждый — в первый отчёт, куда помещается. Цели-лиды — одни на все
+    кампании, отчёт один. Кампания без целей или с набором больше потолка едет в первом
+    отчёте без целей: её конверсии None."""
+    cids = [str(c["Id"]) for c in campaigns]
+    if lead:
+        return [(cids, list(lead), {cid: list(lead) for cid in cids})]
+    sets: Dict[Tuple[int, ...], List[str]] = {}
+    blind: List[str] = []
+    for c in campaigns:
+        goals = tuple(Q.strategy_goals(c))
+        if goals and len(goals) <= MAX_REPORT_GOALS:
+            sets.setdefault(goals, []).append(str(c["Id"]))
+        else:
+            blind.append(str(c["Id"]))
+    out: List[Tuple[List[str], set, Dict[str, List[int]]]] = []
+    for goals, ids in sorted(sets.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        for b in out:
+            if len(b[1] | set(goals)) <= MAX_REPORT_GOALS:
+                break
+        else:
+            b = ([], set(), {})
+            out.append(b)
+        b[0].extend(ids)
+        b[1].update(goals)
+        b[2].update({cid: list(goals) for cid in ids})
+    if blind:
+        if not out:
+            out.append(([], set(), {}))
+        out[0][0].extend(blind)
+    return [(ids, sorted(goals), by_cid) for ids, goals, by_cid in out]
 
 
 def load_login(acc: DirectAccount, store, slug: str, lead: List[int], yesterday: date
@@ -110,13 +140,16 @@ def load_login(acc: DirectAccount, store, slug: str, lead: List[int], yesterday:
     if not camps:
         return None
     start, end = span(store.query_stats_last_day(slug, acc.login), yesterday)
-    by_cid, goals = _goals(camps, lead)
-    raw = _report(acc, start, end, goals, [str(c["Id"]) for c in camps])
-    if goals and raw and not any(Q._GOAL_COLUMN.match(k) for k in raw[0]):
-        by_cid = {}
-    got = rows(raw, by_cid)
+    got: List[Row] = []
+    plan = batches(camps, lead)
+    for ids, goals, by_cid in plan:
+        raw = _report(acc, start, end, goals, ids)
+        if goals and raw and not any(Q._GOAL_COLUMN.match(k) for k in raw[0]):
+            by_cid = {}
+        got += rows(raw, by_cid)
     store.replace_query_stats(slug, acc.login, start, end, got)
-    return {"from": start.isoformat(), "to": end.isoformat(), "rows": len(got)}
+    return {"from": start.isoformat(), "to": end.isoformat(), "rows": len(got),
+            "reports": len(plan)}
 
 
 def prepare(ctx: Context, store) -> dict:
