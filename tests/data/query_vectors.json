@@ -1,0 +1,110 @@
+{
+  "_": "Общие тест-векторы классификации запросов: TS (lib/queries) и робот edu-sync (sync/modules/query_class.py, копия tests/data/query_vectors.json). Меняется — в обоих репо.",
+  "dict": {
+    "brand": ["lime", "лайм", "лаим", "laim", "дшьу"],
+    "comp": ["zara", "зара", "love republic", "lamoda", "ozon"],
+    "trash": ["вакансии", "работа в", "бесплатно", "б/у", "своими руками"],
+    "never": ["официальный сайт"],
+    "notBrand": ["лайма"]
+  },
+  "thresholds": { "noConvCost": 500, "maxCpa": 4000 },
+  "classify": [
+    ["lime платье", "brand", "lime"],
+    ["LIME Платье", "brand", "lime"],
+    ["limestore", "brand", "lime"],
+    ["лайм магазин одежды", "brand", "лайм"],
+    ["лайма витамин", "nonbrand", null],
+    ["дшьу", "brand", "дшьу"],
+    ["ламй одежда", "near", "ламй"],
+    ["love story платье", "nonbrand", null],
+    ["laime", "brand", "laim"],
+    ["lmie куртка", "near", "lmie"],
+    ["l me одежда", "near", "lme"],
+    ["зара платье", "comp", "зара"],
+    ["love republic юбка", "comp", "love republic"],
+    ["republic love", "nonbrand", null],
+    ["вакансии продавец", "trash", "вакансии"],
+    ["бесплатное платье", "trash", "бесплатно"],
+    ["работа в магазине", "trash", "работа в"],
+    ["работа водителем", "nonbrand", null],
+    ["платье б/у", "trash", "б/у"],
+    ["89161234567", "trash", "89161234567"],
+    ["8 916 123 45 67", "trash", "8 916 123 45 67"],
+    ["платье 2024", "nonbrand", null],
+    ["платье женское вечернее", "nonbrand", null],
+    ["бесплатно lime", "trash", "бесплатно"],
+    ["Ёлка", "nonbrand", null]
+  ],
+  "judge": [
+    {
+      "row": { "query": "lime платье", "cost": 100, "clicks": 2, "conversions": 0 },
+      "clean": ["brand", "comp", "trash", "rules"],
+      "expect": ["brand", "lime"]
+    },
+    {
+      "row": { "query": "lime платье", "cost": 100, "clicks": 2, "conversions": 0 },
+      "clean": ["nonbrand", "comp", "trash"],
+      "expect": [null, null]
+    },
+    {
+      "row": { "query": "платье женское вечернее длинное красное в пол с разрезом", "cost": 10, "clicks": 1, "conversions": 0 },
+      "clean": ["nonbrand"],
+      "expect": ["nonbrand", "платье женское вечернее длинное красное в пол"]
+    },
+    {
+      "row": { "query": "платье вечернее", "cost": 600, "clicks": 9, "conversions": 0 },
+      "clean": ["brand", "rules"],
+      "expect": ["rules", "платье вечернее"]
+    },
+    {
+      "row": { "query": "платье вечернее", "cost": 400, "clicks": 9, "conversions": 0 },
+      "clean": ["brand", "rules"],
+      "expect": [null, null]
+    },
+    {
+      "row": { "query": "платье вечернее", "cost": 9000, "clicks": 90, "conversions": 2 },
+      "clean": ["rules"],
+      "expect": ["rules", "платье вечернее"]
+    },
+    {
+      "row": { "query": "платье вечернее", "cost": 7000, "clicks": 90, "conversions": 2 },
+      "clean": ["rules"],
+      "expect": [null, null]
+    },
+    {
+      "row": { "query": "платье вечернее", "cost": 9000, "clicks": 90, "conversions": null },
+      "clean": ["rules"],
+      "expect": [null, null]
+    },
+    {
+      "row": { "query": "ламй одежда", "cost": 900, "clicks": 9, "conversions": 0 },
+      "clean": ["brand", "nonbrand", "comp", "trash", "rules"],
+      "expect": [null, null]
+    },
+    {
+      "row": { "query": "lime официальный сайт", "cost": 100, "clicks": 9, "conversions": 0 },
+      "clean": ["brand"],
+      "expect": [null, null]
+    },
+    {
+      "row": { "query": "зара платье", "cost": 100, "clicks": 9, "conversions": 0 },
+      "clean": ["comp"],
+      "expect": ["comp", "зара"]
+    }
+  ],
+  "sets": {
+    "sets": [
+      { "id": "a", "name": "Брендовые", "on": true, "clean": ["nonbrand"], "include": "бренд", "exclude": "без бренда", "campaigns": [] },
+      { "id": "b", "name": "Небрендовые", "on": true, "clean": ["brand"], "include": "без бренда", "exclude": "", "campaigns": [7] }
+    ],
+    "manual": { "5": "none", "6": "b" },
+    "cases": [
+      [{ "id": 1, "name": "Поиск. Бренд. Москва" }, "a", "name"],
+      [{ "id": 2, "name": "Поиск. Фид. Без бренда. Тест." }, "b", "name"],
+      [{ "id": 3, "name": "РСЯ. Ретаргет" }, null, "none"],
+      [{ "id": 5, "name": "Поиск. Бренд" }, null, "manual-none"],
+      [{ "id": 6, "name": "Поиск. Бренд" }, "b", "manual"],
+      [{ "id": 7, "name": "Поиск. Бренд" }, "b", "added"]
+    ]
+  }
+}
