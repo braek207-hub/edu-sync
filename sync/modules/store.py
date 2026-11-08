@@ -9,6 +9,7 @@ project_sources —
 20261017153700_project_onboarding_core.sql); здесь таблицы не создаются.
 """
 
+import hashlib
 import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -544,17 +545,22 @@ def replace_query_stats(slug: str, login: str, start, end, rows) -> None:
     """Дни start..end кабинета заменяются целиком, одной транзакцией: страница не увидит
     день посреди перезаливки. rows — (день, кампания, запрос, показы, клики, расход,
     конверсии или None). Тексты — в словарь проекта; id перечитываются SELECT-ом:
-    ON CONFLICT DO NOTHING RETURNING не отдаёт id уже существующих."""
+    ON CONFLICT DO NOTHING RETURNING не отдаёт id уже существующих.
+    Уникальность текста держит индекс по (slug, md5(query)): индекс по самому тексту весил
+    больше самих текстов. Поиск id — по md5 (идёт по индексу) и по тексту (точность);
+    текст, чей md5 совпал с чужим, не записывается, и его строки пропускаются."""
     texts = sorted({r[2] for r in rows})
     with db.get_connection() as conn, conn.cursor() as cur:
         ids = {}
         if texts:
             psycopg2.extras.execute_values(
                 cur, "INSERT INTO module_query_texts (dashboard_slug, query) VALUES %s "
-                     "ON CONFLICT (dashboard_slug, query) DO NOTHING",
+                     "ON CONFLICT DO NOTHING",
                 [(slug, q) for q in texts], page_size=1000)
-            cur.execute("SELECT query, id FROM module_query_texts "
-                        "WHERE dashboard_slug = %s AND query = ANY(%s)", (slug, texts))
+            cur.execute("SELECT query, id FROM module_query_texts WHERE dashboard_slug = %s "
+                        "AND md5(query) = ANY(%s) AND query = ANY(%s)",
+                        (slug, [hashlib.md5(q.encode("utf-8")).hexdigest() for q in texts],
+                         texts))
             ids = dict(cur.fetchall())
         cur.execute("DELETE FROM module_query_stats WHERE dashboard_slug = %s AND login = %s "
                     "AND day BETWEEN %s AND %s", (slug, login, start, end))
@@ -566,7 +572,8 @@ def replace_query_stats(slug: str, login: str, start, end, rows) -> None:
                      "login = EXCLUDED.login, impressions = EXCLUDED.impressions, "
                      "clicks = EXCLUDED.clicks, cost = EXCLUDED.cost, "
                      "conversions = EXCLUDED.conversions",
-                [(slug, r[0], r[1], ids[r[2]], login, r[3], r[4], r[5], r[6]) for r in rows],
+                [(slug, r[0], r[1], ids[r[2]], login, r[3], r[4], r[5], r[6])
+                 for r in rows if r[2] in ids],
                 page_size=1000)
 
 
