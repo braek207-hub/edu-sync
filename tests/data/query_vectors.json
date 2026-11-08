@@ -47,7 +47,12 @@
       "expect": [null, null]
     },
     {
-      "row": { "query": "платье женское вечернее длинное красное в пол с разрезом", "cost": 10, "clicks": 1, "conversions": 0 },
+      "row": {
+        "query": "платье женское вечернее длинное красное в пол с разрезом",
+        "cost": 10,
+        "clicks": 1,
+        "conversions": 0
+      },
       "clean": ["nonbrand"],
       "expect": ["nonbrand", "платье женское вечернее длинное красное в пол"]
     },
@@ -92,10 +97,38 @@
       "expect": ["comp", "зара"]
     }
   ],
+  "judgeNoMaxCpa": [
+    {
+      "row": { "query": "платье вечернее", "cost": 9000, "clicks": 90, "conversions": 2 },
+      "clean": ["rules"],
+      "expect": [null, null]
+    },
+    {
+      "row": { "query": "платье вечернее", "cost": 600, "clicks": 9, "conversions": 0 },
+      "clean": ["rules"],
+      "expect": ["rules", "платье вечернее"]
+    }
+  ],
   "sets": {
     "sets": [
-      { "id": "a", "name": "Брендовые", "on": true, "clean": ["nonbrand"], "include": "бренд", "exclude": "без бренда", "campaigns": [] },
-      { "id": "b", "name": "Небрендовые", "on": true, "clean": ["brand"], "include": "без бренда", "exclude": "", "campaigns": [7] }
+      {
+        "id": "a",
+        "name": "Брендовые",
+        "on": true,
+        "clean": ["nonbrand"],
+        "include": "бренд",
+        "exclude": "без бренда",
+        "campaigns": []
+      },
+      {
+        "id": "b",
+        "name": "Небрендовые",
+        "on": true,
+        "clean": ["brand"],
+        "include": "без бренда",
+        "exclude": "",
+        "campaigns": [7]
+      }
     ],
     "manual": { "5": "none", "6": "b" },
     "cases": [

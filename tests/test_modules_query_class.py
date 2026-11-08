@@ -23,6 +23,13 @@ def test_judge(case):
     assert [clean, minus] == case["expect"]
 
 
+@pytest.mark.parametrize("case", V["judgeNoMaxCpa"], ids=lambda c: str(c["row"]["cost"]))
+def test_judge_without_max_cpa(case):
+    s = {"id": "s", "on": True, "clean": case["clean"], "campaigns": []}
+    th = dict(V["thresholds"], maxCpa=None)
+    assert list(qc.judge(case["row"], s, V["dict"], th)[2:]) == case["expect"]
+
+
 @pytest.mark.parametrize("camp,set_id,kind", V["sets"]["cases"])
 def test_set_for(camp, set_id, kind):
     s, why = qc.set_for(camp, V["sets"]["sets"], V["sets"]["manual"])

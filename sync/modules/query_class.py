@@ -153,7 +153,9 @@ def judge(row: dict, s: Optional[dict], d: Dict[str, List[str]], th: Dict[str, f
         return cls, hit, "nonbrand", query_phrase(row["query"])
     conv = row.get("conversions")
     if "rules" in clean and conv is not None:
-        bad = row["cost"] >= th["noConvCost"] if conv == 0 else row["cost"] / conv > th["maxCpa"]
+        cpa = th.get("maxCpa")  # None — порог цены конверсии выключен
+        bad = (row["cost"] >= th["noConvCost"] if conv == 0
+               else cpa is not None and row["cost"] / conv > cpa)
         if bad:
             return cls, hit, "rules", query_phrase(row["query"])
     return none
