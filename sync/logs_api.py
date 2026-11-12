@@ -17,6 +17,11 @@ BASE = "https://api-metrika.yandex.net/management/v1/counter/{c}/logrequest"
 CREATE = "https://api-metrika.yandex.net/management/v1/counter/{c}/logrequests"
 
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+# 400 «Query is too complicated» зависит от нагрузки Яндекса, а не от запроса: тот же день через
+# минуту отдаётся (так же ловят Stat API — sync/bjorn/common.py, sync/lime_ru_metrika_api.py).
+# Признак — только текст: error_type общий query_error, язык зависит от lang.
+_TOO_COMPLEX_MARKERS = ("слишком сложный", "too complicated")
+_TOO_COMPLEX_SLEEP = 60
 _TERMINAL_STATUSES = {"processed", "processing_failed", "awaiting_retry", "cleaned_by_user"}
 
 
@@ -33,6 +38,10 @@ def _retry_request(method: str, url: str, token: str, *, params: Dict = None, ti
         if resp.status_code in _TRANSIENT_STATUSES and attempt < 5:
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
+            continue
+        if (resp.status_code == 400 and attempt < 5
+                and any(m in resp.text.lower() for m in _TOO_COMPLEX_MARKERS)):
+            time.sleep(_TOO_COMPLEX_SLEEP)
             continue
         raise RuntimeError(f"Logs API {method} {url} -> {resp.status_code}: {resp.text[:400]}")
     raise RuntimeError(f"Logs API {method} {url}: max retries")
