@@ -126,6 +126,10 @@ def parse_money(value: Any) -> float:
 
 
 def parse_optional_float(value: Any) -> float | None:
+    # Число — сразу: clean_text(0) даёт "" (str(0 or "")), и отказы 0% из JSON Метрики
+    # до 13.11.2026 ложились в staging как NULL — 1,6 тыс. строк за месяц.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
     text = clean_text(value).replace(" ", "").replace(",", ".")
     if not text or text in {"--", "null", "None"}:
         return None

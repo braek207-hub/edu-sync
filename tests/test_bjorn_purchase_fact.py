@@ -101,3 +101,24 @@ def test_build_fact_refuses_window_without_staging():
     rows = [{"date": "2026-05-21"}, {"date": "2026-05-23"}]
     assert missing_staging_days(rows, "2026-05-20", "2026-05-23") == ["2026-05-20", "2026-05-22"]
     assert missing_staging_days(rows + [{"date": "2026-05-22"}], "2026-05-21", "2026-05-23") == []
+
+
+def test_zero_bounce_is_a_value_not_missing():
+    from sync.bjorn.common import parse_optional_float
+
+    assert parse_optional_float(0) == 0.0
+    assert parse_optional_float(0.0) == 0.0
+    assert parse_optional_float(None) is None
+
+
+def test_merged_rows_weight_rates_only_by_visits_that_have_them():
+    # Две строки staging в один ключ витрины. Ставка без значения не тянет среднюю к нулю
+    # и не размножается на чужие визиты — порядок строк на результат не влияет.
+    a = {**stg("Яндекс.Директ", "999999999", 0, visits=10), "bounce_rate": 40.0, "page_depth": 2.0}
+    b = {**stg("Яндекс.Директ", "999999999", 0, visits=30), "bounce_rate": 20.0, "page_depth": None}
+    c = {**stg("Яндекс.Директ", "999999999", 0, visits=5)}
+    for order in ([a, b, c], [c, b, a]):
+        [row] = build_fact_rows(order, [])
+        assert row["visits"] == 45
+        assert row["bounce_rate"] == 25.0
+        assert row["page_depth"] == 2.0

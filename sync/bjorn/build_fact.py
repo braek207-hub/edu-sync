@@ -94,6 +94,10 @@ def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[s
     fact_rows: list[dict[str, Any]] = []
     # Track (date, attribution, source, source_detail, campaign_id) → index for geo-variant merge
     fact_index: dict[tuple[str, str, str, str, str], int] = {}
+    # Веса отказов/глубины по индексу строки: [Σ rate·visits, Σ visits с rate, то же для глубины].
+    # Средняя — только по визитам, где Метрика дала значение: до 13.11.2026 слияние
+    # домножало известную ставку на все визиты строки, и сверка verify_fact падала.
+    rate_acc: list[list[float]] = []
 
     for row in metrica_rows:
         row_date = str(row["date"])
@@ -125,30 +129,14 @@ def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[s
             source, campaign_id, str(row.get("campaign_name") or ""), direct_row
         )
 
+        visits = parse_int(row.get("visits"))
         br_m = parse_optional_float(row.get("bounce_rate"))
         pd_m = parse_optional_float(row.get("page_depth"))
 
         fact_key = (row_date, attribution, source, source_detail, campaign_id)
-        if fact_key in fact_index:
-            # Merge geo-variant into existing row (sum additive metrics)
-            ex = fact_rows[fact_index[fact_key]]
-            ex["visits"]         += parse_int(row.get("visits"))
-            ex["add_to_cart"]    += parse_int(row.get("add_to_cart"))
-            ex["begin_checkout"] += parse_int(row.get("begin_checkout"))
-            ex["purchases"]      += parse_int(row.get("purchases"))
-            ex["revenue"]        = round(ex["revenue"] + money(row.get("revenue")), 2)
-            # Weighted bounce_rate / page_depth
-            v_new = parse_int(row.get("visits"))
-            if v_new > 0 and br_m is not None:
-                v_ex = ex["visits"] - v_new
-                br_ex = ex.get("bounce_rate") or 0.0
-                ex["bounce_rate"] = (br_ex * v_ex + br_m * v_new) / ex["visits"] if ex["visits"] else None
-            if v_new > 0 and pd_m is not None:
-                v_ex = ex["visits"] - v_new
-                pd_ex = ex.get("page_depth") or 0.0
-                ex["page_depth"] = (pd_ex * v_ex + pd_m * v_new) / ex["visits"] if ex["visits"] else None
-        else:
+        if fact_key not in fact_index:
             fact_index[fact_key] = len(fact_rows)
+            rate_acc.append([0.0, 0, 0.0, 0])
             fact_rows.append(
                 {
                     "date": row_date,
@@ -158,7 +146,7 @@ def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[s
                     "campaign_id": campaign_id,
                     "campaign_name": campaign_name,
                     "source_type": source_type,
-                    "visits": parse_int(row.get("visits")),
+                    "visits": visits,
                     "add_to_cart": parse_int(row.get("add_to_cart")),
                     "begin_checkout": parse_int(row.get("begin_checkout")),
                     "purchases": parse_int(row.get("purchases")),
@@ -166,10 +154,30 @@ def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[s
                     "impressions": parse_int(cost_row.get("impressions")) if cost_row else 0,
                     "clicks": parse_int(cost_row.get("clicks")) if cost_row else 0,
                     "cost_vat": money(cost_row.get("cost_vat")) if cost_row else 0.0,
-                    "bounce_rate": br_m,
-                    "page_depth": pd_m,
+                    "bounce_rate": None,
+                    "page_depth": None,
                 }
             )
+        else:
+            # Merge geo-variant into existing row (sum additive metrics)
+            ex = fact_rows[fact_index[fact_key]]
+            ex["visits"]         += visits
+            ex["add_to_cart"]    += parse_int(row.get("add_to_cart"))
+            ex["begin_checkout"] += parse_int(row.get("begin_checkout"))
+            ex["purchases"]      += parse_int(row.get("purchases"))
+            ex["revenue"]        = round(ex["revenue"] + money(row.get("revenue")), 2)
+
+        acc = rate_acc[fact_index[fact_key]]
+        if visits > 0 and br_m is not None:
+            acc[0] += br_m * visits
+            acc[1] += visits
+        if visits > 0 and pd_m is not None:
+            acc[2] += pd_m * visits
+            acc[3] += visits
+
+    for fact_row, (bw, bv, dw, dv) in zip(fact_rows, rate_acc):
+        fact_row["bounce_rate"] = round(bw / bv, 2) if bv else None
+        fact_row["page_depth"] = round(dw / dv, 4) if dv else None
 
     # Direct-only rows (no Metrica match) — added once under "automatic" attribution
     for key, direct_row in sorted(direct_by_key.items()):
