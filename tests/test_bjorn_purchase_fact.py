@@ -122,3 +122,19 @@ def test_merged_rows_weight_rates_only_by_visits_that_have_them():
         assert row["visits"] == 45
         assert row["bounce_rate"] == 25.0
         assert row["page_depth"] == 2.0
+
+
+def test_marketplace_campaign_gets_own_source_in_fact_and_purchases():
+    direct = [{**DIRECT[0], "campaign_id": "715860664", "campaign_name": "РСЯ. Lamoda. Товарная. СПБ + МСК"}]
+    rows = build_fact_rows([stg("Яндекс.Директ", "715860664", 1)], direct)
+    assert [(r["source"], r["campaign_id"], r["cost_vat"]) for r in rows] == [
+        ("Продвижение маркетплейсов", "715860664", 500.0)
+    ]
+    # Кампания без визитов на сайте (трафик уходит на Lamoda) — строка только с расходом.
+    [only_cost] = build_fact_rows([], direct)
+    assert only_cost["source"] == "Продвижение маркетплейсов"
+    [p] = build_purchase_fact_rows([purchase("A1", "715860664")], direct)
+    assert p["source"] == "Продвижение маркетплейсов"
+    # Органика с тем же словом в названии не трогается — только рекламный источник.
+    assert build_fact_rows([{**stg("Яндекс.Директ", "", 0), "source": "Переходы по ссылкам на сайтах",
+                             "campaign_name": "lamoda.ru"}], [])[0]["source"] == "Переходы по ссылкам на сайтах"

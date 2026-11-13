@@ -25,6 +25,10 @@ DATE_FMT = "%Y-%m-%d"
 NOT_SET_CAMPAIGN_ID = "not_set"
 NOT_SET_CAMPAIGN_NAME = "Не определено"
 AD_SOURCE_NAME = "Переходы по рекламе"
+# Реклама карточек на маркетплейсах ведёт трафик не на сайт — свой источник, а не «Переходы
+# по рекламе» (Павел 13.11.2026). Кампанию узнаём по названию в кабинете.
+MARKETPLACE_SOURCE_NAME = "Продвижение маркетплейсов"
+_MARKETPLACE_CAMPAIGN_RE = re.compile(r"lamoda|ламода|marketplace|маркетплейс", re.IGNORECASE)
 
 
 def env_required(name: str) -> str:
@@ -350,6 +354,14 @@ def derive_source_detail(source_engine_raw: str, utm_source_raw: str, source: st
 def is_paid_source(source: str) -> bool:
     s = clean_text(source).lower()
     return "реклам" in s or "direct" in s or s in {"paid", "ad", "ads", "cpc"} or "cpc" in s
+
+
+def fact_source(source: str, campaign_name: str) -> str:
+    """Источник строки витрины и поштучной покупки: рекламная кампания маркетплейса уходит
+    из рекламного источника Метрики в свой."""
+    if is_paid_source(source) and _MARKETPLACE_CAMPAIGN_RE.search(campaign_name or ""):
+        return MARKETPLACE_SOURCE_NAME
+    return source
 
 
 def normalize_campaign_id(value: Any) -> str:

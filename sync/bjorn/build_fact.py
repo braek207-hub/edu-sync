@@ -11,6 +11,7 @@ from .common import (
     campaign_name_or_default,
     clean_text,
     fact_campaign_id,
+    fact_source,
     infer_source_type,
     is_paid_source,
     money,
@@ -128,6 +129,7 @@ def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[s
         campaign_id, campaign_name, source_type = resolve_fact_campaign(
             source, campaign_id, str(row.get("campaign_name") or ""), direct_row
         )
+        source = fact_source(source, campaign_name)
 
         visits = parse_int(row.get("visits"))
         br_m = parse_optional_float(row.get("bounce_rate"))
@@ -189,7 +191,7 @@ def build_fact_rows(metrica_rows: list[dict[str, Any]], direct_rows: list[dict[s
             {
                 "date": str(direct_row["date"]),
                 "attribution": "automatic",
-                "source": AD_SOURCE_NAME,
+                "source": fact_source(AD_SOURCE_NAME, campaign_name),
                 "source_detail": "Яндекс.Директ",
                 "campaign_id": str(direct_row["campaign_id"]),
                 "campaign_name": campaign_name,
