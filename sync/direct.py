@@ -39,7 +39,19 @@ EDU_CONVERSION_GOALS: Dict[str, List[str]] = {
     "vuz": ["360811375"],
     "vse": ["330070378"],
     "provuz": ["330389387"],
+    # ОШ Синергия: цель стратегий кабинета — CRM-статус (sync/modules/accounts.py).
+    "synergy_school": ["317516886"],
 }
+
+# Кабинеты вне агентства EDU: свой токен, и весь кабинет — один проект (имена кампаний
+# «ОШ Синергия РСЯ - …» проекта не называют). ОШ Синергия ведётся через approve.agency;
+# Павел 16.11.2026: отдельный проект внутри EDU, история с 28.10. Не в DIRECT_CLIENTS_JSON:
+# его читают автопилот, алерты и настройки кампаний под DIRECT_TOKEN, а этому кабинету
+# тот токен не подходит.
+OWN_TOKEN_CABINETS: List[Dict[str, str]] = [
+    {"login": "vpo-goroda-316088-c0ts", "project": "synergy_school", "direction": "school",
+     "token_env": "APPROVE_AGENCY_TOKEN"},
+]
 
 INTERNATIONAL_MARKERS = ("дубай", "дубае", "за границ", "зарубеж", "international", "оаэ")
 
@@ -117,8 +129,17 @@ def _direct_clients() -> List[dict]:
     raise RuntimeError("Нужен DIRECT_CLIENTS_JSON или DIRECT_CLIENT_LOGIN")
 
 
-def _report_headers(login: str) -> dict:
-    token = os.environ["DIRECT_TOKEN"]
+def _own_token_cabinets() -> List[dict]:
+    return [
+        {"login": c["login"], "goal_ids": [], "project": c["project"], "sheet_name": "",
+         "direction": c["direction"], "token_env": c["token_env"],
+         "token": os.environ.get(c["token_env"], "").strip()}
+        for c in OWN_TOKEN_CABINETS
+    ]
+
+
+def _report_headers(login: str, token: str | None = None) -> dict:
+    token = token or os.environ["DIRECT_TOKEN"]
     return {
         "Authorization": f"Bearer {token}",
         "Client-Login": login,
@@ -137,7 +158,10 @@ def _report_headers(login: str) -> dict:
 
 
 def _parse_report_tsv(
-    text: str, project: str | None = None, fallback_goals: List[str] | None = None
+    text: str,
+    project: str | None = None,
+    fallback_goals: List[str] | None = None,
+    cabinet: dict | None = None,
 ) -> List[Dict[str, Any]]:
     """TSV \u0441 \u0437\u0430\u0433\u043e\u043b\u043e\u0432\u043a\u043e\u043c. \u041a\u043e\u043d\u0432\u0435\u0440\u0441\u0438\u0438 \u043a\u0430\u043c\u043f\u0430\u043d\u0438\u0438 \u2014 \u0441\u0443\u043c\u043c\u0430 \u043a\u043e\u043b\u043e\u043d\u043e\u043a \u0435\u0451 \u0446\u0435\u043b\u0435\u0439 (campaign_goals)."""
     rows: List[Dict[str, Any]] = []
@@ -176,8 +200,8 @@ def _parse_report_tsv(
                 "date": str(row.get("Date", "")).strip(),
                 "campaign_id": campaign_id,
                 "campaign_name": campaign_name,
-                "project": detect_project(campaign_name),
-                "direction": detect_direction(campaign_name),
+                "project": cabinet["project"] if cabinet else detect_project(campaign_name),
+                "direction": cabinet["direction"] if cabinet else detect_direction(campaign_name),
                 "cost": cost,
                 "clicks": clicks,
                 "impressions": impressions,
@@ -211,9 +235,14 @@ def _report_body(login: str, date_from: str, date_to: str, goals: List[str]) -> 
 
 
 def _fetch_report(
-    login: str, date_from: str, date_to: str, goals: List[str], project: str | None = None
+    login: str,
+    date_from: str,
+    date_to: str,
+    goals: List[str],
+    project: str | None = None,
+    cabinet: dict | None = None,
 ) -> List[Dict[str, Any]]:
-    headers = _report_headers(login)
+    headers = _report_headers(login, cabinet["token"] if cabinet else None)
     body = _report_body(login, date_from, date_to, goals)
 
     resp = None
@@ -249,14 +278,14 @@ def _fetch_report(
     else:
         raise RuntimeError(f"Директ API [{login}]: превышено число попыток")
 
-    return _parse_report_tsv(resp.text, project, goals)
+    return _parse_report_tsv(resp.text, project, goals, cabinet)
 
 
 def sync_direct_api_range(
     date_from: str, date_to: str, *, replace_from: bool = False
 ) -> int:
     """Загрузка Direct через API за период [date_from, date_to]."""
-    clients = _direct_clients()
+    clients = _direct_clients() + _own_token_cabinets()
     print(f"Директ API: {date_from} — {date_to}, клиентов: {len(clients)}")
 
     all_rows: List[Dict[str, Any]] = []
@@ -266,7 +295,12 @@ def sync_direct_api_range(
         try:
             project = client.get("project")
             goals = cabinet_goals(project, client.get("goal_ids"))
-            chunk = _fetch_report(login, date_from, date_to, goals, project)
+            if "token_env" in client:
+                if not client["token"]:
+                    raise RuntimeError(f"нет токена в {client['token_env']}")
+                chunk = _fetch_report(login, date_from, date_to, goals, project, cabinet=client)
+            else:
+                chunk = _fetch_report(login, date_from, date_to, goals, project)
             print(f"  [{login}] получено {len(chunk)} строк")
             all_rows.extend(chunk)
         except Exception as e:

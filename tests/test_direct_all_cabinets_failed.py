@@ -24,6 +24,7 @@ def db(monkeypatch):
     )
     monkeypatch.setitem(__import__("sys").modules, "sync.db", fake)
     monkeypatch.setattr(D, "_direct_clients", lambda: CLIENTS)
+    monkeypatch.setattr(D, "_own_token_cabinets", lambda: [])
     return calls
 
 

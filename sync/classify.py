@@ -83,6 +83,8 @@ def normalize_plan_project(raw: str) -> str:
         return "brand"
     if s in ("eduschool", "школа", "онлайн-школа", "онлайн школа", "school"):
         return "eduschool"
+    if s in ("synergy_school", "ош синергия", "синергия"):
+        return "synergy_school"
     return s
 
 
@@ -239,6 +241,10 @@ def map_crm_land(land: str) -> str:
         return "vse"
     if s in ("postupi_provuz", "provuz", "provuz_postupi"):
         return "provuz"
+    # ОШ Синергия (synergy.ru/lp/school, кабинет vpo-goroda) — не Онлайн-школа EDU:
+    # другой ленд и кабинет, Павел 16.11.2026 — отдельный проект.
+    if s == "schkd2":
+        return "synergy_school"
     return "unknown"
 
 

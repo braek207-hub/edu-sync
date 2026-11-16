@@ -125,3 +125,12 @@ def test_the_direction_list_matches_what_the_classifier_returns():
                 if isinstance(node, ast.Return)
                 and isinstance(node.value, ast.Constant)}
     assert returned == set(classify.DIRECTIONS)
+
+
+def test_map_crm_land_synergy_school():
+    """ОШ Синергия (ленд schkd2) — свой проект, не Онлайн-школа EDU."""
+    from sync.classify import map_crm_land, normalize_plan_project
+
+    assert map_crm_land("schkd2") == "synergy_school"
+    assert normalize_plan_project("ОШ Синергия") == "synergy_school"
+    assert normalize_plan_project("synergy_school") == "synergy_school"
