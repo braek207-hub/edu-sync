@@ -501,6 +501,8 @@ class _Login:
         """Спам-площадки логина и ошибка отчёта (или None). Правило дополняет чистку,
         а не блокирует её, но без него логин считается просмотренным не до конца."""
         acc, params = self.acc, self.settings["spam"]
+        if not acc.spam_rule:
+            return {}, None
         try:
             if params.get("goals") == "leads":
                 if self.goals_code:

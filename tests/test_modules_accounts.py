@@ -84,3 +84,16 @@ def test_default_agency_lookup_uses_injected_token(monkeypatch):
                         lambda token: seen.append(token) or ["c1"])
     acc, _ = accounts_for("edunetwork", {"DIRECT_TOKEN": "inj"})
     assert seen == ["inj"] and [a.login for a in acc] == ["c1"]
+
+
+def test_edu_includes_synergy_school_without_spam_rule():
+    env = {"DIRECT_TOKEN": "t", "APPROVE_AGENCY_TOKEN": "ag"}
+    acc, why = accounts_for("edunetwork", env, lambda s: ["a"])
+    assert [(a.login, a.token, a.spam_rule) for a in acc] == [
+        ("a", "t", True), ("vpo-goroda-316088-c0ts", "ag", False)]
+    assert why == []
+
+
+def test_edu_without_agency_token_says_why():
+    acc, why = accounts_for("edunetwork", {"DIRECT_TOKEN": "t"}, lambda s: ["a"])
+    assert [a.login for a in acc] == ["a"] and any("APPROVE_AGENCY_TOKEN" in w for w in why)

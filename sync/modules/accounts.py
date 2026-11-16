@@ -7,7 +7,7 @@
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, List, Mapping, Optional, Tuple
 
 from sync.direct_settings_cabinets import parse_clients_json
@@ -22,6 +22,9 @@ class DirectAccount:
     # Кампании, которые обходит модуль (settings.campaigns); None — все подходящие кабинета.
     # Ставит раннер (cabinets.select_accounts); accounts_for оставляет None.
     campaign_ids: Optional[Tuple[int, ...]] = None
+    # Спам-правило проекта судит площадки по цели-лиду. У кабинета, чья цель — CRM-статус,
+    # высокий CR площадки — настоящие клиенты, а не накрутка: правило к нему не применяется.
+    spam_rule: bool = True
 
 
 def agency_logins_by_token(token: str) -> List[str]:
@@ -74,7 +77,14 @@ def _edu(env, agency_logins, why) -> List[DirectAccount]:
         logins = [c["login"] for c in _json_clients(env, "DIRECT_CLIENTS_JSON", "", why)]
         if not logins and not why:
             why.append("у агентства нет клиентов, DIRECT_CLIENTS_JSON пуст")
-    return [DirectAccount(l, token, "RUB", "EDUNETWORK") for l in logins]
+    found = [DirectAccount(l, token, "RUB", "EDUNETWORK") for l in logins]
+    return found + _synergy_school(env, why)
+
+
+def _synergy_school(env, why) -> List[DirectAccount]:
+    found = _single(env, ["APPROVE_AGENCY_TOKEN"], [], SYNERGY_SCHOOL_LOGIN,
+                    "ОШ Синергия", "RUB", why)
+    return [replace(a, spam_rule=False) for a in found]
 
 
 def _single(env, token_names, login_names, default_login, label, currency, why):
@@ -98,10 +108,10 @@ def _single(env, token_names, login_names, default_login, label, currency, why):
     return [DirectAccount(login, token, currency, label)]
 
 
-# ОШ Синергия (проект synergy): кабинет vpo-goroda через approve.agency (28.10.2026). Решение
-# владельца 31.10.2026: весь кабинет наш — кампании модулю выбирают галочками в настройках
-# (settings.campaigns), а не списком в коде. Цель стратегии РСЯ-кампаний — CRM-статус
-# 317516886: площадка его не накрутит, спам-правило не нужно.
+# ОШ Синергия: кабинет vpo-goroda через approve.agency (28.10.2026). С 16.11.2026 — проект
+# synergy_school внутри EDU (решение Павла), модули ходят в него с проекта edunetwork.
+# Кампании модулю выбирают галочками в настройках (settings.campaigns). Цель стратегии
+# РСЯ-кампаний — CRM-статус 317516886: площадка его не накрутит, спам-правило не нужно.
 SYNERGY_SCHOOL_LOGIN = "vpo-goroda-316088-c0ts"
 
 
