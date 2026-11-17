@@ -589,16 +589,20 @@ def _load_paid_by_lead_id(service, spreadsheet_id: str) -> Dict[str, Dict[str, A
         # транзиентный 503 (прогон 32613839112) обнулил оплаты всего 2026
         # года. Упавший синк лучше тихо испорченных данных.
         values = read_sheet(service, spreadsheet_id, sheet_name)
+        # Пустой лист или потерянный заголовок — та же порча, что и упавшее чтение:
+        # 17.11.2026 строку заголовков затёрла строка оплаты, «пропуск» листа
+        # снова проставил is_paid=false всем лидам.
         if len(values) < 2:
-            continue
+            raise RuntimeError(f"CRM Оплаты [{sheet_name}]: лист пуст — оплаты не трогаем")
         headers = [str(x) for x in values[0]]
         # Счётчик оплат и выручка — по имени, устойчиво к вставке столбцов (см. find_*).
         i_orders = find_orders_index(headers)
         i_rev = find_revenue_index(headers)
         i_lead = pick_index_loose(headers, ["id лида в scrm", "lead id", "id лида"])
         if i_lead == -1:
-            print(f"CRM Оплаты [{sheet_name}]: нет колонки ID лида — оплаты к лидам не привязать")
-            continue
+            raise RuntimeError(
+                f"CRM Оплаты [{sheet_name}]: нет колонки ID лида (заголовок листа потерян?) — оплаты не трогаем"
+            )
         i_pay_date = pick_index_loose(headers, ["date pay", "дата оплаты"])
         # Описательные колонки для детализации (join по lead_id)
         i_deal = pick_index_loose(headers, ["id сделки в битрикс", "id сделки", "deal id"])
@@ -1071,16 +1075,14 @@ def sync_crm_payments() -> int:
         # потеря его строк из витрины (см. _load_paid_by_lead_id).
         values = read_sheet(service, spreadsheet_id, sheet_name)
         if len(values) < 2:
-            print(f"CRM Оплаты [{sheet_name}]: пустой лист")
-            continue
+            raise RuntimeError(f"CRM Оплаты [{sheet_name}]: лист пуст")
         headers = [str(x) for x in values[0]]
         try:
             sheet_agg = _parse_payments_sheet(
                 headers, values, lead_dims_by_id, sheet_name
             )
         except ValueError as e:
-            print(f"CRM Оплаты [{sheet_name}]: {e}")
-            continue
+            raise RuntimeError(f"CRM Оплаты [{sheet_name}]: {e}") from e
         merge_payments_agg(agg, sheet_agg)
 
     if not agg:
